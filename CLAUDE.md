@@ -12,6 +12,7 @@ Re-architecture of the OpenClaw-on-AWS single EC2 deployment to run on AWS Bedro
 - **Agent**: Strands Agents (Python) on Bedrock AgentCore Runtime
 - **Messaging Bridge**: OpenClaw (Node.js) containerized on ECS Fargate
 - **Models**: Claude Sonnet 4.6 (default: `au.anthropic.claude-sonnet-4-6` via Bedrock cross-region inference)
+- **Identity**: Cognito User Pool + AgentCore WorkloadIdentity (HMAC-derived passwords, JWT tokens)
 - **Observability**: CloudWatch, X-Ray, OpenTelemetry, custom CloudWatch dashboards
 - **Token Monitoring**: Lambda + DynamoDB + CloudWatch custom metrics
 - **Security**: VPC endpoints, WAF, CloudFront, KMS, Secrets Manager, cdk-nag
@@ -19,48 +20,161 @@ Re-architecture of the OpenClaw-on-AWS single EC2 deployment to run on AWS Bedro
 ## Architecture
 
 ```
-Users (Telegram/Discord/Slack/Browser)
-  → CloudFront + WAF + CF Function (token auth, Web UI only)
-  → Public ALB (restricted to CloudFront origin-facing IPs)
-  → ECS Fargate (OpenClaw messaging bridge + proxy, private subnet)
-  → [PROXY_MODE switch]:
-      "bedrock-direct" → Bedrock ConverseStream API → Claude Sonnet 4.6
-      "agentcore"      → AgentCore Runtime Endpoint → Strands Agent (VPC) → Bedrock + Memory
+                              +--------------------------+
+                              |     Users / Clients      |
+                              | Telegram  Discord  Slack |
+                              |       Web Browser        |
+                              +------------+-------------+
+                                           |
+                              +------------v-------------+
+                              |   CloudFront (CDN/TLS)   |
+                              |   + WAF (rate limiting)   |
+                              |   + CF Function (token    |
+                              |     auth, Web UI only)    |
+                              +------------+-------------+
+                                           |
+                            HTTPS (origin-facing IPs only)
+                                           |
+                              +------------v-------------+
+                              |     Public ALB           |
+                              | (restricted to CF IPs    |
+                              |  via managed prefix list)|
+                              +------------+-------------+
+                                           |
+                         +-----------------+------------------+
+                         |        Private Subnet (VPC)        |
+                         |                                    |
+                         |  +------------------------------+  |
+                         |  |    ECS Fargate Task          |  |
+                         |  |                              |  |
+                         |  |  +------------------------+  |  |
+                         |  |  | OpenClaw Gateway       |  |  |
+                         |  |  | (port 18789)           |  |  |
+                         |  |  | - Channel providers    |  |  |
+                         |  |  | - WebSocket / Web UI   |  |  |
+                         |  |  +----------+-------------+  |  |
+                         |  |             |                 |  |
+                         |  |  +----------v-------------+  |  |
+                         |  |  | agentcore-proxy.js     |  |  |
+                         |  |  | (port 18790)           |  |  |
+                         |  |  | - OpenAI -> Bedrock    |  |  |
+                         |  |  | - Cognito auto-prov.   |  |  |
+                         |  |  | - JWT token caching    |  |  |
+                         |  |  | - SSE streaming        |  |  |
+                         |  |  +----------+-------------+  |  |
+                         |  +------------------------------+  |
+                         |                |                    |
+                         |     +----------+----------+        |
+                         |     |  PROXY_MODE switch  |        |
+                         |     +----+----------+----+         |
+                         |          |          |              |
+                         |  bedrock-direct  agentcore         |
+                         |          |          |              |
+                         +----------+----------+--------------+
+                                    |          |
+                         +----------v---+  +---v--------------+
+                         | Bedrock API  |  | AgentCore Runtime|
+                         | ConverseStr. |  | (VPC mode)       |
+                         | Claude 4.6   |  | Strands Agent    |
+                         +--------------+  +---+---------+----+
+                                               |         |
+                                        +------v--+  +---v----------+
+                                        | Bedrock |  | AgentCore    |
+                                        | Claude  |  | Memory       |
+                                        | 4.6     |  | (semantic,   |
+                                        +---------+  |  user-prefs, |
+                                                     |  summary)    |
+                                                     +--------------+
 
-Identity: Cognito User Pool (admin-provisioned) → Proxy auto-creates users from channel IDs
-          → HMAC-derived passwords (secret in Secrets Manager) → JWT tokens cached per user
-          → CfnWorkloadIdentity + Runtime JWT authorizer (enforcement requires CfnGateway)
+  +----------------------------------------------------------------+
+  |                    Identity Flow                                |
+  |                                                                |
+  |  Channel User ID (e.g. telegram:6087229962)                    |
+  |    -> Proxy derives HMAC password from secret + actorId        |
+  |    -> AdminCreateUser (if new) + AdminSetUserPassword          |
+  |    -> AdminInitiateAuth -> JWT IdToken                         |
+  |    -> Token cached per user (60s early refresh)                |
+  |    -> CfnWorkloadIdentity registered in AgentCore              |
+  |    -> Runtime JWT authorizer configured (Cognito OIDC)         |
+  |    -> [Enforcement requires CfnGateway — future]               |
+  +----------------------------------------------------------------+
 
-AgentCore Memory (semantic + user-prefs + summary strategies, KMS-encrypted, 90d TTL)
-
-Telegram/Discord/Slack ← OpenClaw channel providers (long-polling, outbound only)
-
-Bedrock invocation logs → CloudWatch Logs → Lambda → DynamoDB (token usage) → CloudWatch custom metrics → dashboards + budget alarms
+  +----------------------------------------------------------------+
+  |                 Observability Pipeline                          |
+  |                                                                |
+  |  Bedrock invocation logs -> CloudWatch Logs                    |
+  |    -> Lambda processor -> DynamoDB (token usage, single-table) |
+  |    -> CloudWatch custom metrics -> Dashboards + Budget alarms  |
+  +----------------------------------------------------------------+
 ```
 
-Key decisions:
+### Request Flow Summary
+
+| Component | Port | Role |
+|---|---|---|
+| CloudFront | 443 | TLS termination, WAF, CF Function token auth |
+| Public ALB | 443 | Routes to Fargate (restricted to CF origin IPs) |
+| OpenClaw Gateway | 18789 | WebSocket, Web UI, channel management |
+| agentcore-proxy.js | 18790 | OpenAI-to-Bedrock translation, Cognito identity, SSE streaming |
+| Bedrock ConverseStream | - | Direct model invocation (`bedrock-direct` mode) |
+| AgentCore Runtime | - | Managed agent runtime with memory (`agentcore` mode) |
+
+### Key Design Decisions
+
 - Fargate handles WebSocket connections, Web UI, and channel management; a local proxy adapter translates OpenAI-format requests to either direct Bedrock ConverseStream API calls or AgentCore Runtime invocations (controlled by `PROXY_MODE` env var)
 - Public ALB (not internal) because CloudFront VPC Origins do not support WebSocket upgrade — ALB is restricted to CloudFront origin-facing IPs only via managed prefix list
 - CloudFront Function validates gateway token (exact value comparison, not presence-only)
 - All secrets in Secrets Manager with KMS CMK encryption, never in code or env vars
-- OpenClaw `controlUi.allowInsecureAuth: true` is required because ALB→Fargate is HTTP (TLS terminates at CloudFront)
+- OpenClaw `controlUi.allowInsecureAuth: true` is required because ALB->Fargate is HTTP (TLS terminates at CloudFront)
 - Node.js 22 in VPC without IPv6 requires `force-ipv4.js` DNS patch (see Gotchas)
 - Channel tokens are validated at startup — channels with placeholder/missing tokens are skipped to prevent retry loops
+- Cognito passwords are HMAC-derived (deterministic, never stored) — enables `AdminInitiateAuth` without per-user password storage
 
-## Implementation Structure
+## Project Structure
 
-The project follows a 10-task sequential implementation plan defined in `implementation-guide.md`:
+```
+openclaw-on-agentcore/
+  app.py                          # CDK app entry point — wires all stacks
+  cdk.json                        # CDK context config (model, sizing, thresholds)
+  requirements.txt                # Python deps (aws-cdk-lib, cdk-nag)
+  implementation-guide.md         # 10-task implementation plan (all complete)
+  stacks/
+    __init__.py                   # Shared helper (retention_days enum converter)
+    vpc_stack.py                  # VPC, subnets, NAT, VPC endpoints, flow logs
+    security_stack.py             # KMS CMK, Secrets Manager, Cognito User Pool, CloudTrail
+    agentcore_stack.py            # Runtime, Endpoint, Memory, WorkloadIdentity, IAM roles
+    fargate_stack.py              # ECS cluster, Fargate service, ALB, task def, IAM
+    edge_stack.py                 # CloudFront, WAF, CF Function (token auth)
+    observability_stack.py        # Dashboards, alarms, invocation log group
+    token_monitoring_stack.py     # Lambda processor, DynamoDB, analytics dashboard
+  agent/
+    my_agent.py                   # Strands Agent (Python) — BedrockAgentCoreApp entrypoint
+    Dockerfile                    # Agent container image
+    requirements.txt              # Agent Python deps
+  bridge/
+    agentcore-proxy.js            # Proxy adapter: OpenAI -> Bedrock/AgentCore + Cognito
+    entrypoint.sh                 # Container startup: fetch secrets, write config, launch
+    force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
+    Dockerfile                    # Bridge container image (node:22-slim + OpenClaw)
+  lambda/
+    token_metrics/index.py        # Bedrock invocation log processor -> DynamoDB + CW metrics
+  scripts/
+    deploy.sh                     # Full deployment script
+    rotate-token.sh               # Gateway token rotation
+    test-e2e.js                   # WebSocket e2e streaming test
+```
 
-1. **CDK Project Scaffolding & VPC Foundation** — VPC, subnets, VPC endpoints, security groups, CloudTrail ✅
-2. **AgentCore Strands Agent** — `agent/my_agent.py` with BedrockAgentCoreApp entrypoint, OTel instrumentation ✅
-3. **AgentCore Memory Integration** — Short-term (session) + long-term memory, namespaced by actor_id ✅
-4. **Secrets Management & Security Hardening** — Secrets Manager, KMS CMK, cdk-nag, IAM role separation ✅
-5. **OpenClaw Messaging Bridge on Fargate** — `bridge/Dockerfile`, `bridge/entrypoint.sh`, Fargate service ✅
-6. **CloudFront + WAF for Web UI** — ALB, CloudFront distribution, WAF rules, token auth ✅
-7. **Fargate ↔ AgentCore Integration** — Proxy adapter with Bedrock ConverseStream + SSE streaming ✅
-8. **Observability & Bedrock Invocation Logging** — X-Ray, invocation logs, operations dashboard, alarms ✅
-9. **Token Usage Monitoring & Budget Alerts** — Lambda processor, DynamoDB single-table design, analytics dashboard ✅
-10. **End-to-End Integration Testing** — Telegram channel verified, WebSocket e2e test, streaming confirmed ✅
+## CDK Stacks (7 stacks)
+
+| Stack | Key Resources | Cross-Stack Dependencies |
+|---|---|---|
+| **OpenClawVpc** | VPC, subnets (2 AZ), NAT, 7 VPC endpoints, flow logs | None |
+| **OpenClawSecurity** | KMS CMK, Secrets Manager (gateway token, channel tokens, Cognito password), Cognito User Pool + app client, CloudTrail | None |
+| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnMemory, CfnWorkloadIdentity, agent SG, IAM roles | VPC, Security (CMK, Cognito) |
+| **OpenClawFargate** | ECS cluster, Fargate service, ALB, task definition, IAM | VPC, Security (secrets, CMK, Cognito), AgentCore (IDs) |
+| **OpenClawEdge** | CloudFront distribution, WAF WebACL, CF Function | Fargate (ALB) |
+| **OpenClawObservability** | Operations dashboard, invocation log group, alarms, SNS topic | Fargate (service) |
+| **OpenClawTokenMonitoring** | Lambda processor, DynamoDB (single-table), analytics dashboard | Observability (log group, SNS) |
 
 ## Expected Commands
 
@@ -122,7 +236,7 @@ aws bedrock-agentcore get-memory --memory-id <MEMORY_ID> --region ap-southeast-2
 
 ### Proxy Mode Switch
 ```bash
-# Switch to AgentCore mode (update cdk.json proxy_mode → "agentcore", then redeploy Fargate):
+# Switch to AgentCore mode (update cdk.json proxy_mode -> "agentcore", then redeploy Fargate):
 cdk deploy OpenClawFargate -c proxy_mode=agentcore
 
 # Rollback to direct Bedrock mode:
@@ -150,17 +264,17 @@ cdk synth  # should pass cdk-nag checks with no errors
 
 Single-table design with composite keys:
 - **PK**: `USER#<actor_id>`, **SK**: `DATE#<yyyy-mm-dd>#CHANNEL#<channel>#SESSION#<session_id>`
-- **GSI1**: channel aggregation — PK: `CHANNEL#<channel>`, SK: `DATE#<yyyy-mm-dd>`
-- **GSI2**: model aggregation — PK: `MODEL#<model_id>`, SK: `DATE#<yyyy-mm-dd>`
-- **GSI3**: daily cost ranking — PK: `DATE#<yyyy-mm-dd>`, SK: `COST#<estimated_cost>`
+- **GSI1**: channel aggregation -- PK: `CHANNEL#<channel>`, SK: `DATE#<yyyy-mm-dd>`
+- **GSI2**: model aggregation -- PK: `MODEL#<model_id>`, SK: `DATE#<yyyy-mm-dd>`
+- **GSI3**: daily cost ranking -- PK: `DATE#<yyyy-mm-dd>`, SK: `COST#<estimated_cost>`
 - TTL for automatic cleanup (default 90 days)
 
 ## Key Configuration Points
 
 - CDK context variables in `cdk.json` control all tunable thresholds (daily token budget, cost budget, anomaly detection band width, TTL days)
-- Proxy mode: `proxy_mode` in `cdk.json` — `"bedrock-direct"` (default) or `"agentcore"` — controls whether proxy routes through AgentCore Runtime or calls Bedrock directly
-- Default Bedrock model: `au.anthropic.claude-sonnet-4-6` (set in `cdk.json` → Fargate env var → proxy)
-- CloudFront domain: set in `cdk.json` as `cloudfront_domain` → Fargate env var → entrypoint.sh `allowedOrigins`
+- Proxy mode: `proxy_mode` in `cdk.json` -- `"bedrock-direct"` (default) or `"agentcore"` -- controls whether proxy routes through AgentCore Runtime or calls Bedrock directly
+- Default Bedrock model: `au.anthropic.claude-sonnet-4-6` (set in `cdk.json` -> Fargate env var -> proxy)
+- CloudFront domain: set in `cdk.json` as `cloudfront_domain` -> Fargate env var -> entrypoint.sh `allowedOrigins`
 - Fargate sizing: 256 CPU / 1024 MiB (configurable via `cdk.json`)
 - WAF rate limiting: 100 req/5min per IP
 - CloudWatch log retention: 30 days for Fargate container logs
@@ -173,52 +287,48 @@ All 7 CDK stacks deployed to account 657117630614 / ap-southeast-2:
 - CloudFront URL: `https://d34s8ria53v6u2.cloudfront.net`
 - Fargate service running and healthy
 - Telegram channel: connected and responding (`@Openclaw_agentcore_bot`)
-- Discord/Slack channels: placeholder tokens — update via Secrets Manager when ready
+- Discord/Slack channels: placeholder tokens -- update via Secrets Manager when ready
 - WebSocket e2e streaming: verified working through CloudFront
 
 ### AI Path (Feature-Flagged)
 
 The proxy supports two modes controlled by the `PROXY_MODE` environment variable (set in `cdk.json`):
 
-**`bedrock-direct` (default)** — Direct Bedrock, no AgentCore:
+**`bedrock-direct` (default)** -- Direct Bedrock, no AgentCore:
 ```
-Telegram/Browser → OpenClaw → agentcore-proxy.js (port 18790) → Bedrock ConverseStream API → Claude Sonnet 4.6
+Telegram/Browser -> OpenClaw -> agentcore-proxy.js (port 18790) -> Bedrock ConverseStream API -> Claude Sonnet 4.6
 ```
 
-**`agentcore`** — Full AgentCore Runtime with Memory:
+**`agentcore`** -- Full AgentCore Runtime with Memory:
 ```
-Telegram/Browser → OpenClaw → agentcore-proxy.js (port 18790) → AgentCore Runtime Endpoint → Strands Agent → Bedrock + Memory
+Telegram/Browser -> OpenClaw -> agentcore-proxy.js (port 18790) -> AgentCore Runtime Endpoint -> Strands Agent -> Bedrock + Memory
 ```
 
 ### AgentCore Component Status
 
 | Component | CDK Resource | Status | Notes |
 |---|---|---|---|
-| **AgentCore Runtime** | `CfnRuntime` (container-based, VPC mode) | CDK resource defined | Requires agent image pushed to ECR before deploy |
-| **Runtime Endpoint** | `CfnRuntimeEndpoint` | CDK resource defined | Production endpoint `openclaw-agent-live` |
-| **AgentCore Memory** | `CfnMemory` (semantic + user-prefs + summary) | CDK resource defined | KMS-encrypted, 90-day event expiry |
-| **Memory Execution Role** | IAM Role (bedrock.amazonaws.com) | CDK resource defined | InvokeModel for memory extraction |
-| **Agent SG** | EC2 SecurityGroup in AgentCore stack | CDK resource defined | HTTPS from VPC CIDR |
-| **VPC Endpoint** | `bedrock-agentcore-runtime` interface endpoint | CDK resource defined | In VPC stack with other endpoints |
-| **Proxy Feature Flag** | `PROXY_MODE` env var | Defaults to `bedrock-direct` | Set to `agentcore` to enable AgentCore path |
-| **WorkloadIdentity** | `CfnWorkloadIdentity` | CDK resource defined | `openclaw-identity` — registered in AgentCore |
-| **Cognito User Pool** | `cognito.UserPool` in Security stack | CDK resource defined | Self-signup disabled, admin-provisioned only |
-| **Cognito App Client** | `UserPoolClient` (`openclaw-proxy`) | CDK resource defined | ADMIN_USER_PASSWORD_AUTH flow |
-| **Password Secret** | Secrets Manager (`openclaw/cognito-password-secret`) | CDK resource defined | HMAC secret for deterministic password derivation |
-| **Runtime JWT Authorizer** | `authorizer_configuration` on CfnRuntime | CDK resource defined | Cognito OIDC discovery URL + audience |
-| **Proxy Auto-Provisioning** | `agentcore-proxy.js` Cognito integration | Implemented | Auto-creates users, caches JWT tokens |
+| **AgentCore Runtime** | `CfnRuntime` (container-based, VPC mode) | Deployed | `openclaw_agent-Stv3n03Lta` |
+| **Runtime Endpoint** | `CfnRuntimeEndpoint` | Deployed | `openclaw_agent_live` |
+| **AgentCore Memory** | `CfnMemory` (semantic + user-prefs + summary) | Deployed | `openclaw_memory-ZEvU7zB6fu`, KMS-encrypted, 90-day event expiry |
+| **Memory Execution Role** | IAM Role (bedrock + bedrock-agentcore) | Deployed | InvokeModel for memory extraction |
+| **Agent SG** | EC2 SecurityGroup in AgentCore stack | Deployed | HTTPS from VPC CIDR |
+| **VPC Endpoint** | `bedrock-agentcore-runtime` | **Removed** | Service unavailable in ap-southeast-2; re-add when available |
+| **Proxy Feature Flag** | `PROXY_MODE` env var | Active (`bedrock-direct`) | Set to `agentcore` to enable AgentCore path |
+| **WorkloadIdentity** | `CfnWorkloadIdentity` | Deployed | `openclaw_identity` |
+| **Cognito User Pool** | `cognito.UserPool` in Security stack | Deployed | `ap-southeast-2_sqDasprUW`, self-signup disabled |
+| **Cognito App Client** | `UserPoolClient` (`openclaw-proxy`) | Deployed | `4lujqi9ev9bdkjlkaa10nsr0rh`, ADMIN_USER_PASSWORD_AUTH |
+| **Password Secret** | Secrets Manager (`openclaw/cognito-password-secret`) | Deployed | HMAC secret for deterministic password derivation |
+| **Runtime JWT Authorizer** | `authorizer_configuration` on CfnRuntime | Deployed | Cognito OIDC discovery URL + audience |
+| **Proxy Auto-Provisioning** | `agentcore-proxy.js` Cognito integration | Active | Auto-creates users, caches JWT tokens |
 | **AgentCore Gateway** | Not configured | **Not deployed** | Required for JWT enforcement (future) |
 
 ### Remaining Work
 
-- **Build & push agent Docker image** to `openclaw-agent` ECR repo before deploying `OpenClawAgentCore` stack
-- **Build & push bridge Docker image** with Cognito SDK (`@aws-sdk/client-cognito-identity-provider`)
-- **Deploy CDK stacks** in order: VPC → Security → AgentCore → Fargate (with `proxy_mode=bedrock-direct` first)
-- **Verify Runtime + Endpoint reach ACTIVE** status before switching proxy mode
+- **Verify Cognito auto-provisioning**: send Telegram message -> check Cognito console for auto-created user
+- **Map channel user IDs**: configure OpenClaw to pass `x-openclaw-actor-id` headers with channel-specific user IDs (e.g. `telegram:6087229962`) -- currently falls back to `default-user`
 - **Switch to `proxy_mode=agentcore`** and verify Telegram still works with memory persistence
-- **Verify Cognito auto-provisioning**: send Telegram message → check Cognito console for auto-created user
 - **CfnGateway**: add AgentCore Gateway to enforce JWT auth on runtime invocations (currently preparatory)
-- **Map channel user IDs**: configure OpenClaw to pass `x-openclaw-actor-id` headers with channel-specific user IDs (e.g. `telegram:6087229962`)
 - Set up Discord channel (create bot, store token, redeploy)
 - Set up Slack channel (pending team approval for Slack app)
 - Cognito hosted UI for Web UI authentication (replace gateway token auth, future)
@@ -227,43 +337,47 @@ Telegram/Browser → OpenClaw → agentcore-proxy.js (port 18790) → AgentCore 
 ## Gotchas & Patterns
 
 ### CDK (Python)
-- `logs.RetentionDays` is an enum, not constructable from int — use the helper in `stacks/__init__.py`
+- `logs.RetentionDays` is an enum, not constructable from int -- use the helper in `stacks/__init__.py`
 - `SnsAction` lives in `aws_cloudwatch_actions`, not `aws_cloudwatch`
 - CloudTrail uses `cloud_watch_log_group` (singular), not `cloud_watch_logs_group`
 - Cross-stack cyclic deps: use string ARN params + inline `add_to_policy()` instead of `grant_*()` methods
 - ControlTower hook requires `default_root_object` on CloudFront distributions
-- AgentCore resources (`CfnRuntime`, `CfnRuntimeEndpoint`, `CfnMemory`) are in `aws_cdk.aws_bedrockagentcore` — agent image must be pushed to ECR before `CfnRuntime` deploy
-- Bedrock logging `largeDataDeliveryS3Config` fails validation if `bucketName` is empty — omit the block entirely
-- ALB `add_listener()` auto-creates `0.0.0.0/0` ingress by default — always use `open=False`
+- AgentCore resources (`CfnRuntime`, `CfnRuntimeEndpoint`, `CfnMemory`, `CfnWorkloadIdentity`) are in `aws_cdk.aws_bedrockagentcore` -- agent image must be pushed to ECR before `CfnRuntime` deploy
+- AgentCore resource names must match `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` -- use underscores, not hyphens
+- AgentCore `EventExpiryDuration` is in **days** (max 365), not seconds
+- AgentCore Memory execution role must trust **both** `bedrock.amazonaws.com` and `bedrock-agentcore.amazonaws.com`
+- `bedrock-agentcore-runtime` VPC endpoint service does not exist in ap-southeast-2 -- omit from VPC stack
+- Bedrock logging `largeDataDeliveryS3Config` fails validation if `bucketName` is empty -- omit the block entirely
+- ALB `add_listener()` auto-creates `0.0.0.0/0` ingress by default -- always use `open=False`
 - Removing cross-stack exports: deploy the importing stack first (remove imports), then the exporting stack (remove exports)
-- CloudFormation drift on deleted resources: remove from template → deploy → add back → deploy (2-step)
+- CloudFormation drift on deleted resources: remove from template -> deploy -> add back -> deploy (2-step)
 
 ### OpenClaw
-- Requires Node >= 22.12.0 — Dockerfile uses `node:22-slim`
+- Requires Node >= 22.12.0 -- Dockerfile uses `node:22-slim`
 - Correct start command: `openclaw gateway run --port 18789 --bind lan --verbose` (not `openclaw start`)
 - Config requires `gateway.mode: "local"` or `--allow-unconfigured` flag
 - Auth token key: `gateway.auth.token` (not `gateway.token`)
-- WebSocket auth protocol: `type: "req"` / `method: "connect"` with `client.id: "openclaw-control-ui"`, protocol version 3, and `auth: { token }` — NOT HMAC challenge-response
-- `controlUi.allowInsecureAuth: true` is required when ALB→Fargate is HTTP (gateway checks X-Forwarded-Proto)
+- WebSocket auth protocol: `type: "req"` / `method: "connect"` with `client.id: "openclaw-control-ui"`, protocol version 3, and `auth: { token }` -- NOT HMAC challenge-response
+- `controlUi.allowInsecureAuth: true` is required when ALB->Fargate is HTTP (gateway checks X-Forwarded-Proto)
 - `controlUi.allowedOrigins` must include the CloudFront domain for Web UI access
 - Channel config is object-keyed: Telegram uses `botToken`, Discord uses `token`, Slack uses `botToken`
-- Telegram `dmPolicy: "open"` requires `allowFrom: ["*"]` — validation error otherwise
+- Telegram `dmPolicy: "open"` requires `allowFrom: ["*"]` -- validation error otherwise
 - WhatsApp requires interactive session auth (QR code), cannot be configured via secret token
-- Gateway is WebSocket-only on port 18789 — HTTP health checks must target the proxy on port 18790
+- Gateway is WebSocket-only on port 18789 -- HTTP health checks must target the proxy on port 18790
 - Streaming: agent events with `stream: "assistant"` and `data.delta` for text deltas; `chat` events with `state: "final"` for completion
 
 ### Node.js 22 + VPC IPv6 Issue
 - **Critical**: Node.js 22's Happy Eyeballs (`autoSelectFamily`) fails in VPCs without IPv6 support
 - Symptoms: `ETIMEDOUT` on IPv4 + `ENETUNREACH` on IPv6 for external APIs (Telegram, Discord, etc.)
-- `curl` works but Node.js `fetch`/`https.get` fails — because `autoSelectFamily` tries both address families
+- `curl` works but Node.js `fetch`/`https.get` fails -- because `autoSelectFamily` tries both address families
 - Fix: `bridge/force-ipv4.js` patches `dns.lookup()` to force `family: 4`, loaded via `NODE_OPTIONS="-r /app/force-ipv4.js"`
 - Also set `--dns-result-order=ipv4first --no-network-family-autoselection` in NODE_OPTIONS
 - `/proc/sys/net/ipv6/conf/all/disable_ipv6` is not writable in Fargate (read-only `/proc/sys`)
 
 ### ECS / Fargate
 - EC2 instance requires `sudo docker` (ec2-user not in docker group)
-- Push image to ECR before deploying stack — otherwise ECS tasks fail with `CannotPullContainerError`
-- ALB auto-creates SG egress for target port but NOT for health check port — add explicitly
+- Push image to ECR before deploying stack -- otherwise ECS tasks fail with `CannotPullContainerError`
+- ALB auto-creates SG egress for target port but NOT for health check port -- add explicitly
 - Force new deployment after image push: `aws ecs update-service --force-new-deployment`
 - ROLLBACK_FAILED stacks: delete with `--retain-resources <logicalId>` after they transition to DELETE_FAILED
 - OpenClaw takes ~4 minutes from container start to gateway listening (plugin init phase)
@@ -271,14 +385,14 @@ Telegram/Browser → OpenClaw → agentcore-proxy.js (port 18790) → AgentCore 
 
 ### Security
 - ALB listeners must use `open=False` to prevent CDK from auto-creating `0.0.0.0/0` ingress rules
-- CloudFront Function validates gateway token by exact value (not just presence) — token read from Secrets Manager at `cdk synth` time via boto3
+- CloudFront Function validates gateway token by exact value (not just presence) -- token read from Secrets Manager at `cdk synth` time via boto3
 - Public ALB SG restricted to CloudFront origin-facing IPs via managed prefix list `pl-b8a742d1`
 
 ### Cognito Identity
-- Cognito User Pool has self-signup disabled — all users are auto-provisioned by the proxy via `AdminCreateUser`
-- Passwords are HMAC-derived: `HMAC-SHA256(secret, actorId)` truncated to 32 chars — deterministic, never stored
+- Cognito User Pool has self-signup disabled -- all users are auto-provisioned by the proxy via `AdminCreateUser`
+- Passwords are HMAC-derived: `HMAC-SHA256(secret, actorId)` truncated to 32 chars -- deterministic, never stored
 - The HMAC secret is in Secrets Manager (`openclaw/cognito-password-secret`), fetched at container startup
-- Cognito usernames are channel-prefixed (e.g. `telegram:6087229962`) — colons are allowed in Cognito usernames
+- Cognito usernames are channel-prefixed (e.g. `telegram:6087229962`) -- colons are allowed in Cognito usernames
 - JWT tokens are cached per user with 60s early refresh to avoid expiry during requests
-- Runtime JWT authorizer is configured but **not enforced** without CfnGateway — direct SDK invocation uses SigV4
+- Runtime JWT authorizer is configured but **not enforced** without CfnGateway -- direct SDK invocation uses SigV4
 - `AdminInitiateAuth` requires `ADMIN_USER_PASSWORD_AUTH` enabled on the app client

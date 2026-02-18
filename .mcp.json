@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "drawio": {
+      "command": "npx",
+      "args": ["@drawio/mcp"]
+    }
+  }
+}
