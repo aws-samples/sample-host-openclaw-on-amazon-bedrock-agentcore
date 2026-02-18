@@ -83,9 +83,8 @@ class VpcStack(Stack):
 
         interface_endpoints = {
             "BedrockRuntime": ec2.InterfaceVpcEndpointAwsService.BEDROCK_RUNTIME,
-            "BedrockAgentCoreRuntime": ec2.InterfaceVpcEndpointAwsService(
-                "bedrock-agentcore-runtime"
-            ),
+            # NOTE: bedrock-agentcore-runtime VPC endpoint service does not exist
+            # in ap-southeast-2 yet. Re-add when the service becomes available.
             "Ssm": ec2.InterfaceVpcEndpointAwsService.SSM,
             "EcrApi": ec2.InterfaceVpcEndpointAwsService.ECR,
             "EcrDkr": ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,

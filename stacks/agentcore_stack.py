@@ -131,7 +131,10 @@ class AgentCoreStack(Stack):
         self.memory_role = iam.Role(
             self,
             "MemoryExecutionRole",
-            assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com"),
+            assumed_by=iam.CompositePrincipal(
+                iam.ServicePrincipal("bedrock.amazonaws.com"),
+                iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
+            ),
         )
         self.memory_role.add_to_policy(
             iam.PolicyStatement(
@@ -144,27 +147,27 @@ class AgentCoreStack(Stack):
         self.memory = agentcore.CfnMemory(
             self,
             "AgentMemory",
-            name="openclaw-memory",
-            event_expiry_duration=90 * 86400,  # 90 days (matches token_ttl_days)
+            name="openclaw_memory",
+            event_expiry_duration=90,  # 90 days (matches token_ttl_days)
             description="OpenClaw conversation memory",
             encryption_key_arn=cmk_arn,
             memory_execution_role_arn=self.memory_role.role_arn,
             memory_strategies=[
                 agentcore.CfnMemory.MemoryStrategyProperty(
                     semantic_memory_strategy=agentcore.CfnMemory.SemanticMemoryStrategyProperty(
-                        name="openclaw-semantic",
+                        name="openclaw_semantic",
                         description="Extract factual knowledge from conversations",
                     )
                 ),
                 agentcore.CfnMemory.MemoryStrategyProperty(
                     user_preference_memory_strategy=agentcore.CfnMemory.UserPreferenceMemoryStrategyProperty(
-                        name="openclaw-user-prefs",
+                        name="openclaw_user_prefs",
                         description="Track user preferences across sessions",
                     )
                 ),
                 agentcore.CfnMemory.MemoryStrategyProperty(
                     summary_memory_strategy=agentcore.CfnMemory.SummaryMemoryStrategyProperty(
-                        name="openclaw-summary",
+                        name="openclaw_summary",
                         description="Summarize conversation sessions",
                     )
                 ),
@@ -175,14 +178,14 @@ class AgentCoreStack(Stack):
         self.workload_identity = agentcore.CfnWorkloadIdentity(
             self,
             "WorkloadIdentity",
-            name="openclaw-identity",
+            name="openclaw_identity",
         )
 
         # --- AgentCore Runtime --------------------------------------------
         self.runtime = agentcore.CfnRuntime(
             self,
             "AgentRuntime",
-            agent_runtime_name="openclaw-agent",
+            agent_runtime_name="openclaw_agent",
             agent_runtime_artifact=agentcore.CfnRuntime.AgentRuntimeArtifactProperty(
                 container_configuration=agentcore.CfnRuntime.ContainerConfigurationProperty(
                     container_uri=f"{account}.dkr.ecr.{region}.amazonaws.com/openclaw-agent:latest"
@@ -220,7 +223,7 @@ class AgentCoreStack(Stack):
             self,
             "AgentRuntimeEndpoint",
             agent_runtime_id=self.runtime.attr_agent_runtime_id,
-            name="openclaw-agent-live",
+            name="openclaw_agent_live",
             description="Production endpoint for OpenClaw agent",
         )
 
