@@ -1,13 +1,19 @@
 """AgentCore Stack — Runtime, RuntimeEndpoint, Memory, ECR repo, and agent IAM role."""
 
+import os
+
 from aws_cdk import (
     CfnOutput,
+    CustomResource,
+    Duration,
     Stack,
     RemovalPolicy,
     aws_bedrockagentcore as agentcore,
     aws_ec2 as ec2,
     aws_ecr as ecr,
     aws_iam as iam,
+    aws_lambda as lambda_,
+    custom_resources as cr,
 )
 import cdk_nag
 from constructs import Construct
@@ -218,6 +224,44 @@ class AgentCoreStack(Stack):
             ),
         )
 
+        # --- Wait for Runtime to reach READY status -----------------------
+        # CfnRuntime returns CREATE_COMPLETE as soon as the API call succeeds,
+        # but the runtime takes minutes to transition from CREATING → READY.
+        # Without this waiter, CfnRuntimeEndpoint fails with a 409:
+        #   "Agent version 1 must be in READY status. Current status: CREATING"
+        waiter_fn = lambda_.Function(
+            self,
+            "RuntimeWaiterFunction",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="index.on_event",
+            code=lambda_.Code.from_asset(
+                os.path.join(os.path.dirname(__file__), "..", "lambda", "runtime_waiter")
+            ),
+            timeout=Duration.minutes(15),
+            memory_size=128,
+        )
+        waiter_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["bedrock-agentcore:GetRuntime"],
+                resources=["*"],
+            )
+        )
+
+        waiter_provider = cr.Provider(
+            self,
+            "RuntimeWaiterProvider",
+            on_event_handler=waiter_fn,
+        )
+
+        runtime_ready = CustomResource(
+            self,
+            "RuntimeReadyWaiter",
+            service_token=waiter_provider.service_token,
+            properties={
+                "AgentRuntimeId": self.runtime.attr_agent_runtime_id,
+            },
+        )
+
         # --- AgentCore Runtime Endpoint -----------------------------------
         self.runtime_endpoint = agentcore.CfnRuntimeEndpoint(
             self,
@@ -226,6 +270,8 @@ class AgentCoreStack(Stack):
             name="openclaw_agent_live",
             description="Production endpoint for OpenClaw agent",
         )
+        # Ensure endpoint waits for the runtime to be READY (not just created)
+        self.runtime_endpoint.node.add_dependency(runtime_ready)
 
         # --- Expose outputs for downstream stacks -------------------------
         self.runtime_id = self.runtime.attr_agent_runtime_id
@@ -284,4 +330,54 @@ class AgentCoreStack(Stack):
                     "cannot be validated at synth time.",
                 ),
             ],
+        )
+        # Runtime waiter Lambda + Provider framework suppressions
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            waiter_fn,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="bedrock-agentcore:GetRuntime does not support resource-level "
+                    "ARNs; wildcard required. Action is read-only.",
+                    applies_to=["Resource::*"],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM4",
+                    reason="Lambda uses AWSLambdaBasicExecutionRole for CloudWatch Logs.",
+                    applies_to=[
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                    ],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-L1",
+                    reason="Python 3.12 is the latest stable runtime supported by CDK.",
+                ),
+            ],
+            apply_to_children=True,
+        )
+        # Provider framework Lambda (CDK-managed, cannot customise)
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            waiter_provider,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM4",
+                    reason="CDK Provider framework Lambda uses AWSLambdaBasicExecutionRole. "
+                    "This is managed by CDK and cannot be customised.",
+                    applies_to=[
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                    ],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="CDK Provider framework Lambda needs invoke permission on the "
+                    "on_event handler. The :* suffix covers Lambda versions and is "
+                    "CDK-managed.",
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-L1",
+                    reason="Lambda runtime is managed by CDK Provider framework "
+                    "and cannot be overridden.",
+                ),
+            ],
+            apply_to_children=True,
         )
