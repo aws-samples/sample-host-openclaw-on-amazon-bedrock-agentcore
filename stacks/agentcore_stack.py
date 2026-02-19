@@ -6,6 +6,8 @@ proxy on port 18790, and OpenClaw gateway on port 18789 (started lazily
 per user session).
 """
 
+import os
+
 from aws_cdk import (
     CfnOutput,
     Duration,
@@ -319,4 +321,54 @@ class AgentCoreStack(Stack):
                     "cannot be validated at synth time.",
                 ),
             ],
+        )
+        # Runtime waiter Lambda + Provider framework suppressions
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            waiter_fn,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="bedrock-agentcore:GetRuntime does not support resource-level "
+                    "ARNs; wildcard required. Action is read-only.",
+                    applies_to=["Resource::*"],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM4",
+                    reason="Lambda uses AWSLambdaBasicExecutionRole for CloudWatch Logs.",
+                    applies_to=[
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                    ],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-L1",
+                    reason="Python 3.12 is the latest stable runtime supported by CDK.",
+                ),
+            ],
+            apply_to_children=True,
+        )
+        # Provider framework Lambda (CDK-managed, cannot customise)
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            waiter_provider,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM4",
+                    reason="CDK Provider framework Lambda uses AWSLambdaBasicExecutionRole. "
+                    "This is managed by CDK and cannot be customised.",
+                    applies_to=[
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                    ],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="CDK Provider framework Lambda needs invoke permission on the "
+                    "on_event handler. The :* suffix covers Lambda versions and is "
+                    "CDK-managed.",
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-L1",
+                    reason="Lambda runtime is managed by CDK Provider framework "
+                    "and cannot be overridden.",
+                ),
+            ],
+            apply_to_children=True,
         )
