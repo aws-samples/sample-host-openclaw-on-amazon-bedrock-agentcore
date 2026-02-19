@@ -46,6 +46,31 @@ function sleep(ms) {
 }
 
 /**
+ * Parse an OpenClaw session key to extract channel and actor identity.
+ *
+ * Session key formats:
+ *   agent:{agentId}:{channel}:{peerId}                    (DM)
+ *   agent:{agentId}:{channel}:group:{groupId}             (group chat)
+ *   agent:{agentId}:{channel}:channel:{channelId}         (channel chat)
+ *   agent:{agentId}:{channel}:group:{groupId}:topic:{id}  (forum topic)
+ *   main                                                   (default/fallback)
+ */
+function parseSessionKey(sessionKey) {
+  let channel = "unknown";
+  let actorId = "";
+
+  // "agent:{agentId}:{channel}:{rest}" — standard format
+  const agentMatch = sessionKey.match(/^agent:[^:]+:([^:]+):(.+)$/);
+  if (agentMatch) {
+    channel = agentMatch[1];
+    actorId = `${channel}:${agentMatch[2]}`;
+    return { channel, actorId };
+  }
+
+  return { channel, actorId };
+}
+
+/**
  * Extract session metadata from request headers and body.
  * Returns { sessionId, actorId, channel }.
  */
@@ -55,17 +80,57 @@ function extractSessionMetadata(parsed, headers) {
   let channel = headers["x-openclaw-channel"] || "unknown";
   let sessionId = headers["x-openclaw-session-id"] || "";
 
-  // 2. Check OpenAI 'user' field (OpenClaw may populate this)
+  // 2. Parse OpenClaw system prompt for identity signals
+  if (!actorId && parsed.messages) {
+    const systemMsg = parsed.messages.find(m => m.role === "system");
+    if (systemMsg) {
+      const content = typeof systemMsg.content === "string"
+        ? systemMsg.content : "";
+
+      // 2a. Extract chat_id from system prompt JSON examples (e.g. "chat_id": "telegram:6087229962")
+      const chatIdMatch = content.match(/"chat_id":\s*"((?:telegram|discord|slack|whatsapp|web|signal|imessage):([^"]+))"/i);
+      if (chatIdMatch) {
+        actorId = chatIdMatch[1];
+        channel = chatIdMatch[1].split(":")[0].toLowerCase();
+      }
+
+      // 2b. Fallback: parse Session: line (e.g. "Session: agent:main:telegram:123456789 •")
+      if (!actorId) {
+        const sessionMatch = content.match(/Session:\s+(\S+)/);
+        if (sessionMatch) {
+          const sk = parseSessionKey(sessionMatch[1]);
+          if (sk.actorId) actorId = sk.actorId;
+          if (sk.channel !== "unknown") channel = sk.channel;
+        }
+      }
+
+      // 2c. Fallback: extract channel from "channel": "telegram" in system prompt
+      if (channel === "unknown") {
+        const channelMatch = content.match(/"channel":\s*"(telegram|discord|slack|whatsapp|web|signal|imessage)"/i);
+        if (channelMatch) channel = channelMatch[1].toLowerCase();
+      }
+
+      // 2d. Fallback: extract channel from Runtime line
+      if (channel === "unknown") {
+        const rtMatch = content.match(
+          /Runtime:.*·\s+(telegram|discord|slack|whatsapp|web|signal|imessage)\b/i
+        );
+        if (rtMatch) channel = rtMatch[1].toLowerCase();
+      }
+    }
+  }
+
+  // 3. Check OpenAI 'user' field
   if (!actorId && parsed.user) {
     actorId = parsed.user;
   }
 
-  // 3. Fallback to default
+  // 4. Fallback to default
   if (!actorId) {
     actorId = "default-user";
   }
 
-  // 4. Generate stable session ID
+  // Generate stable session ID
   if (!sessionId) {
     const key = `${actorId}:${channel}`;
     if (!sessionMap.has(key)) {
@@ -592,6 +657,7 @@ const server = http.createServer(async (req, res) => {
           }
         } else {
           // --- Direct Bedrock path (default) ---
+          console.log(`[proxy] Bedrock: actor=${actorId} channel=${channel} jwt=${cognitoToken ? "yes" : "no"}`);
           if (stream) {
             await invokeBedrockStreaming(messages, res, parsed.model);
           } else {

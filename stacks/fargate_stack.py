@@ -2,6 +2,7 @@
 
 from aws_cdk import (
     Stack,
+    CfnOutput,
     Duration,
     aws_ec2 as ec2,
     aws_ecs as ecs,
@@ -353,3 +354,7 @@ class FargateStack(Stack):
                     ),
                 ],
             )
+
+        # --- Stack Outputs ---
+        CfnOutput(self, "ClusterName", value=self.cluster.cluster_name)
+        CfnOutput(self, "ServiceName", value=self.service.service_name)

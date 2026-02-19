@@ -89,7 +89,10 @@ Re-architecture of the OpenClaw-on-AWS single EC2 deployment to run on AWS Bedro
   +----------------------------------------------------------------+
   |                    Identity Flow                                |
   |                                                                |
-  |  Channel User ID (e.g. telegram:6087229962)                    |
+  |  OpenClaw system prompt contains "chat_id": "telegram:NNN"     |
+  |    -> Proxy extracts actorId + channel from system message     |
+  |    -> Fallbacks: Session: line, "channel" field, Runtime line, |
+  |       x-openclaw-* headers, parsed.user, "default-user"       |
   |    -> Proxy derives HMAC password from secret + actorId        |
   |    -> AdminCreateUser (if new) + AdminSetUserPassword          |
   |    -> AdminInitiateAuth -> JWT IdToken                         |
@@ -115,7 +118,7 @@ Re-architecture of the OpenClaw-on-AWS single EC2 deployment to run on AWS Bedro
 | CloudFront | 443 | TLS termination, WAF, CF Function token auth |
 | Public ALB | 443 | Routes to Fargate (restricted to CF origin IPs) |
 | OpenClaw Gateway | 18789 | WebSocket, Web UI, channel management |
-| agentcore-proxy.js | 18790 | OpenAI-to-Bedrock translation, Cognito identity, SSE streaming |
+| agentcore-proxy.js | 18790 | OpenAI-to-Bedrock translation, per-user identity extraction, Cognito auto-provisioning, SSE streaming |
 | Bedrock ConverseStream | - | Direct model invocation (`bedrock-direct` mode) |
 | AgentCore Runtime | - | Managed agent runtime with memory (`agentcore` mode) |
 
@@ -152,7 +155,7 @@ openclaw-on-agentcore/
     Dockerfile                    # Agent container image
     requirements.txt              # Agent Python deps
   bridge/
-    agentcore-proxy.js            # Proxy adapter: OpenAI -> Bedrock/AgentCore + Cognito
+    agentcore-proxy.js            # Proxy adapter: OpenAI -> Bedrock/AgentCore + identity extraction + Cognito
     entrypoint.sh                 # Container startup: fetch secrets, write config, launch
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
     Dockerfile                    # Bridge container image (node:22-slim + OpenClaw)
@@ -178,7 +181,23 @@ openclaw-on-agentcore/
 
 ## Expected Commands
 
-### CDK
+### Full Deployment (recommended for first-time or complete redeploy)
+```bash
+./scripts/deploy.sh                            # full deploy: CDK stacks + Docker images + ECS restart
+./scripts/deploy.sh --skip-images              # CDK stacks only (no image rebuild)
+./scripts/deploy.sh --profile my-profile       # use a specific AWS profile
+```
+
+The deploy script handles:
+1. Install CDK Python dependencies
+2. `cdk synth` (includes cdk-nag checks)
+3. Deploy foundation stacks (VPC, Security, AgentCore, Fargate) — creates ECR repos
+4. Build and push Docker images (bridge + agent) to ECR
+5. Force new ECS deployment to pick up latest images
+6. Deploy remaining stacks (Edge, Observability, Token Monitoring)
+7. Print deployment summary with URLs and next steps
+
+### CDK (manual)
 ```bash
 cdk synth                                    # synthesize (runs from project root)
 cdk deploy --all --require-approval never     # deploy all stacks
@@ -187,7 +206,7 @@ cdk diff                                      # preview changes
 cdk destroy                                   # tear down
 ```
 
-### Fargate / Docker
+### Fargate / Docker (manual image deploy)
 ```bash
 sudo docker build -t openclaw-bridge bridge/                                              # build image
 aws ecr get-login-password --region ap-southeast-2 | sudo docker login --username AWS --password-stdin 657117630614.dkr.ecr.ap-southeast-2.amazonaws.com
@@ -272,6 +291,7 @@ Single-table design with composite keys:
 ## Key Configuration Points
 
 - CDK context variables in `cdk.json` control all tunable thresholds (daily token budget, cost budget, anomaly detection band width, TTL days)
+- **New deployers**: update `account` and `region` in `cdk.json` to match your AWS account before deploying; `cloudfront_domain` will be set after the first `cdk deploy OpenClawEdge`
 - Proxy mode: `proxy_mode` in `cdk.json` -- `"bedrock-direct"` (default) or `"agentcore"` -- controls whether proxy routes through AgentCore Runtime or calls Bedrock directly
 - Default Bedrock model: `au.anthropic.claude-sonnet-4-6` (set in `cdk.json` -> Fargate env var -> proxy)
 - CloudFront domain: set in `cdk.json` as `cloudfront_domain` -> Fargate env var -> entrypoint.sh `allowedOrigins`
@@ -279,6 +299,8 @@ Single-table design with composite keys:
 - WAF rate limiting: 100 req/5min per IP
 - CloudWatch log retention: 30 days for Fargate container logs
 - OpenClaw startup takes ~4 minutes (plugin registration, bonjour, etc.) before channels connect
+- Container images are **not** pre-built -- users must build and push Docker images to ECR (the `deploy.sh` script handles this automatically)
+- ECR repositories (`openclaw-bridge`, `openclaw-agent`) are created by CDK in the Fargate and AgentCore stacks respectively
 
 ## Deployment Status
 
@@ -325,8 +347,8 @@ Telegram/Browser -> OpenClaw -> agentcore-proxy.js (port 18790) -> AgentCore Run
 
 ### Remaining Work
 
-- **Verify Cognito auto-provisioning**: send Telegram message -> check Cognito console for auto-created user
-- **Map channel user IDs**: configure OpenClaw to pass `x-openclaw-actor-id` headers with channel-specific user IDs (e.g. `telegram:6087229962`) -- currently falls back to `default-user`
+- ~~**Verify Cognito auto-provisioning**~~: ✅ Done — Telegram message auto-creates Cognito user `telegram:6087229962` (CONFIRMED status)
+- ~~**Map channel user IDs**~~: ✅ Done — proxy extracts `chat_id` from OpenClaw system prompt JSON (e.g. `"chat_id": "telegram:6087229962"`), with fallbacks for `Session:` line / `"channel"` field / `Runtime:` line / headers / `user` field / `default-user`
 - **Switch to `proxy_mode=agentcore`** and verify Telegram still works with memory persistence
 - **CfnGateway**: add AgentCore Gateway to enforce JWT auth on runtime invocations (currently preparatory)
 - Set up Discord channel (create bot, store token, redeploy)
@@ -365,6 +387,8 @@ Telegram/Browser -> OpenClaw -> agentcore-proxy.js (port 18790) -> AgentCore Run
 - WhatsApp requires interactive session auth (QR code), cannot be configured via secret token
 - Gateway is WebSocket-only on port 18789 -- HTTP health checks must target the proxy on port 18790
 - Streaming: agent events with `stream: "assistant"` and `data.delta` for text deltas; `chat` events with `state: "final"` for completion
+- OpenClaw does NOT pass sender identity (channel user ID, sender name) in HTTP headers or the OpenAI `user` field when calling the model provider endpoint -- the `openai-completions.js:buildParams()` constructs the request with only `model`, `messages`, `stream`, and optional `temperature`/`max_tokens`
+- The system prompt includes a JSON example containing `"chat_id": "telegram:6087229962"` and `"channel": "telegram"` -- this is the only reliable signal for per-user identity extraction in the proxy
 
 ### Node.js 22 + VPC IPv6 Issue
 - **Critical**: Node.js 22's Happy Eyeballs (`autoSelectFamily`) fails in VPCs without IPv6 support
@@ -396,3 +420,5 @@ Telegram/Browser -> OpenClaw -> agentcore-proxy.js (port 18790) -> AgentCore Run
 - JWT tokens are cached per user with 60s early refresh to avoid expiry during requests
 - Runtime JWT authorizer is configured but **not enforced** without CfnGateway -- direct SDK invocation uses SigV4
 - `AdminInitiateAuth` requires `ADMIN_USER_PASSWORD_AUTH` enabled on the app client
+- Actor identity is extracted from OpenClaw's system prompt `"chat_id"` field (e.g. `"chat_id": "telegram:6087229962"`) -- OpenClaw does NOT pass sender identity in headers or the OpenAI `user` field; the system prompt JSON is the only reliable signal
+- Identity extraction priority: (1) `x-openclaw-*` headers, (2) `chat_id` from system prompt, (3) `Session:` line from system prompt, (4) `"channel"` field from system prompt, (5) `Runtime:` line, (6) OpenAI `user` field, (7) `default-user`
