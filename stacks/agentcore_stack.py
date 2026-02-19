@@ -24,6 +24,7 @@ class AgentCoreStack(Stack):
         private_subnet_ids: list[str],
         cognito_issuer_url: str,
         cognito_client_id: str,
+        default_model_id: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -76,8 +77,7 @@ class AgentCoreStack(Stack):
                     "bedrock:InvokeModelWithResponseStream",
                 ],
                 resources=[
-                    f"arn:aws:bedrock:{region}::foundation-model/*",
-                    f"arn:aws:bedrock:us-east-1::foundation-model/*",
+                    "arn:aws:bedrock:*::foundation-model/*",
                 ],
             )
         )
@@ -207,7 +207,7 @@ class AgentCoreStack(Stack):
             ),
             role_arn=self.agent_role.role_arn,
             environment_variables={
-                "DEFAULT_MODEL_ID": "au.anthropic.claude-sonnet-4-6",
+                "DEFAULT_MODEL_ID": default_model_id,
                 "AWS_REGION": region,
                 "AGENTCORE_MEMORY_ID": self.memory.attr_memory_id,
             },
@@ -250,8 +250,7 @@ class AgentCoreStack(Stack):
                     "InvokeModel only. Memory, AgentCore Runtime, Logs, Metrics, and "
                     "X-Ray APIs do not support resource-level permissions.",
                     applies_to=[
-                        f"Resource::arn:aws:bedrock:{region}::foundation-model/*",
-                        "Resource::arn:aws:bedrock:us-east-1::foundation-model/*",
+                        "Resource::arn:aws:bedrock:*::foundation-model/*",
                         "Resource::*",
                     ],
                 ),

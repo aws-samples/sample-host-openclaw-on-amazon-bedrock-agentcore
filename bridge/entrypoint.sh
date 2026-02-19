@@ -9,7 +9,7 @@ if [ -n "${GATEWAY_TOKEN_SECRET_ID:-}" ]; then
     SM_ERR=$(mktemp)
     GATEWAY_TOKEN=$(aws secretsmanager get-secret-value \
         --secret-id "${GATEWAY_TOKEN_SECRET_ID}" \
-        --region "${AWS_REGION:-ap-southeast-2}" \
+        --region "${AWS_REGION:?AWS_REGION env var required}" \
         --query 'SecretString' \
         --output text 2>"${SM_ERR}" || echo "")
     if [ -s "${SM_ERR}" ]; then
@@ -32,7 +32,7 @@ if [ -n "${COGNITO_PASSWORD_SECRET_ID:-}" ]; then
     echo "[openclaw-bridge] Fetching Cognito password secret from Secrets Manager..."
     COGNITO_PASSWORD_SECRET=$(aws secretsmanager get-secret-value \
         --secret-id "${COGNITO_PASSWORD_SECRET_ID}" \
-        --region "${AWS_REGION:-ap-southeast-2}" \
+        --region "${AWS_REGION:?AWS_REGION env var required}" \
         --query 'SecretString' --output text 2>/dev/null || echo "")
     if [ -n "${COGNITO_PASSWORD_SECRET}" ]; then
         echo "[openclaw-bridge] Cognito password secret loaded"
@@ -49,7 +49,7 @@ read_channel_secret() {
     local value
     value=$(aws secretsmanager get-secret-value \
         --secret-id "${secret_id}" \
-        --region "${AWS_REGION:-ap-southeast-2}" \
+        --region "${AWS_REGION:?AWS_REGION env var required}" \
         --query 'SecretString' \
         --output text 2>/dev/null || echo "")
     echo "${value}"
@@ -135,7 +135,7 @@ cat > /root/.openclaw/openclaw.json <<CONF
     "controlUi": {
       "enabled": true,
       "allowInsecureAuth": true,
-      "allowedOrigins": ["https://${CLOUDFRONT_DOMAIN:-d34s8ria53v6u2.cloudfront.net}"]
+      "allowedOrigins": ["https://${CLOUDFRONT_DOMAIN:-localhost}"]
     }
   },
   "channels": ${CHANNELS_JSON}

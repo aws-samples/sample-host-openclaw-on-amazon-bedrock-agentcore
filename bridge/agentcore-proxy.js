@@ -14,9 +14,10 @@ const http = require("http");
 const crypto = require("crypto");
 
 const PORT = 18790;
-const AWS_REGION = process.env.AWS_REGION || "ap-southeast-2";
-const MODEL_ID =
-  process.env.BEDROCK_MODEL_ID || "au.anthropic.claude-sonnet-4-6";
+const AWS_REGION = process.env.AWS_REGION;
+if (!AWS_REGION) { console.error("AWS_REGION env var required"); process.exit(1); }
+const MODEL_ID = process.env.BEDROCK_MODEL_ID;
+if (!MODEL_ID) { console.error("BEDROCK_MODEL_ID env var required"); process.exit(1); }
 const PROXY_MODE = process.env.PROXY_MODE || "bedrock-direct";
 const AGENTCORE_RUNTIME_ENDPOINT_ID = process.env.AGENTCORE_RUNTIME_ENDPOINT_ID || "";
 

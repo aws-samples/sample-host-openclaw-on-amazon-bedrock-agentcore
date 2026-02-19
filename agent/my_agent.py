@@ -23,8 +23,8 @@ logging.basicConfig(level=logging.INFO)
 tracer = trace.get_tracer("openclaw-agent")
 
 # --- Configuration ---
-DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "au.anthropic.claude-sonnet-4-6")
-AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+DEFAULT_MODEL_ID = os.environ["DEFAULT_MODEL_ID"]
+AWS_REGION = os.environ["AWS_REGION"]
 MEMORY_ID = os.environ.get("AGENTCORE_MEMORY_ID", "")
 
 SYSTEM_PROMPT = """You are a helpful personal assistant powered by OpenClaw. You are friendly,

@@ -33,6 +33,8 @@ class FargateStack(Stack):
         cognito_user_pool_id: str,
         cognito_client_id: str,
         cognito_password_secret_name: str,
+        cloudfront_prefix_list_id: str,
+        default_model_id: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -172,7 +174,7 @@ class FargateStack(Stack):
                 "AGENTCORE_RUNTIME_ENDPOINT_ID": runtime_endpoint_id,
                 "AGENTCORE_MEMORY_ID": memory_id,
                 "PROXY_MODE": self.node.try_get_context("proxy_mode") or "bedrock-direct",
-                "BEDROCK_MODEL_ID": self.node.try_get_context("default_model_id") or "au.anthropic.claude-sonnet-4-6",
+                "BEDROCK_MODEL_ID": default_model_id,
                 "CLOUDFRONT_DOMAIN": self.node.try_get_context("cloudfront_domain") or "",
                 "COGNITO_USER_POOL_ID": cognito_user_pool_id,
                 "COGNITO_CLIENT_ID": cognito_client_id,
@@ -236,7 +238,7 @@ class FargateStack(Stack):
         )
         # Restrict to CloudFront origin-facing IPs only (managed prefix list)
         self.public_alb.connections.allow_from(
-            ec2.Peer.prefix_list("pl-b8a742d1"),
+            ec2.Peer.prefix_list(cloudfront_prefix_list_id),
             ec2.Port.tcp(80),
             "Allow HTTP from CloudFront origin-facing IPs only",
         )

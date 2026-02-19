@@ -2,16 +2,14 @@
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
-const CF_URL = process.env.CF_URL || 'wss://d34s8ria53v6u2.cloudfront.net/';
+const CF_URL = process.env.CF_URL;
+if (!CF_URL) { console.error('CF_URL env var required (e.g. wss://XXXX.cloudfront.net/)'); process.exit(1); }
 const token = process.env.GATEWAY_TOKEN;
+if (!token) { console.error('GATEWAY_TOKEN env var required'); process.exit(1); }
 
-if (!token) {
-  console.error('GATEWAY_TOKEN env var required');
-  process.exit(1);
-}
-
+const origin = CF_URL.replace('wss://', 'https://').replace(/\/$/, '');
 const ws = new WebSocket(CF_URL, {
-  headers: { Origin: 'https://d34s8ria53v6u2.cloudfront.net' }
+  headers: { Origin: origin }
 });
 let done = false;
 let reqId = 0;

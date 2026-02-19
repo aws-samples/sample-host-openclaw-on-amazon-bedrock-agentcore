@@ -33,6 +33,7 @@ yarn-error.log*
 # AWS CDK
 # ──────────────────────────────────────────────
 cdk.out/
+cdk.context.json
 
 # ──────────────────────────────────────────────
 # Secrets & credentials (never commit these)

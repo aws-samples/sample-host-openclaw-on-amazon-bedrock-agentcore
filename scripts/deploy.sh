@@ -28,6 +28,17 @@ done
 
 REGION=$(python3 -c "import json; print(json.load(open('${PROJECT_DIR}/cdk.json'))['context']['region'])")
 ACCOUNT=$(python3 -c "import json; print(json.load(open('${PROJECT_DIR}/cdk.json'))['context']['account'])")
+
+# Pre-flight validation — ensure placeholders have been replaced
+if [ "$ACCOUNT" = "YOUR_AWS_ACCOUNT_ID" ] || [ -z "$ACCOUNT" ]; then
+    echo "ERROR: Edit cdk.json and set 'account' to your AWS account ID"
+    exit 1
+fi
+if [ "$REGION" = "YOUR_REGION" ] || [ -z "$REGION" ]; then
+    echo "ERROR: Edit cdk.json and set 'region' to your target AWS region"
+    exit 1
+fi
+
 ECR_REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 
 echo "=========================================="
@@ -158,6 +169,8 @@ echo "    2. Open the Web UI URL above in your browser"
 echo "    3. To connect messaging channels, add bot tokens via Secrets Manager:"
 echo "       aws secretsmanager update-secret --secret-id openclaw/channels/telegram --secret-string 'BOT_TOKEN'"
 echo "       Then force a new deployment to pick up the token."
+echo "    4. If this is your first deploy, update cdk.json 'cloudfront_domain' with the"
+echo "       CloudFront URL above, then redeploy: ./scripts/deploy.sh --skip-images"
 echo ""
 echo "  NOTE: OpenClaw takes ~4 minutes from container start to gateway listening."
 echo ""
