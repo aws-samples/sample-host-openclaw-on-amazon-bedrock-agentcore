@@ -153,7 +153,23 @@ openclaw-on-agentcore/
 
 ## Expected Commands
 
-### CDK
+### Full Deployment (recommended for first-time or complete redeploy)
+```bash
+./scripts/deploy.sh                            # full deploy: CDK stacks + Docker images + ECS restart
+./scripts/deploy.sh --skip-images              # CDK stacks only (no image rebuild)
+./scripts/deploy.sh --profile my-profile       # use a specific AWS profile
+```
+
+The deploy script handles:
+1. Install CDK Python dependencies
+2. `cdk synth` (includes cdk-nag checks)
+3. Deploy foundation stacks (VPC, Security, AgentCore, Fargate) — creates ECR repos
+4. Build and push Docker images (bridge + agent) to ECR
+5. Force new ECS deployment to pick up latest images
+6. Deploy remaining stacks (Edge, Observability, Token Monitoring)
+7. Print deployment summary with URLs and next steps
+
+### CDK (manual)
 ```bash
 source .venv/bin/activate
 cdk synth                                    # synthesize + cdk-nag checks
