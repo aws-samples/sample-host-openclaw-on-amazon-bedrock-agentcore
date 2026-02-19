@@ -1,7 +1,3 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Project Overview
 
 Re-architecture of the OpenClaw-on-AWS single EC2 deployment to run on AWS Bedrock AgentCore's managed serverless runtime. The project replaces EC2 with AgentCore Runtime (Strands Agents) for AI reasoning and ECS Fargate for the OpenClaw Node.js messaging bridge, adding session isolation, memory, observability, and granular token usage monitoring.
