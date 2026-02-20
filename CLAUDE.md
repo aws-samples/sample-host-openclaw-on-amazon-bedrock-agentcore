@@ -11,7 +11,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Di
 - **Infrastructure**: CDK v2 (Python), 6 stacks
 - **Runtime**: Bedrock AgentCore Runtime (serverless ARM64 container, VPC mode)
 - **Messaging**: OpenClaw (Node.js) — Telegram, Discord, Slack channel providers
-- **Tools & Skills**: Built-in tool groups (full profile) + 10 ClawHub skills (web search, research, memory, etc.)
+- **Tools & Skills**: Built-in tool groups (full profile) + 9 ClawHub skills (web search, research, memory, etc.)
 - **AI Model**: Claude Sonnet 4.6 via Bedrock ConverseStream (`us.anthropic.claude-sonnet-4-6`)
 - **Identity**: Cognito User Pool (HMAC-derived passwords, auto-provisioned users)
 - **Memory**: AgentCore Memory (semantic, user preferences, summary strategies)

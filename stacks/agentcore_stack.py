@@ -15,6 +15,8 @@ from aws_cdk import (
     aws_ec2 as ec2,
     aws_ecr as ecr,
     aws_iam as iam,
+    aws_kms as kms,
+    aws_s3 as s3,
 )
 import cdk_nag
 from constructs import Construct
@@ -51,6 +53,20 @@ class AgentCoreStack(Stack):
             image_scan_on_push=True,
         )
 
+        # --- S3 Bucket for workspace persistence -------------------------------
+        self.workspace_bucket = s3.Bucket(
+            self,
+            "WorkspaceBucket",
+            bucket_name=f"openclaw-workspace-{account}-{region}",
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=kms.Key.from_key_arn(self, "ImportedCmk", cmk_arn),
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+            versioned=True,
+            removal_policy=RemovalPolicy.RETAIN,
+            auto_delete_objects=False,
+        )
+
         # --- Security Group for AgentCore Runtime containers ------------------
         self.agent_sg = ec2.SecurityGroup(
             self,
@@ -69,7 +85,6 @@ class AgentCoreStack(Stack):
         self.execution_role = iam.Role(
             self,
             "OpenClawExecutionRole",
-            role_name="openclaw-agentcore-execution-role",
             assumed_by=iam.CompositePrincipal(
                 iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
                 iam.ServicePrincipal("bedrock.amazonaws.com"),
@@ -111,6 +126,9 @@ class AgentCoreStack(Stack):
                 resources=[cmk_arn],
             )
         )
+
+        # S3 workspace persistence
+        self.workspace_bucket.grant_read_write(self.execution_role)
 
         # Cognito admin operations for auto-provisioning identities
         self.execution_role.add_to_policy(
@@ -244,7 +262,8 @@ class AgentCoreStack(Stack):
                 "COGNITO_CLIENT_ID": cognito_client_id,
                 "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
                 "AGENTCORE_MEMORY_ID": self.memory.attr_memory_id,
-                "IMAGE_VERSION": "6",  # bump to force container redeploy
+                "WORKSPACE_BUCKET": self.workspace_bucket.bucket_name,
+                "IMAGE_VERSION": "10",  # bump to force container redeploy
             },
             description="OpenClaw messaging bridge on AgentCore Runtime",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
@@ -274,6 +293,7 @@ class AgentCoreStack(Stack):
         CfnOutput(self, "RuntimeId", value=self.runtime.attr_agent_runtime_id)
         CfnOutput(self, "RuntimeEndpointId", value=self.runtime_endpoint.attr_id)
         CfnOutput(self, "MemoryId", value=self.memory.attr_memory_id)
+        CfnOutput(self, "WorkspaceBucketName", value=self.workspace_bucket.bucket_name)
         CfnOutput(self, "WorkloadIdentityArn", value=self.workload_identity.attr_workload_identity_arn)
         CfnOutput(
             self,
@@ -290,13 +310,22 @@ class AgentCoreStack(Stack):
                     reason="Bedrock foundation model ARNs require wildcard for model ID. "
                     "Memory, Logs, Metrics, X-Ray, and Secrets Manager APIs are scoped "
                     "to project prefix (openclaw/*) or do not support resource-level "
-                    "permissions. Cognito userpool/* is scoped to this account/region.",
+                    "permissions. Cognito userpool/* is scoped to this account/region. "
+                    "S3 workspace bucket uses /* for object-level read/write.",
                     applies_to=[
                         "Resource::arn:aws:bedrock:*::foundation-model/*",
                         f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::arn:aws:cognito-idp:{region}:{account}:userpool/*",
                         "Resource::*",
+                        "Resource::<WorkspaceBucket53E30B92.Arn>/*",
+                        "Action::kms:GenerateDataKey*",
+                        "Action::kms:ReEncrypt*",
+                        "Action::s3:Abort*",
+                        "Action::s3:DeleteObject*",
+                        "Action::s3:GetBucket*",
+                        "Action::s3:GetObject*",
+                        "Action::s3:List*",
                     ],
                 ),
             ],
@@ -315,6 +344,16 @@ class AgentCoreStack(Stack):
                 ),
             ],
             apply_to_children=True,
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            self.workspace_bucket,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-S1",
+                    reason="Workspace bucket stores agent workspace files (markdown). "
+                    "Access logging not required for non-sensitive operational data.",
+                ),
+            ],
         )
         cdk_nag.NagSuppressions.add_resource_suppressions(
             self.agent_sg,

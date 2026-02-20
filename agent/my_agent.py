@@ -43,7 +43,7 @@ Keep your responses appropriate for chat-style messaging — avoid very long par
 specifically asked for detailed explanations."""
 
 # --- Memory helpers ---
-bedrock_agent_runtime = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
+bedrock_agentcore = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
 
 
 def load_memory_context(actor_id: str, session_id: str) -> str:
@@ -55,15 +55,17 @@ def load_memory_context(actor_id: str, session_id: str) -> str:
 
     # Retrieve long-term memories (semantic + preferences)
     try:
-        response = bedrock_agent_runtime.retrieve_memories(
+        response = bedrock_agentcore.retrieve_memory_records(
             memoryId=MEMORY_ID,
             namespace=actor_id,
-            query={"text": "user preferences and important facts"},
+            searchCriteria={
+                "searchQuery": "user preferences and important facts",
+            },
             maxResults=10,
         )
-        memories = response.get("memories", [])
-        if memories:
-            facts = [m.get("content", {}).get("text", "") for m in memories if m.get("content")]
+        records = response.get("memoryRecordSummaries", [])
+        if records:
+            facts = [r.get("content", {}).get("text", "") for r in records if r.get("content")]
             if facts:
                 context_parts.append(
                     "Relevant memories from previous interactions:\n"
@@ -74,18 +76,23 @@ def load_memory_context(actor_id: str, session_id: str) -> str:
 
     # List recent short-term events for this session
     try:
-        response = bedrock_agent_runtime.list_memory_events(
+        response = bedrock_agentcore.list_events(
             memoryId=MEMORY_ID,
-            namespace=actor_id,
+            sessionId=session_id,
+            actorId=actor_id,
+            includePayloads=True,
             maxResults=20,
         )
         events = response.get("events", [])
         if events:
             recent = []
             for evt in events[-10:]:
-                content = evt.get("content", {}).get("text", "")
-                if content:
-                    recent.append(content)
+                for item in evt.get("payload", []):
+                    conv = item.get("conversational", {})
+                    text = conv.get("content", {}).get("text", "")
+                    role = conv.get("role", "")
+                    if text:
+                        recent.append(f"{role}: {text}" if role else text)
             if recent:
                 context_parts.append(
                     "Recent conversation context:\n" + "\n".join(recent)
@@ -102,14 +109,25 @@ def store_memory_event(actor_id: str, session_id: str, user_message: str, agent_
         return
 
     try:
-        bedrock_agent_runtime.create_memory_event(
+        from datetime import datetime, timezone
+
+        bedrock_agentcore.create_event(
             memoryId=MEMORY_ID,
-            namespace=actor_id,
-            events=[
+            actorId=actor_id,
+            sessionId=session_id,
+            eventTimestamp=datetime.now(timezone.utc),
+            payload=[
                 {
-                    "content": {
-                        "text": f"User ({actor_id}): {user_message}\nAssistant: {agent_response}"
-                    },
+                    "conversational": {
+                        "content": {"text": user_message},
+                        "role": "user",
+                    }
+                },
+                {
+                    "conversational": {
+                        "content": {"text": agent_response},
+                        "role": "assistant",
+                    }
                 },
             ],
         )
@@ -187,7 +205,7 @@ def handle_request(payload: dict) -> dict:
 app = BedrockAgentCoreApp()
 
 
-@app.handler
+@app.entrypoint
 def invoke(payload: dict) -> dict:
     """AgentCore Runtime entrypoint."""
     return handle_request(payload)

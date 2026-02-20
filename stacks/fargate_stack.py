@@ -29,6 +29,7 @@ class FargateStack(Stack):
         cmk_arn: str,
         runtime_id: str,
         runtime_endpoint_id: str,
+        runtime_endpoint_name: str,
         memory_id: str,
         cognito_user_pool_id: str,
         cognito_client_id: str,
@@ -105,6 +106,7 @@ class FargateStack(Stack):
                     "bedrock:InvokeModelWithResponseStream",
                     "bedrock:Converse",
                     "bedrock:ConverseStream",
+                    "bedrock-agentcore:InvokeAgentRuntime",
                     "bedrock-agentcore:InvokeRuntime",
                     "bedrock-agentcore:InvokeRuntimeEndpoint",
                 ],
@@ -172,6 +174,8 @@ class FargateStack(Stack):
                 "NODE_OPTIONS": "--max-old-space-size=768",
                 "AGENTCORE_RUNTIME_ID": runtime_id,
                 "AGENTCORE_RUNTIME_ENDPOINT_ID": runtime_endpoint_id,
+                "AGENTCORE_RUNTIME_ARN": f"arn:aws:bedrock-agentcore:{Stack.of(self).region}:{Stack.of(self).account}:runtime/{runtime_id}",
+                "AGENTCORE_ENDPOINT_QUALIFIER": runtime_endpoint_name,
                 "AGENTCORE_MEMORY_ID": memory_id,
                 "PROXY_MODE": self.node.try_get_context("proxy_mode") or "bedrock-direct",
                 "BEDROCK_MODEL_ID": default_model_id,
@@ -318,6 +322,7 @@ class FargateStack(Stack):
                     id="AwsSolutions-ECS2",
                     reason="Environment variables (AWS_REGION, GATEWAY_TOKEN_SECRET_ID, "
                     "AGENTCORE_RUNTIME_ID, AGENTCORE_RUNTIME_ENDPOINT_ID, "
+                    "AGENTCORE_RUNTIME_ARN, AGENTCORE_ENDPOINT_QUALIFIER, "
                     "AGENTCORE_MEMORY_ID, PROXY_MODE, COGNITO_USER_POOL_ID, "
                     "COGNITO_CLIENT_ID, COGNITO_PASSWORD_SECRET_ID) contain only "
                     "non-sensitive configuration. Actual secret values are fetched "

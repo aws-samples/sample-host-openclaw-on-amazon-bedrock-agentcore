@@ -9,7 +9,6 @@ from aws_cdk import (
     aws_logs as logs,
     aws_iam as iam,
     aws_sns as sns,
-    aws_ecs as ecs,
     custom_resources as cr,
     CfnOutput,
 )
@@ -24,10 +23,6 @@ class ObservabilityStack(Stack):
         self,
         scope: Construct,
         construct_id: str,
-        *,
-        fargate_service: ecs.IBaseService,
-        cluster_name: str,
-        service_name: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -121,28 +116,6 @@ class ObservabilityStack(Stack):
             dashboard_name="OpenClaw-Operations",
         )
 
-        # Fargate metrics
-        fargate_cpu = cw.Metric(
-            namespace="AWS/ECS",
-            metric_name="CPUUtilization",
-            dimensions_map={
-                "ClusterName": cluster_name,
-                "ServiceName": service_name,
-            },
-            period=Duration.minutes(5),
-            statistic="Average",
-        )
-        fargate_memory = cw.Metric(
-            namespace="AWS/ECS",
-            metric_name="MemoryUtilization",
-            dimensions_map={
-                "ClusterName": cluster_name,
-                "ServiceName": service_name,
-            },
-            period=Duration.minutes(5),
-            statistic="Average",
-        )
-
         # Bedrock metrics
         bedrock_invocations = cw.Metric(
             namespace="AWS/Bedrock",
@@ -190,13 +163,7 @@ class ObservabilityStack(Stack):
         )
 
         dashboard.add_widgets(
-            cw.TextWidget(markdown="# OpenClaw Operations Dashboard", width=24, height=1),
-            cw.GraphWidget(
-                title="Fargate CPU & Memory",
-                left=[fargate_cpu],
-                right=[fargate_memory],
-                width=12,
-            ),
+            cw.TextWidget(markdown="# OpenClaw Operations Dashboard (AgentCore)", width=24, height=1),
             cw.GraphWidget(
                 title="Bedrock Invocations & Errors",
                 left=[bedrock_invocations],
