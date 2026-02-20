@@ -114,7 +114,26 @@ if [ -n "${DISCORD_TOKEN}" ]; then
     CHANNELS_JSON=$(echo "${CHANNELS_JSON}" | jq --arg t "${DISCORD_TOKEN}" '. + {"discord": {"enabled": true, "token": $t}}')
 fi
 if [ -n "${SLACK_TOKEN}" ]; then
-    CHANNELS_JSON=$(echo "${CHANNELS_JSON}" | jq --arg t "${SLACK_TOKEN}" '. + {"slack": {"enabled": true, "botToken": $t}}')
+    # Slack secret can be JSON {"botToken":"xoxb-...","appToken":"xapp-..."} or plain bot token string.
+    # Socket Mode requires appToken; without it OpenClaw cannot connect to Slack.
+    SLACK_BOT_TOKEN=""
+    SLACK_APP_TOKEN=""
+    if echo "${SLACK_TOKEN}" | jq -e '.botToken' >/dev/null 2>&1; then
+        SLACK_BOT_TOKEN=$(echo "${SLACK_TOKEN}" | jq -r '.botToken')
+        SLACK_APP_TOKEN=$(echo "${SLACK_TOKEN}" | jq -r '.appToken // empty')
+    else
+        SLACK_BOT_TOKEN="${SLACK_TOKEN}"
+    fi
+    if [ -n "${SLACK_APP_TOKEN}" ]; then
+        CHANNELS_JSON=$(echo "${CHANNELS_JSON}" | jq \
+            --arg bt "${SLACK_BOT_TOKEN}" \
+            --arg at "${SLACK_APP_TOKEN}" \
+            '. + {"slack": {"enabled": true, "botToken": $bt, "appToken": $at, "dmPolicy": "open", "allowFrom": ["*"]}}')
+        echo "[openclaw-agentcore] Slack configured with botToken + appToken (Socket Mode)"
+    elif [ -n "${SLACK_BOT_TOKEN}" ]; then
+        CHANNELS_JSON=$(echo "${CHANNELS_JSON}" | jq --arg t "${SLACK_BOT_TOKEN}" '. + {"slack": {"enabled": true, "botToken": $t}}')
+        echo "[openclaw-agentcore] WARNING: Slack configured with botToken only — Socket Mode requires appToken"
+    fi
 fi
 
 cat > /root/.openclaw/openclaw.json <<CONF
@@ -139,6 +158,15 @@ cat > /root/.openclaw/openclaw.json <<CONF
       "model": {
         "primary": "agentcore/bedrock-agentcore"
       }
+    }
+  },
+  "tools": {
+    "profile": "full"
+  },
+  "skills": {
+    "allowBundled": ["*"],
+    "load": {
+      "extraDirs": ["/skills"]
     }
   },
   "gateway": {

@@ -11,6 +11,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Di
 - **Infrastructure**: CDK v2 (Python), 6 stacks
 - **Runtime**: Bedrock AgentCore Runtime (serverless ARM64 container, VPC mode)
 - **Messaging**: OpenClaw (Node.js) — Telegram, Discord, Slack channel providers
+- **Tools & Skills**: Built-in tool groups (full profile) + 10 ClawHub skills (web search, research, memory, etc.)
 - **AI Model**: Claude Sonnet 4.6 via Bedrock ConverseStream (`us.anthropic.claude-sonnet-4-6`)
 - **Identity**: Cognito User Pool (HMAC-derived passwords, auto-provisioned users)
 - **Memory**: AgentCore Memory (semantic, user preferences, summary strategies)
@@ -57,7 +58,7 @@ openclaw-on-agentcore/
     observability_stack.py        # Dashboards, alarms, Bedrock logging
     token_monitoring_stack.py     # Lambda processor, DynamoDB, token analytics
   bridge/
-    Dockerfile                    # Container image (node:22-slim, ARM64)
+    Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup orchestration (5 steps)
     agentcore-contract.js         # AgentCore HTTP contract (/ping, /invocations)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter
@@ -120,6 +121,12 @@ aws secretsmanager update-secret \
   --secret-id openclaw/channels/discord \
   --secret-string 'BOT_TOKEN' \
   --region $CDK_DEFAULT_REGION
+
+# Store Slack tokens (JSON — both botToken and appToken required for Socket Mode)
+aws secretsmanager update-secret \
+  --secret-id openclaw/channels/slack \
+  --secret-string '{"botToken":"xoxb-YOUR-BOT-TOKEN","appToken":"xapp-YOUR-APP-TOKEN"}' \
+  --region $CDK_DEFAULT_REGION
 ```
 
 ### Runtime Operations
@@ -162,7 +169,7 @@ aws bedrock-agentcore invoke-agent-runtime \
 1. **agentcore-contract.js** (port 8080) — MUST start first for health check
 2. **Fetch secrets** — gateway token, Cognito secret, channel bot tokens
 3. **agentcore-proxy.js** (port 18790) — OpenAI-to-Bedrock adapter
-4. **Write OpenClaw config** — `openclaw.json` with enabled channels
+4. **Write OpenClaw config** — `openclaw.json` with enabled channels, tools (full profile), and skills
 5. **OpenClaw gateway** (port 18789) — foreground process
 
 ## Gotchas
@@ -195,6 +202,11 @@ aws bedrock-agentcore invoke-agent-runtime \
 - Correct start command: `openclaw gateway run --port 18789 --bind lan --verbose`
 - Telegram `dmPolicy: "open"` requires `allowFrom: ["*"]`
 - Channel token validation: `entrypoint.sh` skips channels with placeholder/short tokens
+- **Slack Socket Mode requires two tokens**: The `openclaw/channels/slack` secret must be JSON `{"botToken":"xoxb-...","appToken":"xapp-..."}`. The entrypoint parses JSON secrets and passes both tokens to OpenClaw. Plain string secrets (backward compatible) only pass `botToken` and will fail to connect via Socket Mode
+- **`skills.allowBundled`**: Must be an array (e.g., `["*"]`), not a boolean — OpenClaw schema validation rejects `true`
+- **ClawHub skill paths**: `clawhub install` installs to `/skills/<name>`, not `~/.openclaw/skills` — use `/skills` as `extraDirs`
+- **ClawHub VirusTotal flags**: Some skills (jina-reader, etc.) are flagged for external API calls — use `--force` in non-interactive mode
+- **Image updates require session restart**: Pushing a new ECR image and redeploying via CDK updates the runtime config, but the existing keepalive session continues running the old image. Stop it with `stop-runtime-session` or bump `IMAGE_VERSION` env var in the stack and redeploy
 
 ### Cognito Identity
 - Self-signup disabled — users auto-provisioned by proxy via `AdminCreateUser`

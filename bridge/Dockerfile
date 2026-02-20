@@ -9,11 +9,24 @@ RUN apt-get update && \
 # Install AWS CLI (for Secrets Manager in entrypoint)
 RUN pip3 install --no-cache-dir --break-system-packages awscli
 
-# Install OpenClaw globally
-RUN npm install -g openclaw@latest
+# Install OpenClaw and ClawHub CLI globally
+RUN npm install -g openclaw@latest clawhub@latest
 
 # Create app directory and config directory
-RUN mkdir -p /app /root/.openclaw
+RUN mkdir -p /app /root/.openclaw/skills
+
+# Pre-install Tier 1+2 skills from ClawHub
+# --force needed because some skills trigger VirusTotal flags for external API calls
+RUN clawhub install duckduckgo-search --no-input --force && \
+    clawhub install jina-reader --no-input --force && \
+    clawhub install openclaw-mem --no-input --force && \
+    clawhub install telegram-compose --no-input --force && \
+    clawhub install transcript --no-input --force && \
+    clawhub install deep-research-pro --no-input --force && \
+    clawhub install hackernews --no-input --force && \
+    clawhub install news-feed --no-input --force && \
+    clawhub install task-decomposer --no-input --force && \
+    clawhub install cron-mastery --no-input --force
 
 WORKDIR /app
 

@@ -244,6 +244,7 @@ class AgentCoreStack(Stack):
                 "COGNITO_CLIENT_ID": cognito_client_id,
                 "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
                 "AGENTCORE_MEMORY_ID": self.memory.attr_memory_id,
+                "IMAGE_VERSION": "6",  # bump to force container redeploy
             },
             description="OpenClaw messaging bridge on AgentCore Runtime",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(

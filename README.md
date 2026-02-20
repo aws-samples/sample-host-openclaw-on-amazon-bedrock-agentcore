@@ -2,7 +2,7 @@
 
 Deploy an AI-powered multi-channel messaging bot (Telegram, Discord, Slack) on AWS Bedrock AgentCore Runtime using CDK.
 
-OpenClaw runs as a serverless container on AgentCore Runtime, with a local proxy that translates OpenAI-format chat requests to Bedrock ConverseStream API calls. A keepalive Lambda prevents idle session termination.
+OpenClaw runs as a serverless container on AgentCore Runtime, with a local proxy that translates OpenAI-format chat requests to Bedrock ConverseStream API calls. The agent has built-in tools (web, filesystem, runtime, memory, sessions, automation) and 10 pre-installed ClawHub skills for web search, content extraction, research, and more. A keepalive Lambda prevents idle session termination.
 
 ## Architecture
 
@@ -204,7 +204,7 @@ openclaw-on-agentcore/
     observability_stack.py        # CloudWatch dashboards, alarms, Bedrock logging
     token_monitoring_stack.py     # Lambda log processor, DynamoDB, token analytics
   bridge/
-    Dockerfile                    # Bridge container (node:22-slim, ARM64)
+    Dockerfile                    # Bridge container (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: contract server -> secrets -> proxy -> OpenClaw
     agentcore-contract.js         # AgentCore HTTP contract (/ping, /invocations)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter
@@ -256,7 +256,7 @@ All tunable parameters are in `cdk.json`:
      --secret-string 'YOUR_BOT_TOKEN' \
      --region $CDK_DEFAULT_REGION
    ```
-5. Restart the container (redeploy or invoke the runtime)
+5. Restart the runtime session (see [Update the container image](#update-the-container-image) for the `stop-runtime-session` command)
 
 ### Discord
 
@@ -270,19 +270,50 @@ All tunable parameters are in `cdk.json`:
      --secret-string 'YOUR_BOT_TOKEN' \
      --region $CDK_DEFAULT_REGION
    ```
+5. Restart the runtime session (see [Update the container image](#update-the-container-image) for the `stop-runtime-session` command)
 
 ### Slack
 
-1. Create a Slack app at [api.slack.com/apps](https://api.slack.com/apps)
-2. Add Bot Token Scopes: `chat:write`, `app_mentions:read`, `im:history`, `im:read`, `im:write`
-3. Install to workspace and copy the Bot User OAuth Token
-4. Store the token:
-   ```bash
-   aws secretsmanager update-secret \
-     --secret-id openclaw/channels/slack \
-     --secret-string 'xoxb-YOUR-BOT-TOKEN' \
-     --region $CDK_DEFAULT_REGION
-   ```
+OpenClaw connects to Slack via **Socket Mode** (WebSocket), which requires both a Bot Token (`xoxb-`) and an App-Level Token (`xapp-`). No public URL or request URL is needed.
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App** > **From scratch**
+2. Give it a name (e.g., "OpenClaw") and select your workspace
+
+**Enable Socket Mode:**
+
+3. Go to **Settings** > **Socket Mode** and toggle it **on**
+4. Create an app-level token with the `connections:write` scope — name it something like `openclaw-socket`. Copy this token (starts with `xapp-`)
+
+**Configure Event Subscriptions:**
+
+5. Go to **Features** > **Event Subscriptions** and toggle **Enable Events** on
+6. Under **Subscribe to bot events**, add:
+   - `message.im` — receive direct messages
+   - `app_mention` — respond when @mentioned in channels
+
+**Add OAuth Scopes:**
+
+7. Go to **Features** > **OAuth & Permissions** > **Scopes** > **Bot Token Scopes** and add:
+   - `chat:write` — send messages
+   - `app_mentions:read` — detect @mentions
+   - `im:history` — read DM history
+   - `im:read` — access DMs
+   - `im:write` — send DMs
+   - `channels:history` — read channel messages (for @mention context)
+
+**Install and configure:**
+
+8. Go to **Settings** > **Install App** and click **Install to Workspace**, then authorize
+9. Copy the **Bot User OAuth Token** (starts with `xoxb-`)
+10. Go to **Features** > **App Home** and enable **Allow users to send Slash commands and messages from the messages tab** (under "Show Tabs" > "Messages Tab")
+11. Store both tokens as JSON in Secrets Manager:
+    ```bash
+    aws secretsmanager update-secret \
+      --secret-id openclaw/channels/slack \
+      --secret-string '{"botToken":"xoxb-YOUR-BOT-TOKEN","appToken":"xapp-YOUR-APP-TOKEN"}' \
+      --region $CDK_DEFAULT_REGION
+    ```
+12. Restart the runtime session (see [Update the container image](#update-the-container-image) for the `stop-runtime-session` command) — the entrypoint fetches secrets at startup, so a running session won't pick up the new token automatically
 
 ## How It Works
 
@@ -293,7 +324,7 @@ The bridge container runs on AgentCore Runtime and executes 5 steps in order:
 1. **AgentCore contract server** (port 8080) — starts immediately for health check
 2. **Fetch secrets** — gateway token, Cognito secret, channel bot tokens from Secrets Manager
 3. **Bedrock proxy** (port 18790) — OpenAI-to-Bedrock adapter with Cognito auto-provisioning
-4. **Write OpenClaw config** — generates `openclaw.json` with enabled channels
+4. **Write OpenClaw config** — generates `openclaw.json` with enabled channels, tools (full profile), and skills (`/skills` directory)
 5. **OpenClaw gateway** (port 18789) — main process, handles channel messages
 
 ### Keepalive Mechanism
@@ -311,6 +342,25 @@ User sends Telegram message
   -> Proxy converts response back to OpenAI SSE format
   -> OpenClaw streams response to Telegram
 ```
+
+### Tools & Skills
+
+The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, memory, sessions, automation). Additionally, 10 community skills are pre-installed from ClawHub at Docker build time:
+
+| Skill | Purpose |
+|---|---|
+| `duckduckgo-search` | Web search (no API key required) |
+| `jina-reader` | Web content extraction as markdown |
+| `openclaw-mem` | Persistent memory (SQLite + FTS5) |
+| `telegram-compose` | Rich HTML formatting for Telegram |
+| `transcript` | YouTube transcript extraction |
+| `deep-research-pro` | Multi-step research agent |
+| `hackernews` | Browse/search Hacker News |
+| `news-feed` | RSS-based news aggregation |
+| `task-decomposer` | Break complex requests into subtasks |
+| `cron-mastery` | Cron scheduling and management |
+
+Skills are installed into `/skills/` by `clawhub` during the Docker build. The `openclaw.json` config references this directory via `skills.load.extraDirs`.
 
 ### Token Usage Tracking
 
@@ -362,8 +412,26 @@ aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
 docker push \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
 
-# Redeploy the AgentCore stack to pick up the new image
+# Bump IMAGE_VERSION in stacks/agentcore_stack.py to force a runtime update,
+# then redeploy the AgentCore stack
 cdk deploy OpenClawAgentCore --require-approval never
+
+# Stop the running keepalive session so it restarts with the new image
+RUNTIME_ARN=$(aws cloudformation describe-stacks \
+  --stack-name OpenClawAgentCore \
+  --query "Stacks[0].Outputs[?OutputKey=='RuntimeArn'].OutputValue" \
+  --output text --region $CDK_DEFAULT_REGION)
+
+aws bedrock-agentcore stop-runtime-session \
+  --runtime-session-id openclaw-telegram-session-primary-keepalive-001 \
+  --agent-runtime-arn $RUNTIME_ARN \
+  --qualifier openclaw_agent_live \
+  --region $CDK_DEFAULT_REGION
+
+# The keepalive Lambda will start a new session within 5 minutes,
+# or trigger it manually:
+aws lambda invoke --function-name openclaw-keepalive \
+  --region $CDK_DEFAULT_REGION /tmp/keepalive.json
 ```
 
 ### Security validation
@@ -410,6 +478,11 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **CDK RetentionDays**: `logs.RetentionDays` is an enum, not constructable from int. Use the helper in `stacks/__init__.py`.
 - **Cognito passwords**: HMAC-derived (`HMAC-SHA256(secret, actorId)`) — deterministic, never stored. Enables `AdminInitiateAuth` without per-user password storage.
 - **Channel token validation**: `entrypoint.sh` skips channels with placeholder tokens (< 20 chars or "changeme") to prevent retry loops.
+- **Slack requires two tokens**: Socket Mode needs both `botToken` (`xoxb-`) and `appToken` (`xapp-`). The `openclaw/channels/slack` secret must be JSON: `{"botToken":"xoxb-...","appToken":"xapp-..."}`. A plain `xoxb-` string will fail to connect.
+- **`skills.allowBundled` is an array**: OpenClaw expects `["*"]` (not `true`) — boolean causes config validation failure.
+- **ClawHub installs to `/skills/`**: Not `~/.openclaw/skills`. The `extraDirs` config must point to `/skills`.
+- **ClawHub `--force` flag**: Some skills are flagged by VirusTotal for external API calls. Use `--no-input --force` for non-interactive Docker builds.
+- **Image updates need session restart**: Pushing a new image to ECR and redeploying via CDK updates the runtime config, but the existing keepalive session keeps running the old image. Stop it with `stop-runtime-session` (see Operations section).
 
 ## Cleanup
 
