@@ -12,9 +12,9 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Di
 - **Runtime**: Bedrock AgentCore Runtime (serverless ARM64 container, VPC mode)
 - **Messaging**: OpenClaw (Node.js) — Telegram, Discord, Slack channel providers
 - **Tools & Skills**: Built-in tool groups (full profile) + 10 ClawHub skills (web search, research, memory, etc.)
-- **AI Model**: Claude Sonnet 4.6 via Bedrock ConverseStream (`us.anthropic.claude-sonnet-4-6`)
+- **AI Model**: Claude Sonnet 4.6 via Bedrock ConverseStream (`au.anthropic.claude-sonnet-4-6`)
 - **Identity**: Cognito User Pool (HMAC-derived passwords, auto-provisioned users)
-- **Memory**: AgentCore Memory (semantic, user preferences, summary strategies)
+- **Memory**: AgentCore Memory (semantic, user_preference, summary strategies) — integrated into proxy for per-user persistent context
 - **Observability**: CloudWatch dashboards + alarms, Bedrock invocation logging
 - **Token Monitoring**: Lambda + DynamoDB (single-table) + CloudWatch custom metrics
 - **Security**: VPC endpoints, KMS CMK, Secrets Manager, cdk-nag
@@ -29,16 +29,22 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Di
     |                       |
     |  agentcore-contract.js (port 8080) -- /ping, /invocations
     |  OpenClaw Gateway     (port 18789) -- channel providers
-    |  agentcore-proxy.js   (port 18790) -- OpenAI -> Bedrock
+    |  agentcore-proxy.js   (port 18790) -- OpenAI -> Bedrock + Memory
     +-----------+-----------+
                 |
     +-----------v-----------+      +-----------------------+
     |   Amazon Bedrock      |      | EventBridge (5 min)   |
     |   ConverseStream API  |      | + Keepalive Lambda    |
     |   Claude Sonnet 4.6   |      +-----------------------+
+    +-----------+-----------+
+                |
+    +-----------v-----------+
+    |  AgentCore Memory     |  <-- Per-user persistent memory
+    |  (semantic, prefs,    |      Namespaced by actorId
+    |   summary strategies) |      Extraction every 10 min
     +-----------------------+
 
-    Supporting: VPC, KMS, Secrets Manager, Cognito, AgentCore Memory,
+    Supporting: VPC, KMS, Secrets Manager, Cognito,
                CloudWatch, DynamoDB, CloudTrail
 ```
 
@@ -61,7 +67,7 @@ openclaw-on-agentcore/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup orchestration (5 steps)
     agentcore-contract.js         # AgentCore HTTP contract (/ping, /invocations)
-    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter
+    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Memory integration
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
@@ -157,8 +163,8 @@ aws bedrock-agentcore invoke-agent-runtime \
 | Parameter | Default | Description |
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` |
-| `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
-| `default_model_id` | `us.anthropic.claude-sonnet-4-6` | Bedrock model ID |
+| `region` | `ap-southeast-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
+| `default_model_id` | `au.anthropic.claude-sonnet-4-6` | Bedrock model ID (cross-region inference profile) |
 | `cloudwatch_log_retention_days` | `30` | Log retention |
 | `daily_token_budget` | `1000000` | Token budget alarm threshold |
 | `daily_cost_budget_usd` | `5` | Cost budget alarm threshold |
@@ -184,9 +190,10 @@ aws bedrock-agentcore invoke-agent-runtime \
 - **VPC endpoints**: `bedrock-agentcore-runtime` endpoint not available in all regions — omit if unsupported
 
 ### IAM / Bedrock
-- **Cross-region inference**: Model `us.anthropic.claude-sonnet-4-6` routes to any US region — IAM uses `arn:aws:bedrock:*::foundation-model/*`
+- **Cross-region inference**: Model `au.anthropic.claude-sonnet-4-6` routes to any AU/APAC region — IAM uses `arn:aws:bedrock:*::foundation-model/*`
 - **Inference profile ARN**: Separate from foundation model — `arn:aws:bedrock:{region}:{account}:inference-profile/*`
 - **Memory execution role**: Must trust both `bedrock.amazonaws.com` and `bedrock-agentcore.amazonaws.com`
+- **Memory IAM actions use `bedrock-agentcore:` prefix**: NOT `bedrock:`. Actions: `CreateEvent`, `GetEvent`, `ListEvents`, `DeleteEvent`, `RetrieveMemoryRecords`, `ListMemoryRecords`, `StartMemoryExtractionJob`, `ListMemoryExtractionJobs`
 
 ### Node.js 22 + VPC
 - **IPv6 issue**: Node.js 22 Happy Eyeballs fails in VPCs without IPv6 — `force-ipv4.js` patches `dns.lookup()` to force IPv4
@@ -213,3 +220,13 @@ aws bedrock-agentcore invoke-agent-runtime \
 - Passwords: `HMAC-SHA256(secret, actorId).slice(0, 32)` — deterministic, never stored
 - Usernames are channel-prefixed: `telegram:6087229962`
 - JWT tokens cached per user with 60s early refresh
+
+### AgentCore Memory Integration
+- **Per-user isolation**: Each user's memories are namespaced by `actorId` (colons replaced with underscores, e.g., `telegram_6087229962`)
+- **Request flow**: Before each Bedrock call, the proxy retrieves up to 5 relevant memory records via `RetrieveMemoryRecords` and appends them to the system prompt. After the response, the user/assistant exchange is stored as a memory event via `CreateEvent` (fire-and-forget)
+- **Memory extraction**: A timer triggers `StartMemoryExtractionJob` every 10 minutes (+ 30s after startup) so the 3 configured strategies (semantic, user_preference, summary) process accumulated events into retrievable records
+- **Graceful degradation**: All memory operations log warnings on failure but never block the chat flow. If `AGENTCORE_MEMORY_ID` is empty, memory is completely disabled
+- **SDK**: Uses `@aws-sdk/client-bedrock-agentcore` (`BedrockAgentCoreClient`)
+- **Namespace character restrictions**: `actorId` contains colons (e.g., `telegram:6087229962`) which may be rejected by the namespace field — proxy replaces `:` with `_`
+- **Added latency**: Memory retrieval adds ~50-200ms per request
+- **Container restart**: Memories persist across container restarts since they are stored in AgentCore Memory (server-side), not in-memory

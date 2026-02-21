@@ -96,6 +96,140 @@ function getCognitoClient() {
   return _cognitoClient;
 }
 
+// AgentCore Memory configuration
+const AGENTCORE_MEMORY_ID = process.env.AGENTCORE_MEMORY_ID || "";
+const MEMORY_RETRIEVAL_LIMIT = 5;
+const MEMORY_EXTRACTION_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+
+// Lazily initialized AgentCore client
+let _agentCoreClient = null;
+function getAgentCoreClient() {
+  if (!_agentCoreClient) {
+    const { BedrockAgentCoreClient } = require("@aws-sdk/client-bedrock-agentcore");
+    _agentCoreClient = new BedrockAgentCoreClient({ region: AWS_REGION });
+  }
+  return _agentCoreClient;
+}
+
+/**
+ * Retrieve relevant memory context for a user based on their latest message.
+ * Returns a formatted string to inject into the system prompt, or empty string on failure.
+ */
+async function retrieveMemoryContext(actorId, latestUserMessage) {
+  if (!AGENTCORE_MEMORY_ID || !latestUserMessage) return "";
+
+  try {
+    const { RetrieveMemoryRecordsCommand } = require("@aws-sdk/client-bedrock-agentcore");
+    const client = getAgentCoreClient();
+
+    // Use actorId as namespace; replace colons with underscores if needed
+    const namespace = actorId.replace(/:/g, "_");
+
+    const response = await client.send(new RetrieveMemoryRecordsCommand({
+      memoryId: AGENTCORE_MEMORY_ID,
+      namespace,
+      searchCriteria: {
+        searchQuery: latestUserMessage,
+        topK: MEMORY_RETRIEVAL_LIMIT,
+      },
+    }));
+
+    const records = response.memoryRecordSummaries || [];
+    if (records.length === 0) return "";
+
+    const memoryLines = records
+      .filter((r) => r.content && r.content.text)
+      .map((r) => `- ${r.content.text}`);
+
+    if (memoryLines.length === 0) return "";
+
+    console.log(`[proxy] Memory retrieval: ${memoryLines.length} records for ${actorId}`);
+    return (
+      "\n\n## Relevant memories about this user\n" +
+      "The following is context from previous conversations with this user. " +
+      "Use it to personalize your response when relevant, but do not mention " +
+      "that you are reading from memory unless asked.\n" +
+      memoryLines.join("\n")
+    );
+  } catch (err) {
+    console.warn(`[proxy] Memory retrieval failed for ${actorId}:`, err.message);
+    return "";
+  }
+}
+
+/**
+ * Store a conversation exchange as a memory event.
+ * Fire-and-forget: errors are logged but not thrown.
+ */
+async function storeConversationEvent(actorId, sessionId, userMessage, assistantMessage) {
+  if (!AGENTCORE_MEMORY_ID || !userMessage || !assistantMessage) return;
+
+  try {
+    const { CreateEventCommand } = require("@aws-sdk/client-bedrock-agentcore");
+    const client = getAgentCoreClient();
+
+    const namespace = actorId.replace(/:/g, "_");
+
+    await client.send(new CreateEventCommand({
+      memoryId: AGENTCORE_MEMORY_ID,
+      actorId: namespace,
+      sessionId,
+      eventTimestamp: new Date(),
+      payload: [
+        {
+          conversational: {
+            role: "USER",
+            content: { text: userMessage },
+          },
+        },
+        {
+          conversational: {
+            role: "ASSISTANT",
+            content: { text: assistantMessage },
+          },
+        },
+      ],
+    }));
+
+    console.log(`[proxy] Memory event stored for ${actorId} (session: ${sessionId})`);
+  } catch (err) {
+    console.warn(`[proxy] Memory event storage failed for ${actorId}:`, err.message);
+  }
+}
+
+/**
+ * Trigger memory extraction so configured strategies (semantic, user_preference, summary)
+ * process accumulated events into retrievable records.
+ */
+async function triggerMemoryExtraction() {
+  if (!AGENTCORE_MEMORY_ID) return;
+
+  try {
+    const { StartMemoryExtractionJobCommand } = require("@aws-sdk/client-bedrock-agentcore");
+    const client = getAgentCoreClient();
+
+    const jobId = `extraction_${Date.now()}`;
+    await client.send(new StartMemoryExtractionJobCommand({
+      memoryId: AGENTCORE_MEMORY_ID,
+      extractionJob: { jobId },
+    }));
+
+    console.log(`[proxy] Memory extraction triggered (jobId: ${jobId})`);
+  } catch (err) {
+    console.warn(`[proxy] Memory extraction trigger failed:`, err.message);
+  }
+}
+
+// Periodic memory extraction timer
+let _extractionTimer = null;
+function startMemoryExtractionTimer() {
+  if (!AGENTCORE_MEMORY_ID || _extractionTimer) return;
+  _extractionTimer = setInterval(triggerMemoryExtraction, MEMORY_EXTRACTION_INTERVAL_MS);
+  // Also run once shortly after startup to process any pending events
+  setTimeout(triggerMemoryExtraction, 30000);
+  console.log(`[proxy] Memory extraction timer started (every ${MEMORY_EXTRACTION_INTERVAL_MS / 60000} min)`);
+}
+
 /**
  * Ensure a Cognito user exists for the given actorId. Creates one if not found.
  */
@@ -197,13 +331,15 @@ function convertMessages(messages) {
 
 /**
  * Call Bedrock Converse API (non-streaming).
+ * Accepts optional systemTextOverride to inject memory context.
  */
-async function invokeBedrock(messages) {
+async function invokeBedrock(messages, systemTextOverride) {
   const { BedrockRuntimeClient, ConverseCommand } = require(
     "@aws-sdk/client-bedrock-runtime"
   );
   const client = new BedrockRuntimeClient({ region: AWS_REGION });
   const { bedrockMessages, systemText } = convertMessages(messages);
+  const finalSystemText = systemTextOverride || systemText;
 
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -218,7 +354,7 @@ async function invokeBedrock(messages) {
         new ConverseCommand({
           modelId: MODEL_ID,
           messages: bedrockMessages,
-          system: [{ text: systemText }],
+          system: [{ text: finalSystemText }],
           inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
         })
       );
@@ -243,18 +379,22 @@ async function invokeBedrock(messages) {
 
 /**
  * Call Bedrock ConverseStream API and write SSE chunks to the HTTP response.
+ * Accepts optional systemTextOverride to inject memory context.
+ * Returns the full accumulated response text for memory storage.
  */
-async function invokeBedrockStreaming(messages, res, model) {
+async function invokeBedrockStreaming(messages, res, model, systemTextOverride) {
   const { BedrockRuntimeClient, ConverseStreamCommand } = require(
     "@aws-sdk/client-bedrock-runtime"
   );
   const client = new BedrockRuntimeClient({ region: AWS_REGION });
   const { bedrockMessages, systemText } = convertMessages(messages);
+  const finalSystemText = systemTextOverride || systemText;
 
   const chatId = `chatcmpl-${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
   let inputTokens = 0;
   let outputTokens = 0;
+  let fullResponseText = "";
 
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -263,13 +403,14 @@ async function invokeBedrockStreaming(messages, res, model) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
         console.log(`[proxy] Stream retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms`);
         await sleep(delay);
+        fullResponseText = "";
       }
 
       const response = await client.send(
         new ConverseStreamCommand({
           modelId: MODEL_ID,
           messages: bedrockMessages,
-          system: [{ text: systemText }],
+          system: [{ text: finalSystemText }],
           inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
         })
       );
@@ -283,6 +424,8 @@ async function invokeBedrockStreaming(messages, res, model) {
 
       for await (const event of response.stream) {
         if (event.contentBlockDelta?.delta?.text) {
+          const textDelta = event.contentBlockDelta.delta.text;
+          fullResponseText += textDelta;
           const chunk = {
             id: chatId,
             object: "chat.completion.chunk",
@@ -290,7 +433,7 @@ async function invokeBedrockStreaming(messages, res, model) {
             model: model || MODEL_ID,
             choices: [{
               index: 0,
-              delta: { content: event.contentBlockDelta.delta.text },
+              delta: { content: textDelta },
               finish_reason: null,
             }],
           };
@@ -320,7 +463,7 @@ async function invokeBedrockStreaming(messages, res, model) {
       res.end();
 
       console.log(`[proxy] Stream complete: ${inputTokens}in/${outputTokens}out tokens`);
-      return;
+      return fullResponseText;
     } catch (err) {
       lastError = err;
       console.error(`[proxy] Stream attempt ${attempt + 1} failed:`, err.message);
@@ -337,6 +480,7 @@ async function invokeBedrockStreaming(messages, res, model) {
   } else {
     res.end();
   }
+  return "";
 }
 
 /**
@@ -377,6 +521,7 @@ const server = http.createServer(async (req, res) => {
       status: "ok",
       model: MODEL_ID,
       cognito: COGNITO_USER_POOL_ID ? "configured" : "disabled",
+      memory: AGENTCORE_MEMORY_ID ? "configured" : "disabled",
     }));
     return;
   }
@@ -406,17 +551,42 @@ const server = http.createServer(async (req, res) => {
           console.warn(`[proxy] Cognito token acquisition failed for ${actorId}:`, err.message);
         }
 
+        // --- Retrieve memory context for this user ---
+        const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+        const lastUserText = lastUserMsg
+          ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
+          : "";
+        const memoryContext = await retrieveMemoryContext(actorId, lastUserText);
+
+        // Build augmented system text if memory context is available
+        let systemTextOverride = null;
+        if (memoryContext) {
+          const systemMessages = messages.filter((m) => m.role === "system");
+          const baseSystemText = systemMessages.length > 0
+            ? systemMessages.map((m) => m.content).join("\n")
+            : SYSTEM_PROMPT;
+          systemTextOverride = baseSystemText + memoryContext;
+        }
+
         // --- Direct Bedrock path ---
         if (stream) {
-          await invokeBedrockStreaming(messages, res, parsed.model);
+          const responseText = await invokeBedrockStreaming(messages, res, parsed.model, systemTextOverride);
+          // Fire-and-forget: store conversation in memory
+          if (responseText && lastUserText) {
+            storeConversationEvent(actorId, sessionId, lastUserText, responseText).catch(() => {});
+          }
         } else {
-          const result = await invokeBedrock(messages);
+          const result = await invokeBedrock(messages, systemTextOverride);
           const response = formatChatResponse(result, parsed.model);
           console.log(
             `[proxy] Response: ${result.usage.inputTokens || "?"}in/${result.usage.outputTokens || "?"}out tokens`
           );
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(response));
+          // Fire-and-forget: store conversation in memory
+          if (result.text && lastUserText) {
+            storeConversationEvent(actorId, sessionId, lastUserText, result.text).catch(() => {});
+          }
         }
       } catch (err) {
         console.error("[proxy] Request failed:", err.message);
@@ -465,4 +635,8 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`
   );
+  console.log(
+    `[proxy] AgentCore Memory: ${AGENTCORE_MEMORY_ID ? `id=${AGENTCORE_MEMORY_ID}` : "disabled"}`
+  );
+  startMemoryExtractionTimer();
 });

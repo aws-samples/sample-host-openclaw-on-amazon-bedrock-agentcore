@@ -127,17 +127,18 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # AgentCore Memory APIs
+        # AgentCore Memory APIs (bedrock-agentcore: prefix, not bedrock:)
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
-                    "bedrock:CreateMemory",
-                    "bedrock:GetMemory",
-                    "bedrock:ListMemories",
-                    "bedrock:DeleteMemory",
-                    "bedrock:CreateMemoryEvent",
-                    "bedrock:ListMemoryEvents",
-                    "bedrock:RetrieveMemories",
+                    "bedrock-agentcore:CreateEvent",
+                    "bedrock-agentcore:GetEvent",
+                    "bedrock-agentcore:ListEvents",
+                    "bedrock-agentcore:DeleteEvent",
+                    "bedrock-agentcore:RetrieveMemoryRecords",
+                    "bedrock-agentcore:ListMemoryRecords",
+                    "bedrock-agentcore:StartMemoryExtractionJob",
+                    "bedrock-agentcore:ListMemoryExtractionJobs",
                 ],
                 resources=["*"],
             )
@@ -244,7 +245,8 @@ class AgentCoreStack(Stack):
                 "COGNITO_CLIENT_ID": cognito_client_id,
                 "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
                 "AGENTCORE_MEMORY_ID": self.memory.attr_memory_id,
-                "IMAGE_VERSION": "6",  # bump to force container redeploy
+                "AGENTCORE_WORKLOAD_IDENTITY_NAME": "openclaw_identity",
+                "IMAGE_VERSION": "8",  # bump to force container redeploy
             },
             description="OpenClaw messaging bridge on AgentCore Runtime",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
@@ -288,9 +290,10 @@ class AgentCoreStack(Stack):
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
                     reason="Bedrock foundation model ARNs require wildcard for model ID. "
-                    "Memory, Logs, Metrics, X-Ray, and Secrets Manager APIs are scoped "
-                    "to project prefix (openclaw/*) or do not support resource-level "
-                    "permissions. Cognito userpool/* is scoped to this account/region.",
+                    "AgentCore Memory (bedrock-agentcore:*), Logs, Metrics, X-Ray, and "
+                    "Secrets Manager APIs are scoped to project prefix (openclaw/*) or "
+                    "do not support resource-level permissions. Cognito userpool/* is "
+                    "scoped to this account/region.",
                     applies_to=[
                         "Resource::arn:aws:bedrock:*::foundation-model/*",
                         f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",

@@ -117,7 +117,7 @@ const server = http.createServer(async (req, res) => {
               uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
               openclaw_ready: openclawReady,
               proxy_ready: proxyReady,
-              proxy_mode: proxyHealth?.mode || "unknown",
+              proxy_health: proxyHealth || null,
               telegram_connected: telegramConnected,
               last_invocation: new Date(lastInvocationTime).toISOString(),
             })
