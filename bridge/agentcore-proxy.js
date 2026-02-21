@@ -1231,6 +1231,7 @@ async function invokeBedrockStreaming(
   } else {
     res.end();
   }
+  return "";
 }
 
 /**
@@ -1421,6 +1422,23 @@ const server = http.createServer(async (req, res) => {
           }
         }
 
+        // --- Retrieve memory context for this user ---
+        const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+        const lastUserText = lastUserMsg
+          ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
+          : "";
+        const memoryContext = await retrieveMemoryContext(actorId, lastUserText);
+
+        // Build augmented system text if memory context is available
+        let systemTextOverride = null;
+        if (memoryContext) {
+          const systemMessages = messages.filter((m) => m.role === "system");
+          const baseSystemText = systemMessages.length > 0
+            ? systemMessages.map((m) => m.content).join("\n")
+            : SYSTEM_PROMPT;
+          systemTextOverride = baseSystemText + memoryContext;
+        }
+
         // --- Direct Bedrock path ---
         if (stream) {
           await invokeBedrockStreaming(
@@ -1442,6 +1460,10 @@ const server = http.createServer(async (req, res) => {
           );
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(response));
+          // Fire-and-forget: store conversation in memory
+          if (result.text && lastUserText) {
+            storeConversationEvent(actorId, sessionId, lastUserText, result.text).catch(() => {});
+          }
         }
       } catch (err) {
         console.error("[proxy] Request failed:", err.message);
@@ -1490,4 +1512,8 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`,
   );
+  console.log(
+    `[proxy] AgentCore Memory: ${AGENTCORE_MEMORY_ID ? `id=${AGENTCORE_MEMORY_ID}` : "disabled"}`
+  );
+  startMemoryExtractionTimer();
 });
