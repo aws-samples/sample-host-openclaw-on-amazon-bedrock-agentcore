@@ -1,0 +1,846 @@
+{
+ "Resources": {
+  "AgentRepo85A4923D": {
+   "Type": "AWS::ECR::Repository",
+   "Properties": {
+    "EmptyOnDelete": true,
+    "ImageScanningConfiguration": {
+     "ScanOnPush": true
+    },
+    "RepositoryName": "openclaw-agent"
+   },
+   "UpdateReplacePolicy": "Delete",
+   "DeletionPolicy": "Delete",
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/AgentRepo/Resource"
+   }
+  },
+  "AgentRuntimeSecurityGroupF11B1EE5": {
+   "Type": "AWS::EC2::SecurityGroup",
+   "Properties": {
+    "GroupDescription": "AgentCore Runtime container security group",
+    "SecurityGroupEgress": [
+     {
+      "CidrIp": "0.0.0.0/0",
+      "Description": "Allow all outbound traffic by default",
+      "IpProtocol": "-1"
+     }
+    ],
+    "SecurityGroupIngress": [
+     {
+      "CidrIp": {
+       "Fn::ImportValue": "OpenClawVpc:ExportsOutputFnGetAttVpc8378EB38CidrBlock14DD2396"
+      },
+      "Description": "HTTPS from VPC",
+      "FromPort": 443,
+      "IpProtocol": "tcp",
+      "ToPort": 443
+     }
+    ],
+    "VpcId": {
+     "Fn::ImportValue": "OpenClawVpc:ExportsOutputRefVpc8378EB38272D6E3A"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/AgentRuntimeSecurityGroup/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "Ingress uses VPC CIDR; not open to 0.0.0.0/0.",
+       "id": "AwsSolutions-EC23"
+      },
+      {
+       "reason": "Security group rule uses Fn::GetAtt for VPC CIDR which cannot be validated at synth time.",
+       "id": "CdkNagValidationFailure"
+      }
+     ]
+    }
+   }
+  },
+  "AgentExecutionRole8AD76C36": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": [
+         "bedrock-agentcore.amazonaws.com",
+         "bedrock.amazonaws.com",
+         "ecs-tasks.amazonaws.com"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/AgentExecutionRole/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "Bedrock foundation model and inference profile ARNs require wildcard for model ID because the agent may use multiple models. Actions are scoped to InvokeModel only. Memory, AgentCore Runtime, Logs, Metrics, and X-Ray APIs do not support resource-level permissions.",
+       "id": "AwsSolutions-IAM5",
+       "applies_to": [
+        "Resource::arn:aws:bedrock:*::foundation-model/*",
+        "Resource::arn:aws:bedrock:ap-southeast-2:657117630614:inference-profile/*",
+        "Resource::*"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  "AgentExecutionRoleDefaultPolicyF9CB1199": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+       ],
+       "Effect": "Allow",
+       "Resource": [
+        "arn:aws:bedrock:*::foundation-model/*",
+        "arn:aws:bedrock:ap-southeast-2:657117630614:inference-profile/*"
+       ]
+      },
+      {
+       "Action": [
+        "bedrock-agentcore:CreateEvent",
+        "bedrock-agentcore:GetMemory",
+        "bedrock-agentcore:InvokeAgentRuntime",
+        "bedrock-agentcore:InvokeRuntime",
+        "bedrock-agentcore:InvokeRuntimeEndpoint",
+        "bedrock-agentcore:ListEvents",
+        "bedrock-agentcore:ListMemories",
+        "bedrock-agentcore:RetrieveMemoryRecords",
+        "cloudwatch:PutMetricData",
+        "ecr:GetAuthorizationToken",
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "xray:PutTelemetryRecords",
+        "xray:PutTraceSegments"
+       ],
+       "Effect": "Allow",
+       "Resource": "*"
+      },
+      {
+       "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+       ],
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::GetAtt": [
+         "AgentRepo85A4923D",
+         "Arn"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "AgentExecutionRoleDefaultPolicyF9CB1199",
+    "Roles": [
+     {
+      "Ref": "AgentExecutionRole8AD76C36"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/AgentExecutionRole/DefaultPolicy/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "Bedrock foundation model and inference profile ARNs require wildcard for model ID because the agent may use multiple models. Actions are scoped to InvokeModel only. Memory, AgentCore Runtime, Logs, Metrics, and X-Ray APIs do not support resource-level permissions.",
+       "id": "AwsSolutions-IAM5",
+       "applies_to": [
+        "Resource::arn:aws:bedrock:*::foundation-model/*",
+        "Resource::arn:aws:bedrock:ap-southeast-2:657117630614:inference-profile/*",
+        "Resource::*"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  "MemoryExecutionRole36014876": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": [
+         "bedrock-agentcore.amazonaws.com",
+         "bedrock.amazonaws.com"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/MemoryExecutionRole/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "Memory execution role needs InvokeModel on foundation models for memory extraction. Wildcard required for model ID.",
+       "id": "AwsSolutions-IAM5",
+       "applies_to": [
+        "Resource::arn:aws:bedrock:ap-southeast-2::foundation-model/*"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  "MemoryExecutionRoleDefaultPolicy27406011": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": "bedrock:InvokeModel",
+       "Effect": "Allow",
+       "Resource": "arn:aws:bedrock:ap-southeast-2::foundation-model/*"
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "MemoryExecutionRoleDefaultPolicy27406011",
+    "Roles": [
+     {
+      "Ref": "MemoryExecutionRole36014876"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/MemoryExecutionRole/DefaultPolicy/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "Memory execution role needs InvokeModel on foundation models for memory extraction. Wildcard required for model ID.",
+       "id": "AwsSolutions-IAM5",
+       "applies_to": [
+        "Resource::arn:aws:bedrock:ap-southeast-2::foundation-model/*"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  "AgentMemory": {
+   "Type": "AWS::BedrockAgentCore::Memory",
+   "Properties": {
+    "Description": "OpenClaw conversation memory",
+    "EncryptionKeyArn": {
+     "Fn::ImportValue": "OpenClawSecurity:ExportsOutputFnGetAttSecretsCmkD9B77A1FArn35A0D999"
+    },
+    "EventExpiryDuration": 90,
+    "MemoryExecutionRoleArn": {
+     "Fn::GetAtt": [
+      "MemoryExecutionRole36014876",
+      "Arn"
+     ]
+    },
+    "MemoryStrategies": [
+     {
+      "SemanticMemoryStrategy": {
+       "Description": "Extract factual knowledge from conversations",
+       "Name": "openclaw_semantic"
+      }
+     },
+     {
+      "UserPreferenceMemoryStrategy": {
+       "Description": "Track user preferences across sessions",
+       "Name": "openclaw_user_prefs"
+      }
+     },
+     {
+      "SummaryMemoryStrategy": {
+       "Description": "Summarize conversation sessions",
+       "Name": "openclaw_summary"
+      }
+     }
+    ],
+    "Name": "openclaw_memory"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/AgentMemory"
+   }
+  },
+  "WorkloadIdentity": {
+   "Type": "AWS::BedrockAgentCore::WorkloadIdentity",
+   "Properties": {
+    "Name": "openclaw_identity"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/WorkloadIdentity"
+   }
+  },
+  "AgentRuntime": {
+   "Type": "AWS::BedrockAgentCore::Runtime",
+   "Properties": {
+    "AgentRuntimeArtifact": {
+     "ContainerConfiguration": {
+      "ContainerUri": "657117630614.dkr.ecr.ap-southeast-2.amazonaws.com/openclaw-agent:v4"
+     }
+    },
+    "AgentRuntimeName": "openclaw_agent_v3",
+    "Description": "OpenClaw agent v3 - fixed entrypoint decorator",
+    "EnvironmentVariables": {
+     "DEFAULT_MODEL_ID": "au.anthropic.claude-sonnet-4-6",
+     "AWS_REGION": "ap-southeast-2",
+     "AGENTCORE_MEMORY_ID": {
+      "Fn::GetAtt": [
+       "AgentMemory",
+       "MemoryId"
+      ]
+     }
+    },
+    "LifecycleConfiguration": {
+     "IdleRuntimeSessionTimeout": 1800,
+     "MaxLifetime": 3600
+    },
+    "NetworkConfiguration": {
+     "NetworkMode": "VPC",
+     "NetworkModeConfig": {
+      "SecurityGroups": [
+       {
+        "Fn::GetAtt": [
+         "AgentRuntimeSecurityGroupF11B1EE5",
+         "GroupId"
+        ]
+       }
+      ],
+      "Subnets": [
+       {
+        "Fn::ImportValue": "OpenClawVpc:ExportsOutputRefVpcPrivateSubnet1Subnet536B997AFD4CC940"
+       },
+       {
+        "Fn::ImportValue": "OpenClawVpc:ExportsOutputRefVpcPrivateSubnet2Subnet3788AAA1380949A3"
+       }
+      ]
+     }
+    },
+    "RoleArn": {
+     "Fn::GetAtt": [
+      "AgentExecutionRole8AD76C36",
+      "Arn"
+     ]
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/AgentRuntime"
+   }
+  },
+  "RuntimeWaiterFunctionServiceRoleA9756902": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "lambda.amazonaws.com"
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "ManagedPolicyArns": [
+     {
+      "Fn::Join": [
+       "",
+       [
+        "arn:",
+        {
+         "Ref": "AWS::Partition"
+        },
+        ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      ]
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/RuntimeWaiterFunction/ServiceRole/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "bedrock-agentcore:GetRuntime and bedrock-agentcore:GetAgentRuntime do not support resource-level ARNs; wildcard required. Actions are read-only.",
+       "id": "AwsSolutions-IAM5",
+       "applies_to": [
+        "Resource::*"
+       ]
+      },
+      {
+       "reason": "Lambda uses AWSLambdaBasicExecutionRole for CloudWatch Logs.",
+       "id": "AwsSolutions-IAM4",
+       "applies_to": [
+        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      },
+      {
+       "reason": "Python 3.12 is the latest stable runtime supported by CDK.",
+       "id": "AwsSolutions-L1"
+      }
+     ]
+    }
+   }
+  },
+  "RuntimeWaiterFunctionServiceRoleDefaultPolicy120E95B0": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "bedrock-agentcore:GetAgentRuntime",
+        "bedrock-agentcore:GetRuntime"
+       ],
+       "Effect": "Allow",
+       "Resource": "*"
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "RuntimeWaiterFunctionServiceRoleDefaultPolicy120E95B0",
+    "Roles": [
+     {
+      "Ref": "RuntimeWaiterFunctionServiceRoleA9756902"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/RuntimeWaiterFunction/ServiceRole/DefaultPolicy/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "bedrock-agentcore:GetRuntime and bedrock-agentcore:GetAgentRuntime do not support resource-level ARNs; wildcard required. Actions are read-only.",
+       "id": "AwsSolutions-IAM5",
+       "applies_to": [
+        "Resource::*"
+       ]
+      },
+      {
+       "reason": "Lambda uses AWSLambdaBasicExecutionRole for CloudWatch Logs.",
+       "id": "AwsSolutions-IAM4",
+       "applies_to": [
+        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      },
+      {
+       "reason": "Python 3.12 is the latest stable runtime supported by CDK.",
+       "id": "AwsSolutions-L1"
+      }
+     ]
+    }
+   }
+  },
+  "RuntimeWaiterFunction78CCFCB0": {
+   "Type": "AWS::Lambda::Function",
+   "Properties": {
+    "Code": {
+     "S3Bucket": "cdk-hnb659fds-assets-657117630614-ap-southeast-2",
+     "S3Key": "a738c26232e8d6d4a27ef3b30df8e973d48056dd7763d2f48739595e2b07163a.zip"
+    },
+    "Handler": "index.on_event",
+    "MemorySize": 128,
+    "Role": {
+     "Fn::GetAtt": [
+      "RuntimeWaiterFunctionServiceRoleA9756902",
+      "Arn"
+     ]
+    },
+    "Runtime": "python3.12",
+    "Timeout": 900
+   },
+   "DependsOn": [
+    "RuntimeWaiterFunctionServiceRoleDefaultPolicy120E95B0",
+    "RuntimeWaiterFunctionServiceRoleA9756902"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/RuntimeWaiterFunction/Resource",
+    "aws:asset:path": "asset.a738c26232e8d6d4a27ef3b30df8e973d48056dd7763d2f48739595e2b07163a",
+    "aws:asset:is-bundled": false,
+    "aws:asset:property": "Code",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "bedrock-agentcore:GetRuntime and bedrock-agentcore:GetAgentRuntime do not support resource-level ARNs; wildcard required. Actions are read-only.",
+       "id": "AwsSolutions-IAM5",
+       "applies_to": [
+        "Resource::*"
+       ]
+      },
+      {
+       "reason": "Lambda uses AWSLambdaBasicExecutionRole for CloudWatch Logs.",
+       "id": "AwsSolutions-IAM4",
+       "applies_to": [
+        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      },
+      {
+       "reason": "Python 3.12 is the latest stable runtime supported by CDK.",
+       "id": "AwsSolutions-L1"
+      }
+     ]
+    }
+   }
+  },
+  "RuntimeWaiterProviderframeworkonEventServiceRole5AF9F35A": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "lambda.amazonaws.com"
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "ManagedPolicyArns": [
+     {
+      "Fn::Join": [
+       "",
+       [
+        "arn:",
+        {
+         "Ref": "AWS::Partition"
+        },
+        ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      ]
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/RuntimeWaiterProvider/framework-onEvent/ServiceRole/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "CDK Provider framework Lambda uses AWSLambdaBasicExecutionRole. This is managed by CDK and cannot be customised.",
+       "id": "AwsSolutions-IAM4",
+       "applies_to": [
+        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      },
+      {
+       "reason": "CDK Provider framework Lambda needs invoke permission on the on_event handler. The :* suffix covers Lambda versions and is CDK-managed.",
+       "id": "AwsSolutions-IAM5"
+      },
+      {
+       "reason": "Lambda runtime is managed by CDK Provider framework and cannot be overridden.",
+       "id": "AwsSolutions-L1"
+      }
+     ]
+    }
+   }
+  },
+  "RuntimeWaiterProviderframeworkonEventServiceRoleDefaultPolicyDAF2F834": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": "lambda:InvokeFunction",
+       "Effect": "Allow",
+       "Resource": [
+        {
+         "Fn::GetAtt": [
+          "RuntimeWaiterFunction78CCFCB0",
+          "Arn"
+         ]
+        },
+        {
+         "Fn::Join": [
+          "",
+          [
+           {
+            "Fn::GetAtt": [
+             "RuntimeWaiterFunction78CCFCB0",
+             "Arn"
+            ]
+           },
+           ":*"
+          ]
+         ]
+        }
+       ]
+      },
+      {
+       "Action": "lambda:GetFunction",
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::GetAtt": [
+         "RuntimeWaiterFunction78CCFCB0",
+         "Arn"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "RuntimeWaiterProviderframeworkonEventServiceRoleDefaultPolicyDAF2F834",
+    "Roles": [
+     {
+      "Ref": "RuntimeWaiterProviderframeworkonEventServiceRole5AF9F35A"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/RuntimeWaiterProvider/framework-onEvent/ServiceRole/DefaultPolicy/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "CDK Provider framework Lambda uses AWSLambdaBasicExecutionRole. This is managed by CDK and cannot be customised.",
+       "id": "AwsSolutions-IAM4",
+       "applies_to": [
+        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      },
+      {
+       "reason": "CDK Provider framework Lambda needs invoke permission on the on_event handler. The :* suffix covers Lambda versions and is CDK-managed.",
+       "id": "AwsSolutions-IAM5"
+      },
+      {
+       "reason": "Lambda runtime is managed by CDK Provider framework and cannot be overridden.",
+       "id": "AwsSolutions-L1"
+      }
+     ]
+    }
+   }
+  },
+  "RuntimeWaiterProviderframeworkonEvent1BB6BFAA": {
+   "Type": "AWS::Lambda::Function",
+   "Properties": {
+    "Code": {
+     "S3Bucket": "cdk-hnb659fds-assets-657117630614-ap-southeast-2",
+     "S3Key": "07a90cc3efdfc34da22208dcd9d211f06f5b0e01b21e778edc7c3966b1f61d57.zip"
+    },
+    "Description": "AWS CDK resource provider framework - onEvent (OpenClawAgentCore/RuntimeWaiterProvider)",
+    "Environment": {
+     "Variables": {
+      "USER_ON_EVENT_FUNCTION_ARN": {
+       "Fn::GetAtt": [
+        "RuntimeWaiterFunction78CCFCB0",
+        "Arn"
+       ]
+      }
+     }
+    },
+    "Handler": "framework.onEvent",
+    "LoggingConfig": {
+     "ApplicationLogLevel": "FATAL",
+     "LogFormat": "JSON"
+    },
+    "Role": {
+     "Fn::GetAtt": [
+      "RuntimeWaiterProviderframeworkonEventServiceRole5AF9F35A",
+      "Arn"
+     ]
+    },
+    "Runtime": "nodejs22.x",
+    "Timeout": 900
+   },
+   "DependsOn": [
+    "RuntimeWaiterProviderframeworkonEventServiceRoleDefaultPolicyDAF2F834",
+    "RuntimeWaiterProviderframeworkonEventServiceRole5AF9F35A"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/RuntimeWaiterProvider/framework-onEvent/Resource",
+    "aws:asset:path": "asset.07a90cc3efdfc34da22208dcd9d211f06f5b0e01b21e778edc7c3966b1f61d57",
+    "aws:asset:is-bundled": false,
+    "aws:asset:property": "Code",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "CDK Provider framework Lambda uses AWSLambdaBasicExecutionRole. This is managed by CDK and cannot be customised.",
+       "id": "AwsSolutions-IAM4",
+       "applies_to": [
+        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      },
+      {
+       "reason": "CDK Provider framework Lambda needs invoke permission on the on_event handler. The :* suffix covers Lambda versions and is CDK-managed.",
+       "id": "AwsSolutions-IAM5"
+      },
+      {
+       "reason": "Lambda runtime is managed by CDK Provider framework and cannot be overridden.",
+       "id": "AwsSolutions-L1"
+      }
+     ]
+    }
+   }
+  },
+  "RuntimeReadyWaiter": {
+   "Type": "AWS::CloudFormation::CustomResource",
+   "Properties": {
+    "ServiceToken": {
+     "Fn::GetAtt": [
+      "RuntimeWaiterProviderframeworkonEvent1BB6BFAA",
+      "Arn"
+     ]
+    },
+    "AgentRuntimeId": {
+     "Fn::GetAtt": [
+      "AgentRuntime",
+      "AgentRuntimeId"
+     ]
+    }
+   },
+   "UpdateReplacePolicy": "Delete",
+   "DeletionPolicy": "Delete",
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/RuntimeReadyWaiter/Default"
+   }
+  },
+  "AgentRuntimeEndpoint": {
+   "Type": "AWS::BedrockAgentCore::RuntimeEndpoint",
+   "Properties": {
+    "AgentRuntimeId": {
+     "Fn::GetAtt": [
+      "AgentRuntime",
+      "AgentRuntimeId"
+     ]
+    },
+    "Description": "Production endpoint for OpenClaw agent (v2)",
+    "Name": "openclaw_agent_live"
+   },
+   "DependsOn": [
+    "RuntimeReadyWaiter"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/AgentRuntimeEndpoint"
+   }
+  },
+  "CDKMetadata": {
+   "Type": "AWS::CDK::Metadata",
+   "Properties": {
+    "Analytics": "v2:deflate64:H4sIAAAAAAAA/1VQy07EMAz8lr1nDWqFBEd2BYgDoloOHKvUMd3QNq6cBFRV/XfSB1o4eTwzmYycQZbfwvVOf/s9mmbf2grGt6CxUYkqR0KB8UQ9extYBnX8cJdtUoRZshNGsWF4Eo797PhHTMrqLmVwS8vreRbcWlzCVjSpiowwNromF5CFYEziC3Xbn+8sTcvaPJukp+QlKSbY0R/44EzP1oVJtbqrjIbxMToMlt1s+sWT8nmpvafg4X4eaYdDxIbCQXua1EKmG9TW1QqjD9yVQp6jIHkohL+sIVHHRTltwnqZC36NoY+pSTGEM7urHO4gu9l9emv3sraFrfUPRHOLXoMBAAA="
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawAgentCore/CDKMetadata/Default"
+   }
+  }
+ },
+ "Outputs": {
+  "RuntimeId": {
+   "Value": {
+    "Fn::GetAtt": [
+     "AgentRuntime",
+     "AgentRuntimeId"
+    ]
+   }
+  },
+  "RuntimeEndpointId": {
+   "Value": {
+    "Fn::GetAtt": [
+     "AgentRuntimeEndpoint",
+     "Id"
+    ]
+   }
+  },
+  "MemoryId": {
+   "Value": {
+    "Fn::GetAtt": [
+     "AgentMemory",
+     "MemoryId"
+    ]
+   }
+  },
+  "WorkloadIdentityArn": {
+   "Value": {
+    "Fn::GetAtt": [
+     "WorkloadIdentity",
+     "WorkloadIdentityArn"
+    ]
+   }
+  },
+  "ExportsOutputFnGetAttAgentRuntimeAgentRuntimeIdDEE0B659": {
+   "Value": {
+    "Fn::GetAtt": [
+     "AgentRuntime",
+     "AgentRuntimeId"
+    ]
+   },
+   "Export": {
+    "Name": "OpenClawAgentCore:ExportsOutputFnGetAttAgentRuntimeAgentRuntimeIdDEE0B659"
+   }
+  },
+  "ExportsOutputFnGetAttAgentRuntimeEndpointId8C2131AB": {
+   "Value": {
+    "Fn::GetAtt": [
+     "AgentRuntimeEndpoint",
+     "Id"
+    ]
+   },
+   "Export": {
+    "Name": "OpenClawAgentCore:ExportsOutputFnGetAttAgentRuntimeEndpointId8C2131AB"
+   }
+  },
+  "ExportsOutputFnGetAttAgentMemoryMemoryId0CB9085A": {
+   "Value": {
+    "Fn::GetAtt": [
+     "AgentMemory",
+     "MemoryId"
+    ]
+   },
+   "Export": {
+    "Name": "OpenClawAgentCore:ExportsOutputFnGetAttAgentMemoryMemoryId0CB9085A"
+   }
+  }
+ },
+ "Parameters": {
+  "BootstrapVersion": {
+   "Type": "AWS::SSM::Parameter::Value<String>",
+   "Default": "/cdk-bootstrap/hnb659fds/version",
+   "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]"
+  }
+ },
+ "Rules": {
+  "CheckBootstrapVersion": {
+   "Assertions": [
+    {
+     "Assert": {
+      "Fn::Not": [
+       {
+        "Fn::Contains": [
+         [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+         ],
+         {
+          "Ref": "BootstrapVersion"
+         }
+        ]
+       }
+      ]
+     },
+     "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+    }
+   ]
+  }
+ }
+}

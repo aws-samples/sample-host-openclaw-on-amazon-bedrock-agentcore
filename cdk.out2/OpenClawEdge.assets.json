@@ -1,0 +1,21 @@
+{
+  "version": "48.0.0",
+  "files": {
+    "55011f654b93d1de2f2a3995d303607966733964aef038bc19480d526100ba45": {
+      "displayName": "OpenClawEdge Template",
+      "source": {
+        "path": "OpenClawEdge.template.json",
+        "packaging": "file"
+      },
+      "destinations": {
+        "657117630614-ap-southeast-2-af7c1665": {
+          "bucketName": "cdk-hnb659fds-assets-657117630614-ap-southeast-2",
+          "objectKey": "55011f654b93d1de2f2a3995d303607966733964aef038bc19480d526100ba45.json",
+          "region": "ap-southeast-2",
+          "assumeRoleArn": "arn:${AWS::Partition}:iam::657117630614:role/cdk-hnb659fds-file-publishing-role-657117630614-ap-southeast-2"
+        }
+      }
+    }
+  },
+  "dockerImages": {}
+}

@@ -1,0 +1,7 @@
+Rule ID,Resource ID,Compliance,Exception Reason,Rule Level,Rule Info
+"AwsSolutions-VPC7","OpenClawVpc/Vpc/Resource","Compliant","N/A","Error","The VPC does not have an associated Flow Log."
+"AwsSolutions-IAM4","OpenClawVpc/VpcFlowLogRole/Resource","Compliant","N/A","Error","The IAM user, role, or group uses AWS managed policies."
+"AwsSolutions-IAM5","OpenClawVpc/VpcFlowLogRole/Resource","Compliant","N/A","Error","The IAM entity contains wildcard permissions and does not have a cdk-nag rule suppression with evidence for those permission."
+"AwsSolutions-IAM5","OpenClawVpc/VpcFlowLogRole/DefaultPolicy/Resource","Compliant","N/A","Error","The IAM entity contains wildcard permissions and does not have a cdk-nag rule suppression with evidence for those permission."
+"AwsSolutions-EC23","OpenClawVpc/VpceSecurityGroup/Resource","Suppressed","Ingress uses VPC CIDR (10.0.0.0/16) which resolves via Fn::GetAtt at deploy time; not open to 0.0.0.0/0.","Error","The Security Group allows for 0.0.0.0/0 or ::/0 inbound access."
+"AwsSolutions-EC27","OpenClawVpc/VpceSecurityGroup/Resource","Compliant","N/A","Error","The Security Group does not have a description."

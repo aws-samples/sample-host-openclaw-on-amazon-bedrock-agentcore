@@ -49,71 +49,8 @@ function sleep(ms) {
 }
 
 /**
- * Parse actorId and channel from OpenClaw's message envelope.
- *
- * OpenClaw wraps every inbound message in an envelope like:
- *   DMs:    "[Telegram DM from telegram:6087229962]\nHello"
- *   Groups: "[Telegram Group from telegram:group:-100123]\nAlice (id:6087229962): Hello"
- *
- * For DMs the `from` field IS the per-user identity.
- * For groups the `from` field is the group/channel ID; the individual sender
- * appears as "(id:<user_id>)" in the message body — we extract the last one
- * (most recent speaker) and combine it with the channel prefix.
- *
- * Returns { actorId, channel } or null if no envelope found.
- */
-function parseEnvelopeIdentity(messages) {
-  // Find the last user-role message (most recent inbound)
-  const userMessages = (messages || []).filter((m) => m.role === "user");
-  if (userMessages.length === 0) return null;
-
-  const lastMsg = userMessages[userMessages.length - 1];
-  const text = typeof lastMsg.content === "string"
-    ? lastMsg.content
-    : JSON.stringify(lastMsg.content);
-
-  // Match the envelope header: [Channel Type from channel:id]
-  const envelopeRe = /\[(\w+)\s+\w+\s+from\s+((?:telegram|discord|slack):\S+)\]/i;
-  const envMatch = text.match(envelopeRe);
-  if (!envMatch) return null;
-
-  const channelName = envMatch[1].toLowerCase(); // "telegram", "discord", "slack"
-  const fromId = envMatch[2];                     // e.g. "telegram:6087229962" or "telegram:group:-100123"
-
-  // Check if this is a group/channel context (contains "group:" or "channel:" in the from ID)
-  const isGroup = /:(group|channel):/.test(fromId);
-
-  if (!isGroup) {
-    // DM — the from field is the per-user identity
-    return { actorId: fromId, channel: channelName };
-  }
-
-  // Group/channel — extract the individual sender from "(id:XXXXX)" in the body
-  // The envelope body follows the header line. Find all sender ID patterns and use the last one.
-  const senderIdRe = /\(id:(\S+?)\)/g;
-  let lastSenderId = null;
-  let match;
-  while ((match = senderIdRe.exec(text)) !== null) {
-    lastSenderId = match[1];
-  }
-
-  if (lastSenderId) {
-    return { actorId: `${channelName}:${lastSenderId}`, channel: channelName };
-  }
-
-  // Group message but no individual sender ID found — fall back to group identity
-  return { actorId: fromId, channel: channelName };
-}
-
-/**
  * Extract session metadata from request headers and body.
  * Returns { sessionId, actorId, channel }.
- *
- * Identity resolution priority:
- *   1. x-openclaw-actor-id header (explicit, custom)
- *   2. OpenAI 'user' field in request body
- *   3. Parse from OpenClaw message envelope text
- *   4. Fallback to "default-user"
  */
 function extractSessionMetadata(parsed, headers) {
   let actorId = "";
@@ -909,7 +846,7 @@ function convertTools(openaiTools) {
  * Convert OpenAI messages to Bedrock Converse format.
  * Handles user, assistant (with tool_calls), and tool (tool results) roles.
  */
-function convertMessages(messages, memoryContext) {
+function convertMessages(messages) {
   const bedrockMessages = [];
   for (const msg of messages) {
     if (msg.role === "system") continue;
@@ -1016,16 +953,6 @@ function convertMessages(messages, memoryContext) {
     systemMessages.length > 0
       ? systemMessages.map((m) => m.content).join("\n")
       : SYSTEM_PROMPT;
-
-  const now = new Date();
-  const today = now.toISOString().split("T")[0];
-  const dayOfWeek = now.toLocaleDateString("en-US", { weekday: "long" });
-  const dateContext = `[IMPORTANT: Today is ${dayOfWeek}, ${today}. The current year is ${now.getFullYear()}. Do NOT use your training data cutoff as the current date.]`;
-
-  let systemText = `${dateContext}\n\n${baseSystemText}`;
-  if (memoryContext) {
-    systemText += `\n\n## Relevant Context\n${memoryContext}`;
-  }
 
   return { bedrockMessages, systemText };
 }
@@ -1304,7 +1231,6 @@ async function invokeBedrockStreaming(
   } else {
     res.end();
   }
-  return "";
 }
 
 /**
@@ -1563,8 +1489,5 @@ server.listen(PORT, "0.0.0.0", () => {
   );
   console.log(
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`,
-  );
-  console.log(
-    `[proxy] AgentCore Memory: ${AGENTCORE_MEMORY_ID ? `id=${AGENTCORE_MEMORY_ID}` : "disabled"}`
   );
 });

@@ -1,0 +1,21 @@
+{
+  "version": "48.0.0",
+  "files": {
+    "4bbcafb6e4b15fe4246495165d58b31dcc3e2c9e9a5d9da8223969fab2818411": {
+      "displayName": "OpenClawFargate Template",
+      "source": {
+        "path": "OpenClawFargate.template.json",
+        "packaging": "file"
+      },
+      "destinations": {
+        "657117630614-ap-southeast-2-757e46ec": {
+          "bucketName": "cdk-hnb659fds-assets-657117630614-ap-southeast-2",
+          "objectKey": "4bbcafb6e4b15fe4246495165d58b31dcc3e2c9e9a5d9da8223969fab2818411.json",
+          "region": "ap-southeast-2",
+          "assumeRoleArn": "arn:${AWS::Partition}:iam::657117630614:role/cdk-hnb659fds-file-publishing-role-657117630614-ap-southeast-2"
+        }
+      }
+    }
+  },
+  "dockerImages": {}
+}
