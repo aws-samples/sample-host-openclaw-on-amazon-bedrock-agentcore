@@ -2,7 +2,7 @@
 
 Deploy an AI-powered multi-channel messaging bot (Telegram, Discord, Slack) on AWS Bedrock AgentCore Runtime using CDK.
 
-OpenClaw runs as a serverless container on AgentCore Runtime, with a local proxy that translates OpenAI-format chat requests to Bedrock ConverseStream API calls. The agent has built-in tools (web, filesystem, runtime, memory, sessions, automation) and 10 pre-installed ClawHub skills for web search, content extraction, research, and more. A keepalive Lambda prevents idle session termination.
+OpenClaw runs as a serverless container on AgentCore Runtime, with a local proxy that translates OpenAI-format chat requests to Bedrock ConverseStream API calls. Each user gets **persistent, isolated conversation memory** via AgentCore Memory — the proxy retrieves relevant context before each request and stores exchanges after each response, so the bot remembers users across sessions and container restarts. The agent has built-in tools (web, filesystem, runtime, memory, sessions, automation) and 10 pre-installed ClawHub skills for web search, content extraction, research, and more. A keepalive Lambda prevents idle session termination.
 
 ## Architecture
 
@@ -34,14 +34,17 @@ OpenClaw runs as a serverless container on AgentCore Runtime, with a local proxy
     |  | proxy.js         | |
     |  | (port 18790)     | |
     |  | OpenAI -> Bedrock| |
+    |  | + Memory         | |
     |  +--------+---------+ |
     +-----------+-----------+
                 |
-    +-----------v-----------+
-    |   Amazon Bedrock      |
-    |   ConverseStream API  |
-    |   Claude Sonnet 4.6   |
-    +-----------------------+
+    +-----------v-----------+      +-----------------------+
+    |   Amazon Bedrock      |      |   AgentCore Memory    |
+    |   ConverseStream API  |      |   Per-user namespaces |
+    |   Claude Sonnet 4.6   |      |   3 strategies:       |
+    +-----------------------+      |   semantic, prefs,    |
+                                   |   summary             |
+                                   +-----------------------+
 
     +--------------------------------------------------+
     |              Supporting Services                  |
@@ -50,7 +53,6 @@ OpenClaw runs as a serverless container on AgentCore Runtime, with a local proxy
     |  KMS CMK (encryption at rest)                    |
     |  Secrets Manager (bot tokens, gateway token)     |
     |  Cognito User Pool (identity auto-provisioning)  |
-    |  AgentCore Memory (semantic, prefs, summary)     |
     |  CloudWatch (dashboards, alarms, logs)           |
     |  DynamoDB (token usage tracking)                 |
     |  CloudTrail (audit logging)                      |
@@ -87,7 +89,7 @@ cd openclaw-on-agentcore
 
 # Set your AWS account and region
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export CDK_DEFAULT_REGION=us-west-2
+export CDK_DEFAULT_REGION=ap-southeast-2
 ```
 
 Or edit `cdk.json` directly:
@@ -95,7 +97,7 @@ Or edit `cdk.json` directly:
 {
   "context": {
     "account": "123456789012",
-    "region": "us-west-2"
+    "region": "ap-southeast-2"
   }
 }
 ```
@@ -207,7 +209,7 @@ openclaw-on-agentcore/
     Dockerfile                    # Bridge container (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: contract server -> secrets -> proxy -> OpenClaw
     agentcore-contract.js         # AgentCore HTTP contract (/ping, /invocations)
-    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter
+    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Memory integration
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue in VPC
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
@@ -234,8 +236,8 @@ All tunable parameters are in `cdk.json`:
 | Parameter | Default | Description |
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
-| `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
-| `default_model_id` | `us.anthropic.claude-sonnet-4-6` | Bedrock model ID (cross-region inference profile) |
+| `region` | `ap-southeast-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
+| `default_model_id` | `au.anthropic.claude-sonnet-4-6` | Bedrock model ID (cross-region inference profile) |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Daily token budget alarm threshold |
 | `daily_cost_budget_usd` | `5` | Daily cost budget alarm threshold (USD) |
@@ -337,9 +339,13 @@ AgentCore Runtime has an 8-hour maximum session lifetime and will terminate idle
 User sends Telegram message
   -> OpenClaw Gateway (port 18789) receives it
   -> Routes to agentcore-proxy.js (port 18790) as OpenAI chat completion
+  -> Proxy extracts actorId (e.g., telegram:6087229962) from request
+  -> Proxy retrieves relevant memories for this user from AgentCore Memory
+  -> Memory context appended to system prompt
   -> Proxy converts to Bedrock ConverseStream API call
-  -> Claude Sonnet 4.6 generates response
+  -> Claude Sonnet 4.6 generates response (with user-specific context)
   -> Proxy converts response back to OpenAI SSE format
+  -> Proxy stores user/assistant exchange as memory event (fire-and-forget)
   -> OpenClaw streams response to Telegram
 ```
 
@@ -361,6 +367,23 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 | `cron-mastery` | Cron scheduling and management |
 
 Skills are installed into `/skills/` by `clawhub` during the Docker build. The `openclaw.json` config references this directory via `skills.load.extraDirs`.
+
+### Per-User Memory
+
+Each user gets isolated, persistent conversation memory powered by AgentCore Memory. The proxy handles all memory operations transparently — OpenClaw is unaware of the memory layer.
+
+**How it works:**
+
+1. **Identity extraction** — The proxy extracts `actorId` from each request (e.g., `telegram:6087229962`, `slack:U0123ABC`). Users are namespaced by replacing colons with underscores (e.g., `telegram_6087229962`).
+2. **Memory retrieval** — Before each Bedrock call, the proxy queries `RetrieveMemoryRecords` with the user's latest message as a semantic search query. Up to 5 relevant memory records are appended to the system prompt.
+3. **Event storage** — After each response, the user/assistant exchange is stored as a memory event via `CreateEvent` (fire-and-forget, non-blocking).
+4. **Memory extraction** — Every 10 minutes, the proxy triggers `StartMemoryExtractionJob` to process accumulated events through 3 configured strategies:
+   - **Semantic** — extracts factual information and topics
+   - **User preference** — captures user preferences and patterns
+   - **Summary** — produces conversation summaries
+5. **Persistence** — Memories survive container restarts because they are stored server-side in AgentCore Memory, not in the container's process memory.
+
+**Graceful degradation** — All memory operations log warnings on failure but never block the chat flow. If `AGENTCORE_MEMORY_ID` is not set, memory is completely disabled.
 
 ### Token Usage Tracking
 
@@ -461,7 +484,7 @@ The AgentCore contract server on port 8080 must start within seconds. If `entryp
 ### 502 / Bedrock authorization errors
 
 - **Model access not enabled**: Enable model access in the Bedrock console for your region.
-- **Cross-region inference**: The model ID `us.anthropic.claude-sonnet-4-6` routes requests to any US region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` to allow all regions.
+- **Cross-region inference**: The model ID `au.anthropic.claude-sonnet-4-6` routes requests to AU/APAC regions. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` to allow all regions. Use the region-appropriate prefix (`us.` for US, `eu.` for EU, `au.` for APAC).
 - **Inference profile ARN**: The IAM policy also includes `arn:aws:bedrock:{region}:{account}:inference-profile/*`.
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
@@ -483,6 +506,9 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **ClawHub installs to `/skills/`**: Not `~/.openclaw/skills`. The `extraDirs` config must point to `/skills`.
 - **ClawHub `--force` flag**: Some skills are flagged by VirusTotal for external API calls. Use `--no-input --force` for non-interactive Docker builds.
 - **Image updates need session restart**: Pushing a new image to ECR and redeploying via CDK updates the runtime config, but the existing keepalive session keeps running the old image. Stop it with `stop-runtime-session` (see Operations section).
+- **Memory IAM prefix**: AgentCore Memory APIs use the `bedrock-agentcore:` IAM action prefix, NOT `bedrock:`. Using the wrong prefix causes `AccessDeniedException`.
+- **Memory namespace characters**: `actorId` values contain colons (e.g., `telegram:6087229962`) which may be rejected by namespace fields. The proxy replaces `:` with `_`.
+- **Memory extraction latency**: New conversation events are not immediately searchable. The extraction job must run first (triggered every 10 minutes) to process events into retrievable records via the 3 configured strategies.
 
 ## Cleanup
 
