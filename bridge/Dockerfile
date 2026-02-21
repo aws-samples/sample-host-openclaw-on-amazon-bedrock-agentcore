@@ -19,9 +19,11 @@ RUN mkdir -p /app /root/.openclaw/skills
 # --force needed because some skills trigger VirusTotal flags for external API calls
 RUN clawhub install duckduckgo-search --no-input --force && \
     clawhub install jina-reader --no-input --force && \
+    clawhub install openclaw-mem --no-input --force && \
     clawhub install telegram-compose --no-input --force && \
     clawhub install transcript --no-input --force && \
     clawhub install deep-research-pro --no-input --force && \
+    clawhub install hackernews --no-input --force && \
     clawhub install news-feed --no-input --force && \
     clawhub install task-decomposer --no-input --force && \
     clawhub install cron-mastery --no-input --force
@@ -31,8 +33,7 @@ WORKDIR /app
 # Install AWS SDK for Bedrock Runtime and Cognito (used by the proxy adapter)
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install @aws-sdk/client-bedrock-runtime \
-                @aws-sdk/client-cognito-identity-provider \
-                @aws-sdk/client-bedrock-agentcore
+                @aws-sdk/client-cognito-identity-provider
 
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js

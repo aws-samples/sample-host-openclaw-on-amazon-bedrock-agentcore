@@ -1,0 +1,260 @@
+{
+ "Resources": {
+  "TokenAuthFunction0F995BE8": {
+   "Type": "AWS::CloudFront::Function",
+   "Properties": {
+    "AutoPublish": true,
+    "FunctionCode": "\nfunction handler(event) {\n    var request = event.request;\n    var headers = request.headers;\n    var params = request.querystring;\n\n    // Allow WebSocket upgrade requests through — OpenClaw gateway handles\n    // its own token-based auth on the WebSocket connection.\n    // Note: CloudFront strips hop-by-hop headers (Upgrade, Connection)\n    // before passing to Functions, so we detect WebSocket via the\n    // Sec-WebSocket-Version header which is always present in WS handshakes.\n    if (headers['sec-websocket-version']) {\n        return request;\n    }\n\n    // Validate token value in query string\n    if (!params.token || params.token.value !== 'HY8gIR3OP1GySHTILNudeWyrWpdZKQOBK2UdpH6hvqdT7IpiD2zEhlQUXvt8rsKm') {\n        return {\n            statusCode: 403,\n            statusDescription: 'Forbidden',\n            headers: {\n                'content-type': { value: 'text/plain' }\n            },\n            body: { encoding: 'text', data: 'Access denied' }\n        };\n    }\n\n    return request;\n}\n",
+    "FunctionConfig": {
+     "Comment": "Validate access token in query string",
+     "Runtime": "cloudfront-js-2.0"
+    },
+    "Name": "ap-southeast-2OpenClawEdgeTokenAuthFunction0BA6B663"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawEdge/TokenAuthFunction/Resource"
+   }
+  },
+  "WafAcl": {
+   "Type": "AWS::WAFv2::WebACL",
+   "Properties": {
+    "DefaultAction": {
+     "Allow": {}
+    },
+    "Rules": [
+     {
+      "Action": {
+       "Block": {}
+      },
+      "Name": "RateLimit",
+      "Priority": 1,
+      "Statement": {
+       "RateBasedStatement": {
+        "AggregateKeyType": "IP",
+        "Limit": 100
+       }
+      },
+      "VisibilityConfig": {
+       "CloudWatchMetricsEnabled": true,
+       "MetricName": "OpenClawRateLimit",
+       "SampledRequestsEnabled": true
+      }
+     },
+     {
+      "Name": "AWSManagedRulesCommonRuleSet",
+      "OverrideAction": {
+       "None": {}
+      },
+      "Priority": 2,
+      "Statement": {
+       "ManagedRuleGroupStatement": {
+        "Name": "AWSManagedRulesCommonRuleSet",
+        "VendorName": "AWS"
+       }
+      },
+      "VisibilityConfig": {
+       "CloudWatchMetricsEnabled": true,
+       "MetricName": "OpenClawCommonRules",
+       "SampledRequestsEnabled": true
+      }
+     },
+     {
+      "Name": "AWSManagedRulesKnownBadInputs",
+      "OverrideAction": {
+       "None": {}
+      },
+      "Priority": 3,
+      "Statement": {
+       "ManagedRuleGroupStatement": {
+        "Name": "AWSManagedRulesKnownBadInputsRuleSet",
+        "VendorName": "AWS"
+       }
+      },
+      "VisibilityConfig": {
+       "CloudWatchMetricsEnabled": true,
+       "MetricName": "OpenClawBadInputs",
+       "SampledRequestsEnabled": true
+      }
+     }
+    ],
+    "Scope": "REGIONAL",
+    "VisibilityConfig": {
+     "CloudWatchMetricsEnabled": true,
+     "MetricName": "OpenClawWaf",
+     "SampledRequestsEnabled": true
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawEdge/WafAcl"
+   }
+  },
+  "Distribution830FAC52": {
+   "Type": "AWS::CloudFront::Distribution",
+   "Properties": {
+    "DistributionConfig": {
+     "Comment": "OpenClaw Web UI",
+     "DefaultCacheBehavior": {
+      "AllowedMethods": [
+       "GET",
+       "HEAD",
+       "OPTIONS",
+       "PUT",
+       "PATCH",
+       "POST",
+       "DELETE"
+      ],
+      "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+      "Compress": true,
+      "FunctionAssociations": [
+       {
+        "EventType": "viewer-request",
+        "FunctionARN": {
+         "Fn::GetAtt": [
+          "TokenAuthFunction0F995BE8",
+          "FunctionARN"
+         ]
+        }
+       }
+      ],
+      "OriginRequestPolicyId": "216adef6-5c7f-47e4-b989-5492eafa07d3",
+      "TargetOriginId": "OpenClawEdgeDistributionOrigin199C8FEE6",
+      "ViewerProtocolPolicy": "redirect-to-https"
+     },
+     "DefaultRootObject": "index.html",
+     "Enabled": true,
+     "HttpVersion": "http2",
+     "IPV6Enabled": true,
+     "Origins": [
+      {
+       "CustomOriginConfig": {
+        "OriginKeepaliveTimeout": 60,
+        "OriginProtocolPolicy": "http-only",
+        "OriginReadTimeout": 60,
+        "OriginSSLProtocols": [
+         "TLSv1.2"
+        ]
+       },
+       "DomainName": {
+        "Fn::ImportValue": "OpenClawFargate:ExportsOutputFnGetAttPublicAlb84330974DNSNameFA3FF7E9"
+       },
+       "Id": "OpenClawEdgeDistributionOrigin199C8FEE6",
+       "OriginCustomHeaders": [
+        {
+         "HeaderName": "X-Forwarded-Proto",
+         "HeaderValue": "https"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawEdge/Distribution/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "R2VvIHJlc3RyaWN0aW9ucyBhcmUgaW50ZW50aW9uYWxseSBub3QgZW5hYmxlZCDigJQgdGhlIHNlcnZpY2UgaXMgZGVzaWduZWQgZm9yIGdsb2JhbCBhY2Nlc3MgdmlhIG1lc3NhZ2luZyBwbGF0Zm9ybXMuIEFjY2VzcyBjb250cm9sIGlzIGVuZm9yY2VkIHZpYSB0b2tlbi1iYXNlZCBhdXRoZW50aWNhdGlvbiBhdCB0aGUgQ2xvdWRGcm9udCBGdW5jdGlvbiBsYXllci4=",
+       "id": "AwsSolutions-CFR1",
+       "is_reason_encoded": true
+      },
+      {
+       "reason": "WAF is attached to the public ALB (regional scope) rather than CloudFront directly, because the WAF WebACL uses REGIONAL scope to stay in the same region as the ALB. Rate limiting, Common Rule Set, and Known Bad Inputs rules are active on the ALB.",
+       "id": "AwsSolutions-CFR2"
+      },
+      {
+       "reason": "CloudFront access logging is not enabled to minimize cost for this single-user deployment. WAF logging on the ALB and Fargate container logs provide sufficient request-level observability.",
+       "id": "AwsSolutions-CFR3"
+      },
+      {
+       "reason": "Distribution uses the default CloudFront viewer certificate which enforces TLS 1.2 via minimum_protocol_version=TLS_V1_2_2021. The cdk-nag rule flags this because the default certificate's SslSupportMethod is 'sni-only' but the rule expects a custom certificate. No custom domain is configured for this deployment.",
+       "id": "AwsSolutions-CFR4"
+      },
+      {
+       "reason": "Origin uses HTTP_ONLY protocol because the ALB does not have an SSL certificate. The ALB is restricted to CloudFront origin-facing IPs via managed prefix list. End-to-end HTTPS would require an ACM certificate on the ALB.",
+       "id": "AwsSolutions-CFR5"
+      }
+     ]
+    }
+   }
+  },
+  "WafAlbAssociation": {
+   "Type": "AWS::WAFv2::WebACLAssociation",
+   "Properties": {
+    "ResourceArn": {
+     "Fn::ImportValue": "OpenClawFargate:ExportsOutputRefPublicAlb8433097455637888"
+    },
+    "WebACLArn": {
+     "Fn::GetAtt": [
+      "WafAcl",
+      "Arn"
+     ]
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawEdge/WafAlbAssociation"
+   }
+  },
+  "CDKMetadata": {
+   "Type": "AWS::CDK::Metadata",
+   "Properties": {
+    "Analytics": "v2:deflate64:H4sIAAAAAAAA/02KwQrCMBBEv6X3ZJUUQY+l4klQ9OBRkrTBtTWRZGORkH+3KhZP8+bNCBDlEuaFHALXTcd7VJCOJHXHRnVOunexMd5ZgrSJVhM6y2pjJ15jII8q/ob/ntkgzUNAGv2pVVW9ZRNVITiN8nPLb72LdI+U2f5JF2dnJaxALIprQOQ+WsJbC4dvvgBO+VFRtAAAAA=="
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawEdge/CDKMetadata/Default"
+   }
+  }
+ },
+ "Outputs": {
+  "CloudFrontUrl": {
+   "Description": "CloudFront Web UI URL (append ?token=<value>)",
+   "Value": {
+    "Fn::Join": [
+     "",
+     [
+      "https://",
+      {
+       "Fn::GetAtt": [
+        "Distribution830FAC52",
+        "DomainName"
+       ]
+      }
+     ]
+    ]
+   }
+  }
+ },
+ "Parameters": {
+  "BootstrapVersion": {
+   "Type": "AWS::SSM::Parameter::Value<String>",
+   "Default": "/cdk-bootstrap/hnb659fds/version",
+   "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]"
+  }
+ },
+ "Rules": {
+  "CheckBootstrapVersion": {
+   "Assertions": [
+    {
+     "Assert": {
+      "Fn::Not": [
+       {
+        "Fn::Contains": [
+         [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+         ],
+         {
+          "Ref": "BootstrapVersion"
+         }
+        ]
+       }
+      ]
+     },
+     "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+    }
+   ]
+  }
+ }
+}

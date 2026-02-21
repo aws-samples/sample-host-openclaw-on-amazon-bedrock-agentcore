@@ -1,0 +1,920 @@
+{
+ "Resources": {
+  "Vpc8378EB38": {
+   "Type": "AWS::EC2::VPC",
+   "Properties": {
+    "CidrBlock": "10.0.0.0/16",
+    "EnableDnsHostnames": true,
+    "EnableDnsSupport": true,
+    "InstanceTenancy": "default",
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/Resource"
+   }
+  },
+  "VpcPublicSubnet1Subnet5C2D37C4": {
+   "Type": "AWS::EC2::Subnet",
+   "Properties": {
+    "AvailabilityZone": "ap-southeast-2a",
+    "CidrBlock": "10.0.0.0/24",
+    "MapPublicIpOnLaunch": true,
+    "Tags": [
+     {
+      "Key": "aws-cdk:subnet-name",
+      "Value": "Public"
+     },
+     {
+      "Key": "aws-cdk:subnet-type",
+      "Value": "Public"
+     },
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PublicSubnet1"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet1/Subnet"
+   }
+  },
+  "VpcPublicSubnet1RouteTable6C95E38E": {
+   "Type": "AWS::EC2::RouteTable",
+   "Properties": {
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PublicSubnet1"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet1/RouteTable"
+   }
+  },
+  "VpcPublicSubnet1RouteTableAssociation97140677": {
+   "Type": "AWS::EC2::SubnetRouteTableAssociation",
+   "Properties": {
+    "RouteTableId": {
+     "Ref": "VpcPublicSubnet1RouteTable6C95E38E"
+    },
+    "SubnetId": {
+     "Ref": "VpcPublicSubnet1Subnet5C2D37C4"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet1/RouteTableAssociation"
+   }
+  },
+  "VpcPublicSubnet1DefaultRoute3DA9E72A": {
+   "Type": "AWS::EC2::Route",
+   "Properties": {
+    "DestinationCidrBlock": "0.0.0.0/0",
+    "GatewayId": {
+     "Ref": "VpcIGWD7BA715C"
+    },
+    "RouteTableId": {
+     "Ref": "VpcPublicSubnet1RouteTable6C95E38E"
+    }
+   },
+   "DependsOn": [
+    "VpcVPCGWBF912B6E"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet1/DefaultRoute"
+   }
+  },
+  "VpcPublicSubnet1EIPD7E02669": {
+   "Type": "AWS::EC2::EIP",
+   "Properties": {
+    "Domain": "vpc",
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PublicSubnet1"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet1/EIP"
+   }
+  },
+  "VpcPublicSubnet1NATGateway4D7517AA": {
+   "Type": "AWS::EC2::NatGateway",
+   "Properties": {
+    "AllocationId": {
+     "Fn::GetAtt": [
+      "VpcPublicSubnet1EIPD7E02669",
+      "AllocationId"
+     ]
+    },
+    "SubnetId": {
+     "Ref": "VpcPublicSubnet1Subnet5C2D37C4"
+    },
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PublicSubnet1"
+     }
+    ]
+   },
+   "DependsOn": [
+    "VpcPublicSubnet1DefaultRoute3DA9E72A",
+    "VpcPublicSubnet1RouteTableAssociation97140677"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet1/NATGateway"
+   }
+  },
+  "VpcPublicSubnet2Subnet691E08A3": {
+   "Type": "AWS::EC2::Subnet",
+   "Properties": {
+    "AvailabilityZone": "ap-southeast-2b",
+    "CidrBlock": "10.0.1.0/24",
+    "MapPublicIpOnLaunch": true,
+    "Tags": [
+     {
+      "Key": "aws-cdk:subnet-name",
+      "Value": "Public"
+     },
+     {
+      "Key": "aws-cdk:subnet-type",
+      "Value": "Public"
+     },
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PublicSubnet2"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet2/Subnet"
+   }
+  },
+  "VpcPublicSubnet2RouteTable94F7E489": {
+   "Type": "AWS::EC2::RouteTable",
+   "Properties": {
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PublicSubnet2"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet2/RouteTable"
+   }
+  },
+  "VpcPublicSubnet2RouteTableAssociationDD5762D8": {
+   "Type": "AWS::EC2::SubnetRouteTableAssociation",
+   "Properties": {
+    "RouteTableId": {
+     "Ref": "VpcPublicSubnet2RouteTable94F7E489"
+    },
+    "SubnetId": {
+     "Ref": "VpcPublicSubnet2Subnet691E08A3"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet2/RouteTableAssociation"
+   }
+  },
+  "VpcPublicSubnet2DefaultRoute97F91067": {
+   "Type": "AWS::EC2::Route",
+   "Properties": {
+    "DestinationCidrBlock": "0.0.0.0/0",
+    "GatewayId": {
+     "Ref": "VpcIGWD7BA715C"
+    },
+    "RouteTableId": {
+     "Ref": "VpcPublicSubnet2RouteTable94F7E489"
+    }
+   },
+   "DependsOn": [
+    "VpcVPCGWBF912B6E"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PublicSubnet2/DefaultRoute"
+   }
+  },
+  "VpcPrivateSubnet1Subnet536B997A": {
+   "Type": "AWS::EC2::Subnet",
+   "Properties": {
+    "AvailabilityZone": "ap-southeast-2a",
+    "CidrBlock": "10.0.2.0/24",
+    "MapPublicIpOnLaunch": false,
+    "Tags": [
+     {
+      "Key": "aws-cdk:subnet-name",
+      "Value": "Private"
+     },
+     {
+      "Key": "aws-cdk:subnet-type",
+      "Value": "Private"
+     },
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PrivateSubnet1"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PrivateSubnet1/Subnet"
+   }
+  },
+  "VpcPrivateSubnet1RouteTableB2C5B500": {
+   "Type": "AWS::EC2::RouteTable",
+   "Properties": {
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PrivateSubnet1"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PrivateSubnet1/RouteTable"
+   }
+  },
+  "VpcPrivateSubnet1RouteTableAssociation70C59FA6": {
+   "Type": "AWS::EC2::SubnetRouteTableAssociation",
+   "Properties": {
+    "RouteTableId": {
+     "Ref": "VpcPrivateSubnet1RouteTableB2C5B500"
+    },
+    "SubnetId": {
+     "Ref": "VpcPrivateSubnet1Subnet536B997A"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PrivateSubnet1/RouteTableAssociation"
+   }
+  },
+  "VpcPrivateSubnet1DefaultRouteBE02A9ED": {
+   "Type": "AWS::EC2::Route",
+   "Properties": {
+    "DestinationCidrBlock": "0.0.0.0/0",
+    "NatGatewayId": {
+     "Ref": "VpcPublicSubnet1NATGateway4D7517AA"
+    },
+    "RouteTableId": {
+     "Ref": "VpcPrivateSubnet1RouteTableB2C5B500"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PrivateSubnet1/DefaultRoute"
+   }
+  },
+  "VpcPrivateSubnet2Subnet3788AAA1": {
+   "Type": "AWS::EC2::Subnet",
+   "Properties": {
+    "AvailabilityZone": "ap-southeast-2b",
+    "CidrBlock": "10.0.3.0/24",
+    "MapPublicIpOnLaunch": false,
+    "Tags": [
+     {
+      "Key": "aws-cdk:subnet-name",
+      "Value": "Private"
+     },
+     {
+      "Key": "aws-cdk:subnet-type",
+      "Value": "Private"
+     },
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PrivateSubnet2"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PrivateSubnet2/Subnet"
+   }
+  },
+  "VpcPrivateSubnet2RouteTableA678073B": {
+   "Type": "AWS::EC2::RouteTable",
+   "Properties": {
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/PrivateSubnet2"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PrivateSubnet2/RouteTable"
+   }
+  },
+  "VpcPrivateSubnet2RouteTableAssociationA89CAD56": {
+   "Type": "AWS::EC2::SubnetRouteTableAssociation",
+   "Properties": {
+    "RouteTableId": {
+     "Ref": "VpcPrivateSubnet2RouteTableA678073B"
+    },
+    "SubnetId": {
+     "Ref": "VpcPrivateSubnet2Subnet3788AAA1"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PrivateSubnet2/RouteTableAssociation"
+   }
+  },
+  "VpcPrivateSubnet2DefaultRoute060D2087": {
+   "Type": "AWS::EC2::Route",
+   "Properties": {
+    "DestinationCidrBlock": "0.0.0.0/0",
+    "NatGatewayId": {
+     "Ref": "VpcPublicSubnet1NATGateway4D7517AA"
+    },
+    "RouteTableId": {
+     "Ref": "VpcPrivateSubnet2RouteTableA678073B"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/PrivateSubnet2/DefaultRoute"
+   }
+  },
+  "VpcIGWD7BA715C": {
+   "Type": "AWS::EC2::InternetGateway",
+   "Properties": {
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/IGW"
+   }
+  },
+  "VpcVPCGWBF912B6E": {
+   "Type": "AWS::EC2::VPCGatewayAttachment",
+   "Properties": {
+    "InternetGatewayId": {
+     "Ref": "VpcIGWD7BA715C"
+    },
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/VPCGW"
+   }
+  },
+  "VpcFlowLog8FF33A73": {
+   "Type": "AWS::EC2::FlowLog",
+   "Properties": {
+    "DeliverLogsPermissionArn": {
+     "Fn::GetAtt": [
+      "VpcFlowLogRoleF66FA0B2",
+      "Arn"
+     ]
+    },
+    "LogDestinationType": "cloud-watch-logs",
+    "LogGroupName": {
+     "Ref": "VpcFlowLogGroup86559C69"
+    },
+    "ResourceId": {
+     "Ref": "Vpc8378EB38"
+    },
+    "ResourceType": "VPC",
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc/FlowLog"
+     }
+    ],
+    "TrafficType": "ALL"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/FlowLog/FlowLog"
+   }
+  },
+  "VpcBedrockRuntimeEndpoint726DDE28": {
+   "Type": "AWS::EC2::VPCEndpoint",
+   "Properties": {
+    "PrivateDnsEnabled": true,
+    "SecurityGroupIds": [
+     {
+      "Fn::GetAtt": [
+       "VpceSecurityGroupA25AF10C",
+       "GroupId"
+      ]
+     }
+    ],
+    "ServiceName": "com.amazonaws.ap-southeast-2.bedrock-runtime",
+    "SubnetIds": [
+     {
+      "Ref": "VpcPrivateSubnet1Subnet536B997A"
+     },
+     {
+      "Ref": "VpcPrivateSubnet2Subnet3788AAA1"
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ],
+    "VpcEndpointType": "Interface",
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/BedrockRuntimeEndpoint/Resource"
+   }
+  },
+  "VpcSsmEndpointC46DB833": {
+   "Type": "AWS::EC2::VPCEndpoint",
+   "Properties": {
+    "PrivateDnsEnabled": true,
+    "SecurityGroupIds": [
+     {
+      "Fn::GetAtt": [
+       "VpceSecurityGroupA25AF10C",
+       "GroupId"
+      ]
+     }
+    ],
+    "ServiceName": "com.amazonaws.ap-southeast-2.ssm",
+    "SubnetIds": [
+     {
+      "Ref": "VpcPrivateSubnet1Subnet536B997A"
+     },
+     {
+      "Ref": "VpcPrivateSubnet2Subnet3788AAA1"
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ],
+    "VpcEndpointType": "Interface",
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/SsmEndpoint/Resource"
+   }
+  },
+  "VpcEcrApiEndpoint25D60339": {
+   "Type": "AWS::EC2::VPCEndpoint",
+   "Properties": {
+    "PrivateDnsEnabled": true,
+    "SecurityGroupIds": [
+     {
+      "Fn::GetAtt": [
+       "VpceSecurityGroupA25AF10C",
+       "GroupId"
+      ]
+     }
+    ],
+    "ServiceName": "com.amazonaws.ap-southeast-2.ecr.api",
+    "SubnetIds": [
+     {
+      "Ref": "VpcPrivateSubnet1Subnet536B997A"
+     },
+     {
+      "Ref": "VpcPrivateSubnet2Subnet3788AAA1"
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ],
+    "VpcEndpointType": "Interface",
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/EcrApiEndpoint/Resource"
+   }
+  },
+  "VpcEcrDkrEndpoint764F3A9A": {
+   "Type": "AWS::EC2::VPCEndpoint",
+   "Properties": {
+    "PrivateDnsEnabled": true,
+    "SecurityGroupIds": [
+     {
+      "Fn::GetAtt": [
+       "VpceSecurityGroupA25AF10C",
+       "GroupId"
+      ]
+     }
+    ],
+    "ServiceName": "com.amazonaws.ap-southeast-2.ecr.dkr",
+    "SubnetIds": [
+     {
+      "Ref": "VpcPrivateSubnet1Subnet536B997A"
+     },
+     {
+      "Ref": "VpcPrivateSubnet2Subnet3788AAA1"
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ],
+    "VpcEndpointType": "Interface",
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/EcrDkrEndpoint/Resource"
+   }
+  },
+  "VpcSecretsManagerEndpoint93E49F69": {
+   "Type": "AWS::EC2::VPCEndpoint",
+   "Properties": {
+    "PrivateDnsEnabled": true,
+    "SecurityGroupIds": [
+     {
+      "Fn::GetAtt": [
+       "VpceSecurityGroupA25AF10C",
+       "GroupId"
+      ]
+     }
+    ],
+    "ServiceName": "com.amazonaws.ap-southeast-2.secretsmanager",
+    "SubnetIds": [
+     {
+      "Ref": "VpcPrivateSubnet1Subnet536B997A"
+     },
+     {
+      "Ref": "VpcPrivateSubnet2Subnet3788AAA1"
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ],
+    "VpcEndpointType": "Interface",
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/SecretsManagerEndpoint/Resource"
+   }
+  },
+  "VpcCwLogsEndpoint45FE285E": {
+   "Type": "AWS::EC2::VPCEndpoint",
+   "Properties": {
+    "PrivateDnsEnabled": true,
+    "SecurityGroupIds": [
+     {
+      "Fn::GetAtt": [
+       "VpceSecurityGroupA25AF10C",
+       "GroupId"
+      ]
+     }
+    ],
+    "ServiceName": "com.amazonaws.ap-southeast-2.logs",
+    "SubnetIds": [
+     {
+      "Ref": "VpcPrivateSubnet1Subnet536B997A"
+     },
+     {
+      "Ref": "VpcPrivateSubnet2Subnet3788AAA1"
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ],
+    "VpcEndpointType": "Interface",
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/CwLogsEndpoint/Resource"
+   }
+  },
+  "VpcMonitoringEndpointF3768550": {
+   "Type": "AWS::EC2::VPCEndpoint",
+   "Properties": {
+    "PrivateDnsEnabled": true,
+    "SecurityGroupIds": [
+     {
+      "Fn::GetAtt": [
+       "VpceSecurityGroupA25AF10C",
+       "GroupId"
+      ]
+     }
+    ],
+    "ServiceName": "com.amazonaws.ap-southeast-2.monitoring",
+    "SubnetIds": [
+     {
+      "Ref": "VpcPrivateSubnet1Subnet536B997A"
+     },
+     {
+      "Ref": "VpcPrivateSubnet2Subnet3788AAA1"
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ],
+    "VpcEndpointType": "Interface",
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/MonitoringEndpoint/Resource"
+   }
+  },
+  "VpcS3Endpoint4A3DE4B5": {
+   "Type": "AWS::EC2::VPCEndpoint",
+   "Properties": {
+    "RouteTableIds": [
+     {
+      "Ref": "VpcPrivateSubnet1RouteTableB2C5B500"
+     },
+     {
+      "Ref": "VpcPrivateSubnet2RouteTableA678073B"
+     }
+    ],
+    "ServiceName": {
+     "Fn::Join": [
+      "",
+      [
+       "com.amazonaws.",
+       {
+        "Ref": "AWS::Region"
+       },
+       ".s3"
+      ]
+     ]
+    },
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "OpenClawVpc/Vpc"
+     }
+    ],
+    "VpcEndpointType": "Gateway",
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/Vpc/S3Endpoint/Resource"
+   }
+  },
+  "VpcFlowLogGroup86559C69": {
+   "Type": "AWS::Logs::LogGroup",
+   "Properties": {
+    "RetentionInDays": 30
+   },
+   "UpdateReplacePolicy": "Delete",
+   "DeletionPolicy": "Delete",
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/VpcFlowLogGroup/Resource"
+   }
+  },
+  "VpcFlowLogRoleF66FA0B2": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "vpc-flow-logs.amazonaws.com"
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/VpcFlowLogRole/Resource"
+   }
+  },
+  "VpcFlowLogRoleDefaultPolicy0C9618DE": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "logs:CreateLogStream",
+        "logs:DescribeLogStreams",
+        "logs:PutLogEvents"
+       ],
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::GetAtt": [
+         "VpcFlowLogGroup86559C69",
+         "Arn"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "VpcFlowLogRoleDefaultPolicy0C9618DE",
+    "Roles": [
+     {
+      "Ref": "VpcFlowLogRoleF66FA0B2"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/VpcFlowLogRole/DefaultPolicy/Resource"
+   }
+  },
+  "VpceSecurityGroupA25AF10C": {
+   "Type": "AWS::EC2::SecurityGroup",
+   "Properties": {
+    "GroupDescription": "VPC Endpoint interface security group",
+    "SecurityGroupEgress": [
+     {
+      "CidrIp": "255.255.255.255/32",
+      "Description": "Disallow all traffic",
+      "FromPort": 252,
+      "IpProtocol": "icmp",
+      "ToPort": 86
+     }
+    ],
+    "SecurityGroupIngress": [
+     {
+      "CidrIp": {
+       "Fn::GetAtt": [
+        "Vpc8378EB38",
+        "CidrBlock"
+       ]
+      },
+      "Description": "HTTPS from VPC (Fargate tasks)",
+      "FromPort": 443,
+      "IpProtocol": "tcp",
+      "ToPort": 443
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/VpceSecurityGroup/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "Ingress uses VPC CIDR (10.0.0.0/16) which resolves via Fn::GetAtt at deploy time; not open to 0.0.0.0/0.",
+       "id": "AwsSolutions-EC23"
+      },
+      {
+       "reason": "Security group rule uses Fn::GetAtt for VPC CIDR which cannot be validated at synth time.",
+       "id": "CdkNagValidationFailure"
+      }
+     ]
+    }
+   }
+  },
+  "CDKMetadata": {
+   "Type": "AWS::CDK::Metadata",
+   "Properties": {
+    "Analytics": "v2:deflate64:H4sIAAAAAAAA/02Q3WrDMAyFn6X3jjdSCt1lKV0pjGGS0dvhuGrrNrGCLS+EkHef898rfTo+kiXFPF5v+ftKVi5Sl2eU64w3KUn1ZEH6bUDFvDmXiu2v5iz2TPgs1yr1mQHqtIUS9AQ/Msth0Rdt5xwqLUmjmc0dHE6iC9+SjpKgkjUTVv8FXBqfDIENPBmGScZsR2HWewGG2GeO1RfeuvcJ+9KrVBA2OJhLidrQWD+nY6NXRwrKW0310aIv+21ehZbleHO8CR/MholbpmXBmwSHK/RRYLhYP/ZAbcsScOitgpaJmu5o3tb8g8eb1cNpHVlvSBfAkyH+A2ddSuOiAQAA"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawVpc/CDKMetadata/Default"
+   }
+  }
+ },
+ "Outputs": {
+  "ExportsOutputFnGetAttVpc8378EB38CidrBlock14DD2396": {
+   "Value": {
+    "Fn::GetAtt": [
+     "Vpc8378EB38",
+     "CidrBlock"
+    ]
+   },
+   "Export": {
+    "Name": "OpenClawVpc:ExportsOutputFnGetAttVpc8378EB38CidrBlock14DD2396"
+   }
+  },
+  "ExportsOutputRefVpc8378EB38272D6E3A": {
+   "Value": {
+    "Ref": "Vpc8378EB38"
+   },
+   "Export": {
+    "Name": "OpenClawVpc:ExportsOutputRefVpc8378EB38272D6E3A"
+   }
+  },
+  "ExportsOutputRefVpcPrivateSubnet1Subnet536B997AFD4CC940": {
+   "Value": {
+    "Ref": "VpcPrivateSubnet1Subnet536B997A"
+   },
+   "Export": {
+    "Name": "OpenClawVpc:ExportsOutputRefVpcPrivateSubnet1Subnet536B997AFD4CC940"
+   }
+  },
+  "ExportsOutputRefVpcPrivateSubnet2Subnet3788AAA1380949A3": {
+   "Value": {
+    "Ref": "VpcPrivateSubnet2Subnet3788AAA1"
+   },
+   "Export": {
+    "Name": "OpenClawVpc:ExportsOutputRefVpcPrivateSubnet2Subnet3788AAA1380949A3"
+   }
+  },
+  "ExportsOutputRefVpcPublicSubnet1Subnet5C2D37C4FFA2B456": {
+   "Value": {
+    "Ref": "VpcPublicSubnet1Subnet5C2D37C4"
+   },
+   "Export": {
+    "Name": "OpenClawVpc:ExportsOutputRefVpcPublicSubnet1Subnet5C2D37C4FFA2B456"
+   }
+  },
+  "ExportsOutputRefVpcPublicSubnet2Subnet691E08A351552740": {
+   "Value": {
+    "Ref": "VpcPublicSubnet2Subnet691E08A3"
+   },
+   "Export": {
+    "Name": "OpenClawVpc:ExportsOutputRefVpcPublicSubnet2Subnet691E08A351552740"
+   }
+  }
+ },
+ "Parameters": {
+  "BootstrapVersion": {
+   "Type": "AWS::SSM::Parameter::Value<String>",
+   "Default": "/cdk-bootstrap/hnb659fds/version",
+   "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]"
+  }
+ },
+ "Rules": {
+  "CheckBootstrapVersion": {
+   "Assertions": [
+    {
+     "Assert": {
+      "Fn::Not": [
+       {
+        "Fn::Contains": [
+         [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+         ],
+         {
+          "Ref": "BootstrapVersion"
+         }
+        ]
+       }
+      ]
+     },
+     "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+    }
+   ]
+  }
+ }
+}

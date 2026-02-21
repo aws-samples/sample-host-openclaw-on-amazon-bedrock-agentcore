@@ -1,0 +1,36 @@
+{
+  "version": "48.0.0",
+  "files": {
+    "2afdaacd2ed665aa3943970373112edb498704a26cb69cc9f303927f38efc6f6": {
+      "displayName": "TokenMetricsFunction/Code",
+      "source": {
+        "path": "asset.2afdaacd2ed665aa3943970373112edb498704a26cb69cc9f303927f38efc6f6",
+        "packaging": "zip"
+      },
+      "destinations": {
+        "657117630614-ap-southeast-2-6ca963fa": {
+          "bucketName": "cdk-hnb659fds-assets-657117630614-ap-southeast-2",
+          "objectKey": "2afdaacd2ed665aa3943970373112edb498704a26cb69cc9f303927f38efc6f6.zip",
+          "region": "ap-southeast-2",
+          "assumeRoleArn": "arn:${AWS::Partition}:iam::657117630614:role/cdk-hnb659fds-file-publishing-role-657117630614-ap-southeast-2"
+        }
+      }
+    },
+    "3d33655db4245132a7b90b2c6885f8f2b9be9a18823203501f0f0ec5581ce002": {
+      "displayName": "OpenClawTokenMonitoring Template",
+      "source": {
+        "path": "OpenClawTokenMonitoring.template.json",
+        "packaging": "file"
+      },
+      "destinations": {
+        "657117630614-ap-southeast-2-2e776823": {
+          "bucketName": "cdk-hnb659fds-assets-657117630614-ap-southeast-2",
+          "objectKey": "3d33655db4245132a7b90b2c6885f8f2b9be9a18823203501f0f0ec5581ce002.json",
+          "region": "ap-southeast-2",
+          "assumeRoleArn": "arn:${AWS::Partition}:iam::657117630614:role/cdk-hnb659fds-file-publishing-role-657117630614-ap-southeast-2"
+        }
+      }
+    }
+  },
+  "dockerImages": {}
+}

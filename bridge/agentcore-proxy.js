@@ -19,9 +19,6 @@ const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
 const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID || "";
 const COGNITO_PASSWORD_SECRET = process.env.COGNITO_PASSWORD_SECRET || "";
 
-// AgentCore Memory configuration
-const AGENTCORE_MEMORY_ID = process.env.AGENTCORE_MEMORY_ID || "";
-
 const SYSTEM_PROMPT =
   "You are a helpful personal assistant powered by OpenClaw. You are friendly, " +
   "concise, and knowledgeable. You help users with a wide range of tasks including " +
@@ -43,105 +40,26 @@ function sleep(ms) {
 }
 
 /**
- * Parse actorId and channel from OpenClaw's message envelope.
- *
- * OpenClaw wraps every inbound message in an envelope like:
- *   DMs:    "[Telegram DM from telegram:6087229962]\nHello"
- *   Groups: "[Telegram Group from telegram:group:-100123]\nAlice (id:6087229962): Hello"
- *
- * For DMs the `from` field IS the per-user identity.
- * For groups the `from` field is the group/channel ID; the individual sender
- * appears as "(id:<user_id>)" in the message body — we extract the last one
- * (most recent speaker) and combine it with the channel prefix.
- *
- * Returns { actorId, channel } or null if no envelope found.
- */
-function parseEnvelopeIdentity(messages) {
-  // Find the last user-role message (most recent inbound)
-  const userMessages = (messages || []).filter((m) => m.role === "user");
-  if (userMessages.length === 0) return null;
-
-  const lastMsg = userMessages[userMessages.length - 1];
-  const text = typeof lastMsg.content === "string"
-    ? lastMsg.content
-    : JSON.stringify(lastMsg.content);
-
-  // Match the envelope header: [Channel Type from channel:id]
-  const envelopeRe = /\[(\w+)\s+\w+\s+from\s+((?:telegram|discord|slack):\S+)\]/i;
-  const envMatch = text.match(envelopeRe);
-  if (!envMatch) return null;
-
-  const channelName = envMatch[1].toLowerCase(); // "telegram", "discord", "slack"
-  const fromId = envMatch[2];                     // e.g. "telegram:6087229962" or "telegram:group:-100123"
-
-  // Check if this is a group/channel context (contains "group:" or "channel:" in the from ID)
-  const isGroup = /:(group|channel):/.test(fromId);
-
-  if (!isGroup) {
-    // DM — the from field is the per-user identity
-    return { actorId: fromId, channel: channelName };
-  }
-
-  // Group/channel — extract the individual sender from "(id:XXXXX)" in the body
-  // The envelope body follows the header line. Find all sender ID patterns and use the last one.
-  const senderIdRe = /\(id:(\S+?)\)/g;
-  let lastSenderId = null;
-  let match;
-  while ((match = senderIdRe.exec(text)) !== null) {
-    lastSenderId = match[1];
-  }
-
-  if (lastSenderId) {
-    return { actorId: `${channelName}:${lastSenderId}`, channel: channelName };
-  }
-
-  // Group message but no individual sender ID found — fall back to group identity
-  return { actorId: fromId, channel: channelName };
-}
-
-/**
  * Extract session metadata from request headers and body.
  * Returns { sessionId, actorId, channel }.
- *
- * Identity resolution priority:
- *   1. x-openclaw-actor-id header (explicit, custom)
- *   2. OpenAI 'user' field in request body
- *   3. Parse from OpenClaw message envelope text
- *   4. Fallback to "default-user"
  */
 function extractSessionMetadata(parsed, headers) {
   // 1. Check custom headers (future: OpenClaw might set these)
   let actorId = headers["x-openclaw-actor-id"] || "";
   let channel = headers["x-openclaw-channel"] || "unknown";
   let sessionId = headers["x-openclaw-session-id"] || "";
-  let identitySource = "default";
 
   // 2. Check OpenAI 'user' field (OpenClaw may populate this)
   if (!actorId && parsed.user) {
     actorId = parsed.user;
-    identitySource = "user-field";
   }
 
-  // 3. Parse from message envelope
-  if (!actorId) {
-    const envelope = parseEnvelopeIdentity(parsed.messages);
-    if (envelope) {
-      actorId = envelope.actorId;
-      channel = envelope.channel;
-      identitySource = "envelope";
-    }
-  }
-
-  // 4. Fallback to default
+  // 3. Fallback to default
   if (!actorId) {
     actorId = "default-user";
-    identitySource = "default";
-  } else if (identitySource === "default") {
-    // actorId was set from header
-    identitySource = "header";
   }
 
-  // 5. Generate stable session ID (AgentCore requires min 33 chars)
+  // 4. Generate stable session ID (AgentCore requires min 33 chars)
   if (!sessionId) {
     const key = `${actorId}:${channel}`;
     if (!sessionMap.has(key)) {
@@ -151,8 +69,6 @@ function extractSessionMetadata(parsed, headers) {
     }
     sessionId = sessionMap.get(key);
   }
-
-  console.log(`[proxy] Identity resolved: actorId=${actorId} source=${identitySource} channel=${channel} sessionId=${sessionId}`);
 
   return { sessionId, actorId, channel };
 }
@@ -178,135 +94,6 @@ function getCognitoClient() {
     _cognitoClient = new CognitoIdentityProviderClient({ region: AWS_REGION });
   }
   return _cognitoClient;
-}
-
-// Lazily initialized AgentCore Memory client
-let _agentCoreClient = null;
-function getAgentCoreClient() {
-  if (!_agentCoreClient) {
-    const { BedrockAgentCoreClient } = require("@aws-sdk/client-bedrock-agentcore");
-    _agentCoreClient = new BedrockAgentCoreClient({ region: AWS_REGION });
-  }
-  return _agentCoreClient;
-}
-
-/**
- * Retrieve memory context for a user from AgentCore Memory.
- * Returns a formatted string to prepend to the system prompt, or empty string.
- */
-async function retrieveMemoryContext(actorId, sessionId, latestUserMessage) {
-  if (!AGENTCORE_MEMORY_ID) return "";
-
-  const contextParts = [];
-
-  // Retrieve long-term memories (semantic + preferences)
-  try {
-    const { RetrieveMemoryRecordsCommand } = require("@aws-sdk/client-bedrock-agentcore");
-    const response = await getAgentCoreClient().send(
-      new RetrieveMemoryRecordsCommand({
-        memoryId: AGENTCORE_MEMORY_ID,
-        namespace: actorId,
-        searchCriteria: {
-          searchQuery: latestUserMessage,
-        },
-        maxResults: 10,
-      })
-    );
-
-    const records = response.memoryRecordSummaries || [];
-    if (records.length > 0) {
-      const facts = records
-        .map((r) => r.content?.text || "")
-        .filter((t) => t);
-      if (facts.length > 0) {
-        contextParts.push(
-          "Relevant memories from previous interactions:\n" +
-            facts.map((f) => `- ${f}`).join("\n")
-        );
-      }
-    }
-    console.log(`[proxy] Retrieved ${records.length} memory records for ${actorId}`);
-  } catch (err) {
-    console.warn(`[proxy] Failed to retrieve long-term memories for ${actorId}:`, err.message);
-  }
-
-  // List recent short-term events for this session
-  try {
-    const { ListEventsCommand } = require("@aws-sdk/client-bedrock-agentcore");
-    const response = await getAgentCoreClient().send(
-      new ListEventsCommand({
-        memoryId: AGENTCORE_MEMORY_ID,
-        sessionId: sessionId,
-        actorId: actorId,
-        includePayloads: true,
-        maxResults: 20,
-      })
-    );
-
-    const events = response.events || [];
-    if (events.length > 0) {
-      const recent = [];
-      const lastEvents = events.slice(-10);
-      for (const evt of lastEvents) {
-        for (const item of evt.payload || []) {
-          const conv = item.conversational || {};
-          const text = conv.content?.text || "";
-          const role = conv.role || "";
-          if (text) {
-            recent.push(role ? `${role}: ${text}` : text);
-          }
-        }
-      }
-      if (recent.length > 0) {
-        contextParts.push(
-          "Recent conversation context:\n" + recent.join("\n")
-        );
-      }
-    }
-  } catch (err) {
-    console.warn(`[proxy] Failed to list short-term events for ${actorId}:`, err.message);
-  }
-
-  return contextParts.join("\n\n");
-}
-
-/**
- * Store a conversation exchange as a memory event (fire-and-forget).
- */
-function storeMemoryEvent(actorId, sessionId, userMessage, assistantResponse) {
-  if (!AGENTCORE_MEMORY_ID) return;
-
-  const { CreateEventCommand } = require("@aws-sdk/client-bedrock-agentcore");
-
-  getAgentCoreClient()
-    .send(
-      new CreateEventCommand({
-        memoryId: AGENTCORE_MEMORY_ID,
-        actorId: actorId,
-        sessionId: sessionId,
-        eventTimestamp: new Date(),
-        payload: [
-          {
-            conversational: {
-              content: { text: userMessage },
-              role: "user",
-            },
-          },
-          {
-            conversational: {
-              content: { text: assistantResponse },
-              role: "assistant",
-            },
-          },
-        ],
-      })
-    )
-    .then(() => {
-      console.log(`[proxy] Memory event stored for ${actorId}`);
-    })
-    .catch((err) => {
-      console.warn(`[proxy] Failed to store memory event for ${actorId}:`, err.message);
-    });
 }
 
 /**
@@ -387,10 +174,8 @@ async function getCognitoToken(actorId) {
 
 /**
  * Convert OpenAI messages to Bedrock Converse format.
- * @param {Array} messages - OpenAI-format messages
- * @param {string} [memoryContext] - Optional AgentCore Memory context to prepend
  */
-function convertMessages(messages, memoryContext) {
+function convertMessages(messages) {
   const bedrockMessages = [];
   for (const msg of messages) {
     if (msg.role === "system") continue;
@@ -403,19 +188,9 @@ function convertMessages(messages, memoryContext) {
   }
 
   const systemMessages = messages.filter((m) => m.role === "system");
-  const baseSystemText = systemMessages.length > 0
+  const systemText = systemMessages.length > 0
     ? systemMessages.map((m) => m.content).join("\n")
     : SYSTEM_PROMPT;
-
-  const now = new Date();
-  const today = now.toISOString().split("T")[0];
-  const dayOfWeek = now.toLocaleDateString("en-US", { weekday: "long" });
-  const dateContext = `[IMPORTANT: Today is ${dayOfWeek}, ${today}. The current year is ${now.getFullYear()}. Do NOT use your training data cutoff as the current date.]`;
-
-  let systemText = `${dateContext}\n\n${baseSystemText}`;
-  if (memoryContext) {
-    systemText += `\n\n## Relevant Context\n${memoryContext}`;
-  }
 
   return { bedrockMessages, systemText };
 }
@@ -423,12 +198,12 @@ function convertMessages(messages, memoryContext) {
 /**
  * Call Bedrock Converse API (non-streaming).
  */
-async function invokeBedrock(messages, memoryContext) {
+async function invokeBedrock(messages) {
   const { BedrockRuntimeClient, ConverseCommand } = require(
     "@aws-sdk/client-bedrock-runtime"
   );
   const client = new BedrockRuntimeClient({ region: AWS_REGION });
-  const { bedrockMessages, systemText } = convertMessages(messages, memoryContext);
+  const { bedrockMessages, systemText } = convertMessages(messages);
 
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -468,20 +243,18 @@ async function invokeBedrock(messages, memoryContext) {
 
 /**
  * Call Bedrock ConverseStream API and write SSE chunks to the HTTP response.
- * Returns the full collected response text (for memory storage).
  */
-async function invokeBedrockStreaming(messages, res, model, memoryContext) {
+async function invokeBedrockStreaming(messages, res, model) {
   const { BedrockRuntimeClient, ConverseStreamCommand } = require(
     "@aws-sdk/client-bedrock-runtime"
   );
   const client = new BedrockRuntimeClient({ region: AWS_REGION });
-  const { bedrockMessages, systemText } = convertMessages(messages, memoryContext);
+  const { bedrockMessages, systemText } = convertMessages(messages);
 
   const chatId = `chatcmpl-${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
   let inputTokens = 0;
   let outputTokens = 0;
-  const collectedChunks = [];
 
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -490,7 +263,6 @@ async function invokeBedrockStreaming(messages, res, model, memoryContext) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
         console.log(`[proxy] Stream retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms`);
         await sleep(delay);
-        collectedChunks.length = 0;
       }
 
       const response = await client.send(
@@ -511,7 +283,6 @@ async function invokeBedrockStreaming(messages, res, model, memoryContext) {
 
       for await (const event of response.stream) {
         if (event.contentBlockDelta?.delta?.text) {
-          collectedChunks.push(event.contentBlockDelta.delta.text);
           const chunk = {
             id: chatId,
             object: "chat.completion.chunk",
@@ -549,7 +320,7 @@ async function invokeBedrockStreaming(messages, res, model, memoryContext) {
       res.end();
 
       console.log(`[proxy] Stream complete: ${inputTokens}in/${outputTokens}out tokens`);
-      return collectedChunks.join("");
+      return;
     } catch (err) {
       lastError = err;
       console.error(`[proxy] Stream attempt ${attempt + 1} failed:`, err.message);
@@ -566,7 +337,6 @@ async function invokeBedrockStreaming(messages, res, model, memoryContext) {
   } else {
     res.end();
   }
-  return "";
 }
 
 /**
@@ -607,7 +377,6 @@ const server = http.createServer(async (req, res) => {
       status: "ok",
       model: MODEL_ID,
       cognito: COGNITO_USER_POOL_ID ? "configured" : "disabled",
-      memory: AGENTCORE_MEMORY_ID ? "configured" : "disabled",
     }));
     return;
   }
@@ -637,36 +406,17 @@ const server = http.createServer(async (req, res) => {
           console.warn(`[proxy] Cognito token acquisition failed for ${actorId}:`, err.message);
         }
 
-        // --- Retrieve memory context (non-blocking failure) ---
-        const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-        const lastUserText = lastUserMsg
-          ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
-          : "";
-
-        let memoryContext = "";
-        try {
-          memoryContext = await retrieveMemoryContext(actorId, sessionId, lastUserText);
-        } catch (err) {
-          console.warn(`[proxy] Memory retrieval failed for ${actorId}:`, err.message);
-        }
-
         // --- Direct Bedrock path ---
         if (stream) {
-          const responseText = await invokeBedrockStreaming(messages, res, parsed.model, memoryContext);
-          if (responseText && lastUserText) {
-            storeMemoryEvent(actorId, sessionId, lastUserText, responseText);
-          }
+          await invokeBedrockStreaming(messages, res, parsed.model);
         } else {
-          const result = await invokeBedrock(messages, memoryContext);
+          const result = await invokeBedrock(messages);
           const response = formatChatResponse(result, parsed.model);
           console.log(
             `[proxy] Response: ${result.usage.inputTokens || "?"}in/${result.usage.outputTokens || "?"}out tokens`
           );
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(response));
-          if (result.text && lastUserText) {
-            storeMemoryEvent(actorId, sessionId, lastUserText, result.text);
-          }
         }
       } catch (err) {
         console.error("[proxy] Request failed:", err.message);
@@ -714,8 +464,5 @@ server.listen(PORT, "0.0.0.0", () => {
   );
   console.log(
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`
-  );
-  console.log(
-    `[proxy] AgentCore Memory: ${AGENTCORE_MEMORY_ID ? `id=${AGENTCORE_MEMORY_ID}` : "disabled"}`
   );
 });

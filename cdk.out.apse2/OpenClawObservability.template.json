@@ -1,0 +1,482 @@
+{
+ "Resources": {
+  "AlarmTopicD01E77F9": {
+   "Type": "AWS::SNS::Topic",
+   "Properties": {
+    "DisplayName": "OpenClaw Alarms",
+    "TopicName": "openclaw-alarms"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/AlarmTopic/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "This SNS topic is used exclusively for CloudWatch alarm notifications. Publishers are AWS services (CloudWatch Alarms) which use internal AWS service endpoints. SSL enforcement via topic policy is not required for service-to-service communication.",
+       "id": "AwsSolutions-SNS3"
+      }
+     ]
+    }
+   }
+  },
+  "BedrockInvocationLogGroupF4F74C2C": {
+   "Type": "AWS::Logs::LogGroup",
+   "Properties": {
+    "LogGroupName": "/aws/bedrock/invocation-logs",
+    "RetentionInDays": 30
+   },
+   "UpdateReplacePolicy": "Delete",
+   "DeletionPolicy": "Delete",
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/BedrockInvocationLogGroup/Resource"
+   }
+  },
+  "BedrockLoggingRole71F633EF": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "bedrock.amazonaws.com"
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/BedrockLoggingRole/Resource"
+   }
+  },
+  "BedrockLoggingRoleDefaultPolicy3D9B316C": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+       ],
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::GetAtt": [
+         "BedrockInvocationLogGroupF4F74C2C",
+         "Arn"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "BedrockLoggingRoleDefaultPolicy3D9B316C",
+    "Roles": [
+     {
+      "Ref": "BedrockLoggingRole71F633EF"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/BedrockLoggingRole/DefaultPolicy/Resource"
+   }
+  },
+  "EnableBedrockInvocationLogging08C87040": {
+   "Type": "Custom::AWS",
+   "Properties": {
+    "ServiceToken": {
+     "Fn::GetAtt": [
+      "AWS679f53fac002430cb0da5b7982bd22872D164C4C",
+      "Arn"
+     ]
+    },
+    "Create": {
+     "Fn::Join": [
+      "",
+      [
+       "{\"action\":\"PutModelInvocationLoggingConfiguration\",\"service\":\"Bedrock\",\"parameters\":{\"loggingConfig\":{\"cloudWatchConfig\":{\"logGroupName\":\"",
+       {
+        "Ref": "BedrockInvocationLogGroupF4F74C2C"
+       },
+       "\",\"roleArn\":\"",
+       {
+        "Fn::GetAtt": [
+         "BedrockLoggingRole71F633EF",
+         "Arn"
+        ]
+       },
+       "\"},\"textDataDeliveryEnabled\":true,\"imageDataDeliveryEnabled\":false,\"embeddingDataDeliveryEnabled\":false}},\"physicalResourceId\":{\"id\":\"bedrock-invocation-logging\"}}"
+      ]
+     ]
+    },
+    "Update": {
+     "Fn::Join": [
+      "",
+      [
+       "{\"action\":\"PutModelInvocationLoggingConfiguration\",\"service\":\"Bedrock\",\"parameters\":{\"loggingConfig\":{\"cloudWatchConfig\":{\"logGroupName\":\"",
+       {
+        "Ref": "BedrockInvocationLogGroupF4F74C2C"
+       },
+       "\",\"roleArn\":\"",
+       {
+        "Fn::GetAtt": [
+         "BedrockLoggingRole71F633EF",
+         "Arn"
+        ]
+       },
+       "\"},\"textDataDeliveryEnabled\":true,\"imageDataDeliveryEnabled\":false,\"embeddingDataDeliveryEnabled\":false}},\"physicalResourceId\":{\"id\":\"bedrock-invocation-logging\"}}"
+      ]
+     ]
+    },
+    "InstallLatestAwsSdk": false
+   },
+   "DependsOn": [
+    "EnableBedrockInvocationLoggingCustomResourcePolicyE02EECFB"
+   ],
+   "UpdateReplacePolicy": "Delete",
+   "DeletionPolicy": "Delete",
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/EnableBedrockInvocationLogging/Resource/Default",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "Bedrock PutModelInvocationLoggingConfiguration is an account-level API that does not support resource-level ARNs; wildcard is required.",
+       "id": "AwsSolutions-IAM5",
+       "applies_to": [
+        "Resource::*"
+       ]
+      },
+      {
+       "reason": "CDK AwsCustomResource uses AWSLambdaBasicExecutionRole for its backing Lambda. This is a CDK-managed construct.",
+       "id": "AwsSolutions-IAM4",
+       "applies_to": [
+        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      },
+      {
+       "reason": "Lambda runtime is managed by CDK AwsCustomResource and cannot be overridden to the latest version.",
+       "id": "AwsSolutions-L1"
+      }
+     ]
+    }
+   }
+  },
+  "EnableBedrockInvocationLoggingCustomResourcePolicyE02EECFB": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "bedrock:GetModelInvocationLoggingConfiguration",
+        "bedrock:PutModelInvocationLoggingConfiguration"
+       ],
+       "Effect": "Allow",
+       "Resource": "*"
+      },
+      {
+       "Action": "iam:PassRole",
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::GetAtt": [
+         "BedrockLoggingRole71F633EF",
+         "Arn"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "EnableBedrockInvocationLoggingCustomResourcePolicyE02EECFB",
+    "Roles": [
+     {
+      "Ref": "AWS679f53fac002430cb0da5b7982bd2287ServiceRoleC1EA0FF2"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/EnableBedrockInvocationLogging/CustomResourcePolicy/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "Bedrock PutModelInvocationLoggingConfiguration is an account-level API that does not support resource-level ARNs; wildcard is required.",
+       "id": "AwsSolutions-IAM5",
+       "applies_to": [
+        "Resource::*"
+       ]
+      },
+      {
+       "reason": "CDK AwsCustomResource uses AWSLambdaBasicExecutionRole for its backing Lambda. This is a CDK-managed construct.",
+       "id": "AwsSolutions-IAM4",
+       "applies_to": [
+        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      },
+      {
+       "reason": "Lambda runtime is managed by CDK AwsCustomResource and cannot be overridden to the latest version.",
+       "id": "AwsSolutions-L1"
+      }
+     ]
+    }
+   }
+  },
+  "AWS679f53fac002430cb0da5b7982bd2287ServiceRoleC1EA0FF2": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "lambda.amazonaws.com"
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "ManagedPolicyArns": [
+     {
+      "Fn::Join": [
+       "",
+       [
+        "arn:",
+        {
+         "Ref": "AWS::Partition"
+        },
+        ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      ]
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/AWS679f53fac002430cb0da5b7982bd2287/ServiceRole/Resource",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "CDK AwsCustomResource singleton Lambda uses AWSLambdaBasicExecutionRole. This is managed by CDK and cannot be customised.",
+       "id": "AwsSolutions-IAM4",
+       "applies_to": [
+        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  "AWS679f53fac002430cb0da5b7982bd22872D164C4C": {
+   "Type": "AWS::Lambda::Function",
+   "Properties": {
+    "Code": {
+     "S3Bucket": "cdk-hnb659fds-assets-657117630614-ap-southeast-2",
+     "S3Key": "f1ef0b7df9fbd6678b581ed85579e856c8f7832ce4e06e642f2c2421ef37c427.zip"
+    },
+    "Handler": "index.handler",
+    "Role": {
+     "Fn::GetAtt": [
+      "AWS679f53fac002430cb0da5b7982bd2287ServiceRoleC1EA0FF2",
+      "Arn"
+     ]
+    },
+    "Runtime": "nodejs22.x",
+    "Timeout": 120
+   },
+   "DependsOn": [
+    "AWS679f53fac002430cb0da5b7982bd2287ServiceRoleC1EA0FF2"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/AWS679f53fac002430cb0da5b7982bd2287/Resource",
+    "aws:asset:path": "asset.f1ef0b7df9fbd6678b581ed85579e856c8f7832ce4e06e642f2c2421ef37c427",
+    "aws:asset:is-bundled": false,
+    "aws:asset:property": "Code",
+    "cdk_nag": {
+     "rules_to_suppress": [
+      {
+       "reason": "Lambda runtime is managed by CDK AwsCustomResource singleton and cannot be overridden.",
+       "id": "AwsSolutions-L1"
+      }
+     ]
+    }
+   }
+  },
+  "OperationsDashboard06307C07": {
+   "Type": "AWS::CloudWatch::Dashboard",
+   "Properties": {
+    "DashboardBody": {
+     "Fn::Join": [
+      "",
+      [
+       "{\"widgets\":[{\"type\":\"text\",\"width\":24,\"height\":1,\"x\":0,\"y\":0,\"properties\":{\"markdown\":\"# OpenClaw Operations Dashboard (AgentCore)\"}},{\"type\":\"metric\",\"width\":12,\"height\":6,\"x\":0,\"y\":1,\"properties\":{\"view\":\"timeSeries\",\"title\":\"Bedrock Invocations & Errors\",\"region\":\"",
+       {
+        "Ref": "AWS::Region"
+       },
+       "\",\"metrics\":[[\"AWS/Bedrock\",\"Invocations\",{\"stat\":\"Sum\"}],[\"AWS/Bedrock\",\"InvocationServerErrors\",{\"stat\":\"Sum\",\"yAxis\":\"right\"}],[\"AWS/Bedrock\",\"InvocationThrottles\",{\"stat\":\"Sum\",\"yAxis\":\"right\"}]],\"yAxis\":{}}},{\"type\":\"metric\",\"width\":12,\"height\":6,\"x\":12,\"y\":1,\"properties\":{\"view\":\"timeSeries\",\"title\":\"Bedrock Latency (p99)\",\"region\":\"",
+       {
+        "Ref": "AWS::Region"
+       },
+       "\",\"metrics\":[[\"AWS/Bedrock\",\"InvocationLatency\",{\"stat\":\"p99\"}]],\"yAxis\":{}}},{\"type\":\"metric\",\"width\":12,\"height\":6,\"x\":0,\"y\":7,\"properties\":{\"view\":\"timeSeries\",\"title\":\"AgentCore Runtime Invocations & Errors\",\"region\":\"",
+       {
+        "Ref": "AWS::Region"
+       },
+       "\",\"metrics\":[[\"AWS/BedrockAgentCore\",\"Invocations\",{\"stat\":\"Sum\"}],[\"AWS/BedrockAgentCore\",\"InvocationErrors\",{\"stat\":\"Sum\",\"yAxis\":\"right\"}]],\"yAxis\":{}}},{\"type\":\"metric\",\"width\":12,\"height\":6,\"x\":12,\"y\":7,\"properties\":{\"view\":\"timeSeries\",\"title\":\"AgentCore Runtime Latency (p99)\",\"region\":\"",
+       {
+        "Ref": "AWS::Region"
+       },
+       "\",\"metrics\":[[\"AWS/BedrockAgentCore\",\"InvocationLatency\",{\"stat\":\"p99\"}]],\"yAxis\":{}}}]}"
+      ]
+     ]
+    },
+    "DashboardName": "OpenClaw-Operations"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/OperationsDashboard/Resource"
+   }
+  },
+  "BedrockErrorAlarm00CA2339": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmActions": [
+     {
+      "Ref": "AlarmTopicD01E77F9"
+     }
+    ],
+    "AlarmName": "openclaw-bedrock-errors",
+    "ComparisonOperator": "GreaterThanThreshold",
+    "EvaluationPeriods": 3,
+    "MetricName": "InvocationServerErrors",
+    "Namespace": "AWS/Bedrock",
+    "Period": 300,
+    "Statistic": "Sum",
+    "Threshold": 5,
+    "TreatMissingData": "notBreaching"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/BedrockErrorAlarm/Resource"
+   }
+  },
+  "BedrockLatencyAlarmDB03ADD8": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmActions": [
+     {
+      "Ref": "AlarmTopicD01E77F9"
+     }
+    ],
+    "AlarmName": "openclaw-bedrock-latency",
+    "ComparisonOperator": "GreaterThanThreshold",
+    "EvaluationPeriods": 3,
+    "ExtendedStatistic": "p99",
+    "MetricName": "InvocationLatency",
+    "Namespace": "AWS/Bedrock",
+    "Period": 300,
+    "Threshold": 10000,
+    "TreatMissingData": "notBreaching"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/BedrockLatencyAlarm/Resource"
+   }
+  },
+  "BedrockThrottleAlarmF6CF42CB": {
+   "Type": "AWS::CloudWatch::Alarm",
+   "Properties": {
+    "AlarmActions": [
+     {
+      "Ref": "AlarmTopicD01E77F9"
+     }
+    ],
+    "AlarmName": "openclaw-bedrock-throttles",
+    "ComparisonOperator": "GreaterThanThreshold",
+    "EvaluationPeriods": 3,
+    "MetricName": "InvocationThrottles",
+    "Namespace": "AWS/Bedrock",
+    "Period": 300,
+    "Statistic": "Sum",
+    "Threshold": 1,
+    "TreatMissingData": "notBreaching"
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/BedrockThrottleAlarm/Resource"
+   }
+  },
+  "CDKMetadata": {
+   "Type": "AWS::CDK::Metadata",
+   "Properties": {
+    "Analytics": "v2:deflate64:H4sIAAAAAAAA/12QQU/DMAyFf8vuWUCtkOC4DY0LElPhXrlpaEPTuIodVVOV/07SUZA4ve89J7aTQhblo7zfwUx71Q57axq5vDOoQaSoXsiRXD5wMkqcPt0KUVjsUvqK3YvHMOXCxlEYGOVSodU5XvWC1qhrtjdK92FsWkhzjOusZnTn4BQbdOIX0umNo6CyBiLNJA9ZkpfHoAbNRyAtlMXQzsCql8szUN8g+DY3+DMHC37M0QoxChWIcay9Jgxe6dR4ptOaVT+R+G/TazZet0if1KX9c+Et8BQ4isuVe3R3pXySxcPui4zZ++DYjFpWN/0GPnYfJm8BAAA="
+   },
+   "Metadata": {
+    "aws:cdk:path": "OpenClawObservability/CDKMetadata/Default"
+   }
+  }
+ },
+ "Outputs": {
+  "AlarmTopicArn": {
+   "Description": "SNS topic ARN for alarm notifications",
+   "Value": {
+    "Ref": "AlarmTopicD01E77F9"
+   }
+  },
+  "ExportsOutputFnGetAttBedrockInvocationLogGroupF4F74C2CArn60345DDE": {
+   "Value": {
+    "Fn::GetAtt": [
+     "BedrockInvocationLogGroupF4F74C2C",
+     "Arn"
+    ]
+   },
+   "Export": {
+    "Name": "OpenClawObservability:ExportsOutputFnGetAttBedrockInvocationLogGroupF4F74C2CArn60345DDE"
+   }
+  },
+  "ExportsOutputRefBedrockInvocationLogGroupF4F74C2C8F85448B": {
+   "Value": {
+    "Ref": "BedrockInvocationLogGroupF4F74C2C"
+   },
+   "Export": {
+    "Name": "OpenClawObservability:ExportsOutputRefBedrockInvocationLogGroupF4F74C2C8F85448B"
+   }
+  },
+  "ExportsOutputRefAlarmTopicD01E77F99DF7FB73": {
+   "Value": {
+    "Ref": "AlarmTopicD01E77F9"
+   },
+   "Export": {
+    "Name": "OpenClawObservability:ExportsOutputRefAlarmTopicD01E77F99DF7FB73"
+   }
+  }
+ },
+ "Parameters": {
+  "BootstrapVersion": {
+   "Type": "AWS::SSM::Parameter::Value<String>",
+   "Default": "/cdk-bootstrap/hnb659fds/version",
+   "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]"
+  }
+ },
+ "Rules": {
+  "CheckBootstrapVersion": {
+   "Assertions": [
+    {
+     "Assert": {
+      "Fn::Not": [
+       {
+        "Fn::Contains": [
+         [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+         ],
+         {
+          "Ref": "BootstrapVersion"
+         }
+        ]
+       }
+      ]
+     },
+     "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+    }
+   ]
+  }
+ }
+}

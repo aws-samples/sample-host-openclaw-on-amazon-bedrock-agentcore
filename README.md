@@ -345,7 +345,7 @@ User sends Telegram message
 
 ### Tools & Skills
 
-The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, memory, sessions, automation). Additionally, 9 community skills are pre-installed from ClawHub at Docker build time:
+The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, memory, sessions, automation). Additionally, 10 community skills are pre-installed from ClawHub at Docker build time:
 
 | Skill | Purpose |
 |---|---|
@@ -355,6 +355,7 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 | `telegram-compose` | Rich HTML formatting for Telegram |
 | `transcript` | YouTube transcript extraction |
 | `deep-research-pro` | Multi-step research agent |
+| `hackernews` | Browse/search Hacker News |
 | `news-feed` | RSS-based news aggregation |
 | `task-decomposer` | Break complex requests into subtasks |
 | `cron-mastery` | Cron scheduling and management |
