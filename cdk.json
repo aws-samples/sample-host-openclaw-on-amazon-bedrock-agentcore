@@ -10,6 +10,7 @@
     "daily_cost_budget_usd": 5,
     "anomaly_band_width": 2,
     "token_ttl_days": 90,
+    "user_files_ttl_days": 365,
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:stackRelativeExports": true,
     "@aws-cdk/aws-ec2:uniqueImdsv2TemplateName": true,

@@ -374,16 +374,18 @@ Each user gets isolated, persistent conversation memory powered by AgentCore Mem
 
 **How it works:**
 
-1. **Identity extraction** — The proxy extracts `actorId` from each request (e.g., `telegram:6087229962`, `slack:U0123ABC`). Users are namespaced by replacing colons with underscores (e.g., `telegram_6087229962`).
-2. **Memory retrieval** — Before each Bedrock call, the proxy queries `RetrieveMemoryRecords` with the user's latest message as a semantic search query. Up to 5 relevant memory records are appended to the system prompt.
-3. **Event storage** — After each response, the user/assistant exchange is stored as a memory event via `CreateEvent` (fire-and-forget, non-blocking).
-4. **Memory extraction** — Every 10 minutes, the proxy triggers `StartMemoryExtractionJob` to process accumulated events through 3 configured strategies:
-   - **Semantic** — extracts factual information and topics
-   - **User preference** — captures user preferences and patterns
-   - **Summary** — produces conversation summaries
-5. **Persistence** — Memories survive container restarts because they are stored server-side in AgentCore Memory, not in the container's process memory.
+1. **Identity extraction** — The proxy extracts `actorId` from each request using three sources in priority order: (1) `x-openclaw-actor-id` header, (2) OpenAI `user` field in the request body, (3) fallback to `"default-user"`. Channel-prefixed IDs like `telegram:6087229962` are namespaced by replacing colons with underscores (e.g., `telegram_6087229962`). Users sharing the `default-user` fallback would share the same memory namespace.
+2. **Memory retrieval** — Before each Bedrock call, the proxy queries `RetrieveMemoryRecords` with the user's latest message as a semantic search query, scoped to that user's namespace. Up to 5 relevant records (hardcoded `MEMORY_RETRIEVAL_LIMIT`) are filtered and appended to the system prompt under a `## Relevant memories about this user` heading. The model is instructed to use them for personalization without mentioning memory unless asked.
+3. **Event storage** — After each response, the user/assistant exchange (both roles in a single event) is stored via `CreateEvent` (fire-and-forget, non-blocking). Events include the session ID for grouping.
+4. **Memory extraction** — Every 10 minutes (plus 30 seconds after startup), the proxy triggers `StartMemoryExtractionJob`. This is a **global operation** that processes accumulated events across all user namespaces through 3 configured strategies:
+   - **Semantic** (`openclaw_semantic`) — extracts factual information and topics
+   - **User preference** (`openclaw_user_prefs`) — captures user preferences and patterns
+   - **Summary** (`openclaw_summary`) — produces conversation summaries
 
-**Graceful degradation** — All memory operations log warnings on failure but never block the chat flow. If `AGENTCORE_MEMORY_ID` is not set, memory is completely disabled.
+   Extraction runs server-side using a dedicated `MemoryExecutionRole` with `bedrock:InvokeModel` permissions. New events are not searchable until the next extraction job runs.
+5. **Persistence** — Memories survive container restarts because they are stored server-side in AgentCore Memory, not in the container's process memory. Raw conversation events expire after **90 days** (`event_expiry_duration`). The in-memory `sessionMap` (which generates stable session IDs per `actorId:channel` pair) is lost on restart, but this only affects session ID continuity — not memory records.
+
+**Graceful degradation** — All memory operations (retrieval, storage, extraction) are wrapped in try/catch — they log warnings on failure but never block the chat flow. If `AGENTCORE_MEMORY_ID` is not set, every memory function short-circuits immediately and memory is completely disabled.
 
 ### Token Usage Tracking
 
@@ -508,7 +510,8 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **Image updates need session restart**: Pushing a new image to ECR and redeploying via CDK updates the runtime config, but the existing keepalive session keeps running the old image. Stop it with `stop-runtime-session` (see Operations section).
 - **Memory IAM prefix**: AgentCore Memory APIs use the `bedrock-agentcore:` IAM action prefix, NOT `bedrock:`. Using the wrong prefix causes `AccessDeniedException`.
 - **Memory namespace characters**: `actorId` values contain colons (e.g., `telegram:6087229962`) which may be rejected by namespace fields. The proxy replaces `:` with `_`.
-- **Memory extraction latency**: New conversation events are not immediately searchable. The extraction job must run first (triggered every 10 minutes) to process events into retrievable records via the 3 configured strategies.
+- **Memory extraction latency**: New conversation events are not immediately searchable. The extraction job must run first (triggered every 10 minutes as a global operation across all namespaces) to process events into retrievable records via the 3 configured strategies.
+- **`default-user` fallback**: If OpenClaw doesn't populate the `user` field or custom headers, all requests fall back to `actorId = "default-user"` — meaning all such users share one memory namespace. Ensure your channel providers populate user identity.
 
 ## Cleanup
 

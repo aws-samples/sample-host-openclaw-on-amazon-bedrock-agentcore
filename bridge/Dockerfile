@@ -19,7 +19,6 @@ RUN mkdir -p /app /root/.openclaw/skills
 # --force needed because some skills trigger VirusTotal flags for external API calls
 RUN clawhub install duckduckgo-search --no-input --force && \
     clawhub install jina-reader --no-input --force && \
-    clawhub install openclaw-mem --no-input --force && \
     clawhub install telegram-compose --no-input --force && \
     clawhub install transcript --no-input --force && \
     clawhub install deep-research-pro --no-input --force && \
@@ -34,12 +33,23 @@ WORKDIR /app
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install @aws-sdk/client-bedrock-runtime \
                 @aws-sdk/client-cognito-identity-provider \
-                @aws-sdk/client-bedrock-agentcore
+                @aws-sdk/client-bedrock-agentcore \
+                @aws-sdk/client-s3
+
+# Ensure skills can resolve npm packages from /app/node_modules
+ENV NODE_PATH=/app/node_modules
 
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY force-ipv4.js /app/force-ipv4.js
+
+# Copy custom per-user file storage skill to both paths:
+# /skills/ — where ClawHub installs skills (scanned via extraDirs config)
+# /root/.openclaw/skills/ — OpenClaw's default skill directory
+COPY skills/s3-user-files /skills/s3-user-files
+COPY skills/s3-user-files /root/.openclaw/skills/s3-user-files
+RUN chmod +x /skills/s3-user-files/*.js /root/.openclaw/skills/s3-user-files/*.js
 
 # Copy entrypoint
 COPY entrypoint.sh /app/entrypoint.sh

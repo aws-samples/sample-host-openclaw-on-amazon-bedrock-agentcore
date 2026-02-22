@@ -32,7 +32,7 @@ if [ -n "${GATEWAY_TOKEN_SECRET_ID:-}" ]; then
     SM_ERR=$(mktemp)
     GATEWAY_TOKEN=$(aws secretsmanager get-secret-value \
         --secret-id "${GATEWAY_TOKEN_SECRET_ID}" \
-        --region "${AWS_REGION:-us-west-2}" \
+        --region "${AWS_REGION:?AWS_REGION must be set}" \
         --query 'SecretString' \
         --output text 2>"${SM_ERR}" || echo "")
     if [ -s "${SM_ERR}" ]; then
@@ -54,7 +54,7 @@ COGNITO_PASSWORD_SECRET=""
 if [ -n "${COGNITO_PASSWORD_SECRET_ID:-}" ]; then
     COGNITO_PASSWORD_SECRET=$(aws secretsmanager get-secret-value \
         --secret-id "${COGNITO_PASSWORD_SECRET_ID}" \
-        --region "${AWS_REGION:-us-west-2}" \
+        --region "${AWS_REGION:?AWS_REGION must be set}" \
         --query 'SecretString' --output text 2>/dev/null || echo "")
     if [ -n "${COGNITO_PASSWORD_SECRET}" ]; then
         echo "[openclaw-agentcore] Cognito password secret loaded"
@@ -71,7 +71,7 @@ read_channel_secret() {
     local value
     value=$(aws secretsmanager get-secret-value \
         --secret-id "${secret_id}" \
-        --region "${AWS_REGION:-us-west-2}" \
+        --region "${AWS_REGION:?AWS_REGION must be set}" \
         --query 'SecretString' \
         --output text 2>/dev/null || echo "")
     echo "${value}"
@@ -162,7 +162,8 @@ cat > /root/.openclaw/openclaw.json <<CONF
     }
   },
   "tools": {
-    "profile": "full"
+    "profile": "full",
+    "deny": ["write", "edit", "apply_patch"]
   },
   "skills": {
     "allowBundled": ["*"],

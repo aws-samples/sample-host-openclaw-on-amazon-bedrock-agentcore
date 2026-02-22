@@ -1,0 +1,9 @@
+{
+  "name": "s3-user-files",
+  "version": "1.0.0",
+  "description": "Per-user persistent file storage backed by AWS S3",
+  "private": true,
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0"
+  }
+}

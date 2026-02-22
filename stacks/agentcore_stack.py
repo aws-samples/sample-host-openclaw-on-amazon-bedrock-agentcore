@@ -9,12 +9,15 @@ Also provisions AgentCore Memory for conversation persistence.
 
 from aws_cdk import (
     CfnOutput,
+    Duration,
     Stack,
     RemovalPolicy,
     aws_bedrockagentcore as agentcore,
     aws_ec2 as ec2,
     aws_ecr as ecr,
     aws_iam as iam,
+    aws_kms as kms,
+    aws_s3 as s3,
 )
 import cdk_nag
 from constructs import Construct
@@ -209,6 +212,32 @@ class AgentCoreStack(Stack):
             ],
         )
 
+        # --- S3 Bucket for Per-User File Storage ------------------------------
+        user_files_ttl_days = int(
+            self.node.try_get_context("user_files_ttl_days") or "365"
+        )
+        user_files_cmk = kms.Key.from_key_arn(self, "UserFilesCmk", cmk_arn)
+        self.user_files_bucket = s3.Bucket(
+            self,
+            "UserFilesBucket",
+            bucket_name=f"openclaw-user-files-{account}-{region}",
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=user_files_cmk,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            removal_policy=RemovalPolicy.RETAIN,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="expire-old-user-files",
+                    expiration=Duration.days(user_files_ttl_days),
+                ),
+            ],
+            enforce_ssl=True,
+            versioned=False,
+        )
+
+        # S3 per-user file storage permissions
+        self.user_files_bucket.grant_read_write(self.execution_role)
+
         # --- AgentCore WorkloadIdentity ---------------------------------------
         self.workload_identity = agentcore.CfnWorkloadIdentity(
             self,
@@ -245,8 +274,9 @@ class AgentCoreStack(Stack):
                 "COGNITO_CLIENT_ID": cognito_client_id,
                 "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
                 "AGENTCORE_MEMORY_ID": self.memory.attr_memory_id,
+                "S3_USER_FILES_BUCKET": self.user_files_bucket.bucket_name,
                 "AGENTCORE_WORKLOAD_IDENTITY_NAME": "openclaw_identity",
-                "IMAGE_VERSION": "8",  # bump to force container redeploy
+                "IMAGE_VERSION": "26",  # bump to force container redeploy
             },
             description="OpenClaw messaging bridge on AgentCore Runtime",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
@@ -264,6 +294,7 @@ class AgentCoreStack(Stack):
             agent_runtime_id=self.runtime.attr_agent_runtime_id,
             name="openclaw_agent_live",
             description="Production endpoint for OpenClaw on AgentCore",
+            agent_runtime_version=self.runtime.attr_agent_runtime_version,
         )
         self.runtime_endpoint.add_dependency(self.runtime)
 
@@ -276,6 +307,7 @@ class AgentCoreStack(Stack):
         CfnOutput(self, "RuntimeId", value=self.runtime.attr_agent_runtime_id)
         CfnOutput(self, "RuntimeEndpointId", value=self.runtime_endpoint.attr_id)
         CfnOutput(self, "MemoryId", value=self.memory.attr_memory_id)
+        CfnOutput(self, "UserFilesBucketName", value=self.user_files_bucket.bucket_name)
         CfnOutput(self, "WorkloadIdentityArn", value=self.workload_identity.attr_workload_identity_arn)
         CfnOutput(
             self,
@@ -300,6 +332,15 @@ class AgentCoreStack(Stack):
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::arn:aws:cognito-idp:{region}:{account}:userpool/*",
                         "Resource::*",
+                        # S3 per-user file storage bucket (grant_read_write wildcards)
+                        "Action::s3:Abort*",
+                        "Action::s3:DeleteObject*",
+                        "Action::s3:GetBucket*",
+                        "Action::s3:GetObject*",
+                        "Action::s3:List*",
+                        "Action::kms:GenerateDataKey*",
+                        "Action::kms:ReEncrypt*",
+                        "Resource::<UserFilesBucketCFDFD8C0.Arn>/*",
                     ],
                 ),
             ],
@@ -318,6 +359,16 @@ class AgentCoreStack(Stack):
                 ),
             ],
             apply_to_children=True,
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            self.user_files_bucket,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-S1",
+                    reason="Server access logging not required for user file storage — "
+                    "CloudTrail S3 data events provide sufficient audit trail.",
+                ),
+            ],
         )
         cdk_nag.NagSuppressions.add_resource_suppressions(
             self.agent_sg,
