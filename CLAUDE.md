@@ -115,7 +115,7 @@ cdk destroy --all                            # tear down
 ### Build & Push Bridge Image
 ```bash
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export CDK_DEFAULT_REGION=us-west-2
+export CDK_DEFAULT_REGION=ap-southeast-2
 
 docker build --platform linux/arm64 -t openclaw-bridge bridge/
 aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
@@ -146,6 +146,30 @@ aws secretsmanager update-secret \
   --secret-id openclaw/channels/slack \
   --secret-string '{"botToken":"xoxb-YOUR-BOT-TOKEN","appToken":"xapp-YOUR-APP-TOKEN"}' \
   --region $CDK_DEFAULT_REGION
+```
+
+### Deploy New Proxy Version
+```bash
+# 1. Bump IMAGE_VERSION in stacks/agentcore_stack.py
+# 2. Build + push
+docker build --platform linux/arm64 -t openclaw-bridge bridge/
+docker tag openclaw-bridge:latest 657117630614.dkr.ecr.ap-southeast-2.amazonaws.com/openclaw-bridge:latest
+docker push 657117630614.dkr.ecr.ap-southeast-2.amazonaws.com/openclaw-bridge:latest
+# 3. CDK deploy
+source .venv/bin/activate && cdk deploy OpenClawAgentCore --require-approval never
+# 4. Stop old session (REQUIRED — existing session keeps old image)
+aws bedrock-agentcore stop-runtime-session \
+  --runtime-session-id "openclaw-telegram-session-primary-keepalive-001" \
+  --agent-runtime-arn "arn:aws:bedrock-agentcore:ap-southeast-2:657117630614:runtime/openclaw_agent-4AglMQ9ED4" \
+  --qualifier "openclaw_agent_live" --region ap-southeast-2
+# 5. Invoke keepalive to start new session, wait ~4 min for OpenClaw startup
+aws lambda invoke --function-name openclaw-keepalive --payload '{}' --region ap-southeast-2 /tmp/status.json
+```
+
+### Bridge Tests
+```bash
+cd bridge && node --test proxy-identity.test.js       # 24 identity extraction tests
+cd bridge/skills/s3-user-files && AWS_REGION=ap-southeast-2 node --test common.test.js  # 22 S3 skill tests
 ```
 
 ### Runtime Operations
@@ -238,7 +262,7 @@ aws bedrock-agentcore invoke-agent-runtime \
 
 ### AgentCore Memory Integration
 - **Per-user isolation**: Each user's memories are namespaced by `actorId` (colons replaced with underscores, e.g., `telegram_6087229962`)
-- **Identity resolution**: `actorId` is extracted in priority order: (1) `x-openclaw-actor-id` header, (2) OpenAI `user` field in request body (NOTE: OpenClaw does NOT populate this), (3) OpenClaw message envelope parsing — regex extracts `id:NNNNN` from `[Channel senderName id:NNNNN timestamp]` prefix and combines with channel name to form `channel:id` (e.g., `telegram:12345`, `slack:U0123456789`), (4) message `name` field (NOTE: OpenClaw does NOT populate this), (5) fallback to `"default-user"` (logs a WARNING). The `default-user` fallback means memory isolation is disabled — all users share the same namespace. Diagnostic logging (`[proxy][identity-diag]`) is active to help verify which extraction method succeeds in production
+- **Identity resolution**: `actorId` is extracted in priority order: (1) `x-openclaw-actor-id` header, (2) OpenAI `user` field, (3) OpenClaw message envelope parsing (3 formats, checked in reverse message order): **Format C** (metadata JSON with `sender` field — highest priority, contains platform user IDs) > **Format A** (`System: [TIMESTAMP] Channel TYPE from SenderName:` — display-name fallback) > **Format B** (`[Channel ... id:ID]` — legacy). Format C auto-detects channel from sender ID pattern: `/^[UW][A-Z0-9]{8,}$/i` → Slack, `/^\d{15,}$/` → Discord, `/^\d{5,14}$/` → Telegram. (4) message `name` field, (5) fallback `"default-user"`. All extracted IDs validated against `VALID_ACTOR_ID` regex
 - **Request flow**: Before each Bedrock call, the proxy retrieves up to 5 relevant memory records via `RetrieveMemoryRecords` (hardcoded `MEMORY_RETRIEVAL_LIMIT = 5` in `agentcore-proxy.js`) using the user's latest message as a semantic search query. Records are filtered (`r.content && r.content.text`) and appended to the system prompt under a `## Relevant memories about this user` heading with instructions not to mention memory unless asked. After the response, the user/assistant exchange (both `USER` and `ASSISTANT` roles) is stored as a memory event via `CreateEvent` (fire-and-forget)
 - **Memory extraction**: A timer triggers `StartMemoryExtractionJob` every 10 minutes (+ 30s after startup). This is a **global operation** — it processes accumulated events across all user namespaces, not per-user. The 3 configured strategies (semantic, user_preference, summary) run server-side using a dedicated `MemoryExecutionRole` with `bedrock:InvokeModel` permissions
 - **Event expiry**: Raw conversation events expire after 90 days (`event_expiry_duration=90` in `agentcore_stack.py`). Extracted memory records (the output of strategies) persist independently
@@ -257,3 +281,10 @@ aws bedrock-agentcore invoke-agent-runtime \
 - **openclaw-mem removed**: The shared SQLite-based `openclaw-mem` ClawHub skill was replaced by AgentCore Memory (per-user) + S3 skill (per-user files)
 - **Content as CLI argument**: `write.js` receives content via `process.argv.slice(4).join(" ")` — works for typical .md files but may truncate very large content passed as shell arguments
 - **default-user rejection**: `write.js` and other S3 scripts reject `default_user`/`default-user` to prevent accidental shared-namespace writes
+- **IDENTITY.md pre-loading**: Proxy reads user's IDENTITY.md from S3 at request time and injects content into system prompt — prevents LLM from reading wrong namespace via tool calls
+- **System prompt sanitization**: IDENTITY.md content is truncated to 4096 chars and triple-backticks replaced with `~~~` to prevent code fence escape / prompt injection
+- **Channel validation**: Channel value validated against allowlist (`telegram`, `slack`, `discord`, `whatsapp`, `unknown`) before system prompt injection
+- **Namespace immutability**: System prompt includes "Namespace Protection (IMMUTABLE)" section — namespace is system-determined, users can change display name but not actorId/namespace
+- **S3 bucket encryption**: Uses project CMK (not AWS-managed key). When switching encryption keys, existing objects must be re-encrypted in-place via `aws s3 cp --sse aws:kms --sse-kms-key-id CMK_ARN`
+- **No PII in diagnostics**: `/health` endpoint only exposes `actorId`, `channel`, `idSource`, `msgCount`, `toolCount`, `timestamp` — no user message content
+- **AWS_REGION required**: Proxy, S3 skill scripts, and entrypoint.sh all fail fast if `AWS_REGION` is not set — no silent fallback to a wrong region
