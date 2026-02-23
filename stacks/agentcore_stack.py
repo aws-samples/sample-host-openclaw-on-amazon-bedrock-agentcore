@@ -276,7 +276,7 @@ class AgentCoreStack(Stack):
                 "AGENTCORE_MEMORY_ID": self.memory.attr_memory_id,
                 "S3_USER_FILES_BUCKET": self.user_files_bucket.bucket_name,
                 "AGENTCORE_WORKLOAD_IDENTITY_NAME": "openclaw_identity",
-                "IMAGE_VERSION": "26",  # bump to force container redeploy
+                "IMAGE_VERSION": "28",  # bump to force container redeploy
             },
             description="OpenClaw messaging bridge on AgentCore Runtime",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(

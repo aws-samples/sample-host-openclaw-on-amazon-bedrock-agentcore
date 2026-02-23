@@ -306,6 +306,87 @@ function getS3Client() {
   return _s3Client;
 }
 
+// Workspace files pre-loaded into system prompt per user (priority order)
+const WORKSPACE_FILES = [
+  {
+    filename: "AGENTS.md",
+    label: "Operating Instructions",
+    purpose: "rules, priorities, and behavioral guidelines",
+  },
+  {
+    filename: "SOUL.md",
+    label: "Agent Persona",
+    purpose: "persona, tone, and communication boundaries",
+  },
+  {
+    filename: "USER.md",
+    label: "User Preferences",
+    purpose: "user identity and communication preferences",
+  },
+  {
+    filename: "IDENTITY.md",
+    label: "Agent Identity",
+    purpose: "agent name, vibe, and emoji",
+  },
+  {
+    filename: "TOOLS.md",
+    label: "Tools Documentation",
+    purpose: "local tools and conventions documentation",
+  },
+  {
+    filename: "MEMORY.md",
+    label: "Notes & Memories",
+    purpose: "freeform notes and memories",
+  },
+];
+const WORKSPACE_PER_FILE_MAX_CHARS = 4096;
+const WORKSPACE_TOTAL_MAX_CHARS = 20000;
+
+// Default templates seeded into a user's S3 namespace on first interaction.
+// Minimal starters — users customize via write_user_file.
+const WORKSPACE_DEFAULTS = {
+  "AGENTS.md":
+    "# Operating Instructions\n\n" +
+    "- Be helpful, concise, and friendly\n" +
+    "- Keep responses appropriate for chat messaging\n" +
+    "- If you don't know something, say so honestly\n",
+  "SOUL.md":
+    "# Agent Persona\n\n" +
+    "You are a helpful personal assistant powered by OpenClaw.\n" +
+    "Tone: friendly, concise, knowledgeable.\n",
+  "USER.md":
+    "# User Preferences\n\n" +
+    "No preferences set yet. When the user shares their preferences " +
+    "(language, tone, format, interests), update this file.\n",
+  "IDENTITY.md":
+    "# Agent Identity\n\n" +
+    "No identity configured yet. When the user gives you a name, " +
+    "vibe, or emoji, update this file.\n",
+  "TOOLS.md":
+    "# Tools Documentation\n\n" +
+    "## Available Skills\n" +
+    "- **s3-user-files**: Read, write, list, and delete files in your personal workspace\n" +
+    "- **duckduckgo-search**: Search the web\n" +
+    "- **jina-reader**: Read web page content\n" +
+    "- **deep-research-pro**: In-depth research on complex topics\n",
+  "MEMORY.md":
+    "# Notes & Memories\n\n" +
+    "No notes yet. When the user asks you to remember something, " +
+    "save it here.\n",
+};
+
+/**
+ * Sanitize workspace file content for safe system prompt injection.
+ * Truncates to per-file limit and escapes code fences (both ``` and ~~~)
+ * to prevent fence-break injection when content is wrapped in ~~~ fences.
+ */
+function sanitizeWorkspaceContent(raw) {
+  return raw
+    .slice(0, WORKSPACE_PER_FILE_MAX_CHARS)
+    .replace(/```/g, "\\`\\`\\`")
+    .replace(/~~~/g, "\\~\\~\\~");
+}
+
 // Lazily initialized AgentCore client
 let _agentCoreClient = null;
 function getAgentCoreClient() {
@@ -374,10 +455,10 @@ async function retrieveMemoryContext(actorId, latestUserMessage) {
 }
 
 /**
- * Read a user's IDENTITY.md from S3 (fire-and-forget on error).
+ * Read a user file from S3 (fire-and-forget on error).
  * Returns the file content or empty string.
  */
-async function readUserIdentityFromS3(namespace) {
+async function readUserFileFromS3(namespace, filename) {
   const bucket = process.env.S3_USER_FILES_BUCKET;
   if (
     !bucket ||
@@ -393,7 +474,7 @@ async function readUserIdentityFromS3(namespace) {
     const response = await s3.send(
       new GetObjectCommand({
         Bucket: bucket,
-        Key: `${namespace}/IDENTITY.md`,
+        Key: `${namespace}/${filename}`,
       }),
     );
     const chunks = [];
@@ -402,15 +483,15 @@ async function readUserIdentityFromS3(namespace) {
     }
     const content = Buffer.concat(chunks).toString("utf-8").trim();
     console.log(
-      `[proxy] Read IDENTITY.md for ${namespace}: ${content.length} bytes`,
+      `[proxy] Read ${filename} for ${namespace}: ${content.length} bytes`,
     );
     return content;
   } catch (err) {
     if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
-      console.log(`[proxy] No IDENTITY.md for ${namespace} (new user)`);
+      console.log(`[proxy] No ${filename} for ${namespace} (not created yet)`);
     } else {
       console.warn(
-        `[proxy] Failed to read IDENTITY.md for ${namespace}:`,
+        `[proxy] Failed to read ${filename} for ${namespace}:`,
         err.message,
       );
     }
@@ -419,9 +500,74 @@ async function readUserIdentityFromS3(namespace) {
 }
 
 /**
+ * Write a file to a user's S3 namespace (fire-and-forget on error).
+ */
+async function writeUserFileToS3(namespace, filename, content) {
+  const bucket = process.env.S3_USER_FILES_BUCKET;
+  if (
+    !bucket ||
+    !namespace ||
+    namespace === "default_user" ||
+    namespace === "default-user"
+  ) {
+    return;
+  }
+  try {
+    const { PutObjectCommand } = require("@aws-sdk/client-s3");
+    const s3 = getS3Client();
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: `${namespace}/${filename}`,
+        Body: content,
+        ContentType: "text/markdown; charset=utf-8",
+      }),
+    );
+    console.log(
+      `[proxy] Seeded ${filename} for ${namespace}: ${content.length} bytes`,
+    );
+  } catch (err) {
+    console.warn(
+      `[proxy] Failed to seed ${filename} for ${namespace}:`,
+      err.message,
+    );
+  }
+}
+
+/**
+ * Seed missing workspace files with default templates.
+ * Called fire-and-forget after reading workspace files — does not block
+ * the current request. Missing files get defaults so they are available
+ * on the next request.
+ */
+async function ensureWorkspaceFiles(namespace, rawContents) {
+  const missing = [];
+  for (let i = 0; i < WORKSPACE_FILES.length; i++) {
+    const wf = WORKSPACE_FILES[i];
+    if (!rawContents[i] && WORKSPACE_DEFAULTS[wf.filename]) {
+      missing.push(wf);
+    }
+  }
+  if (missing.length === 0) return;
+
+  console.log(
+    `[proxy] Seeding ${missing.length} workspace file(s) for ${namespace}: ${missing.map((w) => w.filename).join(", ")}`,
+  );
+  await Promise.all(
+    missing.map((wf) =>
+      writeUserFileToS3(
+        namespace,
+        wf.filename,
+        WORKSPACE_DEFAULTS[wf.filename],
+      ),
+    ),
+  );
+}
+
+/**
  * Build user identity context to inject into the system prompt.
- * Includes actorId, channel, per-user isolation instructions,
- * and pre-loaded IDENTITY.md content from S3.
+ * Pre-loads all workspace files from S3 in parallel, injects per-user
+ * isolation rules, and enforces per-file and total size caps.
  */
 const VALID_CHANNELS = new Set([
   "telegram",
@@ -435,27 +581,72 @@ async function buildUserIdentityContext(actorId, channel) {
   const safeChannel = VALID_CHANNELS.has(channel) ? channel : "unknown";
   const namespace = actorId.replace(/:/g, "_");
 
-  // Pre-load this user's IDENTITY.md so the bot already knows its identity
-  // without needing to execute S3 tool calls (prevents wrong-namespace reads).
-  const rawIdentity = await readUserIdentityFromS3(namespace);
-  // Sanitize: strip triple-backtick sequences to prevent code fence escape / prompt injection,
-  // and cap length to prevent oversized identity files from bloating the system prompt.
-  const identityContent = rawIdentity.slice(0, 4096).replace(/```/g, "~~~");
-  const identitySection = identityContent
-    ? `\n## Pre-loaded User Data (from ${namespace}/IDENTITY.md)\n` +
-      "The following is this user's stored identity file. Use this data directly — " +
-      "do NOT re-read it from S3 unless the user explicitly asks to refresh.\n" +
-      "```\n" +
-      identityContent +
-      "\n```\n"
-    : `\n## No stored identity yet\nThis user (${namespace}) has no IDENTITY.md file. ` +
-      "If they tell you their name or preferences, save it using write_user_file.\n";
+  // Pre-load all workspace files in parallel
+  const rawContents = await Promise.all(
+    WORKSPACE_FILES.map((wf) => readUserFileFromS3(namespace, wf.filename)),
+  );
+
+  // Fire-and-forget: seed any missing workspace files with defaults.
+  // Does not block the current request — defaults appear on next request.
+  ensureWorkspaceFiles(namespace, rawContents).catch(() => {});
+
+  // Build per-file sections with total cap enforcement
+  let totalChars = 0;
+  const fileSections = [];
+  const skippedFiles = new Set();
+  for (let i = 0; i < WORKSPACE_FILES.length; i++) {
+    const wf = WORKSPACE_FILES[i];
+    const raw = rawContents[i];
+
+    if (raw) {
+      const sanitized = sanitizeWorkspaceContent(raw);
+      if (totalChars + sanitized.length > WORKSPACE_TOTAL_MAX_CHARS) {
+        skippedFiles.add(wf.filename);
+        fileSections.push(
+          `\n## Workspace: ${wf.label} (${wf.filename})\n` +
+            `*Skipped — total workspace size cap reached.* ` +
+            `Use \`read_user_file("${namespace}", "${wf.filename}")\` to read on demand.\n`,
+        );
+        continue;
+      }
+      totalChars += sanitized.length;
+      fileSections.push(
+        `\n## Workspace: ${wf.label} (${wf.filename})\n` +
+          "Use this data directly — do NOT re-read from S3 unless the user explicitly asks to refresh.\n" +
+          "~~~\n" +
+          sanitized +
+          "\n~~~\n",
+      );
+    } else {
+      fileSections.push(
+        `\n## Workspace: ${wf.label} (${wf.filename})\n` +
+          `*Not yet created.* This user has no ${wf.filename}. ` +
+          `When the user provides ${wf.purpose}, save it using write_user_file.\n`,
+      );
+    }
+  }
+
+  // Workspace file guide (compact reference including optional files)
+  const fileGuide =
+    "\n## Workspace File Guide\n" +
+    "| File | Purpose | Status |\n" +
+    "|------|---------|--------|\n" +
+    WORKSPACE_FILES.map((wf, i) => {
+      const status = skippedFiles.has(wf.filename)
+        ? "skipped (cap)"
+        : rawContents[i]
+          ? "pre-loaded"
+          : "empty";
+      return `| ${wf.filename} | ${wf.purpose} | ${status} |`;
+    }).join("\n") +
+    "\n| HEARTBEAT.md | scheduled check-in preferences | optional |\n";
 
   return (
     "\n\n## Current User\n" +
     `You are chatting with user: ${actorId} (namespace: ${namespace}) on channel: ${safeChannel}.\n` +
     `Always use "${namespace}" as the user_id when calling the s3-user-files skill.\n` +
-    identitySection +
+    fileSections.join("") +
+    fileGuide +
     "\n## Per-User Isolation Rules (CRITICAL)\n" +
     "1. NEVER write to local files (MEMORY.md, IDENTITY.md, NOTES.md, etc.) " +
     "for storing persistent data. Local files are SHARED across all users.\n" +

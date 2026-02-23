@@ -168,7 +168,7 @@ aws lambda invoke --function-name openclaw-keepalive --payload '{}' --region ap-
 
 ### Bridge Tests
 ```bash
-cd bridge && node --test proxy-identity.test.js       # 24 identity extraction tests
+cd bridge && node --test proxy-identity.test.js       # 31 identity + workspace tests
 cd bridge/skills/s3-user-files && AWS_REGION=ap-southeast-2 node --test common.test.js  # 22 S3 skill tests
 ```
 
@@ -270,7 +270,7 @@ aws bedrock-agentcore invoke-agent-runtime \
 - **Session ID generation**: Session IDs are generated per `actorId:channel` pair as `ses-{timestamp}-{random}-{md5hash}` and cached in-memory (`sessionMap`). AgentCore requires minimum 33 characters. Session IDs are lost on container restart but this only affects session continuity metadata, not memory records
 - **SDK**: Uses `@aws-sdk/client-bedrock-agentcore` (`BedrockAgentCoreClient`)
 - **Namespace character restrictions**: `actorId` contains colons (e.g., `telegram:6087229962`) which may be rejected by the namespace field — proxy replaces `:` with `_`
-- **Added latency**: Memory retrieval adds ~50-200ms per request
+- **Added latency**: Memory retrieval adds ~50-200ms, workspace file pre-loading adds ~100ms (parallel S3 reads) per request
 - **Container restart**: Memories persist across container restarts since they are stored in AgentCore Memory (server-side), not in-memory. The in-memory `sessionMap` is lost, generating new session IDs, but this has no effect on memory retrieval
 
 ### Per-User File Isolation
@@ -281,8 +281,8 @@ aws bedrock-agentcore invoke-agent-runtime \
 - **openclaw-mem removed**: The shared SQLite-based `openclaw-mem` ClawHub skill was replaced by AgentCore Memory (per-user) + S3 skill (per-user files)
 - **Content as CLI argument**: `write.js` receives content via `process.argv.slice(4).join(" ")` — works for typical .md files but may truncate very large content passed as shell arguments
 - **default-user rejection**: `write.js` and other S3 scripts reject `default_user`/`default-user` to prevent accidental shared-namespace writes
-- **IDENTITY.md pre-loading**: Proxy reads user's IDENTITY.md from S3 at request time and injects content into system prompt — prevents LLM from reading wrong namespace via tool calls
-- **System prompt sanitization**: IDENTITY.md content is truncated to 4096 chars and triple-backticks replaced with `~~~` to prevent code fence escape / prompt injection
+- **Workspace file pre-loading**: Proxy reads 5 workspace files (`AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`) from S3 in parallel at request time and injects content into system prompt — prevents LLM from reading wrong namespace via tool calls. ~100ms added latency (parallel S3 reads)
+- **System prompt sanitization**: Workspace file content is truncated to 4096 chars per file (20,000 total) and triple-backticks replaced with `~~~` to prevent code fence escape / prompt injection
 - **Channel validation**: Channel value validated against allowlist (`telegram`, `slack`, `discord`, `whatsapp`, `unknown`) before system prompt injection
 - **Namespace immutability**: System prompt includes "Namespace Protection (IMMUTABLE)" section — namespace is system-determined, users can change display name but not actorId/namespace
 - **S3 bucket encryption**: Uses project CMK (not AWS-managed key). When switching encryption keys, existing objects must be re-encrypted in-place via `aws s3 cp --sse aws:kms --sse-kms-key-id CMK_ARN`
