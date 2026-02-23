@@ -5,126 +5,203 @@
 ```
                                                       +---------------------------+
                                                       |        End Users          |
-                                                      |  Telegram  Discord  Slack |
-                                                      +--+--------+--------+-----+
-                                                         |        |        |
-                                              (bot APIs via HTTPS over internet)
-                                                         |        |        |
-+--------------------------------------------------------+--------+--------+------------------+
-|  AWS Account                                                                                |
-|  +---------------------------------------------------+                                      |
-|  |  VPC (10.0.0.0/16)                                |                                      |
-|  |  +----------------------------------------------+ |                                      |
-|  |  |  Public Subnets (2 AZ)                       | |                                      |
-|  |  |  +----------------+  +---------------------+ | |                                      |
-|  |  |  | NAT Gateway    |  | Internet Gateway    | | |                                      |
-|  |  |  +-------+--------+  +----------+----------+ | |                                      |
-|  |  +----------|-------------------------|---------+ |                                      |
-|  |  |          v                         |           |                                      |
-|  |  |  Private Subnets (2 AZ)            |           |                                      |
-|  |  |                                                |                                      |
-|  |  |  +------------------------------------------+  |                                      |
-|  |  |  |  AgentCore Runtime Container (ARM64)     |  |                                      |
-|  |  |  |  (managed serverless — no EC2/Fargate)   |  |                                      |
-|  |  |  |                                          |  |                                      |
-|  |  |  |  +--------------+  +-----------------+   |  |                                      |
-|  |  |  |  | agentcore-   |  | OpenClaw        |   |  |                                      |
-|  |  |  |  | contract.js  |  | Gateway         |   |  |                                      |
-|  |  |  |  | (port 8080)  |  | (port 18789)    |   |  |                                      |
-|  |  |  |  | - /ping      |  | - Telegram bot  |   |  |                                      |
-|  |  |  |  | - /invoke    |  | - Discord bot   |   |  |                                      |
-|  |  |  |  +--------------+  | - Slack bot     |   |  |                                      |
-|  |  |  |                    +--------+--------+   |  |                                      |
-|  |  |  |                             |            |  |                                      |
-|  |  |  |                    +--------v--------+   |  |                                      |
-|  |  |  |                    | agentcore-      |   |  |                                      |
-|  |  |  |                    | proxy.js        |   |  |                                      |
-|  |  |  |                    | (port 18790)    |   |  |                                      |
-|  |  |  |                    | - OpenAI compat |   |  |                                      |
-|  |  |  |                    | - Converse API  |   |  |                                      |
-|  |  |  |                    | - SSE streaming |   |  |                                      |
-|  |  |  |                    +--------+--------+   |  |                                      |
-|  |  |  +---------------------|--------------------+  |                                      |
-|  |  |                        |                       |                                      |
-|  |  |  +---------------------v--------------------+  |                                      |
-|  |  |  |  VPC Endpoints (Interface)               |  |                                      |
-|  |  |  |  - bedrock-runtime    - ecr.api          |  |                                      |
-|  |  |  |  - secretsmanager     - ecr.dkr          |  |                                      |
-|  |  |  |  - logs               - monitoring       |  |                                      |
-|  |  |  |  - ssm                                   |  |                                      |
-|  |  |  |  + S3 Gateway Endpoint                   |  |                                      |
-|  |  |  +------------------------------------------+  |                                      |
-|  |  +------------------------------------------------+                                      |
-|  |                            |                                                              |
-|  |         +------------------+------------------+                                           |
-|  |         |                                     |                                           |
-|  |  +------v-----------+               +---------v----------+                                |
-|  |  | Amazon Bedrock   |               | Secrets Manager    |                                |
-|  |  | ConverseStream   |               | - gateway-token    |                                |
-|  |  | API              |               | - cognito-password |                                |
-|  |  | Claude Sonnet 4.6|               | - channels/*       |                                |
-|  |  +------------------+               +--------------------+                                |
-|  |                                                                                           |
-+--+-------------------------------------------------------------------------------------------+
-
+                                                      |    Telegram     Slack     |
+                                                      +--+---------------+-------+
+                                                         |               |
+                                              (webhook HTTPS over internet)
+                                                         |               |
++--------------------------------------------------------+---------------+-------------------+
+|  AWS Account                                                                               |
+|                                                                                            |
+|  +----------------------------------------------+                                         |
+|  |  API Gateway HTTP API                        |                                         |
+|  |  (openclaw-router)                           |                                         |
+|  |                                              |                                         |
+|  |  POST /webhook/telegram  --> Lambda          |                                         |
+|  |  POST /webhook/slack     --> Lambda          |                                         |
+|  |  GET  /health            --> Lambda          |                                         |
+|  |  (all other paths --> 404, no Lambda invoke) |                                         |
+|  |                                              |                                         |
+|  |  Throttling: burst 50, sustained 100 req/s   |                                         |
+|  +----------------------+-----------------------+                                         |
+|                         |                                                                  |
+|  +----------------------v-----------------------+                                         |
+|  |  Router Lambda (openclaw-router)             |                                         |
+|  |                                              |                                         |
+|  |  1. Validate webhook signature               |                                         |
+|  |     - Telegram: X-Telegram-Bot-Api-Secret-   |                                         |
+|  |       Token header                           |                                         |
+|  |     - Slack: X-Slack-Signature HMAC-SHA256   |                                         |
+|  |  2. Self-invoke async (return 200 to caller) |                                         |
+|  |  3. Resolve user in DynamoDB identity table  |                                         |
+|  |  4. Get/create per-user AgentCore session    |                                         |
+|  |  5. InvokeAgentRuntime(sessionId=per-user)   |                                         |
+|  |  6. Send response back to channel API        |                                         |
+|  +----------------------+-----------------------+                                         |
+|                         |                                                                  |
+|          +--------------+--------------+                                                   |
+|          |                             |                                                   |
+|  +-------v--------+          +--------v---------+                                         |
+|  | DynamoDB       |          | Secrets Manager   |                                         |
+|  | (identity)     |          | - gateway-token   |                                         |
+|  |                |          | - webhook-secret  |                                         |
+|  | CHANNEL# items |          | - cognito-password|                                         |
+|  | USER# items    |          | - channels/*      |                                         |
+|  | SESSION items  |          +-------------------+                                         |
+|  | BIND# items    |                                                                        |
+|  +----------------+                                                                        |
+|                         |                                                                  |
+|  +---------------------------------------------------+                                    |
+|  |  VPC (10.0.0.0/16)                                |                                    |
+|  |  +----------------------------------------------+ |                                    |
+|  |  |  Public Subnets (2 AZ)                       | |                                    |
+|  |  |  +----------------+  +---------------------+ | |                                    |
+|  |  |  | NAT Gateway    |  | Internet Gateway    | | |                                    |
+|  |  |  +-------+--------+  +----------+----------+ | |                                    |
+|  |  +----------|-------------------------|---------+ |                                    |
+|  |  |          v                         |           |                                    |
+|  |  |  Private Subnets (2 AZ)            |           |                                    |
+|  |  |                                                |                                    |
+|  |  |  +------------------------------------------+  |                                    |
+|  |  |  |  AgentCore Runtime Container (ARM64)     |  |                                    |
+|  |  |  |  (per-user microVM — managed serverless) |  |                                    |
+|  |  |  |                                          |  |                                    |
+|  |  |  |  +--------------+  +-----------------+   |  |                                    |
+|  |  |  |  | agentcore-   |  | OpenClaw        |   |  |                                    |
+|  |  |  |  | contract.js  |  | Gateway         |   |  |                                    |
+|  |  |  |  | (port 8080)  |  | (port 18789)    |   |  |                                    |
+|  |  |  |  | - /ping      |  | - headless mode |   |  |                                    |
+|  |  |  |  | - /invoke    |  | - no channels   |   |  |                                    |
+|  |  |  |  | - WS bridge  |  | - tools & skills|   |  |                                    |
+|  |  |  |  +--------------+  +--------+--------+   |  |                                    |
+|  |  |  |                             |            |  |                                    |
+|  |  |  |                    +--------v--------+   |  |                                    |
+|  |  |  |                    | agentcore-      |   |  |                                    |
+|  |  |  |                    | proxy.js        |   |  |                                    |
+|  |  |  |                    | (port 18790)    |   |  |                                    |
+|  |  |  |                    | - OpenAI compat |   |  |                                    |
+|  |  |  |                    | - Converse API  |   |  |                                    |
+|  |  |  |                    | - SSE streaming |   |  |                                    |
+|  |  |  |                    +--------+--------+   |  |                                    |
+|  |  |  +---------------------|--------------------+  |                                    |
+|  |  |                        |                       |                                    |
+|  |  |  +---------------------v--------------------+  |                                    |
+|  |  |  |  VPC Endpoints (Interface)               |  |                                    |
+|  |  |  |  - bedrock-runtime    - ecr.api          |  |                                    |
+|  |  |  |  - secretsmanager     - ecr.dkr          |  |                                    |
+|  |  |  |  - logs               - monitoring       |  |                                    |
+|  |  |  |  - ssm                                   |  |                                    |
+|  |  |  |  + S3 Gateway Endpoint                   |  |                                    |
+|  |  |  +------------------------------------------+  |                                    |
+|  |  +------------------------------------------------+                                    |
+|  |                            |                                                            |
+|  |         +------------------+------------------+                                         |
+|  |         |                                     |                                         |
+|  |  +------v-----------+               +---------v----------+                              |
+|  |  | Amazon Bedrock   |               | S3 User Files      |                              |
+|  |  | ConverseStream   |               | Bucket             |                              |
+|  |  | API              |               | - {ns}/.openclaw/  |                              |
+|  |  | Claude Opus 4.6  |               | - {ns}/files/      |                              |
+|  |  +------------------+               +--------------------+                              |
+|  |                                                                                         |
++--+-----------------------------------------------------------------------------------------+
 ```
 
-## Keepalive Architecture
+## Per-User Session Lifecycle
 
 ```
-+-------------------+         +-------------------+         +----------------------+
-| Amazon            |  every  | AWS Lambda        |  invoke | AgentCore Runtime    |
-| EventBridge       |-------->| (keepalive)       |-------->| Container            |
-| (5-min rule)      |  5 min  |                   |  POST   | /invocations         |
-+-------------------+         +-------------------+  action | {"action":"keepalive"}|
-                                                    :status +----------------------+
-                                                             |
-                                                    /ping -> HealthyBusy
-                                                    (prevents idle termination)
+  User sends first message on Telegram
+         |
+         v
+  API Gateway HTTP API (POST /webhook/telegram)
+         |
+         v
+  Router Lambda validates X-Telegram-Bot-Api-Secret-Token
+         |
+         v
+  Self-invoke async (returns 200 to Telegram immediately)
+         |
+         v
+  Resolve user in DynamoDB (create if new)
+  Get/create session (ses_{user_id}_{uuid})
+         |
+         v
+  InvokeAgentRuntime(runtimeSessionId = per-user session ID)
+         |
+         v
+  AgentCore creates new microVM for this session
+         |
+         v
+  Container starts -> contract server (port 8080) -> /ping = Healthy
+         |
+         v
+  First /invocations {action: "chat"}:
+    1. Restore .openclaw/ from S3  (workspace-sync.js)
+    2. Start agentcore-proxy.js (port 18790) with USER_ID env
+    3. Write headless OpenClaw config (no channels)
+    4. Start OpenClaw gateway (port 18789, ~4 min startup)
+    5. Start periodic workspace saves (every 5 min)
+         |
+         v
+  WebSocket bridge: auth -> chat.send -> streaming deltas -> final
+         |
+         v
+  Router Lambda sends response to Telegram via sendMessage API
+         |
+         v
+  (Subsequent messages reuse the warm microVM — fast response)
+         |
+  ... idle for 30 min (configurable) ...
+         |
+         v
+  AgentCore sends SIGTERM:
+    1. Save .openclaw/ to S3  (final workspace save)
+    2. Kill child processes
+    3. Exit
+         |
+         v
+  (Next message: new microVM created, workspace restored from S3)
 ```
-
-AgentCore Runtime terminates containers after:
-- **Idle timeout**: configurable (set to 8 hours)
-- **Max lifetime**: 8 hours
-
-The keepalive Lambda invokes the runtime every 5 minutes, and the contract server returns `HealthyBusy` on `/ping` to prevent idle termination.
 
 ## Container Internal Architecture
 
 ```
 +-----------------------------------------------------------------------+
-|  AgentCore Runtime Container (node:22-slim, ARM64)                    |
+|  AgentCore Runtime Container (node:22-slim, ARM64, per-user)          |
 |                                                                       |
-|  entrypoint.sh orchestrates startup in order:                         |
+|  entrypoint.sh starts contract server immediately:                    |
 |                                                                       |
-|  Step 1:  agentcore-contract.js (port 8080)     <-- MUST START FIRST |
-|           |-- GET /ping -> {"status":"HealthyBusy"}                   |
-|           |-- POST /invocations -> status/keepalive                   |
-|           |-- Polls proxy & OpenClaw health every 10s                 |
+|  agentcore-contract.js (port 8080)         <-- MUST START FIRST      |
+|    |-- GET /ping -> {"status":"Healthy"}   (allows idle termination)  |
+|    |-- POST /invocations {action:"chat"}   (triggers lazy init)      |
+|    |-- POST /invocations {action:"status"} (health info)             |
+|    |                                                                  |
+|    |-- On first chat (lazy init):                                    |
+|    |   1. Fetch secrets from Secrets Manager                         |
+|    |   2. Restore .openclaw/ from S3 (workspace-sync.js)             |
+|    |   3. Start agentcore-proxy.js (port 18790)                      |
+|    |   4. Write headless OpenClaw config (no channels)               |
+|    |   5. Start OpenClaw gateway (port 18789) — ~4 min startup       |
+|    |   6. Start periodic workspace saves                              |
+|    |                                                                  |
+|    |-- On subsequent chats:                                          |
+|    |   WebSocket bridge to OpenClaw:                                 |
+|    |   connect -> auth(token) -> chat.send -> deltas -> final        |
+|    |                                                                  |
+|    |-- On SIGTERM:                                                   |
+|        Save .openclaw/ to S3 -> kill children -> exit                |
 |                                                                       |
-|  Step 2:  Fetch secrets from Secrets Manager                          |
-|           |-- Gateway token                                           |
-|           |-- Cognito HMAC secret                                     |
-|           |-- Channel bot tokens (Telegram, Discord, Slack)           |
-|           |-- Skip channels with placeholder tokens                   |
+|  agentcore-proxy.js (port 18790)                                      |
+|    |-- POST /v1/chat/completions -> Bedrock ConverseStream            |
+|    |-- GET /v1/models -> available models                             |
+|    |-- GET /health -> proxy status                                    |
+|    |-- Cognito auto-provisioning (HMAC passwords)                     |
+|    |-- Per-user workspace files (AGENTS.md, SOUL.md, etc.)            |
 |                                                                       |
-|  Step 3:  agentcore-proxy.js (port 18790)                             |
-|           |-- POST /v1/chat/completions -> Bedrock ConverseStream     |
-|           |-- GET /v1/models -> available models                      |
-|           |-- GET /health -> proxy status                             |
-|           |-- Cognito auto-provisioning (HMAC passwords)              |
-|           |-- Retry logic (3x exponential backoff)                    |
-|                                                                       |
-|  Step 4:  Write /root/.openclaw/openclaw.json                         |
-|           |-- Model provider: agentcore (localhost:18790)              |
-|           |-- Enabled channels with valid tokens                      |
-|           |-- Gateway auth token                                      |
-|                                                                       |
-|  Step 5:  openclaw gateway run (port 18789) [foreground]              |
-|           |-- Telegram: polling via getUpdates                        |
-|           |-- Discord: WebSocket gateway                              |
-|           |-- Slack: RTM or Events API                                |
-|           |-- Routes messages to proxy as OpenAI completions          |
+|  OpenClaw Gateway (port 18789) — headless mode                        |
+|    |-- No channel connections (messages bridged via WebSocket)         |
+|    |-- Full tool profile (web, filesystem, runtime, sessions, etc.)   |
+|    |-- 10 ClawHub skills + 1 custom S3 user files skill               |
 |                                                                       |
 |  NODE_OPTIONS: --dns-result-order=ipv4first                           |
 |                --no-network-family-autoselection                       |
@@ -179,10 +256,26 @@ The keepalive Lambda invokes the runtime every 5 minutes, and the contract serve
   Telegram user sends message
          |
          v
-  OpenClaw extracts actor ID (e.g. "telegram:6087229962")
+  API Gateway -> Router Lambda
          |
          v
-  agentcore-proxy.js receives chat completion request
+  Extract channel user ID (e.g. "telegram:6087229962")
+         |
+         v
+  DynamoDB lookup: CHANNEL#telegram:6087229962
+         |
+         +-- Not found: create new user (user_<uuid>)
+         |   -> CHANNEL# item, USER# profile, SESSION item
+         +-- Found: get existing userId
+         |
+         v
+  InvokeAgentRuntime(sessionId from DynamoDB SESSION item)
+         |
+         v
+  Container starts -> agentcore-proxy.js
+         |
+         v
+  USER_ID env var set by contract server (e.g. "telegram:6087229962")
          |
          v
   derivePassword(actorId) = HMAC-SHA256(secret, actorId).slice(0, 32)
@@ -199,45 +292,76 @@ The keepalive Lambda invokes the runtime every 5 minutes, and the contract serve
   JWT IdToken (cached per user, 60s early refresh)
          |
          v
-  [Future: pass JWT to AgentCore Gateway for enforcement]
-  [Current: direct Bedrock call with SigV4]
+  Bedrock ConverseStream call with user-specific workspace context
+```
+
+## Cross-Channel Account Linking
+
+```
+  User on Telegram: "link"
+         |
+         v
+  Router Lambda generates 6-char bind code
+  Stores in DynamoDB: BIND#A1B2C3 -> userId (10 min TTL)
+         |
+         v
+  Bot replies: "Your link code is A1B2C3 (valid 10 min)"
+
+  User on Slack: "link A1B2C3"
+         |
+         v
+  Router Lambda looks up BIND#A1B2C3
+  Finds userId from Telegram
+         |
+         v
+  Creates CHANNEL#slack:U12345 -> same userId
+  Creates USER#userId CHANNEL#slack:U12345 record
+  Deletes bind code
+         |
+         v
+  Both channels now route to same user, session, and workspace
 ```
 
 ## CDK Stack Dependencies
 
 ```
   OpenClawVpc ─────────────┐
-                           │
-  OpenClawSecurity ────────┤
-                           │
-                   ┌───────v───────┐
-                   │ OpenClawAgent │
-                   │ Core          │
-                   └───────┬───────┘
-                           │
-                   ┌───────v───────┐
-                   │ OpenClawKeep  │
-                   │ alive         │
-                   └───────────────┘
+                            │
+  OpenClawSecurity ─────────┤
+                            │
+                    ┌───────v───────┐
+                    │ OpenClawAgent │
+                    │ Core          │
+                    └───────┬───────┘
+                            │
+                    ┌───────v───────┐
+                    │ OpenClawRouter│
+                    └───────────────┘
 
-  OpenClawObservability ───┐
-                           │
-                   ┌───────v───────┐
-                   │ OpenClawToken │
-                   │ Monitoring    │
-                   └───────────────┘
+  OpenClawObservability ────┐
+                            │
+                    ┌───────v───────┐
+                    │ OpenClawToken │
+                    │ Monitoring    │
+                    └───────────────┘
 ```
 
 ## Security Controls
 
 | Layer | Control | Details |
 |---|---|---|
+| API Gateway | Explicit routes | Only `/webhook/telegram`, `/webhook/slack`, `/health` — all others 404 |
+| API Gateway | Throttling | Burst: 50, sustained: 100 req/s |
+| Webhook | Telegram validation | `X-Telegram-Bot-Api-Secret-Token` header against Secrets Manager secret |
+| Webhook | Slack validation | `X-Slack-Signature` HMAC-SHA256 with 5-minute replay window |
 | Network | VPC + private subnets | Container runs in private subnets, egress via NAT |
 | Network | VPC endpoints (7) | Bedrock, ECR, Secrets Manager, Logs, Metrics, SSM, S3 |
 | Encryption | KMS CMK | All secrets encrypted with customer-managed key |
-| Secrets | Secrets Manager | Bot tokens, gateway token, Cognito HMAC secret |
+| Secrets | Secrets Manager | 7 secrets: gateway token, webhook secret, cognito HMAC, 4 channel tokens |
+| Identity | DynamoDB | Channel-to-user mapping, cross-channel binding, session management |
 | Identity | Cognito User Pool | Auto-provisioned users with HMAC-derived passwords |
 | IAM | Least privilege | cdk-nag AwsSolutions checks enforced at synth |
-| Audit | CloudTrail | API call logging with S3 storage |
+| Storage | S3 encryption | KMS-encrypted user files bucket, SSL enforced, public access blocked |
+| Audit | CloudTrail | API call logging with S3 storage and file validation |
 | Monitoring | CloudWatch alarms | Error rates, latency, throttles, budget thresholds |
 | Cost | Token budgets | Daily token/cost alarms with anomaly detection |

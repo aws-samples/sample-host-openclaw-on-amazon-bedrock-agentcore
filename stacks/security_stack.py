@@ -126,6 +126,20 @@ class SecurityStack(Stack):
             f"{self.user_pool.user_pool_id}"
         )
 
+        # --- Webhook validation secret (Telegram secret_token, Slack signing) --
+        self.webhook_secret = secretsmanager.Secret(
+            self,
+            "WebhookSecret",
+            secret_name="openclaw/webhook-secret",
+            description="Secret token for validating incoming webhook requests "
+            "(Telegram X-Telegram-Bot-Api-Secret-Token, Slack signing secret)",
+            encryption_key=self.cmk,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=64,
+                exclude_punctuation=True,
+            ),
+        )
+
         # --- HMAC secret for deriving Cognito user passwords -----------------
         self.cognito_password_secret = secretsmanager.Secret(
             self,
@@ -140,7 +154,7 @@ class SecurityStack(Stack):
         )
 
         # --- cdk-nag suppressions ---
-        all_secrets = [self.gateway_token_secret, self.cognito_password_secret] + list(self.channel_secrets.values())
+        all_secrets = [self.gateway_token_secret, self.cognito_password_secret, self.webhook_secret] + list(self.channel_secrets.values())
         cdk_nag.NagSuppressions.add_resource_suppressions(
             all_secrets,
             [

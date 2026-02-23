@@ -6,8 +6,9 @@
  * (inline in proxy module), we mirror the extraction logic here.
  * Changes to the proxy must be mirrored.
  */
-const { describe, it } = require("node:test");
+const { describe, it, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 
 // --- Mirror of identity extraction logic from extractSessionMetadata ---
 
@@ -115,7 +116,74 @@ function extractIdentityFromMessages(messages) {
   return { actorId, channel, idSource };
 }
 
+// --- Mirror of USER_ID env var path from extractSessionMetadata ---
+
+/**
+ * Simulates the USER_ID env var priority path (priority 0).
+ * When USER_ID is set, all other extraction methods are skipped.
+ */
+function extractWithEnvVars(userId, channelEnv) {
+  if (!userId) return null;
+  const actorId = userId;
+  const channel = channelEnv || "unknown";
+  const idSource = "environment";
+  const key = `${actorId}:${channel}`;
+  const ts = Date.now().toString(36);
+  const rand = crypto.randomBytes(12).toString("hex");
+  const sessionId = `ses-${ts}-${rand}-${crypto
+    .createHash("md5")
+    .update(key)
+    .digest("hex")
+    .slice(0, 8)}`;
+  return { sessionId, actorId, channel, idSource };
+}
+
 // --- Tests ---
+
+describe("USER_ID env var (highest priority, per-user sessions)", () => {
+  it("resolves identity from USER_ID env var", () => {
+    const result = extractWithEnvVars("telegram:6087229962", "telegram");
+    assert.equal(result.actorId, "telegram:6087229962");
+    assert.equal(result.channel, "telegram");
+    assert.equal(result.idSource, "environment");
+  });
+
+  it("generates session ID >= 33 chars (AgentCore requirement)", () => {
+    const result = extractWithEnvVars("telegram:6087229962", "telegram");
+    assert.ok(
+      result.sessionId.length >= 33,
+      `Session ID too short: ${result.sessionId.length} chars`,
+    );
+    assert.ok(result.sessionId.startsWith("ses-"));
+  });
+
+  it("uses 'unknown' channel when CHANNEL env not set", () => {
+    const result = extractWithEnvVars("slack:U0AGD41CBGS", undefined);
+    assert.equal(result.actorId, "slack:U0AGD41CBGS");
+    assert.equal(result.channel, "unknown");
+  });
+
+  it("returns null when USER_ID is empty/unset", () => {
+    const result = extractWithEnvVars("", "telegram");
+    assert.equal(result, null);
+  });
+
+  it("takes priority over message-based extraction", () => {
+    // When USER_ID is set, message content is irrelevant
+    const envResult = extractWithEnvVars("telegram:99999", "telegram");
+    const msgResult = extractIdentityFromMessages([
+      {
+        role: "user",
+        content:
+          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "6087229962"}\n```',
+      },
+    ]);
+    // Env var gives telegram:99999, messages give telegram:6087229962
+    assert.equal(envResult.actorId, "telegram:99999");
+    assert.equal(msgResult.actorId, "telegram:6087229962");
+    // In the real proxy, env var path returns early before message parsing
+  });
+});
 
 describe("Format C: Metadata JSON (highest priority)", () => {
   it("extracts telegram identity from metadata JSON", () => {

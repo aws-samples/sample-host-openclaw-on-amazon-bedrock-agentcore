@@ -17,7 +17,7 @@ if (!AWS_REGION) {
   process.exit(1);
 }
 const MODEL_ID =
-  process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-4-6";
+  process.env.BEDROCK_MODEL_ID || "global.anthropic.claude-opus-4-6-v1";
 
 // Cognito identity configuration
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
@@ -57,6 +57,25 @@ function extractSessionMetadata(parsed, headers) {
   let channel = "unknown";
   let sessionId = "";
   let idSource = "none";
+
+  // 0. Check environment variables (set by contract server per user session)
+  if (process.env.USER_ID) {
+    actorId = process.env.USER_ID;
+    channel = process.env.CHANNEL || "unknown";
+    idSource = "environment";
+    // Generate stable session ID for this user
+    const key = `${actorId}:${channel}`;
+    if (!sessionMap.has(key)) {
+      const ts = Date.now().toString(36);
+      const rand = crypto.randomBytes(12).toString("hex");
+      sessionMap.set(
+        key,
+        `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
+      );
+    }
+    sessionId = sessionMap.get(key);
+    return { sessionId, actorId, channel, idSource };
+  }
 
   // 1. Check custom headers (future: OpenClaw might set these)
   actorId = headers["x-openclaw-actor-id"] || "";

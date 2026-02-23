@@ -44,6 +44,7 @@ MODEL_PRICING = {
     "anthropic.claude-3-5-haiku-20241022-v1:0": {"input": 0.80, "output": 4.00},
     "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3.00, "output": 15.00},
     "anthropic.claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+    "anthropic.claude-opus-4-6": {"input": 15.00, "output": 75.00},
 }
 
 # Default pricing when model is unknown

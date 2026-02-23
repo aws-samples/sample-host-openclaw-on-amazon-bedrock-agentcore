@@ -1,8 +1,9 @@
 """AgentCore Stack — Hosts OpenClaw on AgentCore Runtime.
 
-Deploys the OpenClaw messaging bridge as a container on AgentCore Runtime,
-replacing Fargate. The container runs OpenClaw (Telegram/Discord/Slack),
-a Bedrock proxy, and an AgentCore contract server on port 8080.
+Deploys the OpenClaw messaging bridge as a container on AgentCore Runtime.
+The container runs an AgentCore contract server on port 8080, a Bedrock
+proxy on port 18790, and OpenClaw gateway on port 18789 (started lazily
+per user session).
 """
 
 from aws_cdk import (
@@ -114,6 +115,7 @@ class AgentCoreStack(Stack):
         )
 
         # Cognito admin operations for auto-provisioning identities
+        # Scoped to specific user pool
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
@@ -123,7 +125,7 @@ class AgentCoreStack(Stack):
                     "cognito-idp:AdminGetUser",
                 ],
                 resources=[
-                    f"arn:aws:cognito-idp:{region}:{account}:userpool/*",
+                    f"arn:aws:cognito-idp:{region}:{account}:userpool/{cognito_user_pool_id}",
                 ],
             )
         )
@@ -180,7 +182,7 @@ class AgentCoreStack(Stack):
         )
 
         # --- Default Bedrock model ID -----------------------------------------
-        default_model_id = self.node.try_get_context("default_model_id") or "us.anthropic.claude-sonnet-4-6"
+        default_model_id = self.node.try_get_context("default_model_id") or "global.anthropic.claude-opus-4-6-v1"
 
         # --- AgentCore Runtime (hosts OpenClaw container) ---------------------
         self.runtime = agentcore.CfnRuntime(
@@ -208,15 +210,23 @@ class AgentCoreStack(Stack):
                 "COGNITO_CLIENT_ID": cognito_client_id,
                 "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
                 "S3_USER_FILES_BUCKET": self.user_files_bucket.bucket_name,
-                "AGENTCORE_WORKLOAD_IDENTITY_NAME": "openclaw_identity",
-                "IMAGE_VERSION": "29",  # bump to force container redeploy
+                "WORKSPACE_SYNC_INTERVAL_MS": str(
+                    int(self.node.try_get_context("workspace_sync_interval_seconds") or "300") * 1000
+                ),
+                "IMAGE_VERSION": str(
+                    self.node.try_get_context("image_version") or "1"
+                ),  # bump in cdk.json to force container redeploy
             },
-            description="OpenClaw messaging bridge on AgentCore Runtime",
+            description="OpenClaw messaging bridge on AgentCore Runtime (per-user sessions)",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
-                # Max values to keep the container running as long as possible.
-                # HealthyBusy ping status prevents idle termination.
-                idle_runtime_session_timeout=28800,  # 8 hours
-                max_lifetime=28800,  # 8 hours
+                # Per-user sessions: idle timeout allows natural termination when
+                # user stops chatting. Container returns Healthy (not HealthyBusy).
+                idle_runtime_session_timeout=int(
+                    self.node.try_get_context("session_idle_timeout") or "1800"
+                ),
+                max_lifetime=int(
+                    self.node.try_get_context("session_max_lifetime") or "28800"
+                ),
             ),
         )
 
@@ -255,12 +265,11 @@ class AgentCoreStack(Stack):
                     reason="Bedrock foundation model ARNs require wildcard for model ID. "
                     "Logs, Metrics, X-Ray, and Secrets Manager APIs are scoped to "
                     "project prefix (openclaw/*) or do not support resource-level "
-                    "permissions. Cognito userpool/* is scoped to this account/region.",
+                    "permissions. Cognito scoped to specific user pool.",
                     applies_to=[
                         "Resource::arn:aws:bedrock:*::foundation-model/*",
                         f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
-                        f"Resource::arn:aws:cognito-idp:{region}:{account}:userpool/*",
                         "Resource::*",
                         # S3 per-user file storage bucket (grant_read_write wildcards)
                         "Action::s3:Abort*",

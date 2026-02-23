@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """OpenClaw on AgentCore Runtime — CDK Application entry point.
 
-Architecture: OpenClaw runs directly on AgentCore Runtime (serverless),
-replacing ECS Fargate. A keepalive Lambda ensures the session stays active.
+Architecture: Per-user AgentCore Runtime sessions with webhook-based
+channel ingestion via Router Lambda. No keepalive needed — sessions
+idle-terminate naturally.
 """
 
 import os
@@ -13,7 +14,7 @@ import cdk_nag
 from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
-from stacks.keepalive_stack import KeepaliveStack
+from stacks.router_stack import RouterStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
 
@@ -29,7 +30,7 @@ vpc_stack = VpcStack(app, "OpenClawVpc", env=env)
 
 security_stack = SecurityStack(app, "OpenClawSecurity", env=env)
 
-# --- AgentCore (hosts OpenClaw container directly) ---
+# --- AgentCore (hosts OpenClaw container, per-user sessions) ---
 agentcore_stack = AgentCoreStack(
     app,
     "OpenClawAgentCore",
@@ -44,16 +45,21 @@ agentcore_stack = AgentCoreStack(
     env=env,
 )
 
-# --- Keepalive (Lambda + EventBridge to keep the AgentCore session alive) ---
-keepalive_stack = KeepaliveStack(
+# --- Router (Lambda + API Gateway HTTP API for Telegram/Slack webhooks) ---
+router_stack = RouterStack(
     app,
-    "OpenClawKeepalive",
+    "OpenClawRouter",
     runtime_arn=agentcore_stack.runtime_arn,
     runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
+    gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
+    telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
+    slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
+    webhook_secret_name=security_stack.webhook_secret.secret_name,
+    cmk_arn=security_stack.cmk.key_arn,
     env=env,
 )
 
-# --- Observability (dashboards + alarms — adapted for AgentCore) ---
+# --- Observability (dashboards + alarms) ---
 observability_stack = ObservabilityStack(
     app,
     "OpenClawObservability",
