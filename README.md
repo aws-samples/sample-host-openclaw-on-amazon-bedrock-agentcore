@@ -2,7 +2,7 @@
 
 Deploy an AI-powered multi-channel messaging bot (Telegram, Discord, Slack) on AWS Bedrock AgentCore Runtime using CDK.
 
-OpenClaw runs as a serverless container on AgentCore Runtime, with a local proxy that translates OpenAI-format chat requests to Bedrock ConverseStream API calls. Each user gets **persistent, isolated conversation memory** via AgentCore Memory — the proxy retrieves relevant context before each request and stores exchanges after each response, so the bot remembers users across sessions and container restarts. The agent has built-in tools (web, filesystem, runtime, memory, sessions, automation) and 10 pre-installed ClawHub skills for web search, content extraction, research, and more. A keepalive Lambda prevents idle session termination.
+OpenClaw runs as a serverless container on AgentCore Runtime, with a local proxy that translates OpenAI-format chat requests to Bedrock ConverseStream API calls. Each user gets **isolated, persistent file storage** via S3 — 6 workspace files (`AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`, `MEMORY.md`) are pre-loaded into the system prompt per request and auto-provisioned with defaults on first interaction. The agent can read/write files through the `s3-user-files` skill. The agent has built-in tools (web, filesystem, runtime, sessions, automation) and 9 pre-installed ClawHub skills for web search, content extraction, research, and more. A keepalive Lambda prevents idle session termination.
 
 ## Architecture
 
@@ -34,17 +34,14 @@ OpenClaw runs as a serverless container on AgentCore Runtime, with a local proxy
     |  | proxy.js         | |
     |  | (port 18790)     | |
     |  | OpenAI -> Bedrock| |
-    |  | + Memory         | |
     |  +--------+---------+ |
     +-----------+-----------+
                 |
-    +-----------v-----------+      +-----------------------+
-    |   Amazon Bedrock      |      |   AgentCore Memory    |
-    |   ConverseStream API  |      |   Per-user namespaces |
-    |   Claude Sonnet 4.6   |      |   3 strategies:       |
-    +-----------------------+      |   semantic, prefs,    |
-                                   |   summary             |
-                                   +-----------------------+
+    +-----------v-----------+
+    |   Amazon Bedrock      |
+    |   ConverseStream API  |
+    |   Claude Sonnet 4.6   |
+    +-----------------------+
 
     +--------------------------------------------------+
     |              Supporting Services                  |
@@ -149,7 +146,7 @@ cdk deploy --all --require-approval never
 This deploys 6 stacks in order:
 1. **OpenClawVpc** — VPC, subnets, NAT gateway, VPC endpoints
 2. **OpenClawSecurity** — KMS, Secrets Manager, Cognito, CloudTrail
-3. **OpenClawAgentCore** — Runtime, Memory, WorkloadIdentity, ECR, IAM
+3. **OpenClawAgentCore** — Runtime, WorkloadIdentity, ECR, S3, IAM
 4. **OpenClawKeepalive** — Lambda + EventBridge (5-min keepalive)
 5. **OpenClawObservability** — Dashboards, alarms, Bedrock logging
 6. **OpenClawTokenMonitoring** — DynamoDB, Lambda processor, token analytics
@@ -201,7 +198,7 @@ openclaw-on-agentcore/
     __init__.py                   # Shared helper (RetentionDays converter)
     vpc_stack.py                  # VPC, subnets, NAT, VPC endpoints, flow logs
     security_stack.py             # KMS CMK, Secrets Manager, Cognito, CloudTrail
-    agentcore_stack.py            # AgentCore Runtime, Memory, WorkloadIdentity, IAM
+    agentcore_stack.py            # AgentCore Runtime, WorkloadIdentity, S3, IAM
     keepalive_stack.py            # Lambda + EventBridge keepalive (every 5 min)
     observability_stack.py        # CloudWatch dashboards, alarms, Bedrock logging
     token_monitoring_stack.py     # Lambda log processor, DynamoDB, token analytics
@@ -209,7 +206,7 @@ openclaw-on-agentcore/
     Dockerfile                    # Bridge container (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: contract server -> secrets -> proxy -> OpenClaw
     agentcore-contract.js         # AgentCore HTTP contract (/ping, /invocations)
-    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Memory integration
+    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue in VPC
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
@@ -224,7 +221,7 @@ openclaw-on-agentcore/
 |---|---|---|
 | **OpenClawVpc** | VPC (2 AZ), private/public subnets, NAT, 7 VPC endpoints, flow logs | None |
 | **OpenClawSecurity** | KMS CMK, Secrets Manager (5 secrets), Cognito User Pool, CloudTrail | None |
-| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnMemory, CfnWorkloadIdentity, ECR, SG, IAM | Vpc, Security |
+| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3, SG, IAM | Vpc, Security |
 | **OpenClawKeepalive** | Lambda, EventBridge rule (every 5 min) | AgentCore |
 | **OpenClawObservability** | Operations dashboard, alarms (errors, latency, throttles), SNS, Bedrock logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
@@ -340,24 +337,23 @@ User sends Telegram message
   -> OpenClaw Gateway (port 18789) receives it
   -> Routes to agentcore-proxy.js (port 18790) as OpenAI chat completion
   -> Proxy extracts actorId (e.g., telegram:6087229962) from request
-  -> Proxy retrieves relevant memories for this user from AgentCore Memory
-  -> Memory context appended to system prompt
+  -> Proxy pre-loads workspace files from S3 (AGENTS.md, SOUL.md, etc.)
+  -> User identity + workspace content injected into system prompt
   -> Proxy converts to Bedrock ConverseStream API call
   -> Claude Sonnet 4.6 generates response (with user-specific context)
   -> Proxy converts response back to OpenAI SSE format
-  -> Proxy stores user/assistant exchange as memory event (fire-and-forget)
   -> OpenClaw streams response to Telegram
 ```
 
 ### Tools & Skills
 
-The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, memory, sessions, automation). Additionally, 10 community skills are pre-installed from ClawHub at Docker build time:
+The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, sessions, automation). Additionally, 9 community skills and 1 custom skill are pre-installed:
 
 | Skill | Purpose |
 |---|---|
+| `s3-user-files` | Per-user file CRUD (read, write, list, delete) in S3 namespace |
 | `duckduckgo-search` | Web search (no API key required) |
 | `jina-reader` | Web content extraction as markdown |
-| `openclaw-mem` | Persistent memory (SQLite + FTS5) |
 | `telegram-compose` | Rich HTML formatting for Telegram |
 | `transcript` | YouTube transcript extraction |
 | `deep-research-pro` | Multi-step research agent |
@@ -366,26 +362,22 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 | `task-decomposer` | Break complex requests into subtasks |
 | `cron-mastery` | Cron scheduling and management |
 
-Skills are installed into `/skills/` by `clawhub` during the Docker build. The `openclaw.json` config references this directory via `skills.load.extraDirs`.
+ClawHub skills are installed into `/skills/` during the Docker build. The custom `s3-user-files` skill is copied from `bridge/skills/`. The `openclaw.json` config references `/skills` via `skills.load.extraDirs`.
 
-### Per-User Memory
+### Per-User Workspace
 
-Each user gets isolated, persistent conversation memory powered by AgentCore Memory. The proxy handles all memory operations transparently — OpenClaw is unaware of the memory layer.
+Each user gets 6 workspace files auto-provisioned in S3 on first interaction:
 
-**How it works:**
+| File | Purpose |
+|---|---|
+| `AGENTS.md` | Operating instructions (rules, priorities, behavioral guidelines) |
+| `SOUL.md` | Agent persona (tone, communication boundaries) |
+| `USER.md` | User preferences (language, format, interests) |
+| `IDENTITY.md` | Agent identity (name, vibe, emoji) |
+| `TOOLS.md` | Tools documentation (available skills and conventions) |
+| `MEMORY.md` | Freeform notes and memories |
 
-1. **Identity extraction** — The proxy extracts `actorId` from each request using three sources in priority order: (1) `x-openclaw-actor-id` header, (2) OpenAI `user` field in the request body, (3) fallback to `"default-user"`. Channel-prefixed IDs like `telegram:6087229962` are namespaced by replacing colons with underscores (e.g., `telegram_6087229962`). Users sharing the `default-user` fallback would share the same memory namespace.
-2. **Memory retrieval** — Before each Bedrock call, the proxy queries `RetrieveMemoryRecords` with the user's latest message as a semantic search query, scoped to that user's namespace. Up to 5 relevant records (hardcoded `MEMORY_RETRIEVAL_LIMIT`) are filtered and appended to the system prompt under a `## Relevant memories about this user` heading. The model is instructed to use them for personalization without mentioning memory unless asked.
-3. **Event storage** — After each response, the user/assistant exchange (both roles in a single event) is stored via `CreateEvent` (fire-and-forget, non-blocking). Events include the session ID for grouping.
-4. **Memory extraction** — Every 10 minutes (plus 30 seconds after startup), the proxy triggers `StartMemoryExtractionJob`. This is a **global operation** that processes accumulated events across all user namespaces through 3 configured strategies:
-   - **Semantic** (`openclaw_semantic`) — extracts factual information and topics
-   - **User preference** (`openclaw_user_prefs`) — captures user preferences and patterns
-   - **Summary** (`openclaw_summary`) — produces conversation summaries
-
-   Extraction runs server-side using a dedicated `MemoryExecutionRole` with `bedrock:InvokeModel` permissions. New events are not searchable until the next extraction job runs.
-5. **Persistence** — Memories survive container restarts because they are stored server-side in AgentCore Memory, not in the container's process memory. Raw conversation events expire after **90 days** (`event_expiry_duration`). The in-memory `sessionMap` (which generates stable session IDs per `actorId:channel` pair) is lost on restart, but this only affects session ID continuity — not memory records.
-
-**Graceful degradation** — All memory operations (retrieval, storage, extraction) are wrapped in try/catch — they log warnings on failure but never block the chat flow. If `AGENTCORE_MEMORY_ID` is not set, every memory function short-circuits immediately and memory is completely disabled.
+Files are stored at `s3://{bucket}/{namespace}/{filename}` where namespace is derived from the user's channel identity (e.g., `telegram_6087229962`). All 6 files are read from S3 in parallel and injected into the system prompt on every request. Content is sanitized (code fence escaping, 4096 chars per file, 20,000 chars total cap) to prevent prompt injection.
 
 ### Token Usage Tracking
 
@@ -498,7 +490,6 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **ARM64 required**: AgentCore Runtime runs ARM64 containers. Build with `--platform linux/arm64`.
 - **Image must exist before deploy**: Push the bridge image to ECR before running `cdk deploy` — otherwise CfnRuntime creation fails.
 - **AgentCore resource names**: Must match `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` — use underscores, not hyphens.
-- **Memory event expiry**: `event_expiry_duration` is in days (max 365), not seconds.
 - **VPC endpoints**: The `bedrock-agentcore-runtime` VPC endpoint is not available in all regions. Omit it if your region doesn't support it.
 - **CDK RetentionDays**: `logs.RetentionDays` is an enum, not constructable from int. Use the helper in `stacks/__init__.py`.
 - **Cognito passwords**: HMAC-derived (`HMAC-SHA256(secret, actorId)`) — deterministic, never stored. Enables `AdminInitiateAuth` without per-user password storage.
@@ -508,10 +499,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **ClawHub installs to `/skills/`**: Not `~/.openclaw/skills`. The `extraDirs` config must point to `/skills`.
 - **ClawHub `--force` flag**: Some skills are flagged by VirusTotal for external API calls. Use `--no-input --force` for non-interactive Docker builds.
 - **Image updates need session restart**: Pushing a new image to ECR and redeploying via CDK updates the runtime config, but the existing keepalive session keeps running the old image. Stop it with `stop-runtime-session` (see Operations section).
-- **Memory IAM prefix**: AgentCore Memory APIs use the `bedrock-agentcore:` IAM action prefix, NOT `bedrock:`. Using the wrong prefix causes `AccessDeniedException`.
-- **Memory namespace characters**: `actorId` values contain colons (e.g., `telegram:6087229962`) which may be rejected by namespace fields. The proxy replaces `:` with `_`.
-- **Memory extraction latency**: New conversation events are not immediately searchable. The extraction job must run first (triggered every 10 minutes as a global operation across all namespaces) to process events into retrievable records via the 3 configured strategies.
-- **`default-user` fallback**: If OpenClaw doesn't populate the `user` field or custom headers, all requests fall back to `actorId = "default-user"` — meaning all such users share one memory namespace. Ensure your channel providers populate user identity.
+- **`default-user` fallback**: If OpenClaw doesn't populate the `user` field or custom headers, all requests fall back to `actorId = "default-user"` — meaning all such users share one S3 namespace. Ensure your channel providers populate user identity.
 
 ## Cleanup
 

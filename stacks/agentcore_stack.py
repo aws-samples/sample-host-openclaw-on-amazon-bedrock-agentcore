@@ -3,8 +3,6 @@
 Deploys the OpenClaw messaging bridge as a container on AgentCore Runtime,
 replacing Fargate. The container runs OpenClaw (Telegram/Discord/Slack),
 a Bedrock proxy, and an AgentCore contract server on port 8080.
-
-Also provisions AgentCore Memory for conversation persistence.
 """
 
 from aws_cdk import (
@@ -130,23 +128,6 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # AgentCore Memory APIs (bedrock-agentcore: prefix, not bedrock:)
-        self.execution_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "bedrock-agentcore:CreateEvent",
-                    "bedrock-agentcore:GetEvent",
-                    "bedrock-agentcore:ListEvents",
-                    "bedrock-agentcore:DeleteEvent",
-                    "bedrock-agentcore:RetrieveMemoryRecords",
-                    "bedrock-agentcore:ListMemoryRecords",
-                    "bedrock-agentcore:StartMemoryExtractionJob",
-                    "bedrock-agentcore:ListMemoryExtractionJobs",
-                ],
-                resources=["*"],
-            )
-        )
-
         # CloudWatch Logs + Metrics + X-Ray
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
@@ -164,53 +145,6 @@ class AgentCoreStack(Stack):
 
         # ECR pull
         self.bridge_repo.grant_pull(self.execution_role)
-
-        # --- Memory Execution Role --------------------------------------------
-        self.memory_role = iam.Role(
-            self,
-            "MemoryExecutionRole",
-            assumed_by=iam.CompositePrincipal(
-                iam.ServicePrincipal("bedrock.amazonaws.com"),
-                iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
-            ),
-        )
-        self.memory_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["bedrock:InvokeModel"],
-                resources=[f"arn:aws:bedrock:{region}::foundation-model/*"],
-            )
-        )
-
-        # --- AgentCore Memory -------------------------------------------------
-        self.memory = agentcore.CfnMemory(
-            self,
-            "AgentMemory",
-            name="openclaw_memory",
-            event_expiry_duration=90,
-            description="OpenClaw conversation memory",
-            encryption_key_arn=cmk_arn,
-            memory_execution_role_arn=self.memory_role.role_arn,
-            memory_strategies=[
-                agentcore.CfnMemory.MemoryStrategyProperty(
-                    semantic_memory_strategy=agentcore.CfnMemory.SemanticMemoryStrategyProperty(
-                        name="openclaw_semantic",
-                        description="Extract factual knowledge from conversations",
-                    )
-                ),
-                agentcore.CfnMemory.MemoryStrategyProperty(
-                    user_preference_memory_strategy=agentcore.CfnMemory.UserPreferenceMemoryStrategyProperty(
-                        name="openclaw_user_prefs",
-                        description="Track user preferences across sessions",
-                    )
-                ),
-                agentcore.CfnMemory.MemoryStrategyProperty(
-                    summary_memory_strategy=agentcore.CfnMemory.SummaryMemoryStrategyProperty(
-                        name="openclaw_summary",
-                        description="Summarize conversation sessions",
-                    )
-                ),
-            ],
-        )
 
         # --- S3 Bucket for Per-User File Storage ------------------------------
         user_files_ttl_days = int(
@@ -273,10 +207,9 @@ class AgentCoreStack(Stack):
                 "COGNITO_USER_POOL_ID": cognito_user_pool_id,
                 "COGNITO_CLIENT_ID": cognito_client_id,
                 "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
-                "AGENTCORE_MEMORY_ID": self.memory.attr_memory_id,
                 "S3_USER_FILES_BUCKET": self.user_files_bucket.bucket_name,
                 "AGENTCORE_WORKLOAD_IDENTITY_NAME": "openclaw_identity",
-                "IMAGE_VERSION": "28",  # bump to force container redeploy
+                "IMAGE_VERSION": "29",  # bump to force container redeploy
             },
             description="OpenClaw messaging bridge on AgentCore Runtime",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
@@ -302,11 +235,9 @@ class AgentCoreStack(Stack):
         self.runtime_id = self.runtime.attr_agent_runtime_id
         self.runtime_arn = f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{self.runtime.attr_agent_runtime_id}"
         self.runtime_endpoint_id = self.runtime_endpoint.attr_id
-        self.memory_id = self.memory.attr_memory_id
 
         CfnOutput(self, "RuntimeId", value=self.runtime.attr_agent_runtime_id)
         CfnOutput(self, "RuntimeEndpointId", value=self.runtime_endpoint.attr_id)
-        CfnOutput(self, "MemoryId", value=self.memory.attr_memory_id)
         CfnOutput(self, "UserFilesBucketName", value=self.user_files_bucket.bucket_name)
         CfnOutput(self, "WorkloadIdentityArn", value=self.workload_identity.attr_workload_identity_arn)
         CfnOutput(
@@ -322,10 +253,9 @@ class AgentCoreStack(Stack):
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
                     reason="Bedrock foundation model ARNs require wildcard for model ID. "
-                    "AgentCore Memory (bedrock-agentcore:*), Logs, Metrics, X-Ray, and "
-                    "Secrets Manager APIs are scoped to project prefix (openclaw/*) or "
-                    "do not support resource-level permissions. Cognito userpool/* is "
-                    "scoped to this account/region.",
+                    "Logs, Metrics, X-Ray, and Secrets Manager APIs are scoped to "
+                    "project prefix (openclaw/*) or do not support resource-level "
+                    "permissions. Cognito userpool/* is scoped to this account/region.",
                     applies_to=[
                         "Resource::arn:aws:bedrock:*::foundation-model/*",
                         f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",
@@ -341,20 +271,6 @@ class AgentCoreStack(Stack):
                         "Action::kms:GenerateDataKey*",
                         "Action::kms:ReEncrypt*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*",
-                    ],
-                ),
-            ],
-            apply_to_children=True,
-        )
-        cdk_nag.NagSuppressions.add_resource_suppressions(
-            self.memory_role,
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-IAM5",
-                    reason="Memory execution role needs InvokeModel on foundation models "
-                    "for memory extraction. Wildcard required for model ID.",
-                    applies_to=[
-                        f"Resource::arn:aws:bedrock:{region}::foundation-model/*",
                     ],
                 ),
             ],

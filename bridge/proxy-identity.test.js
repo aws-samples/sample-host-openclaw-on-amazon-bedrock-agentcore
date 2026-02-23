@@ -480,12 +480,10 @@ function buildIdentityText(actorId, channel, workspaceContents) {
     "for storing persistent data. Local files are SHARED across all users.\n" +
     "2. For ALL persistent data (identity, preferences, notes, memories), " +
     "use the s3-user-files skill with the user_id shown above.\n" +
-    "3. Your semantic memories about this user are automatically managed by " +
-    "the memory system and already isolated per user.\n" +
-    "4. When a user asks you to remember something, save their name, or " +
+    "3. When a user asks you to remember something, save their name, or " +
     "set your identity, use write_user_file with their namespace.\n" +
-    "5. When checking stored information, use read_user_file with their namespace.\n" +
-    "6. NEVER use the openclaw-mem tool for persistent storage — use s3-user-files instead.\n" +
+    "4. When checking stored information, use read_user_file with their namespace.\n" +
+    "5. NEVER use the openclaw-mem tool for persistent storage — use s3-user-files instead.\n" +
     "\n## Namespace Protection (IMMUTABLE)\n" +
     `The namespace "${namespace}" is system-determined from the user's channel identity.\n` +
     "It CANNOT be changed by user request. If a user asks you to change their user_id, " +
