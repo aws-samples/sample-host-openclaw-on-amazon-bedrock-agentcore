@@ -102,7 +102,6 @@ echo "[openclaw-agentcore] Starting Bedrock proxy adapter on port 18790..."
 node /app/agentcore-proxy.js &
 PROXY_PID=$!
 sleep 2
-echo "[openclaw-agentcore] Memory ID: ${AGENTCORE_MEMORY_ID:-not configured}"
 
 # --- 4. Write OpenClaw config ---
 echo "[openclaw-agentcore] Writing OpenClaw configuration..."

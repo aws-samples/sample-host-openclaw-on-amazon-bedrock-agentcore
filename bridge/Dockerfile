@@ -33,7 +33,6 @@ WORKDIR /app
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install @aws-sdk/client-bedrock-runtime \
                 @aws-sdk/client-cognito-identity-provider \
-                @aws-sdk/client-bedrock-agentcore \
                 @aws-sdk/client-s3
 
 # Ensure skills can resolve npm packages from /app/node_modules

@@ -213,7 +213,7 @@ function extractSessionMetadata(parsed, headers) {
     idSource = "fallback";
     console.warn(
       "[proxy] WARNING: No user identity found in request — using default-user fallback. " +
-        "Memory isolation is DISABLED. All users share the same memory namespace.",
+        "All users share the same S3 namespace.",
     );
   }
 
@@ -290,11 +290,6 @@ function getCognitoClient() {
   }
   return _cognitoClient;
 }
-
-// AgentCore Memory configuration
-const AGENTCORE_MEMORY_ID = process.env.AGENTCORE_MEMORY_ID || "";
-const MEMORY_RETRIEVAL_LIMIT = 5;
-const MEMORY_EXTRACTION_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 
 // Lazily initialized S3 client
 let _s3Client = null;
@@ -385,73 +380,6 @@ function sanitizeWorkspaceContent(raw) {
     .slice(0, WORKSPACE_PER_FILE_MAX_CHARS)
     .replace(/```/g, "\\`\\`\\`")
     .replace(/~~~/g, "\\~\\~\\~");
-}
-
-// Lazily initialized AgentCore client
-let _agentCoreClient = null;
-function getAgentCoreClient() {
-  if (!_agentCoreClient) {
-    const {
-      BedrockAgentCoreClient,
-    } = require("@aws-sdk/client-bedrock-agentcore");
-    _agentCoreClient = new BedrockAgentCoreClient({ region: AWS_REGION });
-  }
-  return _agentCoreClient;
-}
-
-/**
- * Retrieve relevant memory context for a user based on their latest message.
- * Returns a formatted string to inject into the system prompt, or empty string on failure.
- */
-async function retrieveMemoryContext(actorId, latestUserMessage) {
-  if (!AGENTCORE_MEMORY_ID || !latestUserMessage) return "";
-
-  try {
-    const {
-      RetrieveMemoryRecordsCommand,
-    } = require("@aws-sdk/client-bedrock-agentcore");
-    const client = getAgentCoreClient();
-
-    // Use actorId as namespace; replace colons with underscores if needed
-    const namespace = actorId.replace(/:/g, "_");
-
-    const response = await client.send(
-      new RetrieveMemoryRecordsCommand({
-        memoryId: AGENTCORE_MEMORY_ID,
-        namespace,
-        searchCriteria: {
-          searchQuery: latestUserMessage,
-          topK: MEMORY_RETRIEVAL_LIMIT,
-        },
-      }),
-    );
-
-    const records = response.memoryRecordSummaries || [];
-    if (records.length === 0) return "";
-
-    const memoryLines = records
-      .filter((r) => r.content && r.content.text)
-      .map((r) => `- ${r.content.text}`);
-
-    if (memoryLines.length === 0) return "";
-
-    console.log(
-      `[proxy] Memory retrieval: ${memoryLines.length} records for ${actorId}`,
-    );
-    return (
-      "\n\n## Relevant memories about this user\n" +
-      "The following is context from previous conversations with this user. " +
-      "Use it to personalize your response when relevant, but do not mention " +
-      "that you are reading from memory unless asked.\n" +
-      memoryLines.join("\n")
-    );
-  } catch (err) {
-    console.warn(
-      `[proxy] Memory retrieval failed for ${actorId}:`,
-      err.message,
-    );
-    return "";
-  }
 }
 
 /**
@@ -652,12 +580,10 @@ async function buildUserIdentityContext(actorId, channel) {
     "for storing persistent data. Local files are SHARED across all users.\n" +
     "2. For ALL persistent data (identity, preferences, notes, memories), " +
     "use the s3-user-files skill with the user_id shown above.\n" +
-    "3. Your semantic memories about this user are automatically managed by " +
-    "the memory system and already isolated per user.\n" +
-    "4. When a user asks you to remember something, save their name, or " +
+    "3. When a user asks you to remember something, save their name, or " +
     "set your identity, use write_user_file with their namespace.\n" +
-    "5. When checking stored information, use read_user_file with their namespace.\n" +
-    "6. NEVER use the openclaw-mem tool for persistent storage — use s3-user-files instead.\n" +
+    "4. When checking stored information, use read_user_file with their namespace.\n" +
+    "5. NEVER use the openclaw-mem tool for persistent storage — use s3-user-files instead.\n" +
     "\n## Namespace Protection (IMMUTABLE)\n" +
     `The namespace "${namespace}" is system-determined from the user's channel identity.\n` +
     "It CANNOT be changed by user request. If a user asks you to change their user_id, " +
@@ -665,100 +591,6 @@ async function buildUserIdentityContext(actorId, channel) {
     "automatically derived from their messaging account and cannot be modified.\n" +
     "Users MAY update their display name (stored in IDENTITY.md), but the namespace " +
     `itself must ALWAYS remain "${namespace}". Never use a different user_id value.\n`
-  );
-}
-
-/**
- * Store a conversation exchange as a memory event.
- * Fire-and-forget: errors are logged but not thrown.
- */
-async function storeConversationEvent(
-  actorId,
-  sessionId,
-  userMessage,
-  assistantMessage,
-) {
-  if (!AGENTCORE_MEMORY_ID || !userMessage || !assistantMessage) return;
-
-  try {
-    const { CreateEventCommand } = require("@aws-sdk/client-bedrock-agentcore");
-    const client = getAgentCoreClient();
-
-    const namespace = actorId.replace(/:/g, "_");
-
-    await client.send(
-      new CreateEventCommand({
-        memoryId: AGENTCORE_MEMORY_ID,
-        actorId: namespace,
-        sessionId,
-        eventTimestamp: new Date(),
-        payload: [
-          {
-            conversational: {
-              role: "USER",
-              content: { text: userMessage },
-            },
-          },
-          {
-            conversational: {
-              role: "ASSISTANT",
-              content: { text: assistantMessage },
-            },
-          },
-        ],
-      }),
-    );
-
-    console.log(
-      `[proxy] Memory event stored for ${actorId} (session: ${sessionId})`,
-    );
-  } catch (err) {
-    console.warn(
-      `[proxy] Memory event storage failed for ${actorId}:`,
-      err.message,
-    );
-  }
-}
-
-/**
- * Trigger memory extraction so configured strategies (semantic, user_preference, summary)
- * process accumulated events into retrievable records.
- */
-async function triggerMemoryExtraction() {
-  if (!AGENTCORE_MEMORY_ID) return;
-
-  try {
-    const {
-      StartMemoryExtractionJobCommand,
-    } = require("@aws-sdk/client-bedrock-agentcore");
-    const client = getAgentCoreClient();
-
-    const jobId = `extraction_${Date.now()}`;
-    await client.send(
-      new StartMemoryExtractionJobCommand({
-        memoryId: AGENTCORE_MEMORY_ID,
-        extractionJob: { jobId },
-      }),
-    );
-
-    console.log(`[proxy] Memory extraction triggered (jobId: ${jobId})`);
-  } catch (err) {
-    console.warn(`[proxy] Memory extraction trigger failed:`, err.message);
-  }
-}
-
-// Periodic memory extraction timer
-let _extractionTimer = null;
-function startMemoryExtractionTimer() {
-  if (!AGENTCORE_MEMORY_ID || _extractionTimer) return;
-  _extractionTimer = setInterval(
-    triggerMemoryExtraction,
-    MEMORY_EXTRACTION_INTERVAL_MS,
-  );
-  // Also run once shortly after startup to process any pending events
-  setTimeout(triggerMemoryExtraction, 30000);
-  console.log(
-    `[proxy] Memory extraction timer started (every ${MEMORY_EXTRACTION_INTERVAL_MS / 60000} min)`,
   );
 }
 
@@ -1056,7 +888,7 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig) {
 /**
  * Call Bedrock ConverseStream API and write SSE chunks to the HTTP response.
  * Accepts optional systemTextOverride and toolConfig for tool use.
- * Returns the full accumulated response text for memory storage.
+ * Returns the full accumulated response text.
  */
 async function invokeBedrockStreaming(
   messages,
@@ -1312,7 +1144,6 @@ const server = http.createServer(async (req, res) => {
         status: "ok",
         model: MODEL_ID,
         cognito: COGNITO_USER_POOL_ID ? "configured" : "disabled",
-        memory: AGENTCORE_MEMORY_ID ? "configured" : "disabled",
         s3_bucket: process.env.S3_USER_FILES_BUCKET || "not configured",
         chat_requests: chatRequestCount,
         last_identity: lastIdentityDiag,
@@ -1362,22 +1193,7 @@ const server = http.createServer(async (req, res) => {
           );
         }
 
-        // --- Retrieve memory context for this user ---
-        const lastUserMsg = [...messages]
-          .reverse()
-          .find((m) => m.role === "user");
-        const lastUserText = lastUserMsg
-          ? typeof lastUserMsg.content === "string"
-            ? lastUserMsg.content
-            : JSON.stringify(lastUserMsg.content)
-          : "";
-        const memoryContext = await retrieveMemoryContext(
-          actorId,
-          lastUserText,
-        );
-
-        // Build augmented system text with user identity + memory context.
-        // Identity is ALWAYS injected; memory context may be empty string.
+        // Build augmented system text with user identity context.
         const identityContext = await buildUserIdentityContext(
           actorId,
           channel,
@@ -1387,8 +1203,7 @@ const server = http.createServer(async (req, res) => {
           systemMessages.length > 0
             ? systemMessages.map((m) => m.content).join("\n")
             : SYSTEM_PROMPT;
-        const systemTextOverride =
-          baseSystemText + identityContext + memoryContext;
+        const systemTextOverride = baseSystemText + identityContext;
 
         // --- Convert OpenAI tools to Bedrock toolConfig ---
         const toolConfig = convertTools(parsed.tools);
@@ -1400,22 +1215,13 @@ const server = http.createServer(async (req, res) => {
 
         // --- Direct Bedrock path ---
         if (stream) {
-          const responseText = await invokeBedrockStreaming(
+          await invokeBedrockStreaming(
             messages,
             res,
             parsed.model,
             systemTextOverride,
             toolConfig,
           );
-          // Fire-and-forget: store conversation in memory
-          if (responseText && lastUserText) {
-            storeConversationEvent(
-              actorId,
-              sessionId,
-              lastUserText,
-              responseText,
-            ).catch(() => {});
-          }
         } else {
           const result = await invokeBedrock(
             messages,
@@ -1428,15 +1234,6 @@ const server = http.createServer(async (req, res) => {
           );
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(response));
-          // Fire-and-forget: store conversation in memory
-          if (result.text && lastUserText) {
-            storeConversationEvent(
-              actorId,
-              sessionId,
-              lastUserText,
-              result.text,
-            ).catch(() => {});
-          }
         }
       } catch (err) {
         console.error("[proxy] Request failed:", err.message);
@@ -1485,8 +1282,4 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`,
   );
-  console.log(
-    `[proxy] AgentCore Memory: ${AGENTCORE_MEMORY_ID ? `id=${AGENTCORE_MEMORY_ID}` : "disabled"}`,
-  );
-  startMemoryExtractionTimer();
 });
