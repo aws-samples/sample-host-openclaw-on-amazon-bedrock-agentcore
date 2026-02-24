@@ -128,15 +128,15 @@ cdk diff                                     # preview changes
 cdk destroy --all                            # tear down
 ```
 
-### Build & Push Bridge Image
+### Build & Push Bridge Image (after CDK deploy creates ECR repo)
 ```bash
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export CDK_DEFAULT_REGION=us-west-2  # change to your preferred region
 
-docker build --platform linux/arm64 -t openclaw-bridge bridge/
 aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
   docker login --username AWS --password-stdin \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com
+docker build --platform linux/arm64 -t openclaw-bridge bridge/
 docker tag openclaw-bridge:latest \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
 docker push \
@@ -262,7 +262,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 
 ### AgentCore Runtime
 - **ARM64 required**: Build with `--platform linux/arm64`
-- **Image must exist before deploy**: Push to ECR before `cdk deploy`
+- **Push image after CDK deploy**: CDK creates the ECR repo — do not manually create it (causes `Resource already exists` error). Push the image after `cdk deploy`. AgentCore pulls the image at session start, not deploy time
 - **Resource names**: Must match `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` — underscores, not hyphens
 - **Health check timing**: Contract server on port 8080 must start within seconds
 - **Per-user sessions**: Contract returns `Healthy` (not `HealthyBusy`) — allows natural idle termination

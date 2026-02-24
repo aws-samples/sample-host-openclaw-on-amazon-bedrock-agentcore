@@ -154,14 +154,28 @@ pip install -r requirements.txt
 cdk bootstrap aws://$CDK_DEFAULT_ACCOUNT/$CDK_DEFAULT_REGION
 ```
 
-### 4. Build and push the bridge container image
-
-The bridge image must exist in ECR before the AgentCore stack deploys. You need to create the ECR repository first, then build and push.
+### 4. Deploy all stacks
 
 ```bash
-# Create ECR repository (will be managed by CDK after first deploy)
-aws ecr create-repository --repository-name openclaw-bridge --region $CDK_DEFAULT_REGION 2>/dev/null || true
+cdk synth          # validate (runs cdk-nag security checks)
+cdk deploy --all --require-approval never
+```
 
+This deploys 6 stacks in order:
+1. **OpenClawVpc** — VPC, subnets, NAT gateway, VPC endpoints
+2. **OpenClawSecurity** — KMS, Secrets Manager, Cognito, CloudTrail
+3. **OpenClawAgentCore** — Runtime, WorkloadIdentity, ECR, S3, IAM
+4. **OpenClawRouter** — Lambda + API Gateway HTTP API, DynamoDB identity table
+5. **OpenClawObservability** — Dashboards, alarms, Bedrock logging
+6. **OpenClawTokenMonitoring** — DynamoDB, Lambda processor, token analytics
+
+The CDK AgentCore stack creates the ECR repository. The container image does not need to exist at deploy time — AgentCore only pulls the image when spinning up a microVM for a user session.
+
+### 5. Build and push the bridge container image
+
+After the CDK deploy creates the ECR repository, build and push the bridge container image.
+
+```bash
 # Authenticate Docker to ECR
 aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
   docker login --username AWS --password-stdin \
@@ -177,22 +191,7 @@ docker push \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
 ```
 
-### 5. Deploy all stacks
-
-```bash
-cdk synth          # validate (runs cdk-nag security checks)
-cdk deploy --all --require-approval never
-```
-
-This deploys 6 stacks in order:
-1. **OpenClawVpc** — VPC, subnets, NAT gateway, VPC endpoints
-2. **OpenClawSecurity** — KMS, Secrets Manager, Cognito, CloudTrail
-3. **OpenClawAgentCore** — Runtime, WorkloadIdentity, ECR, S3, IAM
-4. **OpenClawRouter** — Lambda + API Gateway HTTP API, DynamoDB identity table
-5. **OpenClawObservability** — Dashboards, alarms, Bedrock logging
-6. **OpenClawTokenMonitoring** — DynamoDB, Lambda processor, token analytics
-
-### 6. Store your Telegram bot token
+### 7. Store your Telegram bot token
 
 ```bash
 aws secretsmanager update-secret \
@@ -201,7 +200,7 @@ aws secretsmanager update-secret \
   --region $CDK_DEFAULT_REGION
 ```
 
-### 7. Set up Telegram webhook
+### 8. Set up Telegram webhook
 
 ```bash
 # Get Router API URL
@@ -224,7 +223,7 @@ curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}web
 
 The `secret_token` parameter tells Telegram to include an `X-Telegram-Bot-Api-Secret-Token` header on every webhook delivery. The Router Lambda validates this header and rejects requests without a valid token.
 
-### 8. Verify
+### 9. Verify
 
 Send a message to your Telegram bot. The first message triggers a cold start (~4 minutes for OpenClaw initialization). Subsequent messages in the same session are fast.
 
@@ -305,7 +304,7 @@ All tunable parameters are in `cdk.json`:
      --secret-string 'YOUR_BOT_TOKEN' \
      --region $CDK_DEFAULT_REGION
    ```
-5. Set up the webhook (see Quick Start step 7)
+5. Set up the webhook (see Quick Start step 8)
 
 ### Slack
 
@@ -333,22 +332,29 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
 
 **Configure Event Subscriptions:**
 
-9. Go to **Features** > **Event Subscriptions** and toggle **Enable Events** on
-10. Set the **Request URL** to:
+9. Get your API Gateway URL (you'll need this for the Request URL):
+    ```bash
+    aws cloudformation describe-stacks \
+      --stack-name OpenClawRouter \
+      --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+      --output text --region $CDK_DEFAULT_REGION
     ```
-    ${API_URL}webhook/slack
+10. Go to **Features** > **Event Subscriptions** and toggle **Enable Events** on
+11. Set the **Request URL** to your API URL followed by `webhook/slack`, e.g.:
     ```
-    (Use the API URL from the OpenClawRouter stack outputs — Slack sends a challenge request and should show a green checkmark)
-11. Under **Subscribe to bot events**, add:
+    https://<your-api-id>.execute-api.us-west-2.amazonaws.com/webhook/slack
+    ```
+    Slack sends a verification challenge — you should see a green checkmark confirming the URL is valid.
+12. Under **Subscribe to bot events**, add:
     - `message.im` — receive direct messages
     - `message.channels` — messages in channels the bot is in (optional)
-12. Click **Save Changes**
+13. Click **Save Changes**
 
 **Store credentials in Secrets Manager:**
 
-13. From **Settings** > **Basic Information** > **App Credentials**, copy the **Signing Secret**
-14. From **Features** > **OAuth & Permissions**, copy the **Bot User OAuth Token** (starts with `xoxb-`)
-15. Store both values:
+14. From **Settings** > **Basic Information** > **App Credentials**, copy the **Signing Secret** (a hex string like `a1b2c3d4...` — this is NOT the app-level token that starts with `xapp-`)
+15. From **Features** > **OAuth & Permissions**, copy the **Bot User OAuth Token** (starts with `xoxb-`)
+16. Store both values:
     ```bash
     aws secretsmanager update-secret \
       --secret-id openclaw/channels/slack \
@@ -553,7 +559,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 ## Gotchas
 
 - **ARM64 required**: AgentCore Runtime runs ARM64 containers. Build with `--platform linux/arm64`.
-- **Image must exist before deploy**: Push the bridge image to ECR before running `cdk deploy` — otherwise CfnRuntime creation fails.
+- **Push image after CDK deploy**: The CDK AgentCore stack creates the ECR repository. Do **not** manually create it beforehand (causes a `Resource already exists` error). Deploy CDK first, then push the image. AgentCore only pulls the image when a user session starts, not at deploy time.
 - **AgentCore resource names**: Must match `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` — use underscores, not hyphens.
 - **Per-user sessions**: Contract returns `Healthy` (not `HealthyBusy`) — allows natural idle termination after `session_idle_timeout`.
 - **VPC endpoints**: The `bedrock-agentcore-runtime` VPC endpoint is not available in all regions. Omit it if your region doesn't support it.
