@@ -50,6 +50,10 @@ let initPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
 
+// Message queue for serializing concurrent requests
+let messageQueue = [];
+let processingMessage = false;
+
 /**
  * Check if the proxy health endpoint responds.
  */
@@ -301,6 +305,41 @@ function extractTextFromContent(content) {
 }
 
 /**
+ * Process the message queue serially to prevent concurrent WebSocket race conditions.
+ */
+async function processMessageQueue() {
+  if (processingMessage || messageQueue.length === 0) return;
+  processingMessage = true;
+
+  while (messageQueue.length > 0) {
+    const { message, resolve, reject } = messageQueue.shift();
+    console.log(`[contract] Processing queued message (${messageQueue.length} remaining)`);
+
+    try {
+      const response = await bridgeMessage(message, 120000);
+      resolve(response);
+    } catch (err) {
+      reject(err);
+    }
+  }
+
+  processingMessage = false;
+}
+
+/**
+ * Enqueue a message and wait for its response (serialized processing).
+ */
+function enqueueMessage(message) {
+  return new Promise((resolve, reject) => {
+    messageQueue.push({ message, resolve, reject });
+    console.log(`[contract] Message enqueued (queue length: ${messageQueue.length})`);
+    processMessageQueue().catch((err) => {
+      console.error(`[contract] Queue processing error: ${err.message}`);
+    });
+  });
+}
+
+/**
  * Bridge a chat message to OpenClaw via WebSocket and collect the response.
  */
 async function bridgeMessage(message, timeoutMs = 240000) {
@@ -544,10 +583,10 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
-          // Bridge message to OpenClaw via WebSocket
+          // Enqueue message for serial processing (prevents concurrent WebSocket races)
           let responseText;
           try {
-            responseText = await bridgeMessage(message, 120000);
+            responseText = await enqueueMessage(message);
           } catch (bridgeErr) {
             responseText = `Bridge error: ${bridgeErr.message}`;
           }
