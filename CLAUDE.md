@@ -4,13 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Slack) running as per-user serverless containers on AWS Bedrock AgentCore Runtime. Each user gets their own microVM with workspace persistence. A Router Lambda handles webhook ingestion from Telegram and Slack, resolves user identity via DynamoDB, and invokes per-user AgentCore sessions.
+OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Slack) running as per-user serverless containers on AWS Bedrock AgentCore Runtime. Each user gets their own microVM with workspace persistence. A Router Lambda handles webhook ingestion from Telegram and Slack (text and images), resolves user identity via DynamoDB, and invokes per-user AgentCore sessions. Image uploads are stored in S3 and passed to Bedrock as multimodal content.
 
 ## Tech Stack
 
 - **Infrastructure**: CDK v2 (Python), 6 stacks
 - **Runtime**: Bedrock AgentCore Runtime (serverless ARM64 container, VPC mode, per-user sessions)
-- **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API)
+- **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
+- **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
 - **Tools & Skills**: Built-in tool groups (full profile) + 9 ClawHub skills + 1 custom S3 user files skill
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
@@ -66,6 +67,13 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
   | skill                 |        | saved periodically     |
   +-----------------------+        +------------------------+
 
+  +------------------------------------------+
+  | S3 Image Uploads                         |
+  | {namespace}/_uploads/img_*.{jpeg,png,...} |
+  | Router Lambda uploads, proxy fetches     |
+  | for Bedrock multimodal ConverseStream    |
+  +------------------------------------------+
+
   Supporting: VPC, KMS, Secrets Manager, Cognito,
              CloudWatch, DynamoDB, CloudTrail
 ```
@@ -89,7 +97,8 @@ openclaw-on-agentcore/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with lazy init + WebSocket bridge
-    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity
+    agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
+    image-support.test.js         # Image support unit tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
     skills/
@@ -100,7 +109,8 @@ openclaw-on-agentcore/
         list.js / delete.js       # List/delete files in user's S3 namespace
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
-    router/index.py               # Webhook router (Telegram + Slack)
+    router/index.py               # Webhook router (Telegram + Slack, image uploads)
+    router/test_image_upload.py   # Image upload unit tests (pytest)
   docs/
     architecture.md               # Detailed architecture diagrams
 ```
@@ -191,7 +201,13 @@ source .venv/bin/activate && cdk deploy OpenClawAgentCore --require-approval nev
 ### Bridge Tests
 ```bash
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
+cd bridge && node --test image-support.test.js         # image upload + multimodal tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
+```
+
+### Router Lambda Tests
+```bash
+cd lambda/router && python -m pytest test_image_upload.py -v   # image upload unit tests
 ```
 
 ### Runtime Operations
@@ -306,6 +322,16 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 - **Cold start latency**: First message to a new user triggers microVM creation + OpenClaw startup (~4 min)
 - **Telegram typing indicator**: Sent while waiting for AgentCore response
 - **Cross-channel binding**: "link accounts" generates 6-char code in DynamoDB with 10-min TTL
+- **Image uploads**: Telegram photos and Slack file attachments (JPEG, PNG, GIF, WebP, max 3.75 MB) are downloaded by the Router Lambda, uploaded to S3 under `{namespace}/_uploads/`, and passed to AgentCore as a structured message `{text, images[{s3Key, contentType}]}`
+- **Telegram captions**: `message.get("text", "") or message.get("caption", "")` — photos use `caption`, not `text`
+
+### Image Upload Flow
+- **Router Lambda** downloads image from channel API (Telegram `getFile` / Slack `url_private_download`), uploads to S3 `{namespace}/_uploads/img_{ts}_{hex}.{ext}`
+- **Contract server** converts structured message to bridge text with `[OPENCLAW_IMAGES:[...]]` marker appended
+- **Proxy** extracts marker via regex, fetches image bytes from S3 (with namespace validation to prevent cross-user reads), builds Bedrock multimodal content blocks (`{image: {format, source: {bytes}}}`)
+- **Supported types**: `image/jpeg`, `image/png`, `image/gif`, `image/webp` (max 3.75 MB per Bedrock limit)
+- **Security**: S3 key validated against user's namespace prefix + path traversal (`..`) rejection. Format validated against `VALID_BEDROCK_FORMATS` set
+- **Slack prerequisite**: Bot needs `files:read` OAuth scope to download image files
 
 ### Workspace Sync
 - **S3 prefix**: `{namespace}/.openclaw/` where `namespace = actorId.replace(/:/g, "_")`
