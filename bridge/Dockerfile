@@ -42,9 +42,13 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
 # Ensure skills can resolve npm packages from /app/node_modules
 ENV NODE_PATH=/app/node_modules
 
+# Pre-create OpenClaw workspace directory (avoids mkdir at runtime)
+RUN mkdir -p /root/.openclaw
+
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
+COPY lightweight-agent.js /app/lightweight-agent.js
 COPY workspace-sync.js /app/workspace-sync.js
 COPY force-ipv4.js /app/force-ipv4.js
 

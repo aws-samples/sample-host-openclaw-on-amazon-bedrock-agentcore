@@ -13,7 +13,8 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
 - **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
-- **Tools & Skills**: Built-in tool groups (full profile) + 9 ClawHub skills + 1 custom S3 user files skill
+- **Cold Start Shim**: Lightweight agent handles messages in ~10-15s while OpenClaw starts (~2-4 min background)
+- **Tools & Skills**: Built-in tool groups (basic profile) + 1 custom S3 user files skill
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **Workspace Persistence**: .openclaw/ directory synced to/from S3 per user
 - **AI Model**: Claude Opus 4.6 via Bedrock ConverseStream (configurable via `default_model_id` in `cdk.json`, default `global.anthropic.claude-opus-4-6-v1`)
@@ -43,13 +44,16 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
   | AgentCore Runtime     |  <-- Per-user microVM (ARM64, VPC mode)
   |                       |
   | agentcore-contract.js (8080) -- /ping (Healthy), /invocations
-  |   -> lazy init:
-  |     1. Restore .openclaw/ from S3
-  |     2. Start proxy (18790) with USER_ID env
-  |     3. Start OpenClaw headless (18789)
-  |     4. Bridge messages via WebSocket
+  |   -> boot: pre-fetch secrets from Secrets Manager
+  |   -> first /invocations (parallel):
+  |     1. Start proxy (18790) + OpenClaw (18789) + restore .openclaw/
+  |     2. Wait for proxy only (~5s)
+  |     3. Lightweight agent handles messages immediately
+  |   -> background: OpenClaw starts (~2-4 min)
+  |   -> handoff: once OpenClaw ready, route via WebSocket bridge
   |   -> SIGTERM: save .openclaw/ to S3
   |                       |
+  | lightweight-agent.js  -- warm-up shim (proxy -> Bedrock, s3-user-files tools)
   | agentcore-proxy.js    (18790) -- OpenAI -> Bedrock ConverseStream
   | OpenClaw Gateway      (18789) -- headless, no channels
   +-----------+-----------+
@@ -96,7 +100,8 @@ openclaw-on-agentcore/
   bridge/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
-    agentcore-contract.js         # AgentCore HTTP contract with lazy init + WebSocket bridge
+    agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
+    lightweight-agent.js          # Warm-up agent shim (handles messages while OpenClaw starts)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
@@ -250,15 +255,16 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 
 1. **entrypoint.sh**: Configure Node.js IPv4 DNS patch, start contract server
 2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
-3. **On first `/invocations` with `action: chat`** (lazy init):
-   - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
-   - Restore `.openclaw/` from S3 via `workspace-sync.js`
+3. **At boot** (background): Pre-fetch secrets from Secrets Manager (~2s)
+4. **On first `/invocations` with `action: chat`** (parallel init):
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
-   - Write headless OpenClaw config (no channels)
-   - Start OpenClaw gateway (port 18789) — ~4 min startup
-   - Start periodic workspace saves (every 5 min)
-4. **Subsequent `/invocations`**: Bridge message via WebSocket to OpenClaw
-5. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
+   - Start OpenClaw gateway (port 18789) in background
+   - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
+   - Wait for proxy only (~5s)
+5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files tools)
+6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
+7. **After handoff**: Full OpenClaw features (skills, plugins, session management)
+8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ## DynamoDB Identity Table Schema
 
@@ -300,9 +306,9 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 - Empty `cdk.json` account: falls back to `CDK_DEFAULT_ACCOUNT` env var via `app.py`
 
 ### OpenClaw
-- Startup takes ~4 minutes (plugin registration)
+- Startup takes ~2-4 minutes (plugin registration); lightweight agent shim handles messages during this time
 - Correct start command: `openclaw gateway run --port 18789 --bind lan --verbose`
-- **`skills.allowBundled`**: Must be an array (e.g., `["*"]`), not a boolean
+- **`skills.allowBundled`**: Must be an array (e.g., `[]` for none, `["*"]` for all), not a boolean. Set to `[]` for fast startup
 - **ClawHub skill paths**: `clawhub install` installs to `/skills/<name>` — use `/skills` as `extraDirs`
 - **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--force`
 - **Image updates**: New sessions use new image automatically (no keepalive restart needed)
@@ -319,7 +325,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 - **Webhook validation**: Telegram uses `X-Telegram-Bot-Api-Secret-Token` header (set via `secret_token` on `setWebhook`). Slack uses `X-Slack-Signature` HMAC-SHA256 with 5-minute replay window
 - **Async dispatch**: Self-invokes with `InvocationType=Event` for actual processing; returns 200 immediately to webhook
 - **Slack**: Handles `url_verification` challenge synchronously; ignores retries via `x-slack-retry-num` header
-- **Cold start latency**: First message to a new user triggers microVM creation + OpenClaw startup (~4 min)
+- **Cold start latency**: First message to a new user triggers microVM creation; lightweight agent responds in ~10-15s while OpenClaw starts in background (~2-4 min)
 - **Telegram typing indicator**: Sent while waiting for AgentCore response
 - **Cross-channel binding**: "link accounts" generates 6-char code in DynamoDB with 10-min TTL
 - **Image uploads**: Telegram photos and Slack file attachments (JPEG, PNG, GIF, WebP, max 3.75 MB) are downloaded by the Router Lambda, uploaded to S3 under `{namespace}/_uploads/`, and passed to AgentCore as a structured message `{text, images[{s3Key, contentType}]}`
