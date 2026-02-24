@@ -146,6 +146,7 @@ function writeOpenClawConfig() {
     agents: {
       defaults: {
         model: { primary: "agentcore/bedrock-agentcore" },
+        heartbeat: { every: false },  // Disabled — EventBridge replaces internal scheduler
       },
     },
     tools: {
@@ -256,6 +257,7 @@ async function lazyInit(userId, actorId, channel) {
       S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
       USER_ID: actorId,
       CHANNEL: channel,
+      OPENCLAW_SKIP_CRON: "1",  // Disable internal cron — EventBridge handles scheduling
     };
     proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
       env: proxyEnv,
@@ -272,6 +274,8 @@ async function lazyInit(userId, actorId, channel) {
     // 3. Write headless OpenClaw config and start gateway
     writeOpenClawConfig();
     console.log("[contract] Starting OpenClaw gateway (headless)...");
+    // Set OPENCLAW_SKIP_CRON in parent env so OpenClaw gateway inherits it
+    process.env.OPENCLAW_SKIP_CRON = "1";
     openclawProcess = spawn(
       "openclaw",
       [
@@ -645,6 +649,79 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
+        // Warmup action — trigger lazy init without blocking for a chat response
+        if (action === "warmup") {
+          const { userId, actorId, channel } = payload;
+          if (openclawReady && proxyReady) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "ready" }));
+            return;
+          }
+          // Trigger init in background if not already running
+          if (!initInProgress && userId && actorId) {
+            lazyInit(userId, actorId, channel || "unknown").catch((err) => {
+              console.error(`[contract] Warmup lazy init failed: ${err.message}`);
+            });
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "initializing" }));
+          return;
+        }
+
+        // Cron action — blocks until init completes, then bridges the message
+        if (action === "cron") {
+          const { userId, actorId, channel, message } = payload;
+          if (!userId || !actorId || !message) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Missing userId, actorId, or message" }));
+            return;
+          }
+
+          // Block until init completes (unlike chat which returns immediately)
+          if (!openclawReady || !proxyReady) {
+            try {
+              if (!initInProgress) {
+                await lazyInit(userId, actorId, channel || "unknown");
+              } else {
+                await initPromise;
+              }
+            } catch (err) {
+              console.error(`[contract] Cron init failed: ${err.message}`);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({
+                response: "Agent initialization failed for scheduled task.",
+                status: "error",
+              }));
+              return;
+            }
+          }
+
+          if (!openclawReady || !proxyReady) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              response: "Agent not ready after initialization.",
+              status: "error",
+            }));
+            return;
+          }
+
+          // Enqueue message (serialized with chat messages to prevent WebSocket races)
+          let responseText;
+          try {
+            responseText = await enqueueMessage(message);
+          } catch (bridgeErr) {
+            responseText = `Bridge error: ${bridgeErr.message}`;
+          }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            response: responseText,
+            userId: currentUserId,
+            sessionId: payload.sessionId || null,
+          }));
+          return;
+        }
+
         // Chat action — lazy init and bridge
         if (action === "chat") {
           const { userId, actorId, channel, message } = payload;
@@ -783,6 +860,6 @@ server.listen(PORT, "0.0.0.0", () => {
     `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
   );
   console.log(
-    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status}",
+    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron}",
   );
 });

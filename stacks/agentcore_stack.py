@@ -216,6 +216,14 @@ class AgentCoreStack(Stack):
                 "IMAGE_VERSION": str(
                     self.node.try_get_context("image_version") or "1"
                 ),  # bump in cdk.json to force container redeploy
+                # EventBridge cron scheduling — deterministic names to avoid circular deps
+                "EVENTBRIDGE_SCHEDULE_GROUP": "openclaw-cron",
+                "CRON_LAMBDA_ARN": f"arn:aws:lambda:{region}:{account}:function:openclaw-cron-executor",
+                "EVENTBRIDGE_ROLE_ARN": f"arn:aws:iam::{account}:role/openclaw-cron-scheduler-role",
+                "IDENTITY_TABLE_NAME": "openclaw-identity",
+                "CRON_LEAD_TIME_MINUTES": str(
+                    self.node.try_get_context("cron_lead_time_minutes") or "5"
+                ),
             },
             description="OpenClaw messaging bridge on AgentCore Runtime (per-user sessions)",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
@@ -280,6 +288,9 @@ class AgentCoreStack(Stack):
                         "Action::kms:GenerateDataKey*",
                         "Action::kms:ReEncrypt*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*",
+                        # EventBridge cron scheduling (added by CronStack)
+                        f"Resource::arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*",
+                        f"Resource::arn:aws:dynamodb:{region}:{account}:table/openclaw-identity/index/*",
                     ],
                 ),
             ],
