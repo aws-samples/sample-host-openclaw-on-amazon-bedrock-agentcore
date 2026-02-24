@@ -571,12 +571,6 @@ def handle_telegram(body):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
     response_text = _extract_text_from_content_blocks(response_text)
-
-    # Empty response means this message was batched with another — skip channel send
-    if not response_text:
-        logger.info("Empty response (batched) — skipping Telegram send")
-        return
-
     logger.info("Response to send (len=%d): %s", len(response_text), response_text[:200])
 
     # Send response (split if > 4096 chars for Telegram limit)
@@ -657,11 +651,6 @@ def handle_slack(body, headers=None):
     result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", text)
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     response_text = _extract_text_from_content_blocks(response_text)
-
-    # Empty response means this message was batched with another — skip channel send
-    if not response_text:
-        logger.info("Empty response (batched) — skipping Slack send")
-        return {"statusCode": 200, "body": "ok"}
 
     send_slack_message(channel_id, response_text, bot_token)
     return {"statusCode": 200, "body": "ok"}

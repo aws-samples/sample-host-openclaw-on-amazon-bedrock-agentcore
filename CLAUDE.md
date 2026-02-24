@@ -191,7 +191,6 @@ source .venv/bin/activate && cdk deploy OpenClawAgentCore --require-approval nev
 ### Bridge Tests
 ```bash
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
-cd bridge && node --test message-queue.test.js         # message queue serialization tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 ```
 
@@ -242,8 +241,8 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
    - Write headless OpenClaw config (no channels)
    - Start OpenClaw gateway (port 18789) — ~4 min startup
    - Start periodic workspace saves (every 5 min)
-4. **Subsequent `/invocations`**: Enqueue message for serialized processing via `enqueueMessage()` → `processQueue()` → `bridgeMessage()` (WebSocket to OpenClaw)
-5. **SIGTERM**: Drain message queue, save `.openclaw/` to S3, kill child processes, exit
+4. **Subsequent `/invocations`**: Bridge message via WebSocket to OpenClaw
+5. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ## DynamoDB Identity Table Schema
 
@@ -292,8 +291,6 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 - **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--force`
 - **Image updates**: New sessions use new image automatically (no keepalive restart needed)
 - **WebSocket bridge protocol**: Connect → auth (type:req, method:connect, protocol:3, auth:{token}) → agent.chat → streaming deltas → final
-- **Message queue serialization**: Concurrent `/invocations` requests are serialized via `enqueueMessage()`/`processQueue()` in the contract server. Messages arriving while one is processing are batched into a single `bridgeMessage()` call with `[Message N/M]` format. First entry gets the full response; remaining entries get empty string (suppressed by the Router Lambda). Queue depth limit: 10, wait timeout: 90s
-- **Batched response suppression**: Router Lambda skips `send_telegram_message`/`send_slack_message` when response is empty — signals the message was batched with another
 
 ### Cognito Identity
 - Self-signup disabled — users auto-provisioned by proxy via `AdminCreateUser`

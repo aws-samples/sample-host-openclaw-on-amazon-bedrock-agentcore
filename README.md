@@ -33,9 +33,8 @@ OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Rout
   |     1. Restore .openclaw/ from S3
   |     2. Start proxy (18790) with USER_ID env
   |     3. Start OpenClaw headless (18789)
-  |     4. Enqueue + serialize messages via queue
-  |     5. Bridge messages via WebSocket
-  |   -> SIGTERM: drain queue, save .openclaw/ to S3
+  |     4. Bridge messages via WebSocket
+  |   -> SIGTERM: save .openclaw/ to S3
   |                       |
   | agentcore-proxy.js    (18790) -- OpenAI -> Bedrock ConverseStream
   | OpenClaw Gateway      (18789) -- headless, no channels
@@ -246,8 +245,7 @@ openclaw-on-agentcore/
   bridge/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
-    agentcore-contract.js         # AgentCore HTTP contract with lazy init + message queue + WebSocket bridge
-    message-queue.test.js         # Unit tests for message queue serialization
+    agentcore-contract.js         # AgentCore HTTP contract with lazy init + WebSocket bridge
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
@@ -289,7 +287,7 @@ All tunable parameters are in `cdk.json`:
 | `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
-| `image_version` | `2` | Bridge container version tag. Bump to force container redeploy |
+| `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
 
 ## Channel Setup
@@ -378,9 +376,8 @@ Each user gets their own AgentCore microVM. When a user sends a message:
    - Starts the Bedrock proxy with `USER_ID`/`CHANNEL` env vars
    - Starts OpenClaw gateway in headless mode (no channel connections)
    - Starts periodic workspace saves (every 5 min)
-3. **Message queue** serializes concurrent requests — if multiple messages arrive while one is processing, they are batched into a single AI call with `[Message N/M]` format
-4. **WebSocket bridge** forwards the (possibly batched) message to OpenClaw, collects streaming response deltas, and returns the accumulated text
-5. **Router Lambda** sends the response back to the channel (Telegram/Slack API). Empty responses (from batched duplicates) are suppressed — no silent "Message processed." replies
+3. **WebSocket bridge** forwards the message to OpenClaw, collects streaming response deltas, and returns the accumulated text
+4. **Router Lambda** sends the response back to the channel (Telegram/Slack API)
 
 When the session idles (default 30 min), AgentCore terminates the microVM. Before shutdown, the SIGTERM handler saves `.openclaw/` to S3. The next message creates a fresh microVM and restores the workspace.
 
@@ -408,8 +405,8 @@ You can link multiple channels to the same identity by repeating the process.
    - Write headless OpenClaw config (no channels)
    - Start OpenClaw gateway (port 18789) — ~4 min startup
    - Start periodic workspace saves (every 5 min)
-4. **Subsequent `/invocations`**: Enqueue message for serialized processing → `processQueue()` batches concurrent messages → `bridgeMessage()` via WebSocket to OpenClaw
-5. **SIGTERM**: Drain message queue (resolve pending entries with restart message), save `.openclaw/` to S3, kill child processes, exit
+4. **Subsequent `/invocations`**: Bridge message via WebSocket to OpenClaw
+5. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ### Message Flow
 
@@ -421,7 +418,6 @@ User sends Telegram message
   -> Lambda calls InvokeAgentRuntime(sessionId=per-user)
   -> Contract server receives /invocations {action: "chat", ...}
   -> Lazy init (first message only): restore workspace, start proxy + OpenClaw
-  -> Message enqueued -> processQueue batches concurrent messages
   -> WebSocket bridge to OpenClaw gateway: auth -> agent.chat -> streaming deltas
   -> Proxy converts to Bedrock ConverseStream API call
   -> Claude Opus 4.6 generates response (with user-specific workspace context)
@@ -504,7 +500,6 @@ cdk deploy OpenClawAgentCore --require-approval never
 
 ```bash
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
-cd bridge && node --test message-queue.test.js         # message queue serialization tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 ```
 
@@ -551,21 +546,6 @@ This is expected. The first message to a new user triggers microVM creation + Op
   curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getWebhookInfo"
   ```
 - **Router Lambda errors**: Check Lambda logs in CloudWatch
-
-### "Message processed." replies when sending rapid messages
-
-This was fixed in image version 2. If you see this, the container is running an old image. Delete the user's session from DynamoDB to force a new container:
-
-```bash
-# Find and delete the session
-aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION \
-  --filter-expression "SK = :sk" --expression-attribute-values '{":sk":{"S":"SESSION"}}' \
-  --projection-expression "PK, sessionId"
-aws dynamodb delete-item --table-name openclaw-identity --region $CDK_DEFAULT_REGION \
-  --key '{"PK":{"S":"USER#<user_id>"},"SK":{"S":"SESSION"}}'
-```
-
-The next message creates a new session with the updated container. Note: conversation context from after the last periodic workspace save (~5 min) may be lost during the transition.
 
 ### 502 / Bedrock authorization errors
 
