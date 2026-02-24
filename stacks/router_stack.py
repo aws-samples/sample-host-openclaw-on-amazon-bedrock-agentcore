@@ -38,6 +38,8 @@ class RouterStack(Stack):
         slack_token_secret_name: str,
         webhook_secret_name: str,
         cmk_arn: str,
+        user_files_bucket_name: str,
+        user_files_bucket_arn: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -91,6 +93,7 @@ class RouterStack(Stack):
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
                 "WEBHOOK_SECRET_ID": webhook_secret_name,
+                "USER_FILES_BUCKET": user_files_bucket_name,
             },
             log_group=router_log_group,
         )
@@ -186,6 +189,22 @@ class RouterStack(Stack):
             )
         )
 
+        # S3 PutObject for image uploads (scoped to _uploads/ prefix)
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[f"{user_files_bucket_arn}/*/_uploads/*"],
+            )
+        )
+
+        # KMS GenerateDataKey for S3 bucket encryption (bucket uses KMS CMK)
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["kms:GenerateDataKey"],
+                resources=[cmk_arn],
+            )
+        )
+
         # --- Outputs ---
         CfnOutput(
             self,
@@ -215,11 +234,13 @@ class RouterStack(Stack):
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
                     "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
-                    "grant_read_write_data adds index wildcards.",
+                    "grant_read_write_data adds index wildcards. S3 PutObject "
+                    "scoped to */_uploads/* prefix for image uploads.",
                     applies_to=[
                         f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:runtime/<AgentRuntime.AgentRuntimeId>/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::{self.identity_table.table_arn}/index/*",
+                        "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
                     ],
                 ),
                 cdk_nag.NagPackSuppression(
