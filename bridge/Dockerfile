@@ -37,6 +37,9 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
                 @aws-sdk/client-cognito-identity-provider \
                 @aws-sdk/client-s3 \
                 @aws-sdk/client-secrets-manager \
+                @aws-sdk/client-scheduler \
+                @aws-sdk/client-dynamodb \
+                @aws-sdk/lib-dynamodb \
                 ws
 
 # Ensure skills can resolve npm packages from /app/node_modules
@@ -56,6 +59,13 @@ COPY force-ipv4.js /app/force-ipv4.js
 # /skills/ — scanned via extraDirs config (skills also copied to home dir during user setup below)
 COPY skills/s3-user-files /skills/s3-user-files
 RUN chmod +x /skills/s3-user-files/*.js
+
+# Copy EventBridge cron scheduling skill
+COPY skills/eventbridge-cron /skills/eventbridge-cron
+RUN chmod +x /skills/eventbridge-cron/*.js
+
+# Copy project instructions (CLAUDE.md) so the agent knows about its skills
+COPY CLAUDE.md /app/CLAUDE.md
 
 # Copy entrypoint
 COPY entrypoint.sh /app/entrypoint.sh

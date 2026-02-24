@@ -19,7 +19,7 @@ const LOCAL_PATH = process.env.HOME ? `${process.env.HOME}/.openclaw` : "/root/.
 const WORKSPACE_PREFIX = ".openclaw";
 
 // Skip patterns — files/dirs that should not be synced to S3
-const SKIP_PATTERNS = ["node_modules/", ".cache/", "*.log", ".npm/", "package-lock.json"];
+const SKIP_PATTERNS = ["node_modules/", ".cache/", "*.log", "*.lock", ".npm/", "package-lock.json"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 // S3 client singleton (same pattern as agentcore-proxy.js)

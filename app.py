@@ -15,6 +15,7 @@ from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.router_stack import RouterStack
+from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
 
@@ -58,6 +59,28 @@ router_stack = RouterStack(
     cmk_arn=security_stack.cmk.key_arn,
     user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
     user_files_bucket_arn=agentcore_stack.user_files_bucket.bucket_arn,
+    env=env,
+)
+
+# --- Cron (EventBridge Scheduler + Lambda executor) ---
+# Use deterministic string ARNs for identity table to avoid cyclic dependency
+# (AgentCore <- Router already exists; CronStack adds policies to AgentCore role)
+_region = env.region or os.environ.get("CDK_DEFAULT_REGION", "us-west-2")
+_account = env.account or os.environ.get("CDK_DEFAULT_ACCOUNT", "")
+_identity_table_name = "openclaw-identity"
+_identity_table_arn = f"arn:aws:dynamodb:{_region}:{_account}:table/{_identity_table_name}"
+
+cron_stack = CronStack(
+    app,
+    "OpenClawCron",
+    runtime_arn=agentcore_stack.runtime_arn,
+    runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
+    identity_table_name=_identity_table_name,
+    identity_table_arn=_identity_table_arn,
+    telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
+    slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
+    cmk_arn=security_stack.cmk.key_arn,
+    agentcore_execution_role=agentcore_stack.execution_role,
     env=env,
 )
 
