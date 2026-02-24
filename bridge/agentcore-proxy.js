@@ -320,6 +320,122 @@ function getS3Client() {
   return _s3Client;
 }
 
+// ---------------------------------------------------------------------------
+// Image support — extract markers, fetch from S3, build multimodal content
+// ---------------------------------------------------------------------------
+
+const ALLOWED_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
+const CONTENT_TYPE_TO_BEDROCK_FORMAT = {
+  "image/jpeg": "jpeg",
+  "image/png": "png",
+  "image/gif": "gif",
+  "image/webp": "webp",
+};
+const IMAGE_MARKER_REGEX = /\n?\n?\[OPENCLAW_IMAGES:(\[.*?\])\]\s*$/;
+const MAX_IMAGE_BYTES = 3_750_000; // 3.75 MB — Bedrock limit
+
+/**
+ * Extract image references from text that contains the [OPENCLAW_IMAGES:...] marker.
+ * Returns { cleanText, images } where images is an array of { s3Key, contentType }.
+ */
+function extractImageReferences(text) {
+  if (typeof text !== "string") return { cleanText: text, images: [] };
+
+  const match = text.match(IMAGE_MARKER_REGEX);
+  if (!match) return { cleanText: text, images: [] };
+
+  const cleanText = text.slice(0, match.index).trimEnd();
+  try {
+    const images = JSON.parse(match[1]);
+    if (!Array.isArray(images)) return { cleanText, images: [] };
+    // Validate each image entry
+    const validImages = images.filter(
+      (img) =>
+        img.s3Key &&
+        img.contentType &&
+        ALLOWED_IMAGE_TYPES.has(img.contentType),
+    );
+    return { cleanText, images: validImages };
+  } catch {
+    return { cleanText, images: [] };
+  }
+}
+
+const VALID_BEDROCK_FORMATS = new Set(["jpeg", "png", "gif", "webp"]);
+
+/**
+ * Fetch an image from S3 by key. Returns { bytes: Buffer, format: string } or null.
+ * Validates that the key belongs to the expected user namespace and contains no
+ * path traversal sequences.
+ */
+async function fetchImageFromS3(s3Key, expectedNamespace) {
+  // Reject path traversal attempts
+  if (s3Key.includes("..")) {
+    console.warn(`[proxy] Rejected S3 image key with path traversal: ${s3Key}`);
+    return null;
+  }
+
+  // Validate key belongs to the expected user namespace
+  const expectedPrefix = expectedNamespace + "/_uploads/";
+  if (!s3Key.startsWith(expectedPrefix)) {
+    console.warn(
+      `[proxy] Rejected S3 image key outside user namespace: ${s3Key} (expected prefix: ${expectedPrefix})`,
+    );
+    return null;
+  }
+
+  const bucket = process.env.S3_USER_FILES_BUCKET;
+  if (!bucket) {
+    console.warn(
+      "[proxy] S3_USER_FILES_BUCKET not configured — cannot fetch image",
+    );
+    return null;
+  }
+
+  try {
+    const { GetObjectCommand } = require("@aws-sdk/client-s3");
+    const s3 = getS3Client();
+    const resp = await s3.send(
+      new GetObjectCommand({ Bucket: bucket, Key: s3Key }),
+    );
+    const chunks = [];
+    for await (const chunk of resp.Body) {
+      chunks.push(chunk);
+    }
+    const bytes = Buffer.concat(chunks);
+
+    if (bytes.length > MAX_IMAGE_BYTES) {
+      console.warn(
+        `[proxy] S3 image too large: ${bytes.length} bytes (key=${s3Key})`,
+      );
+      return null;
+    }
+
+    // Determine Bedrock format from content type or extension (validated)
+    const contentType = resp.ContentType || "";
+    const rawFormat =
+      CONTENT_TYPE_TO_BEDROCK_FORMAT[contentType] ||
+      (s3Key.includes(".") ? s3Key.split(".").pop().toLowerCase() : null);
+    const format =
+      rawFormat && VALID_BEDROCK_FORMATS.has(rawFormat) ? rawFormat : "jpeg";
+
+    console.log(
+      `[proxy] Fetched image from S3: ${s3Key} (${bytes.length} bytes, format=${format})`,
+    );
+    return { bytes, format };
+  } catch (err) {
+    console.error(
+      `[proxy] Failed to fetch image from S3: ${s3Key} — ${err.message}`,
+    );
+    return null;
+  }
+}
+
 // Workspace files pre-loaded into system prompt per user (priority order)
 const WORKSPACE_FILES = [
   {
@@ -736,17 +852,32 @@ function convertMessages(messages) {
     if (msg.role === "system") continue;
 
     if (msg.role === "user") {
-      bedrockMessages.push({
-        role: "user",
-        content: [
-          {
-            text:
-              typeof msg.content === "string"
-                ? msg.content
-                : JSON.stringify(msg.content),
-          },
-        ],
-      });
+      // Handle multimodal content (array with text + image_bedrock parts)
+      if (Array.isArray(msg.content)) {
+        const bedrockContent = [];
+        for (const part of msg.content) {
+          if (part.type === "text" && part.text) {
+            bedrockContent.push({ text: part.text });
+          } else if (part.type === "image_bedrock" && part.image) {
+            bedrockContent.push({ image: part.image });
+          }
+        }
+        if (bedrockContent.length > 0) {
+          bedrockMessages.push({ role: "user", content: bedrockContent });
+        }
+      } else {
+        bedrockMessages.push({
+          role: "user",
+          content: [
+            {
+              text:
+                typeof msg.content === "string"
+                  ? msg.content
+                  : JSON.stringify(msg.content),
+            },
+          ],
+        });
+      }
     } else if (msg.role === "assistant") {
       const content = [];
       // Add text content if present
@@ -1232,10 +1363,69 @@ const server = http.createServer(async (req, res) => {
           );
         }
 
+        // --- Preprocess images: extract markers from last user message ---
+        let processedMessages = messages;
+        const namespace = actorId.replace(/:/g, "_");
+        const lastUserIdx = messages.reduce(
+          (acc, m, i) => (m.role === "user" ? i : acc),
+          -1,
+        );
+        if (lastUserIdx >= 0) {
+          const lastUser = messages[lastUserIdx];
+          const textContent =
+            typeof lastUser.content === "string"
+              ? lastUser.content
+              : Array.isArray(lastUser.content)
+                ? lastUser.content
+                    .filter((p) => p.type === "text")
+                    .map((p) => p.text)
+                    .join("")
+                : "";
+          const { cleanText, images } = extractImageReferences(textContent);
+          if (images.length > 0) {
+            console.log(
+              `[proxy] Found ${images.length} image reference(s) in last user message`,
+            );
+            const contentParts = [];
+            if (cleanText) {
+              contentParts.push({ type: "text", text: cleanText });
+            }
+            for (const img of images) {
+              const fetched = await fetchImageFromS3(img.s3Key, namespace);
+              if (fetched) {
+                contentParts.push({
+                  type: "image_bedrock",
+                  image: {
+                    format: fetched.format,
+                    source: { bytes: fetched.bytes },
+                  },
+                });
+              } else {
+                console.warn(
+                  `[proxy] Skipping unfetchable image: ${img.s3Key}`,
+                );
+              }
+            }
+            // Fall back to original message if all images failed and no text
+            if (contentParts.length > 0) {
+              // Build new messages array (immutable — don't mutate original)
+              processedMessages = [
+                ...messages.slice(0, lastUserIdx),
+                { ...lastUser, content: contentParts },
+                ...messages.slice(lastUserIdx + 1),
+              ];
+            } else {
+              console.warn(
+                "[proxy] All images failed to fetch and no text — using original message",
+              );
+            }
+          }
+        }
+
         // --- Direct Bedrock path ---
         if (stream) {
           await invokeBedrockStreaming(
-            messages,
+            processedMessages,
             res,
             parsed.model,
             systemTextOverride,
@@ -1243,7 +1433,7 @@ const server = http.createServer(async (req, res) => {
           );
         } else {
           const result = await invokeBedrock(
-            messages,
+            processedMessages,
             systemTextOverride,
             toolConfig,
           );
