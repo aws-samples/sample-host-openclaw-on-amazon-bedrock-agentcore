@@ -163,7 +163,7 @@ cdk diff                                     # preview changes
 cdk destroy --all                            # tear down
 ```
 
-### Build & Push Bridge Image
+### Build & Push Bridge Image (after CDK deploy creates ECR repo)
 ```bash
 source .venv/bin/activate
 cdk synth                                    # synthesize + cdk-nag checks

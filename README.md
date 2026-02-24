@@ -255,7 +255,7 @@ curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}web
 
 </details>
 
-### 8. Verify
+### 9. Verify
 
 Send a message to your Telegram bot. The first message triggers a cold start (~4 minutes for OpenClaw initialization). Subsequent messages in the same session are fast.
 
@@ -351,7 +351,7 @@ All tunable parameters are in `cdk.json`:
      --secret-string 'YOUR_BOT_TOKEN' \
      --region $CDK_DEFAULT_REGION
    ```
-5. Set up the webhook (see Quick Start step 7)
+5. Set up the webhook (see Quick Start step 8)
 
 ### Slack
 
