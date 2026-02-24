@@ -645,6 +645,105 @@ async function bridgeMessage(message, timeoutMs = 240000) {
 }
 
 /**
+ * Enqueue a chat message for serialized processing.
+ * Returns a Promise that resolves with response text (never rejects).
+ * If the system is shutting down or the queue is full, resolves immediately.
+ */
+function enqueueMessage(message, timeoutMs = 120000) {
+  if (shuttingDown) {
+    return Promise.resolve(
+      "The system is restarting. Please resend your message in a moment.",
+    );
+  }
+  if (messageQueue.length >= MAX_QUEUE_DEPTH) {
+    console.warn(
+      `[contract] Queue full (${messageQueue.length}/${MAX_QUEUE_DEPTH}) — rejecting message`,
+    );
+    return Promise.resolve(
+      "Too many messages queued. Please wait for a response before sending more.",
+    );
+  }
+  return new Promise((resolve) => {
+    const entry = { message, timeoutMs, resolve, enqueuedAt: Date.now() };
+    messageQueue.push(entry);
+    console.log(
+      `[contract] Message enqueued (queue depth: ${messageQueue.length})`,
+    );
+    if (!bridgeInProgress) {
+      processQueue();
+    }
+  });
+}
+
+/**
+ * Process queued messages serially. Batches multiple waiting messages into
+ * a single bridgeMessage call when the previous call completes.
+ */
+async function processQueue() {
+  if (bridgeInProgress) return; // re-entry guard
+  bridgeInProgress = true;
+  try {
+    while (messageQueue.length > 0) {
+      // Drain all currently queued entries into a batch (fresh timestamp per batch)
+      const now = Date.now();
+      const batch = [];
+      while (messageQueue.length > 0) {
+        const entry = messageQueue.shift();
+        // Drop timed-out entries
+        if (now - entry.enqueuedAt > QUEUE_WAIT_TIMEOUT_MS) {
+          console.warn("[contract] Dropping timed-out queued message");
+          entry.resolve(
+            "Your message timed out while waiting in the queue. Please try again.",
+          );
+          continue;
+        }
+        batch.push(entry);
+      }
+
+      if (batch.length === 0) continue;
+
+      // Build the message to send
+      let combinedMessage;
+      let bridgeTimeout;
+      if (batch.length === 1) {
+        combinedMessage = batch[0].message;
+        bridgeTimeout = batch[0].timeoutMs;
+      } else {
+        const parts = batch.map(
+          (e, i) => `[Message ${i + 1}/${batch.length}]: ${e.message}`,
+        );
+        combinedMessage = parts.join("\n\n---\n\n");
+        bridgeTimeout = Math.max(...batch.map((e) => e.timeoutMs));
+        console.log(
+          `[contract] Batched ${batch.length} messages into single request`,
+        );
+      }
+
+      // Call bridgeMessage and resolve batch entries — wrapped in try/catch to
+      // guarantee all shifted entries get resolved (prevents hanging promises)
+      let responseText;
+      try {
+        responseText = await bridgeMessage(combinedMessage, bridgeTimeout);
+      } catch (err) {
+        responseText = `Bridge error: ${err.message}`;
+      }
+
+      // First entry gets the full response, rest get empty (suppressed at router)
+      batch[0].resolve(responseText);
+      for (let i = 1; i < batch.length; i++) {
+        batch[i].resolve("");
+      }
+    }
+  } finally {
+    bridgeInProgress = false;
+    // If new items arrived during the final await, re-trigger
+    if (messageQueue.length > 0) {
+      processQueue();
+    }
+  }
+}
+
+/**
  * AgentCore contract HTTP server.
  */
 const server = http.createServer(async (req, res) => {
@@ -922,5 +1021,4 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(
     "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron}",
   );
-  console.log("[contract] Endpoints: GET /ping, POST /invocations {action: chat|status}");
 });
