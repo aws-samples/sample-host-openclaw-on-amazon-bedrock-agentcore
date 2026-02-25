@@ -75,3 +75,4 @@ docker-compose.override.yml
 *.log
 *.tmp
 *.bak
+.claude/
