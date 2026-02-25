@@ -36,6 +36,7 @@ Users can send **text and images** — photos sent via Telegram or Slack are dow
   |     4. Bridge messages via WebSocket
   |   -> SIGTERM: save .openclaw/ to S3
   |                       |
+  | lightweight-agent.js  -- warm-up shim (s3-user-files + eventbridge-cron tools)
   | agentcore-proxy.js    (18790) -- OpenAI -> Bedrock ConverseStream
   | OpenClaw Gateway      (18789) -- headless, no channels
   +-----------+-----------+
@@ -243,7 +244,7 @@ The `secret_token` parameter tells Telegram to include an `X-Telegram-Bot-Api-Se
 
 ### 9. Verify
 
-Send a message to your Telegram bot. The first message triggers a cold start (~4 minutes for OpenClaw initialization). Subsequent messages in the same session are fast.
+Send a message to your Telegram bot. The first message triggers a cold start — the lightweight agent responds in ~10-15 seconds (with file storage and scheduling support) while OpenClaw initializes in the background (~2-4 minutes). After OpenClaw is ready, the full feature set is available. Subsequent messages in the same session are fast.
 
 ## Project Structure
 
@@ -264,7 +265,9 @@ openclaw-on-agentcore/
   bridge/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
-    agentcore-contract.js         # AgentCore HTTP contract with lazy init + WebSocket bridge
+    agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
+    lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron tools)
+    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 35 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
@@ -473,15 +476,16 @@ Each user's schedules are isolated — no cross-user access. Schedule metadata i
 
 1. **entrypoint.sh**: Configure Node.js IPv4 DNS patch, start contract server
 2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
-3. **On first `/invocations` with `action: chat`** (lazy init):
-   - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
-   - Restore `.openclaw/` from S3 via `workspace-sync.js`
+3. **At boot** (background): Pre-fetch secrets from Secrets Manager (~2s)
+4. **On first `/invocations` with `action: chat`, `action: warmup`, or `action: cron`** (parallel init):
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
-   - Write headless OpenClaw config (no channels)
-   - Start OpenClaw gateway (port 18789) — ~4 min startup
-   - Start periodic workspace saves (every 5 min)
-4. **Subsequent `/invocations`**: Bridge message via WebSocket to OpenClaw
-5. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
+   - Start OpenClaw gateway (port 18789) in background
+   - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
+   - Wait for proxy only (~5s)
+5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files and eventbridge-cron tools — users can manage files and schedules immediately)
+6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
+7. **After handoff**: Full OpenClaw features (skills, plugins, session management)
+8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ### Message Flow
 
@@ -580,6 +584,7 @@ cdk deploy OpenClawAgentCore --require-approval never
 ```bash
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
 cd bridge && node --test image-support.test.js         # image upload + multimodal tests
+cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 cd lambda/router && python -m pytest test_image_upload.py -v   # image upload unit tests
 
@@ -599,9 +604,9 @@ cdk synth   # Runs cdk-nag AwsSolutions checks — should produce no errors
 
 The AgentCore contract server on port 8080 must start within seconds. If `entrypoint.sh` does slow operations (like Secrets Manager calls) before starting the contract server, the health check will time out. The contract server is started as step 1 to avoid this.
 
-### First message is slow (~4 minutes)
+### First message is slow (~4 minutes for full OpenClaw)
 
-This is expected. The first message to a new user triggers microVM creation + OpenClaw initialization (plugin registration, etc.). The Router Lambda sends a "typing" indicator to Telegram while waiting. Subsequent messages in the same session are fast.
+This is expected for full OpenClaw initialization. However, the **lightweight agent shim** responds to the first message in ~10-15 seconds with support for file storage and cron scheduling tools. OpenClaw initializes in the background (~2-4 minutes) and takes over once ready. The Router Lambda sends a "typing" indicator to Telegram while waiting. Subsequent messages in the same session are fast.
 
 ### Slack bot not responding
 
