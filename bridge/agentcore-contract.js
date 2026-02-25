@@ -166,6 +166,7 @@ function writeOpenClawConfig() {
         enabled: true,
         allowInsecureAuth: true,
         dangerouslyDisableDeviceAuth: true,
+        dangerouslyAllowHostHeaderOriginFallback: true,
       },
     },
     channels: {}, // No channels — messages bridged via WebSocket
@@ -183,28 +184,31 @@ function writeOpenClawConfig() {
   // Only write if not already present (workspace restore from S3 may have a user-customized version).
   const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
   if (!fs.existsSync(agentsMdPath)) {
-    fs.writeFileSync(agentsMdPath, [
-      "# Agent Instructions",
-      "",
-      "You are a helpful AI assistant running in a per-user container on AWS.",
-      "",
-      "## Scheduling & Cron Jobs",
-      "",
-      "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to:",
-      "- Set up reminders, alarms, or scheduled messages",
-      "- Create recurring tasks or cron jobs",
-      "- Schedule daily, weekly, or periodic actions",
-      "",
-      "**Read the eventbridge-cron SKILL.md and use it.** Do NOT say cron is disabled.",
-      "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
-      "",
-      "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
-      "",
-      "## File Storage",
-      "",
-      "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
-      "",
-    ].join("\n"));
+    fs.writeFileSync(
+      agentsMdPath,
+      [
+        "# Agent Instructions",
+        "",
+        "You are a helpful AI assistant running in a per-user container on AWS.",
+        "",
+        "## Scheduling & Cron Jobs",
+        "",
+        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to:",
+        "- Set up reminders, alarms, or scheduled messages",
+        "- Create recurring tasks or cron jobs",
+        "- Schedule daily, weekly, or periodic actions",
+        "",
+        "**Read the eventbridge-cron SKILL.md and use it.** Do NOT say cron is disabled.",
+        "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
+        "",
+        "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
+        "",
+        "## File Storage",
+        "",
+        "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
+        "",
+      ].join("\n"),
+    );
     console.log("[contract] AGENTS.md written");
   }
 }
@@ -274,7 +278,10 @@ async function lazyInit(userId, actorId, channel) {
       const _fs = require("fs");
       const { execSync } = require("child_process");
       const _home = process.env.HOME || "/root";
-      const locks = execSync(`find ${_home}/.openclaw -name '*.lock' -type f 2>/dev/null || true`, { encoding: "utf8" }).trim();
+      const locks = execSync(
+        `find ${_home}/.openclaw -name '*.lock' -type f 2>/dev/null || true`,
+        { encoding: "utf8" },
+      ).trim();
       if (locks) {
         for (const lockFile of locks.split("\n").filter(Boolean)) {
           _fs.unlinkSync(lockFile);
@@ -301,7 +308,7 @@ async function lazyInit(userId, actorId, channel) {
       S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
       USER_ID: actorId,
       CHANNEL: channel,
-      OPENCLAW_SKIP_CRON: "1",  // Disable internal cron — EventBridge handles scheduling
+      OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
     };
     proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
       env: proxyEnv,
@@ -703,7 +710,9 @@ const server = http.createServer(async (req, res) => {
           // Trigger init in background if not already running
           if (!initInProgress && userId && actorId) {
             lazyInit(userId, actorId, channel || "unknown").catch((err) => {
-              console.error(`[contract] Warmup lazy init failed: ${err.message}`);
+              console.error(
+                `[contract] Warmup lazy init failed: ${err.message}`,
+              );
             });
           }
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -716,7 +725,9 @@ const server = http.createServer(async (req, res) => {
           const { userId, actorId, channel, message } = payload;
           if (!userId || !actorId || !message) {
             res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Missing userId, actorId, or message" }));
+            res.end(
+              JSON.stringify({ error: "Missing userId, actorId, or message" }),
+            );
             return;
           }
 
@@ -731,20 +742,24 @@ const server = http.createServer(async (req, res) => {
             } catch (err) {
               console.error(`[contract] Cron init failed: ${err.message}`);
               res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({
-                response: "Agent initialization failed for scheduled task.",
-                status: "error",
-              }));
+              res.end(
+                JSON.stringify({
+                  response: "Agent initialization failed for scheduled task.",
+                  status: "error",
+                }),
+              );
               return;
             }
           }
 
           if (!openclawReady || !proxyReady) {
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({
-              response: "Agent not ready after initialization.",
-              status: "error",
-            }));
+            res.end(
+              JSON.stringify({
+                response: "Agent not ready after initialization.",
+                status: "error",
+              }),
+            );
             return;
           }
 
@@ -757,11 +772,13 @@ const server = http.createServer(async (req, res) => {
           }
 
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            response: responseText,
-            userId: currentUserId,
-            sessionId: payload.sessionId || null,
-          }));
+          res.end(
+            JSON.stringify({
+              response: responseText,
+              userId: currentUserId,
+              sessionId: payload.sessionId || null,
+            }),
+          );
           return;
         }
 
