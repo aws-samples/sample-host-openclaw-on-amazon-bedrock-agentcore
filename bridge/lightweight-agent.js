@@ -427,6 +427,10 @@ function callProxy(messages) {
  * @returns {Promise<string>} - The assistant's text response
  */
 async function chat(userMessage, userId) {
+  // Convert actorId (colon format e.g. "telegram:123") to namespace (underscore format)
+  // for tool compatibility — skill scripts expect "telegram_123" format.
+  const namespace = userId.replace(/:/g, "_");
+
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
     { role: "user", content: userMessage },
@@ -473,7 +477,7 @@ async function chat(userMessage, userId) {
       }
 
       console.log(`[shim] Tool: ${fnName} args=${JSON.stringify(fnArgs)}`);
-      const result = await executeTool(fnName, fnArgs, userId);
+      const result = await executeTool(fnName, fnArgs, namespace);
 
       messages.push({
         role: "tool",
