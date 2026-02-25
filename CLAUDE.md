@@ -298,7 +298,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 8. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
 9. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
 10. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
-8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
+11. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ## DynamoDB Identity Table Schema
 
@@ -395,3 +395,4 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 - **Per-user sessions**: Contract server sets `USER_ID` env var when starting proxy, so identity is always resolved from environment in per-user mode
 - **S3-backed isolation**: User files in `s3://openclaw-user-files-{account}-{region}/{namespace}/`
 - **Namespace immutability**: System-determined from channel identity, cannot be changed by user request
+- **actorId vs namespace**: actorId uses colon format (`telegram:6087229962`), namespace uses underscore format (`telegram_6087229962`). Skill scripts (s3-user-files, eventbridge-cron) expect namespace format. The lightweight agent's `chat()` converts via `userId.replace(/:/g, "_")` before passing to tools. The proxy and workspace sync also use namespace format for S3 keys

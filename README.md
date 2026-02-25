@@ -29,11 +29,13 @@ Users can send **text and images** — photos sent via Telegram or Slack are dow
   | AgentCore Runtime     |  <-- Per-user microVM (ARM64, VPC mode)
   |                       |
   | agentcore-contract.js (8080) -- /ping (Healthy), /invocations
-  |   -> lazy init on first chat:
-  |     1. Restore .openclaw/ from S3
-  |     2. Start proxy (18790) with USER_ID env
-  |     3. Start OpenClaw headless (18789)
-  |     4. Bridge messages via WebSocket
+  |   -> boot: pre-fetch secrets from Secrets Manager
+  |   -> first /invocations (parallel):
+  |     1. Start proxy (18790) + OpenClaw (18789) + restore .openclaw/
+  |     2. Wait for proxy only (~5s)
+  |     3. Lightweight agent handles messages immediately
+  |   -> background: OpenClaw starts (~2-4 min)
+  |   -> handoff: once OpenClaw ready, route via WebSocket bridge
   |   -> SIGTERM: save .openclaw/ to S3
   |                       |
   | lightweight-agent.js  -- warm-up shim (s3-user-files + eventbridge-cron tools)
@@ -403,12 +405,13 @@ The signing secret is used by the Router Lambda to validate `X-Slack-Signature` 
 Each user gets their own AgentCore microVM. When a user sends a message:
 
 1. **Router Lambda** receives the webhook, resolves user identity in DynamoDB, and calls `InvokeAgentRuntime` with a per-user session ID
-2. **Contract server** (port 8080) handles the invocation — on first message, it lazily initializes the user's environment:
-   - Restores `.openclaw/` workspace from S3
+2. **Contract server** (port 8080) handles the invocation — on first message, it runs parallel initialization:
    - Starts the Bedrock proxy with `USER_ID`/`CHANNEL` env vars
-   - Starts OpenClaw gateway in headless mode (no channel connections)
-   - Starts periodic workspace saves (every 5 min)
-3. **WebSocket bridge** forwards the message to OpenClaw, collects streaming response deltas, and returns the accumulated text
+   - Starts OpenClaw gateway in headless mode (background)
+   - Restores `.openclaw/` workspace from S3 (background)
+   - Waits for proxy only (~5s), then the **lightweight agent** handles the message immediately via proxy -> Bedrock
+   - OpenClaw starts in background (~2-4 min); once ready, all subsequent messages route via WebSocket bridge
+3. **WebSocket bridge** (after OpenClaw ready) forwards messages to OpenClaw, collects streaming response deltas, and returns the accumulated text
 4. **Router Lambda** sends the response back to the channel (Telegram/Slack API)
 
 When the session idles (default 30 min), AgentCore terminates the microVM. Before shutdown, the SIGTERM handler saves `.openclaw/` to S3. The next message creates a fresh microVM and restores the workspace.
@@ -498,7 +501,7 @@ User sends Telegram message (text or photo)
   -> Lambda calls InvokeAgentRuntime(sessionId=per-user)
      message = string (text only) or {text, images[{s3Key, contentType}]} (with photo)
   -> Contract server receives /invocations {action: "chat", ...}
-  -> Lazy init (first message only): restore workspace, start proxy + OpenClaw
+  -> Parallel init (first message only): start proxy + OpenClaw, restore workspace
   -> Contract converts structured message to bridge text + [OPENCLAW_IMAGES:...] marker
   -> WebSocket bridge to OpenClaw gateway: auth -> agent.chat -> streaming deltas
   -> Proxy extracts image marker, fetches image bytes from S3 (namespace-validated)
@@ -658,6 +661,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **ClawHub installs to `/skills/`**: Not `~/.openclaw/skills`. The `extraDirs` config must point to `/skills`.
 - **ClawHub `--force` flag**: Some skills are flagged by VirusTotal for external API calls. Use `--no-input --force` for non-interactive Docker builds.
 - **`default-user` fallback**: If identity resolution fails, requests fall back to `actorId = "default-user"` — meaning all such users share one S3 namespace. The `USER_ID` env var path (set by contract server) should prevent this in per-user mode.
+- **actorId vs namespace format**: The actorId uses colon format (`telegram:6087229962`) while skill scripts expect namespace/underscore format (`telegram_6087229962`). The lightweight agent's `chat()` function converts via `userId.replace(/:/g, "_")` before passing to tool scripts. The proxy and workspace sync also use namespace format for S3 keys.
 - **Image version bumps are required**: After pushing a new bridge container image, you must bump `image_version` in `cdk.json` and redeploy `OpenClawAgentCore`. AgentCore caches images by digest and only re-pulls when the runtime endpoint configuration changes. Without the bump, existing sessions continue using the old image.
 - **Image upload size limit**: Bedrock Converse API limits images to 3.75 MB. The Router Lambda checks this before uploading to S3.
 - **OpenClaw 2026.2.23 controlUi breaking change**: OpenClaw versions from 2026.2.23 onward require `gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback: true` (or explicit `allowedOrigins`) when binding to non-loopback addresses (`--bind lan`). Without this, the gateway fails to start with: `Error: non-loopback Control UI requires gateway.controlUi.allowedOrigins`. The contract server's `writeOpenClawConfig()` includes this setting.
