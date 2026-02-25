@@ -20,6 +20,7 @@ fi
 
 # --- Start the AgentCore contract server (port 8080) ---
 # Must be the first thing to start — AgentCore health-checks /ping very quickly.
-# The contract server fetches secrets from Secrets Manager on first chat invocation.
+# Secrets are pre-fetched at boot. Lightweight agent handles messages while OpenClaw starts.
 echo "[openclaw-agentcore] Starting AgentCore contract server on port 8080..."
+echo "[openclaw-agentcore] Hybrid mode: lightweight agent (~10s) -> OpenClaw handoff (~2-4min)"
 exec node /app/agentcore-contract.js

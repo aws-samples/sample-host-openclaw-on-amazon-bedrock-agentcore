@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "aws-api": {
+      "command": "/home/ec2-user/.local/bin/uvx",
+      "args": ["awslabs.aws-api-mcp-server@latest"],
+      "env": {
+        "AWS_REGION": "ap-southeast-2",
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": true
+    },
+    "aws-iac": {
+      "command": "/home/ec2-user/.local/bin/uvx",
+      "args": ["awslabs.aws-iac-mcp-server@latest"],
+      "env": {
+        "AWS_REGION": "ap-southeast-2",
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": true
+    },
+    "bedrock-agentcore": {
+      "command": "/home/ec2-user/.local/bin/uvx",
+      "args": ["awslabs.amazon-bedrock-agentcore-mcp-server@latest"],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": true
+    }
+  }
+}

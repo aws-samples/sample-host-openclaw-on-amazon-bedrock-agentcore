@@ -12,10 +12,25 @@ const {
   validateBucket,
 } = require("./common");
 
+/**
+ * Read all data from stdin as a string.
+ */
+function readStdin() {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (chunk) => chunks.push(chunk));
+    process.stdin.on("end", () => resolve(chunks.join("")));
+    process.stdin.on("error", reject);
+  });
+}
+
 async function main() {
   const userId = process.argv[2];
   const filename = process.argv[3];
-  const content = process.argv.slice(4).join(" ");
+  // Read content from argv or stdin (--stdin flag). Stdin avoids OS ARG_MAX limits.
+  const argContent = process.argv.slice(4).join(" ");
+  const content = argContent === "--stdin" ? await readStdin() : argContent;
 
   validateUserId(userId);
   validateBucket();

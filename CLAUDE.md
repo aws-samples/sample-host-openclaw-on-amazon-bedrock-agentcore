@@ -13,7 +13,8 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
 - **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
-- **Tools & Skills**: Built-in tool groups (full profile) + 9 ClawHub skills + 2 custom skills (S3 user files, EventBridge cron)
+- **Cold Start Shim**: Lightweight agent handles messages in ~10-15s while OpenClaw starts (~2-4 min background)
+- **Tools & Skills**: Built-in tool groups (basic profile) + 2 custom skills (S3 user files, EventBridge cron)
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **Workspace Persistence**: .openclaw/ directory synced to/from S3 per user
@@ -44,13 +45,16 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
   | AgentCore Runtime     |  <-- Per-user microVM (ARM64, VPC mode)
   |                       |
   | agentcore-contract.js (8080) -- /ping (Healthy), /invocations
-  |   -> lazy init:
-  |     1. Restore .openclaw/ from S3
-  |     2. Start proxy (18790) with USER_ID env
-  |     3. Start OpenClaw headless (18789)
-  |     4. Bridge messages via WebSocket
+  |   -> boot: pre-fetch secrets from Secrets Manager
+  |   -> first /invocations (parallel):
+  |     1. Start proxy (18790) + OpenClaw (18789) + restore .openclaw/
+  |     2. Wait for proxy only (~5s)
+  |     3. Lightweight agent handles messages immediately
+  |   -> background: OpenClaw starts (~2-4 min)
+  |   -> handoff: once OpenClaw ready, route via WebSocket bridge
   |   -> SIGTERM: save .openclaw/ to S3
   |                       |
+  | lightweight-agent.js  -- warm-up shim (proxy -> Bedrock, s3-user-files + eventbridge-cron tools)
   | agentcore-proxy.js    (18790) -- OpenAI -> Bedrock ConverseStream
   | OpenClaw Gateway      (18789) -- headless, no channels
   +-----------+-----------+
@@ -108,7 +112,9 @@ openclaw-on-agentcore/
   bridge/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
-    agentcore-contract.js         # AgentCore HTTP contract with lazy init + WebSocket bridge
+    agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
+    lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron tools)
+    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 35 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
@@ -223,6 +229,7 @@ source .venv/bin/activate && cdk deploy OpenClawAgentCore --require-approval nev
 ```bash
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
 cd bridge && node --test image-support.test.js         # image upload + multimodal tests
+cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 ```
 
@@ -279,17 +286,18 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 
 1. **entrypoint.sh**: Configure Node.js IPv4 DNS patch, start contract server
 2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
-3. **On first `/invocations` with `action: chat` or `action: warmup`** (lazy init):
-   - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
-   - Restore `.openclaw/` from S3 via `workspace-sync.js`
+3. **At boot** (background): Pre-fetch secrets from Secrets Manager (~2s)
+4. **On first `/invocations` with `action: chat`, `action: warmup`, or `action: cron`** (parallel init):
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
-   - Write headless OpenClaw config (no channels)
-   - Start OpenClaw gateway (port 18789) — ~4 min startup
-   - Start periodic workspace saves (every 5 min)
-4. **`action: warmup`**: Triggers lazy init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
-5. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
-6. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
-7. **Subsequent `/invocations` with `action: chat`**: Bridge message via WebSocket to OpenClaw
+   - Start OpenClaw gateway (port 18789) in background
+   - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
+   - Wait for proxy only (~5s)
+5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files and eventbridge-cron tools)
+6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
+7. **After handoff**: Full OpenClaw features (skills, plugins, session management)
+8. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
+9. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
+10. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
 8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ## DynamoDB Identity Table Schema
@@ -333,9 +341,9 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 - Empty `cdk.json` account: falls back to `CDK_DEFAULT_ACCOUNT` env var via `app.py`
 
 ### OpenClaw
-- Startup takes ~4 minutes (plugin registration)
+- Startup takes ~2-4 minutes (plugin registration); lightweight agent shim handles messages during this time
 - Correct start command: `openclaw gateway run --port 18789 --bind lan --verbose`
-- **`skills.allowBundled`**: Must be an array (e.g., `["*"]`), not a boolean
+- **`skills.allowBundled`**: Must be an array (e.g., `[]` for none, `["*"]` for all), not a boolean. Set to `[]` for fast startup
 - **ClawHub skill paths**: `clawhub install` installs to `/skills/<name>` — use `/skills` as `extraDirs`
 - **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--force`
 - **Image updates**: New sessions use new image automatically (no keepalive restart needed)
@@ -353,7 +361,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 - **Webhook validation**: Telegram uses `X-Telegram-Bot-Api-Secret-Token` header (set via `secret_token` on `setWebhook`). Slack uses `X-Slack-Signature` HMAC-SHA256 with 5-minute replay window
 - **Async dispatch**: Self-invokes with `InvocationType=Event` for actual processing; returns 200 immediately to webhook
 - **Slack**: Handles `url_verification` challenge synchronously; ignores retries via `x-slack-retry-num` header
-- **Cold start latency**: First message to a new user triggers microVM creation + OpenClaw startup (~4 min)
+- **Cold start latency**: First message to a new user triggers microVM creation; lightweight agent responds in ~10-15s while OpenClaw starts in background (~2-4 min)
 - **Telegram typing indicator**: Sent while waiting for AgentCore response
 - **Cross-channel binding**: "link accounts" generates 6-char code in DynamoDB with 10-min TTL
 - **Image uploads**: Telegram photos and Slack file attachments (JPEG, PNG, GIF, WebP, max 3.75 MB) are downloaded by the Router Lambda, uploaded to S3 under `{namespace}/_uploads/`, and passed to AgentCore as a structured message `{text, images[{s3Key, contentType}]}`
