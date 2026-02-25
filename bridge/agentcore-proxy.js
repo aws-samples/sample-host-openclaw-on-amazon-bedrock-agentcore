@@ -260,7 +260,6 @@ function extractSessionMetadata(parsed, headers) {
         bracketEnd > 0
           ? firstUserMsg.content.slice(0, bracketEnd + 1)
           : firstUserMsg.content.slice(0, 60);
-      console.log(`[proxy][identity-diag] msgPrefix="${prefix.slice(0, 120)}"`);
     }
   }
   console.log(

@@ -3,7 +3,6 @@
   "context": {
     "account": "",
     "region": "ap-southeast-2",
-    "project_name": "OpenClaw",
     "default_model_id": "global.anthropic.claude-opus-4-6-v1",
     "cloudwatch_log_retention_days": 30,
     "daily_token_budget": 1000000,

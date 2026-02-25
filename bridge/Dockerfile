@@ -15,20 +15,6 @@ RUN npm install -g openclaw@latest clawhub@latest
 # Create app directory
 RUN mkdir -p /app
 
-# Pre-install Tier 1+2 skills from ClawHub
-# DISABLED: clawhub fetch fails under QEMU ARM64 cross-platform emulation on macOS.
-# Re-enable when building on native ARM64 (e.g. EC2 Graviton or CI).
-# --force needed because some skills trigger VirusTotal flags for external API calls
-# RUN clawhub install duckduckgo-search --no-input --force && \
-#     clawhub install jina-reader --no-input --force && \
-#     clawhub install telegram-compose --no-input --force && \
-#     clawhub install transcript --no-input --force && \
-#     clawhub install deep-research-pro --no-input --force && \
-#     clawhub install hackernews --no-input --force && \
-#     clawhub install news-feed --no-input --force && \
-#     clawhub install task-decomposer --no-input --force && \
-#     clawhub install cron-mastery --no-input --force
-
 WORKDIR /app
 
 # Install AWS SDK and WebSocket library (used by proxy adapter and contract server)
