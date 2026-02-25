@@ -8,13 +8,14 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 
 ## Tech Stack
 
-- **Infrastructure**: CDK v2 (Python), 6 stacks
+- **Infrastructure**: CDK v2 (Python), 7 stacks
 - **Runtime**: Bedrock AgentCore Runtime (serverless ARM64 container, VPC mode, per-user sessions)
 - **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
 - **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
 - **Cold Start Shim**: Lightweight agent handles messages in ~10-15s while OpenClaw starts (~2-4 min background)
-- **Tools & Skills**: Built-in tool groups (basic profile) + 1 custom S3 user files skill
+- **Tools & Skills**: Built-in tool groups (basic profile) + 2 custom skills (S3 user files, EventBridge cron)
+- **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **Workspace Persistence**: .openclaw/ directory synced to/from S3 per user
 - **AI Model**: Claude Opus 4.6 via Bedrock ConverseStream (configurable via `default_model_id` in `cdk.json`, default `global.anthropic.claude-opus-4-6-v1`)
@@ -78,6 +79,16 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
   | for Bedrock multimodal ConverseStream    |
   +------------------------------------------+
 
+  +------------------------------------------------------+
+  | EventBridge Scheduler (Cron Jobs)                    |
+  |                                                      |
+  | openclaw-cron schedule group                         |
+  |   -> Cron Lambda (openclaw-cron-executor)            |
+  |     1. Warm up user's AgentCore session              |
+  |     2. Send cron message via AgentCore               |
+  |     3. Deliver response to Telegram/Slack            |
+  +------------------------------------------------------+
+
   Supporting: VPC, KMS, Secrets Manager, Cognito,
              CloudWatch, DynamoDB, CloudTrail
 ```
@@ -86,8 +97,8 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 
 ```
 openclaw-on-agentcore/
-  app.py                          # CDK app entry point (6 stacks)
-  cdk.json                        # Configuration (model, budgets, sessions)
+  app.py                          # CDK app entry point (7 stacks)
+  cdk.json                        # Configuration (model, budgets, sessions, cron)
   requirements.txt                # Python deps (aws-cdk-lib, cdk-nag)
   stacks/
     __init__.py                   # Shared helper (RetentionDays converter)
@@ -97,6 +108,7 @@ openclaw-on-agentcore/
     router_stack.py               # Router Lambda + API Gateway HTTP API + DynamoDB identity
     observability_stack.py        # Dashboards, alarms, Bedrock logging
     token_monitoring_stack.py     # Lambda processor, DynamoDB, token analytics
+    cron_stack.py                 # EventBridge Scheduler, Cron executor Lambda, IAM
   bridge/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
@@ -112,15 +124,23 @@ openclaw-on-agentcore/
         common.js                 # Shared utilities (sanitize, buildKey, validation)
         read.js / write.js        # Read/write files in user's S3 namespace
         list.js / delete.js       # List/delete files in user's S3 namespace
+      eventbridge-cron/           # Cron scheduling skill (EventBridge Scheduler)
+        SKILL.md                  # OpenClaw skill manifest
+        common.js                 # Shared utilities (schedule group, DynamoDB helpers)
+        create.js / update.js     # Create/update EventBridge schedules
+        list.js / delete.js       # List/delete schedules
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py               # Webhook router (Telegram + Slack, image uploads)
     router/test_image_upload.py   # Image upload unit tests (pytest)
+    cron/index.py                 # Cron executor (warmup, invoke, deliver to channel)
+  tests/
+    e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
   docs/
     architecture.md               # Detailed architecture diagrams
 ```
 
-## CDK Stacks (6 stacks)
+## CDK Stacks (7 stacks)
 
 | Stack | Key Resources | Dependencies |
 |---|---|---|
@@ -130,6 +150,7 @@ openclaw-on-agentcore/
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms, SNS, Bedrock invocation logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
+| **OpenClawCron** | EventBridge Scheduler group, Cron executor Lambda, Scheduler IAM role | AgentCore, Router, Security |
 
 ## Expected Commands
 
@@ -215,6 +236,11 @@ cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test com
 cd lambda/router && python -m pytest test_image_upload.py -v   # image upload unit tests
 ```
 
+### E2E Tests
+```bash
+cd tests/e2e && python -m pytest bot_test.py -v   # simulated Telegram webhook tests (requires deployed stack)
+```
+
 ### Runtime Operations
 ```bash
 # Get runtime ID
@@ -250,13 +276,16 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
 | `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
+| `cron_lambda_timeout_seconds` | `600` | Cron executor Lambda timeout (must exceed warmup time) |
+| `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
+| `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 
 ## Container Startup Sequence
 
 1. **entrypoint.sh**: Configure Node.js IPv4 DNS patch, start contract server
 2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
 3. **At boot** (background): Pre-fetch secrets from Secrets Manager (~2s)
-4. **On first `/invocations` with `action: chat`** (parallel init):
+4. **On first `/invocations` with `action: chat`, `action: warmup`, or `action: cron`** (parallel init):
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
    - Start OpenClaw gateway (port 18789) in background
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
@@ -264,6 +293,9 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files tools)
 6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
 7. **After handoff**: Full OpenClaw features (skills, plugins, session management)
+8. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
+9. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
+10. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
 8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ## DynamoDB Identity Table Schema
@@ -277,6 +309,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 | `USER#user_abc123` | `CHANNEL#telegram:6087229962` | User's bound channels |
 | `USER#user_abc123` | `SESSION` | Current session |
 | `BIND#ABC123` | `BIND` | Cross-channel bind code (10 min TTL) |
+| `USER#user_abc123` | `CRON#schedule-name` | User's cron schedule metadata (expression, message, timezone, channel) |
 
 **Cross-channel binding**: User says "link accounts" on Telegram → gets 6-char code → enters code on Slack → both channels route to same user/session.
 
@@ -313,6 +346,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 - **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--force`
 - **Image updates**: New sessions use new image automatically (no keepalive restart needed)
 - **WebSocket bridge protocol**: Connect → auth (type:req, method:connect, protocol:3, auth:{token}) → agent.chat → streaming deltas → final
+- **OpenClaw 2026.2.23 breaking change**: Non-loopback `controlUi` requires `dangerouslyAllowHostHeaderOriginFallback: true` or explicit `allowedOrigins`. Without this, `openclaw gateway run --bind lan` fails with `Error: non-loopback Control UI requires gateway.controlUi.allowedOrigins`
 
 ### Cognito Identity
 - Self-signup disabled — users auto-provisioned by proxy via `AdminCreateUser`
@@ -345,6 +379,14 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 - **SIGTERM grace**: 10s max for final save before exit (AgentCore gives 15s total)
 - **Skip patterns**: `node_modules/`, `.cache/`, `*.log`, files > 10MB
 - **Same S3 bucket**: Uses `S3_USER_FILES_BUCKET` (shared with s3-user-files skill)
+
+### EventBridge Cron Scheduling
+- **Schedule group**: All schedules created under `openclaw-cron` group in EventBridge Scheduler
+- **Schedule naming**: `openclaw-{namespace}-{shortId}` (e.g., `openclaw-telegram_6087229962-87a86927`)
+- **DynamoDB storage**: Schedule metadata stored as `CRON#` SK under the user's PK in the identity table
+- **Cron executor Lambda**: Warms up the user's AgentCore session (sends `action: warmup`), then sends the cron message (sends `action: cron`), then delivers the response to the user's chat channel
+- **Lead time**: Cron Lambda invoked with `cron_lead_time_minutes` (default 5 min) to allow session warmup before the scheduled time
+- **Environment variables**: Container receives `EVENTBRIDGE_SCHEDULE_GROUP`, `CRON_LAMBDA_ARN`, `EVENTBRIDGE_ROLE_ARN`, `IDENTITY_TABLE_NAME`, `CRON_LEAD_TIME_MINUTES` for the eventbridge-cron skill
 
 ### Per-User Identity Resolution
 - **Priority order**: (0) `USER_ID` env var (set by contract server) → (1) `x-openclaw-actor-id` header → (2) OpenAI `user` field → (3) message envelope parsing → (4) message `name` field → (5) fallback `default-user`
