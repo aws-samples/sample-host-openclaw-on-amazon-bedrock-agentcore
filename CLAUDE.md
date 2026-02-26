@@ -129,6 +129,10 @@ openclaw-on-agentcore/
     router/index.py               # Webhook router (Telegram + Slack, image uploads)
     router/test_image_upload.py   # Image upload unit tests (pytest)
     cron/index.py                 # Cron executor (warmup, invoke, deliver to channel)
+  scripts/
+    setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
+    setup-slack.sh                # Slack Event Subscriptions + admin allowlist
+    manage-allowlist.sh           # Add/remove/list users in the allowlist
   tests/
     e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
   docs/
@@ -174,7 +178,14 @@ docker push \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
 ```
 
-### Webhook Setup
+### Webhook Setup (Telegram)
+
+The setup script registers the webhook and adds you to the allowlist in one step:
+```bash
+./scripts/setup-telegram.sh
+```
+
+Or manually:
 ```bash
 # Get Router API Gateway URL
 API_URL=$(aws cloudformation describe-stacks \
@@ -192,6 +203,9 @@ TELEGRAM_TOKEN=$(aws secretsmanager get-secret-value \
   --secret-id openclaw/channels/telegram \
   --region $CDK_DEFAULT_REGION --query SecretString --output text)
 curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}webhook/telegram&secret_token=${WEBHOOK_SECRET}"
+
+# Add yourself to the allowlist (find your ID via @userinfobot on Telegram)
+./scripts/manage-allowlist.sh add telegram:YOUR_TELEGRAM_USER_ID
 ```
 
 ### Channel Setup
@@ -208,6 +222,12 @@ aws secretsmanager update-secret \
   --secret-string '{"botToken":"xoxb-YOUR-BOT-TOKEN","signingSecret":"YOUR-SIGNING-SECRET"}' \
   --region $CDK_DEFAULT_REGION
 ```
+
+### Slack Setup (Event Subscriptions + Allowlist)
+```bash
+./scripts/setup-slack.sh
+```
+This displays the webhook URL for Slack Event Subscriptions, prompts for your Slack member ID, and adds you to the allowlist.
 
 ### Deploy New Bridge Version
 ```bash
@@ -271,6 +291,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
 | `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
+| `registration_open` | `false` | If true, any user can register. If false, only allowlisted users |
 | `cron_lambda_timeout_seconds` | `600` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
@@ -303,9 +324,60 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 | `USER#user_abc123` | `CHANNEL#telegram:6087229962` | User's bound channels |
 | `USER#user_abc123` | `SESSION` | Current session |
 | `BIND#ABC123` | `BIND` | Cross-channel bind code (10 min TTL) |
+| `ALLOW#telegram:6087229962` | `ALLOW` | User allowlist entry |
 | `USER#user_abc123` | `CRON#schedule-name` | User's cron schedule metadata (expression, message, timezone, channel) |
 
 **Cross-channel binding**: User says "link accounts" on Telegram → gets 6-char code → enters code on Slack → both channels route to same user/session.
+
+### User Allowlist
+
+When `registration_open` is `false` (default), only users with an `ALLOW#` record in DynamoDB can register. Existing users (already have a `CHANNEL#` record) are always allowed. Cross-channel binding bypasses the allowlist since it links to an already-approved user.
+
+Unauthorized users who message the bot receive a rejection message that includes their channel ID (e.g. `telegram:123456`), so they can share it with the admin for onboarding.
+
+#### First-User Bootstrap
+
+After initial deployment, no users exist. The easiest path is the setup script, which registers the webhook and adds you to the allowlist in one step:
+
+```bash
+./scripts/setup-telegram.sh
+```
+
+Alternatively, if you don't know your Telegram user ID:
+
+1. Message the bot from Telegram
+2. The bot replies with a rejection message showing your ID, e.g. `telegram:123456`
+3. Add yourself to the allowlist:
+   ```bash
+   ./scripts/manage-allowlist.sh add telegram:123456
+   ```
+4. Message the bot again — you are now registered
+
+#### Adding New Users
+
+When someone wants access to the bot:
+
+1. They message the bot and receive: *"Your ID: `telegram:789012`. Send this ID to the bot admin to request access."*
+2. The admin adds them:
+   ```bash
+   ./scripts/manage-allowlist.sh add telegram:789012
+   ```
+3. The user messages the bot again — they are now registered
+
+#### Managing the Allowlist
+
+```bash
+# Add a user to the allowlist
+./scripts/manage-allowlist.sh add telegram:123456
+
+# Remove a user
+./scripts/manage-allowlist.sh remove telegram:123456
+
+# List all allowed users
+./scripts/manage-allowlist.sh list
+```
+
+Only the **first channel identity** needs to be allowlisted. When a user binds a second channel (e.g. Slack) via `link`, the new channel maps to their existing approved user — no separate allowlist entry needed.
 
 ## Gotchas
 

@@ -49,6 +49,7 @@ class RouterStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
+        registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
 
         # --- DynamoDB Identity Table ---
         self.identity_table = dynamodb.Table(
@@ -93,6 +94,7 @@ class RouterStack(Stack):
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
                 "WEBHOOK_SECRET_ID": webhook_secret_name,
+                "REGISTRATION_OPEN": registration_open,
                 "USER_FILES_BUCKET": user_files_bucket_name,
             },
             log_group=router_log_group,

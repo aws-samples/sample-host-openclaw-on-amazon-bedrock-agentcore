@@ -34,6 +34,7 @@ SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
 
 # --- Clients (lazy init on cold start) ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
@@ -161,10 +162,32 @@ def validate_slack_webhook(headers, body):
 # DynamoDB identity helpers
 # ---------------------------------------------------------------------------
 
+def is_user_allowed(channel, channel_user_id):
+    """Check if a new user is permitted to register.
+
+    Returns True if:
+    - REGISTRATION_OPEN is true (anyone can register), OR
+    - An ALLOW#{channel}:{channel_user_id} record exists in DynamoDB
+
+    This is only called for NEW users (no existing CHANNEL# record).
+    Existing users and bind-code redemptions bypass this check.
+    """
+    if REGISTRATION_OPEN:
+        return True
+    channel_key = f"{channel}:{channel_user_id}"
+    try:
+        resp = identity_table.get_item(Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"})
+        if "Item" in resp:
+            return True
+    except ClientError as e:
+        logger.error("Allowlist check failed: %s", e)
+    return False
+
+
 def resolve_user(channel, channel_user_id, display_name=""):
     """Look up or create a user for the given channel identity.
 
-    Returns (user_id, is_new).
+    Returns (user_id, is_new). Returns (None, False) if user is not allowed.
     """
     channel_key = f"{channel}:{channel_user_id}"
     pk = f"CHANNEL#{channel_key}"
@@ -177,7 +200,12 @@ def resolve_user(channel, channel_user_id, display_name=""):
     except ClientError as e:
         logger.error("DynamoDB get_item failed: %s", e)
 
-    # 2. Create new user (conditional write to handle race conditions)
+    # 2. Check allowlist before creating a new user
+    if not is_user_allowed(channel, channel_user_id):
+        logger.warning("User %s not on allowlist — rejecting registration", channel_key)
+        return None, False
+
+    # 3. Create new user (conditional write to handle race conditions)
     user_id = f"user_{uuid.uuid4().hex[:16]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -691,6 +719,16 @@ def handle_telegram(body):
     actor_id = f"telegram:{user_id_tg}"
     resolved_user_id, is_new = resolve_user("telegram", user_id_tg, display_name)
 
+    if resolved_user_id is None:
+        send_telegram_message(
+            chat_id,
+            f"Sorry, this bot is private and requires an invitation.\n\n"
+            f"Your ID: `telegram:{user_id_tg}`\n\n"
+            f"Send this ID to the bot admin to request access.",
+            token,
+        )
+        return
+
     # Handle bind commands (text-only)
     if _is_link_command(text):
         code = create_bind_code(resolved_user_id)
@@ -800,6 +838,16 @@ def handle_slack(body, headers=None):
     # Resolve user identity
     actor_id = f"slack:{slack_user_id}"
     resolved_user_id, is_new = resolve_user("slack", slack_user_id)
+
+    if resolved_user_id is None:
+        send_slack_message(
+            channel_id,
+            f"Sorry, this bot is private and requires an invitation.\n\n"
+            f"Your ID: `slack:{slack_user_id}`\n\n"
+            f"Send this ID to the bot admin to request access.",
+            bot_token,
+        )
+        return {"statusCode": 200, "body": "ok"}
 
     # Handle bind commands (text-only)
     if _is_link_command(text):

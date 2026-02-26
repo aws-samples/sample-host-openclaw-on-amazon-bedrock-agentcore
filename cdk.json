@@ -17,6 +17,7 @@
     "workspace_sync_interval_seconds": 300,
     "router_lambda_timeout_seconds": 300,
     "router_lambda_memory_mb": 256,
+    "registration_open": false,
     "cron_lambda_timeout_seconds": 600,
     "cron_lambda_memory_mb": 256,
     "cron_lead_time_minutes": 5,

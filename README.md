@@ -218,7 +218,21 @@ aws secretsmanager update-secret \
   --region $CDK_DEFAULT_REGION
 ```
 
-### 8. Set up Telegram webhook
+### 8. Set up Telegram webhook and add yourself to the allowlist
+
+The setup script registers the webhook and adds you to the bot's allowlist in one step:
+
+```bash
+./scripts/setup-telegram.sh
+```
+
+The script will:
+1. Register the Telegram webhook with API Gateway (with secret token for request validation)
+2. Prompt you for your Telegram user ID (find it via [@userinfobot](https://t.me/userinfobot) on Telegram)
+3. Add you to the DynamoDB allowlist so you can use the bot immediately
+
+<details>
+<summary>Manual setup (if you prefer individual commands)</summary>
 
 ```bash
 # Get Router API URL
@@ -237,9 +251,12 @@ TELEGRAM_TOKEN=$(aws secretsmanager get-secret-value \
   --secret-id openclaw/channels/telegram \
   --region $CDK_DEFAULT_REGION --query SecretString --output text)
 curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}webhook/telegram&secret_token=${WEBHOOK_SECRET}"
+
+# Add yourself to the allowlist (find your ID via @userinfobot on Telegram)
+./scripts/manage-allowlist.sh add telegram:YOUR_TELEGRAM_USER_ID
 ```
 
-The `secret_token` parameter tells Telegram to include an `X-Telegram-Bot-Api-Secret-Token` header on every webhook delivery. The Router Lambda validates this header and rejects requests without a valid token.
+</details>
 
 ### 9. Verify
 
@@ -278,6 +295,10 @@ openclaw-on-agentcore/
     router/index.py               # Webhook router (Telegram + Slack, image uploads)
     router/test_image_upload.py   # Image upload unit tests (pytest)
     cron/index.py                 # Cron executor (warmup, invoke, deliver)
+  scripts/
+    setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
+    setup-slack.sh                # Slack Event Subscriptions + admin allowlist
+    manage-allowlist.sh           # Add/remove/list users in the allowlist
   docs/
     architecture.md               # Detailed architecture diagram
 ```
@@ -311,6 +332,7 @@ All tunable parameters are in `cdk.json`:
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
 | `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
+| `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
 | `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
@@ -393,6 +415,18 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
 
 The signing secret is used by the Router Lambda to validate `X-Slack-Signature` HMAC on every incoming webhook request (with 5-minute replay attack prevention).
 
+**Add yourself to the allowlist:**
+
+17. Find your Slack member ID: click your profile picture → **Profile** → **⋯** (more) → **Copy member ID**
+18. Run the setup script (handles steps 9–11 and the allowlist in one go):
+    ```bash
+    ./scripts/setup-slack.sh
+    ```
+    Or add yourself manually:
+    ```bash
+    ./scripts/manage-allowlist.sh add slack:YOUR_MEMBER_ID
+    ```
+
 ## How It Works
 
 ### Per-User Sessions
@@ -439,6 +473,33 @@ By default, each channel creates a separate user identity. If you use both Teleg
 After linking, both channels route to the same user, the same AgentCore session, and the same conversation history. The bind code is stored in DynamoDB with a 10-minute TTL and deleted after use.
 
 You can link multiple channels to the same identity by repeating the process.
+
+### Access Control (User Allowlist)
+
+By default, the bot is **private** (`registration_open: false` in `cdk.json`). Only users on the allowlist can register. Existing users (already registered) are always allowed through.
+
+When an unauthorized user messages the bot, they receive a rejection message that includes their channel ID:
+
+> *Sorry, this bot is private and requires an invitation.*
+> *Your ID: `telegram:123456`*
+> *Send this ID to the bot admin to request access.*
+
+**Adding users:**
+
+```bash
+# Add a user to the allowlist
+./scripts/manage-allowlist.sh add telegram:123456
+
+# Remove a user
+./scripts/manage-allowlist.sh remove telegram:123456
+
+# List all allowed users
+./scripts/manage-allowlist.sh list
+```
+
+Only the first channel identity needs to be allowlisted. When a user binds a second channel (e.g. Slack) via `link`, the new channel maps to their existing approved user — no separate allowlist entry needed.
+
+To make the bot open to everyone, set `registration_open: true` in `cdk.json` and redeploy.
 
 ### Scheduled Tasks (Cron Jobs)
 
