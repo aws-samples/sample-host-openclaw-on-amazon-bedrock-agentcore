@@ -47,7 +47,7 @@ function validateUserId(userId) {
     );
     process.exit(1);
   }
-  // Namespace must match channel_identifier pattern (e.g., telegram_6087229962, slack_sen-outlook).
+  // Namespace must match channel_identifier pattern (e.g., telegram_123456789, slack_U0AGD41CBGS).
   // This prevents prompt injection attacks where a user tricks the AI into using
   // an arbitrary namespace to access another user's files.
   const VALID_NAMESPACE =

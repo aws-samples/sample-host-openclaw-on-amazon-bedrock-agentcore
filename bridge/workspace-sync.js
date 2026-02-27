@@ -5,7 +5,7 @@
  * periodically saves it back. Uses the same S3 bucket and client pattern
  * as the proxy's workspace files (readUserFileFromS3/writeUserFileToS3).
  *
- * Namespace format: {actorId.replace(/:/g, "_")} (e.g., "telegram_6087229962")
+ * Namespace format: {actorId.replace(/:/g, "_")} (e.g., "telegram_123456789")
  * S3 prefix: {namespace}/.openclaw/
  * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/)
  */

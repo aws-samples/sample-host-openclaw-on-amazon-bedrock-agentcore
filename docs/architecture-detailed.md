@@ -269,7 +269,7 @@ The lightweight agent (`bridge/lightweight-agent.js`) provides immediate respons
 
 ```
 s3://openclaw-user-files-{account}-{region}/
-├── telegram_6087229962/           # User namespace (channel_id)
+├── telegram_123456789/           # User namespace (channel_id)
 │   ├── .openclaw/                 # Workspace (synced on init/shutdown)
 │   │   ├── openclaw.json
 │   │   ├── MEMORY.md

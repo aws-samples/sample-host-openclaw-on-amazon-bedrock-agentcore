@@ -82,7 +82,7 @@ describe("buildKey", () => {
 
 describe("validateUserId", () => {
   it("accepts valid telegram namespace", () => {
-    assert.doesNotThrow(() => validateUserId("telegram_6087229962"));
+    assert.doesNotThrow(() => validateUserId("telegram_123456789"));
   });
 
   it("accepts valid slack namespace", () => {

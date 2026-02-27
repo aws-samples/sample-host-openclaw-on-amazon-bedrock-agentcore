@@ -261,10 +261,10 @@
   API Gateway -> Router Lambda
          |
          v
-  Extract channel user ID (e.g. "telegram:6087229962")
+  Extract channel user ID (e.g. "telegram:123456789")
          |
          v
-  DynamoDB lookup: CHANNEL#telegram:6087229962
+  DynamoDB lookup: CHANNEL#telegram:123456789
          |
          +-- Not found: create new user (user_<uuid>)
          |   -> CHANNEL# item, USER# profile, SESSION item
@@ -277,7 +277,7 @@
   Container starts -> agentcore-proxy.js
          |
          v
-  USER_ID env var set by contract server (e.g. "telegram:6087229962")
+  USER_ID env var set by contract server (e.g. "telegram:123456789")
          |
          v
   derivePassword(actorId) = HMAC-SHA256(secret, actorId).slice(0, 32)

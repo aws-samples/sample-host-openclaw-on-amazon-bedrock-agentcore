@@ -105,7 +105,7 @@ function extractSessionMetadata(parsed, headers) {
   // Format C (metadata JSON — checked FIRST, highest priority):
   //   Conversation info (untrusted metadata):
   //   ```json
-  //   { "message_id": "542", "sender": "6087229962" }
+  //   { "message_id": "542", "sender": "123456789" }
   //   ```
   //   NOT anchored — OpenClaw may PREPEND a Slack "System: [...]" line before
   //   the metadata block. Used by ALL channels. Contains the platform user ID

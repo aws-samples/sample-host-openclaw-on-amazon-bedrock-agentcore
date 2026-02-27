@@ -328,12 +328,12 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 
 | PK | SK | Purpose |
 |---|---|---|
-| `CHANNEL#telegram:6087229962` | `PROFILE` | Channel→user lookup |
+| `CHANNEL#telegram:123456789` | `PROFILE` | Channel→user lookup |
 | `USER#user_abc123` | `PROFILE` | User profile |
-| `USER#user_abc123` | `CHANNEL#telegram:6087229962` | User's bound channels |
+| `USER#user_abc123` | `CHANNEL#telegram:123456789` | User's bound channels |
 | `USER#user_abc123` | `SESSION` | Current session |
 | `BIND#ABC123` | `BIND` | Cross-channel bind code (10 min TTL) |
-| `ALLOW#telegram:6087229962` | `ALLOW` | User allowlist entry |
+| `ALLOW#telegram:123456789` | `ALLOW` | User allowlist entry |
 | `USER#user_abc123` | `CRON#schedule-name` | User's cron schedule metadata (expression, message, timezone, channel) |
 
 **Cross-channel binding**: User says "link accounts" on Telegram → gets 6-char code → enters code on Slack → both channels route to same user/session.
@@ -433,7 +433,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 ### Cognito Identity
 - Self-signup disabled — users auto-provisioned by proxy via `AdminCreateUser`
 - Passwords: `HMAC-SHA256(secret, actorId).slice(0, 32)` — deterministic, never stored
-- Usernames are channel-prefixed: `telegram:6087229962`
+- Usernames are channel-prefixed: `telegram:123456789`
 - JWT tokens cached per user with 60s early refresh
 
 ### Router Lambda
@@ -464,7 +464,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 
 ### EventBridge Cron Scheduling
 - **Schedule group**: All schedules created under `openclaw-cron` group in EventBridge Scheduler
-- **Schedule naming**: `openclaw-{namespace}-{shortId}` (e.g., `openclaw-telegram_6087229962-87a86927`)
+- **Schedule naming**: `openclaw-{namespace}-{shortId}` (e.g., `openclaw-telegram_123456789-87a86927`)
 - **DynamoDB storage**: Schedule metadata stored as `CRON#` SK under the user's PK in the identity table
 - **Cron executor Lambda**: Warms up the user's AgentCore session (sends `action: warmup`), then sends the cron message (sends `action: cron`), then delivers the response to the user's chat channel
 - **Lead time**: Cron Lambda invoked with `cron_lead_time_minutes` (default 5 min) to allow session warmup before the scheduled time
@@ -475,4 +475,4 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Per-user sessions**: Contract server sets `USER_ID` env var when starting proxy, so identity is always resolved from environment in per-user mode
 - **S3-backed isolation**: User files in `s3://openclaw-user-files-{account}-{region}/{namespace}/`
 - **Namespace immutability**: System-determined from channel identity, cannot be changed by user request
-- **actorId vs namespace**: actorId uses colon format (`telegram:6087229962`), namespace uses underscore format (`telegram_6087229962`). Skill scripts (s3-user-files, eventbridge-cron) expect namespace format. The lightweight agent's `chat()` converts via `userId.replace(/:/g, "_")` before passing to tools. The proxy and workspace sync also use namespace format for S3 keys
+- **actorId vs namespace**: actorId uses colon format (`telegram:123456789`), namespace uses underscore format (`telegram_123456789`). Skill scripts (s3-user-files, eventbridge-cron) expect namespace format. The lightweight agent's `chat()` converts via `userId.replace(/:/g, "_")` before passing to tools. The proxy and workspace sync also use namespace format for S3 keys
