@@ -16,6 +16,7 @@ os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-us-
 # Mock boto3 before importing the module
 sys.modules["boto3"] = MagicMock()
 sys.modules["botocore"] = MagicMock()
+sys.modules["botocore.config"] = MagicMock()
 sys.modules["botocore.exceptions"] = MagicMock()
 
 import importlib
