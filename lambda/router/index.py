@@ -513,14 +513,28 @@ def send_telegram_typing(chat_id, token):
         pass
 
 
-def _periodic_typing(chat_id, token, stop_event, interval=4):
+def _periodic_typing(chat_id, token, stop_event, interval=4, notify_after_s=30):
     """Send typing indicator every `interval` seconds until stop_event is set.
 
     Runs in a background thread. Telegram typing indicators expire after ~5s,
     so we send every 4s to keep the indicator visible during long AgentCore calls.
+
+    After `notify_after_s` seconds, sends a one-time progress message so the user
+    knows the bot is still working (e.g. during subagent tasks).
     """
+    notified = False
+    elapsed = 0
     while not stop_event.wait(timeout=interval):
+        elapsed += interval
         send_telegram_typing(chat_id, token)
+        if not notified and elapsed >= notify_after_s:
+            send_telegram_message(
+                chat_id,
+                "\u23f3 Working on your request \u2014 this may take a few minutes. "
+                "I'll send the full response when it's ready.",
+                token,
+            )
+            notified = True
 
 
 def send_slack_message(channel_id, text, bot_token):
@@ -545,6 +559,17 @@ def send_slack_message(channel_id, text, bot_token):
         urllib_request.urlopen(req, timeout=10)
     except Exception as e:
         logger.error("Failed to send Slack message to %s: %s", channel_id, e)
+
+
+def _slack_progress_notify(channel_id, bot_token, stop_event, notify_after_s=30):
+    """Send a one-time progress message to Slack if the request takes longer than notify_after_s."""
+    if not stop_event.wait(timeout=notify_after_s):
+        send_slack_message(
+            channel_id,
+            "\u23f3 Working on your request \u2014 this may take a few minutes. "
+            "I'll send the full response when it's ready.",
+            bot_token,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -927,8 +952,19 @@ def handle_slack(body, headers=None):
         resolved_user_id, actor_id, session_id, len(text), has_image,
     )
 
-    # Invoke AgentCore
-    result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message)
+    # Invoke AgentCore with progress notification for long requests
+    stop_notify = threading.Event()
+    notify_thread = threading.Thread(
+        target=_slack_progress_notify,
+        args=(channel_id, bot_token, stop_notify),
+        daemon=True,
+    )
+    notify_thread.start()
+    try:
+        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message)
+    finally:
+        stop_notify.set()
+        notify_thread.join(timeout=2)
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     response_text = _extract_text_from_content_blocks(response_text)
 
