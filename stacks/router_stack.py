@@ -96,6 +96,7 @@ class RouterStack(Stack):
                 "WEBHOOK_SECRET_ID": webhook_secret_name,
                 "REGISTRATION_OPEN": registration_open,
                 "USER_FILES_BUCKET": user_files_bucket_name,
+                "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
             },
             log_group=router_log_group,
         )

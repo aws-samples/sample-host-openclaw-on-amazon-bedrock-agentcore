@@ -14,6 +14,7 @@ import uuid
 from urllib import request as urllib_request
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -26,11 +27,20 @@ IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
+LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
 # --- Clients ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
-agentcore_client = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
+agentcore_client = boto3.client(
+    "bedrock-agentcore",
+    region_name=AWS_REGION,
+    config=Config(
+        read_timeout=max(LAMBDA_TIMEOUT_SECONDS - 30, 60),
+        connect_timeout=10,
+        retries={"max_attempts": 0},
+    ),
+)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 
 # --- Token cache (survives across warm invocations) ---

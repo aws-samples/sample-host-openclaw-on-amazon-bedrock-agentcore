@@ -17,7 +17,7 @@ const { execFile, spawn } = require("child_process");
 const PROXY_PORT = 18790;
 const PROXY_URL = `http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`;
 
-const MAX_ITERATIONS = 20;
+const MAX_ITERATIONS = 10;
 const TOOL_TIMEOUT_MS = 30000;
 const HTTP_TIMEOUT_MS = 120000;
 const WEB_FETCH_TIMEOUT_MS = 15000;
@@ -845,7 +845,7 @@ function callProxy(messages) {
  * @param {string} userId - The user's actor ID (for tool execution)
  * @returns {Promise<string>} - The assistant's text response
  */
-async function chat(userMessage, userId) {
+async function chat(userMessage, userId, deadlineMs = 0) {
   // Convert actorId (colon format e.g. "telegram:123") to namespace (underscore format)
   // for tool compatibility — skill scripts expect "telegram_123" format.
   const namespace = userId.replace(/:/g, "_");
@@ -856,6 +856,10 @@ async function chat(userMessage, userId) {
   ];
 
   for (let i = 0; i < MAX_ITERATIONS; i++) {
+    if (deadlineMs > 0 && Date.now() > deadlineMs) {
+      console.warn(`[shim] Deadline exceeded — stopping at iteration ${i + 1}`);
+      break;
+    }
     console.log(`[shim] Iteration ${i + 1}/${MAX_ITERATIONS}`);
 
     let response;

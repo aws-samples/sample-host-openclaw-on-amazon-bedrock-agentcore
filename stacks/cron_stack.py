@@ -89,6 +89,7 @@ class CronStack(Stack):
                 "IDENTITY_TABLE_NAME": identity_table_name,
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
+                "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
             },
             log_group=cron_log_group,
         )

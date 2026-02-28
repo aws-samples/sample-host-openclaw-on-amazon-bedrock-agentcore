@@ -14,12 +14,14 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from urllib import request as urllib_request
 from urllib.parse import quote
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -35,11 +37,20 @@ WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
+LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
 # --- Clients (lazy init on cold start) ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
-agentcore_client = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
+agentcore_client = boto3.client(
+    "bedrock-agentcore",
+    region_name=AWS_REGION,
+    config=Config(
+        read_timeout=max(LAMBDA_TIMEOUT_SECONDS - 15, 60),
+        connect_timeout=10,
+        retries={"max_attempts": 0},
+    ),
+)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
@@ -502,6 +513,16 @@ def send_telegram_typing(chat_id, token):
         pass
 
 
+def _periodic_typing(chat_id, token, stop_event, interval=4):
+    """Send typing indicator every `interval` seconds until stop_event is set.
+
+    Runs in a background thread. Telegram typing indicators expire after ~5s,
+    so we send every 4s to keep the indicator visible during long AgentCore calls.
+    """
+    while not stop_event.wait(timeout=interval):
+        send_telegram_typing(chat_id, token)
+
+
 def send_slack_message(channel_id, text, bot_token):
     """Send a message via Slack Web API."""
     if not bot_token:
@@ -777,8 +798,19 @@ def handle_telegram(body):
         resolved_user_id, actor_id, session_id, len(text), image_count,
     )
 
-    # Invoke AgentCore
-    result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message)
+    # Invoke AgentCore with periodic typing indicator
+    stop_typing = threading.Event()
+    typing_thread = threading.Thread(
+        target=_periodic_typing,
+        args=(chat_id, token, stop_typing),
+        daemon=True,
+    )
+    typing_thread.start()
+    try:
+        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message)
+    finally:
+        stop_typing.set()
+        typing_thread.join(timeout=2)
     logger.info("AgentCore result keys: %s", list(result.keys()) if isinstance(result, dict) else type(result))
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw

@@ -618,7 +618,7 @@ async function processMessageQueue() {
     );
 
     try {
-      const response = await bridgeMessage(message, 120000);
+      const response = await bridgeMessage(message, 560000);
       resolve(response);
     } catch (err) {
       reject(err);
@@ -646,7 +646,7 @@ function enqueueMessage(message) {
 /**
  * Bridge a chat message to OpenClaw via WebSocket and collect the response.
  */
-async function bridgeMessage(message, timeoutMs = 240000) {
+async function bridgeMessage(message, timeoutMs = 560000) {
   const { randomUUID } = require("crypto");
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
@@ -1037,7 +1037,7 @@ const server = http.createServer(async (req, res) => {
               "[contract] Cron bridge returned empty — falling back to lightweight agent",
             );
             try {
-              responseText = await agent.chat(message, actorId);
+              responseText = await agent.chat(message, actorId, Date.now() + 30000);
             } catch (agentErr) {
               responseText =
                 "I couldn't process this scheduled task. Please check the configuration.";
@@ -1130,7 +1130,7 @@ const server = http.createServer(async (req, res) => {
                 "[contract] Bridge returned empty — falling back to lightweight agent",
               );
               try {
-                responseText = await agent.chat(bridgeText, actorId);
+                responseText = await agent.chat(bridgeText, actorId, Date.now() + 30000);
               } catch (agentErr) {
                 responseText =
                   "I'm having trouble right now. Please try again in a moment.";
@@ -1143,7 +1143,7 @@ const server = http.createServer(async (req, res) => {
             // Warm-up shim path — lightweight agent via proxy
             console.log("[contract] Routing via lightweight agent (warm-up)");
             try {
-              responseText = await agent.chat(bridgeText, actorId);
+              responseText = await agent.chat(bridgeText, actorId, Date.now() + 560000);
             } catch (agentErr) {
               responseText = `I'm having trouble right now. Please try again in a moment.`;
               console.error(
