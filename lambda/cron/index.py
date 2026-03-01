@@ -206,25 +206,36 @@ def warmup_and_wait(session_id, user_id, actor_id, channel):
 # ---------------------------------------------------------------------------
 
 def _extract_text_from_content_blocks(text):
-    """Extract plain text if the response is a JSON array of content blocks."""
+    """Extract plain text if the response is a JSON array of content blocks.
+
+    Recursively unwraps nested content blocks — subagent responses can produce
+    multiple layers of wrapping (e.g., subagent -> parent agent -> bridge).
+    """
     if not text or not isinstance(text, str):
         return text
-    stripped = text.strip()
-    if not (stripped.startswith("[") and stripped.endswith("]")):
-        return text
-    try:
-        blocks = json.JSONDecoder(strict=False).decode(stripped)
-        if isinstance(blocks, list) and blocks:
-            parts = [
-                b.get("text", "")
-                for b in blocks
-                if isinstance(b, dict) and b.get("type") == "text"
-            ]
-            if parts:
-                return "".join(parts)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-    return text
+    result = text
+    for _ in range(10):
+        stripped = result.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]")):
+            break
+        try:
+            blocks = json.JSONDecoder(strict=False).decode(stripped)
+            if isinstance(blocks, list) and blocks:
+                parts = [
+                    b.get("text", "")
+                    for b in blocks
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                if parts:
+                    unwrapped = "".join(parts)
+                    if unwrapped == result:
+                        break
+                    result = unwrapped
+                    continue
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        break
+    return result
 
 
 def send_telegram_message(chat_id, text, token):

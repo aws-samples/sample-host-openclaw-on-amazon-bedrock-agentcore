@@ -564,26 +564,38 @@ async function init(userId, actorId, channel) {
 /**
  * Extract plain text from message content — handles string, array of content
  * blocks, JSON-serialized array of content blocks, or object with text/content.
+ *
+ * Recursively unwraps nested content blocks (common with subagent responses
+ * where each layer wraps the previous one in content block JSON).
  */
 function extractTextFromContent(content) {
   if (!content) return "";
   // Already a parsed array of content blocks
   if (Array.isArray(content)) {
-    return content
+    const text = content
       .filter((b) => b.type === "text")
       .map((b) => b.text)
       .join("");
+    // Recurse in case the inner text is itself a JSON content block array
+    return extractTextFromContent(text);
   }
   if (typeof content === "string") {
     // Check if the string is a JSON-serialized array of content blocks
-    if (content.startsWith("[{")) {
+    const trimmed = content.trim();
+    if (trimmed.startsWith("[{") && trimmed.endsWith("]")) {
       try {
-        const parsed = JSON.parse(content);
-        if (Array.isArray(parsed)) {
-          return parsed
+        const parsed = JSON.parse(trimmed);
+        if (
+          Array.isArray(parsed) &&
+          parsed.length > 0 &&
+          parsed[0].type === "text"
+        ) {
+          const text = parsed
             .filter((b) => b.type === "text")
             .map((b) => b.text)
             .join("");
+          // Recurse to unwrap further nesting
+          return extractTextFromContent(text);
         }
       } catch {}
     }
@@ -592,13 +604,16 @@ function extractTextFromContent(content) {
   }
   // Object with text or content property (e.g., {role: "assistant", content: "..."})
   if (typeof content === "object" && content !== null) {
-    if (typeof content.text === "string") return content.text;
-    if (typeof content.content === "string") return content.content;
+    if (typeof content.text === "string")
+      return extractTextFromContent(content.text);
+    if (typeof content.content === "string")
+      return extractTextFromContent(content.content);
     if (Array.isArray(content.content)) {
-      return content.content
+      const text = content.content
         .filter((b) => b.type === "text")
         .map((b) => b.text)
         .join("");
+      return extractTextFromContent(text);
     }
   }
   return "";
