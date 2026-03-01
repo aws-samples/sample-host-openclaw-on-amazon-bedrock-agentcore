@@ -20,6 +20,7 @@ from urllib import request as urllib_request
 from urllib.parse import quote
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -39,7 +40,14 @@ REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "tru
 # --- Clients (lazy init on cold start) ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
-agentcore_client = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
+agentcore_client = boto3.client(
+    "bedrock-agentcore",
+    region_name=AWS_REGION,
+    config=Config(
+        read_timeout=570,  # AgentCore cold start + processing can take 5+ min
+        retries={"max_attempts": 0},  # Don't retry — would cause duplicate processing
+    ),
+)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)

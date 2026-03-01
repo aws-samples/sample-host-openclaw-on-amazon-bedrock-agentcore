@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Builder — install all dependencies and tools
 # ============================================================
-FROM --platform=linux/arm64 node:22-slim AS builder
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim AS builder
 
 # Install system dependencies
 RUN apt-get update && \
@@ -15,21 +15,25 @@ RUN pip3 install --no-cache-dir --break-system-packages awscli
 RUN npm install -g openclaw@latest clawhub@latest
 
 # Install ClawHub community skills (5 high-value marketplace skills)
-# Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
-# hackernews (niche), news-feed (niche) to reduce startup time.
+# Each in a separate RUN so Docker layer cache survives partial ClawHub rate-limit failures.
 # --no-input --force: non-interactive, skip VirusTotal warnings
-RUN clawhub install jina-reader --no-input --force && \
-    clawhub install deep-research-pro --no-input --force && \
-    clawhub install telegram-compose --no-input --force && \
-    clawhub install transcript --no-input --force && \
-    clawhub install task-decomposer --no-input --force
+RUN clawhub install jina-reader --no-input --force
+RUN clawhub install deep-research-pro --no-input --force
+RUN clawhub install telegram-compose --no-input --force
+RUN clawhub install transcript --no-input --force
+RUN clawhub install task-decomposer --no-input --force
+
+# Install Claude Code CLI globally (required by @anthropic-ai/claude-agent-sdk's
+# query() which spawns `claude` as a subprocess for agentic loops).
+# Installed AFTER ClawHub skills to preserve their Docker layer cache.
+RUN npm install -g @anthropic-ai/claude-code@latest
 
 # Create app directory
 RUN mkdir -p /app
 
 WORKDIR /app
 
-# Install AWS SDK and WebSocket library (production only)
+# Install AWS SDK, WebSocket library, Claude Agent SDK, and Zod (production only)
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install --omit=dev \
                 @aws-sdk/client-bedrock-runtime \
@@ -39,7 +43,12 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
                 @aws-sdk/client-scheduler \
                 @aws-sdk/client-dynamodb \
                 @aws-sdk/lib-dynamodb \
+                @anthropic-ai/claude-agent-sdk \
+                zod \
                 ws
+
+# Install Python MCP server library and boto3 for cost analyzer AWS MCP server
+RUN pip3 install --no-cache-dir --break-system-packages mcp boto3
 
 # Pre-warm V8 compile cache for heavy AWS SDK modules.
 # This populates the bytecode cache at build time so runtime module loading is faster.
@@ -59,11 +68,11 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 # Stage 2: Runtime — minimal image with only needed artifacts
 # ============================================================
-FROM --platform=linux/arm64 node:22-slim
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim
 
-# Install only runtime system dependencies (no git, no pip, no build tools)
+# Install runtime system dependencies (git needed by Claude Agent SDK for cost analyzer agent)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq python3 && \
+    apt-get install -y --no-install-recommends curl jq python3 git && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy AWS CLI from builder
@@ -76,7 +85,8 @@ COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
 # Re-create symlinks instead of COPY (which resolves symlinks and breaks
 # relative imports like ./dist/entry.js in the openclaw ESM binary)
 RUN ln -s /usr/local/lib/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw && \
-    ln -s /usr/local/lib/node_modules/clawhub/bin/clawdhub.js /usr/local/bin/clawhub
+    ln -s /usr/local/lib/node_modules/clawhub/bin/clawdhub.js /usr/local/bin/clawhub && \
+    ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js /usr/local/bin/claude
 
 # Copy ClawHub installed skills (clawhub installs to /skills/ in builder)
 COPY --from=builder /skills/ /skills/
@@ -109,6 +119,19 @@ RUN chmod +x /skills/s3-user-files/*.js
 # Copy EventBridge cron scheduling skill
 COPY skills/eventbridge-cron /skills/eventbridge-cron
 RUN chmod +x /skills/eventbridge-cron/*.js
+
+# Copy cost analyzer skill (only manifest + code — no extra .md files or subdirectories
+# that could interfere with OpenClaw's skill scanner)
+COPY skills/cost-analyzer/SKILL.md /skills/cost-analyzer/SKILL.md
+COPY skills/cost-analyzer/run.js /skills/cost-analyzer/run.js
+COPY skills/cost-analyzer/token-usage-server.js /skills/cost-analyzer/token-usage-server.js
+COPY skills/cost-analyzer/package.json /skills/cost-analyzer/package.json
+RUN chmod +x /skills/cost-analyzer/*.js
+
+# Cost analyzer supporting files (outside /skills/ to avoid skill scanner interference)
+COPY skills/cost-analyzer/system-prompt.md /app/cost-analyzer-deps/system-prompt.md
+COPY skills/cost-analyzer/aws-cost-server/server.py /app/cost-analyzer-deps/aws-cost-server/server.py
+RUN chmod +x /app/cost-analyzer-deps/aws-cost-server/server.py
 
 # Copy project instructions (CLAUDE.md) so the agent knows about its skills
 COPY CLAUDE.md /app/CLAUDE.md

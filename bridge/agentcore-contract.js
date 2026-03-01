@@ -55,7 +55,7 @@ let initPromise = null;
 let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
-const BUILD_VERSION = "v30"; // Bump in cdk.json to force container redeploy
+const BUILD_VERSION = "v46"; // Bump in cdk.json to force container redeploy
 
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
 const OPENCLAW_LOG_LIMIT = 50;
@@ -330,59 +330,72 @@ function writeOpenClawConfig() {
   console.log("[contract] OpenClaw headless config written");
 
   // Write AGENTS.md — OpenClaw loads this as workspace bootstrap instructions.
-  // Only write if not already present (workspace restore from S3 may have a user-customized version).
+  // Always overwrite: this is system-managed content that must match the current image version.
+  // Skills/instructions may change between image versions, and stale AGENTS.md from S3 workspace
+  // restore would cause the bot to not know about newly added skills.
   const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
-  if (!fs.existsSync(agentsMdPath)) {
-    fs.writeFileSync(
-      agentsMdPath,
-      [
-        "# Agent Instructions",
-        "",
-        "You are a helpful AI assistant running in a per-user container on AWS.",
-        "You have built-in web tools, file storage, scheduling, and many community skills.",
-        "",
-        "## Built-in Web Tools",
-        "",
-        "You have built-in **web_search** and **web_fetch** tools:",
-        "- **web_search**: Search the web for current information",
-        "- **web_fetch**: Fetch and read web page content as markdown",
-        "",
-        "Use these for real-time information, news, research, and reading web pages.",
-        "",
-        "## Scheduling & Cron Jobs",
-        "",
-        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to:",
-        "- Set up reminders, alarms, or scheduled messages",
-        "- Create recurring tasks or cron jobs",
-        "- Schedule daily, weekly, or periodic actions",
-        "",
-        "**Read the eventbridge-cron SKILL.md and use it.** Do NOT say cron is disabled.",
-        "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
-        "",
-        "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
-        "",
-        "## File Storage",
-        "",
-        "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
-        "",
-        "## Community Skills (ClawHub)",
-        "",
-        "The following community skills are pre-installed:",
-        "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)",
-        "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)",
-        "- **telegram-compose**: Rich HTML formatting for Telegram messages",
-        "- **transcript**: YouTube video transcript extraction",
-        "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)",
-        "",
-        "## Sub-agents",
-        "",
-        "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.",
-        "Sub-agents share the same model and capabilities. Sandbox is disabled (the container is already isolated).",
-        "",
-      ].join("\n"),
-    );
-    console.log("[contract] AGENTS.md written");
-  }
+  fs.writeFileSync(
+    agentsMdPath,
+    [
+      "# Agent Instructions",
+      "",
+      "You are a helpful AI assistant running in a per-user container on AWS.",
+      "You have built-in web tools, file storage, scheduling, and many community skills.",
+      "",
+      "## Built-in Web Tools",
+      "",
+      "You have built-in **web_search** and **web_fetch** tools:",
+      "- **web_search**: Search the web for current information",
+      "- **web_fetch**: Fetch and read web page content as markdown",
+      "",
+      "Use these for real-time information, news, research, and reading web pages.",
+      "",
+      "## Scheduling & Cron Jobs",
+      "",
+      "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to:",
+      "- Set up reminders, alarms, or scheduled messages",
+      "- Create recurring tasks or cron jobs",
+      "- Schedule daily, weekly, or periodic actions",
+      "",
+      "**Read the eventbridge-cron SKILL.md and use it.** Do NOT say cron is disabled.",
+      "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
+      "",
+      "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
+      "",
+      "## File Storage",
+      "",
+      "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
+      "",
+      "## Cost Analysis",
+      "",
+      "You have the **cost-analyzer** skill for AWS cost analysis.",
+      "**Always use this skill when users ask about costs, spending, usage, or billing.**",
+      "Do NOT use `aws ce` CLI commands directly — the skill provides much richer data:",
+      "- Cross-references Cost Explorer, CloudWatch Bedrock logs, and DynamoDB token usage",
+      "- Provides per-user token breakdown and cost ranking",
+      "- Generates a structured report with actionable recommendations",
+      "",
+      "**Read the cost-analyzer SKILL.md and use it.** Do NOT attempt manual AWS CLI cost queries.",
+      "**IMPORTANT**: After running cost-analyzer, include the COMPLETE output in your response.",
+      "The user can only see your messages — tool outputs are NOT visible to them.",
+      "",
+      "## Community Skills (ClawHub)",
+      "",
+      "The following community skills are pre-installed:",
+      "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)",
+      "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)",
+      "- **telegram-compose**: Rich HTML formatting for Telegram messages",
+      "- **transcript**: YouTube video transcript extraction",
+      "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)",
+      "",
+      "## Sub-agents",
+      "",
+      "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.",
+      "Sub-agents share the same model and capabilities. Sandbox is disabled (the container is already isolated).",
+      "",
+    ].join("\n"),
+  );
+  console.log("[contract] AGENTS.md written");
 }
 
 /**
@@ -553,34 +566,151 @@ async function init(userId, actorId, channel) {
 }
 
 /**
- * Extract plain text from message content — handles string, array of content
- * blocks, or JSON-serialized array of content blocks.
+ * Check if a string looks like (possibly truncated) content block JSON.
+ */
+function looksLikeContentBlockJson(str) {
+  if (typeof str !== "string") return false;
+  const t = str.trim();
+  return t.startsWith("[{") || t.startsWith("{\"type\"");
+}
+
+/**
+ * Extract text from a truncated/partial content block JSON string.
+ * When streaming, OpenClaw may send progressively built content blocks like:
+ *   '[{"type":"text","text":"partial report text here...'
+ * This extracts the text value even when the JSON is incomplete.
+ * Returns empty string if no text content is found.
+ */
+function extractFromPartialContentBlock(str) {
+  if (typeof str !== "string") return "";
+  // Match the text value in a content block — captures everything after "text":"
+  // up to end of string (for truncated) or closing quote (for partial)
+  const match = str.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)(?:"|$)/g);
+  if (!match || match.length < 2) {
+    // Need at least 2 matches: "type":"text" and "text":"<content>"
+    // If only one match, it might be just the type field
+    if (match && match.length === 1) {
+      // Check if this single match is the content text (not the type value)
+      const single = match[0];
+      const val = single.replace(/^"text"\s*:\s*"/, "").replace(/"$/, "");
+      // If the value is "text" itself, it's the type field, not content
+      if (val === "text") return "";
+      return val;
+    }
+    return "";
+  }
+  // The second "text":"..." match is the content (first is type:"text")
+  const contentMatch = match[match.length - 1];
+  const val = contentMatch.replace(/^"text"\s*:\s*"/, "").replace(/"$/, "");
+  // Unescape JSON string escapes
+  try {
+    return JSON.parse('"' + val + '"');
+  } catch {
+    return val.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  }
+}
+
+/**
+ * Extract plain text from message content. Handles all formats OpenClaw may send:
+ *   - Parsed array of content blocks: [{type:"text", text:"..."}, ...]
+ *   - JSON-serialized content blocks (string): '[{"type":"text","text":"..."}]'
+ *   - Single content block object: {type:"text", text:"..."}
+ *   - Plain text string
+ *   - Truncated content block JSON (during streaming)
+ * Recursively unwraps nested content blocks (e.g., content block containing
+ * a JSON string of more content blocks).
  */
 function extractTextFromContent(content) {
   if (!content) return "";
   // Already a parsed array of content blocks
   if (Array.isArray(content)) {
-    return content
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("");
+    const texts = content
+      .filter((b) => b && b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text);
+    if (texts.length > 0) {
+      const joined = texts.join("");
+      // Recursively unwrap if the text itself is a JSON content block array
+      const unwrapped = unwrapContentBlocks(joined);
+      if (unwrapped) return unwrapped;
+      // Try to extract partial text from truncated content block JSON
+      if (looksLikeContentBlockJson(joined)) return extractFromPartialContentBlock(joined);
+      return joined;
+    }
+    return "";
+  }
+  // Single content block object
+  if (typeof content === "object" && content.type === "text" && typeof content.text === "string") {
+    const unwrapped = unwrapContentBlocks(content.text);
+    if (unwrapped) return unwrapped;
+    // Try to extract partial text from truncated content block JSON
+    if (looksLikeContentBlockJson(content.text)) return extractFromPartialContentBlock(content.text);
+    return content.text;
   }
   if (typeof content === "string") {
-    // Check if the string is a JSON-serialized array of content blocks
-    if (content.startsWith("[{")) {
-      try {
-        const parsed = JSON.parse(content);
-        if (Array.isArray(parsed)) {
-          return parsed
-            .filter((b) => b.type === "text")
-            .map((b) => b.text)
-            .join("");
-        }
-      } catch {}
-    }
+    // Try to parse as JSON content blocks
+    const unwrapped = unwrapContentBlocks(content);
+    if (unwrapped) return unwrapped;
+    // Try to extract partial text from truncated content block JSON
+    if (looksLikeContentBlockJson(content)) return extractFromPartialContentBlock(content);
     // Plain text string
     return content;
   }
+  return "";
+}
+
+/**
+ * Detect OpenClaw's NO_REPLY marker — sent as the final assistant message
+ * when the response was already delivered in a previous conversation turn
+ * (e.g., after multi-turn tool use).
+ *
+ * Handles multiple forms:
+ *   - Plain text: "NO_REPLY", "NO_", "NO"
+ *   - Content block wrapped: '[{"type":"text","text":"NO_REPLY"}]'
+ *   - Truncated content block: '[{"type":"text","text":"NO' (streaming partial)
+ */
+function isNoReplyMarker(text) {
+  if (typeof text !== "string") return false;
+  const t = text.trim();
+  if (!t) return false;
+  // Plain text match — full "NO_REPLY" or any streaming prefix of it
+  // During progressive streaming, deltas accumulate: "N" → "NO" → "NO_" → ... → "NO_REPLY"
+  if ("NO_REPLY".startsWith(t) || t === "NO_REPLY") {
+    return true;
+  }
+  // Content block wrapped — try to parse and check inner text
+  if (t.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(t);
+      if (Array.isArray(parsed) && parsed.length === 1 && parsed[0]?.type === "text") {
+        const inner = (parsed[0].text || "").trim();
+        return inner.length > 0 && ("NO_REPLY".startsWith(inner) || inner === "NO_REPLY");
+      }
+    } catch {
+      // Truncated content block — check if it's a partial NO_REPLY
+      const match = t.match(/"text"\s*:\s*"(NO[_A-Z]*)/);
+      if (match && "NO_REPLY".startsWith(match[1])) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * If a string looks like JSON content blocks, parse and extract text.
+ * Returns the extracted text, or empty string if not content blocks.
+ */
+function unwrapContentBlocks(str) {
+  if (typeof str !== "string") return "";
+  const trimmed = str.trim();
+  if (!trimmed.startsWith("[")) return "";
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed) && parsed.length > 0 && parsed[0] && typeof parsed[0].type === "string") {
+      const texts = parsed
+        .filter((b) => b.type === "text" && typeof b.text === "string")
+        .map((b) => b.text);
+      return texts.length > 0 ? texts.join("") : "";
+    }
+  } catch {}
   return "";
 }
 
@@ -598,7 +728,7 @@ async function processMessageQueue() {
     );
 
     try {
-      const response = await bridgeMessage(message, 120000);
+      const response = await bridgeMessage(message, 480000);
       resolve(response);
     } catch (err) {
       reject(err);
@@ -635,6 +765,8 @@ async function bridgeMessage(message, timeoutMs = 240000) {
       headers: { Origin: `http://127.0.0.1:${OPENCLAW_PORT}` },
     });
     let responseText = "";
+    let lastSubstantiveText = ""; // Track last non-marker response for NO_REPLY fallback
+    let deltaCount = 0;
     let authenticated = false;
     let chatSent = false;
     let resolved = false;
@@ -754,7 +886,20 @@ async function bridgeMessage(message, timeoutMs = 240000) {
           const text =
             extractTextFromContent(msgContent) ||
             extractTextFromContent(payload.message);
-          if (text) responseText = text; // Delta replaces (accumulates progressively)
+          if (text) {
+            const marker = isNoReplyMarker(text);
+            responseText = text; // Delta replaces (accumulates progressively)
+            // Track last substantive text (skip NO_REPLY marker used by OpenClaw
+            // to signal "response was already sent in a previous turn")
+            if (!marker) {
+              lastSubstantiveText = text;
+              deltaCount++;
+              // Log periodically (first delta, and every 20th update)
+              if (deltaCount === 1 || deltaCount % 20 === 0) {
+                console.log(`[contract] Delta #${deltaCount}: ${text.length} chars, substantive=${lastSubstantiveText.length} chars`);
+              }
+            }
+          }
           return;
         }
 
@@ -763,9 +908,18 @@ async function bridgeMessage(message, timeoutMs = 240000) {
           const text =
             extractTextFromContent(msgContent) ||
             extractTextFromContent(payload.message);
-          if (text) responseText = text;
-          console.log(`[contract] Chat final (${responseText.length} chars)`);
-          done(responseText || "Message processed.");
+          if (text) {
+            responseText = text;
+            if (!isNoReplyMarker(text)) lastSubstantiveText = text;
+          }
+          // If final response is a NO_REPLY marker, use the last substantive response
+          const isMarker = isNoReplyMarker(responseText);
+          const effectiveText = isMarker ? lastSubstantiveText : responseText;
+          console.log(`[contract] Chat final: response=${responseText.length}ch marker=${isMarker} substantive=${lastSubstantiveText.length}ch effective=${effectiveText.length}ch deltas=${deltaCount}`);
+          if (effectiveText.length < 50) {
+            console.log(`[contract] Chat final raw: ${JSON.stringify(effectiveText)}`);
+          }
+          done(effectiveText || "Message processed.");
           return;
         }
 
@@ -856,6 +1010,140 @@ function buildBridgeText(message) {
     return message;
   }
   return String(message);
+}
+
+/**
+ * Detect if a message is a cost analysis request.
+ * Returns true for messages asking about costs, spending, billing, or usage reports.
+ */
+function isCostAnalysisRequest(text) {
+  if (typeof text !== "string") return false;
+  // Strip image marker if present (from buildBridgeText)
+  const idx = text.indexOf("[OPENCLAW_IMAGES:");
+  const cleanText = idx >= 0 ? text.slice(0, idx) : text;
+  const lower = cleanText.toLowerCase().trim();
+  if (!lower) return false;
+
+  const patterns = [
+    /\bcost\s*(report|analysis|breakdown|summary|overview)\b/,
+    /\b(analyze|show|check|get|run|give)\b.*\bcost/,
+    /\bhow\s+much\b.*\b(spent|cost|spend|spending)\b/,
+    /\bspend(ing)?\s*(report|analysis|breakdown|summary|overview)\b/,
+    /\b(my|our|the)\s+(costs?|spending|billing)\b/,
+    /\bbilling\s*(report|analysis|breakdown|summary|overview)\b/,
+    /\busage\s*(report|analysis|breakdown|summary|overview)\b/,
+    /\bcost.?analyzer\b/,
+  ];
+
+  return patterns.some((p) => p.test(lower));
+}
+
+/**
+ * Extract the number of days to analyze from a message.
+ */
+function extractDaysFromMessage(text) {
+  if (typeof text !== "string") return 7;
+  const lower = text.toLowerCase();
+
+  const dayMatch = lower.match(/(\d+)\s*days?/);
+  if (dayMatch) return Math.min(parseInt(dayMatch[1], 10), 90);
+
+  if (lower.includes("yesterday") || lower.includes("today")) return 1;
+  if (lower.includes("this week") || lower.includes("last week")) return 7;
+  if (lower.includes("this month") || lower.includes("last month")) return 30;
+
+  return 7;
+}
+
+/**
+ * Run the cost analyzer directly as a child process (bypasses OpenClaw).
+ *
+ * OpenClaw only streams the final assistant turn via WebSocket, which is
+ * "NO_REPLY" for multi-turn tool use. The actual cost report is generated in
+ * intermediate turns that never reach the bridge. Running the cost-analyzer
+ * directly avoids this limitation entirely.
+ */
+function runCostAnalyzerDirectly(namespace, days, timeoutMs = 300000) {
+  return new Promise((resolve) => {
+    const fs = require("fs");
+    const scriptPath = "/skills/cost-analyzer/run.js";
+
+    if (!fs.existsSync(scriptPath)) {
+      console.warn("[contract] Cost analyzer script not found at " + scriptPath);
+      resolve(null); // null = not available, fall back to normal routing
+      return;
+    }
+
+    console.log(
+      `[contract] Running cost analyzer directly: user=${namespace} days=${days} timeout=${timeoutMs}ms`,
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    const child = spawn("node", [scriptPath, namespace, String(days)], {
+      env: { ...process.env, CLAUDE_CODE_USE_BEDROCK: "1" },
+    });
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    child.on("error", (err) => {
+      console.error(`[contract] Cost analyzer spawn error: ${err.message}`);
+      finish(null); // null = fall back to normal routing
+    });
+
+    child.on("close", (code) => {
+      // Log stderr summary (last few lines for debugging)
+      const stderrLines = stderr.split("\n").filter((l) => l.trim());
+      if (stderrLines.length > 0) {
+        const last = stderrLines.slice(-5);
+        for (const line of last) {
+          console.log(`[cost-analyzer:err] ${line}`);
+        }
+      }
+      console.log(
+        `[contract] Cost analyzer exited: code=${code} stdout=${stdout.length}ch stderr=${stderr.length}ch`,
+      );
+
+      if (stdout.trim()) {
+        finish(stdout.trim());
+      } else {
+        finish(null); // No output — fall back to normal routing
+      }
+    });
+
+    const timer = setTimeout(() => {
+      console.warn(`[contract] Cost analyzer timeout after ${timeoutMs}ms`);
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+      // Give 5s for graceful shutdown, then SIGKILL
+      setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }, 5000);
+      if (stdout.trim()) {
+        finish(stdout.trim()); // Return partial output
+      } else {
+        finish("Cost analysis timed out. Please try again later.");
+      }
+    }, timeoutMs);
+  });
 }
 
 /**
@@ -986,6 +1274,12 @@ const server = http.createServer(async (req, res) => {
             responseText = `Bridge error: ${bridgeErr.message}`;
           }
 
+          // Unwrap content blocks (same safety net as chat action)
+          if (responseText) {
+            const cronUnwrapped = unwrapContentBlocks(responseText);
+            if (cronUnwrapped) responseText = cronUnwrapped;
+          }
+
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
@@ -1051,8 +1345,28 @@ const server = http.createServer(async (req, res) => {
           const bridgeText = buildBridgeText(message);
 
           // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
+          // Cost analysis requests bypass OpenClaw entirely (direct invocation).
           let responseText;
-          if (openclawReady) {
+
+          if (isCostAnalysisRequest(bridgeText)) {
+            // Direct cost analysis — bypasses OpenClaw WebSocket bridge.
+            // OpenClaw only streams the final assistant turn via WebSocket, which
+            // is "NO_REPLY" for multi-turn tool use. The actual cost report is
+            // generated in intermediate turns that never reach the bridge.
+            console.log(
+              "[contract] Cost analysis detected — running directly (bypassing OpenClaw)",
+            );
+            const costDays = extractDaysFromMessage(bridgeText);
+            const namespace = actorId.replace(/:/g, "_");
+            responseText = await runCostAnalyzerDirectly(
+              namespace,
+              costDays,
+              300000,
+            );
+            // null = script not available, fall through to normal routing
+          }
+
+          if (!responseText && openclawReady) {
             // Full OpenClaw path — WebSocket bridge
             try {
               responseText = await enqueueMessage(bridgeText);
@@ -1063,7 +1377,7 @@ const server = http.createServer(async (req, res) => {
               // Fall back to lightweight agent on bridge failure
               responseText = await agent.chat(bridgeText, actorId);
             }
-          } else if (proxyReady) {
+          } else if (!responseText && proxyReady) {
             // Warm-up shim path — lightweight agent via proxy
             console.log("[contract] Routing via lightweight agent (warm-up)");
             try {
@@ -1074,9 +1388,17 @@ const server = http.createServer(async (req, res) => {
                 `[contract] Lightweight agent error: ${agentErr.message}`,
               );
             }
-          } else {
+          } else if (!responseText) {
             // Proxy not ready yet (should be rare — init awaits proxy)
             responseText = "I'm starting up — please try again in a moment.";
+          }
+
+          // Final safety net: unwrap any remaining content block JSON in the response.
+          // OpenClaw sometimes returns responses wrapped in content blocks even after
+          // extractTextFromContent() processing in the WebSocket bridge.
+          if (responseText) {
+            const finalUnwrapped = unwrapContentBlocks(responseText);
+            if (finalUnwrapped) responseText = finalUnwrapped;
           }
 
           res.writeHead(200, { "Content-Type": "application/json" });

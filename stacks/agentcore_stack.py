@@ -145,6 +145,49 @@ class AgentCoreStack(Stack):
             )
         )
 
+        # Cost Explorer read access (cost-analyzer agent)
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["ce:GetCostAndUsage", "ce:GetCostForecast"],
+                resources=["*"],  # Cost Explorer doesn't support resource-level permissions
+            )
+        )
+
+        # CloudWatch Logs read access for Bedrock invocation logs (cost-analyzer agent)
+        # Note: DescribeLogGroups does NOT support resource-level permissions,
+        # so it's in the general Resource:* statement above (logs:CreateLogGroup etc.)
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "logs:DescribeLogGroups",
+                ],
+                resources=["*"],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "logs:FilterLogEvents",
+                    "logs:GetLogEvents",
+                    "logs:DescribeLogStreams",
+                ],
+                resources=[
+                    f"arn:aws:logs:{region}:{account}:log-group:/aws/bedrock/invocation-logs:*",
+                ],
+            )
+        )
+
+        # DynamoDB read access for token usage table + GSIs (cost-analyzer agent)
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:GetItem", "dynamodb:Query"],
+                resources=[
+                    f"arn:aws:dynamodb:{region}:{account}:table/openclaw-token-usage",
+                    f"arn:aws:dynamodb:{region}:{account}:table/openclaw-token-usage/index/*",
+                ],
+            )
+        )
+
         # ECR pull
         self.bridge_repo.grant_pull(self.execution_role)
 
@@ -226,6 +269,10 @@ class AgentCoreStack(Stack):
                 ),
                 # Sub-agent model: empty = use same as default_model_id
                 "SUBAGENT_MODEL": subagent_model_id,
+                # Cost analyzer agent (Claude Code CLI + MCP servers)
+                "TOKEN_USAGE_TABLE_NAME": "openclaw-token-usage",
+                "BEDROCK_LOG_GROUP_NAME": "/aws/bedrock/invocation-logs",
+                "CLAUDE_CODE_USE_BEDROCK": "1",
             },
             description="OpenClaw messaging bridge on AgentCore Runtime (per-user sessions)",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
@@ -293,6 +340,9 @@ class AgentCoreStack(Stack):
                         # EventBridge cron scheduling (added by CronStack)
                         f"Resource::arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*",
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/openclaw-identity/index/*",
+                        # Cost analyzer agent — CloudWatch Logs and DynamoDB token usage
+                        f"Resource::arn:aws:logs:{region}:{account}:log-group:/aws/bedrock/invocation-logs:*",
+                        f"Resource::arn:aws:dynamodb:{region}:{account}:table/openclaw-token-usage/index/*",
                     ],
                 ),
             ],

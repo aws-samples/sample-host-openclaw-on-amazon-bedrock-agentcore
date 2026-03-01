@@ -38,13 +38,18 @@ MODEL_PRICING = {
     "global.amazon.nova-2-lite-v1:0": {"input": 0.30, "output": 2.50},
     "amazon.nova-pro-v1:0": {"input": 0.80, "output": 3.20},
     "amazon.nova-micro-v1:0": {"input": 0.035, "output": 0.14},
-    # Claude
+    # Claude (with and without global. prefix for cross-region inference)
     "anthropic.claude-3-5-sonnet-20241022-v2:0": {"input": 3.00, "output": 15.00},
     "anthropic.claude-3-haiku-20240307-v1:0": {"input": 0.25, "output": 1.25},
     "anthropic.claude-3-5-haiku-20241022-v1:0": {"input": 0.80, "output": 4.00},
     "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3.00, "output": 15.00},
     "anthropic.claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "anthropic.claude-opus-4-6": {"input": 15.00, "output": 75.00},
+    "global.anthropic.claude-opus-4-6-v1": {"input": 15.00, "output": 75.00},
+    "global.anthropic.claude-sonnet-4-6-v1": {"input": 3.00, "output": 15.00},
+    "global.anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3.00, "output": 15.00},
+    "global.anthropic.claude-3-5-sonnet-20241022-v2:0": {"input": 3.00, "output": 15.00},
+    "global.anthropic.claude-3-5-haiku-20241022-v1:0": {"input": 0.80, "output": 4.00},
 }
 
 # Default pricing when model is unknown
@@ -67,53 +72,43 @@ def estimate_cost(model_id: str, input_tokens: int, output_tokens: int) -> float
 def extract_openclaw_metadata(log_entry: dict) -> dict:
     """Extract OpenClaw metadata (actor_id, session_id, channel) from the log entry.
 
-    Bedrock invocation logs may contain request metadata or we can correlate
-    via X-Ray trace IDs. Supports both direct Bedrock and AgentCore log formats.
+    For Bedrock Converse API logs via AgentCore, user identity is extracted from:
+    1. The IAM session name in identity.arn: BedrockAgentCore-{session-uuid}
+       (each AgentCore microVM is per-user, so all invocations share a session)
+    2. Optional requestMetadata fields (if the caller injects them)
+
+    Note: The AgentCore session UUID is NOT the same as the application-level
+    session ID. Per-user attribution requires a separate mapping mechanism
+    (e.g., the container writing its IAM session → user mapping on startup).
     """
     metadata = {
-        "actor_id": "default-user",
-        "session_id": "default-session",
+        "actor_id": "unknown",
+        "session_id": "unknown",
         "channel": "unknown",
     }
 
-    # Try to extract from request metadata or headers
-    request_metadata = log_entry.get("requestMetadata", {})
-    if request_metadata:
+    # Extract AgentCore session ID from IAM role ARN
+    identity = log_entry.get("identity", {})
+    arn = identity.get("arn", "")
+    if "BedrockAgentCore-" in arn:
+        session_uuid = arn.split("BedrockAgentCore-")[-1]
+        metadata["session_id"] = session_uuid
+
+    # Try requestMetadata injected by the proxy via Bedrock Converse API.
+    # May appear at top level, under input.inputBodyJson, or under input.
+    request_metadata = log_entry.get("requestMetadata")
+    if not isinstance(request_metadata, dict):
+        input_block_meta = log_entry.get("input", {})
+        if isinstance(input_block_meta, dict):
+            request_metadata = input_block_meta.get("requestMetadata")
+            if not isinstance(request_metadata, dict):
+                input_body_json = input_block_meta.get("inputBodyJson", {})
+                if isinstance(input_body_json, dict):
+                    request_metadata = input_body_json.get("requestMetadata")
+
+    if isinstance(request_metadata, dict):
         metadata["actor_id"] = request_metadata.get("openclaw.actor_id", metadata["actor_id"])
-        metadata["session_id"] = request_metadata.get("openclaw.session_id", metadata["session_id"])
         metadata["channel"] = request_metadata.get("openclaw.channel", metadata["channel"])
-
-    # AgentCore logs: extract from sessionState.promptSessionAttributes
-    session_state = log_entry.get("sessionState", {})
-    prompt_attrs = session_state.get("promptSessionAttributes", {})
-    if prompt_attrs:
-        metadata["actor_id"] = prompt_attrs.get("actor_id", metadata["actor_id"])
-        metadata["channel"] = prompt_attrs.get("channel", metadata["channel"])
-
-    # AgentCore logs: extract session ID from top-level field
-    if log_entry.get("sessionId"):
-        metadata["session_id"] = log_entry["sessionId"]
-
-    # AgentCore logs: extract from agentRuntime metadata
-    runtime_metadata = log_entry.get("agentRuntimeMetadata", {})
-    if runtime_metadata:
-        metadata["actor_id"] = runtime_metadata.get("actorId", metadata["actor_id"])
-        metadata["session_id"] = runtime_metadata.get("sessionId", metadata["session_id"])
-
-    # Also check the input body for custom attributes
-    input_body = log_entry.get("input", {})
-    if isinstance(input_body, str):
-        try:
-            input_body = json.loads(input_body)
-        except (json.JSONDecodeError, TypeError):
-            input_body = {}
-
-    # Some models embed metadata in the request
-    custom_attrs = input_body.get("metadata", {})
-    if custom_attrs:
-        metadata["actor_id"] = custom_attrs.get("actor_id", metadata["actor_id"])
-        metadata["session_id"] = custom_attrs.get("session_id", metadata["session_id"])
-        metadata["channel"] = custom_attrs.get("channel", metadata["channel"])
 
     return metadata
 
@@ -160,6 +155,7 @@ def write_to_dynamodb(record: dict):
     }
 
     # Use update expression to accumulate if record already exists
+    from decimal import Decimal
     table.update_item(
         Key={"PK": item["PK"], "SK": item["SK"]},
         UpdateExpression=(
@@ -170,7 +166,8 @@ def write_to_dynamodb(record: dict):
             "actorId = :actor, sessionId = :session, "
             "#ts = :ts, #ttl_attr = :ttl "
             "ADD inputTokens :inp, outputTokens :out, "
-            "totalTokens :total, invocationCount :one"
+            "totalTokens :total, invocationCount :one, "
+            "estimatedCostUSD :cost"
         ),
         ExpressionAttributeNames={
             "#ts": "timestamp",
@@ -193,6 +190,7 @@ def write_to_dynamodb(record: dict):
             ":out": record["output_tokens"],
             ":total": record["total_tokens"],
             ":one": 1,
+            ":cost": Decimal(str(cost)),
         },
     )
 
@@ -258,21 +256,43 @@ def publish_metrics(record: dict):
 
 
 def process_log_entry(log_entry: dict):
-    """Process a single Bedrock invocation log entry."""
-    # Extract token counts
-    input_tokens = log_entry.get("inputTokenCount", 0)
-    output_tokens = log_entry.get("outputTokenCount", 0)
+    """Process a single Bedrock invocation log entry.
 
-    # Some log formats nest token counts differently
+    Bedrock Converse API invocation logs use a nested structure:
+      - input.inputTokenCount / output.outputTokenCount (top-level summary)
+      - output.outputBodyJson.usage.inputTokens / outputTokens (detailed)
+    Older InvokeModel logs may use top-level inputTokenCount / outputTokenCount.
+    """
+    # Try nested paths first (Converse API format)
+    input_block = log_entry.get("input", {}) if isinstance(log_entry.get("input"), dict) else {}
+    output_block = log_entry.get("output", {}) if isinstance(log_entry.get("output"), dict) else {}
+
+    input_tokens = input_block.get("inputTokenCount", 0) or log_entry.get("inputTokenCount", 0)
+    output_tokens = output_block.get("outputTokenCount", 0) or log_entry.get("outputTokenCount", 0)
+
+    # Fall back to output.outputBodyJson.usage (detailed usage block)
     if not input_tokens and not output_tokens:
-        usage = log_entry.get("usage", {})
+        output_body = output_block.get("outputBodyJson", {})
+        if isinstance(output_body, dict):
+            usage = output_body.get("usage", {})
+        else:
+            usage = {}
         input_tokens = usage.get("inputTokens", usage.get("input_tokens", 0))
         output_tokens = usage.get("outputTokens", usage.get("output_tokens", 0))
+
+    # Final fallback: top-level usage block (some older formats)
+    if not input_tokens and not output_tokens:
+        usage = log_entry.get("usage", {})
+        if isinstance(usage, dict):
+            input_tokens = usage.get("inputTokens", usage.get("input_tokens", 0))
+            output_tokens = usage.get("outputTokens", usage.get("output_tokens", 0))
 
     total_tokens = input_tokens + output_tokens
 
     if total_tokens == 0:
-        logger.info("Skipping log entry with zero tokens")
+        # Log top-level keys for debugging format mismatches
+        top_keys = list(log_entry.keys())[:15]
+        logger.info("Skipping log entry with zero tokens (keys: %s)", top_keys)
         return
 
     # Extract model ID

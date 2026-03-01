@@ -991,6 +991,10 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig) {
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
+    requestMetadata: {
+      "openclaw.actor_id": process.env.USER_ID || "unknown",
+      "openclaw.channel": process.env.CHANNEL || "unknown",
+    },
   };
   if (toolConfig) params.toolConfig = toolConfig;
 
@@ -1076,6 +1080,10 @@ async function invokeBedrockStreaming(
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
+    requestMetadata: {
+      "openclaw.actor_id": process.env.USER_ID || "unknown",
+      "openclaw.channel": process.env.CHANNEL || "unknown",
+    },
   };
   if (toolConfig) params.toolConfig = toolConfig;
 

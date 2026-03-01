@@ -57,6 +57,27 @@ The built-in cron scheduler is replaced by Amazon EventBridge Scheduler, which i
 
 You have the **s3-user-files** skill for reading and writing files in the user's persistent storage. Files survive across sessions.
 
+## Cost Analysis
+
+**Always use the cost-analyzer skill for any cost, spending, billing, or usage questions.**
+Do NOT use `aws ce` or other CLI commands directly — the cost-analyzer agent cross-references
+Cost Explorer, CloudWatch Bedrock logs, and DynamoDB token usage to produce a much richer
+report with per-user breakdown and recommendations that raw CLI cannot provide.
+
+| User says | Action |
+|---|---|
+| "Show me my cost report" | run_cost_analysis with days=7 |
+| "How much have I spent this week?" | run_cost_analysis with days=7 |
+| "Why are my costs so high?" | run_cost_analysis with days=14 |
+| "Analyze system-wide costs for the last month" | run_cost_analysis with days=30 |
+
+**IMPORTANT**: After running the cost-analyzer command, you MUST include the COMPLETE output
+in your response. The user can only see your assistant messages — tool/command outputs are
+NOT visible to them. Copy the full report into your message.
+
+You can combine this with the eventbridge-cron skill to schedule recurring reports:
+- "Send me a daily cost report every morning at 9am" -> Create a cron schedule with message: "Run a cost analysis for yesterday and send me the summary"
+
 ## Sub-agents
 
 Skills like `deep-research-pro` and `task-decomposer` can spawn sub-agents for parallel work. Sub-agents use the same model (`SUBAGENT_MODEL` env var, defaults to main model). Sandbox is disabled — AgentCore microVMs provide per-user isolation.
