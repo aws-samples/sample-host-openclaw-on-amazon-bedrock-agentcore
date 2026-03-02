@@ -26,6 +26,7 @@ const {
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
 const agent = require("./lightweight-agent");
+const scopedCreds = require("./scoped-credentials");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -55,6 +56,8 @@ let initPromise = null;
 let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
+let credentialRefreshTimer = null;
+const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const BUILD_VERSION = "v32"; // Bump in cdk.json to force container redeploy
 
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
@@ -451,7 +454,41 @@ async function init(userId, actorId, channel) {
       );
     }
 
-    // 1b. Clean up stale lock files restored from S3 (non-blocking)
+    // 1b. Create scoped S3 credentials (per-user IAM isolation)
+    // Restricts S3 access to the user's namespace prefix, preventing cross-user
+    // data access even through OpenClaw's bash/code execution tools.
+    let scopedCredsAvailable = false;
+    if (process.env.EXECUTION_ROLE_ARN) {
+      try {
+        console.log(`[contract] Creating scoped S3 credentials for namespace=${namespace}...`);
+        const creds = await scopedCreds.createScopedCredentials(namespace);
+        scopedCreds.writeCredentialFiles(creds, SCOPED_CREDS_DIR);
+        workspaceSync.configureCredentials(creds);
+        scopedCredsAvailable = true;
+        console.log("[contract] Scoped S3 credentials created and applied");
+
+        // Refresh credentials before expiry (45 min timer, max 1 hour session)
+        if (credentialRefreshTimer) clearInterval(credentialRefreshTimer);
+        credentialRefreshTimer = setInterval(async () => {
+          try {
+            console.log("[contract] Refreshing scoped S3 credentials...");
+            const refreshed = await scopedCreds.createScopedCredentials(namespace);
+            scopedCreds.writeCredentialFiles(refreshed, SCOPED_CREDS_DIR);
+            workspaceSync.configureCredentials(refreshed);
+            console.log("[contract] Scoped S3 credentials refreshed");
+          } catch (err) {
+            console.error(`[contract] Credential refresh failed: ${err.message}`);
+          }
+        }, 45 * 60 * 1000); // 45 minutes
+      } catch (err) {
+        console.warn(`[contract] Scoped credentials failed (falling back to full role): ${err.message}`);
+        // Non-fatal — fall back to full execution role credentials
+      }
+    } else {
+      console.log("[contract] EXECUTION_ROLE_ARN not set — skipping credential scoping");
+    }
+
+    // 1c. Clean up stale lock files restored from S3 (non-blocking)
     // Runs in parallel with proxy startup — does not block init.
     const lockCleanupPromise = cleanupLockFiles().catch((err) => {
       console.warn(`[contract] Lock cleanup failed: ${err.message}`);
@@ -492,12 +529,19 @@ async function init(userId, actorId, channel) {
     // Write OpenClaw config and start gateway (non-blocking)
     writeOpenClawConfig();
     console.log("[contract] Starting OpenClaw gateway (headless)...");
-    // Set OPENCLAW_SKIP_CRON in parent env so OpenClaw gateway inherits it
-    process.env.OPENCLAW_SKIP_CRON = "1";
+    // Build scoped env for OpenClaw — excludes container credentials,
+    // uses credential_process for scoped S3 access only.
+    // Falls back to full process.env if scoped credentials failed.
+    const openclawEnv = scopedCredsAvailable
+      ? scopedCreds.buildOpenClawEnv({
+          credDir: SCOPED_CREDS_DIR,
+          baseEnv: process.env,
+        })
+      : { ...process.env, OPENCLAW_SKIP_CRON: "1" };
     openclawProcess = spawn(
       "openclaw",
       ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe"], env: openclawEnv },
     );
     // Capture OpenClaw stdout/stderr for diagnostics
     const captureLog = (stream, label) => {
@@ -1212,6 +1256,12 @@ process.on("SIGTERM", async () => {
   console.log(
     "[contract] SIGTERM received — saving workspace and shutting down",
   );
+
+  // Stop credential refresh timer
+  if (credentialRefreshTimer) {
+    clearInterval(credentialRefreshTimer);
+    credentialRefreshTimer = null;
+  }
 
   // Save workspace to S3 (10s max)
   const saveTimeout = setTimeout(() => {

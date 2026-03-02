@@ -130,6 +130,25 @@ class AgentCoreStack(Stack):
             )
         )
 
+        # STS self-assume for per-user scoped S3 credentials
+        # The container assumes its own role with a session policy that restricts
+        # S3 access to the user's namespace prefix, preventing cross-user access.
+        # Two parts required:
+        #   1. IAM permission to call sts:AssumeRole (inline policy)
+        #   2. Trust policy entry allowing the role to assume itself
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["sts:AssumeRole"],
+                resources=[self.execution_role.role_arn],
+            )
+        )
+        self.execution_role.assume_role_policy.add_statements(
+            iam.PolicyStatement(
+                actions=["sts:AssumeRole"],
+                principals=[iam.ArnPrincipal(self.execution_role.role_arn)],
+            )
+        )
+
         # CloudWatch Logs + Metrics + X-Ray
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
@@ -216,6 +235,9 @@ class AgentCoreStack(Stack):
                     int(self.node.try_get_context("workspace_sync_interval_seconds") or "300") * 1000
                 ),
                 "IMAGE_VERSION": image_version,  # bump in cdk.json to force container redeploy
+                # Per-user S3 credential scoping — STS AssumeRole with session policy
+                "EXECUTION_ROLE_ARN": self.execution_role.role_arn,
+                "CMK_ARN": cmk_arn,
                 # EventBridge cron scheduling — deterministic names to avoid circular deps
                 "EVENTBRIDGE_SCHEDULE_GROUP": "openclaw-cron",
                 "CRON_LAMBDA_ARN": f"arn:aws:lambda:{region}:{account}:function:openclaw-cron-executor",

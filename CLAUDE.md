@@ -118,6 +118,9 @@ openclaw-on-agentcore/
     image-support.test.js         # Image support unit tests (node:test)
     content-extraction.test.js    # Content block extraction tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
+    scoped-credentials.js         # Per-user STS session-scoped S3 credentials
+    scoped-credentials.test.js    # Scoped credentials unit tests (node:test, 25 tests)
+    workspace-sync.test.js        # Workspace sync credential tests (node:test, 7 tests)
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
     skills/
       s3-user-files/              # Custom per-user file storage skill (S3-backed)
@@ -255,6 +258,8 @@ cd bridge && node --test image-support.test.js         # image upload + multimod
 cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
 cd bridge && node --test subagent-routing.test.js      # subagent model routing + detection tests
 cd bridge && node --test content-extraction.test.js    # recursive content block extraction tests
+cd bridge && node --test scoped-credentials.test.js    # per-user STS credential scoping tests
+cd bridge && node --test workspace-sync.test.js        # workspace sync credential tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 ```
 
@@ -317,9 +322,12 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
 3. **On first `/invocations` with `action: chat` or `action: warmup`** (lazy init):
    - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
+   - Create STS scoped credentials restricting S3 to user's namespace prefix
+   - Configure workspace-sync with scoped credentials
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
-   - Start OpenClaw gateway (port 18789) in background
+   - Start OpenClaw gateway (port 18789) with scoped credentials env (no container credentials)
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
+   - Start credential refresh timer (45 min interval)
    - Wait for proxy only (~5s)
 4. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, web_fetch, web_search tools)
 5. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
@@ -485,6 +493,14 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **S3-backed isolation**: User files in `s3://openclaw-user-files-{account}-{region}/{namespace}/`
 - **Namespace immutability**: System-determined from channel identity, cannot be changed by user request
 - **actorId vs namespace**: actorId uses colon format (`telegram:123456789`), namespace uses underscore format (`telegram_123456789`). Skill scripts (s3-user-files, eventbridge-cron) expect namespace format. The lightweight agent's `chat()` converts via `userId.replace(/:/g, "_")` before passing to tools. The proxy and workspace sync also use namespace format for S3 keys
+
+### Per-User S3 Credential Isolation
+- **STS session-scoped credentials**: On init, the contract server calls `STS:AssumeRole` on the execution role with a session policy that restricts S3 access to `{namespace}/*` only. This prevents cross-user data access even through OpenClaw's bash tool
+- **Credential files**: Scoped credentials written to `/tmp/scoped-creds/` in `credential_process` format. OpenClaw uses `AWS_CONFIG_FILE` + `AWS_SDK_LOAD_CONFIG=1` to pick them up
+- **OpenClaw env isolation**: OpenClaw spawned with explicit env that excludes `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, and `AWS_CONTAINER_CREDENTIALS_FULL_URI`
+- **Credential refresh**: 45-minute interval timer re-assumes the role and updates credential files (STS self-assume max duration is 1 hour)
+- **Graceful fallback**: If `EXECUTION_ROLE_ARN` is not set or STS fails, falls back to full execution role credentials with a warning log
+- **Proxy keeps full credentials**: The proxy process is trusted code and retains full execution role credentials for Bedrock, Cognito, and S3 image access (with application-level namespace enforcement)
 
 ## Branch Awareness
 Always confirm which git branch you are on BEFORE making any code changes or deployments. If the user specifies a branch, switch to it first and verify with `git branch --show-current`. Never assume the current branch is correct.

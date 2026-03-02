@@ -17,6 +17,11 @@ SCENARIOS = {
         "Quick question one: what is 2+2?",
         "Quick question two: what is 3+3?",
     ],
+    "file_operations": [
+        'Save the text "E2E_SCOPED_CREDS_OK" to a file called e2e-creds-test.txt',
+        "Read the contents of e2e-creds-test.txt",
+        "Delete the file e2e-creds-test.txt",
+    ],
 }
 
 

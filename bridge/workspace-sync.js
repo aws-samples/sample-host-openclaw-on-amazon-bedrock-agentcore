@@ -10,14 +10,17 @@
  * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/)
  */
 
-const {
-  S3Client,
-  GetObjectCommand,
-  PutObjectCommand,
-  ListObjectsV2Command,
-} = require("@aws-sdk/client-s3");
 const fs = require("fs");
 const path = require("path");
+
+// Lazy-require AWS SDK (only available inside Docker image, not in local dev/test)
+let _s3Sdk = null;
+function getS3Sdk() {
+  if (!_s3Sdk) {
+    _s3Sdk = require("@aws-sdk/client-s3");
+  }
+  return _s3Sdk;
+}
 
 const BUCKET = process.env.S3_USER_FILES_BUCKET;
 const LOCAL_PATH = process.env.HOME
@@ -39,11 +42,47 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 // S3 client singleton (same pattern as agentcore-proxy.js)
 let _s3Client = null;
+let _scopedCredentials = null;
+
 function getS3Client() {
   if (!_s3Client) {
-    _s3Client = new S3Client({ region: process.env.AWS_REGION });
+    const { S3Client } = getS3Sdk();
+    const opts = { region: process.env.AWS_REGION };
+    if (_scopedCredentials) {
+      opts.credentials = {
+        accessKeyId: _scopedCredentials.accessKeyId,
+        secretAccessKey: _scopedCredentials.secretAccessKey,
+        sessionToken: _scopedCredentials.sessionToken,
+      };
+    }
+    _s3Client = new S3Client(opts);
   }
   return _s3Client;
+}
+
+/**
+ * Configure the S3 client with explicit credentials (scoped STS session).
+ * Replaces the default client that uses the container's execution role.
+ *
+ * @param {object} credentials
+ * @param {string} credentials.accessKeyId
+ * @param {string} credentials.secretAccessKey
+ * @param {string} [credentials.sessionToken]
+ */
+function configureCredentials(credentials) {
+  if (!credentials || !credentials.accessKeyId) {
+    throw new Error("configureCredentials: accessKeyId is required");
+  }
+  if (!credentials.secretAccessKey) {
+    throw new Error("configureCredentials: secretAccessKey is required");
+  }
+  _scopedCredentials = {
+    accessKeyId: credentials.accessKeyId,
+    secretAccessKey: credentials.secretAccessKey,
+    sessionToken: credentials.sessionToken,
+  };
+  // Reset client so next getS3Client() picks up new credentials
+  _s3Client = null;
 }
 
 /**
@@ -101,7 +140,7 @@ async function restoreWorkspace(namespace) {
     };
     if (continuationToken) params.ContinuationToken = continuationToken;
 
-    const response = await s3.send(new ListObjectsV2Command(params));
+    const response = await s3.send(new (getS3Sdk().ListObjectsV2Command)(params));
     const objects = response.Contents || [];
 
     for (const obj of objects) {
@@ -127,7 +166,7 @@ async function restoreWorkspace(namespace) {
       try {
         fs.mkdirSync(localDir, { recursive: true });
         const getResp = await s3.send(
-          new GetObjectCommand({ Bucket: BUCKET, Key: obj.Key }),
+          new (getS3Sdk().GetObjectCommand)({ Bucket: BUCKET, Key: obj.Key }),
         );
         const chunks = [];
         for await (const chunk of getResp.Body) {
@@ -207,7 +246,7 @@ async function saveWorkspace(namespace) {
 
       const content = fs.readFileSync(localFile);
       await s3.send(
-        new PutObjectCommand({
+        new (getS3Sdk().PutObjectCommand)({
           Bucket: BUCKET,
           Key: `${prefix}${relativePath}`,
           Body: content,
@@ -266,4 +305,6 @@ module.exports = {
   saveWorkspace,
   startPeriodicSave,
   cleanup,
+  configureCredentials,
+  getS3Client,
 };

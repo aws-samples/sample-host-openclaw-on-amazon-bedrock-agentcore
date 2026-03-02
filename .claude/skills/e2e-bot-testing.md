@@ -29,6 +29,7 @@ export CDK_DEFAULT_REGION=ap-southeast-2
 | `pytest tests/e2e/bot_test.py -v -k warmup` | Verify warm-up shim footer present |
 | `pytest tests/e2e/bot_test.py -v -k full_startup` | Wait for full OpenClaw + timing |
 | `pytest tests/e2e/bot_test.py -v -k subagent` | Sub-agent skill verification |
+| `pytest tests/e2e/bot_test.py -v -k ScopedCredentials` | Scoped S3 credentials (file ops) |
 | `pytest tests/e2e/bot_test.py -v -k conversation` | Multi-turn conversation tests |
 | `pytest tests/e2e/bot_test.py -v` | All E2E tests |
 | `pytest -m "not e2e"` | Skip E2E tests in fast CI |
@@ -43,6 +44,7 @@ export CDK_DEFAULT_REGION=ap-southeast-2
 | `python -m tests.e2e.bot_test --reset-user` | Full user reset |
 | `python -m tests.e2e.bot_test --conversation multi_turn --tail-logs` | Multi-turn test |
 | `python -m tests.e2e.bot_test --subagent --tail-logs` | Sub-agent skill test |
+| `python -m tests.e2e.bot_test --scoped-creds --tail-logs` | Scoped credentials test |
 
 ## Startup Phases and Timing
 
@@ -171,6 +173,7 @@ The `AgentCore response body` line contains JSON: `{"response": "full text..."}`
 | `TestWarmupShim` | Warm-up footer present on cold start | ✓ | ✓ |
 | `TestFullStartup` | Full OpenClaw ready + phase timing | ✓ | ✓ |
 | `TestSubagent` | Sub-agent skill verification | | |
+| `TestScopedCredentials` | S3 file ops via scoped STS creds | | |
 | `TestConversation` | Multi-turn scenarios | | |
 
 ### Conversation Scenarios

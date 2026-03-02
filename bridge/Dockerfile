@@ -38,6 +38,7 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
                 @aws-sdk/client-secrets-manager \
                 @aws-sdk/client-scheduler \
                 @aws-sdk/client-dynamodb \
+                @aws-sdk/client-sts \
                 @aws-sdk/lib-dynamodb \
                 ws
 
@@ -51,6 +52,7 @@ RUN mkdir -p /app/.compile-cache && \
       require('@aws-sdk/client-secrets-manager'); \
       require('@aws-sdk/client-scheduler'); \
       require('@aws-sdk/client-dynamodb'); \
+      require('@aws-sdk/client-sts'); \
       require('@aws-sdk/lib-dynamodb'); \
       require('ws'); \
       console.log('[build] V8 compile cache pre-warmed'); \
@@ -99,6 +101,7 @@ COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY workspace-sync.js /app/workspace-sync.js
+COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
 
 # Copy custom per-user file storage skill

@@ -441,6 +441,90 @@ class TestSubagent:
         )
 
 
+class TestScopedCredentials:
+    """Verify per-user S3 credential isolation via the s3-user-files skill.
+
+    After the scoped credentials fix (GitHub issue #20), OpenClaw runs with
+    STS session-scoped credentials that restrict S3 access to the user's
+    namespace prefix. This test verifies the s3-user-files skill still works
+    end-to-end through those scoped credentials.
+
+    Flow:
+      1. Write a test file via the bot (uses s3-user-files write skill)
+      2. Read it back (uses s3-user-files read skill)
+      3. Verify the content matches
+      4. Delete it (uses s3-user-files delete skill)
+
+    Run with: pytest tests/e2e/bot_test.py -v -k scoped_creds
+    """
+
+    TEST_CONTENT = "E2E_SCOPED_CREDS_OK"
+    TEST_FILENAME = "e2e-creds-test.txt"
+
+    @pytest.fixture(scope="class", autouse=True)
+    def ensure_full_openclaw(self, e2e_config):
+        """Wait for full OpenClaw startup — s3-user-files skill requires it."""
+        ready, elapsed = _wait_for_full_openclaw(e2e_config)
+        assert ready, f"OpenClaw not fully started after {elapsed:.0f}s"
+        print(f"\n  OpenClaw ready in {elapsed:.1f}s")
+
+    def test_write_file(self, e2e_config):
+        """Write a test file via the bot's s3-user-files skill."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f'Save the text "{self.TEST_CONTENT}" to a file called {self.TEST_FILENAME}',
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Write file incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+        assert not tail.is_warmup, "Response from warm-up shim, not full OpenClaw"
+        print(f"  Write response ({tail.response_len} chars): {tail.response_text[:200]}")
+
+    def test_read_file(self, e2e_config):
+        """Read the test file back and verify it contains the expected content."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f"Read the contents of {self.TEST_FILENAME}",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Read file incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+        assert not tail.is_warmup, "Response from warm-up shim, not full OpenClaw"
+
+        # The response should contain the test content we wrote
+        assert self.TEST_CONTENT in tail.response_text, (
+            f"Expected '{self.TEST_CONTENT}' in response.\n"
+            f"Response ({tail.response_len} chars): {tail.response_text[:300]}"
+        )
+        print(f"  Read response contains expected content: {tail.response_text[:200]}")
+
+    def test_delete_file(self, e2e_config):
+        """Clean up: delete the test file."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f"Delete the file {self.TEST_FILENAME}",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Delete file incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+        print(f"  Delete response ({tail.response_len} chars): {tail.response_text[:200]}")
+
+
 class TestConversation:
     """Multi-message conversation tests."""
 
@@ -549,6 +633,44 @@ def _cli_subagent(cfg, tail):
     return all_ok
 
 
+def _cli_scoped_creds(cfg, tail):
+    """Test S3 file operations via scoped credentials (write, read, delete).
+
+    Verifies that the s3-user-files skill works through STS session-scoped
+    credentials. Requires full OpenClaw startup.
+    """
+    print("Scoped credentials test (S3 file operations, requires full startup)")
+    print("Waiting for OpenClaw to be fully started...")
+
+    ready, elapsed = _wait_for_full_openclaw(cfg)
+    if not ready:
+        print(f"  FAIL — OpenClaw not fully started after {elapsed:.0f}s")
+        return False
+    print(f"  OpenClaw ready in {elapsed:.1f}s\n")
+
+    test_content = "E2E_SCOPED_CREDS_OK"
+    test_file = "e2e-creds-test.txt"
+
+    # Step 1: Write
+    print(f"1. Writing test file ({test_file})...")
+    ok = _cli_send(cfg, f'Save the text "{test_content}" to a file called {test_file}', tail)
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 2: Read back
+    print(f"\n2. Reading test file ({test_file})...")
+    ok = _cli_send(cfg, f"Read the contents of {test_file}", tail)
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 3: Delete
+    print(f"\n3. Deleting test file ({test_file})...")
+    ok = _cli_send(cfg, f"Delete the file {test_file}", tail)
+    return ok
+
+
 def _cli_conversation(cfg, scenario_name, tail):
     if scenario_name not in SCENARIOS:
         print(f"Unknown scenario: {scenario_name}")
@@ -578,6 +700,7 @@ def main():
     parser.add_argument("--send", type=str, help="Send a single message")
     parser.add_argument("--conversation", type=str, help="Run a conversation scenario")
     parser.add_argument("--subagent", action="store_true", help="Test sub-agent skills (requires full startup)")
+    parser.add_argument("--scoped-creds", action="store_true", help="Test S3 file ops via scoped credentials (requires full startup)")
     parser.add_argument("--reset", action="store_true", help="Reset session before sending")
     parser.add_argument("--reset-user", action="store_true", help="Full user reset (delete all records)")
     parser.add_argument("--tail-logs", action="store_true", help="Tail CloudWatch logs to verify lifecycle")
@@ -612,6 +735,10 @@ def main():
         ok = _cli_subagent(cfg, args.tail_logs)
         sys.exit(0 if ok else 1)
 
+    if args.scoped_creds:
+        ok = _cli_scoped_creds(cfg, args.tail_logs)
+        sys.exit(0 if ok else 1)
+
     if args.conversation:
         ok = _cli_conversation(cfg, args.conversation, args.tail_logs)
         sys.exit(0 if ok else 1)
@@ -621,7 +748,7 @@ def main():
         sys.exit(0 if ok else 1)
 
     if not any([args.health, args.send, args.conversation, args.subagent,
-                args.reset, args.reset_user]):
+                args.scoped_creds, args.reset, args.reset_user]):
         parser.print_help()
         sys.exit(1)
 
