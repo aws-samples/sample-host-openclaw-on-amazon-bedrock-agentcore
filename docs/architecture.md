@@ -303,16 +303,16 @@
   User on Telegram: "link"
          |
          v
-  Router Lambda generates 6-char bind code
-  Stores in DynamoDB: BIND#A1B2C3 -> userId (10 min TTL)
+  Router Lambda generates 8-char bind code
+  Stores in DynamoDB: BIND#A1B2C3D4 -> userId (10 min TTL)
          |
          v
-  Bot replies: "Your link code is A1B2C3 (valid 10 min)"
+  Bot replies: "Your link code is A1B2C3D4 (valid 10 min)"
 
-  User on Slack: "link A1B2C3"
+  User on Slack: "link A1B2C3D4"
          |
          v
-  Router Lambda looks up BIND#A1B2C3
+  Router Lambda looks up BIND#A1B2C3D4
   Finds userId from Telegram
          |
          v
@@ -359,8 +359,9 @@
 | Webhook | Telegram validation | `X-Telegram-Bot-Api-Secret-Token` header against Secrets Manager secret |
 | Webhook | Slack validation | `X-Slack-Signature` HMAC-SHA256 with 5-minute replay window |
 | Network | VPC + private subnets | Container runs in private subnets, egress via NAT |
+| Network | SG egress HTTPS only | Container outbound traffic restricted to TCP 443 |
 | Network | VPC endpoints (7) | Bedrock, ECR, Secrets Manager, Logs, Metrics, SSM, S3 |
-| Encryption | KMS CMK | All secrets encrypted with customer-managed key |
+| Encryption | KMS CMK | All data encrypted with customer-managed key (S3, DynamoDB, SNS, CloudTrail, Secrets Manager) |
 | Secrets | Secrets Manager | 7 secrets: gateway token, webhook secret, cognito HMAC, 4 channel tokens |
 | Identity | DynamoDB | Channel-to-user mapping, cross-channel binding, session management |
 | Identity | Cognito User Pool | Auto-provisioned users with HMAC-derived passwords |
@@ -368,4 +369,5 @@
 | Storage | S3 encryption | KMS-encrypted user files bucket, SSL enforced, public access blocked |
 | Audit | CloudTrail | API call logging with S3 storage and file validation |
 | Monitoring | CloudWatch alarms | Error rates, latency, throttles, budget thresholds |
+| Container | Tool deny list | exec/read tools blocked; proxy on loopback only |
 | Cost | Token budgets | Daily token/cost alarms with anomaly detection |

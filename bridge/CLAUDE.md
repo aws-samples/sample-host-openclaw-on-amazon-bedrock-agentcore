@@ -65,6 +65,7 @@ Skills like `deep-research-pro` and `task-decomposer` can spawn sub-agents for p
 
 The agent runs with OpenClaw's **full** tool profile. The following tools are denied (not useful in this context):
 - `write`, `edit`, `apply_patch` — local filesystem writes don't persist; use `s3-user-files` instead
+- `exec`, `read` — blocked to prevent credential access via /proc; use `s3-user-files` for file operations
 - `browser`, `canvas` — no headless browser or UI rendering available
 - `cron` — EventBridge handles scheduling instead of OpenClaw's built-in cron
 - `gateway` — admin tool, not needed for end users

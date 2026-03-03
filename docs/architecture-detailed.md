@@ -146,15 +146,15 @@ sequenceDiagram
 
     U->>TG: "link"
     TG->>RL: Webhook
-    RL->>DB: Create BIND#ABC123 (10 min TTL)
-    RL->>TG: "Code: ABC123"
+    RL->>DB: Create BIND#A1B2C3D4 (10 min TTL)
+    RL->>TG: "Code: A1B2C3D4"
     TG->>U: Display code
 
-    U->>SL: "link ABC123"
+    U->>SL: "link A1B2C3D4"
     SL->>RL: Webhook
-    RL->>DB: Lookup BIND#ABC123
+    RL->>DB: Lookup BIND#A1B2C3D4
     RL->>DB: Create CHANNEL#slack:U123 → same userId
-    RL->>DB: Delete BIND#ABC123
+    RL->>DB: Delete BIND#A1B2C3D4
     RL->>SL: "Accounts linked!"
     SL->>U: Confirmation
 ```
@@ -310,6 +310,8 @@ See [SECURITY.md](../SECURITY.md) for comprehensive security documentation.
 - VPC isolation with 7 VPC endpoints
 - Webhook signature validation (Telegram + Slack)
 - Per-user microVM isolation
-- STS session-scoped S3 credentials (per-user namespace restriction)
+- STS session-scoped credentials (per-user S3 namespace + DynamoDB record restriction)
 - KMS encryption at rest
+- Security group egress restricted to HTTPS (TCP 443) only
+- OpenClaw exec/read tools denied; proxy bound to loopback
 - Least-privilege IAM with cdk-nag enforcement

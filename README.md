@@ -75,9 +75,10 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Network isolation**: Private VPC subnets with VPC endpoints; no direct internet exposure for containers
 - **Webhook authentication**: Cryptographic validation (Telegram secret token, Slack HMAC-SHA256 with replay protection)
 - **Per-user isolation**: Each user runs in their own AgentCore microVM with dedicated S3 namespace
-- **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3 to the user's namespace prefix — prevents cross-user data access even through shell tools
-- **Encryption**: Data encrypted at rest (KMS) and in transit (TLS); secrets in Secrets Manager
+- **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3 and DynamoDB to the user's namespace/records — prevents cross-user data access even through shell tools
+- **Encryption**: All data encrypted at rest with customer-managed KMS key (S3, DynamoDB, SNS, CloudTrail, Secrets Manager) and in transit (TLS)
 - **Least-privilege IAM**: Tightly scoped permissions per component
+- **Tool hardening**: OpenClaw exec/read tools denied to prevent credential access; proxy bound to loopback only; security group egress restricted to HTTPS
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
 See [SECURITY.md](SECURITY.md) for the complete security architecture.
@@ -275,7 +276,7 @@ openclaw-on-agentcore/
       webhook.py                  # Build + POST Telegram webhook payloads
       session.py                  # DynamoDB session/user reset + AgentCore session stop
       log_tailer.py               # CloudWatch log tailing with pattern matching
-      bot_test.py                 # CLI entrypoint + pytest test classes (11 tests)
+      bot_test.py                 # CLI entrypoint + pytest test classes (17 tests)
       conftest.py                 # pytest fixtures, conversation scenarios
   docs/
     architecture.md               # Detailed architecture diagram
@@ -448,8 +449,8 @@ Users can send photos alongside text messages. The system supports JPEG, PNG, GI
 By default, each channel creates a separate user identity. If you use both Telegram and Slack, you'll have two separate sessions with separate conversation histories. To unify them into a single identity and shared session:
 
 1. **On your first channel** (e.g., Telegram), send: `link`
-   - The bot responds with a 6-character code (e.g., `A1B2C3`) valid for 10 minutes
-2. **On your second channel** (e.g., Slack), send: `link A1B2C3`
+   - The bot responds with an 8-character code (e.g., `A1B2C3D4`) valid for 10 minutes
+2. **On your second channel** (e.g., Slack), send: `link A1B2C3D4`
    - The bot confirms the accounts are linked
 
 After linking, both channels route to the same user, the same AgentCore session, and the same conversation history. The bind code is stored in DynamoDB with a 10-minute TTL and deleted after use.

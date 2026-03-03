@@ -77,10 +77,13 @@ There is **no shared state** between users. Namespace derivation is system-contr
 Beyond microVM isolation, S3 access is restricted at the **IAM level** using STS session policies:
 
 1. On container init, the contract server calls `STS:AssumeRole` on its own execution role with an inline session policy
-2. The session policy restricts S3 to `{bucket}/{namespace}/*` — the user can only access their own prefix
-3. OpenClaw is spawned with these scoped credentials via `credential_process`. Container-level credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CONTAINER_CREDENTIALS_*`) are stripped from its environment
-4. Credentials are refreshed every 45 minutes (STS max session duration is 1 hour)
-5. The trusted proxy process retains full execution role credentials for Bedrock, Cognito, and S3 image access (with application-level namespace enforcement)
+2. The execution role trust policy requires `sts:RoleSessionName` matching the `scoped-*` prefix, preventing unconditioned re-assumption
+3. The session policy restricts S3 to `{bucket}/{namespace}/*` — the user can only access their own prefix
+4. The session policy also restricts DynamoDB access to the user's own records via `dynamodb:LeadingKeys` condition (USER#{actorId} and CHANNEL#{actorId} prefixes only)
+5. OpenClaw is spawned with these scoped credentials via `credential_process`. Container-level credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CONTAINER_CREDENTIALS_*`) are stripped from its environment
+6. Credentials are refreshed every 45 minutes (STS max session duration is 1 hour)
+7. The trusted proxy process retains full execution role credentials for Bedrock, Cognito, and S3 image access (with application-level namespace enforcement)
+8. If STS credential creation fails, OpenClaw starts with **zero AWS access** (all credential environment variables stripped) rather than falling back to full execution role credentials. Tools will fail gracefully but no cross-user data access is possible
 
 This provides defense-in-depth: even if OpenClaw's bash tool or a skill attempts to access another user's S3 prefix, the IAM session policy denies the request. The session policy also scopes DynamoDB access to the identity table and EventBridge access to the cron schedule group.
 
@@ -105,6 +108,10 @@ Each component has tightly scoped permissions:
 | Router Lambda | Secrets Manager access limited to `openclaw/*` prefix |
 | AgentCore Container | S3 access scoped to user's namespace prefix via STS session policy |
 | AgentCore Container | Bedrock invoke scoped to specific model/inference profile |
+| AgentCore Container | Secrets Manager access limited to gateway-token and cognito-password-secret only |
+| AgentCore Container | CloudWatch PutMetricData restricted to OpenClaw/* namespaces only |
+| AgentCore Container | CloudWatch Logs restricted to /openclaw/* log group prefix |
+| AgentCore Container | DynamoDB scoped to user's own records via STS session policy |
 
 ## Data Protection
 
@@ -113,9 +120,11 @@ Each component has tightly scoped permissions:
 | Service | Encryption |
 |---|---|
 | S3 | KMS with customer-managed key (CMK) |
-| DynamoDB | AWS-managed keys |
+| DynamoDB | KMS with customer-managed key (CMK) |
+| SNS Topics | KMS with customer-managed key (CMK) |
 | Secrets Manager | Customer-managed KMS key |
 | CloudWatch Logs | AWS-managed keys |
+| CloudTrail S3 | KMS with customer-managed key (CMK) |
 
 ### Encryption in Transit
 
@@ -137,7 +146,7 @@ All sensitive values are stored in **AWS Secrets Manager** encrypted with a cust
 | `openclaw/cognito-secret` | HMAC secret for password derivation |
 
 Secrets are:
-- Fetched at runtime and held in process memory only
+- Fetched at runtime, cached with 15-minute TTL, and held in process memory only
 - Never written to environment variables, config files, or logs
 - Rotated via Secrets Manager (manual rotation supported)
 
@@ -149,6 +158,12 @@ Secrets are:
 - Internal error details and stack traces are **never exposed** in API responses
 - Container runs on AgentCore's **Firecracker microVM** with hardware-level isolation
 - Each user session runs in a **separate microVM** (not shared containers)
+- OpenClaw tool deny list blocks **exec** and **read** tools to prevent credential access via /proc and local file reads
+- Bedrock proxy binds to **127.0.0.1** (loopback only), preventing network access from other containers
+- Security group egress restricted to **TCP 443 only** (HTTPS)
+- API Gateway **access logging** enabled for forensic analysis
+- S3 bucket **versioning** enabled for accidental deletion recovery
+- Secrets Manager values cached with **15-minute TTL** (not indefinitely)
 
 ### Image Security
 
