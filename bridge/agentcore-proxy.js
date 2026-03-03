@@ -1561,9 +1561,9 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "127.0.0.1", () => {
   console.log(
-    `[proxy] Bedrock proxy adapter listening on http://0.0.0.0:${PORT} (model: ${MODEL_ID})`,
+    `[proxy] Bedrock proxy adapter listening on http://127.0.0.1:${PORT} (model: ${MODEL_ID})`,
   );
   console.log(
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`,
