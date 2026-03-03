@@ -2,7 +2,7 @@
   "app": "python3 app.py",
   "context": {
     "account": "",
-    "region": "ap-southeast-2",
+    "region": "eu-west-1",
     "default_model_id": "global.anthropic.claude-opus-4-6-v1",
     "subagent_model_id": "",
     "cloudwatch_log_retention_days": 30,

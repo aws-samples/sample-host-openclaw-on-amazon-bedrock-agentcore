@@ -18,6 +18,7 @@ from stacks.router_stack import RouterStack
 from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
+from stacks.build_stack import BuildStack
 
 app = cdk.App()
 
@@ -102,5 +103,14 @@ token_monitoring_stack = TokenMonitoringStack(
 
 # --- cdk-nag security checks ---
 cdk.Aspects.of(app).add(cdk_nag.AwsSolutionsChecks(verbose=True))
+
+# --- Build (CodeBuild project for ARM64 container builds without local Docker) ---
+build_stack = BuildStack(
+    app,
+    "OpenClawBuild",
+    ecr_repo_name=agentcore_stack.bridge_repo.repository_name,
+    image_version=str(agentcore_stack.node.try_get_context("image_version") or "1"),
+    env=env,
+)
 
 app.synth()
