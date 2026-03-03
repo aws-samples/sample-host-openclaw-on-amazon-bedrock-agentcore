@@ -149,7 +149,9 @@ The CDK AgentCore stack creates the ECR repository. The container image does not
 
 ### 5. Build and push the bridge container image
 
-After the CDK deploy creates the ECR repository, build and push the bridge container image.
+After the CDK deploy creates the ECR repository, you have two options to build and push the bridge container image:
+
+#### Option 1: Local Docker (default)
 
 ```bash
 # Authenticate Docker to ECR
@@ -169,6 +171,17 @@ docker tag openclaw-bridge:v${VERSION} \
 docker push \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 ```
+
+#### Option 2: CodeBuild (no local Docker required)
+
+If you don't have Docker installed or are in a corporate environment with network restrictions, you can use AWS CodeBuild to build the container in the cloud:
+
+```bash
+# Build and push via CodeBuild (no local Docker needed)
+./scripts/codebuild-push.sh
+```
+
+This will package the bridge/ directory, upload it to S3, and trigger a CodeBuild project that builds the ARM64 container and pushes it to ECR. The script will monitor the build progress and display the build URL for monitoring.
 
 ### 6. Store your Telegram bot token
 

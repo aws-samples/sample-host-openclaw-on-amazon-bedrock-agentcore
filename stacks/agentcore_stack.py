@@ -146,10 +146,20 @@ class AgentCoreStack(Stack):
                 resources=[execution_role_arn_str],
             )
         )
+        # Use AccountPrincipal + ArnLike condition instead of ArnPrincipal.
+        # IAM validates that ArnPrincipal targets exist at creation time, causing
+        # a chicken-and-egg failure when a role references itself (doesn't exist yet).
+        # AccountPrincipal (account root) always exists; the ArnLike condition
+        # tightly scopes the trust to only sessions from this specific role ARN.
         self.execution_role.assume_role_policy.add_statements(
             iam.PolicyStatement(
                 actions=["sts:AssumeRole"],
-                principals=[iam.ArnPrincipal(execution_role_arn_str)],
+                principals=[iam.AccountPrincipal(account)],
+                conditions={
+                    "ArnLike": {
+                        "aws:PrincipalArn": execution_role_arn_str,
+                    }
+                },
             )
         )
 

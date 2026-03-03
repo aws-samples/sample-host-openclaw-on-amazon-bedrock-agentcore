@@ -2,7 +2,7 @@
   "app": "python3 app.py",
   "context": {
     "account": "",
-    "region": "ap-southeast-2",
+    "region": "us-west-2",
     "default_model_id": "global.anthropic.claude-opus-4-6-v1",
     "subagent_model_id": "",
     "cloudwatch_log_retention_days": 30,
@@ -10,7 +10,7 @@
     "daily_cost_budget_usd": 5,
     "anomaly_band_width": 2,
     "token_ttl_days": 90,
-    "image_version": 35,
+    "image_version": 1,
     "user_files_ttl_days": 365,
     "session_idle_timeout": 1800,
     "session_max_lifetime": 28800,

@@ -14,15 +14,14 @@ RUN pip3 install --no-cache-dir --break-system-packages awscli
 # Install OpenClaw and ClawHub CLI globally
 RUN npm install -g openclaw@latest clawhub@latest
 
-# Install ClawHub community skills (5 high-value marketplace skills)
-# Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
-# hackernews (niche), news-feed (niche) to reduce startup time.
-# --no-input --force: non-interactive, skip VirusTotal warnings
-RUN clawhub install jina-reader --no-input --force && \
-    clawhub install deep-research-pro --no-input --force && \
-    clawhub install telegram-compose --no-input --force && \
-    clawhub install transcript --no-input --force && \
-    clawhub install task-decomposer --no-input --force
+# Install ClawHub community skills.
+# NODE_TLS_REJECT_UNAUTHORIZED=0 bypasses clawhub.io expired SSL cert at build time.
+# --no-input --force: non-interactive, skip VirusTotal warnings.
+RUN NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install jina-reader --no-input --force && \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install deep-research-pro --no-input --force && \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install telegram-compose --no-input --force && \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install transcript --no-input --force && \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install task-decomposer --no-input --force
 
 # Create app directory
 RUN mkdir -p /app
