@@ -194,7 +194,7 @@ class BuildStack(Stack):
                     "build logs. Resource-level permissions not supported for CodeBuild "
                     "CloudWatch operations.",
                     applies_to=[
-                        "Resource::arn:aws:logs:eu-west-1:279826012703:log-group:/aws/codebuild/<BridgeBuildProject483AAFF2>:*",
+                        f"Resource::arn:aws:logs:{region}:{account}:log-group:/aws/codebuild/<BridgeBuildProject483AAFF2>:*",
                     ],
                 ),
                 cdk_nag.NagPackSuppression(
@@ -203,7 +203,7 @@ class BuildStack(Stack):
                     "generate build reports. Resource-level permissions not supported for "
                     "CodeBuild report group operations.",
                     applies_to=[
-                        "Resource::arn:aws:codebuild:eu-west-1:279826012703:report-group/<BridgeBuildProject483AAFF2>-*",
+                        f"Resource::arn:aws:codebuild:{region}:{account}:report-group/<BridgeBuildProject483AAFF2>-*",
                     ],
                 ),
                 cdk_nag.NagPackSuppression(

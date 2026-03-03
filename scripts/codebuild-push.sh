@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-REGION="${CDK_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || echo "eu-west-1")}"
+REGION="${CDK_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || echo "us-west-2")}"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
 PROJECT_NAME="openclaw-bridge-build"
 SOURCE_BUCKET="openclaw-build-source-${ACCOUNT}-${REGION}"
