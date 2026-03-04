@@ -349,6 +349,7 @@ function writeOpenClawConfig() {
         enabled: false,
         allowInsecureAuth: true,
         dangerouslyDisableDeviceAuth: true,
+        allowedOrigins: ["*"],
       },
     },
     channels: {}, // No channels — messages bridged via WebSocket
@@ -761,7 +762,7 @@ async function bridgeMessage(message, timeoutMs = 560000) {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
     console.log(`[contract] Connecting to WebSocket: ${wsUrl}`);
     const ws = new WebSocket(wsUrl, {
-      headers: { Origin: `http://127.0.0.1:${OPENCLAW_PORT}` },
+      origin: `http://127.0.0.1:${OPENCLAW_PORT}`,
     });
     let responseText = "";
     let authenticated = false;
