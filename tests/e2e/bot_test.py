@@ -8,6 +8,7 @@ CLI usage:
     python -m tests.e2e.bot_test --conversation multi_turn --tail-logs
     python -m tests.e2e.bot_test --subagent --tail-logs
     python -m tests.e2e.bot_test --skill-manage --tail-logs
+    python -m tests.e2e.bot_test --api-keys --tail-logs
 
 Pytest usage:
     pytest tests/e2e/bot_test.py -v -k smoke
@@ -20,6 +21,8 @@ import argparse
 import sys
 import time
 
+import boto3
+from botocore.exceptions import ClientError
 import pytest
 
 from .config import load_config
@@ -526,6 +529,202 @@ class TestScopedCredentials:
         print(f"  Delete response ({tail.response_len} chars): {tail.response_text[:200]}")
 
 
+class TestApiKeyManagement:
+    """Verify dual-mode API key storage: native file-based and Secrets Manager.
+
+    Tests the manage_api_key (native), manage_secret (Secrets Manager),
+    retrieve_api_key (unified lookup), and migrate_api_key tools during
+    warm-up mode (lightweight agent). These tools are available immediately
+    without waiting for full OpenClaw startup.
+
+    Flow:
+      1. Set a native API key via manage_api_key
+      2. Get it back to verify storage
+      3. Set a secret in Secrets Manager
+      4. Retrieve via unified retrieval (tries SM first, falls back to native)
+      5. List native keys and secrets
+      6. Clean up: delete both keys
+
+    Uses the api-keys skill scripts in /skills/api-keys/ which work in both
+    warm-up mode (lightweight agent) and full OpenClaw mode.
+
+    Run with: pytest tests/e2e/bot_test.py -v -k TestApiKeyManagement
+    """
+
+    NATIVE_KEY_NAME = "e2e_test_native_key"
+    NATIVE_KEY_VALUE = "native-test-value-12345"
+    SM_KEY_NAME = "e2e_test_secure_key"
+    SM_KEY_VALUE = "secure-test-value-67890"
+
+    @pytest.fixture(autouse=True, scope="class")
+    def fresh_session(self, e2e_config):
+        """Reset session and clean up stale Secrets Manager entries before tests."""
+        # Force-delete any lingering test secret (e.g. stuck in 7-day recovery window)
+        sm = boto3.client("secretsmanager", region_name=e2e_config.region)
+        namespace = f"telegram_{e2e_config.telegram_user_id}"
+        secret_name = f"openclaw/user/{namespace}/{self.SM_KEY_NAME}"
+        try:
+            sm.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+            print(f"\n  [cleanup] Force-deleted stale test secret: {self.SM_KEY_NAME}")
+            time.sleep(2)  # Brief wait for deletion to propagate
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                print(f"\n  [cleanup] Warning deleting test secret: {e.response['Error']['Code']}")
+
+        reset_session(e2e_config)
+        time.sleep(2)
+
+    def test_set_native_key(self, e2e_config):
+        """Store an API key using native file-based storage."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f'Save an API key using native file storage. '
+            f'Key name: "{self.NATIVE_KEY_NAME}", value: "{self.NATIVE_KEY_VALUE}". '
+            f'Use the api-keys skill native.js with action "set".',
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Set native key incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+        # Response should confirm the key was stored
+        resp_lower = tail.response_text.lower()
+        assert any(w in resp_lower for w in ["stored", "saved", "set", "success"]), (
+            f"Expected confirmation of key storage.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+        print(f"  Set native key response: {tail.response_text[:200]}")
+
+    def test_get_native_key(self, e2e_config):
+        """Retrieve the native API key and verify the value."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f'Get the API key named "{self.NATIVE_KEY_NAME}" using the api-keys '
+            f'skill native.js with action "get". Show me the exact value.',
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Get native key incomplete (timed_out={tail.timed_out})"
+        )
+        # The response should contain the key value
+        assert self.NATIVE_KEY_VALUE in tail.response_text, (
+            f"Expected key value '{self.NATIVE_KEY_VALUE}' in response.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+        print(f"  Get native key response: {tail.response_text[:200]}")
+
+    def test_set_secret(self, e2e_config):
+        """Store an API key in AWS Secrets Manager."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f'Store a secret in AWS Secrets Manager. '
+            f'Key name: "{self.SM_KEY_NAME}", value: "{self.SM_KEY_VALUE}". '
+            f'Use the api-keys skill secret.js with action "set".',
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Set secret incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+        resp_lower = tail.response_text.lower()
+        assert any(w in resp_lower for w in ["stored", "saved", "created", "success", "encrypted"]), (
+            f"Expected confirmation of secret storage.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+        print(f"  Set secret response: {tail.response_text[:200]}")
+
+    def test_retrieve_api_key_unified(self, e2e_config):
+        """Use retrieve.js to look up a key (tries SM first, then native)."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f'Retrieve the API key named "{self.SM_KEY_NAME}" using the api-keys '
+            f'skill retrieve.js. Show me the value and which backend it came from.',
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Retrieve key incomplete (timed_out={tail.timed_out})"
+        )
+        # Should find the SM key value
+        assert self.SM_KEY_VALUE in tail.response_text, (
+            f"Expected key value '{self.SM_KEY_VALUE}' in response.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+        print(f"  Retrieve key response: {tail.response_text[:200]}")
+
+    def test_list_native_keys(self, e2e_config):
+        """List all native API keys and verify our test key is present."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            'List all native API keys using the api-keys skill native.js with action "list".',
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"List native keys incomplete (timed_out={tail.timed_out})"
+        )
+        assert self.NATIVE_KEY_NAME in tail.response_text, (
+            f"Expected '{self.NATIVE_KEY_NAME}' in key list.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+        print(f"  List native keys response: {tail.response_text[:200]}")
+
+    def test_delete_native_key(self, e2e_config):
+        """Clean up: delete the native API key."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f'Delete the API key named "{self.NATIVE_KEY_NAME}" using the '
+            f'api-keys skill native.js with action "delete".',
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Delete native key incomplete (timed_out={tail.timed_out})"
+        )
+        resp_lower = tail.response_text.lower()
+        assert any(w in resp_lower for w in ["deleted", "removed", "success"]), (
+            f"Expected deletion confirmation.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+        print(f"  Delete native key response: {tail.response_text[:200]}")
+
+    def test_delete_secret(self, e2e_config):
+        """Clean up: delete the Secrets Manager secret."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f'Delete the secret named "{self.SM_KEY_NAME}" using the '
+            f'api-keys skill secret.js with action "delete".',
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Delete secret incomplete (timed_out={tail.timed_out})"
+        )
+        resp_lower = tail.response_text.lower()
+        assert any(w in resp_lower for w in ["deleted", "removed", "scheduled", "success"]), (
+            f"Expected deletion confirmation.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+        print(f"  Delete secret response: {tail.response_text[:200]}")
+
+
 class TestSkillManagement:
     """Verify clawhub-manage skill: list, install, and uninstall skills.
 
@@ -881,6 +1080,86 @@ def _cli_skill_manage(cfg, tail):
     return ok
 
 
+def _cli_api_keys(cfg, tail):
+    """Test dual-mode API key storage: native file-based and Secrets Manager.
+
+    Tests manage_api_key (native), manage_secret (SM), retrieve_api_key
+    (unified lookup), and cleanup (delete both).
+    """
+    native_key = "e2e_test_native_key"
+    native_val = "native-test-value-12345"
+    sm_key = "e2e_test_secure_key"
+    sm_val = "secure-test-value-67890"
+
+    print("API key management test (native + Secrets Manager)")
+
+    # Step 1: Set native key
+    print(f"\n1. Setting native key ({native_key})...")
+    ok = _cli_send(
+        cfg,
+        f'Store an API key named "{native_key}" with value "{native_val}" '
+        f'using the manage_api_key tool with action "set".',
+        tail,
+    )
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 2: Get native key
+    print(f"\n2. Getting native key ({native_key})...")
+    ok = _cli_send(
+        cfg,
+        f'Get the API key named "{native_key}" using manage_api_key with action "get".',
+        tail,
+    )
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 3: Set SM secret
+    print(f"\n3. Setting Secrets Manager secret ({sm_key})...")
+    ok = _cli_send(
+        cfg,
+        f'Store a secret named "{sm_key}" with value "{sm_val}" '
+        f'using the manage_secret tool with action "set".',
+        tail,
+    )
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 4: Retrieve via unified lookup
+    print(f"\n4. Retrieving via retrieve_api_key ({sm_key})...")
+    ok = _cli_send(
+        cfg,
+        f'Use the retrieve_api_key tool to look up "{sm_key}".',
+        tail,
+    )
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 5: Clean up native key
+    print(f"\n5. Deleting native key ({native_key})...")
+    ok = _cli_send(
+        cfg,
+        f'Delete the API key named "{native_key}" using manage_api_key with action "delete".',
+        tail,
+    )
+    if not ok:
+        return False
+    time.sleep(5)
+
+    # Step 6: Clean up SM secret
+    print(f"\n6. Deleting Secrets Manager secret ({sm_key})...")
+    ok = _cli_send(
+        cfg,
+        f'Delete the secret named "{sm_key}" using manage_secret with action "delete".',
+        tail,
+    )
+    return ok
+
+
 def _cli_conversation(cfg, scenario_name, tail):
     if scenario_name not in SCENARIOS:
         print(f"Unknown scenario: {scenario_name}")
@@ -912,6 +1191,7 @@ def main():
     parser.add_argument("--subagent", action="store_true", help="Test sub-agent skills (requires full startup)")
     parser.add_argument("--scoped-creds", action="store_true", help="Test S3 file ops via scoped credentials (requires full startup)")
     parser.add_argument("--skill-manage", action="store_true", help="Test skill management (list, install, uninstall)")
+    parser.add_argument("--api-keys", action="store_true", help="Test API key management (native + Secrets Manager)")
     parser.add_argument("--reset", action="store_true", help="Reset session before sending")
     parser.add_argument("--reset-user", action="store_true", help="Full user reset (delete all records)")
     parser.add_argument("--tail-logs", action="store_true", help="Tail CloudWatch logs to verify lifecycle")
@@ -954,6 +1234,10 @@ def main():
         ok = _cli_skill_manage(cfg, args.tail_logs)
         sys.exit(0 if ok else 1)
 
+    if args.api_keys:
+        ok = _cli_api_keys(cfg, args.tail_logs)
+        sys.exit(0 if ok else 1)
+
     if args.conversation:
         ok = _cli_conversation(cfg, args.conversation, args.tail_logs)
         sys.exit(0 if ok else 1)
@@ -963,7 +1247,8 @@ def main():
         sys.exit(0 if ok else 1)
 
     if not any([args.health, args.send, args.conversation, args.subagent,
-                args.scoped_creds, args.skill_manage, args.reset, args.reset_user]):
+                args.scoped_creds, args.skill_manage, args.api_keys,
+                args.reset, args.reset_user]):
         parser.print_help()
         sys.exit(1)
 

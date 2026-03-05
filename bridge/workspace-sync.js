@@ -37,8 +37,29 @@ const SKIP_PATTERNS = [
   ".npm/",
   "package-lock.json",
   "openclaw.json",
+  // Security: exclude files that commonly contain secrets
+  ".env",
+  ".secrets/",
+  "*.pem",
+  "*.key",
 ];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+// Credential patterns — detect potential secrets before S3 upload.
+// Files matching these are still uploaded (user's choice) but a warning is logged.
+// The designated native key store (user-api-keys.json) is exempt.
+const CREDENTIAL_PATTERNS = [
+  /AKIA[0-9A-Z]{16}/, // AWS access key IDs
+  /-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----/, // Private keys
+  /sk-[a-zA-Z0-9]{20,}/, // OpenAI / Anthropic keys
+  /xox[bpas]-[a-zA-Z0-9-]{10,}/, // Slack tokens
+  /\d{8,10}:[a-zA-Z0-9_-]{35}/, // Telegram bot tokens
+  /ghp_[a-zA-Z0-9]{36}/, // GitHub personal access tokens
+  /glpat-[a-zA-Z0-9_-]{20,}/, // GitLab personal access tokens
+];
+// File exempt from credential scanning — the designated native API key store.
+// Users who choose "native" storage consciously store keys here.
+const CREDENTIAL_SCAN_EXEMPT = "user-api-keys.json";
 
 // S3 client singleton (same pattern as agentcore-proxy.js)
 let _s3Client = null;
@@ -83,6 +104,23 @@ function configureCredentials(credentials) {
   };
   // Reset client so next getS3Client() picks up new credentials
   _s3Client = null;
+}
+
+/**
+ * Scan file content for potential credentials/secrets.
+ * Returns the name of the first matching pattern, or null if clean.
+ *
+ * @param {Buffer|string} content - File content to scan
+ * @returns {string|null} - Pattern description if detected, null if clean
+ */
+function detectCredentials(content) {
+  const text = typeof content === "string" ? content : content.toString("utf-8", 0, Math.min(content.length, 1024 * 64));
+  for (const pattern of CREDENTIAL_PATTERNS) {
+    if (pattern.test(text)) {
+      return pattern.source.slice(0, 40);
+    }
+  }
+  return null;
 }
 
 /**
@@ -253,6 +291,20 @@ async function saveWorkspace(namespace) {
       }
 
       const content = fs.readFileSync(localFile);
+
+      // Credential detection: warn (but don't block) when secrets are found.
+      // Exempt only the root-level native API key store — user made a conscious choice.
+      // Match exact relative path (not just basename) to prevent bypass via subdirectories.
+      if (relativePath !== CREDENTIAL_SCAN_EXEMPT) {
+        const detected = detectCredentials(content);
+        if (detected) {
+          console.warn(
+            `[workspace-sync] WARNING: Potential credential detected in ${relativePath} ` +
+            `(pattern: ${detected}). File will still be uploaded to S3.`,
+          );
+        }
+      }
+
       await s3.send(
         new (getS3Sdk().PutObjectCommand)({
           Bucket: BUCKET,
@@ -315,4 +367,8 @@ module.exports = {
   cleanup,
   configureCredentials,
   getS3Client,
+  // Exported for testing
+  shouldSkip,
+  detectCredentials,
+  CREDENTIAL_SCAN_EXEMPT,
 };

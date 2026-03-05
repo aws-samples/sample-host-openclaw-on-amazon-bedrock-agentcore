@@ -1,13 +1,18 @@
 /**
- * Tests for lightweight-agent.js — tool definitions, buildToolArgs, and web tools.
+ * Tests for lightweight-agent.js — tool definitions, buildToolArgs, web tools,
+ * and native API key management.
  *
  * Covers: TOOLS definitions, SCRIPT_MAP, TOOL_ENV, buildToolArgs logic,
- *         web_fetch and web_search in-process tools, stripHtml, parseSearchResults.
+ *         web_fetch and web_search in-process tools, stripHtml, parseSearchResults,
+ *         manage_api_key native file-based storage.
  * Run: cd bridge && node --test lightweight-agent.test.js
  */
-const { describe, it } = require("node:test");
+const { describe, it, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
-const { TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs, stripHtml, parseSearchResults, executeWebFetch, executeWebSearch } = require("./lightweight-agent");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs, stripHtml, parseSearchResults, executeWebFetch, executeWebSearch, executeManageApiKey, readApiKeys, writeApiKeys, getApiKeysPath, VALID_KEY_NAME, executeManageSecret, buildSecretName, _secretsCache, MAX_SECRETS_PER_USER, executeRetrieveApiKey, executeMigrateApiKey } = require("./lightweight-agent");
 
 // --- TOOLS array ---
 
@@ -24,11 +29,15 @@ describe("TOOLS", () => {
     "install_skill",
     "uninstall_skill",
     "list_skills",
+    "manage_api_key",
+    "manage_secret",
+    "retrieve_api_key",
+    "migrate_api_key",
     "web_fetch",
     "web_search",
   ];
 
-  it("contains all 13 expected tools", () => {
+  it("contains all 17 expected tools", () => {
     const names = TOOLS.map((t) => t.function.name);
     assert.deepStrictEqual(names, EXPECTED_TOOLS);
   });
@@ -126,7 +135,11 @@ describe("SCRIPT_MAP", () => {
     assert.equal(SCRIPT_MAP.delete_user_file, "/skills/s3-user-files/delete.js");
   });
 
-  it("web tools are marked as in-process (no script path)", () => {
+  it("in-process tools have null script paths", () => {
+    assert.equal(SCRIPT_MAP.manage_api_key, null);
+    assert.equal(SCRIPT_MAP.manage_secret, null);
+    assert.equal(SCRIPT_MAP.retrieve_api_key, null);
+    assert.equal(SCRIPT_MAP.migrate_api_key, null);
     assert.equal(SCRIPT_MAP.web_fetch, null);
     assert.equal(SCRIPT_MAP.web_search, null);
   });
@@ -687,5 +700,300 @@ describe("executeWebSearch", () => {
   it("rejects empty query", async () => {
     const result = await executeWebSearch("");
     assert.ok(result.startsWith("Error:") || result.includes("No results"), `should handle empty query, got: ${result}`);
+  });
+});
+
+// --- manage_api_key (native file-based storage) ---
+
+describe("manage_api_key", () => {
+  let tmpDir;
+  let origHome;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "apikeys-test-"));
+    origHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    // Ensure .openclaw directory exists
+    fs.mkdirSync(path.join(tmpDir, ".openclaw"), { recursive: true });
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("VALID_KEY_NAME accepts valid names", () => {
+    assert.ok(VALID_KEY_NAME.test("openai"));
+    assert.ok(VALID_KEY_NAME.test("jina-reader"));
+    assert.ok(VALID_KEY_NAME.test("my_key_123"));
+    assert.ok(VALID_KEY_NAME.test("a"));
+  });
+
+  it("VALID_KEY_NAME rejects invalid names", () => {
+    assert.ok(!VALID_KEY_NAME.test(""));
+    assert.ok(!VALID_KEY_NAME.test("123abc")); // starts with digit
+    assert.ok(!VALID_KEY_NAME.test("key with spaces"));
+    assert.ok(!VALID_KEY_NAME.test("key/path"));
+    assert.ok(!VALID_KEY_NAME.test("../traversal"));
+  });
+
+  it("getApiKeysPath returns path under HOME/.openclaw/", () => {
+    const result = getApiKeysPath();
+    assert.ok(result.includes(".openclaw"));
+    assert.ok(result.endsWith("user-api-keys.json"));
+  });
+
+  it("readApiKeys returns empty object when file does not exist", () => {
+    const keys = readApiKeys();
+    assert.deepStrictEqual(keys, {});
+  });
+
+  it("writeApiKeys creates file and readApiKeys reads it back", () => {
+    writeApiKeys({ openai: "sk-test123" });
+    const keys = readApiKeys();
+    assert.deepStrictEqual(keys, { openai: "sk-test123" });
+  });
+
+  it("set action stores a new key", () => {
+    const result = executeManageApiKey({ action: "set", key_name: "openai", key_value: "sk-test" });
+    assert.ok(result.includes("saved"));
+    const keys = readApiKeys();
+    assert.equal(keys.openai, "sk-test");
+  });
+
+  it("set action updates an existing key", () => {
+    writeApiKeys({ openai: "sk-old" });
+    const result = executeManageApiKey({ action: "set", key_name: "openai", key_value: "sk-new" });
+    assert.ok(result.includes("updated"));
+    assert.equal(readApiKeys().openai, "sk-new");
+  });
+
+  it("get action retrieves a stored key", () => {
+    writeApiKeys({ jina: "jina-key-123" });
+    const result = executeManageApiKey({ action: "get", key_name: "jina" });
+    assert.equal(result, "jina-key-123");
+  });
+
+  it("get action returns error for missing key", () => {
+    const result = executeManageApiKey({ action: "get", key_name: "nonexistent" });
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("list action shows stored keys", () => {
+    writeApiKeys({ openai: "sk-1", jina: "jina-2" });
+    const result = executeManageApiKey({ action: "list" });
+    assert.ok(result.includes("openai"));
+    assert.ok(result.includes("jina"));
+  });
+
+  it("list action shows message when no keys", () => {
+    const result = executeManageApiKey({ action: "list" });
+    assert.ok(result.includes("No API keys"));
+  });
+
+  it("delete action removes a key", () => {
+    writeApiKeys({ openai: "sk-1", jina: "jina-2" });
+    const result = executeManageApiKey({ action: "delete", key_name: "openai" });
+    assert.ok(result.includes("deleted"));
+    const keys = readApiKeys();
+    assert.ok(!("openai" in keys));
+    assert.equal(keys.jina, "jina-2");
+  });
+
+  it("delete action returns error for missing key", () => {
+    const result = executeManageApiKey({ action: "delete", key_name: "nonexistent" });
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("set action rejects missing key_value", () => {
+    const result = executeManageApiKey({ action: "set", key_name: "openai" });
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("set action rejects invalid key_name", () => {
+    const result = executeManageApiKey({ action: "set", key_name: "123invalid", key_value: "val" });
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("rejects invalid action", () => {
+    const result = executeManageApiKey({ action: "invalid" });
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("set/get/delete reject missing key_name", () => {
+    assert.ok(executeManageApiKey({ action: "set" }).startsWith("Error:"));
+    assert.ok(executeManageApiKey({ action: "get" }).startsWith("Error:"));
+    assert.ok(executeManageApiKey({ action: "delete" }).startsWith("Error:"));
+  });
+
+  it("manage_api_key tool definition has correct schema", () => {
+    const tool = TOOLS.find((t) => t.function.name === "manage_api_key");
+    assert.ok(tool, "manage_api_key tool should exist");
+    assert.deepStrictEqual(tool.function.parameters.required, ["action"]);
+    assert.ok(tool.function.parameters.properties.action);
+    assert.ok(tool.function.parameters.properties.key_name);
+    assert.ok(tool.function.parameters.properties.key_value);
+  });
+});
+
+// --- manage_secret (Secrets Manager backend — non-SDK tests) ---
+
+describe("manage_secret", () => {
+  it("buildSecretName constructs correct path", () => {
+    assert.equal(
+      buildSecretName("telegram_123", "openai"),
+      "openclaw/user/telegram_123/openai",
+    );
+  });
+
+  it("buildSecretName handles different namespaces", () => {
+    assert.equal(
+      buildSecretName("slack_abc-def", "jina"),
+      "openclaw/user/slack_abc-def/jina",
+    );
+  });
+
+  it("MAX_SECRETS_PER_USER is 10", () => {
+    assert.equal(MAX_SECRETS_PER_USER, 10);
+  });
+
+  it("secrets cache is a Map", () => {
+    assert.ok(_secretsCache instanceof Map);
+  });
+
+  it("manage_secret tool definition has correct schema", () => {
+    const tool = TOOLS.find((t) => t.function.name === "manage_secret");
+    assert.ok(tool, "manage_secret tool should exist");
+    assert.deepStrictEqual(tool.function.parameters.required, ["action"]);
+    assert.ok(tool.function.parameters.properties.action);
+    assert.ok(tool.function.parameters.properties.key_name);
+    assert.ok(tool.function.parameters.properties.key_value);
+    assert.ok(tool.function.description.includes("Secrets Manager"));
+  });
+
+  it("manage_secret rejects invalid key_name for set", async () => {
+    // executeManageSecret requires SDK so we can only test validation paths
+    // that don't hit the SDK (invalid key_name validation)
+    const result = await executeManageSecret(
+      { action: "set", key_name: "123bad", key_value: "val" },
+      "telegram_123",
+    );
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("manage_secret rejects missing key_value for set", async () => {
+    const result = await executeManageSecret(
+      { action: "set", key_name: "openai" },
+      "telegram_123",
+    );
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("manage_secret rejects invalid action", async () => {
+    const result = await executeManageSecret(
+      { action: "bogus" },
+      "telegram_123",
+    );
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("manage_secret rejects missing key_name for get", async () => {
+    const result = await executeManageSecret(
+      { action: "get" },
+      "telegram_123",
+    );
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("manage_secret rejects missing key_name for delete", async () => {
+    const result = await executeManageSecret(
+      { action: "delete" },
+      "telegram_123",
+    );
+    assert.ok(result.startsWith("Error:"));
+  });
+});
+
+// --- retrieve_api_key (unified retrieval) ---
+
+describe("retrieve_api_key", () => {
+  let tmpDir;
+  let origHome;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "retrieve-test-"));
+    origHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    fs.mkdirSync(path.join(tmpDir, ".openclaw"), { recursive: true });
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("retrieve_api_key tool definition has correct schema", () => {
+    const tool = TOOLS.find((t) => t.function.name === "retrieve_api_key");
+    assert.ok(tool, "retrieve_api_key tool should exist");
+    assert.deepStrictEqual(tool.function.parameters.required, ["key_name"]);
+  });
+
+  it("rejects invalid key_name", async () => {
+    const result = await executeRetrieveApiKey({ key_name: "123bad" }, "ns");
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("rejects missing key_name", async () => {
+    const result = await executeRetrieveApiKey({}, "ns");
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("falls back to native file when SM unavailable", async () => {
+    // Write a key to native store
+    writeApiKeys({ testkey: "native-value-123" });
+    const result = await executeRetrieveApiKey({ key_name: "testkey" }, "telegram_123");
+    assert.equal(result, "native-value-123");
+  });
+
+  it("returns error when key not found anywhere", async () => {
+    const result = await executeRetrieveApiKey({ key_name: "nonexistent" }, "telegram_123");
+    assert.ok(result.startsWith("Error:"));
+    assert.ok(result.includes("nonexistent"));
+  });
+});
+
+// --- migrate_api_key ---
+
+describe("migrate_api_key", () => {
+  it("migrate_api_key tool definition has correct schema", () => {
+    const tool = TOOLS.find((t) => t.function.name === "migrate_api_key");
+    assert.ok(tool, "migrate_api_key tool should exist");
+    assert.deepStrictEqual(tool.function.parameters.required, ["key_name", "direction"]);
+    assert.ok(tool.function.parameters.properties.direction.enum.includes("native-to-secure"));
+    assert.ok(tool.function.parameters.properties.direction.enum.includes("secure-to-native"));
+  });
+
+  it("rejects invalid key_name", async () => {
+    const result = await executeMigrateApiKey(
+      { key_name: "123bad", direction: "native-to-secure" },
+      "telegram_123",
+    );
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("rejects invalid direction", async () => {
+    const result = await executeMigrateApiKey(
+      { key_name: "openai", direction: "invalid" },
+      "telegram_123",
+    );
+    assert.ok(result.startsWith("Error:"));
+  });
+
+  it("rejects missing key_name", async () => {
+    const result = await executeMigrateApiKey(
+      { direction: "native-to-secure" },
+      "telegram_123",
+    );
+    assert.ok(result.startsWith("Error:"));
   });
 });

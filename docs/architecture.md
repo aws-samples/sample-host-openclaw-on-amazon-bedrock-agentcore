@@ -203,7 +203,8 @@
 |  OpenClaw Gateway (port 18789) — headless mode                        |
 |    |-- No channel connections (messages bridged via WebSocket)         |
 |    |-- Full tool profile (web, filesystem, runtime, sessions, etc.)   |
-|    |-- 2 custom skills (s3-user-files, eventbridge-cron)              |
+|    |-- 4 custom skills (s3-user-files, eventbridge-cron,              |
+|    |       clawhub-manage, api-keys)                                  |
 |                                                                       |
 |  NODE_OPTIONS: --dns-result-order=ipv4first                           |
 |                --no-network-family-autoselection                       |

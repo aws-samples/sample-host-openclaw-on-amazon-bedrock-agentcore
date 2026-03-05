@@ -595,3 +595,75 @@ describe("buildOpenClawEnv", () => {
     assert.equal(env.SUBAGENT_BEDROCK_MODEL_ID, "global.anthropic.claude-sonnet-4-6-v1");
   });
 });
+
+// --- Secrets Manager session policy ---
+
+describe("buildSessionPolicy Secrets Manager", () => {
+  let buildSessionPolicy;
+
+  beforeEach(() => {
+    ({ buildSessionPolicy } = require("./scoped-credentials"));
+  });
+
+  it("includes SecretsManagerUserSecrets statement when region and account provided", () => {
+    const policy = buildSessionPolicy({
+      bucket: "openclaw-user-files-123-us-west-2",
+      namespace: "telegram_12345",
+      cmkArn: "arn:aws:kms:us-west-2:123:key/abc-123",
+      region: "us-west-2",
+      account: "123456789012",
+    });
+
+    const parsed = JSON.parse(policy);
+    const smStmt = parsed.Statement.find((s) => s.Sid === "SecretsManagerUserSecrets");
+    assert.ok(smStmt, "SecretsManagerUserSecrets statement should exist");
+    assert.equal(
+      smStmt.Resource,
+      "arn:aws:secretsmanager:us-west-2:123456789012:secret:openclaw/user/telegram_12345/*",
+    );
+    assert.ok(smStmt.Action.includes("secretsmanager:GetSecretValue"));
+    assert.ok(smStmt.Action.includes("secretsmanager:CreateSecret"));
+    assert.ok(smStmt.Action.includes("secretsmanager:DeleteSecret"));
+  });
+
+  it("includes SecretsManagerListUserSecrets statement", () => {
+    const policy = buildSessionPolicy({
+      bucket: "openclaw-user-files-123-us-west-2",
+      namespace: "telegram_12345",
+      region: "us-west-2",
+      account: "123456789012",
+    });
+
+    const parsed = JSON.parse(policy);
+    const listStmt = parsed.Statement.find((s) => s.Sid === "SecretsManagerListUserSecrets");
+    assert.ok(listStmt, "SecretsManagerListUserSecrets statement should exist");
+    assert.equal(listStmt.Action, "secretsmanager:ListSecrets");
+    assert.equal(listStmt.Resource, "*");
+  });
+
+  it("omits Secrets Manager statements when region/account not provided", () => {
+    const policy = buildSessionPolicy({
+      bucket: "openclaw-user-files-123-us-west-2",
+      namespace: "telegram_12345",
+    });
+
+    const parsed = JSON.parse(policy);
+    const smStmt = parsed.Statement.find((s) => s.Sid === "SecretsManagerUserSecrets");
+    assert.equal(smStmt, undefined, "SecretsManagerUserSecrets should not exist without region/account");
+  });
+
+  it("scopes secret resource to correct namespace", () => {
+    const policy = buildSessionPolicy({
+      bucket: "test-bucket",
+      namespace: "slack_abc-def",
+      region: "ap-southeast-2",
+      account: "999888777666",
+    });
+
+    const parsed = JSON.parse(policy);
+    const smStmt = parsed.Statement.find((s) => s.Sid === "SecretsManagerUserSecrets");
+    assert.ok(smStmt.Resource.includes("slack_abc-def"));
+    assert.ok(smStmt.Resource.includes("ap-southeast-2"));
+    assert.ok(smStmt.Resource.includes("999888777666"));
+  });
+});

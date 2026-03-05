@@ -108,7 +108,7 @@ Each component has tightly scoped permissions:
 | Router Lambda | Secrets Manager access limited to `openclaw/*` prefix |
 | AgentCore Container | S3 access scoped to user's namespace prefix via STS session policy |
 | AgentCore Container | Bedrock invoke scoped to specific model/inference profile |
-| AgentCore Container | Secrets Manager access limited to gateway-token and cognito-password-secret only |
+| AgentCore Container | Secrets Manager: system secrets (gateway-token, cognito-password-secret) via execution role; per-user API keys (`openclaw/user/{namespace}/*`) via STS-scoped credentials |
 | AgentCore Container | CloudWatch PutMetricData restricted to OpenClaw/* namespaces only |
 | AgentCore Container | CloudWatch Logs restricted to /openclaw/* log group prefix |
 | AgentCore Container | DynamoDB scoped to user's own records via STS session policy |

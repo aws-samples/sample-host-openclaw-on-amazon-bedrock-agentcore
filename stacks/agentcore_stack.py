@@ -118,6 +118,31 @@ class AgentCoreStack(Stack):
                 ],
             )
         )
+        # Secrets Manager — per-user API key storage (manage_secret tool).
+        # Session policy further restricts to openclaw/user/{namespace}/* per user.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "secretsmanager:GetSecretValue",
+                    "secretsmanager:PutSecretValue",
+                    "secretsmanager:CreateSecret",
+                    "secretsmanager:DeleteSecret",
+                    "secretsmanager:DescribeSecret",
+                    "secretsmanager:TagResource",
+                ],
+                resources=[
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/user/*",
+                ],
+            )
+        )
+        # ListSecrets does not support resource-level restrictions (AWS API limitation).
+        # Results filtered by prefix in application code (executeManageSecret).
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["secretsmanager:ListSecrets"],
+                resources=["*"],
+            )
+        )
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["kms:Decrypt"],
@@ -375,6 +400,8 @@ class AgentCoreStack(Stack):
                         # EventBridge cron scheduling (added by CronStack)
                         f"Resource::arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*",
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/openclaw-identity/index/*",
+                        # Per-user API key storage in Secrets Manager (manage_secret tool)
+                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/user/*",
                     ],
                 ),
             ],

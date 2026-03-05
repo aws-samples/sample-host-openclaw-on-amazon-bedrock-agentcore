@@ -117,6 +117,10 @@ RUN chmod +x /skills/eventbridge-cron/*.js
 COPY skills/clawhub-manage /skills/clawhub-manage
 RUN chmod +x /skills/clawhub-manage/*.js
 
+# Copy API key management skill (dual-mode: native file + Secrets Manager)
+COPY skills/api-keys /skills/api-keys
+RUN chmod +x /skills/api-keys/*.js
+
 # Copy project instructions (CLAUDE.md) so the agent knows about its skills
 COPY CLAUDE.md /app/CLAUDE.md
 

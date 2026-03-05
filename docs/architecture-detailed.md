@@ -170,7 +170,7 @@ flowchart TB
         CONTRACT -->|"full mode<br/>(OpenClaw ready)"| OPENCLAW
 
         subgraph ShimBox["Warm-up Phase (~5s – ~2-4min)"]
-            SHIM["<b>Lightweight Agent</b><br/>Agentic loop (20 iters)<br/>13 tools · SSRF protection<br/>Appends warm-up footer"]
+            SHIM["<b>Lightweight Agent</b><br/>Agentic loop (20 iters)<br/>17 tools · SSRF protection<br/>Appends warm-up footer"]
         end
 
         subgraph FullBox["Full Mode (~2-4min onward)"]
@@ -267,7 +267,7 @@ The lightweight agent (`bridge/lightweight-agent.js`) provides immediate respons
 |---|---|
 | **Routing** | Calls proxy at `127.0.0.1:18790/v1/chat/completions` (OpenAI format, non-streaming) |
 | **Agentic loop** | Up to 20 iterations of tool-call → tool-result → assistant-response |
-| **Tools (13)** | `read_user_file`, `write_user_file`, `list_user_files`, `delete_user_file`, `create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`, `install_skill`, `uninstall_skill`, `list_skills`, `web_fetch`, `web_search` |
+| **Tools (17)** | `read_user_file`, `write_user_file`, `list_user_files`, `delete_user_file`, `create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`, `install_skill`, `uninstall_skill`, `list_skills`, `manage_api_key`, `manage_secret`, `retrieve_api_key`, `migrate_api_key`, `web_fetch`, `web_search` |
 | **File/cron tools** | Execute skill scripts via `execFile` with isolated env vars |
 | **Web tools** | In-process HTTP(S) with SSRF prevention (blocked IPs, DNS rebinding mitigation, redirect validation) |
 | **SSRF protection** | Pre-connection hostname blocklist + post-DNS-resolution IP validation covering loopback, RFC-1918, RFC-6598, link-local (AWS IMDS), IPv6 ULA, IPv4-mapped IPv6 |

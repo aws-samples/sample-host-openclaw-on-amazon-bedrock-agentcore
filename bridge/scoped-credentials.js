@@ -58,7 +58,7 @@ const FORWARDED_ENV_KEYS = [
  * @param {string} [opts.scheduleGroupArn] - EventBridge schedule group ARN (scopes scheduler access)
  * @returns {string} JSON policy document
  */
-function buildSessionPolicy({ bucket, namespace, actorId, cmkArn, eventbridgeRoleArn, identityTableArn, scheduleGroupArn }) {
+function buildSessionPolicy({ bucket, namespace, actorId, cmkArn, eventbridgeRoleArn, identityTableArn, scheduleGroupArn, region, account }) {
   if (!namespace || !VALID_NAMESPACE.test(namespace)) {
     throw new Error(
       `Invalid namespace "${namespace}" — must match ${VALID_NAMESPACE}`,
@@ -155,6 +155,28 @@ function buildSessionPolicy({ bucket, namespace, actorId, cmkArn, eventbridgeRol
           },
         } : {}),
       },
+      // Secrets Manager — per-user secrets namespace (manage_secret tool)
+      ...(region && account ? [{
+        Sid: "SecretsManagerUserSecrets",
+        Effect: "Allow",
+        Action: [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:CreateSecret",
+          "secretsmanager:DeleteSecret",
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:TagResource",
+        ],
+        Resource: `arn:aws:secretsmanager:${region}:${account}:secret:openclaw/user/${namespace}/*`,
+      },
+      {
+        Sid: "SecretsManagerListUserSecrets",
+        Effect: "Allow",
+        Action: "secretsmanager:ListSecrets",
+        // ListSecrets does not support resource-level restrictions (AWS API limitation).
+        // Results are filtered by prefix in executeManageSecret() application code.
+        Resource: "*",
+      }] : []),
       // PassRole scoped to EventBridge scheduler role (prevents privilege escalation)
       ...(eventbridgeRoleArn ? [{
         Sid: "IAMPassRole",
@@ -211,7 +233,7 @@ async function createScopedCredentials(namespace, opts = {}) {
 
   const sessionPolicy = buildSessionPolicy({
     bucket, namespace, actorId, cmkArn, eventbridgeRoleArn,
-    identityTableArn, scheduleGroupArn,
+    identityTableArn, scheduleGroupArn, region, account,
   });
 
   const commandInput = {

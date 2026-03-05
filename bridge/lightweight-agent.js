@@ -10,6 +10,8 @@
  * Supports s3-user-files and eventbridge-cron tools via child_process.
  */
 
+const fs = require("fs");
+const path = require("path");
 const http = require("http");
 const https = require("https");
 const { execFile, spawn } = require("child_process");
@@ -40,6 +42,9 @@ const SYSTEM_PROMPT =
   "Always ask for timezone if not known.\n\n" +
   "When users ask to install or add a skill, use install_skill. " +
   "Do NOT say exec or shell commands are blocked — use the skill management tools instead.\n\n" +
+  "For API key storage, offer two options: manage_api_key (native file-based, simpler) " +
+  "or manage_secret (AWS Secrets Manager, more secure). Recommend manage_secret for " +
+  "production keys. Use retrieve_api_key to look up keys from either backend.\n\n" +
   "After full startup completes (~2-4 minutes), you gain additional capabilities: " +
   "deep research (multi-step analysis), YouTube transcripts, rich Telegram formatting, " +
   "task decomposition with sub-agents, and enhanced web reading via Jina.";
@@ -274,6 +279,112 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "manage_api_key",
+      description:
+        "Manage API keys in the user's local workspace (native file-based storage). " +
+        "Keys are stored in the workspace and persist across sessions via S3 sync. " +
+        "The file is KMS-encrypted at rest in S3 and isolated to your namespace. " +
+        "For stronger security (audit trail, rotation), use manage_secret instead.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["set", "get", "list", "delete"],
+            description: "The operation to perform",
+          },
+          key_name: {
+            type: "string",
+            description:
+              "Name for the API key (e.g. 'openai', 'jina', 'github'). Required for set/get/delete.",
+          },
+          key_value: {
+            type: "string",
+            description: "The API key value. Required for 'set' action.",
+          },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_secret",
+      description:
+        "Manage API keys securely via AWS Secrets Manager. Keys are KMS-encrypted, " +
+        "auditable via CloudTrail, and NOT stored in workspace files. " +
+        "Use this for stronger security than native file-based storage (manage_api_key).",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["set", "get", "list", "delete"],
+            description: "The operation to perform",
+          },
+          key_name: {
+            type: "string",
+            description:
+              "Name for the secret (e.g. 'openai', 'jina', 'github'). Required for set/get/delete.",
+          },
+          key_value: {
+            type: "string",
+            description: "The secret value. Required for 'set' action.",
+          },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "retrieve_api_key",
+      description:
+        "Retrieve an API key by name. Checks Secrets Manager first (secure mode), " +
+        "then falls back to native file storage. Use this when a skill or workflow needs an API key " +
+        "without knowing which backend the user chose.",
+      parameters: {
+        type: "object",
+        properties: {
+          key_name: {
+            type: "string",
+            description: "Name of the API key to retrieve (e.g. 'openai', 'jina')",
+          },
+        },
+        required: ["key_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "migrate_api_key",
+      description:
+        "Migrate an API key between storage backends. " +
+        "Use 'native-to-secure' to move from file storage to Secrets Manager, " +
+        "or 'secure-to-native' for the reverse. The key is deleted from the source after successful copy.",
+      parameters: {
+        type: "object",
+        properties: {
+          key_name: {
+            type: "string",
+            description: "Name of the API key to migrate",
+          },
+          direction: {
+            type: "string",
+            enum: ["native-to-secure", "secure-to-native"],
+            description: "Migration direction",
+          },
+        },
+        required: ["key_name", "direction"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "web_fetch",
       description:
         "Fetch a web page and return its content as plain text. " +
@@ -346,6 +457,10 @@ const SCRIPT_MAP = {
   install_skill: "/skills/clawhub-manage/install.js",
   uninstall_skill: "/skills/clawhub-manage/uninstall.js",
   list_skills: "/skills/clawhub-manage/list.js",
+  manage_api_key: null, // In-process tool — native file-based API key store
+  manage_secret: null, // In-process tool — AWS Secrets Manager backend
+  retrieve_api_key: null, // In-process tool — unified retrieval (SM first, then native)
+  migrate_api_key: null, // In-process tool — move keys between backends
   web_fetch: null, // In-process tool — no child process script
   web_search: null, // In-process tool — no child process script
 };
@@ -820,13 +935,343 @@ function buildToolArgs(toolName, args, userId) {
   }
 }
 
+// --- Native API key storage (file-based, .openclaw/user-api-keys.json) ---
+
+const API_KEYS_FILENAME = "user-api-keys.json";
+const VALID_KEY_NAME = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
+
+/**
+ * Get the path to the native API key store file.
+ */
+function getApiKeysPath() {
+  const home = process.env.HOME || "/root";
+  return path.join(home, ".openclaw", API_KEYS_FILENAME);
+}
+
+/**
+ * Read the native API key store. Returns empty object if file doesn't exist.
+ */
+function readApiKeys() {
+  const filePath = getApiKeysPath();
+  try {
+    const data = fs.readFileSync(filePath, "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Write the native API key store atomically.
+ */
+function writeApiKeys(keys) {
+  const filePath = getApiKeysPath();
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = filePath + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(keys, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, filePath);
+}
+
+/**
+ * Execute the manage_api_key tool (native file-based storage).
+ */
+function executeManageApiKey(args) {
+  const { action, key_name, key_value } = args;
+
+  if (action === "list") {
+    const keys = readApiKeys();
+    const names = Object.keys(keys);
+    if (names.length === 0) return "No API keys stored (native mode).";
+    return "Stored API keys (native mode):\n" + names.map((n) => `- ${n}`).join("\n");
+  }
+
+  if (!key_name || !VALID_KEY_NAME.test(key_name)) {
+    return "Error: key_name is required and must be alphanumeric (a-z, 0-9, _, -), starting with a letter, max 64 chars.";
+  }
+
+  if (action === "set") {
+    if (!key_value) return "Error: key_value is required for 'set' action.";
+    const keys = readApiKeys();
+    const isNew = !(key_name in keys);
+    keys[key_name] = key_value;
+    writeApiKeys(keys);
+    return isNew
+      ? `API key '${key_name}' saved (native mode). This key is stored in your workspace file and synced to S3 (KMS-encrypted at rest).`
+      : `API key '${key_name}' updated (native mode).`;
+  }
+
+  if (action === "get") {
+    const keys = readApiKeys();
+    if (!(key_name in keys)) return `Error: No API key found with name '${key_name}'.`;
+    return keys[key_name];
+  }
+
+  if (action === "delete") {
+    const keys = readApiKeys();
+    if (!(key_name in keys)) return `Error: No API key found with name '${key_name}'.`;
+    delete keys[key_name];
+    writeApiKeys(keys);
+    return `API key '${key_name}' deleted (native mode).`;
+  }
+
+  return "Error: Invalid action. Use 'set', 'get', 'list', or 'delete'.";
+}
+
+// --- Secrets Manager backend (manage_secret tool) ---
+
+// Lazy-require AWS SDK (only available inside Docker image)
+let _smSdk = null;
+function getSmSdk() {
+  if (!_smSdk) {
+    _smSdk = require("@aws-sdk/client-secrets-manager");
+  }
+  return _smSdk;
+}
+
+let _smClient = null;
+function getSmClient() {
+  if (!_smClient) {
+    const { SecretsManagerClient } = getSmSdk();
+    _smClient = new SecretsManagerClient({ region: process.env.AWS_REGION });
+  }
+  return _smClient;
+}
+
+// In-memory cache for secrets during session (cleared on SIGTERM)
+const _secretsCache = new Map();
+const MAX_SECRETS_PER_USER = 10;
+const SECRET_PREFIX = "openclaw/user/";
+
+/**
+ * Build the full Secrets Manager secret name for a user key.
+ */
+function buildSecretName(namespace, keyName) {
+  return `${SECRET_PREFIX}${namespace}/${keyName}`;
+}
+
+/**
+ * Execute the manage_secret tool (AWS Secrets Manager backend).
+ */
+async function executeManageSecret(args, namespace) {
+  const { action, key_name, key_value } = args;
+
+  // Validate inputs before touching the SDK
+  if (action !== "list" && action !== "set" && action !== "get" && action !== "delete") {
+    return "Error: Invalid action. Use 'set', 'get', 'list', or 'delete'.";
+  }
+  if (action !== "list") {
+    if (!key_name || !VALID_KEY_NAME.test(key_name)) {
+      return "Error: key_name is required and must be alphanumeric (a-z, 0-9, _, -), starting with a letter, max 64 chars.";
+    }
+    if (action === "set" && !key_value) {
+      return "Error: key_value is required for 'set' action.";
+    }
+  }
+
+  const sdk = getSmSdk();
+  const client = getSmClient();
+
+  if (action === "list") {
+    try {
+      const prefix = `${SECRET_PREFIX}${namespace}/`;
+      const resp = await client.send(new sdk.ListSecretsCommand({
+        Filters: [{ Key: "name", Values: [prefix] }],
+        MaxResults: 100,
+      }));
+      const secrets = (resp.SecretList || []).map((s) =>
+        s.Name.slice(prefix.length),
+      );
+      if (secrets.length === 0) return "No secrets stored (Secrets Manager).";
+      return "Stored secrets (Secrets Manager):\n" + secrets.map((n) => `- ${n}`).join("\n");
+    } catch (err) {
+      return `Error listing secrets: ${err.message}`;
+    }
+  }
+
+  const secretName = buildSecretName(namespace, key_name);
+
+  if (action === "set") {
+    try {
+      // Try to update existing secret first
+      await client.send(new sdk.PutSecretValueCommand({
+        SecretId: secretName,
+        SecretString: key_value,
+      }));
+      _secretsCache.set(secretName, key_value);
+      return `Secret '${key_name}' updated (Secrets Manager, KMS-encrypted).`;
+    } catch (err) {
+      if (err.name === "ResourceNotFoundException") {
+        // Check max secrets limit before creating
+        try {
+          const prefix = `${SECRET_PREFIX}${namespace}/`;
+          const listResp = await client.send(new sdk.ListSecretsCommand({
+            Filters: [{ Key: "name", Values: [prefix] }],
+            MaxResults: 100,
+          }));
+          if ((listResp.SecretList || []).length >= MAX_SECRETS_PER_USER) {
+            return `Error: Maximum ${MAX_SECRETS_PER_USER} secrets per user reached. Delete an existing secret first.`;
+          }
+        } catch {
+          // Continue with create attempt — worst case it fails at service limit
+        }
+
+        // Create new secret
+        try {
+          await client.send(new sdk.CreateSecretCommand({
+            Name: secretName,
+            SecretString: key_value,
+            Tags: [
+              { Key: "openclaw:user", Value: namespace },
+              { Key: "openclaw:managed", Value: "true" },
+            ],
+          }));
+          _secretsCache.set(secretName, key_value);
+          return `Secret '${key_name}' saved (Secrets Manager, KMS-encrypted, auditable via CloudTrail).`;
+        } catch (createErr) {
+          return `Error creating secret: ${createErr.message}`;
+        }
+      }
+      return `Error updating secret: ${err.message}`;
+    }
+  }
+
+  if (action === "get") {
+    // Check cache first
+    if (_secretsCache.has(secretName)) {
+      return _secretsCache.get(secretName);
+    }
+    try {
+      const resp = await client.send(new sdk.GetSecretValueCommand({
+        SecretId: secretName,
+      }));
+      const value = resp.SecretString;
+      _secretsCache.set(secretName, value);
+      return value;
+    } catch (err) {
+      if (err.name === "ResourceNotFoundException") {
+        return `Error: No secret found with name '${key_name}'.`;
+      }
+      return `Error retrieving secret: ${err.message}`;
+    }
+  }
+
+  if (action === "delete") {
+    try {
+      await client.send(new sdk.DeleteSecretCommand({
+        SecretId: secretName,
+        // Use standard 7-day recovery window so users can recover accidentally deleted secrets.
+        // ForceDeleteWithoutRecovery: true would be irreversible.
+        RecoveryWindowInDays: 7,
+      }));
+      _secretsCache.delete(secretName);
+      return `Secret '${key_name}' scheduled for deletion (Secrets Manager, 7-day recovery window).`;
+    } catch (err) {
+      if (err.name === "ResourceNotFoundException") {
+        return `Error: No secret found with name '${key_name}'.`;
+      }
+      return `Error deleting secret: ${err.message}`;
+    }
+  }
+
+  return "Error: Invalid action. Use 'set', 'get', 'list', or 'delete'.";
+}
+
 /**
  * Execute a tool by running the corresponding skill script or in-process handler.
  * Uses execFile with array args (no shell) to prevent injection.
  * write_user_file uses stdin for content to avoid OS ARG_MAX limits.
  * web_fetch and web_search are handled in-process (no child process).
  */
+/**
+ * Retrieve an API key by name. Checks Secrets Manager first, then native file.
+ */
+async function executeRetrieveApiKey(args, namespace) {
+  const { key_name } = args;
+  if (!key_name || !VALID_KEY_NAME.test(key_name)) {
+    return "Error: key_name is required and must be alphanumeric (a-z, 0-9, _, -), starting with a letter, max 64 chars.";
+  }
+
+  // Try Secrets Manager first (secure mode)
+  try {
+    const smResult = await executeManageSecret({ action: "get", key_name }, namespace);
+    if (!smResult.startsWith("Error:")) {
+      return smResult;
+    }
+  } catch {
+    // SDK not available or SM access failed — fall through to native
+  }
+
+  // Fall back to native file storage
+  const nativeResult = executeManageApiKey({ action: "get", key_name });
+  if (!nativeResult.startsWith("Error:")) {
+    return nativeResult;
+  }
+
+  return `Error: No API key found with name '${key_name}' in either Secrets Manager or native storage.`;
+}
+
+/**
+ * Migrate an API key between storage backends.
+ */
+async function executeMigrateApiKey(args, namespace) {
+  const { key_name, direction } = args;
+  if (!key_name || !VALID_KEY_NAME.test(key_name)) {
+    return "Error: key_name is required and must be alphanumeric (a-z, 0-9, _, -), starting with a letter, max 64 chars.";
+  }
+  if (direction !== "native-to-secure" && direction !== "secure-to-native") {
+    return "Error: direction must be 'native-to-secure' or 'secure-to-native'.";
+  }
+
+  if (direction === "native-to-secure") {
+    // Read from native
+    const value = executeManageApiKey({ action: "get", key_name });
+    if (value.startsWith("Error:")) {
+      return `Error: Key '${key_name}' not found in native storage.`;
+    }
+    // Write to Secrets Manager
+    const setResult = await executeManageSecret({ action: "set", key_name, key_value: value }, namespace);
+    if (setResult.startsWith("Error:")) {
+      return setResult;
+    }
+    // Delete from native
+    executeManageApiKey({ action: "delete", key_name });
+    return `Migrated '${key_name}' from native file storage to Secrets Manager.`;
+  }
+
+  if (direction === "secure-to-native") {
+    // Read from Secrets Manager
+    const value = await executeManageSecret({ action: "get", key_name }, namespace);
+    if (value.startsWith("Error:")) {
+      return `Error: Key '${key_name}' not found in Secrets Manager.`;
+    }
+    // Write to native
+    executeManageApiKey({ action: "set", key_name, key_value: value });
+    // Delete from Secrets Manager
+    await executeManageSecret({ action: "delete", key_name }, namespace);
+    return `Migrated '${key_name}' from Secrets Manager to native file storage.`;
+  }
+
+  return "Error: Invalid migration direction.";
+}
+
 function executeTool(toolName, args, userId) {
+  // In-process native API key tool
+  if (toolName === "manage_api_key") {
+    return Promise.resolve(executeManageApiKey(args));
+  }
+  // In-process Secrets Manager tool
+  if (toolName === "manage_secret") {
+    return executeManageSecret(args, userId);
+  }
+  // Unified retrieval (SM first, then native)
+  if (toolName === "retrieve_api_key") {
+    return executeRetrieveApiKey(args, userId);
+  }
+  // Migration between backends
+  if (toolName === "migrate_api_key") {
+    return executeMigrateApiKey(args, userId);
+  }
   // In-process web tools (no child process spawn)
   if (toolName === "web_fetch") {
     return executeWebFetch(args.url);
@@ -1016,4 +1461,15 @@ module.exports = {
   parseSearchResults,
   executeWebFetch,
   executeWebSearch,
+  executeManageApiKey,
+  readApiKeys,
+  writeApiKeys,
+  getApiKeysPath,
+  VALID_KEY_NAME,
+  executeManageSecret,
+  buildSecretName,
+  _secretsCache,
+  MAX_SECRETS_PER_USER,
+  executeRetrieveApiKey,
+  executeMigrateApiKey,
 };

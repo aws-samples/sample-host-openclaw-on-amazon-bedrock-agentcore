@@ -30,6 +30,7 @@ export CDK_DEFAULT_REGION=ap-southeast-2
 | `pytest tests/e2e/bot_test.py -v -k full_startup` | Wait for full OpenClaw + timing |
 | `pytest tests/e2e/bot_test.py -v -k subagent` | Sub-agent skill verification |
 | `pytest tests/e2e/bot_test.py -v -k ScopedCredentials` | Scoped S3 credentials (file ops) |
+| `pytest tests/e2e/bot_test.py -v -k TestApiKeyManagement` | API key storage (native + Secrets Manager) |
 | `pytest tests/e2e/bot_test.py -v -k conversation` | Multi-turn conversation tests |
 | `pytest tests/e2e/bot_test.py -v` | All E2E tests |
 | `pytest -m "not e2e"` | Skip E2E tests in fast CI |
@@ -45,6 +46,7 @@ export CDK_DEFAULT_REGION=ap-southeast-2
 | `python -m tests.e2e.bot_test --conversation multi_turn --tail-logs` | Multi-turn test |
 | `python -m tests.e2e.bot_test --subagent --tail-logs` | Sub-agent skill test |
 | `python -m tests.e2e.bot_test --scoped-creds --tail-logs` | Scoped credentials test |
+| `python -m tests.e2e.bot_test --api-keys --tail-logs` | API key management test (native + SM) |
 
 ## Startup Phases and Timing
 
@@ -126,6 +128,35 @@ cdk.json: subagent_model_id → agentcore_stack.py: SUBAGENT_BEDROCK_MODEL_ID en
 
 **Subagent verification**: The proxy detects subagent requests by the distinct model name (`bedrock-agentcore-subagent`), increments `subagentRequestCount`, and exposes it via `/health` and the contract `status` endpoint. E2E tests assert this count increases after skill invocations.
 
+### API key management verification (TestApiKeyManagement)
+
+Tests the dual-mode API key storage system during warm-up mode (lightweight agent). These tools are available immediately on cold start — no need to wait for full OpenClaw startup.
+
+```bash
+# Run API key tests only
+pytest tests/e2e/bot_test.py -v -k TestApiKeyManagement
+
+# Ad-hoc CLI testing
+python -m tests.e2e.bot_test --api-keys --tail-logs
+```
+
+**Tools tested:**
+| Tool | Backend | Purpose |
+|------|---------|---------|
+| `manage_api_key` | Native file (`.openclaw/user-api-keys.json`) | Set/get/list/delete API keys |
+| `manage_secret` | AWS Secrets Manager (`openclaw/user/{ns}/{key}`) | Set/get/list/delete secrets |
+| `retrieve_api_key` | Both (SM first, native fallback) | Unified key lookup |
+| `migrate_api_key` | Both | Move keys between backends |
+
+**What the tests verify:**
+1. `manage_api_key` set → get roundtrip (native file storage works)
+2. `manage_secret` set → retrieve (Secrets Manager CRUD works through scoped credentials)
+3. `retrieve_api_key` unified lookup (checks SM first, falls back to native)
+4. List operations for both backends
+5. Cleanup: delete from both backends
+
+**Test resets session** to force warm-up mode, since API key tools are lightweight agent tools (not OpenClaw skills).
+
 ## How It Works
 
 ### Architecture
@@ -173,6 +204,7 @@ The `AgentCore response body` line contains JSON: `{"response": "full text..."}`
 | `TestWarmupShim` | Warm-up footer present on cold start | ✓ | ✓ |
 | `TestFullStartup` | Full OpenClaw ready + phase timing | ✓ | ✓ |
 | `TestSubagent` | Sub-agent skill verification | | |
+| `TestApiKeyManagement` | API key storage (native + SM) | ✓ | |
 | `TestScopedCredentials` | S3 file ops via scoped STS creds | | |
 | `TestConversation` | Multi-turn scenarios | | |
 
@@ -337,6 +369,9 @@ This means diagnostic messages like `[contract] OpenClaw ready`, `[contract] Ope
 | Sub-agent test: short response | Skill didn't invoke sub-agents, or model answered directly | Check `openclaw.json` has correct `subagents` config; verify skill is loaded (`ls /skills/`) |
 | Sub-agent test: warm-up response | OpenClaw not fully started | Test waits 10 min max; check container logs for startup errors |
 | Sub-agent test: timeout | Sub-agent processing exceeded Lambda timeout | Check `router_lambda_timeout_seconds` (default 300s); sub-agent tasks may need longer |
+| API key test: manage_secret fails | Scoped STS credentials missing SM permissions | Check `agentcore_stack.py` has `secretsmanager:*` on `openclaw/user/*`; verify `EXECUTION_ROLE_ARN` env var is set |
+| API key test: key value not in response | Model didn't use the tool or redacted the value | Check prompt is explicit about tool name and action; verify tool is in TOOLS array |
+| API key test: "scheduled for deletion" instead of "deleted" | Expected — SM uses 7-day recovery window | Test accepts "scheduled" as a valid confirmation word |
 
 ### Docker Container Diagnostics
 

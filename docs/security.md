@@ -96,6 +96,7 @@ On container init, the contract server calls `STS:AssumeRole` on the execution r
 |---|---|
 | S3 objects | `arn:aws:s3:::{bucket}/{namespace}/*` only |
 | S3 list | Prefix condition: `{namespace}/*` and `{namespace}` |
+| Secrets Manager | `openclaw/user/{namespace}/*` — per-user API key storage, max 10 secrets |
 | DynamoDB | `ForAllValues:StringLike` on `dynamodb:LeadingKeys`: `USER#{actorId}` and `CHANNEL#{actorId}` only |
 | EventBridge | Schedule group: `openclaw-cron/*` |
 | IAM PassRole | Only the EventBridge scheduler role |
@@ -151,7 +152,7 @@ The proxy process (`agentcore-proxy.js`) is trusted code and retains full execut
 
 ### 3.6 Secrets Management
 
-Seven secrets are stored in AWS Secrets Manager, all encrypted with the project KMS CMK:
+Seven system secrets are stored in AWS Secrets Manager, all encrypted with the project KMS CMK:
 
 | Secret | Purpose |
 |---|---|
@@ -162,6 +163,8 @@ Seven secrets are stored in AWS Secrets Manager, all encrypted with the project 
 | `openclaw/channels/slack` | Slack bot token + signing secret (JSON) |
 | `openclaw/channels/discord` | Discord bot token (placeholder) |
 | `openclaw/channels/whatsapp` | WhatsApp bot token (placeholder) |
+
+**Per-user API key storage**: Users can also store their own API keys (e.g., OpenAI, Jina) in Secrets Manager via the `api-keys` skill. These are stored at `openclaw/user/{namespace}/{key_name}`, scoped by STS session policy so each user can only access their own keys. Max 10 secrets per user. The agent proactively detects API key patterns (e.g., `sk-...`, `ghp_...`) and offers to store them securely.
 
 **Rotation and caching**:
 - Secrets Manager values cached for 15 minutes in Lambda (rotated secrets reflected within 15 min)

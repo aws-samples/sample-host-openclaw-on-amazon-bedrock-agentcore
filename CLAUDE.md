@@ -13,7 +13,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
 - **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
-- **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 3 custom skills (S3 user files, EventBridge cron, ClawHub manage) + 2 built-in shim tools (web_fetch, web_search)
+- **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 4 custom skills (S3 user files, EventBridge cron, ClawHub manage, API keys) + 2 built-in shim tools (web_fetch, web_search)
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **Workspace Persistence**: .openclaw/ directory synced to/from S3 per user
@@ -21,6 +21,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Identity**: DynamoDB identity table (channel→user mapping, cross-channel binding) + Cognito User Pool
 - **Observability**: CloudWatch dashboards + alarms, Bedrock invocation logging
 - **Token Monitoring**: Lambda + DynamoDB (single-table) + CloudWatch custom metrics
+- **API Key Management**: Dual-mode storage — native file-based (S3-synced) or AWS Secrets Manager (KMS-encrypted, CloudTrail-auditable) via `api-keys` skill
 - **Security**: VPC endpoints, KMS CMK, Secrets Manager, cdk-nag
 
 ## Architecture
@@ -53,7 +54,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
   |   -> handoff: once OpenClaw ready, route via WebSocket bridge
   |   -> SIGTERM: save .openclaw/ to S3
   |                       |
-  | lightweight-agent.js  -- warm-up shim (proxy -> Bedrock, 13 tools: s3-user-files, eventbridge-cron, clawhub-manage, web_fetch, web_search)
+  | lightweight-agent.js  -- warm-up shim (proxy -> Bedrock, 17 tools: s3-user-files, eventbridge-cron, clawhub-manage, api-keys, web_fetch, web_search)
   | agentcore-proxy.js    (18790) -- OpenAI -> Bedrock ConverseStream
   | OpenClaw Gateway      (18789) -- headless, no channels
   +-----------+-----------+
@@ -112,15 +113,15 @@ openclaw-on-agentcore/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
-    lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron + clawhub-manage tools)
-    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 73 tests)
+    lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron + clawhub-manage + api-keys tools)
+    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 110 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     content-extraction.test.js    # Content block extraction tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
-    scoped-credentials.js         # Per-user STS session-scoped S3 credentials
-    scoped-credentials.test.js    # Scoped credentials unit tests (node:test, 38 tests)
-    workspace-sync.test.js        # Workspace sync credential tests (node:test, 7 tests)
+    scoped-credentials.js         # Per-user STS session-scoped credentials (S3, Secrets Manager, DynamoDB)
+    scoped-credentials.test.js    # Scoped credentials unit tests (node:test)
+    workspace-sync.test.js        # Workspace sync credential tests (node:test)
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
     skills/
       s3-user-files/              # Custom per-user file storage skill (S3-backed)
@@ -138,6 +139,12 @@ openclaw-on-agentcore/
         common.js                 # Skill name validation
         install.js / uninstall.js # Install/uninstall ClawHub skills
         list.js                   # List installed skills
+      api-keys/                   # Dual-mode API key management (native + Secrets Manager)
+        SKILL.md                  # OpenClaw skill manifest
+        common.js                 # Shared validation (userId, keyName)
+        native.js / secret.js    # Native file CRUD / Secrets Manager CRUD
+        retrieve.js              # Unified lookup (SM first, native fallback)
+        migrate.js               # Move keys between backends
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py               # Webhook router (Telegram + Slack, image uploads)
@@ -327,14 +334,14 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
 3. **On first `/invocations` with `action: chat` or `action: warmup`** (lazy init):
    - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
-   - Create STS scoped credentials restricting S3 to user's namespace prefix
+   - Create STS scoped credentials restricting S3 + Secrets Manager + DynamoDB to user's namespace
    - Configure workspace-sync with scoped credentials
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
    - Start OpenClaw gateway (port 18789) with scoped credentials env (no container credentials)
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
    - Start credential refresh timer (45 min interval)
    - Wait for proxy only (~5s)
-4. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, clawhub-manage, web_fetch, web_search tools)
+4. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, clawhub-manage, api-keys, web_fetch, web_search tools)
 5. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
 6. **After handoff**: Full OpenClaw features — `web_fetch`, `web_search` (built-in), 5 ClawHub skills (Jina reader, deep-research-pro, etc.), sub-agent support, session management
 7. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
@@ -501,8 +508,8 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Namespace immutability**: System-determined from channel identity, cannot be changed by user request
 - **actorId vs namespace**: actorId uses colon format (`telegram:123456789`), namespace uses underscore format (`telegram_123456789`). Skill scripts (s3-user-files, eventbridge-cron) expect namespace format. The lightweight agent's `chat()` converts via `userId.replace(/:/g, "_")` before passing to tools. The proxy and workspace sync also use namespace format for S3 keys
 
-### Per-User S3 Credential Isolation
-- **STS session-scoped credentials**: On init, the contract server calls `STS:AssumeRole` on the execution role with a session policy that restricts S3 access to `{namespace}/*` only. This prevents cross-user data access even through OpenClaw's bash tool
+### Per-User Credential Isolation
+- **STS session-scoped credentials**: On init, the contract server calls `STS:AssumeRole` on the execution role with a session policy that restricts S3 access to `{namespace}/*`, Secrets Manager to `openclaw/user/{namespace}/*`, and DynamoDB to `USER#{actorId}` / `CHANNEL#{actorId}` prefixes only. This prevents cross-user data access even through OpenClaw's bash tool
 - **Credential files**: Scoped credentials written to `/tmp/scoped-creds/` in `credential_process` format. OpenClaw uses `AWS_CONFIG_FILE` + `AWS_SDK_LOAD_CONFIG=1` to pick them up
 - **OpenClaw env isolation**: OpenClaw spawned with explicit env that excludes `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, and `AWS_CONTAINER_CREDENTIALS_FULL_URI`
 - **Credential refresh**: 45-minute interval timer re-assumes the role and updates credential files (STS self-assume max duration is 1 hour)

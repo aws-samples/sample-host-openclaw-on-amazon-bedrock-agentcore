@@ -67,6 +67,21 @@ You have the **clawhub-manage** skill to install, uninstall, and list ClawHub co
 
 After install/uninstall, the new skill will be available on the next session start (after idle timeout or new conversation).
 
+## API Key Storage
+
+You have the **api-keys** skill for secure API key management with two backends:
+
+- **Native (file-based)**: `node /skills/api-keys/native.js <user_id> <action> [key_name] [key_value]`
+- **Secure (Secrets Manager)**: `node /skills/api-keys/secret.js <user_id> <action> [key_name] [key_value]`
+- **Unified retrieval**: `node /skills/api-keys/retrieve.js <user_id> <key_name>` (checks SM first, falls back to native)
+- **Migration**: `node /skills/api-keys/migrate.js <user_id> <key_name> <direction>` (native-to-secure or secure-to-native)
+
+Actions: `set`, `get`, `list`, `delete`. Default to **Secure** (Secrets Manager) unless the user prefers native.
+
+### Proactive Detection
+
+If a user's message contains what looks like an API key or secret — even without asking to save it — proactively offer to store it. Look for patterns like `sk-...`, `ghp_...`, `xoxb-...`, `AKIA...`, or any long token the user labels as a key/secret. Default to Secrets Manager and infer the key name from context.
+
 ## Sub-agents
 
 Skills like `deep-research-pro` and `task-decomposer` can spawn sub-agents for parallel work. Sub-agents use a distinct model name (`bedrock-agentcore-subagent`) routed via `SUBAGENT_BEDROCK_MODEL_ID` env var (defaults to main model). The proxy detects and counts subagent requests separately. Sandbox is disabled — AgentCore microVMs provide per-user isolation.
