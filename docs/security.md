@@ -97,7 +97,7 @@ On container init, the contract server calls `STS:AssumeRole` on the execution r
 | S3 objects | `arn:aws:s3:::{bucket}/{namespace}/*` only |
 | S3 list | Prefix condition: `{namespace}/*` and `{namespace}` |
 | Secrets Manager | `openclaw/user/{namespace}/*` — per-user API key storage, max 10 secrets |
-| DynamoDB | `ForAllValues:StringLike` on `dynamodb:LeadingKeys`: `USER#{actorId}` and `CHANNEL#{actorId}` only |
+| DynamoDB | `ForAllValues:StringLike` on `dynamodb:LeadingKeys`: `USER#{actorId}`, `CHANNEL#{actorId}`, and `USER#{internalUserId}` (for CRON# and SESSION records stored under the internal user ID) |
 | EventBridge | Schedule group: `openclaw-cron/*` |
 | IAM PassRole | Only the EventBridge scheduler role |
 | KMS | `kms:Decrypt`, `kms:GenerateDataKey`, `kms:GenerateDataKeyWithoutPlaintext` on project CMK only (when set) |
@@ -164,7 +164,25 @@ Seven system secrets are stored in AWS Secrets Manager, all encrypted with the p
 | `openclaw/channels/discord` | Discord bot token (placeholder) |
 | `openclaw/channels/whatsapp` | WhatsApp bot token (placeholder) |
 
-**Per-user API key storage**: Users can also store their own API keys (e.g., OpenAI, Jina) in Secrets Manager via the `api-keys` skill. These are stored at `openclaw/user/{namespace}/{key_name}`, scoped by STS session policy so each user can only access their own keys. Max 10 secrets per user. The agent proactively detects API key patterns (e.g., `sk-...`, `ghp_...`) and offers to store them securely.
+#### Per-User API Key Storage (Secrets Manager)
+
+Users frequently need to store third-party API keys for skills and integrations. Rather than relying on **insecure plaintext `.env` files** (no encryption, no audit trail, readable by any process), the `api-keys` skill stores user secrets in **AWS Secrets Manager**:
+
+| Property | Detail |
+|---|---|
+| **Path** | `openclaw/user/{namespace}/{key_name}` |
+| **Encryption** | KMS CMK (customer-managed, auto-rotating) |
+| **Isolation** | STS session-scoped credentials — each user can only access `openclaw/user/{their_namespace}/*` |
+| **Audit** | Every access logged in CloudTrail |
+| **Limits** | Max 10 secrets per user; alphanumeric key names, max 64 chars |
+| **Proactive** | Agent detects key patterns (`sk-...`, `ghp_...`, `AKIA...`, `xoxb-...`) in messages and offers to store securely |
+| **Migration** | Built-in `migrate` tool moves keys from native file → Secrets Manager (or reverse) |
+| **Fallback** | Native file backend (`.openclaw/user-api-keys.json`, S3-synced with KMS encryption) available for quick prototyping |
+
+**Why Secrets Manager over `.env` files:**
+- `.env` files are plaintext on disk — readable by any process, no access auditing, easily leaked via git commits or shell history
+- Secrets Manager provides KMS encryption at rest, per-access CloudTrail logging, and IAM-scoped access control
+- The `read` tool is denied in the tool deny list, but `.env` files could still be read via other means — Secrets Manager access is enforced at the IAM layer regardless of tool configuration
 
 **Rotation and caching**:
 - Secrets Manager values cached for 15 minutes in Lambda (rotated secrets reflected within 15 min)
@@ -455,3 +473,9 @@ aws ecr describe-image-scan-findings \
   --query 'imageScanFindings.findingSeverityCounts' \
   --region $CDK_DEFAULT_REGION
 ```
+
+---
+
+## 8. Reporting Security Issues
+
+See [CONTRIBUTING.md](../CONTRIBUTING.md#security-issue-notifications) for information on reporting security vulnerabilities.

@@ -81,7 +81,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
-See [SECURITY.md](SECURITY.md) for the complete security architecture.
+See [docs/security.md](docs/security.md) for the complete security architecture.
 
 ## Prerequisites
 
@@ -260,6 +260,7 @@ openclaw-on-agentcore/
       s3-user-files/              # Custom per-user file storage skill (S3-backed)
       eventbridge-cron/           # Cron scheduling skill (EventBridge Scheduler)
       clawhub-manage/             # ClawHub skill installer (install/uninstall/list)
+      api-keys/                   # Dual-mode API key management (native file + Secrets Manager)
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py                    # Webhook router (Telegram + Slack, image uploads)
@@ -422,7 +423,7 @@ Each user gets their own AgentCore microVM. When a user sends a message:
    - Restores `.openclaw/` workspace from S3 (background)
    - Starts credential refresh timer (45 min interval)
    - Waits for proxy only (~5s), then the **lightweight agent** handles the message immediately
-3. **Lightweight agent** (warm-up phase, ~5s to ~2-4min) runs an agentic loop with 13 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), EventBridge cron scheduling (create/list/update/delete), and ClawHub skill management (install/uninstall/list). Web tools include SSRF prevention (IP blocklists, DNS rebinding mitigation). All responses include a deterministic warm-up footer
+3. **Lightweight agent** (warm-up phase, ~5s to ~2-4min) runs an agentic loop with 17 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), EventBridge cron scheduling (create/list/update/delete), ClawHub skill management (install/uninstall/list), and API key management (native CRUD, Secrets Manager CRUD, unified retrieval, migration). Web tools include SSRF prevention (IP blocklists, DNS rebinding mitigation). All responses include a deterministic warm-up footer
 4. **WebSocket bridge** (after OpenClaw ready, ~2-4min) takes over — messages route to OpenClaw which provides full tool profile, 5 ClawHub skills, and sub-agent support. Responses no longer have the warm-up footer
 5. **Router Lambda** sends the response back to the channel (Telegram/Slack API). While waiting, it sends typing indicators (Telegram) and a one-time progress message after 30s (both channels) for long-running requests
 
@@ -514,6 +515,37 @@ The bot will ask for your **timezone** (e.g., `Australia/Sydney`, `America/New_Y
 
 Each user's schedules are isolated — no cross-user access. Schedule metadata is stored in the DynamoDB identity table alongside user profiles and session data.
 
+### API Key Management
+
+The agent includes a built-in `api-keys` skill for securely storing and retrieving API keys (e.g., OpenAI, Jina, YouTube). This replaces the common but **insecure** practice of storing secrets in plaintext `.env` files or pasting them into chat messages.
+
+> **Why not `.env` files?** Plaintext `.env` files on disk are readable by any process, visible in shell history, easily committed to git, and have no audit trail. The `api-keys` skill stores secrets in **AWS Secrets Manager** — KMS-encrypted, per-user isolated, and auditable via CloudTrail.
+
+**Two storage backends:**
+
+| Backend | Storage | Encryption | Audit Trail | Best For |
+|---|---|---|---|---|
+| **Secrets Manager** (recommended) | `openclaw/user/{namespace}/{key_name}` | KMS CMK | CloudTrail | Production API keys, tokens with compliance requirements |
+| **Native file** | `.openclaw/user-api-keys.json` (S3-synced) | S3 SSE-KMS | S3 access logs | Quick prototyping, less sensitive keys |
+
+**Just ask the bot in natural language:**
+
+| What you say | What happens |
+|---|---|
+| "Store my OpenAI key: sk-abc123" | Saves to Secrets Manager (default) |
+| "What API keys do I have?" | Lists keys from both backends |
+| "Get my YouTube API key" | Retrieves from SM first, falls back to native |
+| "Move my key to Secrets Manager" | Migrates from native → SM |
+| "Delete my old API key" | Removes from the appropriate backend |
+
+The agent also **proactively detects API keys** — if you paste something that looks like a key (e.g., `sk-...`, `ghp_...`, `AKIA...`), it offers to store it securely without you having to ask.
+
+**Security controls:**
+- Per-user isolation via STS session-scoped credentials (each user can only access `openclaw/user/{their_namespace}/*`)
+- Max 10 secrets per user in Secrets Manager
+- Key names validated (alphanumeric, max 64 chars)
+- Available immediately during warm-up phase — no need to wait for full OpenClaw startup
+
 ### Container Startup Sequence
 
 1. **entrypoint.sh**: Configure Node.js IPv4 DNS patch, start contract server
@@ -550,6 +582,7 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 | `eventbridge-cron` | Cron scheduling via EventBridge Scheduler — create, update, and delete recurring tasks |
 | `s3-user-files` | Per-user file storage (S3-backed) — read, write, list, and delete files |
 | `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills |
+| `api-keys` | Secure API key management — dual-mode storage with native file-based or AWS Secrets Manager backend (see [API Key Management](#api-key-management)) |
 
 Five ClawHub community skills are pre-installed at Docker build time:
 
@@ -561,7 +594,7 @@ Five ClawHub community skills are pre-installed at Docker build time:
 | `transcript` | YouTube video transcript extraction |
 | `task-decomposer` | Break complex requests into subtasks (spawns sub-agents) |
 
-During the warm-up phase (~first 2-4 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files`, `eventbridge-cron`, and `clawhub-manage` skills. Users can install, uninstall, and list ClawHub skills even during warm-up. Installed skills become available after the next session start. ClawHub skills become available after OpenClaw fully starts.
+During the warm-up phase (~first 2-4 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files`, `eventbridge-cron`, `clawhub-manage`, and `api-keys` skills. Users can manage files, schedules, skills, and API keys even during warm-up. ClawHub skills become available after OpenClaw fully starts.
 
 ### Webhook Security
 
@@ -642,6 +675,8 @@ pytest tests/e2e/bot_test.py -v -k full_startup          # full OpenClaw startup
 pytest tests/e2e/bot_test.py -v -k ScopedCredentials     # S3 file write/read/delete via scoped creds
 pytest tests/e2e/bot_test.py -v -k conversation          # multi-turn + rapid-fire
 pytest tests/e2e/bot_test.py -v -k SkillManagement       # clawhub skill install/uninstall/list
+pytest tests/e2e/bot_test.py -v -k ApiKeyManagement      # API key storage (native + Secrets Manager)
+pytest tests/e2e/bot_test.py -v -k CronSchedule          # cron lifecycle + CRON# DynamoDB record check
 pytest tests/e2e/bot_test.py -v                          # all E2E tests
 ```
 
@@ -737,7 +772,7 @@ Note: KMS keys and the Cognito User Pool have `RETAIN` removal policies and will
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for the detailed security architecture, and [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications) for reporting security issues.
+See [docs/security.md](docs/security.md) for the complete security architecture (threat model, defense-in-depth layers, operations runbook), [SECURITY.md](SECURITY.md) for reporting vulnerabilities, and [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications) for contribution guidelines.
 
 ## License
 

@@ -219,6 +219,13 @@ flowchart LR
         LSK["list_skills"]
     end
 
+    subgraph ApiKeyTools["Child Process (execFile)"]
+        MAK["manage_api_key<br/><i>Native file CRUD</i>"]
+        MS["manage_secret<br/><i>Secrets Manager CRUD</i>"]
+        RAK["retrieve_api_key<br/><i>SM first, native fallback</i>"]
+        MIG["migrate_api_key<br/><i>Between backends</i>"]
+    end
+
     subgraph SSRF["SSRF Prevention"]
         BL["Hostname blocklist<br/><i>localhost, metadata, IMDS</i>"]
         DNS["Post-DNS IP check<br/><i>loopback, RFC-1918,<br/>RFC-6598, link-local,<br/>IPv6 ULA, IPv4-mapped</i>"]
@@ -229,6 +236,7 @@ flowchart LR
     FileTools -->|"/skills/s3-user-files/*.js"| S3[("S3")]
     CronTools -->|"/skills/eventbridge-cron/*.js"| EB["EventBridge<br/>Scheduler"]
     SkillTools -->|"/skills/clawhub-manage/*.js"| DISK["Filesystem<br/>(clawhub CLI)"]
+    ApiKeyTools -->|"/skills/api-keys/*.js"| SM["Secrets Manager<br/>+ S3 (native)"]
 ```
 
 ### Two-Phase Startup
@@ -267,7 +275,7 @@ The lightweight agent (`bridge/lightweight-agent.js`) provides immediate respons
 |---|---|
 | **Routing** | Calls proxy at `127.0.0.1:18790/v1/chat/completions` (OpenAI format, non-streaming) |
 | **Agentic loop** | Up to 20 iterations of tool-call → tool-result → assistant-response |
-| **Tools (17)** | `read_user_file`, `write_user_file`, `list_user_files`, `delete_user_file`, `create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`, `install_skill`, `uninstall_skill`, `list_skills`, `manage_api_key`, `manage_secret`, `retrieve_api_key`, `migrate_api_key`, `web_fetch`, `web_search` |
+| **Tools (17)** | `read_user_file`, `write_user_file`, `list_user_files`, `delete_user_file`, `create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`, `install_skill`, `uninstall_skill`, `list_skills`, `manage_api_key` (native file), `manage_secret` (Secrets Manager), `retrieve_api_key` (unified lookup), `migrate_api_key` (between backends), `web_fetch`, `web_search` |
 | **File/cron tools** | Execute skill scripts via `execFile` with isolated env vars |
 | **Web tools** | In-process HTTP(S) with SSRF prevention (blocked IPs, DNS rebinding mitigation, redirect validation) |
 | **SSRF protection** | Pre-connection hostname blocklist + post-DNS-resolution IP validation covering loopback, RFC-1918, RFC-6598, link-local (AWS IMDS), IPv6 ULA, IPv4-mapped IPv6 |
@@ -311,7 +319,7 @@ s3://openclaw-user-files-{account}-{region}/
 
 ## Security Architecture
 
-See [SECURITY.md](../SECURITY.md) for comprehensive security documentation.
+See [security.md](security.md) for the complete security architecture.
 
 **Key controls:**
 - VPC isolation with 7 VPC endpoints
