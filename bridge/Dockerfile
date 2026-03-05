@@ -11,18 +11,24 @@ RUN apt-get update && \
 # Install AWS CLI (for Secrets Manager in entrypoint)
 RUN pip3 install --no-cache-dir --break-system-packages awscli
 
-# Install OpenClaw and ClawHub CLI globally
-RUN npm install -g openclaw@latest clawhub@latest
+# Install OpenClaw globally
+RUN npm install -g openclaw@latest
 
-# Install ClawHub community skills (5 high-value marketplace skills)
-# Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
-# hackernews (niche), news-feed (niche) to reduce startup time.
-# --no-input --force: non-interactive, skip VirusTotal warnings
-RUN clawhub install jina-reader --no-input --force && \
-    clawhub install deep-research-pro --no-input --force && \
-    clawhub install telegram-compose --no-input --force && \
-    clawhub install transcript --no-input --force && \
-    clawhub install task-decomposer --no-input --force
+# NOTE: ClawHub skills installation disabled due to rate limit issues during build
+# Users can install skills post-deployment inside the running container:
+#   clawhub install jina-reader
+#   clawhub install deep-research-pro
+#   clawhub install telegram-compose
+#   clawhub install transcript
+#   clawhub install task-decomposer
+#
+# Alternative: Pre-install specific skills in a custom layer/image
+# RUN npm install -g clawhub@latest
+# RUN clawhub install jina-reader --no-input --force && \
+#     clawhub install deep-research-pro --no-input --force && \
+#     clawhub install telegram-compose --no-input --force && \
+#     clawhub install transcript --no-input --force && \
+#     clawhub install task-decomposer --no-input --force
 
 # Create app directory
 RUN mkdir -p /app
@@ -73,15 +79,15 @@ COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/lib/python3.*/dist-packages /usr/local/lib/python3.11/dist-packages
 COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-packages
 
-# Copy OpenClaw and ClawHub from builder (global npm modules + binaries)
+# Copy OpenClaw from builder (global npm modules + binaries)
 COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
 # Re-create symlinks instead of COPY (which resolves symlinks and breaks
 # relative imports like ./dist/entry.js in the openclaw ESM binary)
-RUN ln -s /usr/local/lib/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw && \
-    ln -s /usr/local/lib/node_modules/clawhub/bin/clawdhub.js /usr/local/bin/clawhub
+RUN ln -s /usr/local/lib/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw
 
-# Copy ClawHub installed skills (clawhub installs to /skills/ in builder)
-COPY --from=builder /skills/ /skills/
+# Copy ClawHub installed skills (disabled - no pre-installed skills)
+# If you enable skill pre-installation in builder stage, uncomment:
+# COPY --from=builder /skills/ /skills/
 
 # Copy app directory (node_modules, compile cache)
 COPY --from=builder /app/node_modules /app/node_modules
