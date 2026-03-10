@@ -636,17 +636,23 @@ def _extract_screenshots(text: str) -> tuple:
     return clean, keys
 
 
-def _fetch_s3_image(s3_key: str):
-    """Fetch image bytes from S3. Returns None on error."""
+def _fetch_s3_image(s3_key: str, namespace: str):
+    """Fetch image bytes from S3. Returns None on error or invalid key."""
+    # Validate: reject path traversal
+    if ".." in s3_key:
+        logger.error("Rejected S3 screenshot key with path traversal: %s", s3_key)
+        return None
+    # Validate: key must be within user namespace _screenshots/ prefix
+    expected_prefix = f"{namespace}/_screenshots/"
+    if not s3_key.startswith(expected_prefix):
+        logger.error("Rejected S3 screenshot key outside user namespace: %s (expected prefix: %s)", s3_key, expected_prefix)
+        return None
     try:
-        bucket = os.environ.get("S3_USER_FILES_BUCKET", "")
-        if not bucket:
-            logger.error("S3_USER_FILES_BUCKET not set — cannot fetch screenshot")
-            return None
+        bucket = os.environ["S3_USER_FILES_BUCKET"]
         resp = s3_client.get_object(Bucket=bucket, Key=s3_key)
         return resp["Body"].read()
     except Exception as e:
-        logger.error("Failed to fetch screenshot from S3: %s: %s", s3_key, e)
+        logger.error("Failed to fetch screenshot from S3 key %s: %s", s3_key, e)
         return None
 
 
@@ -1123,9 +1129,10 @@ def handle_telegram(body):
     logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
 
     # Extract and deliver screenshot images before sending text
+    namespace = actor_id.replace(":", "_")
     response_text, screenshot_keys = _extract_screenshots(response_text)
     for s3_key in screenshot_keys:
-        img_bytes = _fetch_s3_image(s3_key)
+        img_bytes = _fetch_s3_image(s3_key, namespace)
         if img_bytes:
             _send_telegram_photo(chat_id, img_bytes, None, token)
         else:
@@ -1265,9 +1272,10 @@ def handle_slack(body, headers=None):
     response_text = _extract_text_from_content_blocks(response_text)
 
     # Extract and deliver screenshot images before sending text
+    namespace = actor_id.replace(":", "_")
     response_text, screenshot_keys = _extract_screenshots(response_text)
     for s3_key in screenshot_keys:
-        img_bytes = _fetch_s3_image(s3_key)
+        img_bytes = _fetch_s3_image(s3_key, namespace)
         if img_bytes:
             _send_slack_file(channel_id, img_bytes, bot_token)
         else:

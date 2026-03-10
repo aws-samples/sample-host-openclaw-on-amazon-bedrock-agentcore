@@ -549,9 +549,9 @@ async function stopBrowserSessions() {
       browserIdentifier,
       sessionId: currentBrowserSessionId,
     }));
-    console.log(`[browser] Stopped session for ${currentUserId}`);
+    console.log(`[browser] Stopped session for user (sessionId: ${currentBrowserSessionId})`);
   } catch (err) {
-    console.error(`[browser] Stop failed for ${currentUserId}:`, err.message);
+    console.error(`[browser] Stop failed (sessionId: ${currentBrowserSessionId}):`, err.message);
   }
 }
 

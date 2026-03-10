@@ -98,7 +98,7 @@ class TestExtractScreenshots(unittest.TestCase):
 
 
 class TestFetchS3Image(unittest.TestCase):
-    """Tests for _fetch_s3_image() S3 retrieval."""
+    """Tests for _fetch_s3_image() S3 retrieval with namespace validation."""
 
     @patch("index.s3_client")
     def test_returns_bytes_on_success(self, mock_s3):
@@ -106,15 +106,15 @@ class TestFetchS3Image(unittest.TestCase):
         body_mock.read.return_value = b"fake-png-data"
         mock_s3.get_object.return_value = {"Body": body_mock}
         with patch.dict(os.environ, {"S3_USER_FILES_BUCKET": "test-bucket"}):
-            result = _fetch_s3_image("ns/screenshot.png")
+            result = _fetch_s3_image("ns/_screenshots/screenshot.png", namespace="ns")
         self.assertEqual(result, b"fake-png-data")
-        mock_s3.get_object.assert_called_once_with(Bucket="test-bucket", Key="ns/screenshot.png")
+        mock_s3.get_object.assert_called_once_with(Bucket="test-bucket", Key="ns/_screenshots/screenshot.png")
 
     @patch("index.s3_client")
     def test_returns_none_on_s3_error(self, mock_s3):
         mock_s3.get_object.side_effect = Exception("NoSuchKey")
         with patch.dict(os.environ, {"S3_USER_FILES_BUCKET": "test-bucket"}):
-            result = _fetch_s3_image("missing/key.png")
+            result = _fetch_s3_image("ns/_screenshots/missing.png", namespace="ns")
         self.assertIsNone(result)
 
     @patch("index.s3_client")
@@ -123,8 +123,23 @@ class TestFetchS3Image(unittest.TestCase):
         body_mock.read.return_value = b"data"
         mock_s3.get_object.return_value = {"Body": body_mock}
         with patch.dict(os.environ, {"S3_USER_FILES_BUCKET": "custom-bucket"}):
-            _fetch_s3_image("key.png")
-        mock_s3.get_object.assert_called_once_with(Bucket="custom-bucket", Key="key.png")
+            _fetch_s3_image("ns/_screenshots/key.png", namespace="ns")
+        mock_s3.get_object.assert_called_once_with(Bucket="custom-bucket", Key="ns/_screenshots/key.png")
+
+    def test_rejects_path_traversal(self):
+        result = _fetch_s3_image("../../etc/passwd", namespace="telegram_123456")
+        self.assertIsNone(result)
+
+    def test_rejects_cross_namespace(self):
+        result = _fetch_s3_image("other_user/_screenshots/shot.png", namespace="telegram_123456")
+        self.assertIsNone(result)
+
+    @patch("index.s3_client")
+    def test_accepts_valid_namespace_key(self, mock_s3):
+        mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: b"data")}
+        with patch.dict(os.environ, {"S3_USER_FILES_BUCKET": "bucket"}):
+            result = _fetch_s3_image("telegram_123456/_screenshots/screenshot_123.png", namespace="telegram_123456")
+        self.assertEqual(result, b"data")
 
 
 class TestSendTelegramPhoto(unittest.TestCase):

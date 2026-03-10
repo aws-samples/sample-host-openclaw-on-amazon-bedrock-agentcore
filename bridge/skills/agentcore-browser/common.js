@@ -45,6 +45,9 @@ async function connectBrowser() {
 
 async function uploadScreenshotToS3(imageBuffer) {
   const bucket = process.env.S3_USER_FILES_BUCKET;
+  if (!bucket) {
+    throw new Error("S3_USER_FILES_BUCKET environment variable is not set — cannot upload screenshot");
+  }
   const userId = process.env.USER_ID || "default-user";
   const namespace = userId.replace(/:/g, "_");
   const timestamp = Date.now();

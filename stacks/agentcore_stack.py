@@ -23,7 +23,7 @@ import cdk_nag
 from constructs import Construct
 
 # Regions where AgentCore Browser (CfnBrowserCustom) is confirmed available.
-BROWSER_SUPPORTED_REGIONS = {"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"}
+BROWSER_SUPPORTED_REGIONS = {"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "ap-southeast-2"}
 
 
 class AgentCoreStack(Stack):
@@ -360,8 +360,7 @@ class AgentCoreStack(Stack):
         self.runtime_endpoint.add_dependency(self.runtime)
 
         # --- AgentCore Browser (optional) -------------------------------------
-        enable_browser_raw = self.node.try_get_context("enable_browser")
-        enable_browser = enable_browser_raw in (True, "true", "True")
+        enable_browser = str(self.node.try_get_context("enable_browser") or "false").lower() == "true"
         self.browser = None
         if enable_browser:
             if region not in BROWSER_SUPPORTED_REGIONS:
