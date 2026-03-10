@@ -1506,8 +1506,11 @@ def handle_slack(body, headers=None):
         return {"statusCode": 200, "body": "ok"}
 
     event = event_data.get("event", {})
-    # Allow "file_share" subtype (image uploads) in addition to plain messages
-    if event.get("type") != "message" or event.get("subtype") not in (None, "file_share"):
+    event_type = event.get("type")
+    # Allow "message" (DM), "file_share" subtype (image uploads), and "app_mention" (channel @mentions)
+    if event_type == "app_mention":
+        pass  # app_mention events are always processed
+    elif event_type != "message" or event.get("subtype") not in (None, "file_share"):
         return {"statusCode": 200, "body": "ok"}
 
     text = event.get("text", "")
