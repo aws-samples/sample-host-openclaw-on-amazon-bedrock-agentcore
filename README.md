@@ -305,7 +305,7 @@ All tunable parameters are in `cdk.json`:
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
 | `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
-| `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
+| `default_model_id` | `minimax.minimax-m2.1` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
 | `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Set to e.g. `global.anthropic.claude-sonnet-4-6-v1` for faster/cheaper sub-agents |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Daily token budget alarm threshold |
@@ -323,6 +323,7 @@ All tunable parameters are in `cdk.json`:
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
+| `enable_browser` | `false` | Enable headless Chromium browser inside the container. Requires `BROWSER_IDENTIFIER` env var |
 
 ## Channel Setup
 
@@ -548,6 +549,32 @@ The agent also **proactively detects API keys** — if you paste something that 
 - Key names validated (alphanumeric, max 64 chars)
 - Available immediately during warm-up phase — no need to wait for full OpenClaw startup
 
+### Browser Support (Optional)
+
+The agent can browse the web using a headless Chromium browser running inside the AgentCore container. This is **opt-in** — disabled by default.
+
+**Enable it:** Set `enable_browser` to `true` in `cdk.json` and ensure `BROWSER_IDENTIFIER` is configured in the AgentCore environment. The contract server creates a browser session on init, and the `agentcore-browser` skill scripts communicate with it via a session file.
+
+**What you can do:**
+
+| What you say | What happens |
+|---|---|
+| "Open https://example.com" | Navigates to the URL and returns page content |
+| "Take a screenshot of this page" | Captures a PNG screenshot, delivered as a photo in chat |
+| "Click the Sign In button" | Interacts with page elements (click, type, scroll) |
+
+**Three skill tools:**
+
+| Tool | Purpose |
+|---|---|
+| `browser_navigate` | Navigate to a URL, return page title and text content |
+| `browser_screenshot` | Capture a PNG screenshot, uploaded to S3 with `[SCREENSHOT:]` marker for channel delivery |
+| `browser_interact` | Click, type, scroll, or wait on page elements by CSS selector |
+
+Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as photos to Telegram/Slack via the router's screenshot marker detection.
+
+> **Note:** Browser support requires full OpenClaw startup — it is not available during the warm-up phase. The browser session has a 1-hour timeout and is recreated automatically if needed.
+
 ### Container Startup Sequence
 
 1. **entrypoint.sh**: Configure Node.js IPv4 DNS patch, start contract server
@@ -585,6 +612,7 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 | `s3-user-files` | Per-user file storage (S3-backed) — read, write, list, and delete files |
 | `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills |
 | `api-keys` | Secure API key management — dual-mode storage with native file-based or AWS Secrets Manager backend (see [API Key Management](#api-key-management)) |
+| `agentcore-browser` | Headless Chromium browser — navigate, screenshot, interact with web pages (optional, see [Browser Support](#browser-support-optional)) |
 
 Five ClawHub community skills are pre-installed at Docker build time:
 
@@ -729,7 +757,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 ### 502 / Bedrock authorization errors
 
 - **Model access not enabled**: Enable model access in the Bedrock console for your region.
-- **Cross-region inference**: The default model ID `global.anthropic.claude-opus-4-6-v1` uses a global cross-region inference profile that routes to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions.
+- **Cross-region inference**: The default model ID `minimax.minimax-m2.1` uses a global cross-region inference profile that routes to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions.
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
 

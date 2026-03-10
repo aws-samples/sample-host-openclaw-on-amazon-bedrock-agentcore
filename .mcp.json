@@ -1,0 +1,36 @@
+{
+  "mcpServers": {
+    "bedrock-agentcore": {
+      "command": "/home/ec2-user/.local/bin/uvx",
+      "args": [
+        "awslabs.amazon-bedrock-agentcore-mcp-server@latest"
+      ],
+      "env": {
+        "LOG_LEVEL": "ERROR"
+      },
+      "disabled": true
+    },
+    "aws-api": {
+      "command": "/home/ec2-user/.local/bin/uvx",
+      "args": [
+        "awslabs.aws-api-mcp-server@latest",
+        "--region", "ap-southeast-2"
+      ],
+      "env": {
+        "LOG_LEVEL": "ERROR"
+      },
+      "disabled": true
+    },
+    "aws-iac": {
+      "command": "/home/ec2-user/.local/bin/uvx",
+      "args": [
+        "awslabs.aws-iac-mcp-server@latest",
+        "--region", "ap-southeast-2"
+      ],
+      "env": {
+        "LOG_LEVEL": "ERROR"
+      },
+      "disabled": true
+    }
+  }
+}

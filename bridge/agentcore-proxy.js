@@ -17,7 +17,7 @@ if (!AWS_REGION) {
   process.exit(1);
 }
 const MODEL_ID =
-  process.env.BEDROCK_MODEL_ID || "global.anthropic.claude-opus-4-6-v1";
+  process.env.BEDROCK_MODEL_ID || "minimax.minimax-m2.1";
 
 // Subagent model routing — distinct model name lets proxy detect subagent requests
 const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcore-subagent";

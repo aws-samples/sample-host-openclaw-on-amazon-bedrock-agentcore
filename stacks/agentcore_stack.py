@@ -273,7 +273,7 @@ class AgentCoreStack(Stack):
         )
 
         # --- Default Bedrock model ID -----------------------------------------
-        default_model_id = self.node.try_get_context("default_model_id") or "global.anthropic.claude-opus-4-6-v1"
+        default_model_id = self.node.try_get_context("default_model_id") or "minimax.minimax-m2.1"
         subagent_model_id = self.node.try_get_context("subagent_model_id") or ""
         image_version = str(self.node.try_get_context("image_version") or "1")
 

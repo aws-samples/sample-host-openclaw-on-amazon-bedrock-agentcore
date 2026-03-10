@@ -3,7 +3,7 @@
   "context": {
     "account": "",
     "region": "ap-southeast-2",
-    "default_model_id": "global.anthropic.claude-opus-4-6-v1",
+    "default_model_id": "minimax.minimax-m2.1",
     "subagent_model_id": "",
     "cloudwatch_log_retention_days": 30,
     "daily_token_budget": 1000000,

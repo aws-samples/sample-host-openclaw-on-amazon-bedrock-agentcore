@@ -45,6 +45,7 @@ MODEL_PRICING = {
     "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3.00, "output": 15.00},
     "anthropic.claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "anthropic.claude-opus-4-6": {"input": 15.00, "output": 75.00},
+    "minimax.minimax-m2": {"input": 1.00, "output": 5.00},
 }
 
 # Default pricing when model is unknown
