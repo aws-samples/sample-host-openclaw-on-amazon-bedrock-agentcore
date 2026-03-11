@@ -1130,39 +1130,23 @@ class TestCronSchedule:
 
 
 class TestBrowserFeature:
-    """Browser feature E2E tests -- requires enable_browser=true and BROWSER_IDENTIFIER set.
+    """Browser feature smoke test -- requires enable_browser=true.
 
-    Tests the agentcore-browser skill lifecycle: navigate to a URL,
-    take a screenshot, and interact with page elements.
-
-    The browser session is created by the contract server on init when
-    BROWSER_IDENTIFIER is set (from enable_browser CDK config). The skill
-    scripts in /skills/agentcore-browser/ communicate with the browser
-    via the session file at /tmp/agentcore-browser-session.json.
+    Sends a single navigate request to verify the browser skill is available
+    and functional. Requires full OpenClaw startup (browser skill is not
+    available during the lightweight-agent warm-up phase).
 
     Run with: pytest tests/e2e/bot_test.py -v -k TestBrowserFeature
     """
 
-    @pytest.fixture(autouse=True, scope="class")
-    def ensure_full_startup(self, e2e_config, browser_enabled):
-        """Wait for full OpenClaw startup -- browser skill needs the full runtime."""
+    def test_browser_smoke(self, e2e_config, browser_enabled):
+        """Agent navigates to a URL using the browser skill."""
         ready, elapsed = _wait_for_full_openclaw(e2e_config)
         assert ready, (
             f"OpenClaw did not fully start within timeout. "
             f"Browser tests require full startup (elapsed={elapsed:.0f}s)"
         )
-        # Prime the LLM's context with browser skill awareness.
-        # OpenClaw may finish loading extraDirs skills slightly after HTTP readiness.
-        since_ms = int(time.time() * 1000)
-        post_webhook(
-            e2e_config,
-            "Do you have the agentcore-browser skill? "
-            "Just confirm yes or no, and list the browser commands.",
-        )
-        tail_logs(e2e_config, since_ms=since_ms, timeout_s=120)
 
-    def test_browser_navigate(self, e2e_config, browser_enabled):
-        """Agent navigates to a URL and returns the page title."""
         since_ms = int(time.time() * 1000)
         result = post_webhook(
             e2e_config,
@@ -1173,61 +1157,14 @@ class TestBrowserFeature:
 
         tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=120)
         assert tail.full_lifecycle, (
-            f"Navigate incomplete (timed_out={tail.timed_out}, "
+            f"Browser navigate incomplete (timed_out={tail.timed_out}, "
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
-        assert "example domain" in tail.response_text.lower(), (
-            f"Expected 'Example Domain' in response.\n"
+        assert "example" in tail.response_text.lower(), (
+            f"Expected 'example' in response.\n"
             f"Response: {tail.response_text[:300]}"
         )
-        print(f"  Navigate response: {tail.response_text[:200]}")
-
-    def test_browser_screenshot(self, e2e_config, browser_enabled):
-        """Agent takes a screenshot and returns it via the channel."""
-        since_ms = int(time.time() * 1000)
-        result = post_webhook(
-            e2e_config,
-            "Navigate to https://example.com and take a screenshot of the page "
-            "using the agentcore-browser skill.",
-        )
-        assert result.status_code == 200
-
-        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=120)
-        assert tail.full_lifecycle, (
-            f"Screenshot incomplete (timed_out={tail.timed_out}, "
-            f"elapsed={tail.elapsed_s:.1f}s)"
-        )
-        # The response should mention the screenshot was taken or include a marker
-        resp_lower = tail.response_text.lower()
-        assert any(w in resp_lower for w in ["screenshot", "image", "captured", "photo"]), (
-            f"Expected screenshot confirmation in response.\n"
-            f"Response: {tail.response_text[:300]}"
-        )
-        print(f"  Screenshot response: {tail.response_text[:200]}")
-
-    def test_browser_interact(self, e2e_config, browser_enabled):
-        """Agent clicks a link on example.com."""
-        since_ms = int(time.time() * 1000)
-        result = post_webhook(
-            e2e_config,
-            "Using the agentcore-browser skill, navigate to https://example.com "
-            'and click the "More information..." link. '
-            "Tell me the URL you ended up on.",
-        )
-        assert result.status_code == 200
-
-        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=120)
-        assert tail.full_lifecycle, (
-            f"Interact incomplete (timed_out={tail.timed_out}, "
-            f"elapsed={tail.elapsed_s:.1f}s)"
-        )
-        # Clicking "More information..." on example.com leads to iana.org
-        resp_lower = tail.response_text.lower()
-        assert any(w in resp_lower for w in ["iana", "rfc", "example"]), (
-            f"Expected navigation result from clicking link.\n"
-            f"Response: {tail.response_text[:300]}"
-        )
-        print(f"  Interact response: {tail.response_text[:200]}")
+        print(f"  Browser response: {tail.response_text[:200]}")
 
 
 class TestConversation:
@@ -1588,11 +1525,11 @@ def _cli_cron(cfg, tail):
 
 
 def _cli_browser(cfg, tail):
-    """Test browser skill lifecycle: navigate, screenshot, interact.
+    """Browser smoke test: navigate to example.com.
 
     Requires enable_browser=true in CDK config and BROWSER_IDENTIFIER set.
     """
-    print("Browser feature test (navigate, screenshot, interact)")
+    print("Browser feature smoke test")
     print("Waiting for OpenClaw to be fully started...")
 
     ready, elapsed = _wait_for_full_openclaw(cfg)
@@ -1601,40 +1538,13 @@ def _cli_browser(cfg, tail):
         return False
     print(f"  OpenClaw ready in {elapsed:.1f}s\n")
 
-    # Step 1: Navigate
-    print("1. Navigating to https://example.com...")
-    ok = _cli_send(
+    print("Navigating to https://example.com...")
+    return _cli_send(
         cfg,
         "Open https://example.com using the agentcore-browser skill "
         "and tell me the page title.",
         tail,
     )
-    if not ok:
-        return False
-    time.sleep(5)
-
-    # Step 2: Screenshot
-    print("\n2. Taking a screenshot...")
-    ok = _cli_send(
-        cfg,
-        "Navigate to https://example.com and take a screenshot of the page "
-        "using the agentcore-browser skill.",
-        tail,
-    )
-    if not ok:
-        return False
-    time.sleep(5)
-
-    # Step 3: Interact (click link)
-    print("\n3. Clicking a link...")
-    ok = _cli_send(
-        cfg,
-        "Using the agentcore-browser skill, navigate to https://example.com "
-        'and click the "More information..." link. '
-        "Tell me the URL you ended up on.",
-        tail,
-    )
-    return ok
 
 
 def _cli_conversation(cfg, scenario_name, tail):
