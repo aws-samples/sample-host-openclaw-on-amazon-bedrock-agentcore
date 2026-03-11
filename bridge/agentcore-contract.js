@@ -62,6 +62,9 @@ const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const IDENTITY_FILE = "/tmp/current-identity.json";
 const BUILD_VERSION = "v35"; // Bump in cdk.json to force container redeploy
 
+// Active task counter for HealthyBusy status (prevents idle timeout during long tasks)
+let activeTaskCount = 0;
+
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
 const OPENCLAW_LOG_LIMIT = 50;
 let openclawLogs = [];
@@ -1053,13 +1056,19 @@ function buildBridgeText(message) {
 const server = http.createServer(async (req, res) => {
   // GET /ping — AgentCore health check
   if (req.method === "GET" && req.url === "/ping") {
-    // Return Healthy (not HealthyBusy) — allows natural idle termination.
-    // Per-user sessions should terminate when idle.
+    // Return HealthyBusy when tasks are in progress to prevent idle timeout.
+    // This keeps the session alive during long-running tasks (e.g., deep research).
+    // When no tasks are active, return Healthy to allow natural idle termination.
+    const status = activeTaskCount > 0 ? "HealthyBusy" : "Healthy";
+    if (activeTaskCount > 0) {
+      console.log(`[contract] /ping -> ${status} (active tasks: ${activeTaskCount})`);
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
-        status: "Healthy",
+        status,
         time_of_last_update: Math.floor(Date.now() / 1000),
+        active_tasks: activeTaskCount,
       }),
     );
     return;
@@ -1105,6 +1114,8 @@ const server = http.createServer(async (req, res) => {
             openclawLogs: openclawLogs.slice(-20),
             totalRequestCount: proxyHealth?.total_requests ?? null,
             subagentRequestCount: proxyHealth?.subagent_requests ?? null,
+            activeTaskCount,
+            pingStatus: activeTaskCount > 0 ? "HealthyBusy" : "Healthy",
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));
@@ -1176,6 +1187,10 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
+          // Track task start
+          activeTaskCount++;
+          console.log(`[contract] Cron task started (active tasks: ${activeTaskCount})`);
+
           // Enqueue message (serialized with chat messages to prevent WebSocket races)
           let responseText;
           try {
@@ -1201,6 +1216,10 @@ const server = http.createServer(async (req, res) => {
               );
             }
           }
+
+          // Track task completion
+          activeTaskCount = Math.max(0, activeTaskCount - 1);
+          console.log(`[contract] Cron task completed (active tasks: ${activeTaskCount})`);
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
@@ -1269,6 +1288,10 @@ const server = http.createServer(async (req, res) => {
 
           const bridgeText = buildBridgeText(message);
 
+          // Track task start
+          activeTaskCount++;
+          console.log(`[contract] Chat task started (active tasks: ${activeTaskCount})`);
+
           // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
           let responseText;
           if (openclawReady) {
@@ -1312,6 +1335,10 @@ const server = http.createServer(async (req, res) => {
             // Proxy not ready yet (should be rare — init awaits proxy)
             responseText = "I'm starting up — please try again in a moment.";
           }
+
+          // Track task completion
+          activeTaskCount = Math.max(0, activeTaskCount - 1);
+          console.log(`[contract] Chat task completed (active tasks: ${activeTaskCount})`);
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
