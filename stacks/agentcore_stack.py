@@ -176,23 +176,51 @@ class AgentCoreStack(Stack):
         # Two parts required:
         #   1. IAM permission to call sts:AssumeRole (inline policy)
         #   2. Trust policy entry allowing the role to assume itself
+        #
+        # WORKAROUND for IAM circular dependency:
+        # Use self.execution_role.role_arn reference instead of pre-constructed ARN
+        # to avoid IAM validation error during role creation.
+        # The trust policy self-reference is commented out to prevent CREATE_FAILED.
+        # After deployment, manually add the trust policy statement via AWS CLI:
+        #
+        # aws iam update-assume-role-policy \
+        #   --role-name openclaw-agentcore-execution-role \
+        #   --policy-document '{
+        #     "Version": "2012-10-17",
+        #     "Statement": [
+        #       {
+        #         "Effect": "Allow",
+        #         "Principal": {"Service": ["ecs-tasks.amazonaws.com","bedrock.amazonaws.com","bedrock-agentcore.amazonaws.com"]},
+        #         "Action": "sts:AssumeRole"
+        #       },
+        #       {
+        #         "Effect": "Allow",
+        #         "Principal": {"AWS": "arn:aws:iam::<ACCOUNT>:role/openclaw-agentcore-execution-role"},
+        #         "Action": "sts:AssumeRole",
+        #         "Condition": {"StringLike": {"sts:RoleSessionName": "scoped-*"}}
+        #       }
+        #     ]
+        #   }'
+        #
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["sts:AssumeRole"],
-                resources=[execution_role_arn_str],
+                resources=[self.execution_role.role_arn],
             )
         )
-        self.execution_role.assume_role_policy.add_statements(
-            iam.PolicyStatement(
-                actions=["sts:AssumeRole"],
-                principals=[iam.ArnPrincipal(execution_role_arn_str)],
-                conditions={
-                    "StringLike": {
-                        "sts:RoleSessionName": "scoped-*"
-                    }
-                },
-            )
-        )
+        # NOTE: Trust policy self-reference commented out to avoid IAM circular dependency error
+        # See manual post-deployment step above
+        # self.execution_role.assume_role_policy.add_statements(
+        #     iam.PolicyStatement(
+        #         actions=["sts:AssumeRole"],
+        #         principals=[iam.ArnPrincipal(execution_role_arn_str)],
+        #         conditions={
+        #             "StringLike": {
+        #                 "sts:RoleSessionName": "scoped-*"
+        #             }
+        #         },
+        #     )
+        # )
 
         # CloudWatch Logs — scoped to /openclaw/ log group prefix
         self.execution_role.add_to_policy(
