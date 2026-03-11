@@ -614,9 +614,9 @@ async function initBrowserSession(userId) {
       }
     }, 4 * 60 * 1000);
 
-    console.log(`[browser] Session started for ${userId}: ${response.sessionId}`);
+    console.log("[browser] Session started for", userId, "-", response.sessionId);
   } catch (err) {
-    console.error(`[browser] Failed to start session for ${userId}:`, err.message);
+    console.error("[browser] Failed to start session for", userId, "-", err.message);
     // Non-fatal — continue without browser
   }
 }
@@ -638,9 +638,9 @@ async function stopBrowserSessions() {
       browserIdentifier,
       sessionId: currentBrowserSessionId,
     }));
-    console.log(`[browser] Stopped session for user (sessionId: ${currentBrowserSessionId})`);
+    console.log("[browser] Stopped session for user (sessionId:", currentBrowserSessionId + ")");
   } catch (err) {
-    console.error(`[browser] Stop failed (sessionId: ${currentBrowserSessionId}):`, err.message);
+    console.error("[browser] Stop failed (sessionId:", currentBrowserSessionId + ") -", err.message);
   }
 }
 
@@ -696,7 +696,7 @@ async function init(userId, actorId, channel) {
     let scopedCredsAvailable = false;
     if (process.env.EXECUTION_ROLE_ARN) {
       try {
-        console.log(`[contract] Creating scoped S3 credentials for namespace=${namespace}...`);
+        console.log("[contract] Creating scoped S3 credentials for namespace=", namespace);
         const creds = await scopedCreds.createScopedCredentials(namespace, { internalUserId: userId });
         scopedCreds.writeCredentialFiles(creds, SCOPED_CREDS_DIR);
         workspaceSync.configureCredentials(creds);
