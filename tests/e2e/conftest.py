@@ -1,5 +1,8 @@
 """pytest fixtures and configuration for E2E tests."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from .config import E2EConfig, load_config
@@ -36,6 +39,20 @@ def pytest_collection_modifyitems(config, items):
 def e2e_config() -> E2EConfig:
     """Load E2E config once per test session."""
     return load_config()
+
+
+@pytest.fixture(scope="session")
+def browser_enabled() -> bool:
+    """Check if enable_browser=true in cdk.json. Skip tests if not enabled."""
+    cdk_json = Path(__file__).resolve().parents[2] / "cdk.json"
+    enabled = False
+    if cdk_json.exists():
+        with open(cdk_json) as f:
+            ctx = json.load(f).get("context", {})
+            enabled = ctx.get("enable_browser", False)
+    if not enabled:
+        pytest.skip("Browser feature not enabled (set enable_browser=true in cdk.json)")
+    return True
 
 
 @pytest.fixture(params=list(SCENARIOS.keys()))

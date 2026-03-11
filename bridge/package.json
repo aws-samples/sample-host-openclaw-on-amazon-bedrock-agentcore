@@ -1,0 +1,19 @@
+{
+  "name": "openclaw-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenClaw AgentCore bridge container",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.0.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "@aws-sdk/client-scheduler": "^3.0.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/client-bedrock-agentcore": "^3.0.0",
+    "@aws-sdk/client-sts": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "playwright-core": "^1.50.0",
+    "ws": "^8.0.0"
+  }
+}

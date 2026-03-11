@@ -44,6 +44,8 @@ const FORWARDED_ENV_KEYS = [
   "CRON_LAMBDA_ARN",
   "EVENTBRIDGE_ROLE_ARN",
   "CRON_LEAD_TIME_MINUTES",
+  // User identity — skills like agentcore-browser read USER_ID from env
+  "USER_ID",
 ];
 
 /**

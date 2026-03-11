@@ -7,6 +7,7 @@ per user session).
 """
 
 from aws_cdk import (
+    Annotations,
     CfnOutput,
     Duration,
     Stack,
@@ -20,6 +21,9 @@ from aws_cdk import (
 )
 import cdk_nag
 from constructs import Construct
+
+# Regions where AgentCore Browser (CfnBrowserCustom) is confirmed available.
+BROWSER_SUPPORTED_REGIONS = {"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "ap-southeast-2"}
 
 
 class AgentCoreStack(Stack):
@@ -269,7 +273,7 @@ class AgentCoreStack(Stack):
         )
 
         # --- Default Bedrock model ID -----------------------------------------
-        default_model_id = self.node.try_get_context("default_model_id") or "global.anthropic.claude-opus-4-6-v1"
+        default_model_id = self.node.try_get_context("default_model_id") or "minimax.minimax-m2.1"
         subagent_model_id = self.node.try_get_context("subagent_model_id") or ""
         image_version = str(self.node.try_get_context("image_version") or "1")
 
@@ -355,6 +359,56 @@ class AgentCoreStack(Stack):
         )
         self.runtime_endpoint.add_dependency(self.runtime)
 
+        # --- AgentCore Browser (optional) -------------------------------------
+        enable_browser = str(self.node.try_get_context("enable_browser") or "false").lower() == "true"
+        self.browser = None
+        if enable_browser:
+            if region not in BROWSER_SUPPORTED_REGIONS:
+                Annotations.of(self).add_warning(
+                    f"enable_browser=true but region {region} is not in "
+                    f"BROWSER_SUPPORTED_REGIONS {BROWSER_SUPPORTED_REGIONS}. "
+                    f"Browser resource will NOT be deployed."
+                )
+            else:
+                self.browser = agentcore.CfnBrowserCustom(
+                    self,
+                    "BrowserCustom",
+                    name="openclaw_browser",
+                    network_configuration=agentcore.CfnBrowserCustom.BrowserNetworkConfigurationProperty(
+                        network_mode="VPC",
+                        vpc_config=agentcore.CfnBrowserCustom.VpcConfigProperty(
+                            subnets=private_subnet_ids,
+                            security_groups=[self.agent_sg.security_group_id],
+                        ),
+                    ),
+                    execution_role_arn=self.execution_role.role_arn,
+                    recording_config=agentcore.CfnBrowserCustom.RecordingConfigProperty(
+                        enabled=False,
+                    ),
+                    description="AgentCore Browser for OpenClaw (per-user browsing sessions)",
+                )
+
+                self.execution_role.add_to_policy(
+                    iam.PolicyStatement(
+                        actions=[
+                            "bedrock-agentcore:StartBrowserSession",
+                            "bedrock-agentcore:StopBrowserSession",
+                            "bedrock-agentcore:GetBrowserSession",
+                            "bedrock-agentcore:UpdateBrowserStream",
+                            "bedrock-agentcore:ConnectBrowserAutomationStream",
+                        ],
+                        resources=[self.browser.attr_browser_arn],
+                    )
+                )
+
+                # Inject browser identifier into Runtime environment variables.
+                # CfnRuntime.environment_variables is a map — override the property
+                # to include the new key (CDK L1 constructs expose cfn_options).
+                self.runtime.add_property_override(
+                    "EnvironmentVariables.BROWSER_IDENTIFIER",
+                    self.browser.attr_browser_id,
+                )
+
         # --- Outputs ----------------------------------------------------------
         self.runtime_id = self.runtime.attr_agent_runtime_id
         self.runtime_arn = f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{self.runtime.attr_agent_runtime_id}"
@@ -369,6 +423,13 @@ class AgentCoreStack(Stack):
             "RuntimeArn",
             value=f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{self.runtime.attr_agent_runtime_id}",
         )
+        if self.browser:
+            CfnOutput(
+                self,
+                "BrowserIdentifier",
+                value=self.browser.attr_browser_id,
+                description="AgentCore Browser identifier",
+            )
 
         # --- cdk-nag suppressions ---------------------------------------------
         cdk_nag.NagSuppressions.add_resource_suppressions(

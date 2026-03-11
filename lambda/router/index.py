@@ -64,6 +64,9 @@ _token_cache = {}  # {secret_id: (value, fetched_at)}
 
 BIND_CODE_TTL_SECONDS = 600  # 10 minutes
 
+# --- Screenshot marker detection ---
+SCREENSHOT_MARKER_RE = re.compile(r"\[SCREENSHOT:([^\]]+)\]")
+
 
 def _get_secret(secret_id):
     """Fetch a secret value, cached with a 15-minute TTL."""
@@ -617,6 +620,129 @@ def _markdown_to_telegram_html(text):
     return text
 
 
+# ---------------------------------------------------------------------------
+# Screenshot marker detection and delivery
+# ---------------------------------------------------------------------------
+
+
+def _extract_screenshots(text: str) -> tuple:
+    """Extract [SCREENSHOT:key] markers from text.
+
+    Returns (clean_text, [s3_keys]). The clean_text has all markers removed
+    and extra whitespace stripped.
+    """
+    keys = SCREENSHOT_MARKER_RE.findall(text)
+    clean = SCREENSHOT_MARKER_RE.sub("", text).strip()
+    return clean, keys
+
+
+def _fetch_s3_image(s3_key: str, namespace: str):
+    """Fetch image bytes from S3. Returns None on error or invalid key."""
+    # Validate: reject path traversal
+    if ".." in s3_key:
+        logger.error("Rejected S3 screenshot key with path traversal: %s", s3_key)
+        return None
+    # Validate: key must be within user namespace _screenshots/ prefix
+    expected_prefix = f"{namespace}/_screenshots/"
+    if not s3_key.startswith(expected_prefix):
+        logger.error("Rejected S3 screenshot key outside user namespace: %s (expected prefix: %s)", s3_key, expected_prefix)
+        return None
+    try:
+        bucket = os.environ["S3_USER_FILES_BUCKET"]
+        resp = s3_client.get_object(Bucket=bucket, Key=s3_key)
+        return resp["Body"].read()
+    except Exception as e:
+        logger.error("Failed to fetch screenshot from S3 key %s: %s", s3_key, e)
+        return None
+
+
+def _send_telegram_photo(chat_id: str, image_bytes: bytes, caption, token: str) -> bool:
+    """Send a photo to Telegram chat via multipart form data. Returns True on success."""
+    boundary = "----FormBoundary" + str(int(time.time()))
+    parts = []
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+        f"{chat_id}"
+    )
+    if caption:
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="caption"\r\n\r\n'
+            f"{caption}"
+        )
+    # Build body: text parts + binary photo part
+    text_body = "\r\n".join(parts) + "\r\n"
+    photo_header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="photo"; filename="screenshot.png"\r\n'
+        f"Content-Type: image/png\r\n\r\n"
+    )
+    closing = f"\r\n--{boundary}--\r\n"
+    body = text_body.encode() + photo_header.encode() + image_bytes + closing.encode()
+
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    req = urllib_request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        urllib_request.urlopen(req, timeout=15)
+        return True
+    except Exception as e:
+        logger.error("Failed to send Telegram photo: %s", e)
+        return False
+
+
+def _send_slack_file(channel_id: str, image_bytes: bytes, bot_token: str) -> bool:
+    """Upload a screenshot to Slack using the v2 file upload API.
+
+    Requires files:write Slack bot scope for screenshot delivery.
+    """
+    import urllib.request
+    import urllib.parse
+
+    try:
+        # Step 1: Get upload URL
+        params = urllib.parse.urlencode({"filename": "screenshot.png", "length": len(image_bytes)})
+        req = urllib.request.Request(
+            f"https://slack.com/api/files.getUploadURLExternal?{params}",
+            headers={"Authorization": f"Bearer {bot_token}"},
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        if not resp.get("ok"):
+            logger.error("Slack getUploadURLExternal failed: %s", resp.get("error"))
+            return False
+
+        upload_url = resp["upload_url"]
+        file_id = resp["file_id"]
+
+        # Step 2: Upload file bytes
+        urllib.request.urlopen(
+            urllib.request.Request(upload_url, data=image_bytes, method="POST"),
+            timeout=30,
+        )
+
+        # Step 3: Complete upload and share to channel
+        complete_data = json.dumps({
+            "files": [{"id": file_id}],
+            "channel_id": channel_id,
+        }).encode()
+        complete_req = urllib.request.Request(
+            "https://slack.com/api/files.completeUploadExternal",
+            data=complete_data,
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        complete_resp = json.loads(urllib.request.urlopen(complete_req, timeout=10).read())
+        return complete_resp.get("ok", False)
+    except Exception as e:
+        logger.error("Failed to send Slack file: %s", e)
+        return False
+
+
 def send_telegram_message(chat_id, text, token):
     """Send a message via Telegram Bot API.
 
@@ -1002,13 +1128,24 @@ def handle_telegram(body):
     response_text = _extract_text_from_content_blocks(response_text)
     logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
 
-    # Send response (split if > 4096 chars for Telegram limit)
-    if len(response_text) <= 4096:
-        send_telegram_message(chat_id, response_text, token)
-    else:
-        for i in range(0, len(response_text), 4096):
-            send_telegram_message(chat_id, response_text[i:i + 4096], token)
-    logger.info("Telegram response sent to chat_id=%s", chat_id)
+    # Extract and deliver screenshot images before sending text
+    namespace = actor_id.replace(":", "_")
+    response_text, screenshot_keys = _extract_screenshots(response_text)
+    for s3_key in screenshot_keys:
+        img_bytes = _fetch_s3_image(s3_key, namespace)
+        if img_bytes:
+            _send_telegram_photo(chat_id, img_bytes, None, token)
+        else:
+            logger.warning("Skipping undeliverable screenshot: %s", s3_key)
+
+    # Send response (split if > 4096 chars for Telegram limit); skip if empty after stripping
+    if response_text:
+        if len(response_text) <= 4096:
+            send_telegram_message(chat_id, response_text, token)
+        else:
+            for i in range(0, len(response_text), 4096):
+                send_telegram_message(chat_id, response_text[i:i + 4096], token)
+    logger.info("Telegram response sent to chat_id=%s (screenshots=%d)", chat_id, len(screenshot_keys))
 
 
 def handle_slack(body, headers=None):
@@ -1134,7 +1271,19 @@ def handle_slack(body, headers=None):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     response_text = _extract_text_from_content_blocks(response_text)
 
-    send_slack_message(channel_id, response_text, bot_token)
+    # Extract and deliver screenshot images before sending text
+    namespace = actor_id.replace(":", "_")
+    response_text, screenshot_keys = _extract_screenshots(response_text)
+    for s3_key in screenshot_keys:
+        img_bytes = _fetch_s3_image(s3_key, namespace)
+        if img_bytes:
+            _send_slack_file(channel_id, img_bytes, bot_token)
+        else:
+            logger.warning("Skipping undeliverable screenshot: %s", s3_key)
+
+    # Send text response; skip if empty after stripping markers
+    if response_text:
+        send_slack_message(channel_id, response_text, bot_token)
     return {"statusCode": 200, "body": "ok"}
 
 

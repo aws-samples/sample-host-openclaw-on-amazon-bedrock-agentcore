@@ -58,8 +58,13 @@ let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
+let browserHeaderRefreshTimer = null;
+let currentBrowserSessionId = null;
+let currentBrowserEndpoint = null;
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const IDENTITY_FILE = "/tmp/current-identity.json";
+const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
+const BROWSER_SESSION_TIMEOUT_SECONDS = 3600;
 const BUILD_VERSION = "v35"; // Bump in cdk.json to force container redeploy
 
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
@@ -327,7 +332,7 @@ function writeOpenClawConfig() {
         "edit", // Local edits are ephemeral — use S3 skill instead
         "apply_patch", // Code patching not needed for chat assistant
         "read", // Blocks local file reads — prevents reading sibling process environ; use s3-user-files
-        "browser", // No headless browser in ARM64 container
+        "browser", // Deny built-in browser tool — use agentcore-browser skill instead (via exec)
         "canvas", // No UI rendering in headless chat context
         "cron", // EventBridge handles scheduling, not OpenClaw's built-in cron
         "gateway", // Admin tool — not needed for end users
@@ -364,9 +369,10 @@ function writeOpenClawConfig() {
   console.log("[contract] OpenClaw headless config written");
 
   // Write AGENTS.md — OpenClaw loads this as workspace bootstrap instructions.
-  // Only write if not already present (workspace restore from S3 may have a user-customized version).
+  // Always overwrite to ensure instructions match the current container version
+  // (workspace restore from S3 may carry stale AGENTS.md without new features like browser).
   const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
-  if (!fs.existsSync(agentsMdPath)) {
+  {
     fs.writeFileSync(
       agentsMdPath,
       [
@@ -460,6 +466,28 @@ function writeOpenClawConfig() {
         "",
         "**Important**: The `<user_id>` is your namespace (e.g. `telegram_12345`). Never write API keys to regular user files (s3-user-files). Always use the api-keys skill.",
         "",
+        ...(process.env.BROWSER_IDENTIFIER
+          ? [
+              "## Browser (AgentCore Browser)",
+              "",
+              "You have the **agentcore-browser** skill for headless Chromium browsing. Use it when users ask to:",
+              "- Visit or navigate to a web page",
+              "- Take a screenshot of a website",
+              "- Interact with page elements (click buttons, fill forms, scroll)",
+              "",
+              "**Commands** (run via Bash):",
+              '- Navigate: `node /skills/agentcore-browser/navigate.js \'{"url": "https://example.com"}\'`',
+              '- Screenshot: `node /skills/agentcore-browser/screenshot.js \'{"description": "Page screenshot"}\'`',
+              '- Click: `node /skills/agentcore-browser/interact.js \'{"action": "click", "selector": "#btn"}\'`',
+              '- Type: `node /skills/agentcore-browser/interact.js \'{"action": "type", "selector": "#input", "text": "hello"}\'`',
+              '- Scroll: `node /skills/agentcore-browser/interact.js \'{"action": "scroll"}\'`',
+              '- Wait: `node /skills/agentcore-browser/interact.js \'{"action": "wait", "selector": ".results"}\'`',
+              "",
+              "Screenshots are uploaded to S3 and delivered as images to the user's chat.",
+              "The browser session is pre-created at startup — no setup needed.",
+              "",
+            ]
+          : []),
         "## Sub-agents",
         "",
         "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.",
@@ -491,6 +519,132 @@ async function pollOpenClawReadiness(namespace) {
 }
 
 /**
+ * Generate SigV4-signed HTTP headers for a WebSocket CDP endpoint.
+ * The browser automation stream requires IAM authentication — Playwright's
+ * connectOverCDP sends these as HTTP upgrade request headers.
+ *
+ * @param {string} wsEndpoint - WebSocket URL (wss://...)
+ * @returns {object} Signed headers (Authorization, X-Amz-Date, X-Amz-Security-Token, Host)
+ */
+async function signBrowserEndpoint(wsEndpoint) {
+  const { SignatureV4 } = require("@smithy/signature-v4");
+  const { Sha256 } = require("@aws-crypto/sha256-js");
+  const { defaultProvider } = require("@aws-sdk/credential-provider-node");
+
+  const url = new URL(wsEndpoint.replace(/^wss:/, "https:"));
+  const region = process.env.AWS_REGION || "us-east-1";
+
+  const signer = new SignatureV4({
+    service: "bedrock-agentcore",
+    region,
+    credentials: defaultProvider(),
+    sha256: Sha256,
+  });
+
+  const signed = await signer.sign({
+    method: "GET",
+    protocol: url.protocol,
+    hostname: url.hostname,
+    port: url.port ? Number(url.port) : undefined,
+    path: url.pathname + url.search,
+    headers: {
+      host: url.host,
+    },
+  });
+
+  // Return only the auth-relevant headers
+  const result = {};
+  for (const [k, v] of Object.entries(signed.headers)) {
+    if (/^(authorization|x-amz-|host)$/i.test(k) || k.startsWith("x-amz-")) {
+      result[k] = v;
+    }
+  }
+  return result;
+}
+
+/**
+ * Start an AgentCore Browser session for the given user.
+ * Non-fatal — logs and continues if browser feature is not enabled or SDK fails.
+ */
+async function initBrowserSession(userId) {
+  const browserIdentifier = process.env.BROWSER_IDENTIFIER;
+  if (!browserIdentifier) return; // Feature not enabled
+
+  // Per-user sessions use a single userId; check state vars directly
+  if (currentBrowserSessionId) return; // Already initialized
+
+  try {
+    const { BedrockAgentCoreClient, StartBrowserSessionCommand } =
+      await import("@aws-sdk/client-bedrock-agentcore");
+    const client = new BedrockAgentCoreClient({ region: process.env.AWS_REGION || "us-east-1" });
+
+    const response = await client.send(new StartBrowserSessionCommand({
+      browserIdentifier,
+      name: userId.replace(/[^a-zA-Z0-9-]/g, "-").slice(0, 64),
+      sessionTimeoutSeconds: BROWSER_SESSION_TIMEOUT_SECONDS,
+      viewportConfiguration: {
+        width: 1280,
+        height: 720,
+      },
+    }));
+
+    const endpoint = response.streams?.automationStream?.streamEndpoint;
+    if (!endpoint) throw new Error("No automation stream endpoint returned");
+
+    currentBrowserSessionId = response.sessionId;
+    currentBrowserEndpoint = endpoint;
+
+    // Generate SigV4 auth headers for the WebSocket CDP connection
+    const headers = await signBrowserEndpoint(endpoint);
+
+    // Write endpoint + headers to file for skill processes to read
+    fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify({
+      endpoint, sessionId: response.sessionId, headers,
+    }));
+
+    // Refresh SigV4 headers every 4 min (signatures expire after ~5 min)
+    browserHeaderRefreshTimer = setInterval(async () => {
+      try {
+        const refreshed = await signBrowserEndpoint(currentBrowserEndpoint);
+        const data = JSON.parse(fs.readFileSync(BROWSER_SESSION_FILE, "utf8"));
+        data.headers = refreshed;
+        fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify(data));
+      } catch (e) {
+        console.error("[browser] Failed to refresh SigV4 headers:", e.message);
+      }
+    }, 4 * 60 * 1000);
+
+    console.log("[browser] Session started for", userId, "-", response.sessionId);
+  } catch (err) {
+    console.error("[browser] Failed to start session for", userId, "-", err.message);
+    // Non-fatal — continue without browser
+  }
+}
+
+/**
+ * Stop all active browser sessions. Called during SIGTERM shutdown.
+ */
+async function stopBrowserSessions() {
+  const browserIdentifier = process.env.BROWSER_IDENTIFIER;
+  if (!browserIdentifier) return;
+  if (!currentBrowserSessionId) return;
+
+  try {
+    const { BedrockAgentCoreClient, StopBrowserSessionCommand } =
+      await import("@aws-sdk/client-bedrock-agentcore");
+    const client = new BedrockAgentCoreClient({ region: process.env.AWS_REGION || "us-east-1" });
+
+    await client.send(new StopBrowserSessionCommand({
+      browserIdentifier,
+      sessionId: currentBrowserSessionId,
+    }));
+    console.log("[browser] Stopped session for user (sessionId:", currentBrowserSessionId + ")");
+  } catch (err) {
+    console.error("[browser] Stop failed (sessionId:", currentBrowserSessionId + ") -", err.message);
+  }
+}
+
+/**
  * Initialization — called on first /invocations request.
  *
  * Uses pre-fetched secrets. Starts proxy, OpenClaw, and workspace restore
@@ -506,6 +660,9 @@ async function init(userId, actorId, channel) {
     const namespace = actorId.replace(/:/g, "_");
     currentUserId = userId;
     currentNamespace = namespace;
+
+    // Expose USER_ID so child processes (OpenClaw skill scripts) inherit it
+    process.env.USER_ID = actorId;
 
     // Write initial identity file for the proxy to read
     updateIdentityFile(actorId, channel);
@@ -539,7 +696,7 @@ async function init(userId, actorId, channel) {
     let scopedCredsAvailable = false;
     if (process.env.EXECUTION_ROLE_ARN) {
       try {
-        console.log(`[contract] Creating scoped S3 credentials for namespace=${namespace}...`);
+        console.log("[contract] Creating scoped S3 credentials for namespace=", namespace);
         const creds = await scopedCreds.createScopedCredentials(namespace, { internalUserId: userId });
         scopedCreds.writeCredentialFiles(creds, SCOPED_CREDS_DIR);
         workspaceSync.configureCredentials(creds);
@@ -679,6 +836,11 @@ async function init(userId, actorId, channel) {
       console.error(
         `[contract] OpenClaw readiness polling failed: ${err.message}`,
       );
+    });
+
+    // Start browser session in background (non-blocking, fire-and-forget)
+    initBrowserSession(userId).catch((err) => {
+      console.error(`[browser] Init error (non-fatal): ${err.message}`);
     });
 
     console.log(
@@ -1361,6 +1523,10 @@ process.on("SIGTERM", async () => {
     clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = null;
   }
+  if (browserHeaderRefreshTimer) {
+    clearInterval(browserHeaderRefreshTimer);
+    browserHeaderRefreshTimer = null;
+  }
 
   // Save workspace to S3 (10s max)
   const saveTimeout = setTimeout(() => {
@@ -1373,6 +1539,14 @@ process.on("SIGTERM", async () => {
   } catch (err) {
     console.warn(`[contract] Workspace cleanup error: ${err.message}`);
   }
+
+  // Stop browser sessions before exit
+  try {
+    await stopBrowserSessions();
+  } catch (err) {
+    console.warn(`[contract] Browser session cleanup error: ${err.message}`);
+  }
+
   clearTimeout(saveTimeout);
 
   // Kill child processes

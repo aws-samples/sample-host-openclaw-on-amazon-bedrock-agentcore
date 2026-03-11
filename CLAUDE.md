@@ -13,11 +13,11 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
 - **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
-- **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 4 custom skills (S3 user files, EventBridge cron, ClawHub manage, API keys) + 2 built-in shim tools (web_fetch, web_search)
+- **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 5 custom skills (S3 user files, EventBridge cron, ClawHub manage, API keys, agentcore-browser) + 2 built-in shim tools (web_fetch, web_search)
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **Workspace Persistence**: .openclaw/ directory synced to/from S3 per user
-- **AI Model**: Claude Opus 4.6 via Bedrock ConverseStream (configurable via `default_model_id` in `cdk.json`, default `global.anthropic.claude-opus-4-6-v1`)
+- **AI Model**: MiniMax M2.1 via Bedrock ConverseStream (configurable via `default_model_id` in `cdk.json`, default `minimax.minimax-m2.1`)
 - **Identity**: DynamoDB identity table (channel→user mapping, cross-channel binding) + Cognito User Pool
 - **Observability**: CloudWatch dashboards + alarms, Bedrock invocation logging
 - **Token Monitoring**: Lambda + DynamoDB (single-table) + CloudWatch custom metrics
@@ -62,7 +62,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
   +-----------v-----------+
   |   Amazon Bedrock      |
   |   ConverseStream API  |
-  |   Claude Opus 4.6   |
+  |   MiniMax M2.1      |
   +-----------------------+
 
   +-----------------------+        +------------------------+
@@ -145,6 +145,12 @@ openclaw-on-agentcore/
         native.js / secret.js    # Native file CRUD / Secrets Manager CRUD
         retrieve.js              # Unified lookup (SM first, native fallback)
         migrate.js               # Move keys between backends
+      agentcore-browser/          # Headless browser skill (optional, enable_browser=true)
+        SKILL.md                  # OpenClaw skill manifest
+        common.js                 # Session file reader, S3 upload helper
+        navigate.js               # Navigate to URL, return title + content
+        screenshot.js             # Capture PNG screenshot, upload to S3
+        interact.js               # Click, type, scroll, wait on elements
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py               # Webhook router (Telegram + Slack, image uploads)
@@ -274,6 +280,8 @@ cd bridge && node --test subagent-routing.test.js      # subagent model routing 
 cd bridge && node --test content-extraction.test.js    # recursive content block extraction tests
 cd bridge && node --test scoped-credentials.test.js    # per-user STS credential scoping tests
 cd bridge && node --test workspace-sync.test.js        # workspace sync credential tests
+cd bridge && node --test agentcore-browser.test.js     # browser skill unit tests
+cd bridge && node --test browser-lifecycle.test.js     # browser session lifecycle tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 ```
 
@@ -282,11 +290,13 @@ cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test com
 cd lambda/router && python -m pytest test_image_upload.py -v        # image upload unit tests
 cd lambda/router && python -m pytest test_content_extraction.py -v  # content block extraction tests
 cd lambda/router && python -m pytest test_markdown_html.py -v       # markdown-to-HTML conversion tests
+cd lambda/router && python -m pytest test_screenshot_handling.py -v # screenshot marker detection + delivery tests
 ```
 
 ### E2E Tests
 ```bash
-cd tests/e2e && python -m pytest bot_test.py -v   # simulated Telegram webhook tests (requires deployed stack)
+cd tests/e2e && python -m pytest bot_test.py -v                    # simulated Telegram webhook tests (requires deployed stack)
+cd tests/e2e && python -m pytest bot_test.py -v -k TestBrowserFeature  # browser E2E tests (requires enable_browser=true)
 ```
 
 ### Runtime Operations
@@ -312,7 +322,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` |
 | `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
-| `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID. The `global.` prefix routes to any available region |
+| `default_model_id` | `minimax.minimax-m2.1` | Bedrock model ID. The `global.` prefix routes to any available region |
 | `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
 | `cloudwatch_log_retention_days` | `30` | Log retention |
 | `daily_token_budget` | `1000000` | Token budget alarm threshold |
@@ -330,6 +340,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail (S3 bucket + trail). Off by default — most accounts already have one |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `subagent_model_id` | (empty) | Bedrock model for sub-agents. Empty = use `default_model_id` |
+| `enable_browser` | `false` | Enable headless Chromium browser. Sets `BROWSER_IDENTIFIER` env var on container |
 
 ## Container Startup Sequence
 
@@ -343,6 +354,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
    - Start OpenClaw gateway (port 18789) with scoped credentials env (no container credentials)
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
    - Start credential refresh timer (45 min interval)
+   - If `BROWSER_IDENTIFIER` set: create browser session via AgentCore Browser API, write session file to `/tmp/agentcore-browser-session.json`
    - Wait for proxy only (~5s)
 4. **Warm-up phase** (t=~10s to ~1-2min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, clawhub-manage, api-keys, web_fetch, web_search tools)
 5. **Handoff** (~1-2min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
@@ -432,7 +444,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **CDK L1 property gaps**: workload_identity_details and request_header_configuration on CfnRuntime are not yet supported in the installed CDK version — TODOs in agentcore_stack.py
 
 ### IAM / Bedrock
-- **Cross-region inference**: Model `global.anthropic.claude-opus-4-6-v1` uses a global cross-region inference profile that routes to any available region — IAM uses `arn:aws:bedrock:*::foundation-model/*` and inference-profile wildcards
+- **Cross-region inference**: Model `minimax.minimax-m2.1` uses a global cross-region inference profile that routes to any available region — IAM uses `arn:aws:bedrock:*::foundation-model/*` and inference-profile wildcards
 - **Inference profile ARN**: Separate from foundation model — `arn:aws:bedrock:{region}:{account}:inference-profile/*`
 
 ### Node.js 22 + VPC
@@ -503,6 +515,15 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Cron executor Lambda**: Warms up the user's AgentCore session (sends `action: warmup`), then sends the cron message (sends `action: cron`), then delivers the response to the user's chat channel
 - **Lead time**: Cron Lambda invoked with `cron_lead_time_minutes` (default 5 min) to allow session warmup before the scheduled time
 - **Environment variables**: Container receives `EVENTBRIDGE_SCHEDULE_GROUP`, `CRON_LAMBDA_ARN`, `EVENTBRIDGE_ROLE_ARN`, `IDENTITY_TABLE_NAME`, `CRON_LEAD_TIME_MINUTES` for the eventbridge-cron skill
+
+### AgentCore Browser (Optional)
+- **Opt-in**: Only active when `enable_browser=true` in `cdk.json` and `BROWSER_IDENTIFIER` is set as container env var
+- **Session file**: `/tmp/agentcore-browser-session.json` — written by contract server on init, read by skill scripts
+- **Session timeout**: 1 hour (`BROWSER_SESSION_TIMEOUT_SECONDS = 3600`). Session recreated automatically on expiry
+- **Screenshot delivery**: Screenshots uploaded to `{namespace}/_screenshots/` in S3, embedded in response as `[SCREENSHOT:key]` marker. Router Lambda detects markers and delivers as photos to Telegram/Slack
+- **Not available during warm-up**: Browser skill requires full OpenClaw startup — the lightweight agent does not include browser tools
+- **Lifecycle**: `startBrowserSession()` called during init (parallel with proxy/OpenClaw start), `stopBrowserSession()` called on SIGTERM
+- **Skill scripts**: `navigate.js` (CDP Page.navigate), `screenshot.js` (CDP Page.captureScreenshot → S3 upload), `interact.js` (click/type/scroll/wait via CDP)
 
 ### Per-User Identity Resolution
 - **Priority order**: (0) `USER_ID` env var (set by contract server) → (1) `x-openclaw-actor-id` header → (2) OpenAI `user` field → (3) message envelope parsing → (4) message `name` field → (5) fallback `default-user`

@@ -10,6 +10,7 @@ CLI usage:
     python -m tests.e2e.bot_test --skill-manage --tail-logs
     python -m tests.e2e.bot_test --api-keys --tail-logs
     python -m tests.e2e.bot_test --cron --tail-logs
+    python -m tests.e2e.bot_test --browser --tail-logs
 
 Pytest usage:
     pytest tests/e2e/bot_test.py -v -k smoke
@@ -1128,6 +1129,46 @@ class TestCronSchedule:
             print(f"  EventBridge schedule confirmed deleted: {eb_name}")
 
 
+class TestBrowserFeature:
+    """Browser feature smoke test -- requires enable_browser=true.
+
+    Sends a single navigate request to verify the browser skill is available
+    and functional. Requires full OpenClaw startup (browser skill is not
+    available during the lightweight-agent warm-up phase).
+
+    Run with: pytest tests/e2e/bot_test.py -v -k TestBrowserFeature
+    """
+
+    def test_browser_smoke(self, e2e_config, browser_enabled):
+        """Agent takes a screenshot of a live site — proves real browser usage."""
+        ready, elapsed = _wait_for_full_openclaw(e2e_config)
+        assert ready, (
+            f"OpenClaw did not fully start within timeout. "
+            f"Browser tests require full startup (elapsed={elapsed:.0f}s)"
+        )
+
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            "Using the agentcore-browser skill, navigate to https://quotes.toscrape.com, "
+            "take a screenshot of the page, and tell me the main headline you can see.",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=120)
+        assert tail.full_lifecycle, (
+            f"Browser navigate incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+        response_lower = tail.response_text.lower()
+        screenshot_words = ["screenshot", "captured", "image", "photo", "taken"]
+        assert any(w in response_lower for w in screenshot_words), (
+            f"Expected screenshot confirmation (one of {screenshot_words}) in response.\n"
+            f"Response: {tail.response_text[:500]}"
+        )
+        print(f"  Browser response: {tail.response_text[:200]}")
+
+
 class TestConversation:
     """Multi-message conversation tests."""
 
@@ -1485,6 +1526,29 @@ def _cli_cron(cfg, tail):
     return True
 
 
+def _cli_browser(cfg, tail):
+    """Browser smoke test: navigate to example.com.
+
+    Requires enable_browser=true in CDK config and BROWSER_IDENTIFIER set.
+    """
+    print("Browser feature smoke test")
+    print("Waiting for OpenClaw to be fully started...")
+
+    ready, elapsed = _wait_for_full_openclaw(cfg)
+    if not ready:
+        print(f"  FAIL -- OpenClaw not fully started after {elapsed:.0f}s")
+        return False
+    print(f"  OpenClaw ready in {elapsed:.1f}s\n")
+
+    print("Navigating to https://example.com...")
+    return _cli_send(
+        cfg,
+        "Open https://example.com using the agentcore-browser skill "
+        "and tell me the page title.",
+        tail,
+    )
+
+
 def _cli_conversation(cfg, scenario_name, tail):
     if scenario_name not in SCENARIOS:
         print(f"Unknown scenario: {scenario_name}")
@@ -1518,6 +1582,7 @@ def main():
     parser.add_argument("--skill-manage", action="store_true", help="Test skill management (list, install, uninstall)")
     parser.add_argument("--api-keys", action="store_true", help="Test API key management (native + Secrets Manager)")
     parser.add_argument("--cron", action="store_true", help="Test cron schedule lifecycle (create, verify CRON# record, list, delete)")
+    parser.add_argument("--browser", action="store_true", help="Test browser skill (navigate, screenshot, interact)")
     parser.add_argument("--reset", action="store_true", help="Reset session before sending")
     parser.add_argument("--reset-user", action="store_true", help="Full user reset (delete all records)")
     parser.add_argument("--tail-logs", action="store_true", help="Tail CloudWatch logs to verify lifecycle")
@@ -1568,6 +1633,10 @@ def main():
         ok = _cli_cron(cfg, args.tail_logs)
         sys.exit(0 if ok else 1)
 
+    if args.browser:
+        ok = _cli_browser(cfg, args.tail_logs)
+        sys.exit(0 if ok else 1)
+
     if args.conversation:
         ok = _cli_conversation(cfg, args.conversation, args.tail_logs)
         sys.exit(0 if ok else 1)
@@ -1578,7 +1647,7 @@ def main():
 
     if not any([args.health, args.send, args.conversation, args.subagent,
                 args.scoped_creds, args.skill_manage, args.api_keys,
-                args.cron, args.reset, args.reset_user]):
+                args.cron, args.browser, args.reset, args.reset_user]):
         parser.print_help()
         sys.exit(1)
 

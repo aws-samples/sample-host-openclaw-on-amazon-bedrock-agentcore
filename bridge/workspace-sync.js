@@ -37,6 +37,7 @@ const SKIP_PATTERNS = [
   ".npm/",
   "package-lock.json",
   "openclaw.json",
+  "AGENTS.md",
   // Security: exclude files that commonly contain secrets
   ".env",
   ".secrets/",
