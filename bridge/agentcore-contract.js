@@ -58,6 +58,7 @@ let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
+let browserHeaderRefreshTimer = null;
 let currentBrowserSessionId = null;
 let currentBrowserEndpoint = null;
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
@@ -518,6 +519,50 @@ async function pollOpenClawReadiness(namespace) {
 }
 
 /**
+ * Generate SigV4-signed HTTP headers for a WebSocket CDP endpoint.
+ * The browser automation stream requires IAM authentication — Playwright's
+ * connectOverCDP sends these as HTTP upgrade request headers.
+ *
+ * @param {string} wsEndpoint - WebSocket URL (wss://...)
+ * @returns {object} Signed headers (Authorization, X-Amz-Date, X-Amz-Security-Token, Host)
+ */
+async function signBrowserEndpoint(wsEndpoint) {
+  const { SignatureV4 } = require("@smithy/signature-v4");
+  const { Sha256 } = require("@aws-crypto/sha256-js");
+  const { defaultProvider } = require("@aws-sdk/credential-provider-node");
+
+  const url = new URL(wsEndpoint.replace(/^wss:/, "https:"));
+  const region = process.env.AWS_REGION || "us-east-1";
+
+  const signer = new SignatureV4({
+    service: "bedrock-agentcore",
+    region,
+    credentials: defaultProvider(),
+    sha256: Sha256,
+  });
+
+  const signed = await signer.sign({
+    method: "GET",
+    protocol: url.protocol,
+    hostname: url.hostname,
+    port: url.port ? Number(url.port) : undefined,
+    path: url.pathname + url.search,
+    headers: {
+      host: url.host,
+    },
+  });
+
+  // Return only the auth-relevant headers
+  const result = {};
+  for (const [k, v] of Object.entries(signed.headers)) {
+    if (/^(authorization|x-amz-|host)$/i.test(k) || k.startsWith("x-amz-")) {
+      result[k] = v;
+    }
+  }
+  return result;
+}
+
+/**
  * Start an AgentCore Browser session for the given user.
  * Non-fatal — logs and continues if browser feature is not enabled or SDK fails.
  */
@@ -545,8 +590,25 @@ async function initBrowserSession(userId) {
     currentBrowserSessionId = response.sessionId;
     currentBrowserEndpoint = endpoint;
 
-    // Write endpoint to file for skill processes to read
-    fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify({ endpoint, sessionId: response.sessionId }));
+    // Generate SigV4 auth headers for the WebSocket CDP connection
+    const headers = await signBrowserEndpoint(endpoint);
+
+    // Write endpoint + headers to file for skill processes to read
+    fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify({
+      endpoint, sessionId: response.sessionId, headers,
+    }));
+
+    // Refresh SigV4 headers every 4 min (signatures expire after ~5 min)
+    browserHeaderRefreshTimer = setInterval(async () => {
+      try {
+        const refreshed = await signBrowserEndpoint(currentBrowserEndpoint);
+        const data = JSON.parse(fs.readFileSync(BROWSER_SESSION_FILE, "utf8"));
+        data.headers = refreshed;
+        fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify(data));
+      } catch (e) {
+        console.error("[browser] Failed to refresh SigV4 headers:", e.message);
+      }
+    }, 4 * 60 * 1000);
 
     console.log(`[browser] Session started for ${userId}: ${response.sessionId}`);
   } catch (err) {
@@ -1453,6 +1515,10 @@ process.on("SIGTERM", async () => {
   if (credentialRefreshTimer) {
     clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = null;
+  }
+  if (browserHeaderRefreshTimer) {
+    clearInterval(browserHeaderRefreshTimer);
+    browserHeaderRefreshTimer = null;
   }
 
   // Save workspace to S3 (10s max)

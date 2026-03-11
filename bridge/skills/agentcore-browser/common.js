@@ -11,7 +11,7 @@ const WAIT_TIMEOUT_MS = 15000;
 let _browser = null;
 let _page = null;
 
-function getBrowserEndpoint() {
+function getBrowserSession() {
   if (!fs.existsSync(BROWSER_SESSION_FILE)) {
     throw new Error(
       "Browser session not available. Ensure enable_browser=true in CDK config and that the session has been initialized."
@@ -19,7 +19,7 @@ function getBrowserEndpoint() {
   }
   const data = JSON.parse(fs.readFileSync(BROWSER_SESSION_FILE, "utf8"));
   if (!data.endpoint) throw new Error("Browser session file missing endpoint");
-  return data.endpoint;
+  return data;
 }
 
 async function connectBrowser() {
@@ -33,9 +33,12 @@ async function connectBrowser() {
       _page = null;
     }
   }
-  const endpoint = getBrowserEndpoint();
+  const session = getBrowserSession();
   const { chromium } = require("playwright-core");
-  _browser = await chromium.connectOverCDP(endpoint, { timeout: 15000 });
+  _browser = await chromium.connectOverCDP(session.endpoint, {
+    timeout: 15000,
+    headers: session.headers || {},
+  });
   const contexts = _browser.contexts();
   const context = contexts.length > 0 ? contexts[0] : await _browser.newContext();
   const pages = context.pages();
@@ -70,7 +73,7 @@ function truncateContent(text, maxChars) {
 }
 
 module.exports = {
-  getBrowserEndpoint,
+  getBrowserSession,
   connectBrowser,
   uploadScreenshotToS3,
   truncateContent,

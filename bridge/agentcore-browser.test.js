@@ -1,7 +1,7 @@
 /**
  * Tests for agentcore-browser skill — navigate, screenshot, interact.
  *
- * Covers: getBrowserEndpoint, truncateContent, browserNavigate (missing url),
+ * Covers: getBrowserSession, truncateContent, browserNavigate (missing url),
  *         browserInteract (invalid action, missing selector), browserScreenshot
  *         (connect failure), S3 key format.
  * Run: cd bridge && node --test agentcore-browser.test.js
@@ -13,9 +13,9 @@ const path = require("path");
 
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 
-// --- getBrowserEndpoint ---
+// --- getBrowserSession ---
 
-describe("getBrowserEndpoint", () => {
+describe("getBrowserSession", () => {
   afterEach(() => {
     try { fs.unlinkSync(BROWSER_SESSION_FILE); } catch {}
   });
@@ -23,26 +23,29 @@ describe("getBrowserEndpoint", () => {
   it("throws when session file is missing", () => {
     // Ensure file does not exist
     try { fs.unlinkSync(BROWSER_SESSION_FILE); } catch {}
-    const { getBrowserEndpoint } = require("./skills/agentcore-browser/common");
+    const { getBrowserSession } = require("./skills/agentcore-browser/common");
     assert.throws(
-      () => getBrowserEndpoint(),
+      () => getBrowserSession(),
       (err) => err.message.includes("Browser session not available")
     );
   });
 
-  it("returns endpoint when session file exists", () => {
-    fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify({ endpoint: "ws://127.0.0.1:9222" }));
-    // Re-require to get fresh module state
-    const { getBrowserEndpoint } = require("./skills/agentcore-browser/common");
-    const endpoint = getBrowserEndpoint();
-    assert.equal(endpoint, "ws://127.0.0.1:9222");
+  it("returns session data when session file exists", () => {
+    fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify({
+      endpoint: "ws://127.0.0.1:9222",
+      headers: { Authorization: "test" },
+    }));
+    const { getBrowserSession } = require("./skills/agentcore-browser/common");
+    const session = getBrowserSession();
+    assert.equal(session.endpoint, "ws://127.0.0.1:9222");
+    assert.equal(session.headers.Authorization, "test");
   });
 
   it("throws when session file missing endpoint field", () => {
     fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify({ other: "data" }));
-    const { getBrowserEndpoint } = require("./skills/agentcore-browser/common");
+    const { getBrowserSession } = require("./skills/agentcore-browser/common");
     assert.throws(
-      () => getBrowserEndpoint(),
+      () => getBrowserSession(),
       (err) => err.message.includes("missing endpoint")
     );
   });

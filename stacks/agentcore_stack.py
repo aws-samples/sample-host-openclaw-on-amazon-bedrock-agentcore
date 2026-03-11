@@ -395,6 +395,7 @@ class AgentCoreStack(Stack):
                             "bedrock-agentcore:StopBrowserSession",
                             "bedrock-agentcore:GetBrowserSession",
                             "bedrock-agentcore:UpdateBrowserStream",
+                            "bedrock-agentcore:ConnectBrowserAutomationStream",
                         ],
                         resources=[self.browser.attr_browser_arn],
                     )
