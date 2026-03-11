@@ -18,7 +18,7 @@ for arg in "$@"; do
 done
 
 # ── Telegram notification helper ────────────────────────────────────────────
-TG_CHAT_ID="6087229962"
+TG_CHAT_ID="${E2E_TELEGRAM_CHAT_ID:?Set E2E_TELEGRAM_CHAT_ID}"
 send_telegram() {
   local msg="$1"
   local token
@@ -94,8 +94,8 @@ echo "── Step 3: Reset sessions + stop old runtime ──"
 # Require E2E env vars
 if [ -z "${E2E_TELEGRAM_USER_ID:-}" ] || [ -z "${E2E_TELEGRAM_CHAT_ID:-}" ]; then
   echo "ERROR: E2E_TELEGRAM_USER_ID and E2E_TELEGRAM_CHAT_ID must be set"
-  echo "  export E2E_TELEGRAM_USER_ID=6087229962"
-  echo "  export E2E_TELEGRAM_CHAT_ID=6087229962"
+  echo "  export E2E_TELEGRAM_USER_ID=<YOUR_TELEGRAM_USER_ID>"
+  echo "  export E2E_TELEGRAM_CHAT_ID=<YOUR_TELEGRAM_CHAT_ID>"
   exit 1
 fi
 
