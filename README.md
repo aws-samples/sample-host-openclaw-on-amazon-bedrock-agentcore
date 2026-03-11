@@ -305,7 +305,7 @@ All tunable parameters are in `cdk.json`:
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
 | `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
-| `default_model_id` | `minimax.minimax-m2.1` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
+| `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
 | `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Set to e.g. `global.anthropic.claude-sonnet-4-6-v1` for faster/cheaper sub-agents |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Daily token budget alarm threshold |
@@ -757,7 +757,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 ### 502 / Bedrock authorization errors
 
 - **Model access not enabled**: Enable model access in the Bedrock console for your region.
-- **Cross-region inference**: The default model ID `minimax.minimax-m2.1` uses a global cross-region inference profile that routes to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions.
+- **Cross-region inference**: The default model ID `global.anthropic.claude-opus-4-6-v1` uses a global cross-region inference profile that routes to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions.
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
 
