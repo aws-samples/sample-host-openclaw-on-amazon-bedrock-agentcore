@@ -354,6 +354,7 @@ function writeOpenClawConfig() {
         enabled: false,
         allowInsecureAuth: true,
         dangerouslyDisableDeviceAuth: true,
+        dangerouslyAllowHostHeaderOriginFallback: true,
         allowedOrigins: ["*"],
       },
     },
