@@ -107,7 +107,7 @@ describe("browserNavigate", () => {
       JSON.stringify({ url: "https://example.com" }),
     ], { encoding: "utf8" });
     const parsed = JSON.parse(result.trim());
-    assert.ok(parsed.error.includes("Browser is not available"));
+    assert.ok(parsed.error.includes("Browser session not available"));
   });
 });
 
@@ -187,7 +187,7 @@ describe("browserInteract", () => {
       JSON.stringify({ action: "scroll" }),
     ], { encoding: "utf8" });
     const parsed = JSON.parse(result.trim());
-    assert.ok(parsed.error.includes("Browser is not available"));
+    assert.ok(parsed.error.includes("Browser session not available"));
   });
 });
 
@@ -202,7 +202,7 @@ describe("browserScreenshot", () => {
       JSON.stringify({}),
     ], { encoding: "utf8" });
     const parsed = JSON.parse(result.trim());
-    assert.ok(parsed.error.includes("Browser is not available"));
+    assert.ok(parsed.error.includes("Browser session not available"));
   });
 });
 

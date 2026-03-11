@@ -4,8 +4,8 @@ const { connectBrowser, uploadScreenshotToS3 } = require("./common");
 async function browserScreenshot(args) {
   const { description } = args || {};
 
+  const { page, disconnect } = await connectBrowser();
   try {
-    const { page } = await connectBrowser();
     const imageBuffer = await page.screenshot({ type: "png", fullPage: false });
     const s3Key = await uploadScreenshotToS3(imageBuffer);
 
@@ -16,6 +16,8 @@ async function browserScreenshot(args) {
       return JSON.stringify({ error: "Browser is not available. The enable_browser feature must be enabled in CDK configuration." });
     }
     return JSON.stringify({ error: `Screenshot failed: ${err.message}` });
+  } finally {
+    await disconnect();
   }
 }
 

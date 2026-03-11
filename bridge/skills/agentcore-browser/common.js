@@ -7,10 +7,6 @@ const NAV_TIMEOUT_MS = 30000;
 const INTERACT_TIMEOUT_MS = 10000;
 const WAIT_TIMEOUT_MS = 15000;
 
-// Module-level CDP connection cache
-let _browser = null;
-let _page = null;
-
 function getBrowserSession() {
   if (!fs.existsSync(BROWSER_SESSION_FILE)) {
     throw new Error(
@@ -23,27 +19,23 @@ function getBrowserSession() {
 }
 
 async function connectBrowser() {
-  if (_browser && _page) {
-    // Check connection is still alive
-    try {
-      await _page.title(); // lightweight liveness check
-      return { browser: _browser, page: _page };
-    } catch {
-      _browser = null;
-      _page = null;
-    }
-  }
   const session = getBrowserSession();
   const { chromium } = require("playwright-core");
-  _browser = await chromium.connectOverCDP(session.endpoint, {
+  const browser = await chromium.connectOverCDP(session.endpoint, {
     timeout: 15000,
     headers: session.headers || {},
   });
-  const contexts = _browser.contexts();
-  const context = contexts.length > 0 ? contexts[0] : await _browser.newContext();
+  const contexts = browser.contexts();
+  const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
   const pages = context.pages();
-  _page = pages.length > 0 ? pages[0] : await context.newPage();
-  return { browser: _browser, page: _page };
+  const page = pages.length > 0 ? pages[0] : await context.newPage();
+  return {
+    browser,
+    page,
+    disconnect: async () => {
+      try { await browser.close(); } catch {}
+    },
+  };
 }
 
 async function uploadScreenshotToS3(imageBuffer) {

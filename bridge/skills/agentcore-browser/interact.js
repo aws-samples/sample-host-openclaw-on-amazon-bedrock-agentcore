@@ -20,8 +20,8 @@ async function browserInteract(args) {
     if (!text) return JSON.stringify({ error: "text is required for type" });
   }
 
+  const { page, disconnect } = await connectBrowser();
   try {
-    const { page } = await connectBrowser();
     await applyStealthHeaders(page);
 
     switch (action) {
@@ -49,6 +49,8 @@ async function browserInteract(args) {
       return JSON.stringify({ error: "Browser is not available. The enable_browser feature must be enabled in CDK configuration." });
     }
     return JSON.stringify({ error: `Interaction failed: ${err.message}` });
+  } finally {
+    await disconnect();
   }
 }
 

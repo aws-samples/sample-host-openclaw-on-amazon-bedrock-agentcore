@@ -5,8 +5,8 @@ async function browserNavigate(args) {
   const { url } = args;
   if (!url) return JSON.stringify({ error: "url is required" });
 
+  const { page, disconnect } = await connectBrowser();
   try {
-    const { page } = await connectBrowser();
     await applyStealthHeaders(page);
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
     const title = await page.title();
@@ -33,6 +33,8 @@ async function browserNavigate(args) {
       return JSON.stringify({ error: "Browser is not available. The enable_browser feature must be enabled in CDK configuration." });
     }
     return JSON.stringify({ error: `Navigation failed: ${err.message}` });
+  } finally {
+    await disconnect();
   }
 }
 
