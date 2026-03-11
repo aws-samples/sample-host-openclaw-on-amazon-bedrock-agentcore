@@ -124,6 +124,10 @@ RUN chmod +x /skills/clawhub-manage/*.js
 COPY skills/api-keys /skills/api-keys
 RUN chmod +x /skills/api-keys/*.js
 
+# Copy AgentCore browser skill (headless Chromium browsing)
+COPY skills/agentcore-browser /skills/agentcore-browser
+RUN chmod +x /skills/agentcore-browser/*.js
+
 # Copy project instructions (CLAUDE.md) so the agent knows about its skills
 COPY CLAUDE.md /app/CLAUDE.md
 

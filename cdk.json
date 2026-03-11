@@ -10,7 +10,7 @@
     "daily_cost_budget_usd": 5,
     "anomaly_band_width": 2,
     "token_ttl_days": 90,
-    "image_version": 52,
+    "image_version": 53,
     "user_files_ttl_days": 365,
     "session_idle_timeout": 1800,
     "session_max_lifetime": 28800,
