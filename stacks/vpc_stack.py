@@ -20,13 +20,14 @@ class VpcStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
 
         # --- VPC ----------------------------------------------------------
-        self.vpc = ec2.Vpc(
-            self,
-            "Vpc",
-            ip_addresses=ec2.IpAddresses.cidr("10.0.0.0/16"),
-            max_azs=2,
-            nat_gateways=1,
-            subnet_configuration=[
+        # Allow users to override AZs via context if AgentCore Runtime has AZ restrictions
+        # Context: "availability_zones": ["us-east-1b", "us-east-1c"]
+        availability_zones = self.node.try_get_context("availability_zones")
+        
+        vpc_kwargs = {
+            "ip_addresses": ec2.IpAddresses.cidr("10.0.0.0/16"),
+            "nat_gateways": 1,
+            "subnet_configuration": [
                 ec2.SubnetConfiguration(
                     name="Public",
                     subnet_type=ec2.SubnetType.PUBLIC,
@@ -38,7 +39,14 @@ class VpcStack(Stack):
                     cidr_mask=24,
                 ),
             ],
-        )
+        }
+        
+        if availability_zones:
+            vpc_kwargs["availability_zones"] = availability_zones
+        else:
+            vpc_kwargs["max_azs"] = 2
+        
+        self.vpc = ec2.Vpc(self, "Vpc", **vpc_kwargs)
 
         # VPC Flow Logs
         flow_log_group = logs.LogGroup(

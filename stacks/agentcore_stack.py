@@ -77,10 +77,9 @@ class AgentCoreStack(Stack):
         )
 
         # --- Execution Role (what the container can do) -----------------------
+        # Use deterministic role name to construct ARN for self-assume trust policy
+        # This avoids circular dependency when role references itself
         execution_role_name = "openclaw-agentcore-execution-role"
-        # Deterministic ARN avoids CDK circular dependency when the role
-        # references itself in its trust policy and inline policy.
-        execution_role_arn_str = f"arn:aws:iam::{account}:role/{execution_role_name}"
         self.execution_role = iam.Role(
             self,
             "OpenClawExecutionRole",
@@ -173,26 +172,20 @@ class AgentCoreStack(Stack):
         # STS self-assume for per-user scoped S3 credentials
         # The container assumes its own role with a session policy that restricts
         # S3 access to the user's namespace prefix, preventing cross-user access.
-        # Two parts required:
-        #   1. IAM permission to call sts:AssumeRole (inline policy)
-        #   2. Trust policy entry allowing the role to assume itself
+        execution_role_arn_str = f"arn:aws:iam::{account}:role/{execution_role_name}"
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["sts:AssumeRole"],
                 resources=[execution_role_arn_str],
             )
         )
-        self.execution_role.assume_role_policy.add_statements(
-            iam.PolicyStatement(
-                actions=["sts:AssumeRole"],
-                principals=[iam.ArnPrincipal(execution_role_arn_str)],
-                conditions={
-                    "StringLike": {
-                        "sts:RoleSessionName": "scoped-*"
-                    }
-                },
-            )
-        )
+        
+        # Note: Self-assume trust policy cannot be added during role creation
+        # because IAM rejects roles that reference themselves as principals.
+        # The trust policy must be updated after the role exists.
+        # This is handled by a post-deployment script or manual update:
+        # aws iam update-assume-role-policy --role-name openclaw-agentcore-execution-role \
+        #   --policy-document '{"Version":"2012-10-17","Statement":[...]}'
 
         # CloudWatch Logs — scoped to /openclaw/ log group prefix
         self.execution_role.add_to_policy(
@@ -320,7 +313,7 @@ class AgentCoreStack(Stack):
                 ),
                 "IMAGE_VERSION": image_version,  # bump in cdk.json to force container redeploy
                 # Per-user S3 credential scoping — STS AssumeRole with session policy
-                "EXECUTION_ROLE_ARN": execution_role_arn_str,
+                "EXECUTION_ROLE_ARN": self.execution_role.role_arn,
                 "CMK_ARN": cmk_arn,
                 # EventBridge cron scheduling — deterministic names to avoid circular deps
                 "EVENTBRIDGE_SCHEDULE_GROUP": "openclaw-cron",
