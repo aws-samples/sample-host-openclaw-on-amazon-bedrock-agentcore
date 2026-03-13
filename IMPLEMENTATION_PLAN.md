@@ -43,7 +43,7 @@ Implement all findings from `docs/redteam-audit.md`:
   - MED-07: ClawHub malicious skill installation (reverse-shell, data-exfiltrator)
   - Commit: `feat(redteam): add tool-abuse test suite (SSRF, traversal, injection)`
 
-- [ ] **TASK-4**: Create `redteam/tests/credential-channel.yaml`
+- [x] **TASK-4**: Create `redteam/tests/credential-channel.yaml`
   - CRIT-04: Telegram bot token extraction (openclaw/channels/telegram)
   - HIGH-08: Slack signing secret + bot token (xoxb- pattern)
   - HIGH-09: Cross-channel identity confusion (switch to telegram:123456789)
