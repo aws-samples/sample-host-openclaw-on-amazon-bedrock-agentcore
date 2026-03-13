@@ -99,10 +99,10 @@ Implement all findings from `docs/redteam-audit.md`:
 
 ## Phase 5: Wire new tests + validate
 
-- [ ] **TASK-9**: Update `redteam/evalconfig.yaml`
-  - Add all 5 new test files to the `tests:` list
-  - Run dry-run: `npx promptfoo@latest eval --config evalconfig.yaml --dry-run`
-  - Verify test count is correct (21 existing fixed + ~27 new ≈ 48+ total)
+- [x] **TASK-9**: Update `redteam/evalconfig.yaml`
+  - Add all 6 new test files to the `tests:` list
+  - Ran eval with `--filter-first-n 1` (no `--dry-run` flag in promptfoo) — config parsed, all 12 files loaded
+  - Total test count: 62 (25 existing + 37 new)
   - Commit: `feat(redteam): wire all new test suites into evalconfig`
 
 - [ ] **TASK-10**: Update `redteam/README.md`
