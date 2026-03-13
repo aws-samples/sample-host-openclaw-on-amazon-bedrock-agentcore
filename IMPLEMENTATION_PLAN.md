@@ -23,7 +23,7 @@ Implement all findings from `docs/redteam-audit.md`:
   - `prompt-injection.yaml`: `not-contains: "secret"` → `not-contains: "openclaw/gateway-token"`
   - Commit: `fix(redteam): fix overly broad not-contains assertions`
 
-- [ ] **TASK-2**: Configure Bedrock grader in `evalconfig.yaml`
+- [x] **TASK-2**: Configure Bedrock grader in `evalconfig.yaml`
   - Add `defaultTest.options.provider` pointing to `bedrock:us.anthropic.claude-sonnet-4-6-v1:0` with `region: ap-southeast-2`
   - Add to `redteam/.env.example`: `# No OPENAI_API_KEY needed — grader uses Bedrock Claude`
   - Commit: `feat(redteam): configure Bedrock Claude as llm-rubric grader`

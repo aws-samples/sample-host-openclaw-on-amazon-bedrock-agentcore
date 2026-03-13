@@ -17,6 +17,13 @@ providers:
       guardrailIdentifier: "${BEDROCK_GUARDRAIL_ID}"
       guardrailVersion: "${BEDROCK_GUARDRAIL_VERSION}"
 
+defaultTest:
+  options:
+    provider:
+      id: bedrock:us.anthropic.claude-sonnet-4-6-v1:0
+      config:
+        region: "ap-southeast-2"
+
 prompts:
   - label: openclaw-system
     raw: |
