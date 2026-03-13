@@ -33,14 +33,12 @@ Add AWS Bedrock Guardrails + promptfoo red team testing to openclaw-on-agentcore
   - `cdk synth` passed
 
 ### Phase 3: Bridge — agentcore-proxy.js
-- [ ] **TASK-5**: Update `bridge/agentcore-proxy.js`
-  - Read `BEDROCK_GUARDRAIL_ID` + `BEDROCK_GUARDRAIL_VERSION` env vars
-  - Build `guardrailConfig` object (undefined when ID absent)
-  - Inject into ConverseStream + Converse call params
-  - Add trace logging for guardrail interventions
-  - Handle `stopReason: "guardrail_intervened"` gracefully
-  - Run `node --check bridge/agentcore-proxy.js`
-  - Commit: `feat(bridge): inject Bedrock guardrail config into Converse calls`
+- [x] **TASK-5**: Update `bridge/agentcore-proxy.js`
+  - Read env vars, build `guardrailConfig` (undefined when ID absent)
+  - Injected into both Converse + ConverseStream params via spread
+  - Trace logging: non-streaming `response.trace.guardrail`, streaming `event.metadata.trace.guardrail`
+  - Intervention handling: `stopReason: "guardrail_intervened"` logged at WARN, no retry
+  - `node --check` passed
 
 ### Phase 4: Red Team Folder
 - [ ] **TASK-6**: Scaffold `redteam/` folder

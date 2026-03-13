@@ -23,6 +23,16 @@ const MODEL_ID =
 const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcore-subagent";
 const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || MODEL_ID;
 
+// Bedrock Guardrails — content filtering (undefined = disabled)
+const GUARDRAIL_ID = process.env.BEDROCK_GUARDRAIL_ID || "";
+const GUARDRAIL_VERSION = process.env.BEDROCK_GUARDRAIL_VERSION || "DRAFT";
+const guardrailConfig = GUARDRAIL_ID
+  ? { guardrailIdentifier: GUARDRAIL_ID, guardrailVersion: GUARDRAIL_VERSION }
+  : undefined;
+if (guardrailConfig) {
+  console.log(`[proxy] Bedrock Guardrails enabled: ${GUARDRAIL_ID} v${GUARDRAIL_VERSION}`);
+}
+
 // Cognito identity configuration
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
 const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID || "";
@@ -1038,6 +1048,7 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
+    ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
 
@@ -1053,6 +1064,15 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
       }
 
       const response = await client.send(new ConverseCommand(params));
+
+      // Log guardrail trace if present
+      if (response?.trace?.guardrail) {
+        console.debug("[guardrail] trace:", JSON.stringify(response.trace.guardrail));
+      }
+      // Handle guardrail intervention
+      if (response?.stopReason === "guardrail_intervened") {
+        console.warn("[guardrail] intervention on non-streaming response");
+      }
 
       const outputMessage = response.output?.message;
       if (outputMessage && outputMessage.content) {
@@ -1124,6 +1144,7 @@ async function invokeBedrockStreaming(
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
+    ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
 
@@ -1244,6 +1265,14 @@ async function invokeBedrockStreaming(
         if (event.metadata?.usage) {
           inputTokens = event.metadata.usage.inputTokens || 0;
           outputTokens = event.metadata.usage.outputTokens || 0;
+        }
+
+        // Log guardrail trace/intervention from streaming events
+        if (event.metadata?.trace?.guardrail) {
+          console.debug("[guardrail] stream trace:", JSON.stringify(event.metadata.trace.guardrail));
+        }
+        if (event.messageStop?.stopReason === "guardrail_intervened") {
+          console.warn("[guardrail] intervention on streaming response");
         }
       }
 
