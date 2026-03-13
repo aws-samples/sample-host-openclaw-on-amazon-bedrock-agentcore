@@ -1,0 +1,86 @@
+# IMPLEMENTATION_PLAN.md
+
+## Goal
+Add AWS Bedrock Guardrails + promptfoo red team testing to openclaw-on-agentcore.
+
+## Tasks
+
+### Phase 1: Design Doc Finalisation
+- [x] **TASK-1**: Merge `docs/redteam-guardrails-addendum.md` into `docs/redteam-design.md`
+  - Addendum file never existed separately — opt-in/opt-out content already in `docs/redteam-design.md` (sections 2.9, cost callout)
+  - No commit needed
+
+### Phase 2: CDK — GuardrailsStack
+- [x] **TASK-2**: Create `stacks/guardrails_stack.py`
+  - Implemented `GuardrailsStack` per `specs/guardrails-cdk.md`
+  - Read `enable_guardrails` context (default True), `guardrails_pii_action` context
+  - Content filters (6), topic denial (6), word filters (7 + profanity), PII (10 entities), custom regex (3)
+  - CfnGuardrailVersion for production pinning
+  - Expose `guardrail_id`, `guardrail_version`, `guardrail_arn`
+  - CfnOutputs for GuardrailId, GuardrailVersion, GuardrailArn
+  - PII entity types verified against CloudFormation docs (EMAIL, PHONE, not EMAIL_ADDRESS/PHONE_NUMBER)
+
+- [ ] **TASK-3**: Wire `GuardrailsStack` into `app.py`
+  - Instantiate after SecurityStack, before AgentCoreStack
+  - Pass guardrail exports to AgentCoreStack
+  - Run `cdk synth` to verify — fix errors
+  - Commit: `feat(cdk): wire GuardrailsStack in app.py`
+
+- [ ] **TASK-4**: Update `stacks/agentcore_stack.py`
+  - Accept `guardrails_stack` param
+  - Set env vars `BEDROCK_GUARDRAIL_ID` + `BEDROCK_GUARDRAIL_VERSION` on container (conditional on guardrail_id not None)
+  - Add `bedrock:ApplyGuardrail` IAM permission (conditional)
+  - Run `cdk synth` to verify — fix errors
+  - Commit: `feat(cdk): inject guardrail env vars into AgentCore container`
+
+### Phase 3: Bridge — agentcore-proxy.js
+- [ ] **TASK-5**: Update `bridge/agentcore-proxy.js`
+  - Read `BEDROCK_GUARDRAIL_ID` + `BEDROCK_GUARDRAIL_VERSION` env vars
+  - Build `guardrailConfig` object (undefined when ID absent)
+  - Inject into ConverseStream + Converse call params
+  - Add trace logging for guardrail interventions
+  - Handle `stopReason: "guardrail_intervened"` gracefully
+  - Run `node --check bridge/agentcore-proxy.js`
+  - Commit: `feat(bridge): inject Bedrock guardrail config into Converse calls`
+
+### Phase 4: Red Team Folder
+- [ ] **TASK-6**: Scaffold `redteam/` folder
+  - Create folder structure per `specs/redteam-folder.md`
+  - `package.json`, `.gitignore`, `promptfooconfig.yaml`
+  - `providers/baseline.yaml` + `providers/hardened.yaml`
+  - `results/.gitkeep` + `results/README.md`
+  - Commit: `feat(redteam): scaffold promptfoo red team folder`
+
+- [ ] **TASK-7**: Write test suites
+  - `tests/jailbreaks.yaml`
+  - `tests/prompt-injection.yaml`
+  - `tests/harmful-content.yaml`
+  - `tests/pii-fishing.yaml`
+  - `tests/topic-denial.yaml`
+  - `tests/credential-extraction.yaml`
+  - Min 3 prompts + assertions per file (mapped to threat model in `docs/security.md`)
+  - Commit: `feat(redteam): add promptfoo test suites for all attack categories`
+
+- [ ] **TASK-8**: Write `redteam/README.md`
+  - Prerequisites, setup, before/after story, commands
+  - Commit: `docs(redteam): add README with before/after demo story`
+
+### Phase 5: Documentation
+- [ ] **TASK-9**: Update `docs/security.md`
+  - Add Bedrock Guardrails to Section 3 (Defense-in-Depth)
+  - Add cost note (💰 Cost note callout)
+  - Add to Section 6 (Potential Extensions) — remove guardrails since now implemented
+  - Commit: `docs: update security.md with Bedrock Guardrails coverage`
+
+- [ ] **TASK-10**: Update `README.md`
+  - Add Bedrock Guardrails to features/architecture section
+  - Add `enable_guardrails` to cdk.json configuration table
+  - Add 💰 cost note
+  - Commit: `docs: add Bedrock Guardrails to README`
+
+## Learnings
+- TASK-1: Addendum file was never created separately; content was written directly into redteam-design.md
+- TASK-2: CloudFormation PII entity types use short names: `EMAIL` not `EMAIL_ADDRESS`, `PHONE` not `PHONE_NUMBER`, `AWS_ACCESS_KEY` not `AWS_ACCESS_KEY_ID`
+
+## Status
+IN_PROGRESS
