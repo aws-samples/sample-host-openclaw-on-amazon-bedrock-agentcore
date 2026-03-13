@@ -53,9 +53,9 @@ Add AWS Bedrock Guardrails + promptfoo red team testing to openclaw-on-agentcore
   - 25 total test cases with llm-rubric + not-contains assertions
   - Mapped to guardrail policies: content filters, topic denial, PII, word filters
 
-- [ ] **TASK-8**: Write `redteam/README.md`
-  - Prerequisites, setup, before/after story, commands
-  - Commit: `docs(redteam): add README with before/after demo story`
+- [x] **TASK-8**: Write `redteam/README.md`
+  - Prerequisites, setup, before/after story (3-act), commands table
+  - Test categories table, expected results table, cost note
 
 ### Phase 5: Documentation
 - [ ] **TASK-9**: Update `docs/security.md`
