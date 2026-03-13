@@ -299,6 +299,24 @@ Container `cloudwatch:PutMetricData` permission is conditioned on `cloudwatch:na
 | SIGTERM grace period | 10s for final workspace save before exit (AgentCore gives 15s total) |
 | Workspace sync | Periodic saves every 5 min; `openclaw.json` excluded from sync (always programmatically generated) |
 
+### 3.11 Bedrock Guardrails (Content Filtering)
+
+Bedrock Guardrails add a content-level defense layer that evaluates both user inputs and model outputs. Deployed via CDK as `OpenClawGuardrails` stack (opt-in, default ON).
+
+| Policy | Coverage |
+|---|---|
+| **Content filters** | HATE, INSULTS, SEXUAL, VIOLENCE, MISCONDUCT (HIGH strength), PROMPT_ATTACK (input only) |
+| **Topic denial** | 6 denied topics: crypto scams, phishing, self-harm, weapons manufacturing, malware creation, identity fraud |
+| **Word filters** | Managed profanity + 7 custom terms (credential patterns, internal identifiers) |
+| **PII filters** | 10 entity types: EMAIL, PHONE, credit cards, AWS keys, PASSWORD, PIN, USERNAME |
+| **Custom regex** | AWS access key (`AKIA[0-9A-Z]{16}`), AWS secret key (40-char base64), generic API key (`sk-...`) |
+
+**How it works**: The proxy injects `guardrailConfig` into every Bedrock Converse/ConverseStream API call. Bedrock evaluates the guardrail server-side — blocked inputs get a rejection message, blocked outputs are replaced or anonymized. The IAM role has `bedrock:ApplyGuardrail` permission.
+
+**Opt-out**: Set `"enable_guardrails": false` in `cdk.json`. This skips the entire `GuardrailsStack` — no guardrail resources, no guardrail charges, no content filtering.
+
+> **Cost note**: Guardrails add ~$0.75 per 1,000 text units on top of model inference costs. See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling guardrails removes content-level protections but other security layers (STS scoping, tool deny list, SSRF protection) remain active.
+
 ---
 
 ## 4. AWS Cloud-Native Security Value
@@ -320,14 +338,15 @@ These are the security capabilities that AWS managed services provide — capabi
 | **STS** | Session-scoped credentials with fine-grained IAM policies; time-limited (1 hour); auditable via CloudTrail |
 | **ECR** | Private container registry with image scanning on push (CVE detection); IAM-controlled pull access |
 | **EventBridge Scheduler** | IAM-controlled scheduling; PassRole conditions prevent privilege escalation; schedule group isolation |
-| **IAM + cdk-nag** | Least-privilege enforcement at deploy time; automated compliance checking across all 7 stacks |
+| **Bedrock Guardrails** | Server-side content filtering on every Converse/ConverseStream call; content filters, topic denial, PII redaction, word filters, custom regex; KMS-encrypted guardrail configuration |
+| **IAM + cdk-nag** | Least-privilege enforcement at deploy time; automated compliance checking across all 8 stacks |
 | **SNS** | KMS-encrypted alarm topic; service-to-service communication for alarm delivery |
 
 ---
 
 ## 5. Compliance & cdk-nag
 
-All 7 CDK stacks run cdk-nag `AwsSolutions` checks at `cdk synth` time. This catches security misconfigurations before any infrastructure is deployed. Key areas validated:
+All 8 CDK stacks run cdk-nag `AwsSolutions` checks at `cdk synth` time. This catches security misconfigurations before any infrastructure is deployed. Key areas validated:
 
 | Category | What cdk-nag Checks |
 |---|---|

@@ -58,11 +58,11 @@ Add AWS Bedrock Guardrails + promptfoo red team testing to openclaw-on-agentcore
   - Test categories table, expected results table, cost note
 
 ### Phase 5: Documentation
-- [ ] **TASK-9**: Update `docs/security.md`
-  - Add Bedrock Guardrails to Section 3 (Defense-in-Depth)
-  - Add cost note (💰 Cost note callout)
-  - Add to Section 6 (Potential Extensions) — remove guardrails since now implemented
-  - Commit: `docs: update security.md with Bedrock Guardrails coverage`
+- [x] **TASK-9**: Update `docs/security.md`
+  - Added Section 3.11 (Bedrock Guardrails) with policy table, how-it-works, opt-out, cost note
+  - Added Bedrock Guardrails to Section 4 (Cloud-Native Security Value)
+  - Updated stack count to 8 in Section 5 (cdk-nag)
+  - Section 6 had no guardrails entry to remove
 
 - [ ] **TASK-10**: Update `README.md`
   - Add Bedrock Guardrails to features/architecture section
