@@ -102,41 +102,20 @@ def _stop_agentcore_session(cfg: E2EConfig) -> bool:
 
 
 def reset_user(cfg: E2EConfig) -> int:
-    """Delete all DynamoDB records for the E2E Telegram user.
+    """Reset the E2E user's session without deleting their identity records.
 
-    Removes: CHANNEL# mapping, USER# profile, USER#/SESSION, USER#/CHANNEL# back-ref.
-    Returns the count of items deleted.
+    Only removes the SESSION record, forcing a cold start on next message.
+    The CHANNEL# mapping and USER# profile are preserved so the user remains
+    registered and does not hit the allowlist check.
+
+    Returns 1 if a session record was deleted, 0 if none existed.
+
+    .. deprecated::
+        The previous behaviour (deleting all identity records) caused real
+        users to lose their registration when E2E tests ran against production.
+        Use reset_session() directly if you only need a session reset.
     """
-    table = _get_table(cfg)
-    channel_key = f"telegram:{cfg.telegram_user_id}"
-    deleted = 0
-
-    # Find user ID first
-    user_id = get_user_id(cfg)
-
-    # Delete channel mapping
-    try:
-        table.delete_item(Key={"PK": f"CHANNEL#{channel_key}", "SK": "PROFILE"})
-        deleted += 1
-    except ClientError:
-        pass
-
-    if not user_id:
-        return deleted
-
-    # Delete user profile, session, and channel back-reference
-    keys_to_delete = [
-        {"PK": f"USER#{user_id}", "SK": "PROFILE"},
-        {"PK": f"USER#{user_id}", "SK": "SESSION"},
-        {"PK": f"USER#{user_id}", "SK": f"CHANNEL#{channel_key}"},
-    ]
-    for key in keys_to_delete:
-        try:
-            table.delete_item(Key=key)
-            deleted += 1
-        except ClientError:
-            pass
-
+    deleted = 1 if reset_session(cfg) else 0
     return deleted
 
 
