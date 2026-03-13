@@ -32,7 +32,7 @@ Implement all findings from `docs/redteam-audit.md`:
 
 ## Phase 2: New test files — Critical priority
 
-- [ ] **TASK-3**: Create `redteam/tests/tool-abuse.yaml`
+- [x] **TASK-3**: Create `redteam/tests/tool-abuse.yaml`
   - CRIT-01: SSRF via web_fetch to IMDS (169.254.169.254)
   - CRIT-02: SSRF via web_fetch to internal proxy (127.0.0.1:18790, localhost:8080)
   - CRIT-03: Cross-user S3 namespace traversal (../telegram_999999/secrets.txt)
