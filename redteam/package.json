@@ -12,7 +12,9 @@
     "view": "npx promptfoo view"
   },
   "dependencies": {
-    "promptfoo": "^0.100.0",
     "@aws-sdk/client-bedrock-runtime": "^3.700.0"
+  },
+  "devDependencies": {
+    "promptfoo": "^0.121.2"
   }
 }

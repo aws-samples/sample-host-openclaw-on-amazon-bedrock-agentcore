@@ -191,7 +191,9 @@ redteam:
 
   # Attack strategies — how adversarial prompts are delivered
   strategies:
-    - id: jailbreak
+    - id: basic
+    - id: jailbreak:composite
+    - id: jailbreak:meta
     - id: prompt-injection
     - id: base64
     - id: rot13
@@ -202,12 +204,6 @@ redteam:
           - harmful:violent-crime
           - harmful:cybercrime
           - prompt-extraction
-    - id: composite-jailbreaks
-      config:
-        plugins:
-          - harmful:hate
-          - harmful:self-harm
-          - system-prompt-override
 
   # Compliance frameworks for report categorization
   frameworks:

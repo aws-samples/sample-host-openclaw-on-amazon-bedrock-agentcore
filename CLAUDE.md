@@ -268,8 +268,14 @@ This displays the webhook URL for Slack Event Subscriptions, prompts for your Sl
 # 2. Build + push image (see above)
 # 3. CDK deploy
 source .venv/bin/activate && cdk deploy OpenClawAgentCore --require-approval never
-# 4. New sessions will use the new image automatically (per-user idle termination)
+# 4. Run post-deploy tag script (MANDATORY — protects resources from automated cleanup)
+./post-deploy.sh
+# 5. New sessions will use the new image automatically (per-user idle termination)
 ```
+
+> ⚠️ **Always run `./post-deploy.sh` after any CDK deploy.** This applies `auto-delete=no` tags to all
+> OpenClaw resources to prevent automated cleanup processes from deleting production infrastructure.
+> The script is gitignored (internal only) — if it doesn't exist, ask the user to restore it.
 
 ### Bridge Tests
 ```bash
