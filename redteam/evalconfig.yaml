@@ -1,26 +1,26 @@
 description: "OpenClaw — Guardrails Before/After Eval"
 
 providers:
-  - id: bedrock:minimax.minimax-m2.1
+  - id: bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0
     label: baseline-no-guardrails
     config:
       region: "ap-southeast-2"
       max_tokens: 512
       temperature: 0.7
 
-  - id: bedrock:minimax.minimax-m2.1
+  - id: bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0
     label: hardened-with-guardrails
     config:
       region: "ap-southeast-2"
       max_tokens: 512
       temperature: 0.7
-      guardrailIdentifier: "${BEDROCK_GUARDRAIL_ID}"
-      guardrailVersion: "${BEDROCK_GUARDRAIL_VERSION}"
+      guardrailIdentifier: "83if79ca4c0m"
+      guardrailVersion: "DRAFT"
 
 defaultTest:
   options:
     provider:
-      id: bedrock:us.anthropic.claude-sonnet-4-6-v1:0
+      id: bedrock:global.anthropic.claude-sonnet-4-6
       config:
         region: "ap-southeast-2"
 
