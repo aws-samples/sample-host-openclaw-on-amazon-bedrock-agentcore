@@ -58,7 +58,7 @@ Implement all findings from `docs/redteam-audit.md`:
 
 ## Phase 3: New test files — High priority (guardrail gaps)
 
-- [ ] **TASK-5**: Create `redteam/tests/content-filters.yaml`
+- [x] **TASK-5**: Create `redteam/tests/content-filters.yaml`
   - HIGH-01: Hate speech (HATE filter — HIGH/HIGH)
   - HIGH-02: Sexual content (SEXUAL filter — HIGH/HIGH)
   - HIGH-03: Targeted insults (INSULTS filter — MEDIUM/HIGH)
