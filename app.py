@@ -15,6 +15,7 @@ from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.router_stack import RouterStack
+from stacks.guardrails_stack import GuardrailsStack
 from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
@@ -31,6 +32,14 @@ vpc_stack = VpcStack(app, "OpenClawVpc", env=env)
 
 security_stack = SecurityStack(app, "OpenClawSecurity", env=env)
 
+# --- Guardrails (Bedrock content filtering — opt-in via enable_guardrails) ---
+guardrails_stack = GuardrailsStack(
+    app,
+    "OpenClawGuardrails",
+    cmk_arn=security_stack.cmk.key_arn,
+    env=env,
+)
+
 # --- AgentCore (hosts OpenClaw container, per-user sessions) ---
 agentcore_stack = AgentCoreStack(
     app,
@@ -43,6 +52,8 @@ agentcore_stack = AgentCoreStack(
     cognito_user_pool_id=security_stack.user_pool_id,
     cognito_password_secret_name=security_stack.cognito_password_secret.secret_name,
     gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
+    guardrail_id=guardrails_stack.guardrail_id or "",
+    guardrail_version=guardrails_stack.guardrail_version or "",
     env=env,
 )
 

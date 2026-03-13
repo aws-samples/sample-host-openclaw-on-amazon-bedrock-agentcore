@@ -40,6 +40,8 @@ class AgentCoreStack(Stack):
         cognito_user_pool_id: str,
         cognito_password_secret_name: str,
         gateway_token_secret_name: str,
+        guardrail_id: str = "",
+        guardrail_version: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)

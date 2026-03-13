@@ -20,11 +20,11 @@ Add AWS Bedrock Guardrails + promptfoo red team testing to openclaw-on-agentcore
   - CfnOutputs for GuardrailId, GuardrailVersion, GuardrailArn
   - PII entity types verified against CloudFormation docs (EMAIL, PHONE, not EMAIL_ADDRESS/PHONE_NUMBER)
 
-- [ ] **TASK-3**: Wire `GuardrailsStack` into `app.py`
-  - Instantiate after SecurityStack, before AgentCoreStack
-  - Pass guardrail exports to AgentCoreStack
-  - Run `cdk synth` to verify — fix errors
-  - Commit: `feat(cdk): wire GuardrailsStack in app.py`
+- [x] **TASK-3**: Wire `GuardrailsStack` into `app.py`
+  - Instantiated after SecurityStack, before AgentCoreStack
+  - Passed `guardrail_id` and `guardrail_version` to AgentCoreStack (with `or ""` for None safety)
+  - Added `guardrail_id`/`guardrail_version` params to AgentCoreStack constructor (minimal, for synth)
+  - `cdk synth` passed — all 8 stacks including OpenClawGuardrails
 
 - [ ] **TASK-4**: Update `stacks/agentcore_stack.py`
   - Accept `guardrails_stack` param
