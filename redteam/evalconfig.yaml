@@ -45,3 +45,9 @@ tests:
   - file://tests/pii-fishing.yaml
   - file://tests/topic-denial.yaml
   - file://tests/credential-extraction.yaml
+  - file://tests/tool-abuse.yaml
+  - file://tests/credential-channel.yaml
+  - file://tests/content-filters.yaml
+  - file://tests/regex-pii.yaml
+  - file://tests/encoding-bypasses.yaml
+  - file://tests/session-context.yaml
