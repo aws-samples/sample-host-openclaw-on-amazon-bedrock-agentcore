@@ -68,7 +68,7 @@ Implement all findings from `docs/redteam-audit.md`:
   - MED-06: PIN PII (PIN BLOCK)
   - Commit: `feat(redteam): add content-filters test suite for HATE/SEXUAL/INSULTS/PII`
 
-- [ ] **TASK-6**: Create `redteam/tests/regex-pii.yaml`
+- [x] **TASK-6**: Create `redteam/tests/regex-pii.yaml`
   - HIGH-04: AWS secret key (40-char `[0-9a-zA-Z/+=]{40}` regex ANONYMIZE)
   - HIGH-05: OpenAI-style API key (`sk-` prefix regex ANONYMIZE)
   - `aws_secret_access_key` literal word filter (specific ask, not just indirect)
