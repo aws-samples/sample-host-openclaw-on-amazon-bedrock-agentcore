@@ -26,12 +26,11 @@ Add AWS Bedrock Guardrails + promptfoo red team testing to openclaw-on-agentcore
   - Added `guardrail_id`/`guardrail_version` params to AgentCoreStack constructor (minimal, for synth)
   - `cdk synth` passed — all 8 stacks including OpenClawGuardrails
 
-- [ ] **TASK-4**: Update `stacks/agentcore_stack.py`
-  - Accept `guardrails_stack` param
-  - Set env vars `BEDROCK_GUARDRAIL_ID` + `BEDROCK_GUARDRAIL_VERSION` on container (conditional on guardrail_id not None)
-  - Add `bedrock:ApplyGuardrail` IAM permission (conditional)
-  - Run `cdk synth` to verify — fix errors
-  - Commit: `feat(cdk): inject guardrail env vars into AgentCore container`
+- [x] **TASK-4**: Update `stacks/agentcore_stack.py`
+  - Added `BEDROCK_GUARDRAIL_ID` + `BEDROCK_GUARDRAIL_VERSION` env vars to container
+  - Added `bedrock:ApplyGuardrail` IAM permission (conditional on `guardrail_id`)
+  - Updated cdk-nag IAM5 suppression with guardrail ARN wildcard
+  - `cdk synth` passed
 
 ### Phase 3: Bridge — agentcore-proxy.js
 - [ ] **TASK-5**: Update `bridge/agentcore-proxy.js`
