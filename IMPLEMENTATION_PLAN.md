@@ -41,12 +41,12 @@ Add AWS Bedrock Guardrails + promptfoo red team testing to openclaw-on-agentcore
   - `node --check` passed
 
 ### Phase 4: Red Team Folder
-- [ ] **TASK-6**: Scaffold `redteam/` folder
-  - Create folder structure per `specs/redteam-folder.md`
-  - `package.json`, `.gitignore`, `promptfooconfig.yaml`
+- [x] **TASK-6**: Scaffold `redteam/` folder
+  - Created folder structure: `providers/`, `tests/`, `results/`
+  - `package.json`, `.gitignore`, `.env.example`, `system-prompt.txt`
+  - `promptfooconfig.yaml` with full redteam config (20+ plugins, 7 strategies, 2 frameworks)
   - `providers/baseline.yaml` + `providers/hardened.yaml`
   - `results/.gitkeep` + `results/README.md`
-  - Commit: `feat(redteam): scaffold promptfoo red team folder`
 
 - [ ] **TASK-7**: Write test suites
   - `tests/jailbreaks.yaml`
