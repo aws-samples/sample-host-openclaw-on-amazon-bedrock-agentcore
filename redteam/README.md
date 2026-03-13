@@ -94,6 +94,18 @@ npm run report     # opens interactive HTML report
 | `pii-fishing.yaml` | 4 | PII filters + custom regex |
 | `topic-denial.yaml` | 5 | 6 denied topics (crypto, phishing, malware, etc.) |
 | `credential-extraction.yaml` | 4 | Word filters + PII filters |
+| `tool-abuse.yaml` | 8 | SSRF, namespace traversal, injection, resource exhaustion |
+| `credential-channel.yaml` | 8 | Channel secrets, identity confusion, infra metadata |
+| `content-filters.yaml` | 7 | HATE, SEXUAL, INSULTS filters + EMAIL/PHONE/PASSWORD/PIN PII |
+| `regex-pii.yaml` | 4 | AWS secret key regex, OpenAI `sk-` regex, word filters |
+| `encoding-bypasses.yaml` | 6 | Base64, ROT13, multilingual, Unicode, fragmented bypasses |
+| `session-context.yaml` | 4 | Session hijacking, context poisoning, workspace injection |
+
+**Total: 62 test cases across 12 files.**
+
+## Grader Configuration
+
+The `llm-rubric` assertions use **Bedrock Claude Sonnet** as the grader — no `OPENAI_API_KEY` needed. This is configured in `evalconfig.yaml` under `defaultTest.options.provider`.
 
 ## Expected Results
 
@@ -104,6 +116,8 @@ npm run report     # opens interactive HTML report
 | PII redaction rate | ~10% | ~90% |
 | Jailbreak resistance | ~50% | ~85% |
 | Topic denial effectiveness | ~20% | ~95% |
+| Tool abuse resistance | ~20% | ~80% |
+| Credential leakage blocked | ~30% | ~90% |
 
 ## Saving Result Snapshots
 

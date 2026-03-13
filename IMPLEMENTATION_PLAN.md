@@ -1,4 +1,4 @@
-STATUS: IN_PROGRESS
+STATUS: COMPLETE
 
 ## Goal
 Implement all findings from `docs/redteam-audit.md`:
@@ -105,10 +105,10 @@ Implement all findings from `docs/redteam-audit.md`:
   - Total test count: 62 (25 existing + 37 new)
   - Commit: `feat(redteam): wire all new test suites into evalconfig`
 
-- [ ] **TASK-10**: Update `redteam/README.md`
-  - Update test category table with new suites
-  - Update expected test count
-  - Add note about Bedrock grader (no OPENAI_API_KEY needed)
+- [x] **TASK-10**: Update `redteam/README.md`
+  - Updated test category table with all 12 suites (62 total tests)
+  - Added grader configuration section (Bedrock Claude, no OPENAI_API_KEY needed)
+  - Added tool abuse + credential leakage rows to expected results
   - Commit: `docs(redteam): update README with new test suites and grader config`
 
 ---
