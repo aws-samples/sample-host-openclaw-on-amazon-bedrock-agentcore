@@ -64,15 +64,14 @@ Add AWS Bedrock Guardrails + promptfoo red team testing to openclaw-on-agentcore
   - Updated stack count to 8 in Section 5 (cdk-nag)
   - Section 6 had no guardrails entry to remove
 
-- [ ] **TASK-10**: Update `README.md`
-  - Add Bedrock Guardrails to features/architecture section
-  - Add `enable_guardrails` to cdk.json configuration table
-  - Add 💰 cost note
-  - Commit: `docs: add Bedrock Guardrails to README`
+- [x] **TASK-10**: Update `README.md`
+  - Added Bedrock Guardrails to Security section
+  - Added `OpenClawGuardrails` to CDK Stacks table
+  - Added `enable_guardrails` + `guardrails_pii_action` to Configuration table with cost note
 
 ## Learnings
 - TASK-1: Addendum file was never created separately; content was written directly into redteam-design.md
 - TASK-2: CloudFormation PII entity types use short names: `EMAIL` not `EMAIL_ADDRESS`, `PHONE` not `PHONE_NUMBER`, `AWS_ACCESS_KEY` not `AWS_ACCESS_KEY_ID`
 
 ## Status
-IN_PROGRESS
+STATUS: COMPLETE

@@ -79,6 +79,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Encryption**: All data encrypted at rest with customer-managed KMS key (S3, DynamoDB, SNS, Secrets Manager) and in transit (TLS)
 - **CloudTrail**: Optional dedicated trail (`enable_cloudtrail` in cdk.json). Off by default — most AWS accounts already have an organization or account-level trail. Enabling adds a dedicated S3 bucket + trail for this project's audit logs
 - **Least-privilege IAM**: Tightly scoped permissions per component
+- **Bedrock Guardrails**: Content filtering on every Bedrock API call — content filters (hate, violence, prompt attacks), topic denial (6 categories), PII redaction, word filters, and custom regex for credential patterns. Opt-out via `enable_guardrails: false` in `cdk.json`
 - **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
@@ -291,7 +292,8 @@ openclaw-on-agentcore/
 |---|---|---|
 | **OpenClawVpc** | VPC (2 AZ), private/public subnets, NAT, 7 VPC endpoints, flow logs | None |
 | **OpenClawSecurity** | KMS CMK, Secrets Manager (7 secrets incl. webhook validation), Cognito User Pool, optional CloudTrail | None |
-| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM | Vpc, Security |
+| **OpenClawGuardrails** | CfnGuardrail (content filters, topic denial, PII, word filters, regex), CfnGuardrailVersion | Security |
+| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM | Vpc, Security, Guardrails |
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms (errors, latency, throttles), SNS, Bedrock logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
@@ -323,6 +325,8 @@ All tunable parameters are in `cdk.json`:
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
+| `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. Adds ~$0.75/1K text units. Set `false` to disable (reduces safety but saves cost). See [Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails) |
+| `guardrails_pii_action` | `ANONYMIZE` | PII handling: `ANONYMIZE` (redact) or `BLOCK` (reject). Credit cards always BLOCK regardless |
 | `enable_browser` | `false` | Enable headless Chromium browser inside the container. Requires `BROWSER_IDENTIFIER` env var |
 
 ## Channel Setup
