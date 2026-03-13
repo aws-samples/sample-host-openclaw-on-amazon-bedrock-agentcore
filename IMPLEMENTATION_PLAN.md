@@ -48,15 +48,10 @@ Add AWS Bedrock Guardrails + promptfoo red team testing to openclaw-on-agentcore
   - `providers/baseline.yaml` + `providers/hardened.yaml`
   - `results/.gitkeep` + `results/README.md`
 
-- [ ] **TASK-7**: Write test suites
-  - `tests/jailbreaks.yaml`
-  - `tests/prompt-injection.yaml`
-  - `tests/harmful-content.yaml`
-  - `tests/pii-fishing.yaml`
-  - `tests/topic-denial.yaml`
-  - `tests/credential-extraction.yaml`
-  - Min 3 prompts + assertions per file (mapped to threat model in `docs/security.md`)
-  - Commit: `feat(redteam): add promptfoo test suites for all attack categories`
+- [x] **TASK-7**: Write test suites
+  - 6 test files: jailbreaks (4), prompt-injection (4), harmful-content (4), pii-fishing (4), topic-denial (5), credential-extraction (4)
+  - 25 total test cases with llm-rubric + not-contains assertions
+  - Mapped to guardrail policies: content filters, topic denial, PII, word filters
 
 - [ ] **TASK-8**: Write `redteam/README.md`
   - Prerequisites, setup, before/after story, commands
