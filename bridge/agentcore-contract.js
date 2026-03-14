@@ -900,7 +900,19 @@ function extractTextFromContent(content) {
           });
           parsed = JSON.parse(sanitized);
         } catch {
-          // Both failed — fall through, return content as-is
+          // Both failed — try regex extraction below
+        }
+      }
+      if (!parsed) {
+        // Regex fallback for malformed JSON (e.g., "text","value" instead of "text":"value")
+        const textMatch = trimmed.match(/[,{]\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"/);
+        if (textMatch) {
+          try {
+            const extracted = JSON.parse('"' + textMatch[1] + '"');
+            if (extracted) return extractTextFromContent(extracted);
+          } catch {
+            return extractTextFromContent(textMatch[1]);
+          }
         }
       }
       if (parsed && Array.isArray(parsed) && parsed.length > 0 && parsed[0].type === "text") {

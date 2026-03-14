@@ -34,7 +34,19 @@ function extractTextFromContent(content) {
           });
           parsed = JSON.parse(sanitized);
         } catch {
-          // Both failed — fall through, return content as-is
+          // Both failed — try regex extraction below
+        }
+      }
+      if (!parsed) {
+        // Regex fallback for malformed JSON (e.g., "text","value" instead of "text":"value")
+        const textMatch = trimmed.match(/[,{]\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"/);
+        if (textMatch) {
+          try {
+            const extracted = JSON.parse('"' + textMatch[1] + '"');
+            if (extracted) return extractTextFromContent(extracted);
+          } catch {
+            return extractTextFromContent(textMatch[1]);
+          }
         }
       }
       if (parsed && Array.isArray(parsed) && parsed.length > 0 && parsed[0].type === "text") {
@@ -167,6 +179,13 @@ describe("extractTextFromContent", () => {
     // Simulate JSON with actual newline bytes (not escaped \\n)
     const json = '[{"type":"text","text":"Hello' + String.fromCharCode(10) + 'world"}]';
     assert.equal(extractTextFromContent(json), "Hello\nworld");
+  });
+
+  it("extracts text from malformed JSON with comma instead of colon", () => {
+    // Real-world case: "text","value" instead of "text":"value"
+    const malformed = '[{"type":"text","text","\\n\\n## ✅ Hello World"}]';
+    const result = extractTextFromContent(malformed);
+    assert.ok(result.includes("Hello World"), `Expected 'Hello World' in: ${result}`);
   });
 
   it("extracts text from JSON string with literal tab characters", () => {
