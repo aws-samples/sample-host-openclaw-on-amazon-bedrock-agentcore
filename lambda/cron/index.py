@@ -288,18 +288,101 @@ def _extract_text_from_content_blocks(text):
     return result
 
 
+def _tables_to_bullets(text):
+    """Convert markdown tables to bullet lists for Telegram compatibility.
+
+    Markdown tables don't render in Telegram. This converts them to
+    plain bullet lists before HTML conversion.
+
+    Input:
+      | Name | Value |
+      |------|-------|
+      | foo  | bar   |
+      | baz  | qux   |
+
+    Output:
+      • foo — bar
+      • baz — qux
+    """
+    if not text or '|' not in text:
+        return text
+
+    lines = text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Check if this looks like a table row (has | at start or contains |col|col|)
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2:
+            # Collect all consecutive table lines
+            table_lines = []
+            while i < len(lines):
+                tl = lines[i].strip()
+                if tl.startswith('|') and tl.endswith('|'):
+                    table_lines.append(tl)
+                    i += 1
+                else:
+                    break
+
+            # Parse the table
+            # First non-separator row = header; subsequent non-separator rows = data
+            header_cols = None
+            bullets = []
+            for tl in table_lines:
+                # Skip separator rows (contain only |, -, :, space)
+                if re.match(r'^\|[\s\-\:\|]+\|$', tl):
+                    continue
+                cols = [c.strip() for c in tl.strip('|').split('|')]
+                cols = [c for c in cols if c]  # remove empty
+                if not cols:
+                    continue
+                if header_cols is None:
+                    header_cols = cols
+                    # If all header cols are empty or whitespace, skip as header
+                    if all(not c for c in header_cols):
+                        header_cols = None
+                    continue
+                # Data row: format as bullet
+                if len(cols) == 1:
+                    bullets.append(f'• {cols[0]}')
+                elif len(cols) == 2:
+                    bullets.append(f'• {cols[0]} — {cols[1]}')
+                else:
+                    # More cols: join non-empty cols
+                    non_empty = [c for c in cols if c and c not in ('', ' ')]
+                    if non_empty:
+                        bullets.append('• ' + ' — '.join(non_empty))
+
+            if bullets:
+                result.extend(bullets)
+            elif header_cols:
+                # Table had only header, no data rows — show header as bullets
+                for h in header_cols:
+                    if h:
+                        result.append(f'• {h}')
+        else:
+            result.append(lines[i])
+            i += 1
+
+    return '\n'.join(result)
+
+
 def _markdown_to_telegram_html(text):
     """Convert common Markdown to Telegram-compatible HTML.
 
     Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>,
     <a href="">, <blockquote>, <tg-spoiler>.
 
-    Strategy: extract code blocks/inline code first (protect from other
-    conversions), HTML-escape the rest, convert markdown patterns, then
-    re-insert code.
+    Strategy: convert tables to bullets, extract code blocks/inline code
+    first (protect from other conversions), HTML-escape the rest, convert
+    markdown patterns, then re-insert code.
     """
     if not text:
         return text
+
+    # Convert markdown tables to bullet lists (tables don't render in Telegram)
+    text = _tables_to_bullets(text)
 
     placeholders = []
 
@@ -319,47 +402,7 @@ def _markdown_to_telegram_html(text):
         text, flags=re.DOTALL,
     )
 
-    # 2. Extract markdown tables and render as monospace <pre> blocks
-    def _convert_table(m):
-        lines = m.group(0).strip().split("\n")
-        rows = []
-        for line in lines:
-            stripped = line.strip().strip("|").strip()
-            if stripped and not re.match(r"^[\s|:-]+$", stripped):
-                cells = [c.strip() for c in line.strip().strip("|").split("|")]
-                rows.append(cells)
-        if not rows:
-            return m.group(0)
-        col_count = max(len(r) for r in rows)
-        widths = [0] * col_count
-        for row in rows:
-            for i, cell in enumerate(row):
-                if i < col_count:
-                    plain = re.sub(r"\*\*(.+?)\*\*", r"\1", cell)
-                    widths[i] = max(widths[i], len(plain))
-        formatted = []
-        for ri, row in enumerate(rows):
-            parts = []
-            for i in range(col_count):
-                cell = row[i] if i < len(row) else ""
-                plain = re.sub(r"\*\*(.+?)\*\*", r"\1", cell)
-                pad = widths[i] - len(plain) + len(cell)
-                parts.append(cell.ljust(pad))
-            formatted.append("  ".join(parts))
-            if ri == 0:
-                formatted.append("  ".join("─" * w for w in widths))
-        table_text = "\n".join(formatted)
-        table_text = table_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        table_text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", table_text)
-        return _placeholder(f"<pre>{table_text}</pre>")
-
-    text = re.sub(
-        r"(?:^\|.+\|[ \t]*$\n?){2,}",
-        _convert_table,
-        text, flags=re.MULTILINE,
-    )
-
-    # 3. Extract inline code: `text`
+    # 2. Extract inline code: `text`
     text = re.sub(
         r"`([^`\n]+)`",
         lambda m: _placeholder(
@@ -370,10 +413,10 @@ def _markdown_to_telegram_html(text):
         text,
     )
 
-    # 4. HTML-escape remaining text
+    # 3. HTML-escape remaining text
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    # 5. Convert markdown patterns to HTML
+    # 4. Convert markdown patterns to HTML
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
@@ -392,7 +435,7 @@ def _markdown_to_telegram_html(text):
     text = text.replace("</blockquote>\n<blockquote>", "\n")
     text = re.sub(r"^[-=*]{3,}\s*$", "———", text, flags=re.MULTILINE)
 
-    # 6. Re-insert placeholders
+    # 5. Re-insert placeholders
     for idx, content in enumerate(placeholders):
         text = text.replace(f"\x00PH{idx}\x00", content)
 
