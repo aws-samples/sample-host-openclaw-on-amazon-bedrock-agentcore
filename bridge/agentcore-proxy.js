@@ -50,7 +50,7 @@ const SYSTEM_PROMPT =
   "with daily tasks. Keep responses concise unless the user asks for detail. " +
   "If you don't know something, say so honestly. You are accessed through messaging " +
   "channels (WhatsApp, Telegram, Discord, Slack, or a web UI). Keep your responses " +
-  "appropriate for chat-style messaging.";
+  "appropriate for chat-style messaging. Do not use markdown tables in responses — use bullet lists or plain paragraphs, as they render better in chat interfaces like Telegram and Slack.";
 
 // Retry configuration
 const MAX_RETRIES = 3;

@@ -22,20 +22,28 @@ function extractTextFromContent(content) {
   if (typeof content === "string") {
     const trimmed = content.trim();
     if (trimmed.startsWith("[{") && trimmed.endsWith("]")) {
+      let parsed = null;
       try {
-        const parsed = JSON.parse(trimmed);
-        if (
-          Array.isArray(parsed) &&
-          parsed.length > 0 &&
-          parsed[0].type === "text"
-        ) {
-          const text = parsed
-            .filter((b) => b.type === "text")
-            .map((b) => b.text)
-            .join("");
-          return extractTextFromContent(text);
+        parsed = JSON.parse(trimmed);
+      } catch {
+        // Retry with literal control characters escaped (JS JSON.parse is strict)
+        try {
+          const sanitized = trimmed.replace(/[\x00-\x1f\x7f]/g, c => {
+            const e = {"\b":"\\b","\t":"\\t","\n":"\\n","\f":"\\f","\r":"\\r"};
+            return e[c] || ("\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+          });
+          parsed = JSON.parse(sanitized);
+        } catch {
+          // Both failed — fall through, return content as-is
         }
-      } catch {}
+      }
+      if (parsed && Array.isArray(parsed) && parsed.length > 0 && parsed[0].type === "text") {
+        const text = parsed
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("");
+        if (text) return extractTextFromContent(text);
+      }
     }
     return content;
   }
@@ -151,5 +159,18 @@ describe("extractTextFromContent", () => {
       { type: "text", text: " world" },
     ];
     assert.equal(extractTextFromContent(blocks), "Hello world");
+  });
+
+  // --- Literal control character handling (JSON.parse strict mode) ---
+
+  it("extracts text from JSON string with literal newlines", () => {
+    // Simulate JSON with actual newline bytes (not escaped \\n)
+    const json = '[{"type":"text","text":"Hello' + String.fromCharCode(10) + 'world"}]';
+    assert.equal(extractTextFromContent(json), "Hello\nworld");
+  });
+
+  it("extracts text from JSON string with literal tab characters", () => {
+    const json = '[{"type":"text","text":"col1' + String.fromCharCode(9) + 'col2"}]';
+    assert.equal(extractTextFromContent(json), "col1\tcol2");
   });
 });
