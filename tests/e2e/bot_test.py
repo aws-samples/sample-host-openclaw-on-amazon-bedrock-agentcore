@@ -145,7 +145,7 @@ class TestTelegramFormatting:
         assert tail.response_len > 0, "Response was empty"
 
         resp = tail.response_text
-        assert "| ---" not in resp and "|---|" not in resp, (
+        assert "|---" not in resp, (
             f"Markdown table separators leaked to user:\n{resp[:500]}"
         )
 
