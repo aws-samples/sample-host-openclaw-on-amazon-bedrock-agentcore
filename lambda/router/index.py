@@ -486,6 +486,17 @@ def _extract_text_from_content_blocks(text):
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
         break
+    # Regex fallback: handle cases where JSON parsing fails (encoding issues, etc.)
+    stripped_result = result.strip()
+    if stripped_result.startswith("[{") and '"type"' in stripped_result and '"text"' in stripped_result:
+        match = re.search(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"', stripped_result)
+        if match:
+            try:
+                candidate = json.loads('"' + match.group(1) + '"')
+                if candidate and candidate != result:
+                    result = candidate
+            except (json.JSONDecodeError, ValueError):
+                pass
     return result
 
 

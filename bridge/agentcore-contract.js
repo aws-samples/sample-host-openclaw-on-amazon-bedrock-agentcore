@@ -381,6 +381,13 @@ function writeOpenClawConfig() {
         "You are a helpful AI assistant running in a per-user container on AWS.",
         "You have built-in web tools, file storage, scheduling, and many community skills.",
         "",
+        "## Response Formatting",
+        "",
+        "Format responses for chat messaging apps (Telegram, Slack):",
+        "- **No markdown tables** — use bullet lists or plain text paragraphs instead",
+        "- Tables do not render in most chat apps; bullets always work",
+        "- Keep responses concise and chat-appropriate",
+        "",
         "## Built-in Web Tools",
         "",
         "You have built-in **web_search** and **web_fetch** tools:",
@@ -881,21 +888,28 @@ function extractTextFromContent(content) {
     // Check if the string is a JSON-serialized array of content blocks
     const trimmed = content.trim();
     if (trimmed.startsWith("[{") && trimmed.endsWith("]")) {
+      let parsed = null;
       try {
-        const parsed = JSON.parse(trimmed);
-        if (
-          Array.isArray(parsed) &&
-          parsed.length > 0 &&
-          parsed[0].type === "text"
-        ) {
-          const text = parsed
-            .filter((b) => b.type === "text")
-            .map((b) => b.text)
-            .join("");
-          // Recurse to unwrap further nesting
-          return extractTextFromContent(text);
+        parsed = JSON.parse(trimmed);
+      } catch {
+        // Retry with literal control characters escaped (JS JSON.parse is strict)
+        try {
+          const sanitized = trimmed.replace(/[\x00-\x1f\x7f]/g, c => {
+            const e = {"\b":"\\b","\t":"\\t","\n":"\\n","\f":"\\f","\r":"\\r"};
+            return e[c] || ("\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+          });
+          parsed = JSON.parse(sanitized);
+        } catch {
+          // Both failed — fall through, return content as-is
         }
-      } catch {}
+      }
+      if (parsed && Array.isArray(parsed) && parsed.length > 0 && parsed[0].type === "text") {
+        const text = parsed
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("");
+        if (text) return extractTextFromContent(text);
+      }
     }
     // Plain text string
     return content;
@@ -1348,6 +1362,9 @@ const server = http.createServer(async (req, res) => {
               `[contract] Cron bridge error: ${bridgeErr.message}`,
             );
           }
+          // Belt-and-suspenders: strip any remaining content-block JSON wrappers
+          if (responseText) responseText = extractTextFromContent(responseText);
+
           // If bridge returned empty, fall back to lightweight agent
           if (!responseText || !responseText.trim()) {
             console.warn(
@@ -1474,6 +1491,9 @@ const server = http.createServer(async (req, res) => {
             // Proxy not ready yet (should be rare — init awaits proxy)
             responseText = "I'm starting up — please try again in a moment.";
           }
+
+          // Belt-and-suspenders: strip any remaining content-block JSON wrappers
+          if (responseText) responseText = extractTextFromContent(responseText);
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(

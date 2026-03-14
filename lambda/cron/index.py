@@ -246,6 +246,17 @@ def _extract_text_from_content_blocks(text):
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
         break
+    # Regex fallback: handle cases where JSON parsing fails (encoding issues, etc.)
+    stripped_result = result.strip()
+    if stripped_result.startswith("[{") and '"type"' in stripped_result and '"text"' in stripped_result:
+        match = re.search(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"', stripped_result)
+        if match:
+            try:
+                candidate = json.loads('"' + match.group(1) + '"')
+                if candidate and candidate != result:
+                    result = candidate
+            except (json.JSONDecodeError, ValueError):
+                pass
     return result
 
 
@@ -340,7 +351,15 @@ def _markdown_to_telegram_html(text):
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection
+    def _safe_link(m):
+        link_text, link_url = m.group(1), m.group(2)
+        if re.match(r'^(https?://|tg://|mailto:)', link_url):
+            return f'<a href="{link_url}">{link_text}</a>'
+        return m.group(0)  # leave non-http links as plain text
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
     text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
     text = text.replace("</blockquote>\n<blockquote>", "\n")
     text = re.sub(r"^[-=*]{3,}\s*$", "———", text, flags=re.MULTILINE)
