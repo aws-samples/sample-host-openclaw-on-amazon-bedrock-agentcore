@@ -260,21 +260,26 @@ def _extract_text_from_content_blocks(text):
     return result
 
 
-def _tables_to_bullets(text):
-    """Convert markdown tables to bullet lists for Telegram compatibility.
+def _tables_to_pre_ascii(text):
+    """Convert markdown tables to Unicode box-drawing ASCII tables in <pre> blocks.
 
-    Markdown tables don't render in Telegram. This converts them to
-    plain bullet lists before HTML conversion.
+    Telegram's <pre> block uses monospace font, so tables render beautifully.
 
     Input:
-      | Name | Value |
-      |------|-------|
-      | foo  | bar   |
-      | baz  | qux   |
+      | Name | Description |
+      |------|-------------|
+      | foo  | bar baz     |
+      | qux  | quux        |
 
     Output:
-      • foo — bar
-      • baz — qux
+      <pre>
+      ┌──────┬─────────────┐
+      │ Name │ Description │
+      ├──────┼─────────────┤
+      │ foo  │ bar baz     │
+      │ qux  │ quux        │
+      └──────┴─────────────┘
+      </pre>
     """
     if not text or '|' not in text:
         return text
@@ -284,10 +289,8 @@ def _tables_to_bullets(text):
     i = 0
     while i < len(lines):
         line = lines[i]
-        # Check if this looks like a table row (has | at start or contains |col|col|)
         stripped = line.strip()
         if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2:
-            # Collect all consecutive table lines
             table_lines = []
             while i < len(lines):
                 tl = lines[i].strip()
@@ -297,42 +300,52 @@ def _tables_to_bullets(text):
                 else:
                     break
 
-            # Parse the table
-            # First non-separator row = header; subsequent non-separator rows = data
-            header_cols = None
-            bullets = []
+            header = None
+            rows = []
             for tl in table_lines:
-                # Skip separator rows (contain only |, -, :, space)
                 if re.match(r'^\|[\s\-\:\|]+\|$', tl):
                     continue
                 cols = [c.strip() for c in tl.strip('|').split('|')]
-                cols = [c for c in cols if c]  # remove empty
-                if not cols:
-                    continue
-                if header_cols is None:
-                    header_cols = cols
-                    # If all header cols are empty or whitespace, skip as header
-                    if all(not c for c in header_cols):
-                        header_cols = None
-                    continue
-                # Data row: format as bullet
-                if len(cols) == 1:
-                    bullets.append(f'• {cols[0]}')
-                elif len(cols) == 2:
-                    bullets.append(f'• {cols[0]} — {cols[1]}')
+                if header is None:
+                    header = cols
                 else:
-                    # More cols: join non-empty cols
-                    non_empty = [c for c in cols if c and c not in ('', ' ')]
-                    if non_empty:
-                        bullets.append('• ' + ' — '.join(non_empty))
+                    rows.append(cols)
 
-            if bullets:
-                result.extend(bullets)
-            elif header_cols:
-                # Table had only header, no data rows — show header as bullets
-                for h in header_cols:
-                    if h:
-                        result.append(f'• {h}')
+            if not header:
+                result.extend(table_lines)
+                continue
+
+            num_cols = max(len(header), max((len(r) for r in rows), default=0))
+            header = (header + [''] * num_cols)[:num_cols]
+            rows = [(r + [''] * num_cols)[:num_cols] for r in rows]
+
+            col_widths = []
+            for c in range(num_cols):
+                w = max(
+                    len(header[c]),
+                    max((len(row[c]) for row in rows), default=0),
+                    3,
+                )
+                col_widths.append(w)
+
+            def make_row(cells, left='│', sep='│', right='│'):
+                parts = [f' {cells[c]:<{col_widths[c]}} ' for c in range(num_cols)]
+                return left + sep.join(parts) + right
+
+            def make_sep(left, mid, right, fill='─'):
+                parts = [fill * (w + 2) for w in col_widths]
+                return left + mid.join(parts) + right
+
+            table_str = '\n'.join([
+                make_sep('┌', '┬', '┐'),
+                make_row(header),
+                make_sep('├', '┼', '┤'),
+                *[make_row(row) for row in rows],
+                make_sep('└', '┴', '┘'),
+            ])
+
+            table_str = table_str.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            result.append(f'<pre>{table_str}</pre>')
         else:
             result.append(lines[i])
             i += 1
@@ -346,15 +359,15 @@ def _markdown_to_telegram_html(text):
     Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>,
     <a href="">, <blockquote>, <tg-spoiler>.
 
-    Strategy: convert tables to bullets, extract code blocks/inline code
+    Strategy: convert tables to <pre> box-drawing blocks, extract code blocks/inline code
     first (protect from other conversions), HTML-escape the rest, convert
     markdown patterns, then re-insert code.
     """
     if not text:
         return text
 
-    # Convert markdown tables to bullet lists (tables don't render in Telegram)
-    text = _tables_to_bullets(text)
+    # Convert markdown tables to Unicode box-drawing ASCII in <pre> blocks
+    text = _tables_to_pre_ascii(text)
 
     placeholders = []
 
@@ -362,6 +375,13 @@ def _markdown_to_telegram_html(text):
         idx = len(placeholders)
         placeholders.append(content)
         return f"\x00PH{idx}\x00"
+
+    # 0. Extract table <pre> blocks (already HTML-escaped by _tables_to_pre_ascii)
+    text = re.sub(
+        r"<pre>(.*?)</pre>",
+        lambda m: _placeholder(f"<pre>{m.group(1)}</pre>"),
+        text, flags=re.DOTALL,
+    )
 
     # 1. Extract fenced code blocks: ```lang\n...\n```
     text = re.sub(

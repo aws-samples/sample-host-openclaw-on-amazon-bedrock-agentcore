@@ -162,45 +162,49 @@ class TestMarkdownToTelegramHtml(unittest.TestCase):
         # The * at start of line followed by space should NOT become <i>
         self.assertNotIn("<i>", result)
 
-    # --- Tables (converted to bullet lists) ---
+    # --- Tables (converted to Unicode box-drawing <pre> blocks) ---
 
-    def test_simple_table_to_bullets(self):
-        """Markdown table is converted to bullet list."""
-        text = (
-            "| Name   | Age |\n"
-            "|--------|-----|\n"
-            "| Alice  | 30  |\n"
-            "| Bob    | 25  |"
-        )
-        result = index._markdown_to_telegram_html(text)
-        self.assertIn("•", result)
-        self.assertIn("Alice", result)
-        self.assertIn("Bob", result)
-        # No table artifacts
-        self.assertNotIn("|", result)
-        self.assertNotIn("---", result)
+    def test_table_to_pre_ascii(self):
+        """Markdown table is converted to Unicode box-drawing <pre> block."""
+        md = "| Name | Value |\n|------|-------|\n| foo  | bar   |\n| baz  | qux   |"
+        result = index._markdown_to_telegram_html(md)
+        self.assertIn('<pre>', result)
+        self.assertIn('foo', result)
+        self.assertIn('bar', result)
+        self.assertIn('│', result)
+        self.assertIn('┌', result)
+        self.assertIn('└', result)
+
+    def test_table_no_markdown_separators_leak(self):
+        """No markdown separator rows leak into output."""
+        md = "| A | B |\n|---|---|\n| 1 | 2 |"
+        result = index._markdown_to_telegram_html(md)
+        self.assertNotIn('|---|', result)
+        self.assertNotIn('| ---', result)
+        self.assertIn('<pre>', result)
 
     def test_table_separator_variations(self):
         """Various separator row styles are handled."""
         for sep in ["|---|---|", "|-----|-----|", "|:---|---:|", "|:---:|:---:|"]:
             text = f"| A | B |\n{sep}\n| x | y |"
             result = index._markdown_to_telegram_html(text)
-            self.assertIn("•", result, f"Failed for separator: {sep}")
+            self.assertIn('<pre>', result, f"Failed for separator: {sep}")
             self.assertNotIn("|---", result, f"Separator leaked for: {sep}")
 
     def test_table_header_only(self):
-        """Table with header but no data rows shows header as bullets."""
+        """Table with header but no data rows renders header in box."""
         text = (
             "| Name | Value |\n"
             "|------|-------|\n"
         )
         result = index._markdown_to_telegram_html(text)
-        self.assertIn("•", result)
-        self.assertIn("Name", result)
-        self.assertIn("Value", result)
+        self.assertIn('<pre>', result)
+        self.assertIn('Name', result)
+        self.assertIn('Value', result)
+        self.assertIn('┌', result)
 
     def test_single_col_table(self):
-        """Single-column table data rows become bullets."""
+        """Single-column table renders as box-drawing."""
         text = (
             "| Item |\n"
             "|------|\n"
@@ -208,11 +212,13 @@ class TestMarkdownToTelegramHtml(unittest.TestCase):
             "| banana |"
         )
         result = index._markdown_to_telegram_html(text)
-        self.assertIn("• apple", result)
-        self.assertIn("• banana", result)
+        self.assertIn('<pre>', result)
+        self.assertIn('apple', result)
+        self.assertIn('banana', result)
+        self.assertIn('│', result)
 
     def test_multi_col_table(self):
-        """3+ column table joins cols with em dash."""
+        """3+ column table renders with box-drawing separators."""
         text = (
             "| Name | Age | City |\n"
             "|------|-----|------|\n"
@@ -220,28 +226,17 @@ class TestMarkdownToTelegramHtml(unittest.TestCase):
             "| Bob | 25 | LA |"
         )
         result = index._markdown_to_telegram_html(text)
-        self.assertIn("•", result)
-        self.assertIn("Alice", result)
-        self.assertIn("NYC", result)
-        self.assertIn("—", result)
+        self.assertIn('<pre>', result)
+        self.assertIn('Alice', result)
+        self.assertIn('NYC', result)
+        self.assertIn('│', result)
+        self.assertIn('┼', result)
 
     def test_no_table_passthrough(self):
         """Text without tables passes through unchanged."""
         text = "No table here, just plain text."
         result = index._markdown_to_telegram_html(text)
         self.assertEqual(result, text)
-
-    def test_table_with_bold(self):
-        """Bold text in table cells is rendered as HTML bold."""
-        text = (
-            "| Language       | Speed |\n"
-            "|----------------|-------|\n"
-            "| **Python**     | Slow  |\n"
-            "| **Rust**       | Fast  |"
-        )
-        result = index._markdown_to_telegram_html(text)
-        self.assertIn("<b>Python</b>", result)
-        self.assertIn("<b>Rust</b>", result)
 
     def test_table_with_surrounding_text(self):
         """Table embedded in text is converted; surrounding text is preserved."""
@@ -254,11 +249,11 @@ class TestMarkdownToTelegramHtml(unittest.TestCase):
         )
         result = index._markdown_to_telegram_html(text)
         self.assertIn("Here is a comparison:", result)
-        self.assertIn("•", result)
+        self.assertIn('<pre>', result)
         self.assertIn("That", result)
 
     def test_table_html_entities_escaped(self):
-        """HTML special chars in bullet text are escaped."""
+        """HTML special chars in table cells are escaped."""
         text = (
             "| Expr   | Result |\n"
             "|--------|--------|\n"
@@ -268,6 +263,7 @@ class TestMarkdownToTelegramHtml(unittest.TestCase):
         result = index._markdown_to_telegram_html(text)
         self.assertIn("&lt;", result)
         self.assertIn("&gt;", result)
+        self.assertIn('<pre>', result)
 
 
 if __name__ == "__main__":
