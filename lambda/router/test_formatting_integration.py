@@ -1,8 +1,8 @@
 """Integration tests for the full formatting pipeline.
 
 Validates that content-block JSON wrappers are stripped and markdown tables
-are converted to Unicode box-drawing <pre> blocks for Telegram — end-to-end
-through both _extract_text_from_content_blocks and _markdown_to_telegram_html.
+are converted to bold-bullet lists for Telegram — end-to-end through both
+_extract_text_from_content_blocks and _markdown_to_telegram_html.
 """
 
 import json
@@ -88,15 +88,14 @@ class TestFullPipeline(unittest.TestCase):
     # --- No markdown table separators ---
 
     def test_table_converted_no_markdown_separators(self):
-        """Markdown table is converted to <pre> box-drawing — no |---| leaks."""
+        """Markdown table is converted to bullets — no |---| leaks."""
         html = self._pipeline(SAMPLE_CONTENT_BLOCKS)
         self.assertNotIn("| ---", html)
         self.assertNotIn("|---|", html)
         self.assertNotIn("|----", html)
         self.assertNotIn("|---", html)
         self.assertNotIn("|------", html)
-        self.assertIn("<pre>", html)
-        self.assertIn("│", html)
+        self.assertIn("<b>", html)
 
     def test_table_in_double_wrapped_response(self):
         """Table inside double-wrapped content blocks is rendered correctly."""
@@ -111,9 +110,8 @@ class TestFullPipeline(unittest.TestCase):
         ])}])
         html = self._pipeline(payload)
         self.assertNotIn("|---|", html)
-        self.assertIn("<pre>", html)
-        self.assertIn("│", html)
-        self.assertIn("Cron", html)
+        self.assertIn("<b>Cron</b>", html)
+        self.assertIn("Yes", html)
 
     # --- Output is plain text or valid Telegram HTML ---
 
@@ -131,9 +129,9 @@ class TestFullPipeline(unittest.TestCase):
         html = self._pipeline(SAMPLE_CONTENT_BLOCKS)
         # Headers become bold
         self.assertIn("<b>", html)
-        # Tables become <pre> box-drawing blocks
-        self.assertIn("<pre>", html)
-        self.assertIn("│", html)
+        # Tables become bullet lists with bold names
+        self.assertIn("\u2022", html)
+        self.assertIn("\u2014", html)
 
     # --- Realistic subagent payloads ---
 
@@ -183,10 +181,10 @@ class TestFullPipeline(unittest.TestCase):
 
 
 class TestExtractionThenHtml(unittest.TestCase):
-    """Focused tests on extraction → HTML conversion ordering."""
+    """Focused tests on extraction -> HTML conversion ordering."""
 
     def test_extraction_strips_before_html_converts(self):
-        """Content blocks are fully unwrapped BEFORE markdown → HTML conversion."""
+        """Content blocks are fully unwrapped BEFORE markdown -> HTML conversion."""
         wrapped = json.dumps([{"type": "text", "text": "**Bold** and *italic*"}])
         extracted = index._extract_text_from_content_blocks(wrapped)
         self.assertEqual(extracted, "**Bold** and *italic*")
@@ -194,8 +192,8 @@ class TestExtractionThenHtml(unittest.TestCase):
         self.assertIn("<b>Bold</b>", html)
         self.assertIn("<i>italic</i>", html)
 
-    def test_table_in_content_blocks_becomes_pre_ascii(self):
-        """Table inside content blocks → extracted → converted to <pre> box-drawing."""
+    def test_table_in_content_blocks_becomes_bullets(self):
+        """Table inside content blocks -> extracted -> converted to bullet list."""
         table_md = (
             "| A | B |\n"
             "|---|---|\n"
@@ -205,8 +203,8 @@ class TestExtractionThenHtml(unittest.TestCase):
         extracted = index._extract_text_from_content_blocks(wrapped)
         self.assertEqual(extracted, table_md)
         html = index._markdown_to_telegram_html(extracted)
-        self.assertIn("<pre>", html)
-        self.assertIn("│", html)
+        self.assertIn("<b>1</b>", html)
+        self.assertIn("2", html)
         self.assertNotIn("|---|", html)
 
     def test_multiple_blocks_concatenated_then_formatted(self):

@@ -500,26 +500,15 @@ def _extract_text_from_content_blocks(text):
     return result
 
 
-def _tables_to_pre_ascii(text):
-    """Convert markdown tables to Unicode box-drawing ASCII tables in <pre> blocks.
+def _tables_to_bullets(text):
+    """Convert markdown tables to bold-name bullet lists for Telegram.
 
-    Telegram's <pre> block uses monospace font, so tables render beautifully.
+    | Name | Description |       ->    • **Name** — Description
+    |------|-------------|
+    | foo  | bar         |       ->    • **foo** — bar
 
-    Input:
-      | Name | Description |
-      |------|-------------|
-      | foo  | bar baz     |
-      | qux  | quux        |
-
-    Output:
-      <pre>
-      ┌──────┬─────────────┐
-      │ Name │ Description │
-      ├──────┼─────────────┤
-      │ foo  │ bar baz     │
-      │ qux  │ quux        │
-      └──────┴─────────────┘
-      </pre>
+    Works with CJK characters and emoji (no alignment issues).
+    Uses ** for bold so _markdown_to_telegram_html converts to <b> tags.
     """
     if not text or '|' not in text:
         return text
@@ -528,8 +517,7 @@ def _tables_to_pre_ascii(text):
     result = []
     i = 0
     while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
+        stripped = lines[i].strip()
         if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2:
             table_lines = []
             while i < len(lines):
@@ -541,51 +529,25 @@ def _tables_to_pre_ascii(text):
                     break
 
             header = None
-            rows = []
+            bullets = []
             for tl in table_lines:
                 if re.match(r'^\|[\s\-\:\|]+\|$', tl):
                     continue
                 cols = [c.strip() for c in tl.strip('|').split('|')]
+                cols = [c for c in cols if c]
+                if not cols:
+                    continue
                 if header is None:
                     header = cols
-                else:
-                    rows.append(cols)
+                    continue
+                if len(cols) == 1:
+                    bullets.append(f'\u2022 {cols[0]}')
+                elif len(cols) >= 2:
+                    name = cols[0]
+                    desc = ' \u2014 '.join(cols[1:])
+                    bullets.append(f'\u2022 **{name}** \u2014 {desc}')
 
-            if not header:
-                result.extend(table_lines)
-                continue
-
-            num_cols = max(len(header), max((len(r) for r in rows), default=0))
-            header = (header + [''] * num_cols)[:num_cols]
-            rows = [(r + [''] * num_cols)[:num_cols] for r in rows]
-
-            col_widths = []
-            for c in range(num_cols):
-                w = max(
-                    len(header[c]),
-                    max((len(row[c]) for row in rows), default=0),
-                    3,
-                )
-                col_widths.append(w)
-
-            def make_row(cells, left='│', sep='│', right='│'):
-                parts = [f' {cells[c]:<{col_widths[c]}} ' for c in range(num_cols)]
-                return left + sep.join(parts) + right
-
-            def make_sep(left, mid, right, fill='─'):
-                parts = [fill * (w + 2) for w in col_widths]
-                return left + mid.join(parts) + right
-
-            table_str = '\n'.join([
-                make_sep('┌', '┬', '┐'),
-                make_row(header),
-                make_sep('├', '┼', '┤'),
-                *[make_row(row) for row in rows],
-                make_sep('└', '┴', '┘'),
-            ])
-
-            table_str = table_str.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            result.append(f'<pre>{table_str}</pre>')
+            result.extend(bullets)
         else:
             result.append(lines[i])
             i += 1
@@ -599,15 +561,15 @@ def _markdown_to_telegram_html(text):
     Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>,
     <a href="">, <blockquote>, <tg-spoiler>.
 
-    Strategy: convert tables to <pre> box-drawing blocks, extract code
-    blocks/inline code (protect from other conversions), HTML-escape the
-    rest, convert markdown patterns, then re-insert code.
+    Strategy: convert tables to bullet lists, extract code blocks/inline
+    code (protect from other conversions), HTML-escape the rest, convert
+    markdown patterns, then re-insert code.
     """
     if not text:
         return text
 
-    # Convert markdown tables to Unicode box-drawing ASCII in <pre> blocks
-    text = _tables_to_pre_ascii(text)
+    # Convert markdown tables to bullet lists (uses ** for bold, converted below)
+    text = _tables_to_bullets(text)
 
     placeholders = []
 
@@ -615,13 +577,6 @@ def _markdown_to_telegram_html(text):
         idx = len(placeholders)
         placeholders.append(content)
         return f"\x00PH{idx}\x00"
-
-    # 0. Extract table <pre> blocks (already HTML-escaped by _tables_to_pre_ascii)
-    text = re.sub(
-        r"<pre>(.*?)</pre>",
-        lambda m: _placeholder(f"<pre>{m.group(1)}</pre>"),
-        text, flags=re.DOTALL,
-    )
 
     # 1. Extract fenced code blocks: ```lang\n...\n```
     text = re.sub(
