@@ -102,6 +102,74 @@ class TestMessageLifecycle:
         assert tail.response_len > 0, "Response was empty"
 
 
+class TestTelegramFormatting:
+    """Verify Telegram responses don't leak raw JSON or markdown table syntax.
+
+    These are E2E smoke tests that send real webhooks and inspect the response
+    text captured from CloudWatch logs.
+    """
+
+    def test_no_raw_json_content_blocks(self, e2e_config):
+        """Response text should not contain raw content-block JSON wrappers."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(e2e_config, "List 3 things you can help me with")
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Incomplete lifecycle (timed_out={tail.timed_out})"
+        )
+        assert tail.response_len > 0, "Response was empty"
+
+        resp = tail.response_text
+        assert '[{"type":"text"' not in resp, (
+            f"Raw JSON content-block wrapper leaked to user:\n{resp[:500]}"
+        )
+        assert '{"type": "text"' not in resp, (
+            f"Raw JSON content-block wrapper (spaced) leaked to user:\n{resp[:500]}"
+        )
+
+    def test_no_markdown_tables_in_response(self, e2e_config):
+        """Response text should not contain markdown table separators."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            "Show a table comparing pros and cons of bullet lists vs tables",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Incomplete lifecycle (timed_out={tail.timed_out})"
+        )
+        assert tail.response_len > 0, "Response was empty"
+
+        resp = tail.response_text
+        assert "| ---" not in resp and "|---|" not in resp, (
+            f"Markdown table separators leaked to user:\n{resp[:500]}"
+        )
+
+    def test_response_is_plain_text_or_html(self, e2e_config):
+        """Response should be plain text or Telegram HTML, not raw JSON."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(e2e_config, "Say hello and tell me your name")
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Incomplete lifecycle (timed_out={tail.timed_out})"
+        )
+        assert tail.response_len > 0, "Response was empty"
+
+        resp = tail.response_text.lstrip()
+        assert not resp.startswith("[{"), (
+            f"Response starts with raw JSON array:\n{resp[:500]}"
+        )
+        assert "|---|" not in resp, (
+            f"Markdown table separators in response:\n{resp[:500]}"
+        )
+
+
 class TestColdStart:
     """Cold start tests — reset session, send message, verify new session creation."""
 
