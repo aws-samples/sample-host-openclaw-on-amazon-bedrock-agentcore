@@ -107,6 +107,15 @@ class AgentCoreStack(Stack):
                 ],
             )
         )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "aws-marketplace:ViewSubscriptions",
+                    "aws-marketplace:Subscribe",
+                ],
+                resources=["*"],
+            )
+        )
 
         # Secrets Manager — scoped to the 2 secrets the container actually needs
         # (gateway token for WebSocket auth, Cognito secret for identity derivation)
