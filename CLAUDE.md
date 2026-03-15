@@ -175,8 +175,8 @@ openclaw-on-agentcore/
 | Stack | Key Resources | Dependencies |
 |---|---|---|
 | **OpenClawVpc** | VPC (2 AZ), subnets, NAT, 7 VPC endpoints, flow logs | None |
-| **OpenClawSecurity** | KMS CMK, Secrets Manager (7 secrets incl. webhook validation), Cognito User Pool, optional CloudTrail | None |
-| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM | Vpc, Security |
+| **OpenClawSecurity** | KMS CMK, Secrets Manager (8 secrets incl. webhook validation + feishu), Cognito User Pool, optional CloudTrail | None |
+| **OpenClawAgentCore** | Execution Role, Security Group, S3 bucket (Runtime/Endpoint managed by Starter Toolkit) | Vpc, Security |
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms, SNS, Bedrock invocation logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
@@ -184,30 +184,53 @@ openclaw-on-agentcore/
 
 ## Expected Commands
 
-### CDK
+### Hybrid Deploy (CDK + Starter Toolkit)
+
+Deployment uses a 3-phase hybrid model: CDK for infrastructure, Starter Toolkit for Runtime/container.
+
 ```bash
-source .venv/bin/activate
-cdk synth                                    # synthesize + cdk-nag checks
-cdk deploy --all --require-approval never    # deploy all stacks
-cdk deploy OpenClawAgentCore                 # deploy single stack
-cdk diff                                     # preview changes
-cdk destroy --all                            # tear down
+# Full deploy via script (recommended)
+./scripts/deploy.sh                  # all 3 phases
+./scripts/deploy.sh --phase1         # CDK foundation only
+./scripts/deploy.sh --runtime-only   # Starter Toolkit only
+./scripts/deploy.sh --phase3         # CDK dependent stacks only
 ```
 
-### Build & Push Bridge Image (after CDK deploy creates ECR repo)
+#### Phase 1: CDK foundation stacks
 ```bash
+source .venv/bin/activate
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export CDK_DEFAULT_REGION=us-west-2  # change to your preferred region
+export CDK_DEFAULT_REGION=us-west-2
+cdk deploy OpenClawVpc OpenClawSecurity OpenClawAgentCore OpenClawObservability --require-approval never
+```
 
-aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
-  docker login --username AWS --password-stdin \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com
-VERSION=$(python3 -c "import json; print(json.load(open('cdk.json'))['context']['image_version'])")
-docker build --platform linux/arm64 -t openclaw-bridge:v${VERSION} bridge/
-docker tag openclaw-bridge:v${VERSION} \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
-docker push \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
+#### Phase 2: Starter Toolkit (Runtime + Docker build)
+```bash
+# Configure (first time only)
+agentcore configure --name openclaw_agent --entrypoint bridge/agentcore-contract.js \
+  --execution-role <ROLE_ARN> --region us-west-2 --vpc \
+  --subnets <SUBNET_IDS> --security-groups <SG_ID> \
+  --deployment-type container --language typescript --non-interactive
+
+# Deploy (builds Docker image locally or via CodeBuild, creates/updates Runtime)
+agentcore deploy --agent openclaw_agent --local-build --auto-update-on-conflict \
+  --env "BEDROCK_MODEL_ID=global.anthropic.claude-opus-4-6-v1" \
+  --env "S3_USER_FILES_BUCKET=openclaw-user-files-..." ...
+
+# Update cdk.json with runtime_id and runtime_endpoint_id from toolkit output
+```
+
+#### Phase 3: CDK dependent stacks
+```bash
+cdk deploy OpenClawRouter OpenClawCron OpenClawTokenMonitoring --require-approval never
+```
+
+### Other CDK commands
+```bash
+cdk synth                                    # synthesize + cdk-nag checks
+cdk diff                                     # preview changes
+cdk destroy --all                            # tear down (does NOT destroy Starter Toolkit resources)
+agentcore destroy --agent openclaw_agent     # destroy Starter Toolkit resources
 ```
 
 ### Webhook Setup (Telegram)
@@ -301,15 +324,12 @@ cd tests/e2e && python -m pytest bot_test.py -v -k TestBrowserFeature  # browser
 
 ### Runtime Operations
 ```bash
-# Get runtime ID
-RUNTIME_ID=$(aws cloudformation describe-stacks \
-  --stack-name OpenClawAgentCore \
-  --query "Stacks[0].Outputs[?OutputKey=='RuntimeId'].OutputValue" \
-  --output text --region $CDK_DEFAULT_REGION)
+# Get runtime status (via Starter Toolkit)
+agentcore status --agent openclaw_agent --verbose
 
-# Check runtime status
+# Or via AWS CLI (runtime_id from cdk.json or .bedrock_agentcore.yaml)
 aws bedrock-agentcore get-runtime \
-  --agent-runtime-id $RUNTIME_ID \
+  --agent-runtime-id openclaw_agent-FMElB5ECU7 \
   --region $CDK_DEFAULT_REGION
 
 # Check DynamoDB identity table
@@ -322,7 +342,9 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` |
 | `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
-| `default_model_id` | `minimax.minimax-m2.1` | Bedrock model ID. The `global.` prefix routes to any available region |
+| `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID. The `global.` prefix routes to any available region |
+| `runtime_id` | (empty) | AgentCore Runtime ID from Starter Toolkit. Populated by deploy script after `agentcore deploy` |
+| `runtime_endpoint_id` | (empty) | AgentCore Runtime Endpoint ID. Typically `DEFAULT` when using Starter Toolkit |
 | `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
 | `cloudwatch_log_retention_days` | `30` | Log retention |
 | `daily_token_budget` | `1000000` | Token budget alarm threshold |
@@ -433,15 +455,17 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 ## Gotchas
 
 ### AgentCore Runtime
-- **ARM64 required**: Build with `--platform linux/arm64`
-- **Push image after CDK deploy**: CDK creates the ECR repo — do not manually create it (causes `Resource already exists` error). Push the image after `cdk deploy`. AgentCore pulls the image at session start, not deploy time
+- **Hybrid deploy**: Runtime/Endpoint/ECR managed by Starter Toolkit (`agentcore deploy`), not CDK. CDK manages IAM Role, SG, S3, Lambda, etc. See `./scripts/deploy.sh` for the 3-phase flow
+- **ARM64 required**: Build with `--platform linux/arm64`. This machine is ARM64 native — use `--local-build` mode
+- **Docker Hub rate limit**: Dockerfile uses `public.ecr.aws/docker/library/node:22-slim` (ECR Public Gallery) instead of Docker Hub to avoid anonymous pull rate limits in CodeBuild
+- **IAM role names are region-suffixed**: `openclaw-agentcore-execution-role-{region}` and `openclaw-cron-scheduler-role-{region}` to avoid cross-region conflicts (IAM roles are global)
+- **Trust policy self-assume**: Uses `AccountRootPrincipal()` + `ArnEquals` condition (not `ArnPrincipal`) to avoid chicken-and-egg during role creation
 - **Resource names**: Must match `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` — underscores, not hyphens
 - **Health check timing**: Contract server on port 8080 must start within seconds
 - **Per-user sessions**: Contract returns `Healthy` (not `HealthyBusy`) — allows natural idle termination
 - **Session recreation**: InvokeAgentRuntime with terminated session creates new microVM; workspace restored on init
 - **VPC endpoints**: `bedrock-agentcore-runtime` endpoint not available in all regions
-- **Endpoint version drift**: `CfnRuntimeEndpoint` must set `agent_runtime_version=self.runtime.attr_agent_runtime_version`
-- **CDK L1 property gaps**: workload_identity_details and request_header_configuration on CfnRuntime are not yet supported in the installed CDK version — TODOs in agentcore_stack.py
+- **Starter Toolkit source_path**: Must point to `bridge/` directory (contains Dockerfile and all COPY sources). If source_path is project root, COPY commands fail because paths are relative to bridge/
 
 ### IAM / Bedrock
 - **Cross-region inference**: Model `minimax.minimax-m2.1` uses a global cross-region inference profile that routes to any available region — IAM uses `arn:aws:bedrock:*::foundation-model/*` and inference-profile wildcards
@@ -548,7 +572,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 Always confirm which git branch you are on BEFORE making any code changes or deployments. If the user specifies a branch, switch to it first and verify with `git branch --show-current`. Never assume the current branch is correct.
 
 ### Deployment Target
-Default deployment region is `ap-southeast-2`. Always use this region for ECR, CDK, and Docker operations unless explicitly told otherwise. After deploying, verify the old session/container is replaced — stale sessions can mask fixes.
+Default deployment region is `us-west-2`. Hybrid deployment: CDK manages infrastructure (VPC, IAM, S3, Lambda, etc.), Starter Toolkit manages Runtime/Endpoint/ECR/Docker build. Use `./scripts/deploy.sh` for the full 3-phase flow. After deploying, verify the old session/container is replaced — stale sessions can mask fixes.
 
 ### Git Operations
 Never push to any remote (GitHub, GitLab, or otherwise) without explicit user confirmation. Always ask before pushing.
