@@ -185,10 +185,11 @@ class AgentCoreStack(Stack):
         self.execution_role.assume_role_policy.add_statements(
             iam.PolicyStatement(
                 actions=["sts:AssumeRole"],
-                principals=[iam.ArnPrincipal(execution_role_arn_str)],
+                principals=[iam.AnyPrincipal()],
                 conditions={
                     "StringLike": {
-                        "sts:RoleSessionName": "scoped-*"
+                        "aws:PrincipalArn": execution_role_arn_str,
+                        "sts:RoleSessionName": "scoped-*",
                     }
                 },
             )
