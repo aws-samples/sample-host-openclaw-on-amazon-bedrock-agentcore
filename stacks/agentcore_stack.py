@@ -18,6 +18,7 @@ from aws_cdk import (
     Duration,
     Stack,
     RemovalPolicy,
+    aws_bedrockagentcore as agentcore,
     aws_ec2 as ec2,
     aws_iam as iam,
     aws_kms as kms,
@@ -331,13 +332,10 @@ class AgentCoreStack(Stack):
                     )
                 )
 
-                # Inject browser identifier into Runtime environment variables.
-                # CfnRuntime.environment_variables is a map — override the property
-                # to include the new key (CDK L1 constructs expose cfn_options).
-                self.runtime.add_property_override(
-                    "EnvironmentVariables.BROWSER_IDENTIFIER",
-                    self.browser.attr_browser_id,
-                )
+                # In hybrid deploy mode, Runtime is managed by Starter Toolkit.
+                # Browser identifier is passed via --env BROWSER_IDENTIFIER=<id>
+                # during `agentcore deploy`. Export it for the deploy script.
+                self.browser_id = self.browser.attr_browser_id
 
         # --- Outputs ----------------------------------------------------------
         CfnOutput(self, "ExecutionRoleArn", value=self.execution_role.role_arn)
