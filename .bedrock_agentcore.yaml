@@ -4,12 +4,12 @@ agents:
     name: openclaw_agent
     language: typescript
     node_version: '20'
-    entrypoint: /home/ubuntu/g-repo/openclaw-deploy/bridge/agentcore-contract.js
+    entrypoint: /home/ubuntu/g-repo/sample-host-openclaw-on-amazon-bedrock-agentcore/bridge/agentcore-contract.js
     deployment_type: container
     runtime_type: null
     platform: linux/arm64
     container_runtime: docker
-    source_path: /home/ubuntu/g-repo/openclaw-deploy/bridge
+    source_path: /home/ubuntu/g-repo/sample-host-openclaw-on-amazon-bedrock-agentcore/bridge
     aws:
       execution_role: arn:aws:iam::576186206185:role/openclaw-agentcore-execution-role-us-west-2
       execution_role_auto_create: true
@@ -37,7 +37,7 @@ agents:
     bedrock_agentcore:
       agent_id: openclaw_agent-FMElB5ECU7
       agent_arn: arn:aws:bedrock-agentcore:us-west-2:576186206185:runtime/openclaw_agent-FMElB5ECU7
-      agent_session_id: df64dc33-1359-40ce-b147-ec1847f99386
+      agent_session_id: null
     codebuild:
       project_name: bedrock-agentcore-openclaw_agent-builder
       execution_role: arn:aws:iam::576186206185:role/AmazonBedrockAgentCoreSDKCodeBuild-us-west-2-fa79fb8b0d

@@ -1,10 +1,10 @@
-"""Router Stack — API Gateway HTTP API for Telegram/Slack webhook ingestion.
+"""Router Stack — API Gateway HTTP API for Telegram/Slack/Feishu webhook ingestion.
 
 Deploys the Router Lambda behind an API Gateway HTTP API with explicit
 routes for each webhook path. Webhook secret validation (Telegram
-secret_token header, Slack HMAC signature) is enforced inside the Lambda.
-Also creates the DynamoDB identity table for user resolution and
-cross-channel binding.
+secret_token header, Slack HMAC signature, Feishu X-Lark-Signature)
+is enforced inside the Lambda. Also creates the DynamoDB identity table
+for user resolution and cross-channel binding.
 """
 
 from aws_cdk import (
@@ -37,6 +37,7 @@ class RouterStack(Stack):
         gateway_token_secret_name: str,
         telegram_token_secret_name: str,
         slack_token_secret_name: str,
+        feishu_token_secret_name: str,
         webhook_secret_name: str,
         cmk_arn: str,
         user_files_bucket_name: str,
@@ -97,6 +98,7 @@ class RouterStack(Stack):
                 "IDENTITY_TABLE_NAME": self.identity_table.table_name,
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
+                "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
                 "WEBHOOK_SECRET_ID": webhook_secret_name,
                 "REGISTRATION_OPEN": registration_open,
                 "USER_FILES_BUCKET": user_files_bucket_name,
@@ -128,6 +130,11 @@ class RouterStack(Stack):
         )
         self.http_api.add_routes(
             path="/webhook/slack",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=lambda_integration,
+        )
+        self.http_api.add_routes(
+            path="/webhook/feishu",
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
