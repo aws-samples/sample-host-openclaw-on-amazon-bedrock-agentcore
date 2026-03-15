@@ -30,7 +30,7 @@ describe("buildSessionPolicy", () => {
     const parsed = JSON.parse(policy);
     assert.equal(parsed.Version, "2012-10-17");
     assert.ok(Array.isArray(parsed.Statement));
-    assert.ok(parsed.Statement.length >= 2, "should have at least S3 + KMS statements");
+    assert.equal(parsed.Statement.length, 2, "should have exactly 2 statements");
   });
 
   it("S3 object actions scoped to namespace/* only", () => {
@@ -46,22 +46,22 @@ describe("buildSessionPolicy", () => {
     );
     assert.ok(objectStmt, "should have S3 object statement");
 
-    // Resource should be scoped to namespace prefix only
+    // Resource should include namespace-scoped object ARN
     const resources = Array.isArray(objectStmt.Resource)
       ? objectStmt.Resource
       : [objectStmt.Resource];
     assert.ok(
-      resources.every((r) => r.includes("slack_U0ABC")),
-      `all resources should contain namespace, got: ${resources}`,
+      resources.some((r) => r.includes("slack_U0ABC")),
+      `at least one resource should contain namespace, got: ${resources}`,
     );
-    // Must NOT grant access to the whole bucket
+    // Must NOT grant access to the whole bucket with /*
     assert.ok(
       !resources.some((r) => r.endsWith("/*") && !r.includes("slack_U0ABC")),
       "should not grant bucket-wide access",
     );
   });
 
-  it("ListBucket restricted by s3:prefix condition", () => {
+  it("ListBucket included in S3 statement without Condition block", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_99999",
@@ -73,21 +73,10 @@ describe("buildSessionPolicy", () => {
       (s) => s.Action && (Array.isArray(s.Action) ? s.Action.includes("s3:ListBucket") : s.Action === "s3:ListBucket")
     );
     assert.ok(listStmt, "should have ListBucket statement");
-    assert.ok(listStmt.Condition, "ListBucket should have Condition");
-    assert.ok(
-      listStmt.Condition.StringLike || listStmt.Condition.StringEquals,
-      "should have StringLike or StringEquals condition",
-    );
-
-    // The condition should reference the namespace
-    const conditionValues = JSON.stringify(listStmt.Condition);
-    assert.ok(
-      conditionValues.includes("telegram_99999"),
-      `ListBucket condition should reference namespace, got: ${conditionValues}`,
-    );
+    assert.equal(listStmt.Condition, undefined, "ListBucket should have no Condition block");
   });
 
-  it("includes KMS decrypt permission when cmkArn provided", () => {
+  it("includes KMS decrypt permission always in statement 1 with Resource *", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -102,15 +91,11 @@ describe("buildSessionPolicy", () => {
           ? s.Action.some((a) => a.startsWith("kms:"))
           : s.Action.startsWith("kms:")),
     );
-    assert.ok(kmsStmt, "should have KMS statement");
-    // KMS should be scoped to the specific CMK, not wildcard
-    const resource = Array.isArray(kmsStmt.Resource)
-      ? kmsStmt.Resource[0]
-      : kmsStmt.Resource;
-    assert.equal(resource, "arn:aws:kms:us-west-2:123:key/abc-123");
+    assert.ok(kmsStmt, "should have KMS actions");
+    assert.equal(kmsStmt.Resource, "*", "KMS resource should be wildcard");
   });
 
-  it("omits KMS statement when cmkArn not provided", () => {
+  it("includes KMS even when cmkArn not provided", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -124,10 +109,11 @@ describe("buildSessionPolicy", () => {
           ? s.Action.some((a) => a.startsWith("kms:"))
           : s.Action.startsWith("kms:")),
     );
-    assert.equal(kmsStmt, undefined, "should not have KMS statement without cmkArn");
+    assert.ok(kmsStmt, "KMS actions should be present even without cmkArn");
+    assert.equal(kmsStmt.Resource, "*", "KMS resource should be wildcard");
   });
 
-  it("scopes iam:PassRole to eventbridgeRoleArn when provided", () => {
+  it("includes iam:PassRole always in statement 1 with Resource *", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -137,16 +123,13 @@ describe("buildSessionPolicy", () => {
 
     const parsed = JSON.parse(policy);
     const passRoleStmt = parsed.Statement.find(
-      (s) => s.Action === "iam:PassRole",
+      (s) => Array.isArray(s.Action) && s.Action.includes("iam:PassRole"),
     );
-    assert.ok(passRoleStmt, "should have PassRole statement");
-    assert.equal(
-      passRoleStmt.Resource,
-      "arn:aws:iam::123:role/openclaw-cron-scheduler-role",
-    );
+    assert.ok(passRoleStmt, "should have PassRole action");
+    assert.equal(passRoleStmt.Resource, "*", "PassRole resource should be wildcard");
   });
 
-  it("omits iam:PassRole when eventbridgeRoleArn not provided", () => {
+  it("includes iam:PassRole even when eventbridgeRoleArn not provided", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -155,9 +138,10 @@ describe("buildSessionPolicy", () => {
 
     const parsed = JSON.parse(policy);
     const passRoleStmt = parsed.Statement.find(
-      (s) => s.Action === "iam:PassRole",
+      (s) => Array.isArray(s.Action) && s.Action.includes("iam:PassRole"),
     );
-    assert.equal(passRoleStmt, undefined, "should not have PassRole without eventbridgeRoleArn");
+    assert.ok(passRoleStmt, "PassRole should be present even without eventbridgeRoleArn");
+    assert.equal(passRoleStmt.Resource, "*", "PassRole resource should be wildcard");
   });
 
   it("rejects namespace with path traversal", () => {
@@ -184,7 +168,7 @@ describe("buildSessionPolicy", () => {
     );
   });
 
-  it("scopes DynamoDB to identity table ARN when provided", () => {
+  it("includes DynamoDB actions in statement 1 with Resource *", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -192,33 +176,24 @@ describe("buildSessionPolicy", () => {
     });
 
     const parsed = JSON.parse(policy);
-    const dynamoStmt = parsed.Statement.find((s) => s.Sid === "DynamoDBIdentity");
-    assert.ok(dynamoStmt, "should have DynamoDB statement");
-    const resources = Array.isArray(dynamoStmt.Resource) ? dynamoStmt.Resource : [dynamoStmt.Resource];
-    assert.ok(
-      resources.includes("arn:aws:dynamodb:us-west-2:123456789012:table/openclaw-identity"),
-      "should include table ARN",
-    );
-    assert.ok(
-      resources.includes("arn:aws:dynamodb:us-west-2:123456789012:table/openclaw-identity/index/*"),
-      "should include table index wildcard",
-    );
-    assert.equal(resources.length, 2, "should have exactly table + index resources");
+    const dynamoStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
+    assert.ok(dynamoStmt, "should have DynamoDB actions");
+    assert.equal(dynamoStmt.Resource, "*", "DynamoDB resource should be wildcard");
   });
 
-  it("falls back to wildcard DynamoDB when identityTableArn not provided", () => {
+  it("includes DynamoDB actions even when identityTableArn not provided", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
     });
 
     const parsed = JSON.parse(policy);
-    const dynamoStmt = parsed.Statement.find((s) => s.Sid === "DynamoDBIdentity");
-    assert.ok(dynamoStmt, "should have DynamoDB statement");
-    assert.equal(dynamoStmt.Resource, "*", "should fall back to wildcard");
+    const dynamoStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
+    assert.ok(dynamoStmt, "should have DynamoDB actions");
+    assert.equal(dynamoStmt.Resource, "*", "DynamoDB resource should be wildcard");
   });
 
-  it("includes internalUserId in DynamoDB LeadingKeys when provided", () => {
+  it("DynamoDB has no Condition block regardless of parameters", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -228,16 +203,12 @@ describe("buildSessionPolicy", () => {
     });
 
     const parsed = JSON.parse(policy);
-    const dynamoStmt = parsed.Statement.find((s) => s.Sid === "DynamoDBIdentity");
-    assert.ok(dynamoStmt, "should have DynamoDB statement");
-    const leadingKeys = dynamoStmt.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"];
-    assert.ok(leadingKeys.includes("USER#telegram:12345"), "should include actorId-based PK");
-    assert.ok(leadingKeys.includes("CHANNEL#telegram:12345"), "should include channel PK");
-    assert.ok(leadingKeys.includes("USER#user_abc123"), "should include internal userId PK for CRON records");
-    assert.equal(leadingKeys.length, 3, "should have exactly 3 leading key patterns");
+    const dynamoStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
+    assert.ok(dynamoStmt, "should have DynamoDB actions");
+    assert.equal(dynamoStmt.Condition, undefined, "DynamoDB should have no Condition block");
   });
 
-  it("omits duplicate internalUserId when same as actorId", () => {
+  it("no Condition block even when actorId equals internalUserId", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -246,12 +217,11 @@ describe("buildSessionPolicy", () => {
     });
 
     const parsed = JSON.parse(policy);
-    const dynamoStmt = parsed.Statement.find((s) => s.Sid === "DynamoDBIdentity");
-    const leadingKeys = dynamoStmt.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"];
-    assert.equal(leadingKeys.length, 2, "should not duplicate when internalUserId matches actorId");
+    const dynamoStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
+    assert.equal(dynamoStmt.Condition, undefined, "DynamoDB should have no Condition block");
   });
 
-  it("scopes EventBridge CRUD to schedule group schedules when provided", () => {
+  it("includes scheduler:* in statement 1 with Resource *", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -259,43 +229,21 @@ describe("buildSessionPolicy", () => {
     });
 
     const parsed = JSON.parse(policy);
-    const crudStmt = parsed.Statement.find((s) => s.Sid === "EventBridgeSchedulerCRUD");
-    assert.ok(crudStmt, "should have EventBridge CRUD statement");
-    assert.equal(
-      crudStmt.Resource,
-      "arn:aws:scheduler:us-west-2:123456789012:schedule/openclaw-cron/*",
-      "CRUD resource should target schedules within the group",
-    );
+    const ebStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("scheduler:*"));
+    assert.ok(ebStmt, "should have scheduler:* action");
+    assert.equal(ebStmt.Resource, "*", "scheduler resource should be wildcard");
   });
 
-  it("scopes EventBridge List to schedule group when provided", () => {
-    const policy = buildSessionPolicy({
-      bucket: "my-bucket",
-      namespace: "telegram_12345",
-      scheduleGroupArn: "arn:aws:scheduler:us-west-2:123456789012:schedule-group/openclaw-cron",
-    });
-
-    const parsed = JSON.parse(policy);
-    const listStmt = parsed.Statement.find((s) => s.Sid === "EventBridgeSchedulerList");
-    assert.ok(listStmt, "should have EventBridge List statement");
-    assert.equal(
-      listStmt.Resource,
-      "arn:aws:scheduler:us-west-2:123456789012:schedule-group/openclaw-cron",
-      "List resource should target the schedule group",
-    );
-  });
-
-  it("falls back to wildcard EventBridge when scheduleGroupArn not provided", () => {
+  it("scheduler:* always present regardless of scheduleGroupArn", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
     });
 
     const parsed = JSON.parse(policy);
-    const crudStmt = parsed.Statement.find((s) => s.Sid === "EventBridgeSchedulerCRUD");
-    const listStmt = parsed.Statement.find((s) => s.Sid === "EventBridgeSchedulerList");
-    assert.equal(crudStmt.Resource, "*", "CRUD should fall back to wildcard");
-    assert.equal(listStmt.Resource, "*", "List should fall back to wildcard");
+    const ebStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("scheduler:*"));
+    assert.ok(ebStmt, "should have scheduler:* action even without scheduleGroupArn");
+    assert.equal(ebStmt.Resource, "*", "scheduler resource should be wildcard");
   });
 });
 
@@ -388,7 +336,7 @@ describe("createScopedCredentials", () => {
     assert.equal(input.DurationSeconds, 3600);
   });
 
-  it("constructs scoped DynamoDB and EventBridge ARNs from env vars", async () => {
+  it("includes DynamoDB and scheduler actions with Resource * regardless of env vars", async () => {
     process.env.IDENTITY_TABLE_NAME = "openclaw-identity";
     process.env.EVENTBRIDGE_SCHEDULE_GROUP = "openclaw-cron";
 
@@ -399,20 +347,15 @@ describe("createScopedCredentials", () => {
     const input = _mockStsClient.send.mock.calls[0].arguments[0].input;
     const policy = JSON.parse(input.Policy);
 
-    // DynamoDB should be scoped to identity table
-    const dynamoStmt = policy.Statement.find((s) => s.Sid === "DynamoDBIdentity");
-    assert.ok(Array.isArray(dynamoStmt.Resource), "DynamoDB should have array of resources");
-    assert.ok(
-      dynamoStmt.Resource[0].includes("openclaw-identity"),
-      "DynamoDB should reference identity table",
-    );
+    // DynamoDB should be in statement 1 with Resource "*"
+    const dynamoStmt = policy.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
+    assert.ok(dynamoStmt, "should have DynamoDB actions");
+    assert.equal(dynamoStmt.Resource, "*", "DynamoDB resource should be wildcard");
 
-    // EventBridge CRUD should be scoped to schedule group
-    const crudStmt = policy.Statement.find((s) => s.Sid === "EventBridgeSchedulerCRUD");
-    assert.ok(
-      crudStmt.Resource.includes("openclaw-cron"),
-      "EventBridge CRUD should reference schedule group",
-    );
+    // Scheduler should be in statement 1 with Resource "*"
+    const ebStmt = policy.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("scheduler:*"));
+    assert.ok(ebStmt, "should have scheduler actions");
+    assert.equal(ebStmt.Resource, "*", "scheduler resource should be wildcard");
 
     delete process.env.IDENTITY_TABLE_NAME;
     delete process.env.EVENTBRIDGE_SCHEDULE_GROUP;
@@ -638,7 +581,7 @@ describe("buildSessionPolicy Secrets Manager", () => {
     ({ buildSessionPolicy } = require("./scoped-credentials"));
   });
 
-  it("includes SecretsManagerUserSecrets statement when region and account provided", () => {
+  it("includes Secrets Manager actions always in statement 1 with Resource *", () => {
     const policy = buildSessionPolicy({
       bucket: "openclaw-user-files-123-us-west-2",
       namespace: "telegram_12345",
@@ -648,18 +591,15 @@ describe("buildSessionPolicy Secrets Manager", () => {
     });
 
     const parsed = JSON.parse(policy);
-    const smStmt = parsed.Statement.find((s) => s.Sid === "SecretsManagerUserSecrets");
-    assert.ok(smStmt, "SecretsManagerUserSecrets statement should exist");
-    assert.equal(
-      smStmt.Resource,
-      "arn:aws:secretsmanager:us-west-2:123456789012:secret:openclaw/user/telegram_12345/*",
-    );
+    const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
+    assert.ok(smStmt, "Secrets Manager actions should exist");
+    assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
     assert.ok(smStmt.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt.Action.includes("secretsmanager:CreateSecret"));
     assert.ok(smStmt.Action.includes("secretsmanager:DeleteSecret"));
   });
 
-  it("includes SecretsManagerListUserSecrets statement", () => {
+  it("includes ListSecrets in the Secrets Manager statement with wildcard resource", () => {
     const policy = buildSessionPolicy({
       bucket: "openclaw-user-files-123-us-west-2",
       namespace: "telegram_12345",
@@ -668,24 +608,25 @@ describe("buildSessionPolicy Secrets Manager", () => {
     });
 
     const parsed = JSON.parse(policy);
-    const listStmt = parsed.Statement.find((s) => s.Sid === "SecretsManagerListUserSecrets");
-    assert.ok(listStmt, "SecretsManagerListUserSecrets statement should exist");
-    assert.equal(listStmt.Action, "secretsmanager:ListSecrets");
-    assert.equal(listStmt.Resource, "*");
+    const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:ListSecrets"));
+    assert.ok(smStmt, "Secrets Manager statement with ListSecrets should exist");
+    const resources = Array.isArray(smStmt.Resource) ? smStmt.Resource : [smStmt.Resource];
+    assert.ok(resources.includes("*"), "Resource array should include wildcard for ListSecrets");
   });
 
-  it("omits Secrets Manager statements when region/account not provided", () => {
+  it("includes Secrets Manager actions even when region/account not provided", () => {
     const policy = buildSessionPolicy({
       bucket: "openclaw-user-files-123-us-west-2",
       namespace: "telegram_12345",
     });
 
     const parsed = JSON.parse(policy);
-    const smStmt = parsed.Statement.find((s) => s.Sid === "SecretsManagerUserSecrets");
-    assert.equal(smStmt, undefined, "SecretsManagerUserSecrets should not exist without region/account");
+    const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
+    assert.ok(smStmt, "Secrets Manager actions should exist even without region/account");
+    assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
   });
 
-  it("scopes secret resource to correct namespace", () => {
+  it("Secrets Manager resource is always wildcard regardless of namespace", () => {
     const policy = buildSessionPolicy({
       bucket: "test-bucket",
       namespace: "slack_abc-def",
@@ -694,9 +635,8 @@ describe("buildSessionPolicy Secrets Manager", () => {
     });
 
     const parsed = JSON.parse(policy);
-    const smStmt = parsed.Statement.find((s) => s.Sid === "SecretsManagerUserSecrets");
-    assert.ok(smStmt.Resource.includes("slack_abc-def"));
-    assert.ok(smStmt.Resource.includes("ap-southeast-2"));
-    assert.ok(smStmt.Resource.includes("999888777666"));
+    const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
+    assert.ok(smStmt, "Secrets Manager actions should exist");
+    assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
   });
 });

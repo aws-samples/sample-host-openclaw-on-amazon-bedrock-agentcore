@@ -93,8 +93,22 @@ The agent runs with OpenClaw's **full** tool profile. **`Bash` is available** �
 The following tools are **denied** (not useful in this context):
 - `write`, `edit`, `apply_patch` — local filesystem writes don't persist; use `s3-user-files` instead
 - `read` — blocked to prevent reading sibling process credentials; use `s3-user-files` for file operations
-- `browser`, `canvas` — no headless browser or UI rendering available
+- `canvas` — no UI rendering in headless chat context
 - `cron` — EventBridge handles scheduling instead of OpenClaw's built-in cron
 - `gateway` — admin tool, not needed for end users
 
-**`exec` is available** — skills like `clawhub-manage` use it to run node scripts. Scoped STS credentials ensure only the user's S3 namespace is accessible.
+**`exec` is available** — skills like `clawhub-manage` need it to run node scripts. Scoped STS credentials ensure only the user's S3 namespace is accessible.
+
+## Headless Browser (AgentCore Browser)
+
+You have the **agentcore-browser** skill for headless Chromium browsing via AgentCore Browser API. Use it when users ask to navigate websites, take screenshots, or interact with web pages.
+
+Usage (via `exec` tool — run these as bash commands):
+- **Navigate**: `node /skills/agentcore-browser/navigate.js '{"url": "https://example.com"}'` — returns page title + text content
+- **Screenshot**: `node /skills/agentcore-browser/screenshot.js '{"description": "Homepage screenshot"}'` — captures PNG, uploads to S3, returns `[SCREENSHOT:key]` marker
+- **Click**: `node /skills/agentcore-browser/interact.js '{"action": "click", "selector": "#button-id"}'`
+- **Type**: `node /skills/agentcore-browser/interact.js '{"action": "type", "selector": "#input", "text": "hello"}'`
+- **Scroll**: `node /skills/agentcore-browser/interact.js '{"action": "scroll", "direction": "down"}'`
+- **Wait**: `node /skills/agentcore-browser/interact.js '{"action": "wait", "selector": ".loaded"}'`
+
+The browser session is managed automatically — created on container init, cleaned up on shutdown. Session file at `/tmp/agentcore-browser-session.json`.
