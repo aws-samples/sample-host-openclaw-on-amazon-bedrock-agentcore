@@ -77,6 +77,12 @@ const BUILD_VERSION = "v36"; // Bump in cdk.json to force container redeploy
 const OPENCLAW_LOG_LIMIT = 50;
 let openclawLogs = [];
 let openclawExitCode = null;
+let lastOpenClawEnv = null;
+
+// OpenClaw auto-restart on crash
+let openclawRestartCount = 0;
+const OPENCLAW_MAX_RESTARTS = 3;
+const OPENCLAW_RESTART_DELAY_MS = 5000;
 
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
@@ -658,6 +664,68 @@ async function stopBrowserSessions() {
 }
 
 /**
+ * Auto-restart OpenClaw if it crashes mid-session.
+ * Uses linear backoff (5s, 10s, 15s) with a maximum of 3 retries.
+ * Does not restart during shutdown or if OpenClaw recovered on its own.
+ */
+function scheduleOpenClawRestart(namespace) {
+  if (shuttingDown) return;
+  if (openclawRestartCount >= OPENCLAW_MAX_RESTARTS) {
+    console.error(
+      `[contract] OpenClaw crashed ${openclawRestartCount} times — giving up, lightweight agent will handle messages`,
+    );
+    return;
+  }
+  openclawRestartCount++;
+  const delay = OPENCLAW_RESTART_DELAY_MS * openclawRestartCount;
+  console.log(
+    `[contract] Scheduling OpenClaw restart #${openclawRestartCount} in ${delay}ms...`,
+  );
+  setTimeout(() => {
+    if (shuttingDown || openclawReady) return;
+    console.log(
+      `[contract] Restarting OpenClaw (attempt #${openclawRestartCount})...`,
+    );
+    openclawProcess = spawn(
+      "openclaw",
+      ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
+      { stdio: ["ignore", "pipe", "pipe"], env: lastOpenClawEnv },
+    );
+    const captureLog2 = (stream, label) => {
+      let buf = "";
+      stream.on("data", (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          if (line.trim()) {
+            console.log(`[openclaw:${label}] ${line}`);
+            openclawLogs.push(`[${label}] ${line}`);
+            if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
+          }
+        }
+      });
+    };
+    captureLog2(openclawProcess.stdout, "out");
+    captureLog2(openclawProcess.stderr, "err");
+    openclawProcess.on("exit", (code2) => {
+      console.log(
+        `[contract] OpenClaw (restart #${openclawRestartCount}) exited with code ${code2}`,
+      );
+      openclawExitCode = code2;
+      openclawReady = false;
+      scheduleOpenClawRestart(namespace);
+    });
+    // Poll for readiness after restart
+    pollOpenClawReadiness(namespace).catch((err) => {
+      console.error(
+        `[contract] OpenClaw restart readiness poll failed: ${err.message}`,
+      );
+    });
+  }, delay);
+}
+
+/**
  * Initialization — called on first /invocations request.
  *
  * Uses pre-fetched secrets. Starts proxy, OpenClaw, and workspace restore
@@ -807,6 +875,8 @@ async function init(userId, actorId, channel) {
       ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
       { stdio: ["ignore", "pipe", "pipe"], env: openclawEnv },
     );
+    lastOpenClawEnv = openclawEnv;
+    openclawRestartCount = 0;
     // Capture OpenClaw stdout/stderr for diagnostics
     const captureLog = (stream, label) => {
       let buf = "";
@@ -829,6 +899,7 @@ async function init(userId, actorId, channel) {
       console.log(`[contract] OpenClaw exited with code ${code}`);
       openclawExitCode = code;
       openclawReady = false;
+      scheduleOpenClawRestart(currentNamespace);
     });
 
     // Restore workspace from S3 (non-blocking, needed for OpenClaw)
