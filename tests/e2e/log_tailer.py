@@ -99,21 +99,21 @@ def _parse_line(line: str, result: TailResult) -> None:
             result.agentcore_invoked = True
         elif name == "agentcore_response":
             result.agentcore_response = m.group(1)
-            # Extract response text from JSON body (500 chars, more than
-            # the 200-char truncated "Response to send" line)
-            try:
-                body = json.loads(m.group(1))
-                if isinstance(body, dict) and "response" in body:
-                    result.response_text = body["response"]
-                    result.response_len = len(result.response_text)
-            except (json.JSONDecodeError, TypeError):
-                pass
+            # Pre-extraction fallback — only set if response_to_send
+            # hasn't provided the post-extraction text yet
+            if not result.response_text:
+                try:
+                    body = json.loads(m.group(1))
+                    if isinstance(body, dict) and "response" in body:
+                        result.response_text = body["response"]
+                        result.response_len = len(result.response_text)
+                except (json.JSONDecodeError, TypeError):
+                    pass
         elif name == "response_to_send":
             result.response_len = int(m.group(1))
-            # Only update response_text if we don't already have a
-            # longer version from the agentcore_response JSON body
-            if len(m.group(2)) > len(result.response_text):
-                result.response_text = m.group(2)
+            # Always update — this is the post-extraction text that
+            # actually gets sent to the user
+            result.response_text = m.group(2)
         elif name == "telegram_sent":
             result.telegram_sent = True
         elif name == "new_session":

@@ -1,0 +1,7 @@
+id: bedrock-baseline
+label: "Bedrock (no guardrails)"
+providers:
+  - id: "bedrock:minimax.minimax-m2.1"
+    config:
+      region: ap-southeast-2
+      # No guardrailIdentifier — baseline without content filtering

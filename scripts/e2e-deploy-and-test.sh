@@ -104,16 +104,16 @@ python3 - <<'EOF'
 import sys
 sys.path.insert(0, ".")
 from tests.e2e.config import load_config
-from tests.e2e.session import reset_user, reset_session, _stop_agentcore_session
+from tests.e2e.session import reset_session, _stop_agentcore_session
 
 cfg = load_config()
 print(f"Stopping AgentCore session for E2E user...")
 stopped = _stop_agentcore_session(cfg)
 print(f"  Session stopped: {stopped}")
 
-print(f"Resetting user records in DynamoDB...")
-deleted = reset_user(cfg)
-print(f"  Records deleted: {deleted}")
+print(f"Resetting session record in DynamoDB (preserving user identity)...")
+reset = reset_session(cfg)
+print(f"  Session reset: {reset}")
 
 print("Session reset complete — next message will trigger cold start with new image.")
 EOF

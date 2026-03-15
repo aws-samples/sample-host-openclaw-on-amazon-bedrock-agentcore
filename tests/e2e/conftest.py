@@ -28,6 +28,12 @@ SCENARIOS = {
 }
 
 
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line("markers", "e2e: end-to-end tests requiring a deployed stack")
+    config.addinivalue_line("markers", "guardrail: Bedrock Guardrail wiring tests")
+
+
 def pytest_collection_modifyitems(config, items):
     """Auto-mark all tests in this directory with the 'e2e' marker."""
     for item in items:

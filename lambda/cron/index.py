@@ -246,7 +246,73 @@ def _extract_text_from_content_blocks(text):
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
         break
+    # Regex fallback: handle cases where JSON parsing fails (encoding issues, etc.)
+    stripped_result = result.strip()
+    if stripped_result.startswith("[{") and '"type"' in stripped_result and '"text"' in stripped_result:
+        match = re.search(r'[,{]\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"', stripped_result)
+        if match:
+            try:
+                candidate = json.loads('"' + match.group(1) + '"')
+                if candidate and candidate != result:
+                    result = candidate
+            except (json.JSONDecodeError, ValueError):
+                pass
     return result
+
+
+def _tables_to_bullets(text):
+    """Convert markdown tables to bold-name bullet lists for Telegram.
+
+    | Name | Description |       ->    • **Name** — Description
+    |------|-------------|
+    | foo  | bar         |       ->    • **foo** — bar
+
+    Works with CJK characters and emoji (no alignment issues).
+    Uses ** for bold so _markdown_to_telegram_html converts to <b> tags.
+    """
+    if not text or '|' not in text:
+        return text
+
+    lines = text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2:
+            table_lines = []
+            while i < len(lines):
+                tl = lines[i].strip()
+                if tl.startswith('|') and tl.endswith('|'):
+                    table_lines.append(tl)
+                    i += 1
+                else:
+                    break
+
+            header = None
+            bullets = []
+            for tl in table_lines:
+                if re.match(r'^\|[\s\-\:\|]+\|$', tl):
+                    continue
+                cols = [c.strip() for c in tl.strip('|').split('|')]
+                cols = [c for c in cols if c]
+                if not cols:
+                    continue
+                if header is None:
+                    header = cols
+                    continue
+                if len(cols) == 1:
+                    bullets.append(f'\u2022 {cols[0]}')
+                elif len(cols) >= 2:
+                    name = cols[0]
+                    desc = ' \u2014 '.join(cols[1:])
+                    bullets.append(f'\u2022 **{name}** \u2014 {desc}')
+
+            result.extend(bullets)
+        else:
+            result.append(lines[i])
+            i += 1
+
+    return '\n'.join(result)
 
 
 def _markdown_to_telegram_html(text):
@@ -255,12 +321,15 @@ def _markdown_to_telegram_html(text):
     Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>,
     <a href="">, <blockquote>, <tg-spoiler>.
 
-    Strategy: extract code blocks/inline code first (protect from other
-    conversions), HTML-escape the rest, convert markdown patterns, then
-    re-insert code.
+    Strategy: convert tables to bullet lists, extract code blocks/inline
+    code (protect from other conversions), HTML-escape the rest, convert
+    markdown patterns, then re-insert code.
     """
     if not text:
         return text
+
+    # Convert markdown tables to bullet lists (uses ** for bold, converted below)
+    text = _tables_to_bullets(text)
 
     placeholders = []
 
@@ -280,47 +349,7 @@ def _markdown_to_telegram_html(text):
         text, flags=re.DOTALL,
     )
 
-    # 2. Extract markdown tables and render as monospace <pre> blocks
-    def _convert_table(m):
-        lines = m.group(0).strip().split("\n")
-        rows = []
-        for line in lines:
-            stripped = line.strip().strip("|").strip()
-            if stripped and not re.match(r"^[\s|:-]+$", stripped):
-                cells = [c.strip() for c in line.strip().strip("|").split("|")]
-                rows.append(cells)
-        if not rows:
-            return m.group(0)
-        col_count = max(len(r) for r in rows)
-        widths = [0] * col_count
-        for row in rows:
-            for i, cell in enumerate(row):
-                if i < col_count:
-                    plain = re.sub(r"\*\*(.+?)\*\*", r"\1", cell)
-                    widths[i] = max(widths[i], len(plain))
-        formatted = []
-        for ri, row in enumerate(rows):
-            parts = []
-            for i in range(col_count):
-                cell = row[i] if i < len(row) else ""
-                plain = re.sub(r"\*\*(.+?)\*\*", r"\1", cell)
-                pad = widths[i] - len(plain) + len(cell)
-                parts.append(cell.ljust(pad))
-            formatted.append("  ".join(parts))
-            if ri == 0:
-                formatted.append("  ".join("─" * w for w in widths))
-        table_text = "\n".join(formatted)
-        table_text = table_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        table_text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", table_text)
-        return _placeholder(f"<pre>{table_text}</pre>")
-
-    text = re.sub(
-        r"(?:^\|.+\|[ \t]*$\n?){2,}",
-        _convert_table,
-        text, flags=re.MULTILINE,
-    )
-
-    # 3. Extract inline code: `text`
+    # 2. Extract inline code: `text`
     text = re.sub(
         r"`([^`\n]+)`",
         lambda m: _placeholder(
@@ -331,21 +360,29 @@ def _markdown_to_telegram_html(text):
         text,
     )
 
-    # 4. HTML-escape remaining text
+    # 3. HTML-escape remaining text
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    # 5. Convert markdown patterns to HTML
+    # 4. Convert markdown patterns to HTML
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection
+    def _safe_link(m):
+        link_text, link_url = m.group(1), m.group(2)
+        if re.match(r'^(https?://|tg://|mailto:)', link_url):
+            return f'<a href="{link_url}">{link_text}</a>'
+        return m.group(0)  # leave non-http links as plain text
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
     text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
     text = text.replace("</blockquote>\n<blockquote>", "\n")
     text = re.sub(r"^[-=*]{3,}\s*$", "———", text, flags=re.MULTILINE)
 
-    # 6. Re-insert placeholders
+    # 5. Re-insert placeholders
     for idx, content in enumerate(placeholders):
         text = text.replace(f"\x00PH{idx}\x00", content)
 

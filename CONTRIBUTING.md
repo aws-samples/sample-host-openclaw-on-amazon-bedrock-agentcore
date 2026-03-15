@@ -50,6 +50,38 @@ For more information see the [Code of Conduct FAQ](https://aws.github.io/code-of
 opensource-codeofconduct@amazon.com with any additional questions or comments.
 
 
+## Security Testing
+
+### Red Team Evaluation (LLM adversarial testing)
+
+The `redteam/` directory contains a promptfoo-based adversarial testing harness with 62 test cases across 12 attack categories.
+
+```bash
+cd redteam && npm install
+AWS_REGION=ap-southeast-2 npx promptfoo@latest eval --config evalconfig.yaml
+npx promptfoo@latest view  # view interactive report
+```
+
+### Guardrail E2E Tests
+
+The `TestGuardrailSecurity` class validates guardrails through the full Telegram webhook pipeline:
+
+```bash
+export BEDROCK_GUARDRAIL_ID=$(aws cloudformation describe-stacks \
+  --stack-name OpenClawGuardrails \
+  --query "Stacks[0].Outputs[?OutputKey=='GuardrailId'].OutputValue" \
+  --output text --region ap-southeast-2)
+pytest tests/e2e/bot_test.py -v -k GuardrailSecurity
+```
+
+### When Adding New Features
+
+- If adding a new tool or skill, add corresponding test cases to `redteam/tests/tool-abuse.yaml`
+- If adding a new channel, add credential extraction tests to `redteam/tests/credential-channel.yaml`
+- If modifying guardrail policies, run the full red team eval to verify pass rates haven't regressed
+- Run `cdk synth` to validate cdk-nag compliance before submitting a PR
+
+
 ## Security issue notifications
 If you discover a potential security issue in this project we ask that you notify AWS/Amazon Security via our [vulnerability reporting page](http://aws.amazon.com/security/vulnerability-reporting/). Please do **not** create a public github issue.
 

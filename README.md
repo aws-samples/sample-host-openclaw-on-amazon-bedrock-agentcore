@@ -23,11 +23,24 @@ Deploy an AI-powered multi-channel messaging bot (Telegram, Slack) on AWS Bedroc
 - [Gotchas](#gotchas)
 - [Cleanup](#cleanup)
 - [Security](#security)
+- [Security Testing](#security-testing)
 - [License](#license)
 
 OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Router Lambda handles webhook ingestion from Telegram and Slack, resolves user identity via DynamoDB, and invokes per-user AgentCore sessions. Each user gets their own microVM with workspace persistence (`.openclaw/` directory synced to S3). The agent has built-in tools (web, filesystem, runtime, sessions, automation), custom skills for file storage and cron scheduling, and **EventBridge-based cron scheduling** for recurring tasks.
 
 Users can send **text and images** — photos sent via Telegram or Slack are downloaded by the Router Lambda, stored in S3, and passed to Claude as multimodal content via Bedrock's ConverseStream API. Supported formats: JPEG, PNG, GIF, WebP (max 3.75 MB).
+
+### Features
+
+- Per-user Firecracker microVM isolation (AgentCore Runtime)
+- Multi-channel support (Telegram, Slack) with cross-channel account linking
+- Multimodal: text + image messages via Bedrock ConverseStream
+- STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
+- Custom skills: S3 file storage, EventBridge cron scheduling, API key management, ClawHub skill installer
+- Headless browser (optional, AgentCore Browser API)
+- AWS Bedrock Guardrails — content filtering, PII redaction, topic denial, word filters, prompt attack detection
+- LLM red team testing — 62 test cases across 12 attack categories via promptfoo
+- App-level security E2E tests (TestGuardrailSecurity — 6 tests through the full Telegram webhook pipeline)
 
 ## Architecture
 
@@ -79,6 +92,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Encryption**: All data encrypted at rest with customer-managed KMS key (S3, DynamoDB, SNS, Secrets Manager) and in transit (TLS)
 - **CloudTrail**: Optional dedicated trail (`enable_cloudtrail` in cdk.json). Off by default — most AWS accounts already have an organization or account-level trail. Enabling adds a dedicated S3 bucket + trail for this project's audit logs
 - **Least-privilege IAM**: Tightly scoped permissions per component
+- **Bedrock Guardrails**: Content filtering on every Bedrock API call — content filters (hate, violence, prompt attacks), topic denial (6 categories), PII redaction, word filters, and custom regex for credential patterns. Opt-out via `enable_guardrails: false` in `cdk.json`
 - **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
@@ -229,8 +243,8 @@ Send a message to your Telegram bot. The first message triggers a cold start —
 
 ```
 openclaw-on-agentcore/
-  app.py                          # CDK app entry point (7 stacks)
-  cdk.json                        # Configuration (model, budgets, sessions, cron)
+  app.py                          # CDK app entry point (8 stacks)
+  cdk.json                        # Configuration (model, budgets, sessions, cron, guardrails)
   requirements.txt                # Python deps (aws-cdk-lib, cdk-nag)
   stacks/
     __init__.py                   # Shared helper (RetentionDays converter)
@@ -240,6 +254,7 @@ openclaw-on-agentcore/
     router_stack.py               # Router Lambda + API Gateway HTTP API + DynamoDB identity
     observability_stack.py        # Dashboards, alarms, Bedrock logging
     token_monitoring_stack.py     # Lambda processor, DynamoDB, token analytics
+    guardrails_stack.py           # Bedrock Guardrails (content filters, PII, topic denial)
     cron_stack.py                 # EventBridge Scheduler, Cron executor Lambda, IAM
   bridge/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
@@ -281,8 +296,11 @@ openclaw-on-agentcore/
       log_tailer.py               # CloudWatch log tailing with pattern matching
       bot_test.py                 # CLI entrypoint + pytest test classes (17 tests)
       conftest.py                 # pytest fixtures, conversation scenarios
+  redteam/                        # LLM red team testing (promptfoo, 62 test cases)
   docs/
     architecture.md               # Detailed architecture diagram
+    security.md                   # Complete security architecture
+    guardrails.md                 # Bedrock Guardrails operational runbook
 ```
 
 ## CDK Stacks
@@ -291,7 +309,8 @@ openclaw-on-agentcore/
 |---|---|---|
 | **OpenClawVpc** | VPC (2 AZ), private/public subnets, NAT, 7 VPC endpoints, flow logs | None |
 | **OpenClawSecurity** | KMS CMK, Secrets Manager (7 secrets incl. webhook validation), Cognito User Pool, optional CloudTrail | None |
-| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM | Vpc, Security |
+| **OpenClawGuardrails** | CfnGuardrail (content filters, topic denial, PII, word filters, regex), CfnGuardrailVersion | Security |
+| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM | Vpc, Security, Guardrails |
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms (errors, latency, throttles), SNS, Bedrock logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
@@ -323,7 +342,12 @@ All tunable parameters are in `cdk.json`:
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
+| `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. Set `false` to disable (reduces safety but saves cost) |
+| `guardrails_content_filter_level` | `HIGH` | Content filter strength for all categories: `LOW`, `MEDIUM`, or `HIGH` |
+| `guardrails_pii_action` | `ANONYMIZE` | PII handling: `ANONYMIZE` (redact) or `BLOCK` (reject). Credit cards always BLOCK regardless |
 | `enable_browser` | `false` | Enable headless Chromium browser inside the container. Requires `BROWSER_IDENTIFIER` env var |
+
+> **Guardrails cost**: Bedrock Guardrails are enabled by default and add ~$0.75 per 1,000 text units on top of model inference costs. To disable, set `"enable_guardrails": false` in `cdk.json`. See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling removes content-level protections but other security layers (STS scoping, tool deny list, SSRF protection) remain active.
 
 ## Channel Setup
 
@@ -707,6 +731,7 @@ pytest tests/e2e/bot_test.py -v -k conversation          # multi-turn + rapid-fi
 pytest tests/e2e/bot_test.py -v -k SkillManagement       # clawhub skill install/uninstall/list
 pytest tests/e2e/bot_test.py -v -k ApiKeyManagement      # API key storage (native + Secrets Manager)
 pytest tests/e2e/bot_test.py -v -k CronSchedule          # cron lifecycle + CRON# DynamoDB record check
+pytest tests/e2e/bot_test.py -v -k GuardrailSecurity     # guardrail content filtering (requires BEDROCK_GUARDRAIL_ID env var)
 pytest tests/e2e/bot_test.py -v                          # all E2E tests
 ```
 
@@ -803,6 +828,38 @@ Note: KMS keys and the Cognito User Pool have `RETAIN` removal policies and will
 ## Security
 
 See [docs/security.md](docs/security.md) for the complete security architecture (threat model, defense-in-depth layers, operations runbook), [SECURITY.md](SECURITY.md) for reporting vulnerabilities, and [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications) for contribution guidelines.
+
+## Security Testing
+
+### LLM Red Team Testing
+
+The `redteam/` directory contains a developer-only adversarial testing harness using [promptfoo](https://promptfoo.dev/). It runs 62 test cases across 12 attack categories against the Bedrock model, comparing results with and without Bedrock Guardrails.
+
+**Attack categories tested:** jailbreaks, prompt injection, harmful content, PII fishing, topic denial, credential extraction, tool abuse (SSRF, namespace traversal), channel secret extraction, content filter bypasses (HATE/SEXUAL/INSULTS), encoding bypasses (base64, ROT13, multilingual, Unicode), and session/context manipulation.
+
+```bash
+# Run the full red team evaluation
+cd redteam && npm install
+AWS_REGION=ap-southeast-2 npx promptfoo@latest eval --config evalconfig.yaml
+
+# View interactive report
+npx promptfoo@latest view
+```
+
+**Results with guardrails enabled:** ~93% pass rate (up from ~77% baseline without guardrails). See [redteam/README.md](redteam/README.md) for details.
+
+### Guardrail E2E Tests
+
+The `TestGuardrailSecurity` test class (6 tests) validates guardrail behavior through the full Telegram webhook pipeline:
+
+```bash
+# Requires deployed stack + guardrail ID
+export BEDROCK_GUARDRAIL_ID=$(aws cloudformation describe-stacks \
+  --stack-name OpenClawGuardrails \
+  --query "Stacks[0].Outputs[?OutputKey=='GuardrailId'].OutputValue" \
+  --output text --region ap-southeast-2)
+pytest tests/e2e/bot_test.py -v -k GuardrailSecurity
+```
 
 ## License
 

@@ -40,6 +40,8 @@ class AgentCoreStack(Stack):
         cognito_user_pool_id: str,
         cognito_password_secret_name: str,
         gateway_token_secret_name: str,
+        guardrail_id: str = "",
+        guardrail_version: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -107,6 +109,17 @@ class AgentCoreStack(Stack):
                 ],
             )
         )
+
+        # Bedrock Guardrails — ApplyGuardrail permission (only when guardrails enabled)
+        if guardrail_id:
+            self.execution_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["bedrock:ApplyGuardrail"],
+                    resources=[
+                        f"arn:aws:bedrock:{region}:{account}:guardrail/*",
+                    ],
+                )
+            )
 
         # Secrets Manager — scoped to the 2 secrets the container actually needs
         # (gateway token for WebSocket auth, Cognito secret for identity derivation)
@@ -334,6 +347,9 @@ class AgentCoreStack(Stack):
                 # SUBAGENT_BEDROCK_MODEL_ID is forwarded by the contract server
                 # to the proxy for Bedrock model routing.
                 "SUBAGENT_BEDROCK_MODEL_ID": subagent_model_id,
+                # Bedrock Guardrails — content filtering (empty = disabled)
+                "BEDROCK_GUARDRAIL_ID": guardrail_id,
+                "BEDROCK_GUARDRAIL_VERSION": guardrail_version,
             },
             description="OpenClaw messaging bridge on AgentCore Runtime (per-user sessions)",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
@@ -438,6 +454,7 @@ class AgentCoreStack(Stack):
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
                     reason="Bedrock foundation model ARNs require wildcard for model ID. "
+                    "Bedrock guardrail ARNs require wildcard for guardrail version. "
                     "Logs, Metrics, X-Ray, and Secrets Manager APIs are scoped to "
                     "project prefix (openclaw/*) or do not support resource-level "
                     "permissions. Cognito scoped to specific user pool.",
@@ -463,6 +480,8 @@ class AgentCoreStack(Stack):
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/openclaw-identity/index/*",
                         # Per-user API key storage in Secrets Manager (manage_secret tool)
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/user/*",
+                        # Bedrock Guardrails (wildcard for guardrail version changes)
+                        f"Resource::arn:aws:bedrock:{region}:{account}:guardrail/*",
                     ],
                 ),
             ],

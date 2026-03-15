@@ -12,7 +12,10 @@ RUN apt-get update && \
 RUN pip3 install --no-cache-dir --break-system-packages awscli
 
 # Install OpenClaw and ClawHub CLI globally
-RUN npm install -g openclaw@latest clawhub@latest
+# Pinned to tested versions — update intentionally to avoid unexpected breaking changes.
+# To upgrade: test the new version locally first, then bump both pins here.
+#   openclaw release notes: https://github.com/openclaw/openclaw/releases
+RUN npm install -g openclaw@2026.3.8 clawhub@0.8.0
 
 # Install ClawHub community skills (5 high-value marketplace skills)
 # Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),

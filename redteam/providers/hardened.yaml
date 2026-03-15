@@ -1,0 +1,8 @@
+id: bedrock-hardened
+label: "Bedrock + Guardrails"
+providers:
+  - id: "bedrock:minimax.minimax-m2.1"
+    config:
+      region: ap-southeast-2
+      guardrailIdentifier: "${BEDROCK_GUARDRAIL_ID}"
+      guardrailVersion: "${BEDROCK_GUARDRAIL_VERSION:-DRAFT}"

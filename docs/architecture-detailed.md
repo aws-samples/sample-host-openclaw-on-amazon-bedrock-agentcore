@@ -28,6 +28,7 @@ flowchart TB
             OPENCLAW[OpenClaw :18789]
         end
 
+        GUARDRAIL[Bedrock Guardrails]
         BEDROCK[Bedrock Claude]
 
         subgraph Cron[EventBridge Scheduler]
@@ -45,7 +46,7 @@ flowchart TB
     CONTRACT <-->|workspace| S3
     CONTRACT --> PROXY
     CONTRACT <-->|WebSocket| OPENCLAW
-    PROXY -->|ConverseStream| BEDROCK
+    PROXY -->|"ConverseStream (+guardrailConfig)"| BEDROCK
 
     SCHED -->|trigger| CRONLAMBDA
     CRONLAMBDA -->|invoke| CONTRACT
