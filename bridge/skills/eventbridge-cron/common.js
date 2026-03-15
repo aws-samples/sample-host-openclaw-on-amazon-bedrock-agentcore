@@ -31,7 +31,7 @@ function validateUserId(userId) {
     process.exit(1);
   }
   const VALID_NAMESPACE =
-    /^(telegram|slack|discord|whatsapp)_[a-zA-Z0-9_-]{1,64}$/;
+    /^(telegram|slack|discord|whatsapp|feishu)_[a-zA-Z0-9_-]{1,64}$/;
   if (!VALID_NAMESPACE.test(userId)) {
     console.error(
       `Error: Invalid user_id "${userId}". Must match channel_identifier format (e.g., telegram_123456, slack_username).`,
