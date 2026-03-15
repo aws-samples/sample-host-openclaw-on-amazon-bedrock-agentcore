@@ -32,11 +32,8 @@ RUN mkdir -p /app
 WORKDIR /app
 
 # Install AWS SDK and WebSocket library (production only)
-# Skip browser binary download — we only need playwright-core for CDP client (connectOverCDP)
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install --omit=dev \
-                @aws-sdk/client-bedrock-agentcore \
                 @aws-sdk/client-bedrock-runtime \
                 @aws-sdk/client-cognito-identity-provider \
                 @aws-sdk/client-s3 \
@@ -45,7 +42,6 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
                 @aws-sdk/client-dynamodb \
                 @aws-sdk/client-sts \
                 @aws-sdk/lib-dynamodb \
-                playwright-core \
                 ws
 
 # Pre-warm V8 compile cache for heavy AWS SDK modules.
@@ -126,10 +122,6 @@ RUN chmod +x /skills/clawhub-manage/*.js
 # Copy API key management skill (dual-mode: native file + Secrets Manager)
 COPY skills/api-keys /skills/api-keys
 RUN chmod +x /skills/api-keys/*.js
-
-# Copy AgentCore browser skill (headless Chromium browsing)
-COPY skills/agentcore-browser /skills/agentcore-browser
-RUN chmod +x /skills/agentcore-browser/*.js
 
 # Copy project instructions (CLAUDE.md) so the agent knows about its skills
 COPY CLAUDE.md /app/CLAUDE.md
