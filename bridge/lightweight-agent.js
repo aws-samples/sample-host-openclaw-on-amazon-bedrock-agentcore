@@ -1411,7 +1411,7 @@ async function chat(userMessage, userId, deadlineMs = 0) {
         "I received your message but couldn't generate a response. Please try again.";
       const footer =
         "\n\n---\n" +
-        "_Warm-up mode — after full startup (~1-2 min), additional " +
+        "_Warm-up mode — after full startup (~5-6 second), additional " +
         "community skills come online: YouTube transcripts, deep research, " +
         "task decomposition with sub-agents, etc._";
       return text + footer;
@@ -1445,7 +1445,7 @@ async function chat(userMessage, userId, deadlineMs = 0) {
   console.warn("[shim] Max iterations reached");
   const fallbackFooter =
     "\n\n---\n" +
-    "_Warm-up mode — after full startup (~1-2 min), additional " +
+    "_Warm-up mode — after full startup (~5-6 second), additional " +
     "community skills come online: YouTube transcripts, deep research, " +
     "task decomposition with sub-agents, etc._";
   return "I ran into a limit processing your request. Please try rephrasing." + fallbackFooter;
