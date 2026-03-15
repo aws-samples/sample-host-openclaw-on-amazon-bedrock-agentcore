@@ -245,6 +245,7 @@ class AgentCoreStack(Stack):
                 resources=[
                     f"arn:aws:ecr:{region}:{account}:repository/openclaw-bridge-*",
                     f"arn:aws:ecr:{region}:{account}:repository/openclaw_agent*",
+                    f"arn:aws:ecr:{region}:{account}:repository/bedrock-agentcore-*",
                 ],
             )
         )
@@ -386,9 +387,10 @@ class AgentCoreStack(Stack):
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/openclaw-identity/index/*",
                         # Per-user API key storage in Secrets Manager (manage_secret tool)
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/user/*",
-                        # ECR pull (toolkit-managed repos)
+                        # ECR pull (toolkit-managed repos — Starter Toolkit uses bedrock-agentcore- prefix)
                         f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw-bridge-*",
                         f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw_agent*",
+                        f"Resource::arn:aws:ecr:{region}:{account}:repository/bedrock-agentcore-*",
                     ],
                 ),
             ],
