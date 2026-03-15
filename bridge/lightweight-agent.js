@@ -444,6 +444,7 @@ const TOOL_ENV = {
   CRON_LAMBDA_ARN: process.env.CRON_LAMBDA_ARN || "",
   EVENTBRIDGE_ROLE_ARN: process.env.EVENTBRIDGE_ROLE_ARN || "",
   IDENTITY_TABLE_NAME: process.env.IDENTITY_TABLE_NAME || "",
+  INTERNAL_USER_ID: process.env.INTERNAL_USER_ID || "",
 };
 
 const SCRIPT_MAP = {

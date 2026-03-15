@@ -71,7 +71,7 @@ const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const IDENTITY_FILE = "/tmp/current-identity.json";
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const BROWSER_SESSION_TIMEOUT_SECONDS = 3600;
-const BUILD_VERSION = "v38"; // Bump in cdk.json to force container redeploy
+const BUILD_VERSION = "v39"; // Bump in cdk.json to force container redeploy
 
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
 const OPENCLAW_LOG_LIMIT = 50;
@@ -83,6 +83,9 @@ let lastOpenClawEnv = null;
 let openclawRestartCount = 0;
 const OPENCLAW_MAX_RESTARTS = 3;
 const OPENCLAW_RESTART_DELAY_MS = 5000;
+
+// Active task tracking — HealthyBusy prevents AgentCore from terminating during long tasks
+let activeTaskCount = 0;
 
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
@@ -366,6 +369,7 @@ function writeOpenClawConfig() {
         enabled: false,
         allowInsecureAuth: true,
         dangerouslyDisableDeviceAuth: true,
+        dangerouslyAllowHostHeaderOriginFallback: true,
         allowedOrigins: ["*"],
       },
     },
@@ -745,6 +749,9 @@ async function init(userId, actorId, channel) {
 
     // Expose USER_ID so child processes (OpenClaw skill scripts) inherit it
     process.env.USER_ID = actorId;
+    // Expose INTERNAL_USER_ID for lightweight agent tool env (eventbridge-cron authorization)
+    process.env.INTERNAL_USER_ID = userId;
+    agent.TOOL_ENV.INTERNAL_USER_ID = userId;
 
     // Write initial identity file for the proxy to read
     updateIdentityFile(actorId, channel);
@@ -1326,20 +1333,23 @@ const server = http.createServer(async (req, res) => {
     pingCount++;
     const now = Date.now();
     const uptimeSec = Math.floor((now - startTime) / 1000);
+    // HealthyBusy prevents AgentCore from terminating during active tasks.
+    // Healthy allows natural idle termination when no tasks are running.
+    const status = activeTaskCount > 0 ? "HealthyBusy" : "Healthy";
     const responseBody = {
-      status: "Healthy",
+      status,
+      time_of_last_update: Math.floor(Date.now() / 1000),
+      active_tasks: activeTaskCount,
     };
 
     // Log every ping for the first 5 minutes, then every 60s
     if (uptimeSec < 300 || now - lastPingLogTime >= PING_LOG_INTERVAL_MS) {
       console.log(
-        `[contract] /ping #${pingCount} uptime=${uptimeSec}s status=${responseBody.status} openclawReady=${openclawReady} proxyReady=${proxyReady}`,
+        `[contract] /ping #${pingCount} uptime=${uptimeSec}s status=${responseBody.status} openclawReady=${openclawReady} proxyReady=${proxyReady} activeTasks=${activeTaskCount}`,
       );
       lastPingLogTime = now;
     }
 
-    // Return Healthy (not HealthyBusy) — allows natural idle termination.
-    // Per-user sessions should terminate when idle.
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(responseBody));
     return;
@@ -1385,6 +1395,8 @@ const server = http.createServer(async (req, res) => {
             openclawLogs: openclawLogs.slice(-20),
             totalRequestCount: proxyHealth?.total_requests ?? null,
             subagentRequestCount: proxyHealth?.subagent_requests ?? null,
+            activeTaskCount,
+            pingStatus: activeTaskCount > 0 ? "HealthyBusy" : "Healthy",
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));
@@ -1456,33 +1468,39 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
-          // Enqueue message (serialized with chat messages to prevent WebSocket races)
+          // Track active task to prevent idle termination during cron processing
+          activeTaskCount++;
           let responseText;
           try {
-            responseText = await enqueueMessage(message);
-          } catch (bridgeErr) {
-            responseText = "";
-            console.error(
-              `[contract] Cron bridge error: ${bridgeErr.message}`,
-            );
-          }
-          // Belt-and-suspenders: strip any remaining content-block JSON wrappers
-          if (responseText) responseText = extractTextFromContent(responseText);
-
-          // If bridge returned empty, fall back to lightweight agent
-          if (!responseText || !responseText.trim()) {
-            console.warn(
-              "[contract] Cron bridge returned empty — falling back to lightweight agent",
-            );
+            // Enqueue message (serialized with chat messages to prevent WebSocket races)
             try {
-              responseText = await agent.chat(message, actorId, Date.now() + 30000);
-            } catch (agentErr) {
-              responseText =
-                "I couldn't process this scheduled task. Please check the configuration.";
+              responseText = await enqueueMessage(message);
+            } catch (bridgeErr) {
+              responseText = "";
               console.error(
-                `[contract] Cron lightweight agent fallback error: ${agentErr.message}`,
+                `[contract] Cron bridge error: ${bridgeErr.message}`,
               );
             }
+            // Belt-and-suspenders: strip any remaining content-block JSON wrappers
+            if (responseText) responseText = extractTextFromContent(responseText);
+
+            // If bridge returned empty, fall back to lightweight agent
+            if (!responseText || !responseText.trim()) {
+              console.warn(
+                "[contract] Cron bridge returned empty — falling back to lightweight agent",
+              );
+              try {
+                responseText = await agent.chat(message, actorId, Date.now() + 30000);
+              } catch (agentErr) {
+                responseText =
+                  "I couldn't process this scheduled task. Please check the configuration.";
+                console.error(
+                  `[contract] Cron lightweight agent fallback error: ${agentErr.message}`,
+                );
+              }
+            }
+          } finally {
+            activeTaskCount = Math.max(0, activeTaskCount - 1);
           }
 
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -1552,48 +1570,54 @@ const server = http.createServer(async (req, res) => {
 
           const bridgeText = buildBridgeText(message);
 
-          // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
+          // Track active task to prevent idle termination during chat processing
+          activeTaskCount++;
           let responseText;
-          if (openclawReady) {
-            // Full OpenClaw path — WebSocket bridge
-            try {
-              responseText = await enqueueMessage(bridgeText);
-            } catch (bridgeErr) {
-              console.error(
-                `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
-              );
-              responseText = "";
-            }
-            // If bridge returned empty (OpenClaw sent no content), fall back to
-            // lightweight agent so the user always gets a real AI response.
-            if (!responseText || !responseText.trim()) {
-              console.warn(
-                "[contract] Bridge returned empty — falling back to lightweight agent",
-              );
+          try {
+            // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
+            if (openclawReady) {
+              // Full OpenClaw path — WebSocket bridge
               try {
-                responseText = await agent.chat(bridgeText, actorId, Date.now() + 30000);
-              } catch (agentErr) {
-                responseText =
-                  "I'm having trouble right now. Please try again in a moment.";
+                responseText = await enqueueMessage(bridgeText);
+              } catch (bridgeErr) {
                 console.error(
-                  `[contract] Lightweight agent fallback error: ${agentErr.message}`,
+                  `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
+                );
+                responseText = "";
+              }
+              // If bridge returned empty (OpenClaw sent no content), fall back to
+              // lightweight agent so the user always gets a real AI response.
+              if (!responseText || !responseText.trim()) {
+                console.warn(
+                  "[contract] Bridge returned empty — falling back to lightweight agent",
+                );
+                try {
+                  responseText = await agent.chat(bridgeText, actorId, Date.now() + 30000);
+                } catch (agentErr) {
+                  responseText =
+                    "I'm having trouble right now. Please try again in a moment.";
+                  console.error(
+                    `[contract] Lightweight agent fallback error: ${agentErr.message}`,
+                  );
+                }
+              }
+            } else if (proxyReady) {
+              // Warm-up shim path — lightweight agent via proxy
+              console.log("[contract] Routing via lightweight agent (warm-up)");
+              try {
+                responseText = await agent.chat(bridgeText, actorId, Date.now() + 560000);
+              } catch (agentErr) {
+                responseText = `I'm having trouble right now. Please try again in a moment.`;
+                console.error(
+                  `[contract] Lightweight agent error: ${agentErr.message}`,
                 );
               }
+            } else {
+              // Proxy not ready yet (should be rare — init awaits proxy)
+              responseText = "I'm starting up — please try again in a moment.";
             }
-          } else if (proxyReady) {
-            // Warm-up shim path — lightweight agent via proxy
-            console.log("[contract] Routing via lightweight agent (warm-up)");
-            try {
-              responseText = await agent.chat(bridgeText, actorId, Date.now() + 560000);
-            } catch (agentErr) {
-              responseText = `I'm having trouble right now. Please try again in a moment.`;
-              console.error(
-                `[contract] Lightweight agent error: ${agentErr.message}`,
-              );
-            }
-          } else {
-            // Proxy not ready yet (should be rare — init awaits proxy)
-            responseText = "I'm starting up — please try again in a moment.";
+          } finally {
+            activeTaskCount = Math.max(0, activeTaskCount - 1);
           }
 
           // Belt-and-suspenders: strip any remaining content-block JSON wrappers
