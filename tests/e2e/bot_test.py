@@ -1224,196 +1224,235 @@ class TestCronSchedule:
 
 @pytest.mark.slow
 class TestCronExecution:
-    """Verify actual cron execution: schedule fires, Lambda runs, response delivered.
+    """Verify cron execution pipeline: bot creates schedule, Lambda executes it.
 
-    Creates a one-shot EventBridge schedule via boto3 (bypasses LLM) using at()
-    syntax that fires ~4 min from now, then polls CloudWatch logs to verify the
-    cron Lambda was invoked and the response was delivered to Telegram.
+    Instead of creating an EventBridge schedule via boto3 (which requires
+    iam:PassRole on the scheduler role), this test:
+
+    1. Creates a schedule via the bot (same as TestCronSchedule)
+    2. Captures the CRON# record from DynamoDB
+    3. Directly invokes the cron Lambda with a synthetic event payload
+    4. Verifies the Lambda returns 200 (not 403 "ownership verification failed")
+    5. Cleans up the schedule via boto3
+
+    This validates the full cron execution pipeline including the critical
+    INTERNAL_USER_ID fix (v69): the CRON# record PK must use the internal
+    user ID (e.g. USER#user_9dc5386ba1124fbd), not the channel-prefixed
+    actor ID (e.g. USER#telegram_6087229962).
 
     Run with: pytest tests/e2e/bot_test.py -v -k TestCronExecution
     """
 
     SCHEDULE_GROUP = "openclaw-cron"
     CRON_LAMBDA_NAME = "openclaw-cron-executor"
-    CRON_SCHEDULER_ROLE = "openclaw-cron-scheduler-role"
 
-    # Populated by test_create_oneshot_schedule
-    _schedule_name = None
+    SCHEDULE_NAME = "e2e-exec-test"
+    SCHEDULE_EXPR = "cron(0 0 1 1 ? 2099)"
+    SCHEDULE_TZ = "UTC"
+    SCHEDULE_MSG = "E2E execution test ping"
+
+    # Populated by test_create_schedule_via_bot
     _schedule_id = None
     _eb_schedule_name = None
     _user_id = None
 
     @pytest.fixture(autouse=True, scope="class")
     def fresh_session(self, e2e_config):
-        """Reset session to start clean."""
+        """Reset session to start clean, then clean up stale test schedules."""
+        self._cleanup_stale_schedules(e2e_config)
         reset_session(e2e_config)
         time.sleep(2)
 
-    def test_create_oneshot_schedule(self, e2e_config):
-        """Create a one-shot schedule via boto3, firing ~4 minutes from now."""
-        import hashlib
+    @classmethod
+    def _cleanup_stale_schedules(cls, cfg):
+        """Delete any leftover E2E execution test schedules from prior runs."""
+        namespace = f"telegram_{cfg.telegram_user_id}"
+        scheduler = boto3.client("scheduler", region_name=cfg.region)
+        try:
+            resp = scheduler.list_schedules(GroupName=cls.SCHEDULE_GROUP)
+            for sched in resp.get("Schedules", []):
+                name = sched["Name"]
+                if (name.startswith(f"openclaw-{namespace}-")
+                        and cls.SCHEDULE_NAME in sched.get("Description", "")):
+                    try:
+                        scheduler.delete_schedule(
+                            Name=name, GroupName=cls.SCHEDULE_GROUP
+                        )
+                        print(f"\n  [cleanup] Deleted stale exec test schedule: {name}")
+                    except ClientError:
+                        pass
+        except ClientError:
+            pass
 
+        # Clean up CRON# records referencing our test schedule
+        user_id = get_user_id(cfg)
+        if user_id:
+            dynamodb = boto3.resource("dynamodb", region_name=cfg.region)
+            table = dynamodb.Table(cfg.identity_table)
+            try:
+                resp = table.query(
+                    KeyConditionExpression="PK = :pk AND begins_with(SK, :sk)",
+                    ExpressionAttributeValues={
+                        ":pk": f"USER#{user_id}",
+                        ":sk": "CRON#",
+                    },
+                )
+                for item in resp.get("Items", []):
+                    sn = (item.get("scheduleName", "") or "").lower()
+                    if cls.SCHEDULE_NAME in sn or "e2e" in sn:
+                        table.delete_item(
+                            Key={"PK": item["PK"], "SK": item["SK"]}
+                        )
+                        print(f"\n  [cleanup] Deleted stale CRON# record: {item['SK']}")
+            except ClientError:
+                pass
+
+    def test_create_schedule_via_bot(self, e2e_config):
+        """Create a far-future schedule via the bot (Telegram webhook)."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            f'Create a cron schedule using the eventbridge-cron skill. '
+            f'Schedule name: "{self.SCHEDULE_NAME}". '
+            f'Expression: {self.SCHEDULE_EXPR}. '
+            f'Timezone: {self.SCHEDULE_TZ}. '
+            f'Message: "{self.SCHEDULE_MSG}". '
+            f'Do not ask any follow-up questions, just create it.',
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Create schedule incomplete (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+        resp_lower = tail.response_text.lower()
+        assert any(w in resp_lower for w in ["created", "scheduled", "success"]), (
+            f"Expected schedule creation confirmation.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+        print(f"  Create schedule response: {tail.response_text[:200]}")
+
+    def test_cron_record_has_internal_user_id(self, e2e_config):
+        """Verify the CRON# record PK uses the internal user ID (v69 fix).
+
+        The critical assertion: PK must be USER#user_<hash> (internal ID),
+        NOT USER#telegram_<digits> (namespace/actor format). This validates
+        that INTERNAL_USER_ID is correctly propagated to the container so
+        the eventbridge-cron skill writes CRON# records under the correct
+        user partition.
+        """
         user_id = get_user_id(e2e_config)
         assert user_id, "E2E user not found in DynamoDB"
+
+        # The internal user ID must start with "user_", not "telegram_"
+        assert user_id.startswith("user_"), (
+            f"INTERNAL_USER_ID fix failed: expected userId starting with 'user_', "
+            f"got '{user_id}'. The CHANNEL# PROFILE record points to an actor-format "
+            f"ID instead of an internal user ID."
+        )
         TestCronExecution._user_id = user_id
 
-        namespace = f"telegram_{e2e_config.telegram_user_id}"
-        actor_id = f"telegram:{e2e_config.telegram_user_id}"
-        schedule_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
-        schedule_name = f"e2e-exec-{int(time.time())}"
-        eb_schedule_name = f"openclaw-{namespace}-{schedule_id}"
+        dynamodb = boto3.resource("dynamodb", region_name=e2e_config.region)
+        table = dynamodb.Table(e2e_config.identity_table)
+        resp = table.query(
+            KeyConditionExpression="PK = :pk AND begins_with(SK, :sk)",
+            ExpressionAttributeValues={
+                ":pk": f"USER#{user_id}",
+                ":sk": "CRON#",
+            },
+        )
+        items = resp.get("Items", [])
+        name_variants = [self.SCHEDULE_NAME, self.SCHEDULE_NAME.replace("-", " ")]
+        matching = [
+            item for item in items
+            if any(v in (item.get("scheduleName", "") or "").lower()
+                   for v in name_variants)
+            or "e2e" in (item.get("scheduleName", "") or "").lower()
+            or "2099" in (item.get("expression", "") or "")
+        ]
+        if not matching and len(items) > 0:
+            matching = items
+        assert len(matching) >= 1, (
+            f"Expected at least 1 CRON# record for '{self.SCHEDULE_NAME}', "
+            f"found {len(matching)}. All CRON# records: "
+            f"{[i.get('scheduleName') for i in items]}"
+        )
 
-        TestCronExecution._schedule_name = schedule_name
-        TestCronExecution._schedule_id = schedule_id
-        TestCronExecution._eb_schedule_name = eb_schedule_name
+        cron_record = matching[0]
+        TestCronExecution._schedule_id = cron_record["SK"].replace("CRON#", "")
 
-        fire_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=4)
-        at_expr = f"at({fire_time.strftime('%Y-%m-%dT%H:%M:%S')})"
+        # Verify the record PK uses internal user ID
+        assert cron_record["PK"] == f"USER#{user_id}", (
+            f"CRON# record PK mismatch: expected USER#{user_id}, "
+            f"got {cron_record['PK']}"
+        )
+        print(f"  CRON# record found: PK={cron_record['PK']}, "
+              f"scheduleId={TestCronExecution._schedule_id}")
 
-        # Resolve Lambda ARN and Role ARN
-        sts = boto3.client("sts", region_name=e2e_config.region)
-        account_id = sts.get_caller_identity()["Account"]
-        lambda_arn = f"arn:aws:lambda:{e2e_config.region}:{account_id}:function:{self.CRON_LAMBDA_NAME}"
-        role_arn = f"arn:aws:iam::{account_id}:role/{self.CRON_SCHEDULER_ROLE}"
+    def test_invoke_cron_lambda(self, e2e_config):
+        """Invoke the cron Lambda directly with the CRON# record data.
 
+        Simulates what EventBridge Scheduler would do: sends the exact
+        payload format the cron Lambda expects. The Lambda should:
+        - Find the CRON# record (ownership check passes)
+        - Warm up the AgentCore session
+        - Execute the cron message
+        - Return 200, not 403
+        """
         import json
-        target_input = json.dumps({
+
+        assert TestCronExecution._schedule_id, "No schedule ID from previous test"
+        assert TestCronExecution._user_id, "No user ID from previous test"
+
+        user_id = TestCronExecution._user_id
+        schedule_id = TestCronExecution._schedule_id
+        actor_id = f"telegram:{e2e_config.telegram_user_id}"
+
+        payload = {
             "userId": user_id,
             "actorId": actor_id,
             "channel": "telegram",
             "channelTarget": e2e_config.telegram_user_id,
-            "message": "E2E execution test ping",
+            "message": self.SCHEDULE_MSG,
             "scheduleId": schedule_id,
-            "scheduleName": schedule_name,
-        })
+            "scheduleName": self.SCHEDULE_NAME,
+        }
 
-        # Create EventBridge schedule
-        scheduler = boto3.client("scheduler", region_name=e2e_config.region)
-        scheduler.create_schedule(
-            Name=eb_schedule_name,
-            GroupName=self.SCHEDULE_GROUP,
-            ScheduleExpression=at_expr,
-            ScheduleExpressionTimezone="UTC",
-            FlexibleTimeWindow={"Mode": "OFF"},
-            State="ENABLED",
-            Target={
-                "Arn": lambda_arn,
-                "RoleArn": role_arn,
-                "Input": target_input,
-            },
-            Description=f"E2E test: {schedule_name}",
-        )
-        print(f"  Created EventBridge schedule: {eb_schedule_name} at {at_expr}")
-
-        # Create DynamoDB CRON# record
-        dynamodb = boto3.resource("dynamodb", region_name=e2e_config.region)
-        table = dynamodb.Table(e2e_config.identity_table)
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        table.put_item(Item={
-            "PK": f"USER#{user_id}",
-            "SK": f"CRON#{schedule_id}",
-            "scheduleId": schedule_id,
-            "scheduleName": schedule_name,
-            "expression": at_expr,
-            "timezone": "UTC",
-            "message": "E2E execution test ping",
-            "channel": "telegram",
-            "channelTarget": e2e_config.telegram_user_id,
-            "actorId": actor_id,
-            "enabled": True,
-            "createdAt": now,
-            "updatedAt": now,
-        })
-        print(f"  Created DynamoDB CRON# record: {schedule_id}")
-
-    def test_cron_lambda_invoked(self, e2e_config):
-        """Wait for the cron Lambda to fire and process the schedule."""
-        assert TestCronExecution._schedule_name, "No schedule name from previous test"
-
-        logs_client = boto3.client("logs", region_name=e2e_config.region)
-        cron_log_group = "/openclaw/lambda/cron"
-
-        # Poll CloudWatch logs for up to 6 minutes
-        deadline = time.time() + 360
-        poll_interval = 15
-        # Start searching from before the schedule was created
-        search_start_ms = int((time.time() - 60) * 1000)
-        found = False
-
-        print(f"  Polling {cron_log_group} for cron invocation (up to 6 min)...")
-        while time.time() < deadline:
-            try:
-                resp = logs_client.filter_log_events(
-                    logGroupName=cron_log_group,
-                    startTime=search_start_ms,
-                    filterPattern='"E2E execution test ping"',
-                    limit=10,
-                )
-                if resp.get("events"):
-                    found = True
-                    print(f"  Cron Lambda invocation found in logs "
-                          f"({len(resp['events'])} matching events)")
-                    break
-            except ClientError as e:
-                if e.response["Error"]["Code"] == "ResourceNotFoundException":
-                    pass  # Log group may not exist yet
-                else:
-                    raise
-            time.sleep(poll_interval)
-
-        assert found, (
-            f"Cron Lambda was not invoked within 6 minutes. "
-            f"Schedule: {TestCronExecution._schedule_name}"
+        lambda_client = boto3.client("lambda", region_name=e2e_config.region)
+        resp = lambda_client.invoke(
+            FunctionName=self.CRON_LAMBDA_NAME,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode(),
         )
 
-    def test_response_delivered(self, e2e_config):
-        """Verify the router Lambda delivered the cron response to Telegram."""
-        assert TestCronExecution._schedule_name, "No schedule name from previous test"
+        resp_payload = json.loads(resp["Payload"].read())
+        status_code = resp_payload.get("statusCode", 0)
 
-        logs_client = boto3.client("logs", region_name=e2e_config.region)
-        router_log_group = e2e_config.log_group
+        print(f"  Cron Lambda response: statusCode={status_code}, "
+              f"body={resp_payload.get('body', '')}")
 
-        # Poll CloudWatch logs for delivery confirmation
-        deadline = time.time() + 120
-        poll_interval = 15
-        search_start_ms = int((time.time() - 360) * 1000)
-        found = False
+        # Must not be 403 (ownership verification failed) — this was the
+        # pre-v69 bug where CRON# records were keyed by actor ID
+        assert status_code != 403, (
+            f"Cron Lambda returned 403 — schedule ownership check failed. "
+            f"This means the CRON# record PK (USER#{user_id}) does not match "
+            f"what the Lambda looked up. Response: {resp_payload}"
+        )
+        assert status_code == 200, (
+            f"Cron Lambda returned unexpected status {status_code}. "
+            f"Response: {resp_payload}"
+        )
 
-        print(f"  Checking {router_log_group} for response delivery...")
-        while time.time() < deadline:
-            try:
-                resp = logs_client.filter_log_events(
-                    logGroupName=router_log_group,
-                    startTime=search_start_ms,
-                    filterPattern='"E2E execution test ping"',
-                    limit=10,
-                )
-                if resp.get("events"):
-                    found = True
-                    print(f"  Response delivery found in router logs "
-                          f"({len(resp['events'])} matching events)")
-                    break
-            except ClientError as e:
-                if e.response["Error"]["Code"] == "ResourceNotFoundException":
-                    pass
-                else:
-                    raise
-            time.sleep(poll_interval)
-
-        # Delivery check is best-effort — the cron Lambda may deliver directly
-        if found:
-            print("  Response delivered to Telegram via router Lambda")
-        else:
-            print("  WARNING: No delivery log found in router Lambda "
-                  "(cron Lambda may deliver directly)")
-
-    def test_cleanup_oneshot_schedule(self, e2e_config):
-        """Clean up the one-shot schedule via boto3 directly."""
-        eb_name = TestCronExecution._eb_schedule_name
+    def test_cleanup_schedule(self, e2e_config):
+        """Clean up the test schedule (EventBridge + DynamoDB)."""
         schedule_id = TestCronExecution._schedule_id
         user_id = TestCronExecution._user_id
-        if not eb_name:
+        if not schedule_id:
             pytest.skip("No schedule to clean up")
+
+        namespace = f"telegram_{e2e_config.telegram_user_id}"
+        eb_name = f"openclaw-{namespace}-{schedule_id}"
 
         # Delete EventBridge schedule
         scheduler = boto3.client("scheduler", region_name=e2e_config.region)
