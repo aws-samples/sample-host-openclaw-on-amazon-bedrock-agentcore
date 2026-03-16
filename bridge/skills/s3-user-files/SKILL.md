@@ -59,6 +59,20 @@ node {baseDir}/delete.js <user_id> <filename>
 - `user_id` (required): The user's unique identifier
 - `filename` (required): The file name to delete
 
+### presign_user_file
+
+Generate a temporary download URL (presigned URL) for a file. The URL is valid for 1 hour by default.
+
+```bash
+node {baseDir}/presign.js <user_id> <filename> [expires_in_seconds]
+```
+
+- `user_id` (required): The user's unique identifier
+- `filename` (required): The file name to generate a URL for
+- `expires_in_seconds` (optional): URL validity in seconds (default: 3600, max: 604800)
+
+**Important**: Always use this tool to generate presigned URLs. Do NOT use `aws s3 presign` CLI — it may produce SigV2 signatures that fail on KMS-encrypted buckets.
+
 ## From Agent Chat
 
 - "Save my preferences" -> write_user_file with the user's preferences
@@ -66,6 +80,8 @@ node {baseDir}/delete.js <user_id> <filename>
 - "What's your name?" -> read_user_file IDENTITY.md for this user
 - "Forget everything about me" -> delete_user_file on each stored file
 - "What files do you have for me?" -> list_user_files
+- "Give me a download link for that file" -> presign_user_file
+- "Generate a presigned URL for my screenshot" -> presign_user_file
 
 ## Security Notes
 

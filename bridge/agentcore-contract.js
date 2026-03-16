@@ -26,6 +26,7 @@ const {
   GetSecretValueCommand,
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
+const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
 
@@ -43,6 +44,11 @@ let COGNITO_PASSWORD_SECRET = null;
 
 // Maximum request body size (1MB) to prevent memory exhaustion
 const MAX_BODY_SIZE = 1 * 1024 * 1024;
+
+// Ping diagnostics — track call count and log periodically
+let pingCount = 0;
+let lastPingLogTime = 0;
+const PING_LOG_INTERVAL_MS = 60000; // Log ping stats every 60s
 
 // State tracking
 let currentUserId = null;
@@ -660,6 +666,7 @@ async function init(userId, actorId, channel) {
     const namespace = actorId.replace(/:/g, "_");
     currentUserId = userId;
     currentNamespace = namespace;
+    await cwLogger.init(`${namespace}-${Date.now()}`);
 
     // Expose USER_ID so child processes (OpenClaw skill scripts) inherit it
     process.env.USER_ID = actorId;
@@ -1215,15 +1222,25 @@ function buildBridgeText(message) {
 const server = http.createServer(async (req, res) => {
   // GET /ping — AgentCore health check
   if (req.method === "GET" && req.url === "/ping") {
+    pingCount++;
+    const now = Date.now();
+    const uptimeSec = Math.floor((now - startTime) / 1000);
+    const responseBody = {
+      status: "Healthy",
+    };
+
+    // Log every ping for the first 5 minutes, then every 60s
+    if (uptimeSec < 300 || now - lastPingLogTime >= PING_LOG_INTERVAL_MS) {
+      console.log(
+        `[contract] /ping #${pingCount} uptime=${uptimeSec}s status=${responseBody.status} openclawReady=${openclawReady} proxyReady=${proxyReady}`,
+      );
+      lastPingLogTime = now;
+    }
+
     // Return Healthy (not HealthyBusy) — allows natural idle termination.
     // Per-user sessions should terminate when idle.
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "Healthy",
-        time_of_last_update: Math.floor(Date.now() / 1000),
-      }),
-    );
+    res.end(JSON.stringify(responseBody));
     return;
   }
 
@@ -1561,6 +1578,7 @@ process.on("SIGTERM", async () => {
     } catch {}
   }
 
+  await cwLogger.shutdown();
   console.log("[contract] Shutdown complete");
   process.exit(0);
 });

@@ -1,0 +1,67 @@
+default_agent: openclaw_agent
+agents:
+  openclaw_agent:
+    name: openclaw_agent
+    language: typescript
+    node_version: '20'
+    entrypoint: /home/ubuntu/g-repo/sample-host-openclaw-on-amazon-bedrock-agentcore/bridge/agentcore-contract.js
+    deployment_type: container
+    runtime_type: null
+    platform: linux/arm64
+    container_runtime: docker
+    source_path: /home/ubuntu/g-repo/sample-host-openclaw-on-amazon-bedrock-agentcore/bridge
+    aws:
+      execution_role: arn:aws:iam::576186206185:role/openclaw-agentcore-execution-role-us-west-2
+      execution_role_auto_create: true
+      account: '576186206185'
+      region: us-west-2
+      ecr_repository: 576186206185.dkr.ecr.us-west-2.amazonaws.com/bedrock-agentcore-openclaw_agent
+      ecr_auto_create: false
+      s3_path: null
+      s3_auto_create: false
+      network_configuration:
+        network_mode: VPC
+        network_mode_config:
+          security_groups:
+          - sg-03bb6e6f7149141dd
+          subnets:
+          - subnet-01b1643518072f0b3
+          - subnet-04202e25fbbbb79b6
+      protocol_configuration:
+        server_protocol: HTTP
+      observability:
+        enabled: true
+      lifecycle_configuration:
+        idle_runtime_session_timeout: 1800
+        max_lifetime: 28800
+    bedrock_agentcore:
+      agent_id: openclaw_agent-FMElB5ECU7
+      agent_arn: arn:aws:bedrock-agentcore:us-west-2:576186206185:runtime/openclaw_agent-FMElB5ECU7
+      agent_session_id: 18a3fe52-6659-4dbe-b4e2-f1fa90070772
+    codebuild:
+      project_name: bedrock-agentcore-openclaw_agent-builder
+      execution_role: arn:aws:iam::576186206185:role/AmazonBedrockAgentCoreSDKCodeBuild-us-west-2-fa79fb8b0d
+      source_bucket: bedrock-agentcore-codebuild-sources-576186206185-us-west-2
+    memory:
+      mode: STM_ONLY
+      memory_id: openclaw_agent_mem-MLXNRV4Hpi
+      memory_arn: arn:aws:bedrock-agentcore:us-west-2:576186206185:memory/openclaw_agent_mem-MLXNRV4Hpi
+      memory_name: openclaw_agent_mem
+      event_expiry_days: 30
+      first_invoke_memory_check_done: true
+      was_created_by_toolkit: true
+    identity:
+      credential_providers: []
+      workload: null
+    aws_jwt:
+      enabled: false
+      audiences: []
+      signing_algorithm: ES384
+      issuer_url: null
+      duration_seconds: 300
+    authorizer_configuration: null
+    request_header_configuration: null
+    oauth_configuration: null
+    api_key_env_var_name: null
+    api_key_credential_provider_name: null
+    is_generated_by_agentcore_create: false

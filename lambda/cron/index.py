@@ -217,35 +217,46 @@ def warmup_and_wait(session_id, user_id, actor_id, channel):
 # ---------------------------------------------------------------------------
 
 def _extract_text_from_content_blocks(text):
-    """Extract plain text if the response is a JSON array of content blocks.
+    """Extract plain text from content blocks anywhere in the response.
 
-    Recursively unwraps nested content blocks — subagent responses can produce
-    multiple layers of wrapping (e.g., subagent -> parent agent -> bridge).
+    Handles three cases:
+    1. Entire string is a JSON array: [{"type":"text","text":"..."}]
+    2. Content blocks embedded in surrounding text: "prefix[{...}]suffix"
+    3. Nested content blocks (subagent wrapping): recursively unwraps up to 10 levels
     """
     if not text or not isinstance(text, str):
         return text
     result = text
+    decoder = json.JSONDecoder(strict=False)
     for _ in range(10):
-        stripped = result.strip()
-        if not (stripped.startswith("[") and stripped.endswith("]")):
+        prev = result
+        rebuilt = []
+        i = 0
+        while i < len(result):
+            pos = result.find("[{", i)
+            if pos == -1:
+                rebuilt.append(result[i:])
+                break
+            rebuilt.append(result[i:pos])
+            try:
+                blocks, end = decoder.raw_decode(result, pos)
+                if isinstance(blocks, list) and blocks:
+                    parts = [
+                        b.get("text", "")
+                        for b in blocks
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    if parts:
+                        rebuilt.append("".join(parts))
+                        i = end
+                        continue
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+            rebuilt.append("[")
+            i = pos + 1
+        result = "".join(rebuilt)
+        if result == prev:
             break
-        try:
-            blocks = json.JSONDecoder(strict=False).decode(stripped)
-            if isinstance(blocks, list) and blocks:
-                parts = [
-                    b.get("text", "")
-                    for b in blocks
-                    if isinstance(b, dict) and b.get("type") == "text"
-                ]
-                if parts:
-                    unwrapped = "".join(parts)
-                    if unwrapped == result:
-                        break
-                    result = unwrapped
-                    continue
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-        break
     return result
 
 
@@ -404,6 +415,41 @@ def send_slack_message(channel_id, text, bot_token):
         urllib_request.urlopen(req, timeout=10)
     except Exception as e:
         logger.error("Failed to send Slack message to %s: %s", channel_id, e)
+
+
+def send_feishu_message(receiver_id, text):
+    """Send a message via Feishu Bot API.
+
+    receiver_id can be an open_id (ou_xxx) or chat_id (oc_xxx).
+    The API receive_id_type is auto-detected from the prefix.
+    """
+    token = _get_feishu_tenant_token()
+    if not token:
+        logger.error("No Feishu tenant_access_token available")
+        return
+
+    id_type = "open_id" if receiver_id.startswith("ou_") else "chat_id"
+    url = f"{FEISHU_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={id_type}"
+    MAX_FEISHU_TEXT_LEN = 20000
+
+    chunks = [text[i:i + MAX_FEISHU_TEXT_LEN]
+              for i in range(0, len(text), MAX_FEISHU_TEXT_LEN)] if len(text) > MAX_FEISHU_TEXT_LEN else [text]
+
+    for chunk in chunks:
+        data = json.dumps({
+            "receive_id": receiver_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": chunk}),
+        }).encode()
+        req = urllib_request.Request(url, data=data, headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        })
+        try:
+            urllib_request.urlopen(req, timeout=10)
+        except Exception as e:
+            logger.error("Failed to send Feishu message to %s: %s", receiver_id, e)
+
 
 
 def deliver_response(channel, channel_target, response_text):

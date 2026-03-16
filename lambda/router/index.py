@@ -1,4 +1,4 @@
-"""Router Lambda — Webhook ingestion for Telegram and Slack.
+"""Router Lambda — Webhook ingestion for Telegram, Slack, and Feishu.
 
 Receives webhook events via API Gateway HTTP API, resolves user identity via
 DynamoDB, invokes the per-user AgentCore Runtime session, and sends responses
@@ -7,6 +7,7 @@ back to the originating channel.
 Path routing:
   POST /webhook/telegram  — Telegram Bot API webhook
   POST /webhook/slack     — Slack Events API webhook
+  POST /webhook/feishu    — Feishu Events API webhook
 """
 
 import hashlib
@@ -34,6 +35,8 @@ AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
+FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
+FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
@@ -63,9 +66,6 @@ _SECRET_CACHE_TTL_SECONDS = 900  # 15 minutes
 _token_cache = {}  # {secret_id: (value, fetched_at)}
 
 BIND_CODE_TTL_SECONDS = 600  # 10 minutes
-
-# --- Screenshot marker detection ---
-SCREENSHOT_MARKER_RE = re.compile(r"\[SCREENSHOT:([^\]]+)\]")
 
 
 def _get_secret(secret_id):
@@ -105,6 +105,56 @@ def _get_slack_tokens():
 
 def _get_webhook_secret():
     return _get_secret(WEBHOOK_SECRET_ID)
+
+
+def _get_feishu_credentials():
+    """Return (app_id, app_secret, verification_token, encrypt_key) from Feishu secret."""
+    raw = _get_secret(FEISHU_TOKEN_SECRET_ID)
+    if not raw:
+        return "", "", "", ""
+    try:
+        data = json.loads(raw)
+        return (
+            data.get("appId", ""),
+            data.get("appSecret", ""),
+            data.get("verificationToken", ""),
+            data.get("encryptKey", ""),
+        )
+    except (json.JSONDecodeError, TypeError):
+        return "", "", "", ""
+
+
+# Feishu tenant_access_token cache (2h TTL, refresh 5 min early)
+_feishu_token_cache = {"token": "", "expires_at": 0}
+
+
+def _get_feishu_tenant_token():
+    """Get or refresh Feishu tenant_access_token (2h TTL, refresh 5 min early)."""
+    if _feishu_token_cache["token"] and time.time() < _feishu_token_cache["expires_at"] - 300:
+        return _feishu_token_cache["token"]
+
+    app_id, app_secret, _, _ = _get_feishu_credentials()
+    if not app_id or not app_secret:
+        logger.error("Feishu app_id/app_secret not configured")
+        return ""
+
+    url = f"{FEISHU_API_DOMAIN}/open-apis/auth/v3/tenant_access_token/internal"
+    data = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
+    req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
+
+    try:
+        resp = urllib_request.urlopen(req, timeout=10)
+        result = json.loads(resp.read())
+        if result.get("code") == 0:
+            token = result["tenant_access_token"]
+            expire = result.get("expire", 7200)
+            _feishu_token_cache["token"] = token
+            _feishu_token_cache["expires_at"] = time.time() + expire
+            return token
+        logger.error("Feishu token error: code=%s msg=%s", result.get("code"), result.get("msg", ""))
+    except Exception as e:
+        logger.error("Failed to get Feishu tenant_access_token: %s", e)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +225,155 @@ def validate_slack_webhook(headers, body):
         return False
 
     return True
+
+
+def validate_feishu_webhook(headers, body_bytes):
+    """Validate Feishu webhook using X-Lark-Signature SHA-256 verification.
+
+    Signature = SHA256(timestamp + nonce + encrypt_key + body)
+    Returns False (fail-closed) if encrypt_key is not configured.
+    """
+    _, _, _, encrypt_key = _get_feishu_credentials()
+    if not encrypt_key:
+        logger.error("Feishu encrypt_key not configured — rejecting request (fail-closed)")
+        return False
+
+    timestamp = headers.get("x-lark-request-timestamp", "")
+    nonce = headers.get("x-lark-request-nonce", "")
+    signature = headers.get("x-lark-signature", "")
+
+    if not timestamp or not nonce or not signature:
+        logger.warning("Feishu webhook missing signature headers")
+        return False
+
+    body_b = body_bytes if isinstance(body_bytes, bytes) else body_bytes.encode("utf-8")
+    content = f"{timestamp}{nonce}{encrypt_key}".encode() + body_b
+    expected = hashlib.sha256(content).hexdigest()
+
+    if not hmac.compare_digest(expected, signature):
+        logger.warning("Feishu webhook signature mismatch")
+        return False
+
+    return True
+
+
+def _decrypt_feishu_event(encrypted_body):
+    """Decrypt AES-256-CBC encrypted Feishu event body.
+
+    Feishu encrypts events when Encrypt Key is configured.  The body arrives as
+    {"encrypt": "<base64-ciphertext>"}.  The AES key is SHA-256(encrypt_key),
+    the IV is the first 16 bytes of the ciphertext.
+
+    Uses a zero-dependency AES-CBC implementation to avoid native binary
+    compatibility issues across Lambda architectures.
+
+    Returns the decrypted JSON string, or None on failure.
+    """
+    import base64
+
+    _, _, _, encrypt_key = _get_feishu_credentials()
+    if not encrypt_key:
+        logger.error("Feishu encrypt_key not set — cannot decrypt")
+        return None
+
+    try:
+        data = json.loads(encrypted_body) if isinstance(encrypted_body, str) else encrypted_body
+        cipher_text = base64.b64decode(data["encrypt"])
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.error("Feishu decrypt: bad input — %s", e)
+        return None
+
+    key = hashlib.sha256(encrypt_key.encode("utf-8")).digest()
+    iv = cipher_text[:16]
+    encrypted = cipher_text[16:]
+
+    try:
+        decrypted = _aes_cbc_decrypt(key, iv, encrypted)
+    except RuntimeError as e:
+        logger.error("Feishu decrypt failed: %s", e)
+        return None
+
+    return decrypted.decode("utf-8")
+
+
+def _aes_cbc_decrypt(key, iv, data):
+    """AES-256-CBC decryption via system OpenSSL (libcrypto).
+
+    Lambda runtimes always have libcrypto.so available.  This avoids shipping
+    any native Python extension while still getting C-speed AES.
+    """
+    import ctypes
+    import ctypes.util
+
+    libcrypto_name = ctypes.util.find_library("crypto")
+    if not libcrypto_name:
+        # Fallback paths common on Amazon Linux 2023
+        for path in ("/usr/lib64/libcrypto.so", "/usr/lib/libcrypto.so"):
+            try:
+                libcrypto = ctypes.CDLL(path)
+                break
+            except OSError:
+                continue
+        else:
+            raise RuntimeError("libcrypto not found")
+    else:
+        libcrypto = ctypes.CDLL(libcrypto_name)
+
+    # EVP_CIPHER_CTX_new / free
+    libcrypto.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+    libcrypto.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+
+    # EVP_DecryptInit_ex
+    libcrypto.EVP_DecryptInit_ex.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_char_p, ctypes.c_char_p,
+    ]
+    libcrypto.EVP_DecryptInit_ex.restype = ctypes.c_int
+
+    # EVP_DecryptUpdate
+    libcrypto.EVP_DecryptUpdate.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p, ctypes.c_int,
+    ]
+    libcrypto.EVP_DecryptUpdate.restype = ctypes.c_int
+
+    # EVP_DecryptFinal_ex
+    libcrypto.EVP_DecryptFinal_ex.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+    ]
+    libcrypto.EVP_DecryptFinal_ex.restype = ctypes.c_int
+
+    # EVP_aes_256_cbc
+    libcrypto.EVP_aes_256_cbc.restype = ctypes.c_void_p
+    libcrypto.EVP_aes_256_cbc.argtypes = []
+
+    ctx = libcrypto.EVP_CIPHER_CTX_new()
+    if not ctx:
+        raise RuntimeError("EVP_CIPHER_CTX_new failed")
+
+    try:
+        cipher_type = libcrypto.EVP_aes_256_cbc()
+        rc = libcrypto.EVP_DecryptInit_ex(ctx, cipher_type, None, key, iv)
+        if rc != 1:
+            raise RuntimeError("EVP_DecryptInit_ex failed")
+
+        out_buf = ctypes.create_string_buffer(len(data) + 16)
+        out_len = ctypes.c_int(0)
+
+        rc = libcrypto.EVP_DecryptUpdate(ctx, out_buf, ctypes.byref(out_len), data, len(data))
+        if rc != 1:
+            raise RuntimeError("EVP_DecryptUpdate failed")
+        total = out_len.value
+
+        final_buf = ctypes.create_string_buffer(16)
+        final_len = ctypes.c_int(0)
+        rc = libcrypto.EVP_DecryptFinal_ex(ctx, final_buf, ctypes.byref(final_len))
+        if rc != 1:
+            raise RuntimeError("EVP_DecryptFinal_ex failed — bad padding or wrong key")
+
+        return out_buf.raw[:total] + final_buf.raw[:final_len.value]
+    finally:
+        libcrypto.EVP_CIPHER_CTX_free(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +483,7 @@ def resolve_user(channel, channel_user_id, display_name=""):
     return user_id, True
 
 
+
 def get_or_create_session(user_id):
     """Get or create a session ID for the user. Session IDs must be >= 33 chars."""
     pk = f"USER#{user_id}"
@@ -305,6 +505,7 @@ def get_or_create_session(user_id):
     session_id = f"ses_{user_id}_{uuid.uuid4().hex[:12]}"
     if len(session_id) < 33:
         session_id += "_" + uuid.uuid4().hex[: 33 - len(session_id)]
+    logger.info("New session created: %s for user %s", session_id, user_id)
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     try:
@@ -455,37 +656,52 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
 # ---------------------------------------------------------------------------
 
 def _extract_text_from_content_blocks(text):
-    """Extract plain text if the response is a JSON array of content blocks.
+    """Extract plain text from content blocks anywhere in the response.
 
-    AI responses sometimes arrive wrapped as: [{"type":"text","text":"..."}]
-    The inner text values may contain literal newlines, so strict=False is
-    required for the JSON decoder.
+    Handles three cases:
+    1. Entire string is a JSON array: [{"type":"text","text":"..."}]
+    2. Content blocks embedded in surrounding text: "prefix[{...}]suffix"
+    3. Nested content blocks (subagent wrapping): recursively unwraps up to 10 levels
 
-    Recursively unwraps nested content blocks — subagent responses can produce
-    multiple layers of wrapping (e.g., subagent → parent agent → bridge).
+    Scans for '[{' positions and attempts JSON parse at each to handle
+    complex nested/escaped content blocks from subagent responses.
     """
     if not text or not isinstance(text, str):
         return text
     result = text
-    # Loop to unwrap multiple nesting levels (max 10 to prevent infinite loops)
+    decoder = json.JSONDecoder(strict=False)
     for _ in range(10):
-        stripped = result.strip()
-        if not (stripped.startswith("[") and stripped.endswith("]")):
+        prev = result
+        # Scan for all '[{' positions and try to parse JSON arrays
+        rebuilt = []
+        i = 0
+        while i < len(result):
+            pos = result.find("[{", i)
+            if pos == -1:
+                rebuilt.append(result[i:])
+                break
+            rebuilt.append(result[i:pos])
+            # Try to parse a JSON array starting at pos
+            try:
+                blocks, end = decoder.raw_decode(result, pos)
+                if isinstance(blocks, list) and blocks:
+                    parts = [
+                        b.get("text", "")
+                        for b in blocks
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    if parts:
+                        rebuilt.append("".join(parts))
+                        i = end
+                        continue
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+            # Not a valid content block array, keep the '[' and advance
+            rebuilt.append("[")
+            i = pos + 1
+        result = "".join(rebuilt)
+        if result == prev:
             break
-        try:
-            blocks = json.JSONDecoder(strict=False).decode(stripped)
-            if isinstance(blocks, list) and blocks:
-                parts = [b.get("text", "") for b in blocks
-                         if isinstance(b, dict) and b.get("type") == "text"]
-                if parts:
-                    unwrapped = "".join(parts)
-                    if unwrapped == result:
-                        break  # No progress — avoid infinite loop
-                    result = unwrapped
-                    continue
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-        break
     return result
 
 
@@ -620,129 +836,6 @@ def _markdown_to_telegram_html(text):
     return text
 
 
-# ---------------------------------------------------------------------------
-# Screenshot marker detection and delivery
-# ---------------------------------------------------------------------------
-
-
-def _extract_screenshots(text: str) -> tuple:
-    """Extract [SCREENSHOT:key] markers from text.
-
-    Returns (clean_text, [s3_keys]). The clean_text has all markers removed
-    and extra whitespace stripped.
-    """
-    keys = SCREENSHOT_MARKER_RE.findall(text)
-    clean = SCREENSHOT_MARKER_RE.sub("", text).strip()
-    return clean, keys
-
-
-def _fetch_s3_image(s3_key: str, namespace: str):
-    """Fetch image bytes from S3. Returns None on error or invalid key."""
-    # Validate: reject path traversal
-    if ".." in s3_key:
-        logger.error("Rejected S3 screenshot key with path traversal: %s", s3_key)
-        return None
-    # Validate: key must be within user namespace _screenshots/ prefix
-    expected_prefix = f"{namespace}/_screenshots/"
-    if not s3_key.startswith(expected_prefix):
-        logger.error("Rejected S3 screenshot key outside user namespace: %s (expected prefix: %s)", s3_key, expected_prefix)
-        return None
-    try:
-        bucket = os.environ["S3_USER_FILES_BUCKET"]
-        resp = s3_client.get_object(Bucket=bucket, Key=s3_key)
-        return resp["Body"].read()
-    except Exception as e:
-        logger.error("Failed to fetch screenshot from S3 key %s: %s", s3_key, e)
-        return None
-
-
-def _send_telegram_photo(chat_id: str, image_bytes: bytes, caption, token: str) -> bool:
-    """Send a photo to Telegram chat via multipart form data. Returns True on success."""
-    boundary = "----FormBoundary" + str(int(time.time()))
-    parts = []
-    parts.append(
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
-        f"{chat_id}"
-    )
-    if caption:
-        parts.append(
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="caption"\r\n\r\n'
-            f"{caption}"
-        )
-    # Build body: text parts + binary photo part
-    text_body = "\r\n".join(parts) + "\r\n"
-    photo_header = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="photo"; filename="screenshot.png"\r\n'
-        f"Content-Type: image/png\r\n\r\n"
-    )
-    closing = f"\r\n--{boundary}--\r\n"
-    body = text_body.encode() + photo_header.encode() + image_bytes + closing.encode()
-
-    url = f"https://api.telegram.org/bot{token}/sendPhoto"
-    req = urllib_request.Request(
-        url, data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-    )
-    try:
-        urllib_request.urlopen(req, timeout=15)
-        return True
-    except Exception as e:
-        logger.error("Failed to send Telegram photo: %s", e)
-        return False
-
-
-def _send_slack_file(channel_id: str, image_bytes: bytes, bot_token: str) -> bool:
-    """Upload a screenshot to Slack using the v2 file upload API.
-
-    Requires files:write Slack bot scope for screenshot delivery.
-    """
-    import urllib.request
-    import urllib.parse
-
-    try:
-        # Step 1: Get upload URL
-        params = urllib.parse.urlencode({"filename": "screenshot.png", "length": len(image_bytes)})
-        req = urllib.request.Request(
-            f"https://slack.com/api/files.getUploadURLExternal?{params}",
-            headers={"Authorization": f"Bearer {bot_token}"},
-        )
-        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
-        if not resp.get("ok"):
-            logger.error("Slack getUploadURLExternal failed: %s", resp.get("error"))
-            return False
-
-        upload_url = resp["upload_url"]
-        file_id = resp["file_id"]
-
-        # Step 2: Upload file bytes
-        urllib.request.urlopen(
-            urllib.request.Request(upload_url, data=image_bytes, method="POST"),
-            timeout=30,
-        )
-
-        # Step 3: Complete upload and share to channel
-        complete_data = json.dumps({
-            "files": [{"id": file_id}],
-            "channel_id": channel_id,
-        }).encode()
-        complete_req = urllib.request.Request(
-            "https://slack.com/api/files.completeUploadExternal",
-            data=complete_data,
-            headers={
-                "Authorization": f"Bearer {bot_token}",
-                "Content-Type": "application/json",
-            },
-        )
-        complete_resp = json.loads(urllib.request.urlopen(complete_req, timeout=10).read())
-        return complete_resp.get("ok", False)
-    except Exception as e:
-        logger.error("Failed to send Slack file: %s", e)
-        return False
-
-
 def send_telegram_message(chat_id, text, token):
     """Send a message via Telegram Bot API.
 
@@ -850,6 +943,246 @@ def _slack_progress_notify(channel_id, bot_token, stop_event, notify_after_s=30)
             "I'll send the full response when it's ready.",
             bot_token,
         )
+
+
+def send_feishu_message(chat_id, text):
+    """Send a message via Feishu Bot API."""
+    token = _get_feishu_tenant_token()
+    if not token:
+        logger.error("No Feishu tenant_access_token available")
+        return
+
+    url = f"{FEISHU_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type=chat_id"
+    MAX_FEISHU_TEXT_LEN = 20000
+
+    chunks = [text[i:i + MAX_FEISHU_TEXT_LEN]
+              for i in range(0, len(text), MAX_FEISHU_TEXT_LEN)] if len(text) > MAX_FEISHU_TEXT_LEN else [text]
+
+    for chunk in chunks:
+        data = json.dumps({
+            "receive_id": chat_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": chunk}),
+        }).encode()
+        req = urllib_request.Request(url, data=data, headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        })
+        try:
+            urllib_request.urlopen(req, timeout=10)
+        except Exception as e:
+            logger.error("Failed to send Feishu message to %s: %s", chat_id, e)
+
+
+def _feishu_progress_notify(chat_id, stop_event, notify_after_s=30):
+    """Send a one-time progress message to Feishu if the request takes longer than notify_after_s."""
+    if not stop_event.wait(timeout=notify_after_s):
+        send_feishu_message(chat_id, "\u23f3 正在处理你的请求，可能需要几分钟。完成后会发送完整回复。")
+
+
+def _download_feishu_image(content_str, msg_type):
+    """Download image from Feishu API using image_key.
+
+    Returns (image_bytes, content_type, filename) or (None, None, None).
+    """
+    if msg_type != "image":
+        return None, None, None
+
+    try:
+        content = json.loads(content_str) if isinstance(content_str, str) else content_str
+        image_key = content.get("image_key", "")
+    except (json.JSONDecodeError, TypeError):
+        return None, None, None
+
+    if not image_key:
+        return None, None, None
+
+    token = _get_feishu_tenant_token()
+    if not token:
+        return None, None, None
+
+    url = f"{FEISHU_API_DOMAIN}/open-apis/im/v1/images/{image_key}"
+    req = urllib_request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        resp = urllib_request.urlopen(req, timeout=30)
+        content_type = resp.headers.get("Content-Type", "image/jpeg")
+        image_bytes = resp.read(4 * 1024 * 1024)  # 4MB max
+        if content_type not in ALLOWED_IMAGE_TYPES:
+            logger.warning("Feishu image type %s not in allowed list", content_type)
+            return None, None, None
+        ext = content_type.split("/")[-1].split(";")[0]
+        filename = f"feishu_{image_key}.{ext}"
+        return image_bytes, content_type, filename
+    except Exception as e:
+        logger.error("Failed to download Feishu image %s: %s", image_key, e)
+        return None, None, None
+
+
+
+# --- Screenshot marker detection ---
+SCREENSHOT_MARKER_RE = re.compile(r"\[SCREENSHOT:([^\]]+)\]")
+
+
+def _extract_screenshots(text: str) -> tuple:
+    """Extract [SCREENSHOT:key] markers from text.
+
+    Returns (clean_text, [s3_keys]). The clean_text has all markers removed
+    and extra whitespace stripped.
+    """
+    keys = SCREENSHOT_MARKER_RE.findall(text)
+    clean = SCREENSHOT_MARKER_RE.sub("", text).strip()
+    return clean, keys
+
+
+
+def _fetch_s3_image(s3_key: str, namespace: str):
+    """Fetch image bytes from S3. Returns None on error or invalid key."""
+    # Validate: reject path traversal
+    if ".." in s3_key:
+        logger.error("Rejected S3 screenshot key with path traversal: %s", s3_key)
+        return None
+    # Validate: key must be within user namespace _screenshots/ prefix
+    expected_prefix = f"{namespace}/_screenshots/"
+    if not s3_key.startswith(expected_prefix):
+        logger.error("Rejected S3 screenshot key outside user namespace: %s (expected prefix: %s)", s3_key, expected_prefix)
+        return None
+    try:
+        bucket = os.environ["S3_USER_FILES_BUCKET"]
+        resp = s3_client.get_object(Bucket=bucket, Key=s3_key)
+        return resp["Body"].read()
+    except Exception as e:
+        logger.error("Failed to fetch screenshot from S3 key %s: %s", s3_key, e)
+        return None
+
+
+
+def _send_telegram_photo(chat_id: str, image_bytes: bytes, caption, token: str) -> bool:
+    """Send a photo to Telegram chat via multipart form data. Returns True on success."""
+    boundary = "----FormBoundary" + str(int(time.time()))
+    parts = []
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+        f"{chat_id}"
+    )
+    if caption:
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="caption"\r\n\r\n'
+            f"{caption}"
+        )
+    # Build body: text parts + binary photo part
+    text_body = "\r\n".join(parts) + "\r\n"
+    photo_header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="photo"; filename="screenshot.png"\r\n'
+        f"Content-Type: image/png\r\n\r\n"
+    )
+    closing = f"\r\n--{boundary}--\r\n"
+    body = text_body.encode() + photo_header.encode() + image_bytes + closing.encode()
+
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    req = urllib_request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        urllib_request.urlopen(req, timeout=15)
+        return True
+    except Exception as e:
+        logger.error("Failed to send Telegram photo: %s", e)
+        return False
+
+
+
+
+
+def _send_slack_file(channel_id: str, image_bytes: bytes, bot_token: str) -> bool:
+    """Upload a screenshot to Slack using the v2 file upload API.
+
+    Requires files:write Slack bot scope for screenshot delivery.
+    """
+    import urllib.request
+    import urllib.parse
+
+    try:
+        # Step 1: Get upload URL
+        params = urllib.parse.urlencode({"filename": "screenshot.png", "length": len(image_bytes)})
+        req = urllib.request.Request(
+            f"https://slack.com/api/files.getUploadURLExternal?{params}",
+            headers={"Authorization": f"Bearer {bot_token}"},
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        if not resp.get("ok"):
+            logger.error("Slack getUploadURLExternal failed: %s", resp.get("error"))
+            return False
+
+        upload_url = resp["upload_url"]
+        file_id = resp["file_id"]
+
+        # Step 2: Upload file bytes
+        urllib.request.urlopen(
+            urllib.request.Request(upload_url, data=image_bytes, method="POST"),
+            timeout=30,
+        )
+
+        # Step 3: Complete upload and share to channel
+        complete_data = json.dumps({
+            "files": [{"id": file_id}],
+            "channel_id": channel_id,
+        }).encode()
+        complete_req = urllib.request.Request(
+            "https://slack.com/api/files.completeUploadExternal",
+            data=complete_data,
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        complete_resp = json.loads(urllib.request.urlopen(complete_req, timeout=10).read())
+        return complete_resp.get("ok", False)
+    except Exception as e:
+        logger.error("Failed to send Slack file: %s", e)
+        return False
+
+
+def _get_secret(secret_id):
+    """Fetch a secret value, cached with a 15-minute TTL."""
+    cached = _token_cache.get(secret_id)
+    if cached:
+        value, fetched_at = cached
+        if time.time() - fetched_at < _SECRET_CACHE_TTL_SECONDS:
+            return value
+    if not secret_id:
+        return ""
+    try:
+        resp = secrets_client.get_secret_value(SecretId=secret_id)
+        value = resp["SecretString"]
+        _token_cache[secret_id] = (value, time.time())
+        return value
+    except Exception as e:
+        logger.warning("Failed to fetch secret %s: %s", secret_id, e)
+        return ""
+
+
+def _get_telegram_token():
+    return _get_secret(TELEGRAM_TOKEN_SECRET_ID)
+
+
+def _get_slack_tokens():
+    """Return (bot_token, signing_secret) tuple from Slack secret (JSON or plain string)."""
+    raw = _get_secret(SLACK_TOKEN_SECRET_ID)
+    if not raw:
+        return "", ""
+    try:
+        data = json.loads(raw)
+        return data.get("botToken", ""), data.get("signingSecret", "")
+    except (json.JSONDecodeError, TypeError):
+        return raw, ""
+
+
+def _get_webhook_secret():
+    return _get_secret(WEBHOOK_SECRET_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -1128,24 +1461,13 @@ def handle_telegram(body):
     response_text = _extract_text_from_content_blocks(response_text)
     logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
 
-    # Extract and deliver screenshot images before sending text
-    namespace = actor_id.replace(":", "_")
-    response_text, screenshot_keys = _extract_screenshots(response_text)
-    for s3_key in screenshot_keys:
-        img_bytes = _fetch_s3_image(s3_key, namespace)
-        if img_bytes:
-            _send_telegram_photo(chat_id, img_bytes, None, token)
-        else:
-            logger.warning("Skipping undeliverable screenshot: %s", s3_key)
-
-    # Send response (split if > 4096 chars for Telegram limit); skip if empty after stripping
-    if response_text:
-        if len(response_text) <= 4096:
-            send_telegram_message(chat_id, response_text, token)
-        else:
-            for i in range(0, len(response_text), 4096):
-                send_telegram_message(chat_id, response_text[i:i + 4096], token)
-    logger.info("Telegram response sent to chat_id=%s (screenshots=%d)", chat_id, len(screenshot_keys))
+    # Send response (split if > 4096 chars for Telegram limit)
+    if len(response_text) <= 4096:
+        send_telegram_message(chat_id, response_text, token)
+    else:
+        for i in range(0, len(response_text), 4096):
+            send_telegram_message(chat_id, response_text[i:i + 4096], token)
+    logger.info("Telegram response sent to chat_id=%s", chat_id)
 
 
 def handle_slack(body, headers=None):
@@ -1271,19 +1593,161 @@ def handle_slack(body, headers=None):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     response_text = _extract_text_from_content_blocks(response_text)
 
-    # Extract and deliver screenshot images before sending text
-    namespace = actor_id.replace(":", "_")
-    response_text, screenshot_keys = _extract_screenshots(response_text)
-    for s3_key in screenshot_keys:
-        img_bytes = _fetch_s3_image(s3_key, namespace)
-        if img_bytes:
-            _send_slack_file(channel_id, img_bytes, bot_token)
-        else:
-            logger.warning("Skipping undeliverable screenshot: %s", s3_key)
+    send_slack_message(channel_id, response_text, bot_token)
+    return {"statusCode": 200, "body": "ok"}
 
-    # Send text response; skip if empty after stripping markers
-    if response_text:
-        send_slack_message(channel_id, response_text, bot_token)
+
+def handle_feishu(body, headers=None):
+    """Process a Feishu Events API webhook.
+
+    Returns a response dict for immediate replies (url_verification).
+    """
+    event_data = json.loads(body) if isinstance(body, str) else body
+
+    # Decrypt if the event body is encrypted (Encrypt Key enabled)
+    if "encrypt" in event_data and "header" not in event_data:
+        decrypted = _decrypt_feishu_event(event_data)
+        if not decrypted:
+            logger.error("Feishu: failed to decrypt event")
+            return {"statusCode": 200, "body": "ok"}
+        event_data = json.loads(decrypted)
+        logger.info("Feishu: decrypted event successfully")
+
+    # Feishu URL verification challenge (like Slack's url_verification)
+    if event_data.get("type") == "url_verification":
+        challenge = str(event_data.get("challenge", ""))
+        if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
+            return {"statusCode": 400, "body": "Invalid challenge format"}
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"challenge": challenge}),
+        }
+
+    # Extract v2 event structure
+    header = event_data.get("header", {})
+    event = event_data.get("event", {})
+    event_type = header.get("event_type", "")
+
+    if event_type != "im.message.receive_v1":
+        logger.info("Feishu: ignoring event type: %s", event_type)
+        return {"statusCode": 200, "body": "ok"}
+
+    # Ignore bot messages (same as Slack's bot_id check)
+    sender = event.get("sender", {})
+    if sender.get("sender_type") != "user":
+        return {"statusCode": 200, "body": "ok"}
+
+    sender_id = sender.get("sender_id", {}).get("open_id", "")
+    message = event.get("message", {})
+    chat_id = message.get("chat_id", "")
+    msg_type = message.get("message_type", "")
+    content_str = message.get("content", "{}")
+
+    # Parse message content (Feishu wraps content as JSON string)
+    try:
+        content = json.loads(content_str)
+    except json.JSONDecodeError:
+        content = {}
+
+    if msg_type == "text":
+        text = content.get("text", "")
+    elif msg_type == "image":
+        text = ""  # Image-only — text may be empty
+    else:
+        text = content.get("text", str(content))
+
+    # Group chat: strip @bot mention tags
+    chat_type = message.get("chat_type", "p2p")
+    if chat_type == "group":
+        mentions = message.get("mentions", [])
+        for mention in mentions:
+            mention_key = mention.get("key", "")
+            if mention_key:
+                text = text.replace(mention_key, "").strip()
+
+    has_image = msg_type == "image"
+    if not sender_id or not chat_id or (not text and not has_image):
+        return {"statusCode": 200, "body": "ok"}
+
+    if len(sender_id) > 128:
+        logger.warning("Feishu sender_id too long (%d chars), rejecting", len(sender_id))
+        return {"statusCode": 400, "body": "Invalid sender ID"}
+
+    # Handle bind commands BEFORE allowlist check
+    actor_id = f"feishu:{sender_id}"
+    is_bind, code = _is_bind_command(text)
+    if is_bind:
+        bound_user_id, success = redeem_bind_code(code, "feishu", sender_id)
+        if success:
+            send_feishu_message(chat_id, "Accounts linked successfully! Your sessions are now unified.")
+        else:
+            send_feishu_message(chat_id, "Invalid or expired link code. Please try again.")
+        return {"statusCode": 200, "body": "ok"}
+
+    # Resolve user identity
+    resolved_user_id, is_new = resolve_user("feishu", sender_id)
+
+    if resolved_user_id is None:
+        send_feishu_message(
+            chat_id,
+            f"Sorry, this bot is private and requires an invitation.\n\n"
+            f"Your ID: feishu:{sender_id}\n\n"
+            f"Send this ID to the bot admin to request access.",
+        )
+        return {"statusCode": 200, "body": "ok"}
+
+    # Handle link-accounts command
+    if _is_link_command(text):
+        bind_code = create_bind_code(resolved_user_id)
+        send_feishu_message(
+            chat_id,
+            f"Your link code is: {bind_code}\n\nEnter this code on another channel within 10 minutes "
+            f"by typing: link {bind_code}",
+        )
+        return {"statusCode": 200, "body": "ok"}
+
+    # Build message payload (structured if image, plain string if text-only)
+    agent_message = text or "hi"
+    if has_image:
+        namespace = actor_id.replace(":", "_")
+        image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
+        if image_bytes:
+            s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+            if s3_key:
+                agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
+            else:
+                send_feishu_message(chat_id, "Sorry, I couldn't process that image. Please try again.")
+                return {"statusCode": 200, "body": "ok"}
+        else:
+            send_feishu_message(chat_id, "Sorry, I couldn't download that image. Please try again.")
+            return {"statusCode": 200, "body": "ok"}
+
+    # Get or create session
+    session_id = get_or_create_session(resolved_user_id)
+
+    logger.info(
+        "Feishu: user=%s actor=%s session=%s msg_len=%d has_image=%s chat_type=%s",
+        resolved_user_id, actor_id, session_id, len(text), has_image, chat_type,
+    )
+
+    # Invoke AgentCore with progress notification
+    stop_notify = threading.Event()
+    notify_thread = threading.Thread(
+        target=_feishu_progress_notify,
+        args=(chat_id, stop_notify),
+        daemon=True,
+    )
+    notify_thread.start()
+    try:
+        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message)
+    finally:
+        stop_notify.set()
+        notify_thread.join(timeout=2)
+    response_text = result.get("response", "Sorry, I couldn't process your message.")
+    response_text = _extract_text_from_content_blocks(response_text)
+
+    send_feishu_message(chat_id, response_text)
     return {"statusCode": 200, "body": "ok"}
 
 
@@ -1303,6 +1767,8 @@ def handler(event, context):
             handle_telegram(body)
         elif channel == "slack":
             handle_slack(body, headers)
+        elif channel == "feishu":
+            handle_feishu(body, headers)
         return {"statusCode": 200, "body": "ok"}
 
     # --- Function URL entry point ---
@@ -1372,6 +1838,32 @@ def handler(event, context):
         _self_invoke_async("slack", body, headers)
         return {"statusCode": 200, "body": "ok"}
 
+    elif path.endswith("/webhook/feishu"):
+        # Feishu URL verification challenge — must respond synchronously
+        try:
+            event_data = json.loads(body) if isinstance(body, str) else body
+            if event_data.get("type") == "url_verification":
+                challenge = str(event_data.get("challenge", ""))
+                if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
+                    return {"statusCode": 400, "body": "Invalid challenge format"}
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"challenge": challenge}),
+                }
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # Validate Feishu signature
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        if not validate_feishu_webhook(headers, body_bytes):
+            logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+
+        # Self-invoke async for actual processing
+        _self_invoke_async("feishu", body, headers)
+        return {"statusCode": 200, "body": "ok"}
+
     return {"statusCode": 404, "body": "Not found"}
 
 
@@ -1386,7 +1878,7 @@ def _self_invoke_async(channel, body, headers):
                 "_channel": channel,
                 "_body": body,
                 "_headers": {k: v for k, v in (headers or {}).items()
-                             if k.startswith("x-slack-")},
+                             if k.startswith(("x-slack-", "x-lark-"))},
             }).encode(),
         )
     except Exception as e:
