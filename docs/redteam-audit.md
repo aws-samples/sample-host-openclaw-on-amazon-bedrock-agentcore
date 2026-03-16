@@ -756,12 +756,12 @@ These env vars are set on the container and could potentially be extracted via p
 | `BEDROCK_GUARDRAIL_ID` | `abc123def` | Medium — could be used to test guardrail bypass |
 | `BEDROCK_GUARDRAIL_VERSION` | `1` | Low |
 | `AWS_REGION` | `ap-southeast-2` | Low |
-| `S3_USER_FILES_BUCKET` | `openclaw-user-files-657117630614-ap-southeast-2` | Medium — reveals account ID |
-| `EXECUTION_ROLE_ARN` | `arn:aws:iam::657117630614:role/openclaw-agentcore-execution-role` | High — reveals account ID + role name |
+| `S3_USER_FILES_BUCKET` | `openclaw-user-files-<YOUR_ACCOUNT_ID>-<YOUR_REGION>` | Medium — reveals account ID |
+| `EXECUTION_ROLE_ARN` | `arn:aws:iam::<YOUR_ACCOUNT_ID>:role/openclaw-agentcore-execution-role` | High — reveals account ID + role name |
 | `COGNITO_USER_POOL_ID` | `ap-southeast-2_xxxxx` | Medium |
 | `IDENTITY_TABLE_NAME` | `openclaw-identity` | Low |
 | `GATEWAY_TOKEN_SECRET_ID` | `openclaw/gateway-token` | Medium — name only, not value |
-| `CRON_LAMBDA_ARN` | `arn:aws:lambda:ap-southeast-2:657117630614:function:openclaw-cron-executor` | Medium |
-| `CMK_ARN` | `arn:aws:kms:ap-southeast-2:657117630614:key/xxx` | Medium |
+| `CRON_LAMBDA_ARN` | `arn:aws:lambda:<YOUR_REGION>:<YOUR_ACCOUNT_ID>:function:openclaw-cron-executor` | Medium |
+| `CMK_ARN` | `arn:aws:kms:<YOUR_REGION>:<YOUR_ACCOUNT_ID>:key/xxx` | Medium |
 
 **Note:** The proxy does NOT include `EXECUTION_ROLE_ARN`, `CMK_ARN`, or `GATEWAY_TOKEN_SECRET_ID` in its process env — these are only in the contract server. The OpenClaw child process env is explicitly filtered. However, the system prompt could inadvertently reference these if workspace files contain them.

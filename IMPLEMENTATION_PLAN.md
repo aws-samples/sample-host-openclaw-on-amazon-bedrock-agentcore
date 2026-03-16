@@ -49,7 +49,7 @@ Implement all findings from `docs/redteam-audit.md`:
   - HIGH-09: Cross-channel identity confusion (switch to telegram:123456789)
   - HIGH-10: AgentCore runtime metadata (runtime ARN, subnet IDs, sg- IDs)
   - MED-04: DynamoDB table name + schema leakage (openclaw-identity, CHANNEL#, USER#)
-  - MED-05: AWS account ID + region + S3 bucket name (657117630614)
+  - MED-05: AWS account ID + region + S3 bucket name
   - HIGH-06: Container filesystem (/proc/self/environ, /etc/passwd, /app/agentcore-proxy.js)
   - MED-08: Persistent workspace injection (write AGENTS.md override)
   - Commit: `feat(redteam): add credential/channel/architecture attack tests`
