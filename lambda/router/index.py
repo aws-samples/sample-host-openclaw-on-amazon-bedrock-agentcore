@@ -684,13 +684,16 @@ def _extract_text_from_content_blocks(text):
             # Try to parse a JSON array starting at pos
             try:
                 blocks, end = decoder.raw_decode(result, pos)
-                if isinstance(blocks, list) and blocks:
-                    parts = [
-                        b.get("text", "")
-                        for b in blocks
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    ]
-                    if parts:
+                if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
+                    # Check if this looks like a content block array (dicts with "type" keys)
+                    has_typed_blocks = any(b.get("type") for b in blocks)
+                    if has_typed_blocks:
+                        parts = [
+                            b.get("text", "")
+                            for b in blocks
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        ]
+                        # Always advance past the block — image-only blocks produce empty text
                         rebuilt.append("".join(parts))
                         i = end
                         continue

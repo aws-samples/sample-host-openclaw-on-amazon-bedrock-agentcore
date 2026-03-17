@@ -883,9 +883,10 @@ class TestSkillManagement:
         )
 
         # Verify the response mentions the skill name (installed or attempted)
+        # Bot may respond with display name "hacker news" instead of slug "hackernews"
         resp_lower = tail.response_text.lower()
-        assert self.TEST_SKILL in resp_lower, (
-            f"Expected '{self.TEST_SKILL}' mentioned in response.\n"
+        assert self.TEST_SKILL in resp_lower or "hacker news" in resp_lower, (
+            f"Expected '{self.TEST_SKILL}' or 'hacker news' mentioned in response.\n"
             f"Response: {tail.response_text[:500]}"
         )
         print(f"  Install response ({tail.response_len} chars): {tail.response_text[:300]}")
@@ -932,8 +933,9 @@ class TestSkillManagement:
         )
 
         resp_lower = tail.response_text.lower()
-        assert self.TEST_SKILL in resp_lower, (
-            f"Expected '{self.TEST_SKILL}' mentioned in response.\n"
+        # Bot may respond with display name "hacker news" instead of slug "hackernews"
+        assert self.TEST_SKILL in resp_lower or "hacker news" in resp_lower, (
+            f"Expected '{self.TEST_SKILL}' or 'hacker news' mentioned in response.\n"
             f"Response: {tail.response_text[:500]}"
         )
         print(f"  Uninstall response ({tail.response_len} chars): {tail.response_text[:300]}")
