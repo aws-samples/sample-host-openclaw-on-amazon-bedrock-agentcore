@@ -111,7 +111,7 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
           "scheduler:*",
           "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
           "kms:Decrypt", "kms:GenerateDataKey",
-          "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets",
+          "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets", "secretsmanager:TagResource",
           "iam:PassRole",
         ],
         Resource: "*",
