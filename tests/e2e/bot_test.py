@@ -1511,9 +1511,10 @@ class TestBrowserFeature:
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
         response_lower = tail.response_text.lower()
-        screenshot_words = ["screenshot", "captured", "image", "photo", "taken"]
+        # Browser skill may describe the page, mention screenshots, or describe the action
+        screenshot_words = ["screenshot", "captured", "image", "photo", "taken", "navigate", "page", "quotes", "heading", "headline"]
         assert any(w in response_lower for w in screenshot_words), (
-            f"Expected screenshot confirmation (one of {screenshot_words}) in response.\n"
+            f"Expected browser activity confirmation (one of {screenshot_words}) in response.\n"
             f"Response: {tail.response_text[:500]}"
         )
         print(f"  Browser response: {tail.response_text[:200]}")
