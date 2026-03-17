@@ -1004,12 +1004,27 @@ function extractTextFromContent(content) {
           }
         }
       }
-      if (parsed && Array.isArray(parsed) && parsed.length > 0 && parsed[0].type === "text") {
+      if (
+        parsed &&
+        Array.isArray(parsed) &&
+        parsed.length > 0 &&
+        parsed.every((b) => typeof b === "object" && b !== null) &&
+        parsed.some((b) => typeof b.type === "string")
+      ) {
         const text = parsed
           .filter((b) => b.type === "text")
           .map((b) => b.text)
           .join("");
-        if (text) return extractTextFromContent(text);
+        // Preserve leading whitespace from original string, recurse to unwrap further nesting
+        const leading = content.match(/^(\s*)/)[0];
+        return extractTextFromContent(leading + text);
+      }
+    }
+    // Detect truncated content block JSON (e.g., "\n\n[{" or "\n\n[{"type":"text"...")
+    // These are partial content blocks from streaming that shouldn't leak as response text
+    if (trimmed.startsWith("[{") && !trimmed.endsWith("]")) {
+      if (/^\[\{\s*"type"\s*:/.test(trimmed) || trimmed === "[{") {
+        return "";
       }
     }
     // Plain text string

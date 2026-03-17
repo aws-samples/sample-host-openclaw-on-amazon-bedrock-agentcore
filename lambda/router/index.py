@@ -699,7 +699,12 @@ def _extract_text_from_content_blocks(text):
                         continue
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
-            # Not a valid content block array, keep the '[' and advance
+            # Not a valid content block array — check if it looks like truncated
+            # content blocks (e.g., '[{"type":' ...) and strip them
+            remainder = result[pos:]
+            if re.match(r'^\[\{\s*"type"\s*:', remainder) or remainder.strip() == "[{":
+                # Truncated content block JSON — skip the rest
+                break
             rebuilt.append("[")
             i = pos + 1
         result = "".join(rebuilt)

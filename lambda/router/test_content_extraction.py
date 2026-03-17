@@ -83,9 +83,10 @@ class TestExtractTextFromContentBlocks(unittest.TestCase):
         self.assertEqual(index._extract_text_from_content_blocks(text), text)
 
     def test_malformed_json(self):
-        """Malformed JSON is returned as-is."""
+        """Malformed content block JSON is stripped, not leaked."""
         text = '[{"type":"text","text":"broken'
-        self.assertEqual(index._extract_text_from_content_blocks(text), text)
+        result = index._extract_text_from_content_blocks(text)
+        self.assertNotIn("[{", result)
 
     def test_preserves_newlines_and_markdown(self):
         """Newlines and markdown are preserved after unwrapping."""
@@ -196,6 +197,17 @@ class TestExtractTextFromContentBlocks(unittest.TestCase):
         ])
         result = index._extract_text_from_content_blocks(blocks)
         self.assertEqual(result, "")
+
+    def test_truncated_content_block_json(self):
+        """Truncated content block JSON (\\n\\n[{) should not leak raw JSON."""
+        result = index._extract_text_from_content_blocks("\n\n[{")
+        # The raw '[{' should not appear in the result
+        self.assertNotIn("[{", result)
+
+    def test_partial_content_block_json(self):
+        """Partial content block JSON should not leak."""
+        result = index._extract_text_from_content_blocks('\n\n[{"type":"text","text":"hello')
+        self.assertNotIn("[{", result)
 
 
 if __name__ == "__main__":
