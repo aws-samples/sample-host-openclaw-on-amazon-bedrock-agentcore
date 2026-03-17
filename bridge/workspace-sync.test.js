@@ -143,8 +143,12 @@ describe("shouldSkip", () => {
 
   it("does not skip regular files", () => {
     assert.ok(!shouldSkip("notes.md"));
-    assert.ok(!shouldSkip("AGENTS.md"));
     assert.ok(!shouldSkip("data/config.yaml"));
+  });
+
+  it("skips AGENTS.md (regenerated on init, not synced from S3)", () => {
+    assert.ok(shouldSkip("AGENTS.md"));
+    assert.ok(shouldSkip("workspace/AGENTS.md"));
   });
 });
 
