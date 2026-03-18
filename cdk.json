@@ -4,6 +4,7 @@
     "account": "",
     "region": "ap-southeast-2",
     "default_model_id": "minimax.minimax-m2.1",
+    "deepthink_model_id": "",
     "subagent_model_id": "",
     "cloudwatch_log_retention_days": 30,
     "daily_token_budget": 1000000,

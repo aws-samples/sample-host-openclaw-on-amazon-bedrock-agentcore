@@ -52,6 +52,7 @@ class RouterStack(Stack):
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
+        deepthink_model_id = str(self.node.try_get_context("deepthink_model_id") or "")
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
@@ -103,6 +104,7 @@ class RouterStack(Stack):
                 "REGISTRATION_OPEN": registration_open,
                 "USER_FILES_BUCKET": user_files_bucket_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
+                "DEEPTHINK_MODEL_ID": deepthink_model_id,
             },
             log_group=router_log_group,
         )
