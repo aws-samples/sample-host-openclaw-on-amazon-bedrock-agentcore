@@ -710,31 +710,6 @@ def _extract_text_from_content_blocks(text):
         result = "".join(rebuilt)
         if result == prev:
             break
-        try:
-            blocks = json.JSONDecoder(strict=False).decode(stripped)
-            if isinstance(blocks, list) and blocks:
-                parts = [b.get("text", "") for b in blocks
-                         if isinstance(b, dict) and b.get("type") == "text"]
-                if parts:
-                    unwrapped = "".join(parts)
-                    if unwrapped == result:
-                        break  # No progress — avoid infinite loop
-                    result = unwrapped
-                    continue
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-        break
-    # Regex fallback: handle cases where JSON parsing fails (encoding issues, etc.)
-    stripped_result = result.strip()
-    if stripped_result.startswith("[{") and '"type"' in stripped_result and '"text"' in stripped_result:
-        match = re.search(r'[,{]\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"', stripped_result)
-        if match:
-            try:
-                candidate = json.loads('"' + match.group(1) + '"')
-                if candidate and candidate != result:
-                    result = candidate
-            except (json.JSONDecodeError, ValueError):
-                pass
     return result
 
 

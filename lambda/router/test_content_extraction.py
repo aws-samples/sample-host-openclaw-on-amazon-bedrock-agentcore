@@ -129,15 +129,14 @@ class TestExtractTextFromContentBlocks(unittest.TestCase):
             "Hello world",
         )
 
-    def test_regex_fallback_comma_separator(self):
-        """Regex fallback handles comma instead of colon in malformed JSON."""
-        # Real-world case: "text","value" instead of "text":"value"
+    def test_malformed_json_with_comma_separator_stripped(self):
+        """Malformed content block JSON (comma instead of colon) is stripped, not leaked."""
         raw = '[{"type":"text","text","\\n\\n## ✅ Hello World"}]'
         result = index._extract_text_from_content_blocks(raw)
-        self.assertIn("Hello World", result)
+        self.assertNotIn("[{", result)
 
-    def test_regex_fallback_does_not_alter_non_content_blocks(self):
-        """Regex fallback does not alter JSON that isn't content blocks."""
+    def test_non_content_block_json_not_altered(self):
+        """JSON arrays without 'type' keys are returned as-is."""
         raw = '[{"key": "value"}]'
         self.assertEqual(index._extract_text_from_content_blocks(raw), raw)
 
