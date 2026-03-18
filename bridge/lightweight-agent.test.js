@@ -12,7 +12,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs, stripHtml, parseSearchResults, executeWebFetch, executeWebSearch, executeManageApiKey, readApiKeys, writeApiKeys, getApiKeysPath, VALID_KEY_NAME, executeManageSecret, buildSecretName, _secretsCache, MAX_SECRETS_PER_USER, executeRetrieveApiKey, executeMigrateApiKey } = require("./lightweight-agent");
+const { TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs, stripHtml, parseSearchResults, executeWebFetch, executeWebSearch, executeManageApiKey, readApiKeys, writeApiKeys, getApiKeysPath, VALID_KEY_NAME, executeManageSecret, buildSecretName, _secretsCache, MAX_SECRETS_PER_USER, executeRetrieveApiKey, executeMigrateApiKey, SM_REQUEST_TIMEOUT_MS } = require("./lightweight-agent");
 
 // --- TOOLS array ---
 
@@ -911,6 +911,12 @@ describe("manage_secret", () => {
       "telegram_123",
     );
     assert.ok(result.startsWith("Error:"));
+  });
+
+  it("SM_REQUEST_TIMEOUT_MS is set to prevent indefinite hangs", () => {
+    assert.ok(typeof SM_REQUEST_TIMEOUT_MS === "number");
+    assert.ok(SM_REQUEST_TIMEOUT_MS > 0, "timeout must be positive");
+    assert.ok(SM_REQUEST_TIMEOUT_MS <= 60_000, "timeout should not exceed 60s");
   });
 });
 

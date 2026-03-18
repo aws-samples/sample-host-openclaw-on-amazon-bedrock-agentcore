@@ -5,7 +5,7 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { REGION, validateUserId, validateKeyName } = require("./common");
+const { REGION, validateUserId, validateKeyName, SM_REQUEST_TIMEOUT_MS } = require("./common");
 
 const SECRET_PREFIX = "openclaw/user/";
 const API_KEYS_FILENAME = "user-api-keys.json";
@@ -26,7 +26,10 @@ async function main() {
     GetSecretValueCommand,
   } = require("@aws-sdk/client-secrets-manager");
 
-  const client = new SecretsManagerClient({ region: REGION });
+  const client = new SecretsManagerClient({
+    region: REGION,
+    requestHandler: { requestTimeout: SM_REQUEST_TIMEOUT_MS },
+  });
   const secretName = `${SECRET_PREFIX}${userId}/${keyName}`;
 
   try {
