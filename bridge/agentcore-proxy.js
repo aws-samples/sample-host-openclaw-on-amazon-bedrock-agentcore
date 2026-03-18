@@ -1052,16 +1052,32 @@ function isSubagentRequest(parsed) {
 }
 
 /**
+ * Read the per-user model override from the shared identity file.
+ * Returns empty string if unset or unreadable.
+ */
+function getModelOverride() {
+  try {
+    const identity = JSON.parse(
+      fs.readFileSync("/tmp/current-identity.json", "utf-8"),
+    );
+    return identity.modelOverride || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+/**
  * Resolve the Bedrock model ID based on the requested model name.
- * Subagent requests → SUBAGENT_BEDROCK_MODEL_ID, everything else → MODEL_ID.
+ * Subagent requests → SUBAGENT_BEDROCK_MODEL_ID, everything else →
+ * per-user model override (from identity file) or MODEL_ID.
  */
 function resolveModelId(requestedModel) {
-  if (!requestedModel) return MODEL_ID;
+  if (!requestedModel) return getModelOverride() || MODEL_ID;
   if (requestedModel === SUBAGENT_MODEL_NAME ||
       requestedModel.endsWith(`/${SUBAGENT_MODEL_NAME}`)) {
     return SUBAGENT_BEDROCK_MODEL_ID;
   }
-  return MODEL_ID;
+  return getModelOverride() || MODEL_ID;
 }
 
 /**
