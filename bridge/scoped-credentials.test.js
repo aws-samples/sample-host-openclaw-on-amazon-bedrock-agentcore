@@ -30,7 +30,7 @@ describe("buildSessionPolicy", () => {
     const parsed = JSON.parse(policy);
     assert.equal(parsed.Version, "2012-10-17");
     assert.ok(Array.isArray(parsed.Statement));
-    assert.equal(parsed.Statement.length, 2, "should have exactly 2 statements");
+    assert.equal(parsed.Statement.length, 3, "should have 3 statements (S3 object, S3 list, services)");
   });
 
   it("S3 object actions scoped to namespace/* only", () => {
@@ -597,6 +597,7 @@ describe("buildSessionPolicy Secrets Manager", () => {
     assert.ok(smStmt.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt.Action.includes("secretsmanager:CreateSecret"));
     assert.ok(smStmt.Action.includes("secretsmanager:DeleteSecret"));
+    assert.ok(smStmt.Action.includes("secretsmanager:TagResource"), "TagResource needed for api-keys skill");
   });
 
   it("includes ListSecrets in the Secrets Manager statement with wildcard resource", () => {

@@ -684,49 +684,32 @@ def _extract_text_from_content_blocks(text):
             # Try to parse a JSON array starting at pos
             try:
                 blocks, end = decoder.raw_decode(result, pos)
-                if isinstance(blocks, list) and blocks:
-                    parts = [
-                        b.get("text", "")
-                        for b in blocks
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    ]
-                    if parts:
+                if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
+                    # Check if this looks like a content block array (dicts with "type" keys)
+                    has_typed_blocks = any(b.get("type") for b in blocks)
+                    if has_typed_blocks:
+                        parts = [
+                            b.get("text", "")
+                            for b in blocks
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        ]
+                        # Always advance past the block — image-only blocks produce empty text
                         rebuilt.append("".join(parts))
                         i = end
                         continue
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
-            # Not a valid content block array, keep the '[' and advance
+            # Not a valid content block array — check if it looks like truncated
+            # content blocks (e.g., '[{"type":' ...) and strip them
+            remainder = result[pos:]
+            if re.match(r'^\[\{\s*"type"\s*:', remainder) or remainder.strip() == "[{":
+                # Truncated content block JSON — skip the rest
+                break
             rebuilt.append("[")
             i = pos + 1
         result = "".join(rebuilt)
         if result == prev:
             break
-        try:
-            blocks = json.JSONDecoder(strict=False).decode(stripped)
-            if isinstance(blocks, list) and blocks:
-                parts = [b.get("text", "") for b in blocks
-                         if isinstance(b, dict) and b.get("type") == "text"]
-                if parts:
-                    unwrapped = "".join(parts)
-                    if unwrapped == result:
-                        break  # No progress — avoid infinite loop
-                    result = unwrapped
-                    continue
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-        break
-    # Regex fallback: handle cases where JSON parsing fails (encoding issues, etc.)
-    stripped_result = result.strip()
-    if stripped_result.startswith("[{") and '"type"' in stripped_result and '"text"' in stripped_result:
-        match = re.search(r'[,{]\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"', stripped_result)
-        if match:
-            try:
-                candidate = json.loads('"' + match.group(1) + '"')
-                if candidate and candidate != result:
-                    result = candidate
-            except (json.JSONDecodeError, ValueError):
-                pass
     return result
 
 

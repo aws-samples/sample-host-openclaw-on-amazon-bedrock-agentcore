@@ -414,15 +414,20 @@ function writeOpenClawConfig() {
         "",
         "## Scheduling & Cron Jobs",
         "",
-        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to:",
-        "- Set up reminders, alarms, or scheduled messages",
-        "- Create recurring tasks or cron jobs",
-        "- Schedule daily, weekly, or periodic actions",
-        "",
-        "**Read the eventbridge-cron SKILL.md and use it.** Do NOT say cron is disabled.",
+        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to set up reminders,",
+        "recurring tasks, or cron jobs, use these commands via Bash. Do NOT say cron is disabled.",
         "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
         "",
         "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
+        "",
+        "**Commands** (run via Bash):",
+        "- Create: `node /skills/eventbridge-cron/create.js <user_id> <cron_expression> <timezone> <message> [channel] [channel_target] [schedule_name]`",
+        "- List: `node /skills/eventbridge-cron/list.js <user_id>`",
+        "- Update: `node /skills/eventbridge-cron/update.js <user_id> <schedule_id> [--expression \"cron(...)\"] [--timezone \"TZ\"] [--message \"msg\"] [--enable] [--disable]`",
+        "- Delete: `node /skills/eventbridge-cron/delete.js <user_id> <schedule_id>`",
+        "",
+        "Cron format: `cron(min hour day-of-month month day-of-week year)` — e.g., `cron(0 9 * * ? *)` for daily at 9 AM.",
+        "Rate format: `rate(1 hour)`, `rate(5 minutes)`.",
         "",
         "## File Storage",
         "",
@@ -1004,12 +1009,27 @@ function extractTextFromContent(content) {
           }
         }
       }
-      if (parsed && Array.isArray(parsed) && parsed.length > 0 && parsed[0].type === "text") {
+      if (
+        parsed &&
+        Array.isArray(parsed) &&
+        parsed.length > 0 &&
+        parsed.every((b) => typeof b === "object" && b !== null) &&
+        parsed.some((b) => typeof b.type === "string")
+      ) {
         const text = parsed
           .filter((b) => b.type === "text")
           .map((b) => b.text)
           .join("");
-        if (text) return extractTextFromContent(text);
+        // Preserve leading whitespace from original string, recurse to unwrap further nesting
+        const leading = content.match(/^(\s*)/)[0];
+        return extractTextFromContent(leading + text);
+      }
+    }
+    // Detect truncated content block JSON (e.g., "\n\n[{" or "\n\n[{"type":"text"...")
+    // These are partial content blocks from streaming that shouldn't leak as response text
+    if (trimmed.startsWith("[{") && !trimmed.endsWith("]")) {
+      if (/^\[\{\s*"type"\s*:/.test(trimmed) || trimmed === "[{") {
+        return "";
       }
     }
     // Plain text string

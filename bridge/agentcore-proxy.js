@@ -19,6 +19,10 @@ if (!AWS_REGION) {
 const MODEL_ID =
   process.env.BEDROCK_MODEL_ID || "minimax.minimax-m2.1";
 
+// Log credential env vars at startup for debugging
+console.log(`[proxy] AWS_REGION=${AWS_REGION} MODEL_ID=${MODEL_ID}`);
+console.log(`[proxy] Credential env: RELATIVE_URI=${!!process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI} FULL_URI=${!!process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI} AUTH_TOKEN=${!!process.env.AWS_CONTAINER_AUTHORIZATION_TOKEN}`);
+
 // Subagent model routing — distinct model name lets proxy detect subagent requests
 const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcore-subagent";
 const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || MODEL_ID;
@@ -55,6 +59,37 @@ const SYSTEM_PROMPT =
 // Retry configuration
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 500;
+
+// Bedrock request timeout — prevents indefinite hangs if a model stops responding.
+// 90s per attempt is generous (most Converse calls complete in <30s); with 3 retries
+// the worst case is ~4.5 min, well under the lightweight agent's 120s HTTP timeout
+// for non-streaming and the Router Lambda's 600s timeout for streaming.
+const BEDROCK_REQUEST_TIMEOUT_MS = 90_000;
+
+/**
+ * Cross-region inference profiles (global.* / us.*) require AWS's global
+ * routing layer and CANNOT be served by the regional Bedrock Runtime VPC
+ * endpoint. When a regional VPC endpoint intercepts the DNS query (via
+ * Private DNS), it silently hangs cross-region requests after 90 s.
+ *
+ * Fix: for cross-region profiles, override the endpoint to the public
+ * Bedrock Runtime URL so the SDK bypasses the VPC endpoint and routes
+ * through the NAT gateway → public AWS backbone.
+ * Regional model IDs (e.g. anthropic.claude-3-haiku-20240307-v1:0) are
+ * unaffected and continue to use the VPC endpoint via Private DNS.
+ */
+function isCrossRegionProfile(modelId) {
+  return /^(global|us|eu|ap)\.[a-z]/.test(modelId);
+}
+
+function bedrockClientOptions(modelId) {
+  const opts = { requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS };
+  if (isCrossRegionProfile(modelId)) {
+    // Force public endpoint — bypasses VPC endpoint Private DNS intercept.
+    opts.endpoint = `https://bedrock-runtime.${AWS_REGION}.amazonaws.com`;
+  }
+  return opts;
+}
 
 // Session tracking (in-memory, per container instance)
 const sessionMap = new Map();
@@ -1038,10 +1073,13 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     BedrockRuntimeClient,
     ConverseCommand,
   } = require("@aws-sdk/client-bedrock-runtime");
-  const client = new BedrockRuntimeClient({ region: AWS_REGION });
+  const modelId = resolveModelId(requestedModel);
+  const client = new BedrockRuntimeClient({
+    region: AWS_REGION,
+    requestHandler: bedrockClientOptions(modelId),
+  });
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
-  const modelId = resolveModelId(requestedModel);
 
   const params = {
     modelId,
@@ -1134,10 +1172,13 @@ async function invokeBedrockStreaming(
     BedrockRuntimeClient,
     ConverseStreamCommand,
   } = require("@aws-sdk/client-bedrock-runtime");
-  const client = new BedrockRuntimeClient({ region: AWS_REGION });
+  const modelId = resolveModelId(model);
+  const client = new BedrockRuntimeClient({
+    region: AWS_REGION,
+    requestHandler: bedrockClientOptions(modelId),
+  });
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
-  const modelId = resolveModelId(model);
 
   const params = {
     modelId,

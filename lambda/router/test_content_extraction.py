@@ -83,9 +83,10 @@ class TestExtractTextFromContentBlocks(unittest.TestCase):
         self.assertEqual(index._extract_text_from_content_blocks(text), text)
 
     def test_malformed_json(self):
-        """Malformed JSON is returned as-is."""
+        """Malformed content block JSON is stripped, not leaked."""
         text = '[{"type":"text","text":"broken'
-        self.assertEqual(index._extract_text_from_content_blocks(text), text)
+        result = index._extract_text_from_content_blocks(text)
+        self.assertNotIn("[{", result)
 
     def test_preserves_newlines_and_markdown(self):
         """Newlines and markdown are preserved after unwrapping."""
@@ -128,17 +129,84 @@ class TestExtractTextFromContentBlocks(unittest.TestCase):
             "Hello world",
         )
 
-    def test_regex_fallback_comma_separator(self):
-        """Regex fallback handles comma instead of colon in malformed JSON."""
-        # Real-world case: "text","value" instead of "text":"value"
+    def test_malformed_json_with_comma_separator_stripped(self):
+        """Malformed content block JSON (comma instead of colon) is stripped, not leaked."""
         raw = '[{"type":"text","text","\\n\\n## ✅ Hello World"}]'
         result = index._extract_text_from_content_blocks(raw)
-        self.assertIn("Hello World", result)
+        self.assertNotIn("[{", result)
 
-    def test_regex_fallback_does_not_alter_non_content_blocks(self):
-        """Regex fallback does not alter JSON that isn't content blocks."""
+    def test_non_content_block_json_not_altered(self):
+        """JSON arrays without 'type' keys are returned as-is."""
         raw = '[{"key": "value"}]'
         self.assertEqual(index._extract_text_from_content_blocks(raw), raw)
+
+    def test_image_only_blocks(self):
+        """Image-only content blocks return empty string, not '[{'."""
+        blocks = json.dumps([
+            {"type": "image", "source": {"type": "base64", "data": "abc123"}},
+        ])
+        result = index._extract_text_from_content_blocks(blocks)
+        self.assertNotIn("[{", result)
+        self.assertEqual(result, "")
+
+    def test_mixed_image_and_text_blocks(self):
+        """Mixed image+text blocks return only the text parts."""
+        blocks = json.dumps([
+            {"type": "image", "source": {"type": "base64", "data": "abc123"}},
+            {"type": "text", "text": "Here is the screenshot."},
+        ])
+        result = index._extract_text_from_content_blocks(blocks)
+        self.assertEqual(result, "Here is the screenshot.")
+        self.assertNotIn("[{", result)
+
+    def test_tool_use_blocks_skipped(self):
+        """tool_use blocks are skipped; only text blocks extracted."""
+        blocks = json.dumps([
+            {"type": "tool_use", "id": "t1", "name": "web_search", "input": {"q": "test"}},
+            {"type": "text", "text": "Search results below."},
+        ])
+        result = index._extract_text_from_content_blocks(blocks)
+        self.assertEqual(result, "Search results below.")
+
+    def test_tool_result_blocks_skipped(self):
+        """tool_result blocks are skipped; only text blocks extracted."""
+        blocks = json.dumps([
+            {"type": "tool_result", "tool_use_id": "t1", "content": "result data"},
+            {"type": "text", "text": "Done."},
+        ])
+        result = index._extract_text_from_content_blocks(blocks)
+        self.assertEqual(result, "Done.")
+
+    def test_embedded_image_blocks_in_text(self):
+        """Image blocks embedded in surrounding text are removed cleanly."""
+        blocks = json.dumps([
+            {"type": "image", "source": {"type": "base64", "data": "xyz"}},
+        ])
+        text = f"Here is the image: {blocks} — hope that helps!"
+        result = index._extract_text_from_content_blocks(text)
+        self.assertNotIn("[{", result)
+        self.assertIn("Here is the image:", result)
+        self.assertIn("hope that helps!", result)
+
+    def test_multiple_image_blocks(self):
+        """Multiple image blocks produce empty text, no leakage."""
+        blocks = json.dumps([
+            {"type": "image", "source": {"type": "base64", "data": "a"}},
+            {"type": "image", "source": {"type": "base64", "data": "b"}},
+        ])
+        result = index._extract_text_from_content_blocks(blocks)
+        self.assertEqual(result, "")
+
+    def test_truncated_content_block_json(self):
+        """Truncated content block JSON (\\n\\n[{) should not leak raw JSON."""
+        result = index._extract_text_from_content_blocks("\n\n[{")
+        # The raw '[{' should not appear in the result
+        self.assertNotIn("[{", result)
+
+    def test_partial_content_block_json(self):
+        """Partial content block JSON should not leak."""
+        result = index._extract_text_from_content_blocks('\n\n[{"type":"text","text":"hello')
+        self.assertNotIn("[{", result)
 
 
 if __name__ == "__main__":

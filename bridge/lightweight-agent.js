@@ -1022,6 +1022,10 @@ function executeManageApiKey(args) {
 
 // --- Secrets Manager backend (manage_secret tool) ---
 
+// Request timeout for SM calls — prevents indefinite hangs on VPC endpoint issues.
+// 30s per request attempt × 3 retries = ~90s worst case (well under Lambda timeout).
+const SM_REQUEST_TIMEOUT_MS = 30_000;
+
 // Lazy-require AWS SDK (only available inside Docker image)
 let _smSdk = null;
 function getSmSdk() {
@@ -1035,7 +1039,10 @@ let _smClient = null;
 function getSmClient() {
   if (!_smClient) {
     const { SecretsManagerClient } = getSmSdk();
-    _smClient = new SecretsManagerClient({ region: process.env.AWS_REGION });
+    _smClient = new SecretsManagerClient({
+      region: process.env.AWS_REGION,
+      requestHandler: { requestTimeout: SM_REQUEST_TIMEOUT_MS },
+    });
   }
   return _smClient;
 }
@@ -1474,4 +1481,5 @@ module.exports = {
   MAX_SECRETS_PER_USER,
   executeRetrieveApiKey,
   executeMigrateApiKey,
+  SM_REQUEST_TIMEOUT_MS,
 };
