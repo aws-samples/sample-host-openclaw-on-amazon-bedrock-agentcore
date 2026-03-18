@@ -43,6 +43,9 @@ AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
+# Per-user model switching — if empty, feature is disabled
+DEEPTHINK_MODEL_ID = os.environ.get("DEEPTHINK_MODEL_ID", "")
+
 # --- Clients (lazy init on cold start) ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
@@ -599,21 +602,80 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 
 
 # ---------------------------------------------------------------------------
+# Per-user model switching
+# ---------------------------------------------------------------------------
+
+_MODEL_SWITCH_DEEPTHINK_RE = re.compile(
+    r"(?:^|\b)(?:deepthinking|/model\s+opus)(?:\b|$)", re.IGNORECASE
+)
+_MODEL_SWITCH_NORMAL_RE = re.compile(
+    r"(?:^|\b)(?:normalmode|normalthinking|/model\s+default)(?:\b|$)", re.IGNORECASE
+)
+
+
+def detect_model_switch_command(text):
+    """Detect model-switch commands in message text.
+
+    Returns "deepthink", "normal", or None. Returns None if
+    DEEPTHINK_MODEL_ID is not configured (feature disabled).
+    """
+    if not text or not DEEPTHINK_MODEL_ID:
+        return None
+    if _MODEL_SWITCH_DEEPTHINK_RE.search(text):
+        return "deepthink"
+    if _MODEL_SWITCH_NORMAL_RE.search(text):
+        return "normal"
+    return None
+
+
+def handle_model_switch_command(command, user_id):
+    """Persist or clear modelOverride on the user's PROFILE item in DynamoDB."""
+    pk = f"USER#{user_id}"
+    if command == "deepthink":
+        identity_table.update_item(
+            Key={"PK": pk, "SK": "PROFILE"},
+            UpdateExpression="SET modelOverride = :model",
+            ExpressionAttributeValues={":model": DEEPTHINK_MODEL_ID},
+        )
+        logger.info("Model override set to %s for user %s", DEEPTHINK_MODEL_ID, user_id)
+    elif command == "normal":
+        identity_table.update_item(
+            Key={"PK": pk, "SK": "PROFILE"},
+            UpdateExpression="REMOVE modelOverride",
+        )
+        logger.info("Model override cleared for user %s", user_id)
+
+
+def get_model_override(user_id):
+    """Read modelOverride from the user's PROFILE item. Returns empty string if unset."""
+    try:
+        resp = identity_table.get_item(Key={"PK": f"USER#{user_id}", "SK": "PROFILE"})
+        item = resp.get("Item", {})
+        return item.get("modelOverride", "")
+    except Exception as e:
+        logger.error("Failed to read modelOverride for %s: %s", user_id, e)
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # AgentCore invocation
 # ---------------------------------------------------------------------------
 
-def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
+def invoke_agent_runtime(session_id, user_id, actor_id, channel, message, model_override=""):
     """Invoke the AgentCore Runtime with a per-user session.
 
     Message can be a plain string or a structured dict with text + images.
     """
-    payload = json.dumps({
+    payload_dict = {
         "action": "chat",
         "userId": user_id,
         "actorId": actor_id,
         "channel": channel,
         "message": message,
-    }).encode()
+    }
+    if model_override:
+        payload_dict["modelOverride"] = model_override
+    payload = json.dumps(payload_dict).encode()
 
     try:
         logger.info("Invoking AgentCore: arn=%s qualifier=%s session=%s", AGENTCORE_RUNTIME_ARN, AGENTCORE_QUALIFIER, session_id)
@@ -1422,6 +1484,16 @@ def handle_telegram(body):
         )
         return
 
+    # Handle model-switch commands (deepthinking / normalmode)
+    model_cmd = detect_model_switch_command(text)
+    if model_cmd:
+        handle_model_switch_command(model_cmd, resolved_user_id)
+        if model_cmd == "deepthink":
+            send_telegram_message(chat_id, f"Switched to deep thinking mode ({DEEPTHINK_MODEL_ID}).", token)
+        else:
+            send_telegram_message(chat_id, "Switched back to normal mode.", token)
+        return
+
     # Handle link-accounts command (generate bind code for existing users)
     if _is_link_command(text):
         code = create_bind_code(resolved_user_id)
@@ -1455,10 +1527,13 @@ def handle_telegram(body):
     # Get or create session
     session_id = get_or_create_session(resolved_user_id)
 
+    # Read per-user model override from DynamoDB
+    model_override = get_model_override(resolved_user_id)
+
     image_count = 0 if isinstance(agent_message, str) else len(agent_message.get("images", []))
     logger.info(
-        "Telegram: user=%s actor=%s session=%s text_len=%d images=%d",
-        resolved_user_id, actor_id, session_id, len(text), image_count,
+        "Telegram: user=%s actor=%s session=%s text_len=%d images=%d model_override=%s",
+        resolved_user_id, actor_id, session_id, len(text), image_count, model_override or "(default)",
     )
 
     # Invoke AgentCore with periodic typing indicator
@@ -1470,7 +1545,7 @@ def handle_telegram(body):
     )
     typing_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message)
+        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message, model_override=model_override)
     finally:
         stop_typing.set()
         typing_thread.join(timeout=2)
@@ -1559,6 +1634,16 @@ def handle_slack(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    # Handle model-switch commands (deepthinking / normalmode)
+    model_cmd = detect_model_switch_command(text)
+    if model_cmd:
+        handle_model_switch_command(model_cmd, resolved_user_id)
+        if model_cmd == "deepthink":
+            send_slack_message(channel_id, f"Switched to deep thinking mode ({DEEPTHINK_MODEL_ID}).", bot_token)
+        else:
+            send_slack_message(channel_id, "Switched back to normal mode.", bot_token)
+        return {"statusCode": 200, "body": "ok"}
+
     # Handle link-accounts command (generate bind code for existing users)
     if _is_link_command(text):
         code = create_bind_code(resolved_user_id)
@@ -1591,9 +1676,12 @@ def handle_slack(body, headers=None):
     # Get or create session
     session_id = get_or_create_session(resolved_user_id)
 
+    # Read per-user model override from DynamoDB
+    model_override = get_model_override(resolved_user_id)
+
     logger.info(
-        "Slack: user=%s actor=%s session=%s msg_len=%d has_image=%s",
-        resolved_user_id, actor_id, session_id, len(text), has_image,
+        "Slack: user=%s actor=%s session=%s msg_len=%d has_image=%s model_override=%s",
+        resolved_user_id, actor_id, session_id, len(text), has_image, model_override or "(default)",
     )
 
     # Invoke AgentCore with progress notification for long requests
@@ -1605,7 +1693,7 @@ def handle_slack(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message)
+        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message, model_override=model_override)
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -1716,6 +1804,16 @@ def handle_feishu(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    # Handle model-switch commands (deepthinking / normalmode)
+    model_cmd = detect_model_switch_command(text)
+    if model_cmd:
+        handle_model_switch_command(model_cmd, resolved_user_id)
+        if model_cmd == "deepthink":
+            send_feishu_message(chat_id, f"Switched to deep thinking mode ({DEEPTHINK_MODEL_ID}).")
+        else:
+            send_feishu_message(chat_id, "Switched back to normal mode.")
+        return {"statusCode": 200, "body": "ok"}
+
     # Handle link-accounts command
     if _is_link_command(text):
         bind_code = create_bind_code(resolved_user_id)
@@ -1745,9 +1843,12 @@ def handle_feishu(body, headers=None):
     # Get or create session
     session_id = get_or_create_session(resolved_user_id)
 
+    # Read per-user model override from DynamoDB
+    model_override = get_model_override(resolved_user_id)
+
     logger.info(
-        "Feishu: user=%s actor=%s session=%s msg_len=%d has_image=%s chat_type=%s",
-        resolved_user_id, actor_id, session_id, len(text), has_image, chat_type,
+        "Feishu: user=%s actor=%s session=%s msg_len=%d has_image=%s chat_type=%s model_override=%s",
+        resolved_user_id, actor_id, session_id, len(text), has_image, chat_type, model_override or "(default)",
     )
 
     # Invoke AgentCore with progress notification
@@ -1759,7 +1860,7 @@ def handle_feishu(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message)
+        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message, model_override=model_override)
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
