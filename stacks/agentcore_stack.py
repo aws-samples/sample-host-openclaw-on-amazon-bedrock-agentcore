@@ -101,6 +101,7 @@ class AgentCoreStack(Stack):
                 resources=[
                     "arn:aws:bedrock:*::foundation-model/*",
                     f"arn:aws:bedrock:{region}:{account}:inference-profile/*",
+                    "arn:aws:bedrock:*::inference-profile/*",
                 ],
             )
         )
@@ -382,6 +383,7 @@ class AgentCoreStack(Stack):
                     applies_to=[
                         "Resource::arn:aws:bedrock:*::foundation-model/*",
                         f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",
+                        "Resource::arn:aws:bedrock:*::inference-profile/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/gateway-token-*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/cognito-password-secret-*",
                         "Resource::*",
