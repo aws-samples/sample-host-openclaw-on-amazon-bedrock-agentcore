@@ -81,27 +81,22 @@ class VpcStack(Stack):
             subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
         )
 
-        # Bedrock Runtime endpoint: Private DNS is intentionally disabled.
+        # Bedrock Runtime endpoint: Private DNS is intentionally kept enabled
+        # for regional model IDs (e.g. anthropic.claude-3-haiku-20240307-v1:0),
+        # which resolve to the VPC endpoint and stay on the AWS private network.
         #
-        # Cross-region inference profiles (global.* and us.*) require AWS's
-        # global routing layer, which is only reachable via the public Bedrock
-        # endpoint (through the NAT gateway). When Private DNS is enabled, the
-        # regional VPC endpoint intercepts all bedrock-runtime DNS queries and
-        # forwards them to the regional service only — global routing then
-        # silently hangs. Disabling Private DNS lets the SDK resolve the public
-        # hostname and route via NAT, which supports all model types:
-        #   - Regional models  (e.g. anthropic.claude-3-haiku-20240307-v1:0)
-        #   - US cross-region  (e.g. us.anthropic.claude-3-5-sonnet-...)
-        #   - Global inference (e.g. global.anthropic.claude-sonnet-4-6)
-        #
-        # The endpoint is kept for future use or if Private DNS is re-enabled
-        # with a model that is served purely from the regional endpoint.
+        # Cross-region inference profiles (global.* / us.* / eu.* / ap.*) cannot
+        # be routed via the regional VPC endpoint — they require AWS's global
+        # routing layer. The proxy (agentcore-proxy.js) detects these profile
+        # prefixes and sets a custom endpoint URL on the BedrockRuntimeClient,
+        # which bypasses the Private DNS intercept and routes via NAT gateway.
+        # See: bridge/agentcore-proxy.js — isCrossRegionProfile() / bedrockClientOptions()
         self.vpc.add_interface_endpoint(
             "BedrockRuntimeEndpoint",
             service=ec2.InterfaceVpcEndpointAwsService.BEDROCK_RUNTIME,
             subnets=private_subnets,
             security_groups=[self.vpce_sg],
-            private_dns_enabled=False,  # Must be False for cross-region inference profiles
+            private_dns_enabled=True,  # Regional models use VPC endpoint; cross-region profiles bypass via proxy
         )
 
         interface_endpoints = {
