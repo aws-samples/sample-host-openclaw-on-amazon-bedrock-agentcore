@@ -1507,13 +1507,17 @@ def handle_slack(body, headers=None):
 
     event = event_data.get("event", {})
     event_type = event.get("type")
-    # Allow "message" (DM), "file_share" subtype (image uploads), and "app_mention" (channel @mentions)
-    if event_type == "app_mention":
-        pass  # app_mention events are always processed
-    elif event_type != "message" or event.get("subtype") not in (None, "file_share"):
+    # Allow-list: message (DM), app_mention (channel @mentions), file_share subtype (image uploads)
+    if event_type not in ("message", "app_mention"):
+        return {"statusCode": 200, "body": "ok"}
+    # For "message" events, only allow plain messages and file_share subtype
+    if event_type == "message" and event.get("subtype") not in (None, "file_share"):
         return {"statusCode": 200, "body": "ok"}
 
     text = event.get("text", "")
+    # Strip bot mention tags from text (Slack sends "<@UBOT123> hello" for app_mention)
+    # Apply to all Slack messages since <@mentions> in DMs are also noise
+    text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
     slack_user_id = event.get("user", "")
     channel_id = event.get("channel", "")
 
