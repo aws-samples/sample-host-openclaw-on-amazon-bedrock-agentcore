@@ -73,6 +73,19 @@ const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const BROWSER_SESSION_TIMEOUT_SECONDS = 3600;
 const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
 
+// Derive EVENTBRIDGE_ROLE_ARN from EXECUTION_ROLE_ARN + AWS_REGION if not already set.
+// The agentcore toolkit doesn't support injecting arbitrary env vars into the container,
+// so we derive it: arn:aws:iam::{account}:role/openclaw-cron-scheduler-role-{region}
+if (!process.env.EVENTBRIDGE_ROLE_ARN && process.env.EXECUTION_ROLE_ARN) {
+  const match = process.env.EXECUTION_ROLE_ARN.match(/arn:aws:iam::(\d+):role\//);
+  if (match) {
+    const account = match[1];
+    const region = process.env.AWS_REGION || "us-west-2";
+    process.env.EVENTBRIDGE_ROLE_ARN = `arn:aws:iam::${account}:role/openclaw-cron-scheduler-role-${region}`;
+    console.log(`[contract] Derived EVENTBRIDGE_ROLE_ARN from execution role (account=${account}, region=${region})`);
+  }
+}
+
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
 const OPENCLAW_LOG_LIMIT = 50;
 let openclawLogs = [];

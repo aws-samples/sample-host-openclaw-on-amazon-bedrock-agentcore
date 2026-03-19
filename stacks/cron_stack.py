@@ -96,12 +96,21 @@ class CronStack(Stack):
             log_group=cron_log_group,
         )
 
-        # Grant scheduler role permission to invoke the Lambda
+        # Grant scheduler role permission to invoke the Lambda (IAM policy)
         self.scheduler_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["lambda:InvokeFunction"],
                 resources=[self.cron_fn.function_arn],
             )
+        )
+
+        # Grant EventBridge Scheduler service permission via Lambda resource-based policy
+        # Required in addition to the IAM role policy above
+        self.cron_fn.add_permission(
+            "AllowEventBridgeScheduler",
+            principal=iam.ServicePrincipal("scheduler.amazonaws.com"),
+            action="lambda:InvokeFunction",
+            source_arn=f"arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*",
         )
 
         # --- Cron Lambda IAM Permissions ---
