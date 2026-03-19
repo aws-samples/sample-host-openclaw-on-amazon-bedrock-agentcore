@@ -20,7 +20,17 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Resolve account and region
 ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
-REGION="${CDK_DEFAULT_REGION:-$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('region','us-west-2'))")}"
+REGION="${CDK_DEFAULT_REGION:-}"
+if [ -z "$REGION" ]; then
+  REGION=$(python3 -c "import json; r=json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('region',''); print(r)" 2>/dev/null || echo "")
+fi
+if [ -z "$REGION" ]; then
+  REGION=$(aws configure get region 2>/dev/null || echo "")
+fi
+if [ -z "$REGION" ]; then
+  echo "ERROR: Could not determine AWS region. Set CDK_DEFAULT_REGION, configure region in cdk.json, or run 'aws configure'."
+  exit 1
+fi
 
 if [ -z "$ACCOUNT" ]; then
   echo "ERROR: Could not determine AWS account. Set CDK_DEFAULT_ACCOUNT or configure AWS CLI."
@@ -213,7 +223,7 @@ print(ba.get('agent_id', ''))
   # Get endpoint ID
   ENDPOINT_ID=""
   if [ -n "$RUNTIME_ID" ]; then
-    ENDPOINT_ID=$(aws bedrock-agentcore list-runtime-endpoints \
+    ENDPOINT_ID=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
       --agent-runtime-id "$RUNTIME_ID" \
       --region "$REGION" \
       --query 'runtimeEndpoints[0].runtimeEndpointId' \
