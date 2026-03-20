@@ -293,28 +293,36 @@ phase2_toolkit() {
   echo "--- Reading runtime info ---"
   TOOLKIT_STATUS=$("$AGENTCORE_CLI" status --agent openclaw_agent --verbose 2>&1 || true)
 
-  # Extract runtime_id from status output
+  # Extract runtime_id from status output (handles non-JSON prefix lines from warnings)
   RUNTIME_ID=$(echo "$TOOLKIT_STATUS" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    print(data.get('agent_id', data.get('runtime_id', '')))
-except:
-    import re
-    text = sys.stdin.read() if not 'data' in dir() else ''
-    m = re.search(r'agent_id[\":\s]+([a-zA-Z0-9]+)', text)
-    print(m.group(1) if m else '')
+import sys, re, json
+text = sys.stdin.read()
+# Try to find JSON object in the output
+m = re.search(r'\{.*\}', text, re.DOTALL)
+if m:
+    try:
+        data = json.loads(m.group())
+        # Navigate nested structure: {config: {agent_id: ...}} or flat {agent_id: ...}
+        cfg = data.get('config', data)
+        rid = cfg.get('agent_id', cfg.get('runtime_id', ''))
+        if rid:
+            print(rid)
+            sys.exit(0)
+    except json.JSONDecodeError:
+        pass
+# Regex fallback
+m = re.search(r'\"agent_id\"\s*:\s*\"([a-zA-Z0-9_-]+)\"', text)
+print(m.group(1) if m else '')
 " 2>/dev/null || echo "")
 
-  # Fallback: read from .bedrock_agentcore.yaml
+  # Fallback: read from .bedrock_agentcore.yaml (uses simple text parsing, no yaml dep)
   if [ -z "$RUNTIME_ID" ]; then
     RUNTIME_ID=$(python3 -c "
-import yaml
+import re
 with open('$PROJECT_DIR/.bedrock_agentcore.yaml') as f:
-    cfg = yaml.safe_load(f)
-agent = cfg.get('agents', {}).get('openclaw_agent', {})
-ba = agent.get('bedrock_agentcore', {})
-print(ba.get('agent_id', ''))
+    text = f.read()
+m = re.search(r'agent_id:\s*(\S+)', text)
+print(m.group(1) if m else '')
 " 2>/dev/null || echo "")
   fi
 
