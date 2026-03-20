@@ -99,6 +99,9 @@ const OPENCLAW_RESTART_DELAY_MS = 5000;
 
 // Active task tracking — HealthyBusy prevents AgentCore from terminating during long tasks
 let activeTaskCount = 0;
+// Last activity timestamp (epoch seconds) — reported in /ping so AgentCore can track idle time.
+// Initialized to startup time; updated on each chat/cron/warmup invocation.
+let lastActivityTime = Math.floor(Date.now() / 1000);
 
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
@@ -1371,7 +1374,7 @@ const server = http.createServer(async (req, res) => {
     const status = activeTaskCount > 0 ? "HealthyBusy" : "Healthy";
     const responseBody = {
       status,
-      time_of_last_update: Math.floor(Date.now() / 1000),
+      time_of_last_update: lastActivityTime,
       active_tasks: activeTaskCount,
     };
 
@@ -1438,6 +1441,7 @@ const server = http.createServer(async (req, res) => {
 
         // Warmup action — trigger lazy init without blocking for a chat response
         if (action === "warmup") {
+          lastActivityTime = Math.floor(Date.now() / 1000);
           const { userId, actorId, channel } = payload;
           if (openclawReady && proxyReady) {
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -1502,6 +1506,7 @@ const server = http.createServer(async (req, res) => {
           }
 
           // Track active task to prevent idle termination during cron processing
+          lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
           let responseText;
           try {
@@ -1604,6 +1609,7 @@ const server = http.createServer(async (req, res) => {
           const bridgeText = buildBridgeText(message);
 
           // Track active task to prevent idle termination during chat processing
+          lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
           let responseText;
           try {
