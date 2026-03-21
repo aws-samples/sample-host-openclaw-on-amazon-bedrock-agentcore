@@ -38,6 +38,10 @@ const OPENCLAW_PORT = 18789;
 // No fallback — container will fail to authenticate WebSocket if not set.
 let GATEWAY_TOKEN = null;
 
+// Telegram bot token — fetched from Secrets Manager eagerly at boot.
+// Used for progressive message streaming (send/edit messages as deltas arrive).
+let TELEGRAM_BOT_TOKEN = null;
+
 // Cognito password secret — fetched from Secrets Manager eagerly at boot.
 // Stored in-process only, never written to process.env.
 let COGNITO_PASSWORD_SECRET = null;
@@ -151,6 +155,32 @@ async function prefetchSecrets() {
     if (resp.SecretString) {
       COGNITO_PASSWORD_SECRET = resp.SecretString;
       console.log("[contract] Cognito password secret pre-fetched");
+    }
+  }
+
+  const telegramSecretId = process.env.TELEGRAM_CHANNEL_SECRET_ID;
+  if (telegramSecretId) {
+    try {
+      const resp = await smClient.send(
+        new GetSecretValueCommand({ SecretId: telegramSecretId }),
+      );
+      if (resp.SecretString) {
+        // Secret may be a plain token or JSON with bot_token/token key
+        try {
+          const parsed = JSON.parse(resp.SecretString);
+          TELEGRAM_BOT_TOKEN =
+            parsed.bot_token || parsed.token || resp.SecretString;
+        } catch {
+          TELEGRAM_BOT_TOKEN = resp.SecretString;
+        }
+        console.log(
+          "[contract] Telegram bot token pre-fetched from Secrets Manager",
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[contract] Telegram secret fetch failed (streaming disabled): ${err.message}`,
+      );
     }
   }
 
@@ -1073,6 +1103,127 @@ function extractTextFromContent(content) {
   return "";
 }
 
+// ---------------------------------------------------------------------------
+// Telegram progressive streaming helpers
+// ---------------------------------------------------------------------------
+
+const https = require("https");
+
+/**
+ * Call the Telegram Bot API. Returns parsed JSON response.
+ */
+function telegramApiCall(method, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = https.request(
+      {
+        hostname: "api.telegram.org",
+        path: `/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+        timeout: 10000,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch {
+            resolve({ ok: false, description: data });
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Telegram API timeout"));
+    });
+    req.end(payload);
+  });
+}
+
+/**
+ * Create a progressive Telegram streamer for a given chat.
+ * Returns an { onDelta, finalize } pair.
+ *
+ * onDelta(text): called with cumulative response text on each WS delta.
+ *   - First call (>20 chars): sends initial message with "..." suffix.
+ *   - Subsequent calls (throttled to every 3s): edits the message.
+ * finalize(text): final edit without "..." suffix.
+ */
+function createTelegramStreamer(chatId) {
+  let messageId = null;
+  let lastEditTime = 0;
+  let lastSentText = "";
+  const MIN_EDIT_INTERVAL_MS = 3000;
+  const MIN_INITIAL_CHARS = 20;
+
+  const sendOrEdit = async (text, isFinal) => {
+    const displayText = isFinal ? text : text + " ...";
+    // Avoid editing if text hasn't changed
+    if (displayText === lastSentText && !isFinal) return;
+
+    try {
+      if (!messageId) {
+        // First message
+        const resp = await telegramApiCall("sendMessage", {
+          chat_id: chatId,
+          text: displayText,
+        });
+        if (resp.ok && resp.result?.message_id) {
+          messageId = resp.result.message_id;
+          lastSentText = displayText;
+          lastEditTime = Date.now();
+          console.log(
+            `[telegram-stream] Initial message sent: msg_id=${messageId}`,
+          );
+        }
+      } else {
+        // Edit existing message
+        const resp = await telegramApiCall("editMessageText", {
+          chat_id: chatId,
+          message_id: messageId,
+          text: displayText,
+        });
+        if (resp.ok) {
+          lastSentText = displayText;
+          lastEditTime = Date.now();
+        }
+      }
+    } catch (err) {
+      console.warn(`[telegram-stream] API error: ${err.message}`);
+    }
+  };
+
+  const onDelta = (text) => {
+    if (!text || text.length < MIN_INITIAL_CHARS) return;
+    const now = Date.now();
+    if (!messageId) {
+      // Send initial message immediately
+      sendOrEdit(text, false);
+    } else if (now - lastEditTime >= MIN_EDIT_INTERVAL_MS) {
+      sendOrEdit(text, false);
+    }
+    // Otherwise skip — throttled
+  };
+
+  const finalize = async (text) => {
+    if (!text) return { messageId };
+    if (messageId) {
+      await sendOrEdit(text, true);
+    }
+    // If no message was ever sent (response too short), don't send — let Router handle it
+    return { messageId };
+  };
+
+  return { onDelta, finalize };
+}
+
 /**
  * Process the message queue serially to prevent concurrent WebSocket race conditions.
  */
@@ -1081,13 +1232,13 @@ async function processMessageQueue() {
   processingMessage = true;
 
   while (messageQueue.length > 0) {
-    const { message, resolve, reject } = messageQueue.shift();
+    const { message, onDelta, resolve, reject } = messageQueue.shift();
     console.log(
       `[contract] Processing queued message (${messageQueue.length} remaining)`,
     );
 
     try {
-      const response = await bridgeMessage(message, 560000);
+      const response = await bridgeMessage(message, 620000, onDelta);
       resolve(response);
     } catch (err) {
       reject(err);
@@ -1099,10 +1250,12 @@ async function processMessageQueue() {
 
 /**
  * Enqueue a message and wait for its response (serialized processing).
+ * @param {string} message - The message to send
+ * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-function enqueueMessage(message) {
+function enqueueMessage(message, onDelta) {
   return new Promise((resolve, reject) => {
-    messageQueue.push({ message, resolve, reject });
+    messageQueue.push({ message, onDelta, resolve, reject });
     console.log(
       `[contract] Message enqueued (queue length: ${messageQueue.length})`,
     );
@@ -1114,8 +1267,11 @@ function enqueueMessage(message) {
 
 /**
  * Bridge a chat message to OpenClaw via WebSocket and collect the response.
+ * @param {string} message - The message to send
+ * @param {number} timeoutMs - Timeout in milliseconds
+ * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-async function bridgeMessage(message, timeoutMs = 560000) {
+async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
   const { randomUUID } = require("crypto");
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
@@ -1248,7 +1404,10 @@ async function bridgeMessage(message, timeoutMs = 560000) {
 
         if (payload.state === "delta") {
           const text = extractFromPayload(payload);
-          if (text) responseText = text; // Delta replaces (accumulates progressively)
+          if (text) {
+            responseText = text; // Delta replaces (accumulates progressively)
+            if (onDelta) onDelta(text);
+          }
           return;
         }
 
@@ -1613,6 +1772,26 @@ const server = http.createServer(async (req, res) => {
 
           const bridgeText = buildBridgeText(message);
 
+          // Set up progressive Telegram streaming if applicable
+          let telegramStreamer = null;
+          if (
+            TELEGRAM_BOT_TOKEN &&
+            channel === "telegram" &&
+            actorId
+          ) {
+            // actorId is "telegram:123456789" — extract numeric chat ID
+            const chatId = actorId.split(":")[1];
+            if (chatId) {
+              telegramStreamer = createTelegramStreamer(chatId);
+              console.log(
+                `[contract] Telegram streaming enabled for chat_id=${chatId}`,
+              );
+            }
+          }
+          const onDelta = telegramStreamer
+            ? telegramStreamer.onDelta
+            : undefined;
+
           // Track active task to prevent idle termination during chat processing
           lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
@@ -1622,7 +1801,7 @@ const server = http.createServer(async (req, res) => {
             if (openclawReady) {
               // Full OpenClaw path — WebSocket bridge
               try {
-                responseText = await enqueueMessage(bridgeText);
+                responseText = await enqueueMessage(bridgeText, onDelta);
               } catch (bridgeErr) {
                 console.error(
                   `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
@@ -1698,7 +1877,7 @@ const server = http.createServer(async (req, res) => {
               // Warm-up shim path — lightweight agent via proxy
               console.log("[contract] Routing via lightweight agent (warm-up)");
               try {
-                responseText = await agent.chat(bridgeText, actorId, Date.now() + 560000);
+                responseText = await agent.chat(bridgeText, actorId, Date.now() + 620000);
               } catch (agentErr) {
                 responseText = `I'm having trouble right now. Please try again in a moment.`;
                 console.error(
@@ -1716,12 +1895,31 @@ const server = http.createServer(async (req, res) => {
           // Belt-and-suspenders: strip any remaining content-block JSON wrappers
           if (responseText) responseText = extractTextFromContent(responseText);
 
+          // Finalize Telegram streaming (final edit without "..." suffix)
+          let telegramStreamed = false;
+          if (telegramStreamer && responseText) {
+            try {
+              const result = await telegramStreamer.finalize(responseText);
+              if (result.messageId) {
+                telegramStreamed = true;
+                console.log(
+                  `[contract] Telegram streaming finalized: msg_id=${result.messageId}`,
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `[contract] Telegram streaming finalize error: ${err.message}`,
+              );
+            }
+          }
+
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               response: responseText,
               userId: currentUserId,
               sessionId: payload.sessionId || null,
+              streamed: telegramStreamed || undefined,
             }),
           );
           return;

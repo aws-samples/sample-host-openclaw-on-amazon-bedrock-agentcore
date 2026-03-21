@@ -1487,6 +1487,11 @@ def handle_telegram(body):
     response_text = _extract_text_from_content_blocks(response_text)
     logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
 
+    # If contract already streamed progressively to Telegram, skip duplicate send
+    if result.get("streamed"):
+        logger.info("Telegram response already streamed by contract — skipping send to chat_id=%s", chat_id)
+        return
+
     # Send response (split if > 4096 chars for Telegram limit)
     if len(response_text) <= 4096:
         send_telegram_message(chat_id, response_text, token)
