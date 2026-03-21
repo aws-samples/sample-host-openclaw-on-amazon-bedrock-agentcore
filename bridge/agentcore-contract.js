@@ -1160,8 +1160,8 @@ function createTelegramStreamer(chatId) {
   let messageId = null;
   let lastEditTime = 0;
   let lastSentText = "";
-  const MIN_EDIT_INTERVAL_MS = 3000;
-  const MIN_INITIAL_CHARS = 20;
+  const MIN_EDIT_INTERVAL_MS = 8000;
+  const MIN_INITIAL_CHARS = 60;
 
   const sendOrEdit = async (text, isFinal) => {
     const displayText = isFinal ? text : text + " ...";
