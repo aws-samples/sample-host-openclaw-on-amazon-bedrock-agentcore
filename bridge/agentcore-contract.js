@@ -39,7 +39,7 @@ const OPENCLAW_PORT = 18789;
 let GATEWAY_TOKEN = null;
 
 // Telegram bot token — fetched from Secrets Manager eagerly at boot.
-// Used for progressive message streaming (send/edit messages as deltas arrive).
+// Used for typing indicator during processing + single final message delivery.
 let TELEGRAM_BOT_TOKEN = null;
 
 // Cognito password secret — fetched from Secrets Manager eagerly at boot.
@@ -1148,77 +1148,64 @@ function telegramApiCall(method, body) {
 }
 
 /**
- * Create a progressive Telegram streamer for a given chat.
- * Returns an { onDelta, finalize } pair.
+ * Create a Telegram streamer that shows "typing..." indicator while working,
+ * then sends ONE clean final message when done. No intermediate edits.
  *
- * onDelta(text): called with cumulative response text on each WS delta.
- *   - First call (>20 chars): sends initial message with "..." suffix.
- *   - Subsequent calls (throttled to every 3s): edits the message.
- * finalize(text): final edit without "..." suffix.
+ * onDelta(text): starts a typing indicator loop (sendChatAction every 5s).
+ * finalize(text): stops the typing loop and sends a single sendMessage.
  */
 function createTelegramStreamer(chatId) {
-  let messageId = null;
-  let lastEditTime = 0;
-  let lastSentText = "";
-  const MIN_EDIT_INTERVAL_MS = 8000;
-  const MIN_INITIAL_CHARS = 60;
+  let typingInterval = null;
+  let typingStarted = false;
 
-  const sendOrEdit = async (text, isFinal) => {
-    const displayText = isFinal ? text : text + " ...";
-    // Avoid editing if text hasn't changed
-    if (displayText === lastSentText && !isFinal) return;
-
+  const sendTyping = async () => {
     try {
-      if (!messageId) {
-        // First message
-        const resp = await telegramApiCall("sendMessage", {
-          chat_id: chatId,
-          text: displayText,
-        });
-        if (resp.ok && resp.result?.message_id) {
-          messageId = resp.result.message_id;
-          lastSentText = displayText;
-          lastEditTime = Date.now();
-          console.log(
-            `[telegram-stream] Initial message sent: msg_id=${messageId}`,
-          );
-        }
-      } else {
-        // Edit existing message
-        const resp = await telegramApiCall("editMessageText", {
-          chat_id: chatId,
-          message_id: messageId,
-          text: displayText,
-        });
-        if (resp.ok) {
-          lastSentText = displayText;
-          lastEditTime = Date.now();
-        }
-      }
+      await telegramApiCall("sendChatAction", {
+        chat_id: chatId,
+        action: "typing",
+      });
     } catch (err) {
-      console.warn(`[telegram-stream] API error: ${err.message}`);
+      console.warn(`[telegram-stream] Typing indicator error: ${err.message}`);
+    }
+  };
+
+  const startTypingLoop = () => {
+    if (typingStarted) return;
+    typingStarted = true;
+    sendTyping();
+    typingInterval = setInterval(sendTyping, 5000);
+    console.log(`[telegram-stream] Typing indicator started for chat_id=${chatId}`);
+  };
+
+  const stopTypingLoop = () => {
+    if (typingInterval) {
+      clearInterval(typingInterval);
+      typingInterval = null;
     }
   };
 
   const onDelta = (text) => {
-    if (!text || text.length < MIN_INITIAL_CHARS) return;
-    const now = Date.now();
-    if (!messageId) {
-      // Send initial message immediately
-      sendOrEdit(text, false);
-    } else if (now - lastEditTime >= MIN_EDIT_INTERVAL_MS) {
-      sendOrEdit(text, false);
-    }
-    // Otherwise skip — throttled
+    if (!text || text.length < 60) return;
+    startTypingLoop();
   };
 
   const finalize = async (text) => {
-    if (!text) return { messageId };
-    if (messageId) {
-      await sendOrEdit(text, true);
+    stopTypingLoop();
+    if (!text) return { messageId: null };
+    try {
+      const resp = await telegramApiCall("sendMessage", {
+        chat_id: chatId,
+        text,
+      });
+      const messageId = resp.ok ? resp.result?.message_id : null;
+      if (messageId) {
+        console.log(`[telegram-stream] Final message sent: msg_id=${messageId}`);
+      }
+      return { messageId };
+    } catch (err) {
+      console.warn(`[telegram-stream] Final send error: ${err.message}`);
+      return { messageId: null };
     }
-    // If no message was ever sent (response too short), don't send — let Router handle it
-    return { messageId };
   };
 
   return { onDelta, finalize };
