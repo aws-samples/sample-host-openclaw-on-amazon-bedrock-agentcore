@@ -1250,37 +1250,24 @@ async function invokeBedrockStreaming(
         // Tool use start
         if (event.contentBlockStart?.start?.toolUse) {
           const tu = event.contentBlockStart.start.toolUse;
-          const blockIdx = event.contentBlockStart.contentBlockIndex ?? -1;
-          console.log(`[proxy-debug] TOOL_START name=${tu.name} blockIdx=${blockIdx} id=${tu.toolUseId}`);
           currentToolUse = { id: tu.toolUseId, name: tu.name };
           currentToolInput = "";
-          currentToolBlockIndex = blockIdx;
-        }
-
-        // Text block start (debug)
-        if (event.contentBlockStart && !event.contentBlockStart?.start?.toolUse) {
-          const blockIdx = event.contentBlockStart.contentBlockIndex ?? -1;
-          console.log(`[proxy-debug] TEXT_START blockIdx=${blockIdx}`);
+          currentToolBlockIndex = event.contentBlockStart.contentBlockIndex ?? -1;
         }
 
         // Tool use input delta
         if (event.contentBlockDelta?.delta?.toolUse) {
           const inputChunk = event.contentBlockDelta.delta.toolUse.input || "";
-          console.log(`[proxy-debug] TOOL_DELTA blockIdx=${event.contentBlockDelta.contentBlockIndex} chunkLen=${inputChunk.length} accumulated=${currentToolInput.length + inputChunk.length}`);
           currentToolInput += inputChunk;
         }
 
         // Content block stop — finalize tool use only when the stopped block matches the tool block
         const stopBlockIndex = event.contentBlockStop?.contentBlockIndex ?? -1;
-        if (event.contentBlockStop) {
-          console.log(`[proxy-debug] BLOCK_STOP stopIdx=${stopBlockIndex} toolBlockIdx=${currentToolBlockIndex} hasToolUse=${!!currentToolUse} inputLen=${currentToolInput.length}`);
-        }
         if (event.contentBlockStop && currentToolUse && stopBlockIndex === currentToolBlockIndex) {
           let parsedInput = {};
           try {
             parsedInput = JSON.parse(currentToolInput);
           } catch {}
-          console.log(`[proxy-debug] FINALIZE name=${currentToolUse.name} inputLen=${currentToolInput.length} parsedKeys=${Object.keys(parsedInput).join(",")}`);
           const toolCallIndex = toolCalls.length;
           toolCalls.push({
             id: currentToolUse.id,
