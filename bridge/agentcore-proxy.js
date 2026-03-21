@@ -1199,6 +1199,7 @@ async function invokeBedrockStreaming(
   const toolCalls = [];
   let currentToolUse = null;
   let currentToolInput = "";
+  let currentToolBlockIndex = -1;
 
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -1213,6 +1214,7 @@ async function invokeBedrockStreaming(
         toolCalls.length = 0;
         currentToolUse = null;
         currentToolInput = "";
+        currentToolBlockIndex = -1;
       }
 
       const response = await client.send(new ConverseStreamCommand(params));
@@ -1250,6 +1252,7 @@ async function invokeBedrockStreaming(
           const tu = event.contentBlockStart.start.toolUse;
           currentToolUse = { id: tu.toolUseId, name: tu.name };
           currentToolInput = "";
+          currentToolBlockIndex = event.contentBlockStart.contentBlockIndex ?? -1;
         }
 
         // Tool use input delta
@@ -1257,8 +1260,9 @@ async function invokeBedrockStreaming(
           currentToolInput += event.contentBlockDelta.delta.toolUse.input || "";
         }
 
-        // Content block stop — finalize tool use if one was in progress
-        if (event.contentBlockStop && currentToolUse) {
+        // Content block stop — finalize tool use only when the stopped block matches the tool block
+        const stopBlockIndex = event.contentBlockStop?.contentBlockIndex ?? -1;
+        if (event.contentBlockStop && currentToolUse && stopBlockIndex === currentToolBlockIndex) {
           let parsedInput = {};
           try {
             parsedInput = JSON.parse(currentToolInput);
@@ -1301,6 +1305,7 @@ async function invokeBedrockStreaming(
           res.write(`data: ${JSON.stringify(toolChunk)}\n\n`);
           currentToolUse = null;
           currentToolInput = "";
+          currentToolBlockIndex = -1;
         }
 
         if (event.metadata?.usage) {
