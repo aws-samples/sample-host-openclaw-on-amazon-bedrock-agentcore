@@ -1085,7 +1085,7 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     modelId,
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
-    inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
+    inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
@@ -1184,7 +1184,7 @@ async function invokeBedrockStreaming(
     modelId,
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
-    inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
+    inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
