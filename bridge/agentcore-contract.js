@@ -358,6 +358,11 @@ function writeOpenClawConfig() {
     },
     tools: {
       profile: "full",
+      exec: {
+        host: "gateway",  // Run on container host — microVM provides isolation, no Docker sandbox
+        security: "full", // Full shell access; container is already isolated
+        ask: "off",       // Headless container — no approval UI
+      },
       deny: [
         "write", // Local writes don't persist — use S3 skill instead
         "edit", // Local edits are ephemeral — use S3 skill instead
