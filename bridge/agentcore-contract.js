@@ -1629,20 +1629,69 @@ const server = http.createServer(async (req, res) => {
                 );
                 responseText = "";
               }
-              // If bridge returned empty (OpenClaw sent no content), fall back to
-              // lightweight agent so the user always gets a real AI response.
+              // If bridge returned empty (OpenClaw sent no content), check whether
+              // OpenClaw is mid-run before falling back to lightweight agent.
+              // A tool-call-only response or concurrent subagent task can produce
+              // an empty bridge response that is NOT a failure.
               if (!responseText || !responseText.trim()) {
-                console.warn(
-                  "[contract] Bridge returned empty — falling back to lightweight agent",
-                );
+                // Brief retry — transient empty responses resolve quickly
+                await new Promise((r) => setTimeout(r, 300));
+
+                // Probe OpenClaw to see if it is still busy
+                let openclawBusy = false;
                 try {
-                  responseText = await agent.chat(bridgeText, actorId, Date.now() + 30000);
-                } catch (agentErr) {
-                  responseText =
-                    "I'm having trouble right now. Please try again in a moment.";
-                  console.error(
-                    `[contract] Lightweight agent fallback error: ${agentErr.message}`,
+                  const pingData = await new Promise((resolve, reject) => {
+                    const pingReq = http.get(
+                      `http://127.0.0.1:${OPENCLAW_PORT}`,
+                      (pingRes) => {
+                        let data = "";
+                        pingRes.on("data", (c) => (data += c));
+                        pingRes.on("end", () => resolve(data));
+                      },
+                    );
+                    pingReq.on("error", reject);
+                    pingReq.setTimeout(2000, () => {
+                      pingReq.destroy();
+                      reject(new Error("ping timeout"));
+                    });
+                  });
+                  // OpenClaw may return JSON with activeTasks count
+                  try {
+                    const parsed = JSON.parse(pingData);
+                    if (parsed.activeTasks > 0) openclawBusy = true;
+                  } catch {
+                    // Non-JSON response — OpenClaw is alive but format unknown
+                  }
+                } catch {
+                  // OpenClaw not responding — not busy, allow fallback
+                }
+
+                // Also treat a still-running process (no exit code) as busy
+                if (openclawExitCode === null) openclawBusy = true;
+
+                if (openclawBusy) {
+                  console.log(
+                    "[contract] Bridge returned empty but OpenClaw is mid-run — returning busy message",
                   );
+                  responseText =
+                    "I'm still working on your previous request — check back in a moment.";
+                } else {
+                  console.warn(
+                    "[contract] Bridge returned empty — falling back to lightweight agent",
+                  );
+                  try {
+                    responseText = await agent.chat(
+                      bridgeText,
+                      actorId,
+                      Date.now() + 30000,
+                    );
+                  } catch (agentErr) {
+                    responseText =
+                      "I'm having trouble right now. Please try again in a moment.";
+                    console.error(
+                      `[contract] Lightweight agent fallback error: ${agentErr.message}`,
+                    );
+                  }
                 }
               }
             } else if (proxyReady) {
