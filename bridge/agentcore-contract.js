@@ -898,7 +898,13 @@ async function init(userId, actorId, channel) {
     };
     proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
       env: proxyEnv,
-      stdio: "inherit",
+      stdio: ["inherit", "pipe", "pipe"],
+    });
+    proxyProcess.stdout.on("data", (d) => {
+      d.toString().split("\n").filter(Boolean).forEach(line => console.log(`[proxy:out] ${line}`));
+    });
+    proxyProcess.stderr.on("data", (d) => {
+      d.toString().split("\n").filter(Boolean).forEach(line => console.error(`[proxy:err] ${line}`));
     });
     proxyProcess.on("exit", (code) => {
       console.log(`[contract] Proxy exited with code ${code}`);
