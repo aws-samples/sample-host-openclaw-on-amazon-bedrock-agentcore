@@ -128,6 +128,7 @@ class AgentCoreStack(Stack):
                 resources=[
                     f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/gateway-token-*",
                     f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/cognito-password-secret-*",
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/channels/telegram-*",
                 ],
             )
         )
@@ -386,6 +387,7 @@ class AgentCoreStack(Stack):
                         "Resource::arn:aws:bedrock:*::inference-profile/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/gateway-token-*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/cognito-password-secret-*",
+                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/channels/telegram-*",
                         "Resource::*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*:*",

@@ -12,7 +12,10 @@ RUN apt-get update && \
 RUN pip3 install --no-cache-dir --break-system-packages awscli
 
 # Install OpenClaw and ClawHub CLI globally
-RUN npm install -g openclaw@latest clawhub@latest
+# Pinned to tested versions — update intentionally to avoid unexpected breaking changes.
+# To upgrade: test the new version locally first, then bump both pins here.
+#   openclaw release notes: https://github.com/openclaw/openclaw/releases
+RUN npm install -g openclaw@2026.3.8 clawhub@0.8.0
 
 # Install ClawHub community skills (5 high-value marketplace skills)
 # Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
@@ -32,8 +35,11 @@ RUN mkdir -p /app
 WORKDIR /app
 
 # Install AWS SDK and WebSocket library (production only)
+# Skip browser binary download — we only need playwright-core for CDP client (connectOverCDP)
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install --omit=dev \
+                @aws-sdk/client-bedrock-agentcore \
                 @aws-sdk/client-bedrock-runtime \
                 @aws-sdk/client-cognito-identity-provider \
                 @aws-sdk/client-s3 \
@@ -42,6 +48,9 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
                 @aws-sdk/client-dynamodb \
                 @aws-sdk/client-sts \
                 @aws-sdk/lib-dynamodb \
+                playwright-core \
+                @aws-sdk/s3-request-presigner \
+                @aws-sdk/client-cloudwatch-logs \
                 ws
 
 # Pre-warm V8 compile cache for heavy AWS SDK modules.
@@ -103,6 +112,7 @@ COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY workspace-sync.js /app/workspace-sync.js
+COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
 
@@ -122,6 +132,10 @@ RUN chmod +x /skills/clawhub-manage/*.js
 # Copy API key management skill (dual-mode: native file + Secrets Manager)
 COPY skills/api-keys /skills/api-keys
 RUN chmod +x /skills/api-keys/*.js
+
+# Copy AgentCore browser skill (headless Chromium browsing)
+COPY skills/agentcore-browser /skills/agentcore-browser
+RUN chmod +x /skills/agentcore-browser/*.js
 
 # Copy project instructions (CLAUDE.md) so the agent knows about its skills
 COPY CLAUDE.md /app/CLAUDE.md

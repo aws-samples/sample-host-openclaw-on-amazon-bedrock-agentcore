@@ -38,6 +38,10 @@ const OPENCLAW_PORT = 18789;
 // No fallback — container will fail to authenticate WebSocket if not set.
 let GATEWAY_TOKEN = null;
 
+// Telegram bot token — fetched from Secrets Manager eagerly at boot.
+// Used for typing indicator during processing + single final message delivery.
+let TELEGRAM_BOT_TOKEN = null;
+
 // Cognito password secret — fetched from Secrets Manager eagerly at boot.
 // Stored in-process only, never written to process.env.
 let COGNITO_PASSWORD_SECRET = null;
@@ -151,6 +155,32 @@ async function prefetchSecrets() {
     if (resp.SecretString) {
       COGNITO_PASSWORD_SECRET = resp.SecretString;
       console.log("[contract] Cognito password secret pre-fetched");
+    }
+  }
+
+  const telegramSecretId = process.env.TELEGRAM_CHANNEL_SECRET_ID;
+  if (telegramSecretId) {
+    try {
+      const resp = await smClient.send(
+        new GetSecretValueCommand({ SecretId: telegramSecretId }),
+      );
+      if (resp.SecretString) {
+        // Secret may be a plain token or JSON with bot_token/token key
+        try {
+          const parsed = JSON.parse(resp.SecretString);
+          TELEGRAM_BOT_TOKEN =
+            parsed.bot_token || parsed.token || resp.SecretString;
+        } catch {
+          TELEGRAM_BOT_TOKEN = resp.SecretString;
+        }
+        console.log(
+          "[contract] Telegram bot token pre-fetched from Secrets Manager",
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[contract] Telegram secret fetch failed (streaming disabled): ${err.message}`,
+      );
     }
   }
 
@@ -358,6 +388,11 @@ function writeOpenClawConfig() {
     },
     tools: {
       profile: "full",
+      exec: {
+        host: "gateway",  // Run on container host — microVM provides isolation, no Docker sandbox
+        security: "full", // Full shell access; container is already isolated
+        ask: "off",       // Headless container — no approval UI
+      },
       deny: [
         "write", // Local writes don't persist — use S3 skill instead
         "edit", // Local edits are ephemeral — use S3 skill instead
@@ -863,7 +898,13 @@ async function init(userId, actorId, channel) {
     };
     proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
       env: proxyEnv,
-      stdio: "inherit",
+      stdio: ["inherit", "pipe", "pipe"],
+    });
+    proxyProcess.stdout.on("data", (d) => {
+      d.toString().split("\n").filter(Boolean).forEach(line => console.log(`[proxy:out] ${line}`));
+    });
+    proxyProcess.stderr.on("data", (d) => {
+      d.toString().split("\n").filter(Boolean).forEach(line => console.error(`[proxy:err] ${line}`));
     });
     proxyProcess.on("exit", (code) => {
       console.log(`[contract] Proxy exited with code ${code}`);
@@ -1068,6 +1109,114 @@ function extractTextFromContent(content) {
   return "";
 }
 
+// ---------------------------------------------------------------------------
+// Telegram progressive streaming helpers
+// ---------------------------------------------------------------------------
+
+const https = require("https");
+
+/**
+ * Call the Telegram Bot API. Returns parsed JSON response.
+ */
+function telegramApiCall(method, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = https.request(
+      {
+        hostname: "api.telegram.org",
+        path: `/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+        timeout: 10000,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch {
+            resolve({ ok: false, description: data });
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Telegram API timeout"));
+    });
+    req.end(payload);
+  });
+}
+
+/**
+ * Create a Telegram streamer that shows "typing..." indicator while working,
+ * then sends ONE clean final message when done. No intermediate edits.
+ *
+ * onDelta(text): starts a typing indicator loop (sendChatAction every 5s).
+ * finalize(text): stops the typing loop and sends a single sendMessage.
+ */
+function createTelegramStreamer(chatId) {
+  let typingInterval = null;
+  let typingStarted = false;
+
+  const sendTyping = async () => {
+    try {
+      await telegramApiCall("sendChatAction", {
+        chat_id: chatId,
+        action: "typing",
+      });
+    } catch (err) {
+      console.warn(`[telegram-stream] Typing indicator error: ${err.message}`);
+    }
+  };
+
+  const startTypingLoop = () => {
+    if (typingStarted) return;
+    typingStarted = true;
+    sendTyping();
+    typingInterval = setInterval(sendTyping, 5000);
+    console.log(`[telegram-stream] Typing indicator started for chat_id=${chatId}`);
+  };
+
+  const stopTypingLoop = () => {
+    if (typingInterval) {
+      clearInterval(typingInterval);
+      typingInterval = null;
+    }
+  };
+
+  const onDelta = (text) => {
+    if (!text || text.length < 60) return;
+    startTypingLoop();
+  };
+
+  const finalize = async (text) => {
+    stopTypingLoop();
+    if (!text) return { messageId: null };
+    try {
+      const resp = await telegramApiCall("sendMessage", {
+        chat_id: chatId,
+        text,
+      });
+      const messageId = resp.ok ? resp.result?.message_id : null;
+      if (messageId) {
+        console.log(`[telegram-stream] Final message sent: msg_id=${messageId}`);
+      }
+      return { messageId };
+    } catch (err) {
+      console.warn(`[telegram-stream] Final send error: ${err.message}`);
+      return { messageId: null };
+    }
+  };
+
+  return { onDelta, finalize };
+}
+
 /**
  * Process the message queue serially to prevent concurrent WebSocket race conditions.
  */
@@ -1076,13 +1225,13 @@ async function processMessageQueue() {
   processingMessage = true;
 
   while (messageQueue.length > 0) {
-    const { message, resolve, reject } = messageQueue.shift();
+    const { message, onDelta, resolve, reject } = messageQueue.shift();
     console.log(
       `[contract] Processing queued message (${messageQueue.length} remaining)`,
     );
 
     try {
-      const response = await bridgeMessage(message, 560000);
+      const response = await bridgeMessage(message, 620000, onDelta);
       resolve(response);
     } catch (err) {
       reject(err);
@@ -1094,10 +1243,12 @@ async function processMessageQueue() {
 
 /**
  * Enqueue a message and wait for its response (serialized processing).
+ * @param {string} message - The message to send
+ * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-function enqueueMessage(message) {
+function enqueueMessage(message, onDelta) {
   return new Promise((resolve, reject) => {
-    messageQueue.push({ message, resolve, reject });
+    messageQueue.push({ message, onDelta, resolve, reject });
     console.log(
       `[contract] Message enqueued (queue length: ${messageQueue.length})`,
     );
@@ -1109,8 +1260,11 @@ function enqueueMessage(message) {
 
 /**
  * Bridge a chat message to OpenClaw via WebSocket and collect the response.
+ * @param {string} message - The message to send
+ * @param {number} timeoutMs - Timeout in milliseconds
+ * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-async function bridgeMessage(message, timeoutMs = 560000) {
+async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
   const { randomUUID } = require("crypto");
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
@@ -1243,7 +1397,10 @@ async function bridgeMessage(message, timeoutMs = 560000) {
 
         if (payload.state === "delta") {
           const text = extractFromPayload(payload);
-          if (text) responseText = text; // Delta replaces (accumulates progressively)
+          if (text) {
+            responseText = text; // Delta replaces (accumulates progressively)
+            if (onDelta) onDelta(text);
+          }
           return;
         }
 
@@ -1608,6 +1765,26 @@ const server = http.createServer(async (req, res) => {
 
           const bridgeText = buildBridgeText(message);
 
+          // Set up progressive Telegram streaming if applicable
+          let telegramStreamer = null;
+          if (
+            TELEGRAM_BOT_TOKEN &&
+            channel === "telegram" &&
+            actorId
+          ) {
+            // actorId is "telegram:123456789" — extract numeric chat ID
+            const chatId = actorId.split(":")[1];
+            if (chatId) {
+              telegramStreamer = createTelegramStreamer(chatId);
+              console.log(
+                `[contract] Telegram streaming enabled for chat_id=${chatId}`,
+              );
+            }
+          }
+          const onDelta = telegramStreamer
+            ? telegramStreamer.onDelta
+            : undefined;
+
           // Track active task to prevent idle termination during chat processing
           lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
@@ -1617,34 +1794,83 @@ const server = http.createServer(async (req, res) => {
             if (openclawReady) {
               // Full OpenClaw path — WebSocket bridge
               try {
-                responseText = await enqueueMessage(bridgeText);
+                responseText = await enqueueMessage(bridgeText, onDelta);
               } catch (bridgeErr) {
                 console.error(
                   `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
                 );
                 responseText = "";
               }
-              // If bridge returned empty (OpenClaw sent no content), fall back to
-              // lightweight agent so the user always gets a real AI response.
+              // If bridge returned empty (OpenClaw sent no content), check whether
+              // OpenClaw is mid-run before falling back to lightweight agent.
+              // A tool-call-only response or concurrent subagent task can produce
+              // an empty bridge response that is NOT a failure.
               if (!responseText || !responseText.trim()) {
-                console.warn(
-                  "[contract] Bridge returned empty — falling back to lightweight agent",
-                );
+                // Brief retry — transient empty responses resolve quickly
+                await new Promise((r) => setTimeout(r, 300));
+
+                // Probe OpenClaw to see if it is still busy
+                let openclawBusy = false;
                 try {
-                  responseText = await agent.chat(bridgeText, actorId, Date.now() + 30000);
-                } catch (agentErr) {
-                  responseText =
-                    "I'm having trouble right now. Please try again in a moment.";
-                  console.error(
-                    `[contract] Lightweight agent fallback error: ${agentErr.message}`,
+                  const pingData = await new Promise((resolve, reject) => {
+                    const pingReq = http.get(
+                      `http://127.0.0.1:${OPENCLAW_PORT}`,
+                      (pingRes) => {
+                        let data = "";
+                        pingRes.on("data", (c) => (data += c));
+                        pingRes.on("end", () => resolve(data));
+                      },
+                    );
+                    pingReq.on("error", reject);
+                    pingReq.setTimeout(2000, () => {
+                      pingReq.destroy();
+                      reject(new Error("ping timeout"));
+                    });
+                  });
+                  // OpenClaw may return JSON with activeTasks count
+                  try {
+                    const parsed = JSON.parse(pingData);
+                    if (parsed.activeTasks > 0) openclawBusy = true;
+                  } catch {
+                    // Non-JSON response — OpenClaw is alive but format unknown
+                  }
+                } catch {
+                  // OpenClaw not responding — not busy, allow fallback
+                }
+
+                // Also treat a still-running process (no exit code) as busy
+                if (openclawExitCode === null) openclawBusy = true;
+
+                if (openclawBusy) {
+                  console.log(
+                    "[contract] Bridge returned empty but OpenClaw is mid-run — returning busy message",
                   );
+                  responseText =
+                    "I'm still working on your previous request — check back in a moment.";
+                } else {
+                  console.warn(
+                    "[contract] Bridge returned empty — falling back to lightweight agent",
+                  );
+                  try {
+                    responseText = await agent.chat(
+                      bridgeText,
+                      actorId,
+                      Date.now() + 30000,
+                    );
+                  } catch (agentErr) {
+                    responseText =
+                      "I'm having trouble right now. Please try again in a moment.";
+                    console.error(
+                      `[contract] Lightweight agent fallback error: ${agentErr.message}`,
+                    );
+                  }
                 }
               }
             } else if (proxyReady) {
               // Warm-up shim path — lightweight agent via proxy
               console.log("[contract] Routing via lightweight agent (warm-up)");
               try {
-                responseText = await agent.chat(bridgeText, actorId, Date.now() + 560000);
+                responseText = await agent.chat(bridgeText, actorId, Date.now() + 620000);
               } catch (agentErr) {
                 responseText = `I'm having trouble right now. Please try again in a moment.`;
                 console.error(
@@ -1662,12 +1888,31 @@ const server = http.createServer(async (req, res) => {
           // Belt-and-suspenders: strip any remaining content-block JSON wrappers
           if (responseText) responseText = extractTextFromContent(responseText);
 
+          // Finalize Telegram streaming (final edit without "..." suffix)
+          let telegramStreamed = false;
+          if (telegramStreamer && responseText) {
+            try {
+              const result = await telegramStreamer.finalize(responseText);
+              if (result.messageId) {
+                telegramStreamed = true;
+                console.log(
+                  `[contract] Telegram streaming finalized: msg_id=${result.messageId}`,
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `[contract] Telegram streaming finalize error: ${err.message}`,
+              );
+            }
+          }
+
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               response: responseText,
               userId: currentUserId,
               sessionId: payload.sessionId || null,
+              streamed: telegramStreamed || undefined,
             }),
           );
           return;

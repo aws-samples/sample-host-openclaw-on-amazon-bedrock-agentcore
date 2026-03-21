@@ -181,6 +181,7 @@ read_cdk_outputs() {
     --output text)
 
   COGNITO_PASSWORD_SECRET_ID="openclaw/cognito-password-secret"
+  TELEGRAM_CHANNEL_SECRET_ID="openclaw/channels/telegram"
 
   CMK_ARN=$(aws cloudformation describe-stacks \
     --stack-name OpenClawSecurity --region "$REGION" \
@@ -287,7 +288,8 @@ phase2_toolkit() {
     --env "EVENTBRIDGE_ROLE_ARN=arn:aws:iam::${ACCOUNT}:role/openclaw-cron-scheduler-role-${REGION}" \
     --env "IDENTITY_TABLE_NAME=openclaw-identity" \
     --env "CRON_LEAD_TIME_MINUTES=$CRON_LEAD_TIME" \
-    --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID"
+    --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID" \
+    --env "TELEGRAM_CHANNEL_SECRET_ID=$TELEGRAM_CHANNEL_SECRET_ID"
 
   # Read runtime ID and endpoint ID from toolkit
   echo "--- Reading runtime info ---"
