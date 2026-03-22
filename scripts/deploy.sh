@@ -61,6 +61,35 @@ cleanup_orphaned_resources() {
       aws cloudwatch delete-dashboards --dashboard-names "$dashboard" --region "$REGION"
     fi
   done
+
+  # Log groups with explicit names survive stack deletion (RemovalPolicy.RETAIN or DELETE_SKIPPED).
+  for loggroup in "/openclaw/api-access" "/openclaw/lambda/router" "/openclaw/lambda/cron"; do
+    if aws logs describe-log-groups --log-group-name-prefix "$loggroup" --region "$REGION" \
+       --query "logGroups[?logGroupName=='$loggroup'].logGroupName" --output text 2>/dev/null | grep -q .; then
+      echo "  Deleting orphaned log group: $loggroup"
+      aws logs delete-log-group --log-group-name "$loggroup" --region "$REGION"
+    fi
+  done
+
+  # DynamoDB table with explicit name survives stack deletion.
+  if aws dynamodb describe-table --table-name openclaw-identity --region "$REGION" &>/dev/null; then
+    echo "  Deleting orphaned DynamoDB table: openclaw-identity"
+    aws dynamodb delete-table --table-name openclaw-identity --region "$REGION" > /dev/null
+    aws dynamodb wait table-not-exists --table-name openclaw-identity --region "$REGION"
+  fi
+
+  # S3 bucket with explicit name may survive (non-empty buckets are retained).
+  local BUCKET="openclaw-user-files-${ACCOUNT}-${REGION}"
+  if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" &>/dev/null; then
+    echo "  Deleting orphaned S3 bucket: $BUCKET"
+    python3 -c "
+import boto3
+s3 = boto3.resource('s3', region_name='$REGION')
+bucket = s3.Bucket('$BUCKET')
+bucket.object_versions.all().delete()
+bucket.delete()
+"
+  fi
 }
 
 # --- Ensure CDK bootstrap is up to date ---
