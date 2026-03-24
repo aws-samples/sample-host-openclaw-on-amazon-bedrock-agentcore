@@ -170,6 +170,22 @@ The deploy script runs three phases automatically:
 
 The script runs pre-flight checks (AWS credentials, CDK CLI, Docker, agentcore CLI) before starting.
 
+**Note on Availability Zones:** Bedrock AgentCore Runtime may not be available in all AZs in a region. If deployment fails with an "unsupported availability zones" error, specify supported AZs in `cdk.json`:
+
+```json
+{
+  "context": {
+    "availability_zones": ["us-east-1b", "us-east-1c"]
+  }
+}
+```
+
+To find supported AZs for your region:
+1. Check the error message from the failed deployment (it lists supported AZ IDs like `use1-az1`, `use1-az2`)
+2. Map AZ IDs to AZ names in your account: `aws ec2 describe-availability-zones --region us-east-1`
+3. Update `availability_zones` in `cdk.json` with the AZ names that match the supported AZ IDs
+4. Redeploy: `cdk destroy OpenClawVpc --force && ./scripts/deploy.sh`
+
 #### Build modes
 
 By default, the container image is built **locally** with Docker (`--local-build`). If you don't have Docker or prefer cloud builds, set `BUILD_MODE=codebuild`:
@@ -330,6 +346,7 @@ All tunable parameters are in `cdk.json`:
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
 | `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
+| `availability_zones` | `[]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
 | `default_model_id` | `global.anthropic.claude-sonnet-4-6` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
 | `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Set to e.g. `global.anthropic.claude-sonnet-4-6-v1` for faster/cheaper sub-agents |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |

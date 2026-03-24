@@ -2,7 +2,8 @@
   "app": "python3 app.py",
   "context": {
     "account": "",
-    "region": "ap-southeast-2",
+    "region": "",
+    "availability_zones": [],
     "default_model_id": "global.anthropic.claude-sonnet-4-6",
     "subagent_model_id": "",
     "cloudwatch_log_retention_days": 30,

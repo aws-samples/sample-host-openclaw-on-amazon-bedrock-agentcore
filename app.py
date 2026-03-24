@@ -59,8 +59,6 @@ agentcore_stack = AgentCoreStack(
     cognito_user_pool_id=security_stack.user_pool_id,
     cognito_password_secret_name=security_stack.cognito_password_secret.secret_name,
     gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
-    guardrail_id=guardrails_stack.guardrail_id or "",
-    guardrail_version=guardrails_stack.guardrail_version or "",
     env=env,
 )
 
@@ -83,7 +81,8 @@ router_stack = RouterStack(
 
 # --- Cron (EventBridge Scheduler + Lambda executor) ---
 # Use deterministic string ARNs for identity table to avoid cyclic dependency
-_region = env.region or os.environ.get("CDK_DEFAULT_REGION", "us-west-2")
+# (AgentCore <- Router already exists; CronStack adds policies to AgentCore role)
+_region = env.region or os.environ.get("CDK_DEFAULT_REGION", "")
 _account = env.account or os.environ.get("CDK_DEFAULT_ACCOUNT", "")
 _identity_table_name = "openclaw-identity"
 _identity_table_arn = f"arn:aws:dynamodb:{_region}:{_account}:table/{_identity_table_name}"
