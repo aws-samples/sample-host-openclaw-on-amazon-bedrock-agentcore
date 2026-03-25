@@ -291,6 +291,55 @@ phase2_toolkit() {
     --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID" \
     --env "TELEGRAM_CHANNEL_SECRET_ID=$TELEGRAM_CHANNEL_SECRET_ID"
 
+  # --- Configure session storage (not supported by agentcore CLI yet) ---
+  echo "--- Configuring session storage ---"
+  # Read runtime ID early for the update-agent-runtime call
+  local _early_runtime_id
+  _early_runtime_id=$(python3 -c "
+import re
+with open('$PROJECT_DIR/.bedrock_agentcore.yaml') as f:
+    text = f.read()
+m = re.search(r'agent_id:\s*(\S+)', text)
+print(m.group(1) if m else '')
+" 2>/dev/null || echo "")
+
+  if [ -n "$_early_runtime_id" ]; then
+    python3 -c "
+import boto3, json, sys
+
+client = boto3.client('bedrock-agentcore-control', region_name='$REGION')
+
+# Get current runtime config to preserve all fields
+rt = client.get_agent_runtime(agentRuntimeId='$_early_runtime_id')
+
+# Check if session storage is already configured
+existing_fs = rt.get('filesystemConfigurations', [])
+has_session_storage = any(
+    'sessionStorage' in fs for fs in existing_fs
+)
+
+if has_session_storage:
+    print('  Session storage already configured — skipping.')
+    sys.exit(0)
+
+# Add session storage config (full replace — must include all fields)
+print('  Adding filesystemConfigurations to runtime...')
+client.update_agent_runtime(
+    agentRuntimeId='$_early_runtime_id',
+    agentRuntimeArtifact=rt['agentRuntimeArtifact'],
+    roleArn=rt['roleArn'],
+    networkConfiguration=rt['networkConfiguration'],
+    environmentVariables=rt.get('environmentVariables', {}),
+    filesystemConfigurations=[
+        {'sessionStorage': {'mountPath': '/mnt/workspace'}}
+    ],
+)
+print('  Session storage configured: /mnt/workspace')
+" 2>&1 || echo "  WARNING: Failed to configure session storage (non-fatal)."
+  else
+    echo "  WARNING: Could not determine runtime ID — skipping session storage config."
+  fi
+
   # Read runtime ID and endpoint ID from toolkit
   echo "--- Reading runtime info ---"
   TOOLKIT_STATUS=$("$AGENTCORE_CLI" status --agent openclaw_agent --verbose 2>&1 || true)
