@@ -248,7 +248,8 @@ phase2_toolkit() {
   # Dockerfile COPY commands expect paths relative to bridge/. Patch it back.
   local yaml_file="$PROJECT_DIR/.bedrock_agentcore.yaml"
   if grep -q "source_path:.*$PROJECT_DIR$" "$yaml_file" 2>/dev/null; then
-    sed -i "s|source_path: $PROJECT_DIR$|source_path: $PROJECT_DIR/bridge|" "$yaml_file"
+    local tmp_file="${yaml_file}.tmp"
+    sed "s|source_path: $PROJECT_DIR$|source_path: $PROJECT_DIR/bridge|" "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
     echo "  (patched source_path -> bridge/)"
   fi
 
