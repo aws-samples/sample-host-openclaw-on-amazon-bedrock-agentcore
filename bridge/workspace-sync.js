@@ -327,14 +327,27 @@ async function saveWorkspace(namespace) {
 
 // Periodic save state
 let _saveInterval = null;
+// Backup mode: when session storage is primary, S3 sync becomes a cold backup
+let _backupMode = false;
+// Backup interval: 30 minutes (vs 5 minutes for primary sync)
+const BACKUP_INTERVAL_MS = 30 * 60 * 1000;
+
+/**
+ * Enable or disable backup mode.
+ * In backup mode, periodic saves use a longer interval (30 min)
+ * since session storage handles primary persistence.
+ */
+function setBackupMode(enabled) {
+  _backupMode = enabled;
+  console.log(`[workspace-sync] Backup mode ${enabled ? "enabled" : "disabled"} (session storage is ${enabled ? "primary" : "unavailable"})`);
+}
 
 /**
  * Start periodic workspace saves.
  */
 function startPeriodicSave(namespace, intervalMs) {
-  const interval =
-    intervalMs ||
-    parseInt(process.env.WORKSPACE_SYNC_INTERVAL_MS || "300000", 10);
+  const defaultInterval = parseInt(process.env.WORKSPACE_SYNC_INTERVAL_MS || "300000", 10);
+  const interval = intervalMs || (_backupMode ? BACKUP_INTERVAL_MS : defaultInterval);
   if (_saveInterval) clearInterval(_saveInterval);
 
   _saveInterval = setInterval(() => {
@@ -344,7 +357,7 @@ function startPeriodicSave(namespace, intervalMs) {
   }, interval);
 
   console.log(
-    `[workspace-sync] Periodic save started (every ${interval / 1000}s)`,
+    `[workspace-sync] Periodic save started (every ${interval / 1000}s, mode=${_backupMode ? "backup" : "primary"})`,
   );
 }
 
@@ -368,6 +381,7 @@ module.exports = {
   startPeriodicSave,
   cleanup,
   configureCredentials,
+  setBackupMode,
   getS3Client,
   // Exported for testing
   shouldSkip,
