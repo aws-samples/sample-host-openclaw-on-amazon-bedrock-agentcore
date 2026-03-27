@@ -105,6 +105,15 @@ class AgentCoreStack(Stack):
                 ],
             )
         )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "aws-marketplace:ViewSubscriptions",
+                    "aws-marketplace:Subscribe",
+                ],
+                resources=["*"],
+            )
+        )
 
         # Bedrock Guardrails — ApplyGuardrail permission (only when guardrails enabled)
         if guardrail_id:
