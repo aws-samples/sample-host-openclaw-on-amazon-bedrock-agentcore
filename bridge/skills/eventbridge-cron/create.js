@@ -58,46 +58,11 @@ async function main() {
   const scheduleId = generateScheduleId();
   const ebScheduleName = buildScheduleName(userId, scheduleId);
 
-  // Build the target input payload for the cron Lambda
-  const targetInput = JSON.stringify({
-    userId: userId.replace(/_/g, ":").replace(/^(telegram|slack|discord|whatsapp):/, (match) => {
-      // Reconstruct the proper userId format (user_xxx from DynamoDB)
-      // The Lambda will look up the real userId from the actorId
-      return match;
-    }),
-    actorId,
-    channel,
-    channelTarget,
-    message,
-    scheduleId,
-    scheduleName: scheduleName || `Schedule ${scheduleId}`,
-  });
-
-  // We need the real userId from DynamoDB. The cron Lambda uses actorId to
-  // resolve the user. But we also need the DynamoDB userId for the session
-  // lookup. We pass the actorId and let the Lambda resolve it, but we also
-  // need to store a reference. Let's look up the userId from the USER_ID env.
-  // Actually, the skill runs inside the container where USER_ID is set as the
-  // actorId (e.g. telegram:12345). The userId in DynamoDB is different
-  // (user_xxx). We need to query DynamoDB for the real userId.
-  const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-  const { DynamoDBDocumentClient, GetCommand } = require("@aws-sdk/lib-dynamodb");
-  const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
-
-  let realUserId = null;
-  try {
-    const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }));
-    const channelKey = `${channel}:${channelTarget}`;
-    const resp = await docClient.send(new GetCommand({
-      TableName: IDENTITY_TABLE_NAME,
-      Key: { PK: `CHANNEL#${channelKey}`, SK: "PROFILE" },
-    }));
-    if (resp.Item) {
-      realUserId = resp.Item.userId;
-    }
-  } catch (err) {
-    console.error(`Warning: Could not look up DynamoDB userId: ${err.message}`);
-  }
+  // Use INTERNAL_USER_ID env var (set by agentcore-contract.js at container init).
+  // This is the container's own authorized userId — scoped credentials allow DynamoDB
+  // writes to USER#{INTERNAL_USER_ID}. Avoids cross-user contamination when the same
+  // Telegram/Slack account has multiple internal userIds (session rotation history).
+  const realUserId = process.env.INTERNAL_USER_ID || null;
 
   // Build target input with real userId if found
   const lambdaInput = JSON.stringify({
@@ -149,7 +114,21 @@ async function main() {
       updatedAt: now,
     });
   } catch (err) {
-    console.error(`Warning: Schedule created in EventBridge but DynamoDB save failed: ${err.message}`);
+    // Rollback: delete the EventBridge schedule to avoid orphaned schedules that
+    // will fire forever but always fail ownership check (403).
+    console.error(`CRON# record save failed — rolling back EventBridge schedule: ${err.message}`);
+    try {
+      const { DeleteScheduleCommand } = require("@aws-sdk/client-scheduler");
+      await schedulerClient.send(new DeleteScheduleCommand({
+        Name: ebScheduleName,
+        GroupName: SCHEDULE_GROUP,
+      }));
+      console.error(`Rollback: deleted EventBridge schedule ${ebScheduleName}`);
+    } catch (rollbackErr) {
+      console.error(`Rollback failed (orphaned schedule): ${rollbackErr.message}`);
+    }
+    console.error(`Error creating schedule: ${err.message}`);
+    process.exit(1);
   }
 
   console.log(`Schedule created successfully!`);

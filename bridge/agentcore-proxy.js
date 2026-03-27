@@ -19,9 +19,23 @@ if (!AWS_REGION) {
 const MODEL_ID =
   process.env.BEDROCK_MODEL_ID || "minimax.minimax-m2.1";
 
+// Log credential env vars at startup for debugging
+console.log(`[proxy] AWS_REGION=${AWS_REGION} MODEL_ID=${MODEL_ID}`);
+console.log(`[proxy] Credential env: RELATIVE_URI=${!!process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI} FULL_URI=${!!process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI} AUTH_TOKEN=${!!process.env.AWS_CONTAINER_AUTHORIZATION_TOKEN}`);
+
 // Subagent model routing — distinct model name lets proxy detect subagent requests
 const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcore-subagent";
 const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || MODEL_ID;
+
+// Bedrock Guardrails — content filtering (undefined = disabled)
+const GUARDRAIL_ID = process.env.BEDROCK_GUARDRAIL_ID || "";
+const GUARDRAIL_VERSION = process.env.BEDROCK_GUARDRAIL_VERSION || "DRAFT";
+const guardrailConfig = GUARDRAIL_ID
+  ? { guardrailIdentifier: GUARDRAIL_ID, guardrailVersion: GUARDRAIL_VERSION }
+  : undefined;
+if (guardrailConfig) {
+  console.log(`[proxy] Bedrock Guardrails enabled: ${GUARDRAIL_ID} v${GUARDRAIL_VERSION}`);
+}
 
 // Cognito identity configuration
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
@@ -40,11 +54,42 @@ const SYSTEM_PROMPT =
   "with daily tasks. Keep responses concise unless the user asks for detail. " +
   "If you don't know something, say so honestly. You are accessed through messaging " +
   "channels (WhatsApp, Telegram, Discord, Slack, or a web UI). Keep your responses " +
-  "appropriate for chat-style messaging.";
+  "appropriate for chat-style messaging. Do not use markdown tables in responses — use bullet lists or plain paragraphs, as they render better in chat interfaces like Telegram and Slack.";
 
 // Retry configuration
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 500;
+
+// Bedrock request timeout — prevents indefinite hangs if a model stops responding.
+// 90s per attempt is generous (most Converse calls complete in <30s); with 3 retries
+// the worst case is ~4.5 min, well under the lightweight agent's 120s HTTP timeout
+// for non-streaming and the Router Lambda's 600s timeout for streaming.
+const BEDROCK_REQUEST_TIMEOUT_MS = 90_000;
+
+/**
+ * Cross-region inference profiles (global.* / us.*) require AWS's global
+ * routing layer and CANNOT be served by the regional Bedrock Runtime VPC
+ * endpoint. When a regional VPC endpoint intercepts the DNS query (via
+ * Private DNS), it silently hangs cross-region requests after 90 s.
+ *
+ * Fix: for cross-region profiles, override the endpoint to the public
+ * Bedrock Runtime URL so the SDK bypasses the VPC endpoint and routes
+ * through the NAT gateway → public AWS backbone.
+ * Regional model IDs (e.g. anthropic.claude-3-haiku-20240307-v1:0) are
+ * unaffected and continue to use the VPC endpoint via Private DNS.
+ */
+function isCrossRegionProfile(modelId) {
+  return /^(global|us|eu|ap)\.[a-z]/.test(modelId);
+}
+
+function bedrockClientOptions(modelId) {
+  const opts = { requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS };
+  if (isCrossRegionProfile(modelId)) {
+    // Force public endpoint — bypasses VPC endpoint Private DNS intercept.
+    opts.endpoint = `https://bedrock-runtime.${AWS_REGION}.amazonaws.com`;
+  }
+  return opts;
+}
 
 // Session tracking (in-memory, per container instance)
 const sessionMap = new Map();
@@ -1028,16 +1073,20 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     BedrockRuntimeClient,
     ConverseCommand,
   } = require("@aws-sdk/client-bedrock-runtime");
-  const client = new BedrockRuntimeClient({ region: AWS_REGION });
+  const modelId = resolveModelId(requestedModel);
+  const client = new BedrockRuntimeClient({
+    region: AWS_REGION,
+    requestHandler: bedrockClientOptions(modelId),
+  });
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
-  const modelId = resolveModelId(requestedModel);
 
   const params = {
     modelId,
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
-    inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
+    inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
+    ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
 
@@ -1053,6 +1102,15 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
       }
 
       const response = await client.send(new ConverseCommand(params));
+
+      // Log guardrail trace if present
+      if (response?.trace?.guardrail) {
+        console.debug("[guardrail] trace:", JSON.stringify(response.trace.guardrail));
+      }
+      // Handle guardrail intervention
+      if (response?.stopReason === "guardrail_intervened") {
+        console.warn("[guardrail] intervention on non-streaming response");
+      }
 
       const outputMessage = response.output?.message;
       if (outputMessage && outputMessage.content) {
@@ -1114,16 +1172,20 @@ async function invokeBedrockStreaming(
     BedrockRuntimeClient,
     ConverseStreamCommand,
   } = require("@aws-sdk/client-bedrock-runtime");
-  const client = new BedrockRuntimeClient({ region: AWS_REGION });
+  const modelId = resolveModelId(model);
+  const client = new BedrockRuntimeClient({
+    region: AWS_REGION,
+    requestHandler: bedrockClientOptions(modelId),
+  });
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
-  const modelId = resolveModelId(model);
 
   const params = {
     modelId,
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
-    inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
+    inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
+    ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
 
@@ -1137,6 +1199,7 @@ async function invokeBedrockStreaming(
   const toolCalls = [];
   let currentToolUse = null;
   let currentToolInput = "";
+  let currentToolBlockIndex = -1;
 
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -1151,6 +1214,7 @@ async function invokeBedrockStreaming(
         toolCalls.length = 0;
         currentToolUse = null;
         currentToolInput = "";
+        currentToolBlockIndex = -1;
       }
 
       const response = await client.send(new ConverseStreamCommand(params));
@@ -1188,15 +1252,18 @@ async function invokeBedrockStreaming(
           const tu = event.contentBlockStart.start.toolUse;
           currentToolUse = { id: tu.toolUseId, name: tu.name };
           currentToolInput = "";
+          currentToolBlockIndex = event.contentBlockStart.contentBlockIndex ?? -1;
         }
 
         // Tool use input delta
         if (event.contentBlockDelta?.delta?.toolUse) {
-          currentToolInput += event.contentBlockDelta.delta.toolUse.input || "";
+          const inputChunk = event.contentBlockDelta.delta.toolUse.input || "";
+          currentToolInput += inputChunk;
         }
 
-        // Content block stop — finalize tool use if one was in progress
-        if (event.contentBlockStop && currentToolUse) {
+        // Content block stop — finalize tool use only when the stopped block matches the tool block
+        const stopBlockIndex = event.contentBlockStop?.contentBlockIndex ?? -1;
+        if (event.contentBlockStop && currentToolUse && stopBlockIndex === currentToolBlockIndex) {
           let parsedInput = {};
           try {
             parsedInput = JSON.parse(currentToolInput);
@@ -1239,11 +1306,20 @@ async function invokeBedrockStreaming(
           res.write(`data: ${JSON.stringify(toolChunk)}\n\n`);
           currentToolUse = null;
           currentToolInput = "";
+          currentToolBlockIndex = -1;
         }
 
         if (event.metadata?.usage) {
           inputTokens = event.metadata.usage.inputTokens || 0;
           outputTokens = event.metadata.usage.outputTokens || 0;
+        }
+
+        // Log guardrail trace/intervention from streaming events
+        if (event.metadata?.trace?.guardrail) {
+          console.debug("[guardrail] stream trace:", JSON.stringify(event.metadata.trace.guardrail));
+        }
+        if (event.messageStop?.stopReason === "guardrail_intervened") {
+          console.warn("[guardrail] intervention on streaming response");
         }
       }
 

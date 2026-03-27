@@ -26,6 +26,7 @@ const {
   GetSecretValueCommand,
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
+const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
 
@@ -33,9 +34,17 @@ const PORT = 8080;
 const PROXY_PORT = 18790;
 const OPENCLAW_PORT = 18789;
 
+// Session storage mount path (set via filesystemConfigurations on Runtime)
+const SESSION_STORAGE_MOUNT = "/mnt/workspace";
+const OPENCLAW_DIR = process.env.HOME ? `${process.env.HOME}/.openclaw` : "/root/.openclaw";
+
 // Gateway token — fetched from Secrets Manager eagerly at boot.
 // No fallback — container will fail to authenticate WebSocket if not set.
 let GATEWAY_TOKEN = null;
+
+// Telegram bot token — fetched from Secrets Manager eagerly at boot.
+// Used for typing indicator during processing + single final message delivery.
+let TELEGRAM_BOT_TOKEN = null;
 
 // Cognito password secret — fetched from Secrets Manager eagerly at boot.
 // Stored in-process only, never written to process.env.
@@ -43,6 +52,11 @@ let COGNITO_PASSWORD_SECRET = null;
 
 // Maximum request body size (1MB) to prevent memory exhaustion
 const MAX_BODY_SIZE = 1 * 1024 * 1024;
+
+// Ping diagnostics — track call count and log periodically
+let pingCount = 0;
+let lastPingLogTime = 0;
+const PING_LOG_INTERVAL_MS = 60000; // Log ping stats every 60s
 
 // State tracking
 let currentUserId = null;
@@ -65,12 +79,37 @@ const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const IDENTITY_FILE = "/tmp/current-identity.json";
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const BROWSER_SESSION_TIMEOUT_SECONDS = 3600;
-const BUILD_VERSION = "v35"; // Bump in cdk.json to force container redeploy
+const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
+
+// Derive EVENTBRIDGE_ROLE_ARN from EXECUTION_ROLE_ARN + AWS_REGION if not already set.
+// The agentcore toolkit doesn't support injecting arbitrary env vars into the container,
+// so we derive it: arn:aws:iam::{account}:role/openclaw-cron-scheduler-role-{region}
+if (!process.env.EVENTBRIDGE_ROLE_ARN && process.env.EXECUTION_ROLE_ARN) {
+  const match = process.env.EXECUTION_ROLE_ARN.match(/arn:aws:iam::(\d+):role\//);
+  if (match) {
+    const account = match[1];
+    const region = process.env.AWS_REGION || "us-west-2";
+    process.env.EVENTBRIDGE_ROLE_ARN = `arn:aws:iam::${account}:role/openclaw-cron-scheduler-role-${region}`;
+    console.log(`[contract] Derived EVENTBRIDGE_ROLE_ARN from execution role (account=${account}, region=${region})`);
+  }
+}
 
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
 const OPENCLAW_LOG_LIMIT = 50;
 let openclawLogs = [];
 let openclawExitCode = null;
+let lastOpenClawEnv = null;
+
+// OpenClaw auto-restart on crash
+let openclawRestartCount = 0;
+const OPENCLAW_MAX_RESTARTS = 3;
+const OPENCLAW_RESTART_DELAY_MS = 5000;
+
+// Active task tracking — HealthyBusy prevents AgentCore from terminating during long tasks
+let activeTaskCount = 0;
+// Last activity timestamp (epoch seconds) — reported in /ping so AgentCore can track idle time.
+// Initialized to startup time; updated on each chat/cron/warmup invocation.
+let lastActivityTime = Math.floor(Date.now() / 1000);
 
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
@@ -81,6 +120,56 @@ let processingMessage = false;
  * can pick up cross-channel identity changes (the proxy's env vars are
  * fixed at spawn time and cannot be updated for a running child process).
  */
+/**
+ * Set up symlink from ~/.openclaw to session storage mount.
+ * Returns true if session storage is available and symlink was created.
+ */
+function setupSessionStorageSymlink() {
+  try {
+    // Check if session storage mount exists (only available during invocation)
+    if (!fs.existsSync(SESSION_STORAGE_MOUNT)) {
+      console.log("[contract] Session storage not available at", SESSION_STORAGE_MOUNT);
+      return false;
+    }
+
+    const mountedDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
+    fs.mkdirSync(mountedDir, { recursive: true });
+
+    // Check existing .openclaw — may be a symlink, directory, or missing
+    let existingType = null;
+    try {
+      const stat = fs.lstatSync(OPENCLAW_DIR);
+      if (stat.isSymbolicLink()) {
+        const target = fs.readlinkSync(OPENCLAW_DIR);
+        if (target === mountedDir) {
+          console.log("[contract] Session storage symlink already in place");
+          return true;
+        }
+        existingType = "symlink";
+        fs.unlinkSync(OPENCLAW_DIR);
+      } else if (stat.isDirectory()) {
+        existingType = "directory";
+        // Copy contents to session storage (cross-device, can't use rename)
+        const { execSync } = require("child_process");
+        execSync(`cp -a ${OPENCLAW_DIR}/. ${mountedDir}/ 2>/dev/null || true`);
+        fs.rmSync(OPENCLAW_DIR, { recursive: true, force: true });
+      } else {
+        existingType = "file";
+        fs.unlinkSync(OPENCLAW_DIR);
+      }
+    } catch {
+      // OPENCLAW_DIR doesn't exist yet — that's fine
+    }
+
+    fs.symlinkSync(mountedDir, OPENCLAW_DIR);
+    console.log(`[contract] Session storage symlink: ${OPENCLAW_DIR} -> ${mountedDir} (was: ${existingType || "missing"})`);
+    return true;
+  } catch (err) {
+    console.warn(`[contract] Session storage setup failed: ${err.message}`);
+    return false;
+  }
+}
+
 function updateIdentityFile(actorId, channel) {
   try {
     fs.writeFileSync(
@@ -120,6 +209,32 @@ async function prefetchSecrets() {
     if (resp.SecretString) {
       COGNITO_PASSWORD_SECRET = resp.SecretString;
       console.log("[contract] Cognito password secret pre-fetched");
+    }
+  }
+
+  const telegramSecretId = process.env.TELEGRAM_CHANNEL_SECRET_ID;
+  if (telegramSecretId) {
+    try {
+      const resp = await smClient.send(
+        new GetSecretValueCommand({ SecretId: telegramSecretId }),
+      );
+      if (resp.SecretString) {
+        // Secret may be a plain token or JSON with bot_token/token key
+        try {
+          const parsed = JSON.parse(resp.SecretString);
+          TELEGRAM_BOT_TOKEN =
+            parsed.bot_token || parsed.token || resp.SecretString;
+        } catch {
+          TELEGRAM_BOT_TOKEN = resp.SecretString;
+        }
+        console.log(
+          "[contract] Telegram bot token pre-fetched from Secrets Manager",
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[contract] Telegram secret fetch failed (streaming disabled): ${err.message}`,
+      );
     }
   }
 
@@ -327,6 +442,11 @@ function writeOpenClawConfig() {
     },
     tools: {
       profile: "full",
+      exec: {
+        host: "gateway",  // Run on container host — microVM provides isolation, no Docker sandbox
+        security: "full", // Full shell access; container is already isolated
+        ask: "off",       // Headless container — no approval UI
+      },
       deny: [
         "write", // Local writes don't persist — use S3 skill instead
         "edit", // Local edits are ephemeral — use S3 skill instead
@@ -354,6 +474,7 @@ function writeOpenClawConfig() {
         enabled: false,
         allowInsecureAuth: true,
         dangerouslyDisableDeviceAuth: true,
+        dangerouslyAllowHostHeaderOriginFallback: true,
         allowedOrigins: ["*"],
       },
     },
@@ -381,6 +502,13 @@ function writeOpenClawConfig() {
         "You are a helpful AI assistant running in a per-user container on AWS.",
         "You have built-in web tools, file storage, scheduling, and many community skills.",
         "",
+        "## Response Formatting",
+        "",
+        "Format responses for chat messaging apps (Telegram, Slack):",
+        "- **No markdown tables** — use bullet lists or plain text paragraphs instead",
+        "- Tables do not render in most chat apps; bullets always work",
+        "- Keep responses concise and chat-appropriate",
+        "",
         "## Built-in Web Tools",
         "",
         "You have built-in **web_search** and **web_fetch** tools:",
@@ -391,15 +519,20 @@ function writeOpenClawConfig() {
         "",
         "## Scheduling & Cron Jobs",
         "",
-        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to:",
-        "- Set up reminders, alarms, or scheduled messages",
-        "- Create recurring tasks or cron jobs",
-        "- Schedule daily, weekly, or periodic actions",
-        "",
-        "**Read the eventbridge-cron SKILL.md and use it.** Do NOT say cron is disabled.",
+        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to set up reminders,",
+        "recurring tasks, or cron jobs, use these commands via Bash. Do NOT say cron is disabled.",
         "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
         "",
         "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
+        "",
+        "**Commands** (run via Bash):",
+        "- Create: `node /skills/eventbridge-cron/create.js <user_id> <cron_expression> <timezone> <message> [channel] [channel_target] [schedule_name]`",
+        "- List: `node /skills/eventbridge-cron/list.js <user_id>`",
+        "- Update: `node /skills/eventbridge-cron/update.js <user_id> <schedule_id> [--expression \"cron(...)\"] [--timezone \"TZ\"] [--message \"msg\"] [--enable] [--disable]`",
+        "- Delete: `node /skills/eventbridge-cron/delete.js <user_id> <schedule_id>`",
+        "",
+        "Cron format: `cron(min hour day-of-month month day-of-week year)` — e.g., `cron(0 9 * * ? *)` for daily at 9 AM.",
+        "Rate format: `rate(1 hour)`, `rate(5 minutes)`.",
         "",
         "## File Storage",
         "",
@@ -645,6 +778,68 @@ async function stopBrowserSessions() {
 }
 
 /**
+ * Auto-restart OpenClaw if it crashes mid-session.
+ * Uses linear backoff (5s, 10s, 15s) with a maximum of 3 retries.
+ * Does not restart during shutdown or if OpenClaw recovered on its own.
+ */
+function scheduleOpenClawRestart(namespace) {
+  if (shuttingDown) return;
+  if (openclawRestartCount >= OPENCLAW_MAX_RESTARTS) {
+    console.error(
+      `[contract] OpenClaw crashed ${openclawRestartCount} times — giving up, lightweight agent will handle messages`,
+    );
+    return;
+  }
+  openclawRestartCount++;
+  const delay = OPENCLAW_RESTART_DELAY_MS * openclawRestartCount;
+  console.log(
+    `[contract] Scheduling OpenClaw restart #${openclawRestartCount} in ${delay}ms...`,
+  );
+  setTimeout(() => {
+    if (shuttingDown || openclawReady) return;
+    console.log(
+      `[contract] Restarting OpenClaw (attempt #${openclawRestartCount})...`,
+    );
+    openclawProcess = spawn(
+      "openclaw",
+      ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
+      { stdio: ["ignore", "pipe", "pipe"], env: lastOpenClawEnv },
+    );
+    const captureLog2 = (stream, label) => {
+      let buf = "";
+      stream.on("data", (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          if (line.trim()) {
+            console.log(`[openclaw:${label}] ${line}`);
+            openclawLogs.push(`[${label}] ${line}`);
+            if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
+          }
+        }
+      });
+    };
+    captureLog2(openclawProcess.stdout, "out");
+    captureLog2(openclawProcess.stderr, "err");
+    openclawProcess.on("exit", (code2) => {
+      console.log(
+        `[contract] OpenClaw (restart #${openclawRestartCount}) exited with code ${code2}`,
+      );
+      openclawExitCode = code2;
+      openclawReady = false;
+      scheduleOpenClawRestart(namespace);
+    });
+    // Poll for readiness after restart
+    pollOpenClawReadiness(namespace).catch((err) => {
+      console.error(
+        `[contract] OpenClaw restart readiness poll failed: ${err.message}`,
+      );
+    });
+  }, delay);
+}
+
+/**
  * Initialization — called on first /invocations request.
  *
  * Uses pre-fetched secrets. Starts proxy, OpenClaw, and workspace restore
@@ -660,9 +855,13 @@ async function init(userId, actorId, channel) {
     const namespace = actorId.replace(/:/g, "_");
     currentUserId = userId;
     currentNamespace = namespace;
+    await cwLogger.init(`${namespace}-${Date.now()}`);
 
     // Expose USER_ID so child processes (OpenClaw skill scripts) inherit it
     process.env.USER_ID = actorId;
+    // Expose INTERNAL_USER_ID for lightweight agent tool env (eventbridge-cron authorization)
+    process.env.INTERNAL_USER_ID = userId;
+    agent.TOOL_ENV.INTERNAL_USER_ID = userId;
 
     // Write initial identity file for the proxy to read
     updateIdentityFile(actorId, channel);
@@ -747,12 +946,19 @@ async function init(userId, actorId, channel) {
       SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
       SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
       USER_ID: actorId,
+      INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
       CHANNEL: channel,
       OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
     };
     proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
       env: proxyEnv,
-      stdio: "inherit",
+      stdio: ["inherit", "pipe", "pipe"],
+    });
+    proxyProcess.stdout.on("data", (d) => {
+      d.toString().split("\n").filter(Boolean).forEach(line => console.log(`[proxy:out] ${line}`));
+    });
+    proxyProcess.stderr.on("data", (d) => {
+      d.toString().split("\n").filter(Boolean).forEach(line => console.error(`[proxy:err] ${line}`));
     });
     proxyProcess.on("exit", (code) => {
       console.log(`[contract] Proxy exited with code ${code}`);
@@ -787,11 +993,16 @@ async function init(userId, actorId, channel) {
       });
       openclawEnv.OPENCLAW_NO_AWS = "1";
     }
+    // Propagate INTERNAL_USER_ID so OpenClaw skills (e.g., eventbridge-cron)
+    // can resolve the container's authorized userId for DynamoDB writes.
+    openclawEnv.INTERNAL_USER_ID = userId;
     openclawProcess = spawn(
       "openclaw",
       ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
       { stdio: ["ignore", "pipe", "pipe"], env: openclawEnv },
     );
+    lastOpenClawEnv = openclawEnv;
+    openclawRestartCount = 0;
     // Capture OpenClaw stdout/stderr for diagnostics
     const captureLog = (stream, label) => {
       let buf = "";
@@ -814,12 +1025,36 @@ async function init(userId, actorId, channel) {
       console.log(`[contract] OpenClaw exited with code ${code}`);
       openclawExitCode = code;
       openclawReady = false;
+      scheduleOpenClawRestart(currentNamespace);
     });
 
-    // Restore workspace from S3 (non-blocking, needed for OpenClaw)
-    workspaceSync.restoreWorkspace(namespace).catch((err) => {
-      console.warn(`[contract] Workspace restore failed: ${err.message}`);
-    });
+    // Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available
+    const sessionStorageAvailable = setupSessionStorageSymlink();
+
+    // Restore workspace from S3 if session storage is empty or unavailable
+    if (sessionStorageAvailable) {
+      // Check if session storage .openclaw dir has content (non-empty = resumed session)
+      const mountedOpenclawDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
+      let hasContent = false;
+      try {
+        const entries = fs.readdirSync(mountedOpenclawDir);
+        hasContent = entries.length > 0;
+      } catch { /* dir doesn't exist yet */ }
+
+      if (hasContent) {
+        console.log("[contract] Session storage has existing data — skipping S3 restore");
+      } else {
+        console.log("[contract] Session storage is empty — restoring from S3 backup");
+        workspaceSync.restoreWorkspace(namespace).catch((err) => {
+          console.warn(`[contract] Workspace restore failed: ${err.message}`);
+        });
+      }
+    } else {
+      // No session storage — use S3 sync as primary (existing behavior)
+      workspaceSync.restoreWorkspace(namespace).catch((err) => {
+        console.warn(`[contract] Workspace restore failed: ${err.message}`);
+      });
+    }
 
     // 2. Wait only for proxy readiness (~5s)
     proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
@@ -881,21 +1116,55 @@ function extractTextFromContent(content) {
     // Check if the string is a JSON-serialized array of content blocks
     const trimmed = content.trim();
     if (trimmed.startsWith("[{") && trimmed.endsWith("]")) {
+      let parsed = null;
       try {
-        const parsed = JSON.parse(trimmed);
-        if (
-          Array.isArray(parsed) &&
-          parsed.length > 0 &&
-          parsed[0].type === "text"
-        ) {
-          const text = parsed
-            .filter((b) => b.type === "text")
-            .map((b) => b.text)
-            .join("");
-          // Recurse to unwrap further nesting
-          return extractTextFromContent(text);
+        parsed = JSON.parse(trimmed);
+      } catch {
+        // Retry with literal control characters escaped (JS JSON.parse is strict)
+        try {
+          const sanitized = trimmed.replace(/[\x00-\x1f\x7f]/g, c => {
+            const e = {"\b":"\\b","\t":"\\t","\n":"\\n","\f":"\\f","\r":"\\r"};
+            return e[c] || ("\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+          });
+          parsed = JSON.parse(sanitized);
+        } catch {
+          // Both failed — try regex extraction below
         }
-      } catch {}
+      }
+      if (!parsed) {
+        // Regex fallback for malformed JSON (e.g., "text","value" instead of "text":"value")
+        const textMatch = trimmed.match(/[,{]\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"/);
+        if (textMatch) {
+          try {
+            const extracted = JSON.parse('"' + textMatch[1] + '"');
+            if (extracted) return extractTextFromContent(extracted);
+          } catch {
+            return extractTextFromContent(textMatch[1]);
+          }
+        }
+      }
+      if (
+        parsed &&
+        Array.isArray(parsed) &&
+        parsed.length > 0 &&
+        parsed.every((b) => typeof b === "object" && b !== null) &&
+        parsed.some((b) => typeof b.type === "string")
+      ) {
+        const text = parsed
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("");
+        // Preserve leading whitespace from original string, recurse to unwrap further nesting
+        const leading = content.match(/^(\s*)/)[0];
+        return extractTextFromContent(leading + text);
+      }
+    }
+    // Detect truncated content block JSON (e.g., "\n\n[{" or "\n\n[{"type":"text"...")
+    // These are partial content blocks from streaming that shouldn't leak as response text
+    if (trimmed.startsWith("[{") && !trimmed.endsWith("]")) {
+      if (/^\[\{\s*"type"\s*:/.test(trimmed) || trimmed === "[{") {
+        return "";
+      }
     }
     // Plain text string
     return content;
@@ -917,6 +1186,114 @@ function extractTextFromContent(content) {
   return "";
 }
 
+// ---------------------------------------------------------------------------
+// Telegram progressive streaming helpers
+// ---------------------------------------------------------------------------
+
+const https = require("https");
+
+/**
+ * Call the Telegram Bot API. Returns parsed JSON response.
+ */
+function telegramApiCall(method, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = https.request(
+      {
+        hostname: "api.telegram.org",
+        path: `/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+        timeout: 10000,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch {
+            resolve({ ok: false, description: data });
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Telegram API timeout"));
+    });
+    req.end(payload);
+  });
+}
+
+/**
+ * Create a Telegram streamer that shows "typing..." indicator while working,
+ * then sends ONE clean final message when done. No intermediate edits.
+ *
+ * onDelta(text): starts a typing indicator loop (sendChatAction every 5s).
+ * finalize(text): stops the typing loop and sends a single sendMessage.
+ */
+function createTelegramStreamer(chatId) {
+  let typingInterval = null;
+  let typingStarted = false;
+
+  const sendTyping = async () => {
+    try {
+      await telegramApiCall("sendChatAction", {
+        chat_id: chatId,
+        action: "typing",
+      });
+    } catch (err) {
+      console.warn(`[telegram-stream] Typing indicator error: ${err.message}`);
+    }
+  };
+
+  const startTypingLoop = () => {
+    if (typingStarted) return;
+    typingStarted = true;
+    sendTyping();
+    typingInterval = setInterval(sendTyping, 5000);
+    console.log(`[telegram-stream] Typing indicator started for chat_id=${chatId}`);
+  };
+
+  const stopTypingLoop = () => {
+    if (typingInterval) {
+      clearInterval(typingInterval);
+      typingInterval = null;
+    }
+  };
+
+  const onDelta = (text) => {
+    if (!text || text.length < 60) return;
+    startTypingLoop();
+  };
+
+  const finalize = async (text) => {
+    stopTypingLoop();
+    if (!text) return { messageId: null };
+    try {
+      const resp = await telegramApiCall("sendMessage", {
+        chat_id: chatId,
+        text,
+      });
+      const messageId = resp.ok ? resp.result?.message_id : null;
+      if (messageId) {
+        console.log(`[telegram-stream] Final message sent: msg_id=${messageId}`);
+      }
+      return { messageId };
+    } catch (err) {
+      console.warn(`[telegram-stream] Final send error: ${err.message}`);
+      return { messageId: null };
+    }
+  };
+
+  return { onDelta, finalize };
+}
+
 /**
  * Process the message queue serially to prevent concurrent WebSocket race conditions.
  */
@@ -925,13 +1302,13 @@ async function processMessageQueue() {
   processingMessage = true;
 
   while (messageQueue.length > 0) {
-    const { message, resolve, reject } = messageQueue.shift();
+    const { message, onDelta, resolve, reject } = messageQueue.shift();
     console.log(
       `[contract] Processing queued message (${messageQueue.length} remaining)`,
     );
 
     try {
-      const response = await bridgeMessage(message, 560000);
+      const response = await bridgeMessage(message, 620000, onDelta);
       resolve(response);
     } catch (err) {
       reject(err);
@@ -943,10 +1320,12 @@ async function processMessageQueue() {
 
 /**
  * Enqueue a message and wait for its response (serialized processing).
+ * @param {string} message - The message to send
+ * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-function enqueueMessage(message) {
+function enqueueMessage(message, onDelta) {
   return new Promise((resolve, reject) => {
-    messageQueue.push({ message, resolve, reject });
+    messageQueue.push({ message, onDelta, resolve, reject });
     console.log(
       `[contract] Message enqueued (queue length: ${messageQueue.length})`,
     );
@@ -958,8 +1337,11 @@ function enqueueMessage(message) {
 
 /**
  * Bridge a chat message to OpenClaw via WebSocket and collect the response.
+ * @param {string} message - The message to send
+ * @param {number} timeoutMs - Timeout in milliseconds
+ * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-async function bridgeMessage(message, timeoutMs = 560000) {
+async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
   const { randomUUID } = require("crypto");
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
@@ -1092,7 +1474,10 @@ async function bridgeMessage(message, timeoutMs = 560000) {
 
         if (payload.state === "delta") {
           const text = extractFromPayload(payload);
-          if (text) responseText = text; // Delta replaces (accumulates progressively)
+          if (text) {
+            responseText = text; // Delta replaces (accumulates progressively)
+            if (onDelta) onDelta(text);
+          }
           return;
         }
 
@@ -1215,15 +1600,28 @@ function buildBridgeText(message) {
 const server = http.createServer(async (req, res) => {
   // GET /ping — AgentCore health check
   if (req.method === "GET" && req.url === "/ping") {
-    // Return Healthy (not HealthyBusy) — allows natural idle termination.
-    // Per-user sessions should terminate when idle.
+    pingCount++;
+    const now = Date.now();
+    const uptimeSec = Math.floor((now - startTime) / 1000);
+    // HealthyBusy prevents AgentCore from terminating during active tasks.
+    // Healthy allows natural idle termination when no tasks are running.
+    const status = activeTaskCount > 0 ? "HealthyBusy" : "Healthy";
+    const responseBody = {
+      status,
+      time_of_last_update: lastActivityTime,
+      active_tasks: activeTaskCount,
+    };
+
+    // Log every ping for the first 5 minutes, then every 60s
+    if (uptimeSec < 300 || now - lastPingLogTime >= PING_LOG_INTERVAL_MS) {
+      console.log(
+        `[contract] /ping #${pingCount} uptime=${uptimeSec}s status=${responseBody.status} openclawReady=${openclawReady} proxyReady=${proxyReady} activeTasks=${activeTaskCount}`,
+      );
+      lastPingLogTime = now;
+    }
+
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "Healthy",
-        time_of_last_update: Math.floor(Date.now() / 1000),
-      }),
-    );
+    res.end(JSON.stringify(responseBody));
     return;
   }
 
@@ -1267,6 +1665,8 @@ const server = http.createServer(async (req, res) => {
             openclawLogs: openclawLogs.slice(-20),
             totalRequestCount: proxyHealth?.total_requests ?? null,
             subagentRequestCount: proxyHealth?.subagent_requests ?? null,
+            activeTaskCount,
+            pingStatus: activeTaskCount > 0 ? "HealthyBusy" : "Healthy",
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));
@@ -1275,6 +1675,7 @@ const server = http.createServer(async (req, res) => {
 
         // Warmup action — trigger lazy init without blocking for a chat response
         if (action === "warmup") {
+          lastActivityTime = Math.floor(Date.now() / 1000);
           const { userId, actorId, channel } = payload;
           if (openclawReady && proxyReady) {
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -1338,30 +1739,40 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
-          // Enqueue message (serialized with chat messages to prevent WebSocket races)
+          // Track active task to prevent idle termination during cron processing
+          lastActivityTime = Math.floor(Date.now() / 1000);
+          activeTaskCount++;
           let responseText;
           try {
-            responseText = await enqueueMessage(message);
-          } catch (bridgeErr) {
-            responseText = "";
-            console.error(
-              `[contract] Cron bridge error: ${bridgeErr.message}`,
-            );
-          }
-          // If bridge returned empty, fall back to lightweight agent
-          if (!responseText || !responseText.trim()) {
-            console.warn(
-              "[contract] Cron bridge returned empty — falling back to lightweight agent",
-            );
+            // Enqueue message (serialized with chat messages to prevent WebSocket races)
             try {
-              responseText = await agent.chat(message, actorId, Date.now() + 30000);
-            } catch (agentErr) {
-              responseText =
-                "I couldn't process this scheduled task. Please check the configuration.";
+              responseText = await enqueueMessage(message);
+            } catch (bridgeErr) {
+              responseText = "";
               console.error(
-                `[contract] Cron lightweight agent fallback error: ${agentErr.message}`,
+                `[contract] Cron bridge error: ${bridgeErr.message}`,
               );
             }
+            // Belt-and-suspenders: strip any remaining content-block JSON wrappers
+            if (responseText) responseText = extractTextFromContent(responseText);
+
+            // If bridge returned empty, fall back to lightweight agent
+            if (!responseText || !responseText.trim()) {
+              console.warn(
+                "[contract] Cron bridge returned empty — falling back to lightweight agent",
+              );
+              try {
+                responseText = await agent.chat(message, actorId, Date.now() + 30000);
+              } catch (agentErr) {
+                responseText =
+                  "I couldn't process this scheduled task. Please check the configuration.";
+                console.error(
+                  `[contract] Cron lightweight agent fallback error: ${agentErr.message}`,
+                );
+              }
+            }
+          } finally {
+            activeTaskCount = Math.max(0, activeTaskCount - 1);
           }
 
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -1431,48 +1842,145 @@ const server = http.createServer(async (req, res) => {
 
           const bridgeText = buildBridgeText(message);
 
-          // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
-          let responseText;
-          if (openclawReady) {
-            // Full OpenClaw path — WebSocket bridge
-            try {
-              responseText = await enqueueMessage(bridgeText);
-            } catch (bridgeErr) {
-              console.error(
-                `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
+          // Set up progressive Telegram streaming if applicable
+          let telegramStreamer = null;
+          if (
+            TELEGRAM_BOT_TOKEN &&
+            channel === "telegram" &&
+            actorId
+          ) {
+            // actorId is "telegram:123456789" — extract numeric chat ID
+            const chatId = actorId.split(":")[1];
+            if (chatId) {
+              telegramStreamer = createTelegramStreamer(chatId);
+              console.log(
+                `[contract] Telegram streaming enabled for chat_id=${chatId}`,
               );
-              responseText = "";
             }
-            // If bridge returned empty (OpenClaw sent no content), fall back to
-            // lightweight agent so the user always gets a real AI response.
-            if (!responseText || !responseText.trim()) {
-              console.warn(
-                "[contract] Bridge returned empty — falling back to lightweight agent",
-              );
+          }
+          const onDelta = telegramStreamer
+            ? telegramStreamer.onDelta
+            : undefined;
+
+          // Track active task to prevent idle termination during chat processing
+          lastActivityTime = Math.floor(Date.now() / 1000);
+          activeTaskCount++;
+          let responseText;
+          try {
+            // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
+            if (openclawReady) {
+              // Full OpenClaw path — WebSocket bridge
               try {
-                responseText = await agent.chat(bridgeText, actorId, Date.now() + 30000);
-              } catch (agentErr) {
-                responseText =
-                  "I'm having trouble right now. Please try again in a moment.";
+                responseText = await enqueueMessage(bridgeText, onDelta);
+              } catch (bridgeErr) {
                 console.error(
-                  `[contract] Lightweight agent fallback error: ${agentErr.message}`,
+                  `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
+                );
+                responseText = "";
+              }
+              // If bridge returned empty (OpenClaw sent no content), check whether
+              // OpenClaw is mid-run before falling back to lightweight agent.
+              // A tool-call-only response or concurrent subagent task can produce
+              // an empty bridge response that is NOT a failure.
+              if (!responseText || !responseText.trim()) {
+                // Brief retry — transient empty responses resolve quickly
+                await new Promise((r) => setTimeout(r, 300));
+
+                // Probe OpenClaw to see if it is still busy
+                let openclawBusy = false;
+                try {
+                  const pingData = await new Promise((resolve, reject) => {
+                    const pingReq = http.get(
+                      `http://127.0.0.1:${OPENCLAW_PORT}`,
+                      (pingRes) => {
+                        let data = "";
+                        pingRes.on("data", (c) => (data += c));
+                        pingRes.on("end", () => resolve(data));
+                      },
+                    );
+                    pingReq.on("error", reject);
+                    pingReq.setTimeout(2000, () => {
+                      pingReq.destroy();
+                      reject(new Error("ping timeout"));
+                    });
+                  });
+                  // OpenClaw may return JSON with activeTasks count
+                  try {
+                    const parsed = JSON.parse(pingData);
+                    if (parsed.activeTasks > 0) openclawBusy = true;
+                  } catch {
+                    // Non-JSON response — OpenClaw is alive but format unknown
+                  }
+                } catch {
+                  // OpenClaw not responding — not busy, allow fallback
+                }
+
+                // Also treat a still-running process (no exit code) as busy
+                if (openclawExitCode === null) openclawBusy = true;
+
+                if (openclawBusy) {
+                  console.log(
+                    "[contract] Bridge returned empty but OpenClaw is mid-run — returning busy message",
+                  );
+                  responseText =
+                    "I'm still working on your previous request — check back in a moment.";
+                } else {
+                  console.warn(
+                    "[contract] Bridge returned empty — falling back to lightweight agent",
+                  );
+                  try {
+                    responseText = await agent.chat(
+                      bridgeText,
+                      actorId,
+                      Date.now() + 30000,
+                    );
+                  } catch (agentErr) {
+                    responseText =
+                      "I'm having trouble right now. Please try again in a moment.";
+                    console.error(
+                      `[contract] Lightweight agent fallback error: ${agentErr.message}`,
+                    );
+                  }
+                }
+              }
+            } else if (proxyReady) {
+              // Warm-up shim path — lightweight agent via proxy
+              console.log("[contract] Routing via lightweight agent (warm-up)");
+              try {
+                responseText = await agent.chat(bridgeText, actorId, Date.now() + 620000);
+              } catch (agentErr) {
+                responseText = `I'm having trouble right now. Please try again in a moment.`;
+                console.error(
+                  `[contract] Lightweight agent error: ${agentErr.message}`,
                 );
               }
+            } else {
+              // Proxy not ready yet (should be rare — init awaits proxy)
+              responseText = "I'm starting up — please try again in a moment.";
             }
-          } else if (proxyReady) {
-            // Warm-up shim path — lightweight agent via proxy
-            console.log("[contract] Routing via lightweight agent (warm-up)");
+          } finally {
+            activeTaskCount = Math.max(0, activeTaskCount - 1);
+          }
+
+          // Belt-and-suspenders: strip any remaining content-block JSON wrappers
+          if (responseText) responseText = extractTextFromContent(responseText);
+
+          // Finalize Telegram streaming (final edit without "..." suffix)
+          let telegramStreamed = false;
+          if (telegramStreamer && responseText) {
             try {
-              responseText = await agent.chat(bridgeText, actorId, Date.now() + 560000);
-            } catch (agentErr) {
-              responseText = `I'm having trouble right now. Please try again in a moment.`;
-              console.error(
-                `[contract] Lightweight agent error: ${agentErr.message}`,
+              const result = await telegramStreamer.finalize(responseText);
+              if (result.messageId) {
+                telegramStreamed = true;
+                console.log(
+                  `[contract] Telegram streaming finalized: msg_id=${result.messageId}`,
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `[contract] Telegram streaming finalize error: ${err.message}`,
               );
             }
-          } else {
-            // Proxy not ready yet (should be rare — init awaits proxy)
-            responseText = "I'm starting up — please try again in a moment.";
           }
 
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -1481,6 +1989,7 @@ const server = http.createServer(async (req, res) => {
               response: responseText,
               userId: currentUserId,
               sessionId: payload.sessionId || null,
+              streamed: telegramStreamed || undefined,
             }),
           );
           return;
@@ -1561,6 +2070,7 @@ process.on("SIGTERM", async () => {
     } catch {}
   }
 
+  await cwLogger.shutdown();
   console.log("[contract] Shutdown complete");
   process.exit(0);
 });

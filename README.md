@@ -23,11 +23,24 @@ Deploy an AI-powered multi-channel messaging bot (Telegram, Slack) on AWS Bedroc
 - [Gotchas](#gotchas)
 - [Cleanup](#cleanup)
 - [Security](#security)
+- [Security Testing](#security-testing)
 - [License](#license)
 
 OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Router Lambda handles webhook ingestion from Telegram and Slack, resolves user identity via DynamoDB, and invokes per-user AgentCore sessions. Each user gets their own microVM with workspace persistence (`.openclaw/` directory synced to S3). The agent has built-in tools (web, filesystem, runtime, sessions, automation), custom skills for file storage and cron scheduling, and **EventBridge-based cron scheduling** for recurring tasks.
 
 Users can send **text and images** — photos sent via Telegram or Slack are downloaded by the Router Lambda, stored in S3, and passed to Claude as multimodal content via Bedrock's ConverseStream API. Supported formats: JPEG, PNG, GIF, WebP (max 3.75 MB).
+
+### Features
+
+- Per-user Firecracker microVM isolation (AgentCore Runtime)
+- Multi-channel support (Telegram, Slack) with cross-channel account linking
+- Multimodal: text + image messages via Bedrock ConverseStream
+- STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
+- Custom skills: S3 file storage, EventBridge cron scheduling, API key management, ClawHub skill installer
+- Headless browser (optional, AgentCore Browser API)
+- AWS Bedrock Guardrails — content filtering, PII redaction, topic denial, word filters, prompt attack detection
+- LLM red team testing — 62 test cases across 12 attack categories via promptfoo
+- App-level security E2E tests (TestGuardrailSecurity — 6 tests through the full Telegram webhook pipeline)
 
 ## Architecture
 
@@ -79,6 +92,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Encryption**: All data encrypted at rest with customer-managed KMS key (S3, DynamoDB, SNS, Secrets Manager) and in transit (TLS)
 - **CloudTrail**: Optional dedicated trail (`enable_cloudtrail` in cdk.json). Off by default — most AWS accounts already have an organization or account-level trail. Enabling adds a dedicated S3 bucket + trail for this project's audit logs
 - **Least-privilege IAM**: Tightly scoped permissions per component
+- **Bedrock Guardrails**: Content filtering on every Bedrock API call — content filters (hate, violence, prompt attacks), topic denial (6 categories), PII redaction, word filters, and custom regex for credential patterns. Opt-out via `enable_guardrails: false` in `cdk.json`
 - **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
@@ -90,8 +104,9 @@ See [docs/security.md](docs/security.md) for the complete security architecture.
 - **AWS CLI** v2 configured with credentials (`aws sts get-caller-identity` should succeed)
 - **Node.js** >= 18 (for CDK CLI)
 - **Python** >= 3.11 (for CDK app)
-- **Docker** (for building the bridge container image; ARM64 support via Docker Desktop or buildx)
+- **Docker** (for building the bridge container image; ARM64 support via Docker Desktop or buildx). Not required if using `BUILD_MODE=codebuild`
 - **AWS CDK** v2 (`npm install -g aws-cdk`)
+- **AgentCore Starter Toolkit** (`pip install bedrock-agentcore-toolkit`)
 - **Telegram Bot Token** from [@BotFather](https://t.me/BotFather)
 
 ## Quick Start
@@ -131,48 +146,69 @@ pip install -r requirements.txt
 cdk bootstrap aws://$CDK_DEFAULT_ACCOUNT/$CDK_DEFAULT_REGION
 ```
 
-### 4. Deploy all stacks
+### 4. Install the AgentCore Starter Toolkit
+
+The project uses a **hybrid deployment model**: CDK manages infrastructure (VPC, Lambda, DynamoDB, S3, etc.) while the AgentCore Starter Toolkit manages the Runtime (container image, ECR, lifecycle config).
+
+```bash
+pip install bedrock-agentcore-toolkit
+```
+
+> After installing, ensure `agentcore` is in your PATH (`which agentcore` should succeed). On some systems, pip installs to `~/.local/bin` which may not be in PATH — add it with `export PATH="$HOME/.local/bin:$PATH"`.
+
+### 5. Deploy
 
 ```bash
 cdk synth          # validate (runs cdk-nag security checks)
-cdk deploy --all --require-approval never
+./scripts/deploy.sh
 ```
 
-This deploys 7 stacks in order:
-1. **OpenClawVpc** — VPC, subnets, NAT gateway, VPC endpoints
-2. **OpenClawSecurity** — KMS, Secrets Manager, Cognito (+ optional CloudTrail)
-3. **OpenClawAgentCore** — Runtime, WorkloadIdentity, ECR, S3, IAM
-4. **OpenClawRouter** — Lambda + API Gateway HTTP API, DynamoDB identity table
-5. **OpenClawObservability** — Dashboards, alarms, Bedrock logging
-6. **OpenClawTokenMonitoring** — DynamoDB, Lambda processor, token analytics
-7. **OpenClawCron** — EventBridge Scheduler group, Cron executor Lambda, Scheduler IAM role
+The deploy script runs three phases automatically:
+1. **Phase 1 (CDK)** — VPC, Security, AgentCore base, Observability stacks
+2. **Phase 2 (Starter Toolkit)** — Reads CDK outputs, auto-generates `.bedrock_agentcore.yaml`, builds ARM64 container image, deploys AgentCore Runtime
+3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring stacks (depend on Runtime ID from Phase 2)
 
-The CDK AgentCore stack creates the ECR repository. The container image does not need to exist at deploy time — AgentCore only pulls the image when spinning up a microVM for a user session.
+The script runs pre-flight checks (AWS credentials, CDK CLI, Docker, agentcore CLI) before starting.
 
-### 5. Build and push the bridge container image
+**Note on Availability Zones:** Bedrock AgentCore Runtime may not be available in all AZs in a region. If deployment fails with an "unsupported availability zones" error, specify supported AZs in `cdk.json`:
 
-After the CDK deploy creates the ECR repository, build and push the bridge container image.
+```json
+{
+  "context": {
+    "availability_zones": ["us-east-1b", "us-east-1c"]
+  }
+}
+```
+
+To find supported AZs for your region:
+1. Check the error message from the failed deployment (it lists supported AZ IDs like `use1-az1`, `use1-az2`)
+2. Map AZ IDs to AZ names in your account: `aws ec2 describe-availability-zones --region us-east-1`
+3. Update `availability_zones` in `cdk.json` with the AZ names that match the supported AZ IDs
+4. Redeploy: `cdk destroy OpenClawVpc --force && ./scripts/deploy.sh`
+
+#### Build modes
+
+By default, the container image is built **locally** with Docker (`--local-build`). If you don't have Docker or prefer cloud builds, set `BUILD_MODE=codebuild`:
+
+| Mode | Command | Requires | Notes |
+|------|---------|----------|-------|
+| **local-build** (default) | `./scripts/deploy.sh` | Docker | Builds ARM64 image locally. On x86 hosts, uses QEMU emulation via Docker buildx |
+| **codebuild** | `BUILD_MODE=codebuild ./scripts/deploy.sh` | — | Builds in AWS CodeBuild (no Docker needed, adds ~2 min + CodeBuild cost) |
+
+#### Running individual phases
 
 ```bash
-# Authenticate Docker to ECR
-aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
-  docker login --username AWS --password-stdin \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com
-
-# Read version from cdk.json for versioned image tags
-VERSION=$(python3 -c "import json; print(json.load(open('cdk.json'))['context']['image_version'])")
-
-# Build ARM64 image (required by AgentCore Runtime)
-docker build --platform linux/arm64 -t openclaw-bridge:v${VERSION} bridge/
-
-# Tag and push
-docker tag openclaw-bridge:v${VERSION} \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
-docker push \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
+./scripts/deploy.sh --phase1         # CDK foundation only
+./scripts/deploy.sh --runtime-only   # Starter Toolkit only (Phase 2)
+./scripts/deploy.sh --phase3         # CDK dependent stacks only
+./scripts/deploy.sh --cdk-only       # CDK stacks only (skip toolkit)
 ```
 
+> **Note:** `.bedrock_agentcore.yaml` is auto-generated by `deploy.sh` from CDK CloudFormation outputs. It contains account-specific values and is gitignored — do not commit it.
+
 ### 6. Store your Telegram bot token
+
+> **Timing:** The secret is created (empty) by CDK in Phase 1. Store your bot token any time after Phase 1 completes, before testing the bot. It does not need to be stored before running `./scripts/deploy.sh`.
 
 ```bash
 aws secretsmanager update-secret \
@@ -221,7 +257,7 @@ curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}web
 
 </details>
 
-### 9. Verify
+### 8. Verify
 
 Send a message to your Telegram bot. The first message triggers a cold start — the lightweight agent responds in ~10-15 seconds (with file storage and scheduling support) while OpenClaw initializes in the background (~1-2 minutes). After OpenClaw is ready, the full feature set is available. Subsequent messages in the same session are fast.
 
@@ -229,8 +265,8 @@ Send a message to your Telegram bot. The first message triggers a cold start —
 
 ```
 openclaw-on-agentcore/
-  app.py                          # CDK app entry point (7 stacks)
-  cdk.json                        # Configuration (model, budgets, sessions, cron)
+  app.py                          # CDK app entry point (8 stacks)
+  cdk.json                        # Configuration (model, budgets, sessions, cron, guardrails)
   requirements.txt                # Python deps (aws-cdk-lib, cdk-nag)
   stacks/
     __init__.py                   # Shared helper (RetentionDays converter)
@@ -240,6 +276,7 @@ openclaw-on-agentcore/
     router_stack.py               # Router Lambda + API Gateway HTTP API + DynamoDB identity
     observability_stack.py        # Dashboards, alarms, Bedrock logging
     token_monitoring_stack.py     # Lambda processor, DynamoDB, token analytics
+    guardrails_stack.py           # Bedrock Guardrails (content filters, PII, topic denial)
     cron_stack.py                 # EventBridge Scheduler, Cron executor Lambda, IAM
   bridge/
     Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
@@ -281,8 +318,11 @@ openclaw-on-agentcore/
       log_tailer.py               # CloudWatch log tailing with pattern matching
       bot_test.py                 # CLI entrypoint + pytest test classes (17 tests)
       conftest.py                 # pytest fixtures, conversation scenarios
+  redteam/                        # LLM red team testing (promptfoo, 62 test cases)
   docs/
     architecture.md               # Detailed architecture diagram
+    security.md                   # Complete security architecture
+    guardrails.md                 # Bedrock Guardrails operational runbook
 ```
 
 ## CDK Stacks
@@ -291,7 +331,8 @@ openclaw-on-agentcore/
 |---|---|---|
 | **OpenClawVpc** | VPC (2 AZ), private/public subnets, NAT, 7 VPC endpoints, flow logs | None |
 | **OpenClawSecurity** | KMS CMK, Secrets Manager (7 secrets incl. webhook validation), Cognito User Pool, optional CloudTrail | None |
-| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM | Vpc, Security |
+| **OpenClawGuardrails** | CfnGuardrail (content filters, topic denial, PII, word filters, regex), CfnGuardrailVersion | Security |
+| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM | Vpc, Security, Guardrails |
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms (errors, latency, throttles), SNS, Bedrock logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
@@ -305,7 +346,8 @@ All tunable parameters are in `cdk.json`:
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
 | `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
-| `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
+| `availability_zones` | `[]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
+| `default_model_id` | `global.anthropic.claude-sonnet-4-6` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
 | `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Set to e.g. `global.anthropic.claude-sonnet-4-6-v1` for faster/cheaper sub-agents |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Daily token budget alarm threshold |
@@ -323,7 +365,12 @@ All tunable parameters are in `cdk.json`:
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
+| `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. Set `false` to disable (reduces safety but saves cost) |
+| `guardrails_content_filter_level` | `HIGH` | Content filter strength for all categories: `LOW`, `MEDIUM`, or `HIGH` |
+| `guardrails_pii_action` | `ANONYMIZE` | PII handling: `ANONYMIZE` (redact) or `BLOCK` (reject). Credit cards always BLOCK regardless |
 | `enable_browser` | `false` | Enable headless Chromium browser inside the container. Requires `BROWSER_IDENTIFIER` env var |
+
+> **Guardrails cost**: Bedrock Guardrails are enabled by default and add ~$0.75 per 1,000 text units on top of model inference costs. To disable, set `"enable_guardrails": false` in `cdk.json`. See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling removes content-level protections but other security layers (STS scoping, tool deny list, SSRF protection) remain active.
 
 ## Channel Setup
 
@@ -339,7 +386,7 @@ All tunable parameters are in `cdk.json`:
      --secret-string 'YOUR_BOT_TOKEN' \
      --region $CDK_DEFAULT_REGION
    ```
-5. Set up the webhook (see Quick Start step 8)
+5. Set up the webhook (see Quick Start step 7)
 
 ### Slack
 
@@ -707,6 +754,7 @@ pytest tests/e2e/bot_test.py -v -k conversation          # multi-turn + rapid-fi
 pytest tests/e2e/bot_test.py -v -k SkillManagement       # clawhub skill install/uninstall/list
 pytest tests/e2e/bot_test.py -v -k ApiKeyManagement      # API key storage (native + Secrets Manager)
 pytest tests/e2e/bot_test.py -v -k CronSchedule          # cron lifecycle + CRON# DynamoDB record check
+pytest tests/e2e/bot_test.py -v -k GuardrailSecurity     # guardrail content filtering (requires BEDROCK_GUARDRAIL_ID env var)
 pytest tests/e2e/bot_test.py -v                          # all E2E tests
 ```
 
@@ -790,6 +838,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **actorId vs namespace format**: The actorId uses colon format (`telegram:123456789`) while skill scripts expect namespace/underscore format (`telegram_123456789`). The lightweight agent's `chat()` function converts via `userId.replace(/:/g, "_")` before passing to tool scripts. The proxy and workspace sync also use namespace format for S3 keys.
 - **Image version bumps are required**: After pushing a new bridge container image, you must bump `image_version` in `cdk.json` and redeploy `OpenClawAgentCore`. AgentCore caches images by digest and only re-pulls when the runtime endpoint configuration changes. Without the bump, existing sessions continue using the old image.
 - **Image upload size limit**: Bedrock Converse API limits images to 3.75 MB. The Router Lambda checks this before uploading to S3.
+- **agentcore CLI urllib3 warnings**: The `agentcore` CLI may emit a `RequestsDependencyWarning` to stdout before its JSON output. This is benign — `deploy.sh` handles mixed output gracefully.
 - **OpenClaw 2026.3.2 WebSocket origin enforcement**: OpenClaw enforces origin checks on all WebSocket connections carrying an `Origin` header. The `ws` Node.js library must use the `origin` **option** (not `headers.Origin`) to correctly set the header on the HTTP upgrade request. The `controlUi` config requires `allowedOrigins: ["*"]` to accept the origin. Without both the client `origin` option and config `allowedOrigins`, connections fail with: `Auth failed: origin not allowed`.
 
 ## Cleanup
@@ -803,6 +852,38 @@ Note: KMS keys and the Cognito User Pool have `RETAIN` removal policies and will
 ## Security
 
 See [docs/security.md](docs/security.md) for the complete security architecture (threat model, defense-in-depth layers, operations runbook), [SECURITY.md](SECURITY.md) for reporting vulnerabilities, and [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications) for contribution guidelines.
+
+## Security Testing
+
+### LLM Red Team Testing
+
+The `redteam/` directory contains a developer-only adversarial testing harness using [promptfoo](https://promptfoo.dev/). It runs 62 test cases across 12 attack categories against the Bedrock model, comparing results with and without Bedrock Guardrails.
+
+**Attack categories tested:** jailbreaks, prompt injection, harmful content, PII fishing, topic denial, credential extraction, tool abuse (SSRF, namespace traversal), channel secret extraction, content filter bypasses (HATE/SEXUAL/INSULTS), encoding bypasses (base64, ROT13, multilingual, Unicode), and session/context manipulation.
+
+```bash
+# Run the full red team evaluation
+cd redteam && npm install
+AWS_REGION=ap-southeast-2 npx promptfoo@latest eval --config evalconfig.yaml
+
+# View interactive report
+npx promptfoo@latest view
+```
+
+**Results with guardrails enabled:** ~93% pass rate (up from ~77% baseline without guardrails). See [redteam/README.md](redteam/README.md) for details.
+
+### Guardrail E2E Tests
+
+The `TestGuardrailSecurity` test class (6 tests) validates guardrail behavior through the full Telegram webhook pipeline:
+
+```bash
+# Requires deployed stack + guardrail ID
+export BEDROCK_GUARDRAIL_ID=$(aws cloudformation describe-stacks \
+  --stack-name OpenClawGuardrails \
+  --query "Stacks[0].Outputs[?OutputKey=='GuardrailId'].OutputValue" \
+  --output text --region ap-southeast-2)
+pytest tests/e2e/bot_test.py -v -k GuardrailSecurity
+```
 
 ## License
 

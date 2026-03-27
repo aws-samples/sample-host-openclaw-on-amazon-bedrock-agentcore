@@ -94,6 +94,10 @@ node {baseDir}/delete.js <user_id> <schedule_id>
 - "Delete all my schedules" -> list_schedules then delete_schedule for each
 - "Every weekday at 5pm remind me to log my hours" -> create_schedule with MON-FRI expression
 
+## Displaying Schedule Times
+
+When listing schedules, the `Schedule:` field already contains a human-readable description with the timezone included (e.g., "daily at 07:30 Australia/Sydney"). **Do NOT re-interpret the `Raw:` cron expression as UTC** — the `Schedule:` field is authoritative and timezone-aware. Simply relay it to the user as-is.
+
 ## Security Notes
 
 - Schedules are isolated per user via naming: `openclaw-{userId}-{scheduleId}`

@@ -3,7 +3,7 @@
  * AWS Secrets Manager API key management.
  * Usage: node secret.js <user_id> <action> [key_name] [key_value]
  */
-const { REGION, validateUserId, validateKeyName } = require("./common");
+const { REGION, validateUserId, validateKeyName, SM_REQUEST_TIMEOUT_MS } = require("./common");
 
 const SECRET_PREFIX = "openclaw/user/";
 const MAX_SECRETS_PER_USER = 10;
@@ -39,7 +39,10 @@ async function main() {
     DeleteSecretCommand,
   } = require("@aws-sdk/client-secrets-manager");
 
-  const client = new SecretsManagerClient({ region: REGION });
+  const client = new SecretsManagerClient({
+    region: REGION,
+    requestHandler: { requestTimeout: SM_REQUEST_TIMEOUT_MS },
+  });
 
   if (action === "list") {
     const prefix = `${SECRET_PREFIX}${userId}/`;

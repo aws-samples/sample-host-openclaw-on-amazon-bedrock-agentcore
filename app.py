@@ -4,6 +4,11 @@
 Architecture: Per-user AgentCore Runtime sessions with webhook-based
 channel ingestion via Router Lambda. No keepalive needed — sessions
 idle-terminate naturally.
+
+Hybrid deployment model:
+  Phase 1 (CDK): VPC, Security, AgentCore-base (Role/SG/S3), Observability
+  Phase 2 (Starter Toolkit): Runtime, Endpoint, ECR, Docker build
+  Phase 3 (CDK): Router, Cron, TokenMonitoring (needs runtime_id/endpoint_id)
 """
 
 import os
@@ -15,6 +20,7 @@ from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.router_stack import RouterStack
+from stacks.guardrails_stack import GuardrailsStack
 from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
@@ -31,7 +37,17 @@ vpc_stack = VpcStack(app, "OpenClawVpc", env=env)
 
 security_stack = SecurityStack(app, "OpenClawSecurity", env=env)
 
-# --- AgentCore (hosts OpenClaw container, per-user sessions) ---
+# --- Guardrails (Bedrock content filtering — opt-in via enable_guardrails) ---
+guardrails_stack = GuardrailsStack(
+    app,
+    "OpenClawGuardrails",
+    cmk_arn=security_stack.cmk.key_arn,
+    env=env,
+)
+
+# --- AgentCore base resources (Role, SG, S3) ---
+# Runtime/Endpoint created by Starter Toolkit; runtime_id/endpoint_id
+# injected via cdk.json context after `agentcore deploy`.
 agentcore_stack = AgentCoreStack(
     app,
     "OpenClawAgentCore",
@@ -55,6 +71,7 @@ router_stack = RouterStack(
     gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
     slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
+    feishu_token_secret_name=security_stack.channel_secrets["feishu"].secret_name,
     webhook_secret_name=security_stack.webhook_secret.secret_name,
     cmk_arn=security_stack.cmk.key_arn,
     user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
@@ -65,7 +82,7 @@ router_stack = RouterStack(
 # --- Cron (EventBridge Scheduler + Lambda executor) ---
 # Use deterministic string ARNs for identity table to avoid cyclic dependency
 # (AgentCore <- Router already exists; CronStack adds policies to AgentCore role)
-_region = env.region or os.environ.get("CDK_DEFAULT_REGION", "us-west-2")
+_region = env.region or os.environ.get("CDK_DEFAULT_REGION", "")
 _account = env.account or os.environ.get("CDK_DEFAULT_ACCOUNT", "")
 _identity_table_name = "openclaw-identity"
 _identity_table_arn = f"arn:aws:dynamodb:{_region}:{_account}:table/{_identity_table_name}"
@@ -79,6 +96,7 @@ cron_stack = CronStack(
     identity_table_arn=_identity_table_arn,
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
     slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
+    feishu_token_secret_name=security_stack.channel_secrets["feishu"].secret_name,
     cmk_arn=security_stack.cmk.key_arn,
     agentcore_execution_role=agentcore_stack.execution_role,
     env=env,

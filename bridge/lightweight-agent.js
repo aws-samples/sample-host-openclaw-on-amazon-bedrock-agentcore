@@ -47,7 +47,8 @@ const SYSTEM_PROMPT =
   "production keys. Use retrieve_api_key to look up keys from either backend.\n\n" +
   "After full startup completes (~1-2 minutes), you gain additional capabilities: " +
   "deep research (multi-step analysis), YouTube transcripts, rich Telegram formatting, " +
-  "task decomposition with sub-agents, and enhanced web reading via Jina.";
+  "task decomposition with sub-agents, and enhanced web reading via Jina. " +
+  "Do not use markdown tables in responses — use bullet lists or plain paragraphs, as they render better in chat interfaces like Telegram and Slack.";
 
 const TOOLS = [
   {
@@ -443,6 +444,7 @@ const TOOL_ENV = {
   CRON_LAMBDA_ARN: process.env.CRON_LAMBDA_ARN || "",
   EVENTBRIDGE_ROLE_ARN: process.env.EVENTBRIDGE_ROLE_ARN || "",
   IDENTITY_TABLE_NAME: process.env.IDENTITY_TABLE_NAME || "",
+  INTERNAL_USER_ID: process.env.INTERNAL_USER_ID || "",
 };
 
 const SCRIPT_MAP = {
@@ -1020,6 +1022,10 @@ function executeManageApiKey(args) {
 
 // --- Secrets Manager backend (manage_secret tool) ---
 
+// Request timeout for SM calls — prevents indefinite hangs on VPC endpoint issues.
+// 30s per request attempt × 3 retries = ~90s worst case (well under Lambda timeout).
+const SM_REQUEST_TIMEOUT_MS = 30_000;
+
 // Lazy-require AWS SDK (only available inside Docker image)
 let _smSdk = null;
 function getSmSdk() {
@@ -1033,7 +1039,10 @@ let _smClient = null;
 function getSmClient() {
   if (!_smClient) {
     const { SecretsManagerClient } = getSmSdk();
-    _smClient = new SecretsManagerClient({ region: process.env.AWS_REGION });
+    _smClient = new SecretsManagerClient({
+      region: process.env.AWS_REGION,
+      requestHandler: { requestTimeout: SM_REQUEST_TIMEOUT_MS },
+    });
   }
   return _smClient;
 }
@@ -1411,7 +1420,7 @@ async function chat(userMessage, userId, deadlineMs = 0) {
         "I received your message but couldn't generate a response. Please try again.";
       const footer =
         "\n\n---\n" +
-        "_Warm-up mode — after full startup (~1-2 min), additional " +
+        "_Warm-up mode — after full startup (~5-6 second), additional " +
         "community skills come online: YouTube transcripts, deep research, " +
         "task decomposition with sub-agents, etc._";
       return text + footer;
@@ -1445,7 +1454,7 @@ async function chat(userMessage, userId, deadlineMs = 0) {
   console.warn("[shim] Max iterations reached");
   const fallbackFooter =
     "\n\n---\n" +
-    "_Warm-up mode — after full startup (~1-2 min), additional " +
+    "_Warm-up mode — after full startup (~5-6 second), additional " +
     "community skills come online: YouTube transcripts, deep research, " +
     "task decomposition with sub-agents, etc._";
   return "I ran into a limit processing your request. Please try rephrasing." + fallbackFooter;
@@ -1472,4 +1481,5 @@ module.exports = {
   MAX_SECRETS_PER_USER,
   executeRetrieveApiKey,
   executeMigrateApiKey,
+  SM_REQUEST_TIMEOUT_MS,
 };

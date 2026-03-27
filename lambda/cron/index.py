@@ -133,6 +133,30 @@ def get_or_create_session(user_id):
     return session_id
 
 
+def resolve_current_user_id(actor_id):
+    """Resolve the current internal userId from actorId via CHANNEL# PROFILE lookup.
+
+    The same Telegram/Slack user may have had multiple internal userIds over time
+    (session rotation). This ensures cron always uses the same session as the
+    user's active chat container rather than an old/stale session.
+
+    Falls back to None if lookup fails (caller should use payload userId as fallback).
+    """
+    if not actor_id:
+        return None
+    try:
+        resp = identity_table.get_item(
+            Key={"PK": f"CHANNEL#{actor_id}", "SK": "PROFILE"}
+        )
+        if "Item" in resp and "userId" in resp["Item"]:
+            resolved = resp["Item"]["userId"]
+            logger.info("Resolved current userId=%s from actorId=%s", resolved, actor_id)
+            return resolved
+    except Exception as e:
+        logger.warning("Failed to resolve userId from actorId %s: %s", actor_id, e)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # AgentCore invocation helpers
 # ---------------------------------------------------------------------------
@@ -217,20 +241,48 @@ def warmup_and_wait(session_id, user_id, actor_id, channel):
 # ---------------------------------------------------------------------------
 
 def _extract_text_from_content_blocks(text):
-    """Extract plain text if the response is a JSON array of content blocks.
+    """Extract plain text from content blocks anywhere in the response.
 
-    Recursively unwraps nested content blocks — subagent responses can produce
-    multiple layers of wrapping (e.g., subagent -> parent agent -> bridge).
+    Handles three cases:
+    1. Entire string is a JSON array: [{"type":"text","text":"..."}]
+    2. Content blocks embedded in surrounding text: "prefix[{...}]suffix"
+    3. Nested content blocks (subagent wrapping): recursively unwraps up to 10 levels
     """
     if not text or not isinstance(text, str):
         return text
     result = text
+    decoder = json.JSONDecoder(strict=False)
     for _ in range(10):
-        stripped = result.strip()
-        if not (stripped.startswith("[") and stripped.endswith("]")):
+        prev = result
+        rebuilt = []
+        i = 0
+        while i < len(result):
+            pos = result.find("[{", i)
+            if pos == -1:
+                rebuilt.append(result[i:])
+                break
+            rebuilt.append(result[i:pos])
+            try:
+                blocks, end = decoder.raw_decode(result, pos)
+                if isinstance(blocks, list) and blocks:
+                    parts = [
+                        b.get("text", "")
+                        for b in blocks
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    if parts:
+                        rebuilt.append("".join(parts))
+                        i = end
+                        continue
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+            rebuilt.append("[")
+            i = pos + 1
+        result = "".join(rebuilt)
+        if result == prev:
             break
         try:
-            blocks = json.JSONDecoder(strict=False).decode(stripped)
+            blocks = json.JSONDecoder(strict=False).decode(result)
             if isinstance(blocks, list) and blocks:
                 parts = [
                     b.get("text", "")
@@ -246,7 +298,73 @@ def _extract_text_from_content_blocks(text):
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
         break
+    # Regex fallback: handle cases where JSON parsing fails (encoding issues, etc.)
+    stripped_result = result.strip()
+    if stripped_result.startswith("[{") and '"type"' in stripped_result and '"text"' in stripped_result:
+        match = re.search(r'[,{]\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"', stripped_result)
+        if match:
+            try:
+                candidate = json.loads('"' + match.group(1) + '"')
+                if candidate and candidate != result:
+                    result = candidate
+            except (json.JSONDecodeError, ValueError):
+                pass
     return result
+
+
+def _tables_to_bullets(text):
+    """Convert markdown tables to bold-name bullet lists for Telegram.
+
+    | Name | Description |       ->    • **Name** — Description
+    |------|-------------|
+    | foo  | bar         |       ->    • **foo** — bar
+
+    Works with CJK characters and emoji (no alignment issues).
+    Uses ** for bold so _markdown_to_telegram_html converts to <b> tags.
+    """
+    if not text or '|' not in text:
+        return text
+
+    lines = text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 2:
+            table_lines = []
+            while i < len(lines):
+                tl = lines[i].strip()
+                if tl.startswith('|') and tl.endswith('|'):
+                    table_lines.append(tl)
+                    i += 1
+                else:
+                    break
+
+            header = None
+            bullets = []
+            for tl in table_lines:
+                if re.match(r'^\|[\s\-\:\|]+\|$', tl):
+                    continue
+                cols = [c.strip() for c in tl.strip('|').split('|')]
+                cols = [c for c in cols if c]
+                if not cols:
+                    continue
+                if header is None:
+                    header = cols
+                    continue
+                if len(cols) == 1:
+                    bullets.append(f'\u2022 {cols[0]}')
+                elif len(cols) >= 2:
+                    name = cols[0]
+                    desc = ' \u2014 '.join(cols[1:])
+                    bullets.append(f'\u2022 **{name}** \u2014 {desc}')
+
+            result.extend(bullets)
+        else:
+            result.append(lines[i])
+            i += 1
+
+    return '\n'.join(result)
 
 
 def _markdown_to_telegram_html(text):
@@ -255,12 +373,15 @@ def _markdown_to_telegram_html(text):
     Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>,
     <a href="">, <blockquote>, <tg-spoiler>.
 
-    Strategy: extract code blocks/inline code first (protect from other
-    conversions), HTML-escape the rest, convert markdown patterns, then
-    re-insert code.
+    Strategy: convert tables to bullet lists, extract code blocks/inline
+    code (protect from other conversions), HTML-escape the rest, convert
+    markdown patterns, then re-insert code.
     """
     if not text:
         return text
+
+    # Convert markdown tables to bullet lists (uses ** for bold, converted below)
+    text = _tables_to_bullets(text)
 
     placeholders = []
 
@@ -280,47 +401,7 @@ def _markdown_to_telegram_html(text):
         text, flags=re.DOTALL,
     )
 
-    # 2. Extract markdown tables and render as monospace <pre> blocks
-    def _convert_table(m):
-        lines = m.group(0).strip().split("\n")
-        rows = []
-        for line in lines:
-            stripped = line.strip().strip("|").strip()
-            if stripped and not re.match(r"^[\s|:-]+$", stripped):
-                cells = [c.strip() for c in line.strip().strip("|").split("|")]
-                rows.append(cells)
-        if not rows:
-            return m.group(0)
-        col_count = max(len(r) for r in rows)
-        widths = [0] * col_count
-        for row in rows:
-            for i, cell in enumerate(row):
-                if i < col_count:
-                    plain = re.sub(r"\*\*(.+?)\*\*", r"\1", cell)
-                    widths[i] = max(widths[i], len(plain))
-        formatted = []
-        for ri, row in enumerate(rows):
-            parts = []
-            for i in range(col_count):
-                cell = row[i] if i < len(row) else ""
-                plain = re.sub(r"\*\*(.+?)\*\*", r"\1", cell)
-                pad = widths[i] - len(plain) + len(cell)
-                parts.append(cell.ljust(pad))
-            formatted.append("  ".join(parts))
-            if ri == 0:
-                formatted.append("  ".join("─" * w for w in widths))
-        table_text = "\n".join(formatted)
-        table_text = table_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        table_text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", table_text)
-        return _placeholder(f"<pre>{table_text}</pre>")
-
-    text = re.sub(
-        r"(?:^\|.+\|[ \t]*$\n?){2,}",
-        _convert_table,
-        text, flags=re.MULTILINE,
-    )
-
-    # 3. Extract inline code: `text`
+    # 2. Extract inline code: `text`
     text = re.sub(
         r"`([^`\n]+)`",
         lambda m: _placeholder(
@@ -331,21 +412,29 @@ def _markdown_to_telegram_html(text):
         text,
     )
 
-    # 4. HTML-escape remaining text
+    # 3. HTML-escape remaining text
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    # 5. Convert markdown patterns to HTML
+    # 4. Convert markdown patterns to HTML
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection
+    def _safe_link(m):
+        link_text, link_url = m.group(1), m.group(2)
+        if re.match(r'^(https?://|tg://|mailto:)', link_url):
+            return f'<a href="{link_url}">{link_text}</a>'
+        return m.group(0)  # leave non-http links as plain text
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
     text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
     text = text.replace("</blockquote>\n<blockquote>", "\n")
     text = re.sub(r"^[-=*]{3,}\s*$", "———", text, flags=re.MULTILINE)
 
-    # 6. Re-insert placeholders
+    # 5. Re-insert placeholders
     for idx, content in enumerate(placeholders):
         text = text.replace(f"\x00PH{idx}\x00", content)
 
@@ -406,6 +495,41 @@ def send_slack_message(channel_id, text, bot_token):
         logger.error("Failed to send Slack message to %s: %s", channel_id, e)
 
 
+def send_feishu_message(receiver_id, text):
+    """Send a message via Feishu Bot API.
+
+    receiver_id can be an open_id (ou_xxx) or chat_id (oc_xxx).
+    The API receive_id_type is auto-detected from the prefix.
+    """
+    token = _get_feishu_tenant_token()
+    if not token:
+        logger.error("No Feishu tenant_access_token available")
+        return
+
+    id_type = "open_id" if receiver_id.startswith("ou_") else "chat_id"
+    url = f"{FEISHU_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={id_type}"
+    MAX_FEISHU_TEXT_LEN = 20000
+
+    chunks = [text[i:i + MAX_FEISHU_TEXT_LEN]
+              for i in range(0, len(text), MAX_FEISHU_TEXT_LEN)] if len(text) > MAX_FEISHU_TEXT_LEN else [text]
+
+    for chunk in chunks:
+        data = json.dumps({
+            "receive_id": receiver_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": chunk}),
+        }).encode()
+        req = urllib_request.Request(url, data=data, headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        })
+        try:
+            urllib_request.urlopen(req, timeout=10)
+        except Exception as e:
+            logger.error("Failed to send Feishu message to %s: %s", receiver_id, e)
+
+
+
 def deliver_response(channel, channel_target, response_text):
     """Deliver a response to the user's channel."""
     response_text = _extract_text_from_content_blocks(response_text)
@@ -464,15 +588,27 @@ def handler(event, context):
         schedule_id, user_id, channel, channel_target,
     )
 
+    # Resolve current userId from actorId BEFORE ownership check.
+    # The payload userId may be stale (from before userId was made deterministic).
+    # Look up the current active userId via CHANNEL# PROFILE so the ownership check
+    # uses the correct userId, and cron shares the same session as chat.
+    current_user_id = resolve_current_user_id(actor_id) or user_id
+    if current_user_id != user_id:
+        logger.info(
+            "actorId=%s resolved to current userId=%s (payload had %s)",
+            actor_id, current_user_id, user_id,
+        )
+
     # Verify schedule ownership — cross-check DynamoDB CRON# record
+    # Use current_user_id (resolved from channel identity) for the lookup.
     try:
         cron_record = identity_table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": f"CRON#{schedule_id}"}
+            Key={"PK": f"USER#{current_user_id}", "SK": f"CRON#{schedule_id}"}
         ).get("Item")
         if not cron_record:
             logger.error(
                 "Schedule %s not owned by user %s — skipping execution",
-                schedule_id, user_id,
+                schedule_id, current_user_id,
             )
             return {
                 "statusCode": 403,
@@ -486,10 +622,10 @@ def handler(event, context):
         }
 
     # Phase 1: Get or create session
-    session_id = get_or_create_session(user_id)
+    session_id = get_or_create_session(current_user_id)
 
     # Phase 2: Warm up the container if cold
-    warmup_ok = warmup_and_wait(session_id, user_id, actor_id, channel)
+    warmup_ok = warmup_and_wait(session_id, current_user_id, actor_id, channel)
     if not warmup_ok:
         error_msg = (
             f"[Scheduled: {schedule_name or schedule_id}] "
@@ -501,7 +637,7 @@ def handler(event, context):
 
     # Phase 3: Execute the cron message
     cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"
-    result = invoke_agentcore(session_id, "cron", user_id, actor_id, channel, cron_message)
+    result = invoke_agentcore(session_id, "cron", current_user_id, actor_id, channel, cron_message)
     response_text = result.get("response", "No response from scheduled task.")
 
     # Phase 4: Deliver response to channel

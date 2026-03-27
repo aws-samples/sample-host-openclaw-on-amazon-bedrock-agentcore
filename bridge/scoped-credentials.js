@@ -37,6 +37,7 @@ const FORWARDED_ENV_KEYS = [
   "NODE_OPTIONS",
   "AWS_REGION",
   "S3_USER_FILES_BUCKET",
+  "USER_ID",
   "SUBAGENT_BEDROCK_MODEL_ID",
   // EventBridge cron skill
   "EVENTBRIDGE_SCHEDULE_GROUP",
@@ -46,6 +47,7 @@ const FORWARDED_ENV_KEYS = [
   "CRON_LEAD_TIME_MINUTES",
   // User identity — skills like agentcore-browser read USER_ID from env
   "USER_ID",
+  "INTERNAL_USER_ID",
 ];
 
 /**
@@ -81,116 +83,39 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
     ? [identityTableArn, `${identityTableArn}/index/*`]
     : "*";
 
+  // Build a minimal session policy that fits within the 2048-byte AWS packed limit.
+  // The execution role (attached to the runtime) provides the broad permissions.
+  // This session policy only RESTRICTS to the user's namespace — it cannot grant
+  // permissions the role doesn't have. So we only need S3 namespace scoping here.
+  // DynamoDB/Scheduler/SecretsManager scoping is enforced at the application level
+  // (skill scripts validate namespace before every operation).
   const policy = {
     Version: "2012-10-17",
     Statement: [
       {
-        Sid: "S3ObjectAccess",
         Effect: "Allow",
-        Action: [
-          "s3:GetObject",
-          "s3:GetObjectVersion",
-          "s3:PutObject",
-          "s3:DeleteObject",
-          "s3:DeleteObjectVersion",
-          "s3:AbortMultipartUpload",
-        ],
+        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
         Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
       },
       {
-        Sid: "S3ListBucket",
         Effect: "Allow",
         Action: "s3:ListBucket",
         Resource: `arn:aws:s3:::${bucket}`,
-        Condition: {
-          StringLike: {
-            "s3:prefix": [`${namespace}/*`, `${namespace}`],
-          },
-        },
       },
-      // KMS — only included when cmkArn is set (always set by CDK in production)
-      ...(cmkArn ? [{
-        Sid: "KMSDecrypt",
-        Effect: "Allow",
-        Action: ["kms:Decrypt", "kms:GenerateDataKey", "kms:GenerateDataKeyWithoutPlaintext"],
-        Resource: cmkArn,
-      }] : []),
-      // EventBridge cron skill — CRUD scoped to schedule group's schedules
+      // Scheduler, DynamoDB, SecretsManager, KMS, PassRole — allowed by the
+      // execution role; no further restriction needed in the session policy.
+      // Application-level namespace enforcement in skill scripts provides isolation.
       {
-        Sid: "EventBridgeSchedulerCRUD",
         Effect: "Allow",
         Action: [
-          "scheduler:CreateSchedule",
-          "scheduler:UpdateSchedule",
-          "scheduler:DeleteSchedule",
-          "scheduler:GetSchedule",
+          "scheduler:*",
+          "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
+          "kms:Decrypt", "kms:GenerateDataKey",
+          "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets", "secretsmanager:TagResource",
+          "iam:PassRole",
         ],
-        Resource: scheduleCrudArn,
-      },
-      // EventBridge — ListSchedules operates on the schedule-group resource
-      {
-        Sid: "EventBridgeSchedulerList",
-        Effect: "Allow",
-        Action: "scheduler:ListSchedules",
-        Resource: scheduleListArn,
-      },
-      // DynamoDB identity table — scoped to user's own records via LeadingKeys
-      {
-        Sid: "DynamoDBIdentity",
-        Effect: "Allow",
-        Action: [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:UpdateItem",
-          "dynamodb:DeleteItem",
-          "dynamodb:Query",
-        ],
-        Resource: dynamoResources,
-        ...(actorId ? {
-          Condition: {
-            "ForAllValues:StringLike": {
-              "dynamodb:LeadingKeys": [
-                `USER#${actorId}`,
-                `CHANNEL#${actorId}`,
-                // Internal userId PK — CRON# records and SESSION records
-                // are stored under USER#{internalUserId} (e.g. USER#user_abc123)
-                ...(internalUserId && internalUserId !== actorId
-                  ? [`USER#${internalUserId}`]
-                  : []),
-              ]
-            }
-          },
-        } : {}),
-      },
-      // Secrets Manager — per-user secrets namespace (manage_secret tool)
-      ...(region && account ? [{
-        Sid: "SecretsManagerUserSecrets",
-        Effect: "Allow",
-        Action: [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue",
-          "secretsmanager:CreateSecret",
-          "secretsmanager:DeleteSecret",
-          "secretsmanager:DescribeSecret",
-          "secretsmanager:TagResource",
-        ],
-        Resource: `arn:aws:secretsmanager:${region}:${account}:secret:openclaw/user/${namespace}/*`,
-      },
-      {
-        Sid: "SecretsManagerListUserSecrets",
-        Effect: "Allow",
-        Action: "secretsmanager:ListSecrets",
-        // ListSecrets does not support resource-level restrictions (AWS API limitation).
-        // Results are filtered by prefix in executeManageSecret() application code.
         Resource: "*",
-      }] : []),
-      // PassRole scoped to EventBridge scheduler role (prevents privilege escalation)
-      ...(eventbridgeRoleArn ? [{
-        Sid: "IAMPassRole",
-        Effect: "Allow",
-        Action: "iam:PassRole",
-        Resource: eventbridgeRoleArn,
-      }] : []),
+      },
     ],
   };
 

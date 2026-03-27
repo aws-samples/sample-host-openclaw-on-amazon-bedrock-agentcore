@@ -31,7 +31,7 @@ function validateUserId(userId) {
     process.exit(1);
   }
   const VALID_NAMESPACE =
-    /^(telegram|slack|discord|whatsapp)_[a-zA-Z0-9_-]{1,64}$/;
+    /^(telegram|slack|discord|whatsapp|feishu)_[a-zA-Z0-9_-]{1,64}$/;
   if (!VALID_NAMESPACE.test(userId)) {
     console.error(
       `Error: Invalid user_id "${userId}". Must match channel_identifier format (e.g., telegram_123456, slack_username).`,
@@ -59,36 +59,58 @@ function validateEnv() {
 }
 
 /**
- * Validate a cron or rate expression.
- * Must match cron(...) or rate(...) format.
- * Enforces minimum 5-minute interval to prevent cost abuse.
+ * Validate a schedule expression: cron(...), rate(...), or at(...).
+ * - cron() must have exactly 6 space-separated fields (Minutes Hours Day Month DayOfWeek Year)
+ * - rate() must match rate(N unit) format with minimum 5-minute interval
+ * - at() must match at(YYYY-MM-DDTHH:MM:SS) format
  */
 function validateExpression(expression) {
-  const cronRegex = /^cron\(.+\)$/;
+  const cronRegex = /^cron\((.+)\)$/;
   const rateRegex = /^rate\(\d+\s+(minute|minutes|hour|hours|day|days)\)$/;
+  const atRegex = /^at\((\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\)$/;
 
-  if (!cronRegex.test(expression) && !rateRegex.test(expression)) {
-    console.error(
-      `Error: Invalid expression "${expression}". Must be cron(...) or rate(...) format.\n` +
-      `Examples: cron(0 9 * * ? *), rate(1 hour), rate(5 minutes)`,
-    );
-    process.exit(1);
+  if (atRegex.test(expression)) {
+    // at() expression — validate the datetime is parseable
+    const dateStr = expression.match(atRegex)[1];
+    const parsed = new Date(dateStr);
+    if (isNaN(parsed.getTime())) {
+      console.error(
+        `Error: Invalid at() datetime "${dateStr}". ` +
+        `Must be a valid ISO 8601 datetime: at(YYYY-MM-DDTHH:MM:SS)`,
+      );
+      process.exit(1);
+    }
+    return;
   }
 
-  // Enforce minimum 5-minute interval for rate expressions
-  const rateMatch = expression.match(/^rate\((\d+)\s+(minute|minutes)\)$/);
-  if (rateMatch && parseInt(rateMatch[1], 10) < 5) {
-    console.error(
-      "Error: Minimum rate interval is 5 minutes. " +
-      "Use rate(5 minutes) or higher to prevent cost abuse.",
-    );
-    process.exit(1);
+  if (rateRegex.test(expression)) {
+    // Enforce minimum 5-minute interval for rate expressions
+    const rateMatch = expression.match(/^rate\((\d+)\s+(minute|minutes)\)$/);
+    if (rateMatch && parseInt(rateMatch[1], 10) < 5) {
+      console.error(
+        "Error: Minimum rate interval is 5 minutes. " +
+        "Use rate(5 minutes) or higher to prevent cost abuse.",
+      );
+      process.exit(1);
+    }
+    return;
   }
 
-  // Reject every-minute cron expressions (wildcard or */1 in minutes field)
-  const cronFieldsMatch = expression.match(/^cron\((\S+)\s/);
-  if (cronFieldsMatch) {
-    const minutesField = cronFieldsMatch[1];
+  const cronMatch = expression.match(cronRegex);
+  if (cronMatch) {
+    // Validate cron has exactly 6 fields
+    const fields = cronMatch[1].trim().split(/\s+/);
+    if (fields.length !== 6) {
+      console.error(
+        `Error: cron() expression must have exactly 6 fields, got ${fields.length}.\n` +
+        `Format: cron(Minutes Hours Day-of-month Month Day-of-week Year)\n` +
+        `Example: cron(0 9 * * ? *)`,
+      );
+      process.exit(1);
+    }
+
+    // Reject every-minute cron expressions (wildcard or */1 in minutes field)
+    const minutesField = fields[0];
     if (minutesField === "*" || minutesField === "*/1") {
       console.error(
         "Error: Every-minute cron expressions are not allowed. " +
@@ -96,7 +118,16 @@ function validateExpression(expression) {
       );
       process.exit(1);
     }
+    return;
   }
+
+  // No recognized format
+  console.error(
+    `Error: Invalid expression "${expression}". ` +
+    `Must be cron(...), rate(...), or at(...) format.\n` +
+    `Examples: cron(0 9 * * ? *), rate(1 hour), at(2025-12-31T23:59:00)`,
+  );
+  process.exit(1);
 }
 
 /**

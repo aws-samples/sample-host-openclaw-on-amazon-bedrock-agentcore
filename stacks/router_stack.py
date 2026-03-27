@@ -1,10 +1,10 @@
-"""Router Stack — API Gateway HTTP API for Telegram/Slack webhook ingestion.
+"""Router Stack — API Gateway HTTP API for Telegram/Slack/Feishu webhook ingestion.
 
 Deploys the Router Lambda behind an API Gateway HTTP API with explicit
 routes for each webhook path. Webhook secret validation (Telegram
-secret_token header, Slack HMAC signature) is enforced inside the Lambda.
-Also creates the DynamoDB identity table for user resolution and
-cross-channel binding.
+secret_token header, Slack HMAC signature, Feishu X-Lark-Signature)
+is enforced inside the Lambda. Also creates the DynamoDB identity table
+for user resolution and cross-channel binding.
 """
 
 from aws_cdk import (
@@ -37,6 +37,7 @@ class RouterStack(Stack):
         gateway_token_secret_name: str,
         telegram_token_secret_name: str,
         slack_token_secret_name: str,
+        feishu_token_secret_name: str,
         webhook_secret_name: str,
         cmk_arn: str,
         user_files_bucket_name: str,
@@ -67,7 +68,9 @@ class RouterStack(Stack):
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.RETAIN,
             time_to_live_attribute="ttl",
-            point_in_time_recovery=True,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True,
+            ),
             encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
             encryption_key=identity_cmk,
         )
@@ -97,6 +100,7 @@ class RouterStack(Stack):
                 "IDENTITY_TABLE_NAME": self.identity_table.table_name,
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
+                "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
                 "WEBHOOK_SECRET_ID": webhook_secret_name,
                 "REGISTRATION_OPEN": registration_open,
                 "USER_FILES_BUCKET": user_files_bucket_name,
@@ -128,6 +132,11 @@ class RouterStack(Stack):
         )
         self.http_api.add_routes(
             path="/webhook/slack",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=lambda_integration,
+        )
+        self.http_api.add_routes(
+            path="/webhook/feishu",
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
@@ -261,7 +270,7 @@ class RouterStack(Stack):
                     "for CMK-encrypted table. S3 PutObject scoped to */_uploads/* "
                     "prefix for image uploads.",
                     applies_to=[
-                        f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:runtime/<AgentRuntime.AgentRuntimeId>/*",
+                        f"Resource::{runtime_arn}/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",

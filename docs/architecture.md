@@ -332,6 +332,8 @@
                             │
   OpenClawSecurity ─────────┤
                             │
+  OpenClawGuardrails ───────┤  (Bedrock content filtering)
+                            │
                     ┌───────v───────┐
                     │ OpenClawAgent │
                     │ Core          │
@@ -371,4 +373,5 @@
 | Audit | CloudTrail | API call logging with S3 storage and file validation |
 | Monitoring | CloudWatch alarms | Error rates, latency, throttles, budget thresholds |
 | Container | Tool deny list | `read` tool blocked (prevents credential access); `exec` allowed for skill management (STS-scoped); proxy on loopback only |
+| Content | Bedrock Guardrails | Content filters (HATE, INSULTS, SEXUAL, VIOLENCE, MISCONDUCT, PROMPT_ATTACK), 6 topic denials, PII redaction (10 entity types), word filters, custom regex. Injected via `guardrailConfig` on every ConverseStream call |
 | Cost | Token budgets | Daily token/cost alarms with anomaly detection |

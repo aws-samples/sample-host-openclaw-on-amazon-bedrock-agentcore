@@ -36,6 +36,7 @@ class CronStack(Stack):
         identity_table_arn: str,
         telegram_token_secret_name: str,
         slack_token_secret_name: str,
+        feishu_token_secret_name: str,
         cmk_arn: str,
         agentcore_execution_role: iam.IRole,
         **kwargs,
@@ -59,7 +60,7 @@ class CronStack(Stack):
         self.scheduler_role = iam.Role(
             self,
             "CronSchedulerRole",
-            role_name="openclaw-cron-scheduler-role",
+            role_name=f"openclaw-cron-scheduler-role-{region}",
             assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"),
             description="Role assumed by EventBridge Scheduler to invoke the cron executor Lambda",
         )
@@ -89,17 +90,27 @@ class CronStack(Stack):
                 "IDENTITY_TABLE_NAME": identity_table_name,
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
+                "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
             },
             log_group=cron_log_group,
         )
 
-        # Grant scheduler role permission to invoke the Lambda
+        # Grant scheduler role permission to invoke the Lambda (IAM policy)
         self.scheduler_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["lambda:InvokeFunction"],
                 resources=[self.cron_fn.function_arn],
             )
+        )
+
+        # Grant EventBridge Scheduler service permission via Lambda resource-based policy
+        # Required in addition to the IAM role policy above
+        self.cron_fn.add_permission(
+            "AllowEventBridgeScheduler",
+            principal=iam.ServicePrincipal("scheduler.amazonaws.com"),
+            action="lambda:InvokeFunction",
+            source_arn=f"arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*",
         )
 
         # --- Cron Lambda IAM Permissions ---
@@ -175,7 +186,7 @@ class CronStack(Stack):
 
         # Allow the container to pass the scheduler role to EventBridge
         # Use deterministic ARN to avoid cross-stack cyclic dependency
-        scheduler_role_arn = f"arn:aws:iam::{account}:role/openclaw-cron-scheduler-role"
+        scheduler_role_arn = f"arn:aws:iam::{account}:role/openclaw-cron-scheduler-role-{region}"
         agentcore_execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["iam:PassRole"],
@@ -235,7 +246,7 @@ class CronStack(Stack):
                     "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
                     "index wildcard needed for query operations.",
                     applies_to=[
-                        f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:runtime/<AgentRuntime.AgentRuntimeId>/*",
+                        f"Resource::{runtime_arn}/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                     ],

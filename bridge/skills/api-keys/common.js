@@ -33,9 +33,14 @@ function validateKeyName(keyName) {
   }
 }
 
+// Request timeout for Secrets Manager calls — prevents indefinite hangs
+// on VPC endpoint issues. 30s per attempt × 3 retries = ~90s worst case.
+const SM_REQUEST_TIMEOUT_MS = 30_000;
+
 module.exports = {
   REGION,
   VALID_KEY_NAME,
   validateUserId,
   validateKeyName,
+  SM_REQUEST_TIMEOUT_MS,
 };

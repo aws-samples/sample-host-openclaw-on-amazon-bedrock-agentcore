@@ -82,3 +82,8 @@ docker-compose.override.yml
 *.bak
 SYNC.md
 .claude/skills/
+
+# Internal post-deploy script (not for GitHub)
+post-deploy.sh
+.bedrock_agentcore.yaml
+.bedrock_agentcore/

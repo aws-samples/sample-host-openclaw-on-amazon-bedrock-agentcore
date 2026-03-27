@@ -22,20 +22,56 @@ function extractTextFromContent(content) {
   if (typeof content === "string") {
     const trimmed = content.trim();
     if (trimmed.startsWith("[{") && trimmed.endsWith("]")) {
+      let parsed = null;
       try {
-        const parsed = JSON.parse(trimmed);
-        if (
-          Array.isArray(parsed) &&
-          parsed.length > 0 &&
-          parsed[0].type === "text"
-        ) {
-          const text = parsed
-            .filter((b) => b.type === "text")
-            .map((b) => b.text)
-            .join("");
-          return extractTextFromContent(text);
+        parsed = JSON.parse(trimmed);
+      } catch {
+        // Retry with literal control characters escaped (JS JSON.parse is strict)
+        try {
+          const sanitized = trimmed.replace(/[\x00-\x1f\x7f]/g, c => {
+            const e = {"\b":"\\b","\t":"\\t","\n":"\\n","\f":"\\f","\r":"\\r"};
+            return e[c] || ("\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+          });
+          parsed = JSON.parse(sanitized);
+        } catch {
+          // Both failed — try regex extraction below
         }
-      } catch {}
+      }
+      if (!parsed) {
+        // Regex fallback for malformed JSON (e.g., "text","value" instead of "text":"value")
+        const textMatch = trimmed.match(/[,{]\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"/);
+        if (textMatch) {
+          try {
+            const extracted = JSON.parse('"' + textMatch[1] + '"');
+            if (extracted) return extractTextFromContent(extracted);
+          } catch {
+            return extractTextFromContent(textMatch[1]);
+          }
+        }
+      }
+      if (
+        parsed &&
+        Array.isArray(parsed) &&
+        parsed.length > 0 &&
+        parsed.every((b) => typeof b === "object" && b !== null) &&
+        parsed.some((b) => typeof b.type === "string")
+      ) {
+        const text = parsed
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("");
+        // Preserve leading whitespace from original string
+        const leading = content.match(/^(\s*)/)[0];
+        return extractTextFromContent(leading + text);
+      }
+    }
+    // Detect truncated content block JSON (e.g., "\n\n[{" or "\n\n[{"type":"text"...")
+    // These are partial content blocks from streaming that shouldn't leak as response text
+    if (trimmed.startsWith("[{") && !trimmed.endsWith("]")) {
+      // Check if it looks like the start of a content block array
+      if (/^\[\{\s*"type"\s*:/.test(trimmed) || trimmed === "[{") {
+        return "";
+      }
     }
     return content;
   }
@@ -125,9 +161,10 @@ describe("extractTextFromContent", () => {
     assert.equal(extractTextFromContent(text), text);
   });
 
-  it("handles malformed JSON gracefully", () => {
+  it("handles malformed JSON gracefully (truncated content blocks stripped)", () => {
     const text = '[{"type":"text","text":"broken';
-    assert.equal(extractTextFromContent(text), text);
+    // Truncated content block JSON should be stripped, not leaked
+    assert.equal(extractTextFromContent(text), "");
   });
 
   it("preserves newlines and markdown in unwrapped text", () => {
@@ -151,5 +188,70 @@ describe("extractTextFromContent", () => {
       { type: "text", text: " world" },
     ];
     assert.equal(extractTextFromContent(blocks), "Hello world");
+  });
+
+  // --- Literal control character handling (JSON.parse strict mode) ---
+
+  it("extracts text from JSON string with literal newlines", () => {
+    // Simulate JSON with actual newline bytes (not escaped \\n)
+    const json = '[{"type":"text","text":"Hello' + String.fromCharCode(10) + 'world"}]';
+    assert.equal(extractTextFromContent(json), "Hello\nworld");
+  });
+
+  it("extracts text from malformed JSON with comma instead of colon", () => {
+    // Real-world case: "text","value" instead of "text":"value"
+    const malformed = '[{"type":"text","text","\\n\\n## ✅ Hello World"}]';
+    const result = extractTextFromContent(malformed);
+    assert.ok(result.includes("Hello World"), `Expected 'Hello World' in: ${result}`);
+  });
+
+  it("extracts text from JSON string with literal tab characters", () => {
+    const json = '[{"type":"text","text":"col1' + String.fromCharCode(9) + 'col2"}]';
+    assert.equal(extractTextFromContent(json), "col1\tcol2");
+  });
+
+  // --- Mixed content blocks (image-first) ---
+
+  it("extracts text from JSON string where first block is image (not text)", () => {
+    const json = JSON.stringify([
+      { type: "image", source: { type: "base64", data: "abc123" } },
+      { type: "text", text: "Here is the image analysis" },
+    ]);
+    assert.equal(extractTextFromContent(json), "Here is the image analysis");
+  });
+
+  it("extracts text from JSON string with leading newlines and image-first blocks", () => {
+    const json = "\n\n" + JSON.stringify([
+      { type: "image", source: { type: "base64", data: "abc123" } },
+      { type: "text", text: "Analysis results" },
+    ]);
+    assert.equal(extractTextFromContent(json), "\n\nAnalysis results");
+  });
+
+  it("handles image-only content blocks (no text blocks) in JSON string", () => {
+    const json = JSON.stringify([
+      { type: "image", source: { type: "base64", data: "abc123" } },
+    ]);
+    // Should return empty string since there are no text blocks
+    assert.equal(extractTextFromContent(json), "");
+  });
+
+  it("handles mixed blocks with tool_use first", () => {
+    const json = JSON.stringify([
+      { type: "tool_use", id: "toolu_123", name: "search", input: {} },
+      { type: "text", text: "Search complete" },
+    ]);
+    assert.equal(extractTextFromContent(json), "Search complete");
+  });
+
+  it("handles truncated JSON like \\n\\n[{ gracefully", () => {
+    // Truncated content block JSON should return empty string, not leak raw JSON
+    assert.equal(extractTextFromContent("\n\n[{"), "");
+  });
+
+  it("handles partial content block JSON gracefully", () => {
+    const partial = '\n\n[{"type":"text","text":"hello';
+    // Incomplete JSON — should return empty, not raw partial JSON
+    assert.equal(extractTextFromContent(partial), "");
   });
 });
