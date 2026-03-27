@@ -16,8 +16,8 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 5 custom skills (S3 user files, EventBridge cron, ClawHub manage, API keys, agentcore-browser) + 2 built-in shim tools (web_fetch, web_search)
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
-- **Workspace Persistence**: .openclaw/ directory synced to/from S3 per user
-- **AI Model**: MiniMax M2.1 via Bedrock ConverseStream (configurable via `default_model_id` in `cdk.json`, default `minimax.minimax-m2.1`)
+- **Workspace Persistence**: AgentCore Session Storage (primary, `/mnt/workspace`) + S3 backup (5 min). `.openclaw/` symlinked to session storage mount; S3 backup restores on new sessions or version updates. **Note**: `update-agent-runtime` clears session storage — S3 backup auto-restores
+- **AI Model**: Claude Opus 4.6 via Bedrock ConverseStream (configurable via `default_model_id` in `cdk.json`, default `global.anthropic.claude-opus-4-6-v1`)
 - **Identity**: DynamoDB identity table (channel→user mapping, cross-channel binding) + Cognito User Pool
 - **Observability**: CloudWatch dashboards + alarms, Bedrock invocation logging
 - **Token Monitoring**: Lambda + DynamoDB (single-table) + CloudWatch custom metrics
@@ -496,7 +496,7 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agen
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` |
 | `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
-| `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID. The `global.` prefix routes to any available region |
+| `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID for Claude Opus 4.6. The `global.` prefix routes to any available region |
 | `runtime_id` | (empty) | AgentCore Runtime ID from Starter Toolkit. Populated by deploy script after `agentcore deploy` |
 | `runtime_endpoint_id` | (empty) | AgentCore Runtime Endpoint ID. Typically `DEFAULT` when using Starter Toolkit |
 | `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
@@ -528,7 +528,8 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agen
    - Configure workspace-sync with scoped credentials
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
    - Start OpenClaw gateway (port 18789) with scoped credentials env (no container credentials)
-   - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
+   - Set up session storage symlink (`~/.openclaw` → `/mnt/workspace/.openclaw`)
+   - If session storage empty: restore `.openclaw/` from S3 via `workspace-sync.js`
    - Start credential refresh timer (45 min interval)
    - If `BROWSER_IDENTIFIER` set: create browser session via AgentCore Browser API, write session file to `/tmp/agentcore-browser-session.json`
    - Wait for proxy only (~5s)
@@ -680,11 +681,17 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Security**: S3 key validated against user's namespace prefix + path traversal (`..`) rejection. Format validated against `VALID_BEDROCK_FORMATS` set
 - **Slack prerequisite**: Bot needs `files:read` OAuth scope to download image files
 
-### Workspace Sync
-- **S3 prefix**: `{namespace}/.openclaw/` where `namespace = actorId.replace(/:/g, "_")`
-- **Periodic saves**: Every 5 min (configurable via `WORKSPACE_SYNC_INTERVAL_MS`)
-- **SIGTERM grace**: 10s max for final save before exit (AgentCore gives 15s total)
-- **Skip patterns**: `node_modules/`, `.cache/`, `*.log`, files > 10MB
+### Workspace Persistence (Session Storage + S3 Backup)
+- **Primary**: AgentCore Session Storage — service-managed persistent filesystem mounted at `/mnt/workspace`. Data survives session stop/resume automatically. Configured via `filesystemConfigurations` on the Runtime
+- **Symlink**: `~/.openclaw` → `/mnt/workspace/.openclaw` — created during lazy init, transparent to OpenClaw and all skills
+- **S3 backup**: `workspace-sync.js` continues to run at 5 min interval (unchanged). Backs up to `{namespace}/.openclaw/` in the user files S3 bucket
+- **Restore logic**: On init, if session storage has existing data → skip S3 restore (resumed session). If empty → restore from S3 backup (new session or version update)
+- **Fallback**: If session storage mount not available → full S3 sync mode (5 min interval, existing behavior)
+- **Data lifecycle**: Session storage cleared on 14-day inactivity or runtime version update. S3 backup preserves data across these events
+- **⚠️ Version update clears session storage**: Every `update-agent-runtime` (new container image) resets session storage to empty. S3 backup auto-restores on next session start, but there is a window where the latest changes (since last S3 backup) may be lost. Always ensure S3 backup has run before deploying new versions
+- **VPC permissions**: S3 Gateway Endpoint defaults to allow-all — no policy change needed. Session storage is managed by AgentCore platform (not the execution role), so no IAM changes required
+- **SIGTERM grace**: Platform flushes session storage + 10s for S3 final backup
+- **Skip patterns**: `node_modules/`, `.cache/`, `*.log`, files > 10MB (S3 backup only)
 - **Same S3 bucket**: Uses `S3_USER_FILES_BUCKET` (shared with s3-user-files skill)
 
 ### EventBridge Cron Scheduling

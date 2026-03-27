@@ -34,6 +34,10 @@ const PORT = 8080;
 const PROXY_PORT = 18790;
 const OPENCLAW_PORT = 18789;
 
+// Session storage mount path (set via filesystemConfigurations on Runtime)
+const SESSION_STORAGE_MOUNT = "/mnt/workspace";
+const OPENCLAW_DIR = process.env.HOME ? `${process.env.HOME}/.openclaw` : "/root/.openclaw";
+
 // Gateway token — fetched from Secrets Manager eagerly at boot.
 // No fallback — container will fail to authenticate WebSocket if not set.
 let GATEWAY_TOKEN = null;
@@ -116,6 +120,56 @@ let processingMessage = false;
  * can pick up cross-channel identity changes (the proxy's env vars are
  * fixed at spawn time and cannot be updated for a running child process).
  */
+/**
+ * Set up symlink from ~/.openclaw to session storage mount.
+ * Returns true if session storage is available and symlink was created.
+ */
+function setupSessionStorageSymlink() {
+  try {
+    // Check if session storage mount exists (only available during invocation)
+    if (!fs.existsSync(SESSION_STORAGE_MOUNT)) {
+      console.log("[contract] Session storage not available at", SESSION_STORAGE_MOUNT);
+      return false;
+    }
+
+    const mountedDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
+    fs.mkdirSync(mountedDir, { recursive: true });
+
+    // Check existing .openclaw — may be a symlink, directory, or missing
+    let existingType = null;
+    try {
+      const stat = fs.lstatSync(OPENCLAW_DIR);
+      if (stat.isSymbolicLink()) {
+        const target = fs.readlinkSync(OPENCLAW_DIR);
+        if (target === mountedDir) {
+          console.log("[contract] Session storage symlink already in place");
+          return true;
+        }
+        existingType = "symlink";
+        fs.unlinkSync(OPENCLAW_DIR);
+      } else if (stat.isDirectory()) {
+        existingType = "directory";
+        // Copy contents to session storage (cross-device, can't use rename)
+        const { execSync } = require("child_process");
+        execSync(`cp -a ${OPENCLAW_DIR}/. ${mountedDir}/ 2>/dev/null || true`);
+        fs.rmSync(OPENCLAW_DIR, { recursive: true, force: true });
+      } else {
+        existingType = "file";
+        fs.unlinkSync(OPENCLAW_DIR);
+      }
+    } catch {
+      // OPENCLAW_DIR doesn't exist yet — that's fine
+    }
+
+    fs.symlinkSync(mountedDir, OPENCLAW_DIR);
+    console.log(`[contract] Session storage symlink: ${OPENCLAW_DIR} -> ${mountedDir} (was: ${existingType || "missing"})`);
+    return true;
+  } catch (err) {
+    console.warn(`[contract] Session storage setup failed: ${err.message}`);
+    return false;
+  }
+}
+
 function updateIdentityFile(actorId, channel) {
   try {
     fs.writeFileSync(
@@ -974,10 +1028,33 @@ async function init(userId, actorId, channel) {
       scheduleOpenClawRestart(currentNamespace);
     });
 
-    // Restore workspace from S3 (non-blocking, needed for OpenClaw)
-    workspaceSync.restoreWorkspace(namespace).catch((err) => {
-      console.warn(`[contract] Workspace restore failed: ${err.message}`);
-    });
+    // Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available
+    const sessionStorageAvailable = setupSessionStorageSymlink();
+
+    // Restore workspace from S3 if session storage is empty or unavailable
+    if (sessionStorageAvailable) {
+      // Check if session storage .openclaw dir has content (non-empty = resumed session)
+      const mountedOpenclawDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
+      let hasContent = false;
+      try {
+        const entries = fs.readdirSync(mountedOpenclawDir);
+        hasContent = entries.length > 0;
+      } catch { /* dir doesn't exist yet */ }
+
+      if (hasContent) {
+        console.log("[contract] Session storage has existing data — skipping S3 restore");
+      } else {
+        console.log("[contract] Session storage is empty — restoring from S3 backup");
+        workspaceSync.restoreWorkspace(namespace).catch((err) => {
+          console.warn(`[contract] Workspace restore failed: ${err.message}`);
+        });
+      }
+    } else {
+      // No session storage — use S3 sync as primary (existing behavior)
+      workspaceSync.restoreWorkspace(namespace).catch((err) => {
+        console.warn(`[contract] Workspace restore failed: ${err.message}`);
+      });
+    }
 
     // 2. Wait only for proxy readiness (~5s)
     proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
