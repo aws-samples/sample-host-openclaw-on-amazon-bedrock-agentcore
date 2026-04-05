@@ -629,6 +629,31 @@ function writeOpenClawConfig() {
       ].join("\n"),
     );
     console.log("[contract] AGENTS.md written");
+
+    // Also upload to S3 so the proxy's system prompt injection picks it up.
+    // The proxy reads AGENTS.md from S3 (not local filesystem), so without
+    // this sync the proxy would inject the stale 156-byte default template.
+    const namespace = currentNamespace;
+    const bucket = process.env.S3_USER_FILES_BUCKET;
+    if (bucket && namespace) {
+      const agentsContent = fs.readFileSync(agentsMdPath, "utf-8");
+      (async () => {
+        try {
+          const { PutObjectCommand } = require("@aws-sdk/client-s3");
+          const { S3Client } = require("@aws-sdk/client-s3");
+          const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
+          await s3.send(new PutObjectCommand({
+            Bucket: bucket,
+            Key: `${namespace}/AGENTS.md`,
+            Body: agentsContent,
+            ContentType: "text/markdown",
+          }));
+          console.log(`[contract] AGENTS.md synced to S3 (${agentsContent.length} bytes)`);
+        } catch (err) {
+          console.warn(`[contract] Failed to sync AGENTS.md to S3: ${err.message}`);
+        }
+      })();
+    }
   }
 }
 
@@ -715,7 +740,7 @@ async function initBrowserSession(userId) {
       browserIdentifier,
       name: userId.replace(/[^a-zA-Z0-9-]/g, "-").slice(0, 64),
       sessionTimeoutSeconds: BROWSER_SESSION_TIMEOUT_SECONDS,
-      viewportConfiguration: {
+      viewPort: {
         width: 1280,
         height: 720,
       },
@@ -968,8 +993,9 @@ async function init(userId, actorId, channel) {
     // Wait for lock cleanup to complete before starting OpenClaw
     await lockCleanupPromise;
 
-    // Write OpenClaw config and start gateway (non-blocking)
-    writeOpenClawConfig();
+    // NOTE: writeOpenClawConfig() is called AFTER setupSessionStorageSymlink()
+    // below, so that AGENTS.md is written to the symlinked path (session storage)
+    // and not overwritten by stale data from a previous session.
     console.log("[contract] Starting OpenClaw gateway (headless)...");
     // Build scoped env for OpenClaw — excludes container credentials,
     // uses credential_process for scoped S3 access only.
@@ -1030,6 +1056,10 @@ async function init(userId, actorId, channel) {
 
     // Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available
     const sessionStorageAvailable = setupSessionStorageSymlink();
+
+    // Write OpenClaw config AFTER symlink — ensures AGENTS.md lands in the
+    // symlinked path and is not overwritten by stale session storage data.
+    writeOpenClawConfig();
 
     // Restore workspace from S3 if session storage is empty or unavailable
     if (sessionStorageAvailable) {

@@ -1,6 +1,14 @@
 "use strict";
 const fs = require("fs");
 
+// Ensure /app/node_modules is in the module search path — OpenClaw's exec tool
+// may not forward NODE_PATH to child processes.
+if (!process.env.NODE_PATH?.includes("/app/node_modules")) {
+  require("module").Module._initPaths &&
+    (process.env.NODE_PATH = [process.env.NODE_PATH, "/app/node_modules"].filter(Boolean).join(":"));
+  require("module").Module._initPaths();
+}
+
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const CONTENT_TRUNCATE_CHARS = 8000;
 const NAV_TIMEOUT_MS = 30000;
@@ -26,7 +34,7 @@ async function connectBrowser() {
     headers: session.headers || {},
   });
   const contexts = browser.contexts();
-  const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
+  const context = contexts.length > 0 ? contexts[0] : await browser.newContext({ ignoreHTTPSErrors: true });
   const pages = context.pages();
   const page = pages.length > 0 ? pages[0] : await context.newPage();
   return {
