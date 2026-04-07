@@ -81,6 +81,10 @@ AgentCore microVMs are ephemeral — they're destroyed when idle. OpenClaw store
 
 This lets the system behave like a persistent server (continuous conversation history) while benefiting from serverless economics (no idle compute costs).
 
+### Session Storage (Persistent Filesystem)
+
+When [Managed Session Storage](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-persistent-filesystems.html) is available, `.openclaw/` persists across stop/resume cycles via `/mnt/workspace`, with S3 as a cold backup. Configured automatically by `deploy.sh`. See [docs/session-storage.md](docs/session-storage.md).
+
 ### Security
 
 This solution applies **defense-in-depth** across network, application, identity, and data layers. Key controls include:

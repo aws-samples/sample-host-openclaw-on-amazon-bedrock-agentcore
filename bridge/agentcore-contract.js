@@ -1031,9 +1031,12 @@ async function init(userId, actorId, channel) {
     // Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available
     const sessionStorageAvailable = setupSessionStorageSymlink();
 
-    // Restore workspace from S3 if session storage is empty or unavailable
+    // Restore workspace from S3 and configure sync mode based on session storage availability
     if (sessionStorageAvailable) {
-      // Check if session storage .openclaw dir has content (non-empty = resumed session)
+      // Session storage is primary — S3 becomes a cold backup (30min instead of 5min)
+      workspaceSync.setBackupMode(true);
+
+      // Check if session storage already has data (resumed session)
       const mountedOpenclawDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
       let hasContent = false;
       try {
