@@ -673,6 +673,21 @@ Five ClawHub community skills are pre-installed at Docker build time:
 
 During the warm-up phase (~first 1-2 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files`, `eventbridge-cron`, `clawhub-manage`, and `api-keys` skills. Users can manage files, schedules, skills, and API keys even during warm-up. ClawHub skills become available after OpenClaw fully starts.
 
+OpenClaw code plugins use the OpenClaw plugin CLI, separate from ClawHub skills. For example, install [TweetClaw](https://github.com/Xquik-dev/tweetclaw) when a hosted OpenClaw user needs X/Twitter automation such as tweet search, reply search, follower export, user lookup, monitors, webhooks, giveaway draws, or approval-gated post and reply actions:
+
+```bash
+openclaw plugins install @xquik/tweetclaw
+openclaw config set tools.alsoAllow '["explore", "tweetclaw"]'
+```
+
+Keep credentials out of chat and shell history. Pass the Xquik API key through an environment variable so OpenClaw writes it into plugin config:
+
+```bash
+openclaw config set plugins.entries.tweetclaw.config.apiKey "$XQUIK_API_KEY"
+```
+
+The plugin config is stored under `.openclaw/`, so this sample's S3 workspace sync preserves it across AgentCore session restarts.
+
 ### Webhook Security
 
 The Router Lambda validates all incoming webhook requests:
