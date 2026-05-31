@@ -1,8 +1,48 @@
 #!/usr/bin/env bash
 
+validate_env_name() {
+    local env_name="${1:-}"
+    if [ -z "$env_name" ]; then
+        return 0
+    fi
+
+    if [[ ! "$env_name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+        echo "ERROR: --env/OPENCLAW_ENV_NAME must use lowercase letters, digits, and hyphens only."
+        return 1
+    fi
+}
+
+resolve_env_file() {
+    local project_dir="$1"
+    local env_name="${2:-${OPENCLAW_ENV_NAME:-}}"
+
+    if [ -n "${OPENCLAW_ENV_FILE:-}" ]; then
+        printf '%s\n' "$OPENCLAW_ENV_FILE"
+    elif [ -n "$env_name" ]; then
+        printf '%s/.env.%s\n' "$project_dir" "$env_name"
+    else
+        printf '%s/.env\n' "$project_dir"
+    fi
+}
+
 load_project_env() {
     local project_dir="$1"
-    local env_file="${OPENCLAW_ENV_FILE:-$project_dir/.env}"
+    local env_name="${2:-${OPENCLAW_ENV_NAME:-}}"
+    local env_file=""
+
+    validate_env_name "$env_name"
+    env_file="$(resolve_env_file "$project_dir" "$env_name")"
+    export OPENCLAW_SELECTED_ENV_FILE="$env_file"
+
+    if [ -n "${OPENCLAW_ENV_FILE:-}" ] && [ ! -f "$env_file" ]; then
+        echo "ERROR: OPENCLAW_ENV_FILE points to a file that does not exist: $env_file"
+        return 1
+    fi
+
+    if [ -n "$env_name" ] && [ -z "${OPENCLAW_ENV_FILE:-}" ] && [ ! -f "$env_file" ]; then
+        echo "ERROR: --env $env_name expects an env file at $env_file"
+        return 1
+    fi
 
     if [ -f "$env_file" ]; then
         echo "INFO: Loading environment from $env_file"
@@ -11,6 +51,25 @@ load_project_env() {
         source "$env_file"
         set +a
     fi
+}
+
+apply_named_environment() {
+    local env_name="${1:-${OPENCLAW_ENV_NAME:-}}"
+    if [ -z "$env_name" ]; then
+        return 0
+    fi
+
+    validate_env_name "$env_name"
+
+    if [ -n "${OPENCLAW_ENV_SUFFIX:-}" ] && [ "$OPENCLAW_ENV_SUFFIX" != "$env_name" ]; then
+        echo "ERROR: --env $env_name conflicts with OPENCLAW_ENV_SUFFIX=$OPENCLAW_ENV_SUFFIX"
+        if [ -n "${OPENCLAW_SELECTED_ENV_FILE:-}" ]; then
+            echo "Fix ${OPENCLAW_SELECTED_ENV_FILE} or remove --env."
+        fi
+        return 1
+    fi
+
+    export OPENCLAW_ENV_SUFFIX="$env_name"
 }
 
 resolve_env_suffix() {

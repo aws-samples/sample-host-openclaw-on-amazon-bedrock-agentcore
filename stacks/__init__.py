@@ -4,7 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 
-from aws_cdk import aws_logs as logs
+from aws_cdk import RemovalPolicy, aws_logs as logs
 
 # Map integer days to the nearest valid RetentionDays enum member.
 _RETENTION_MAP = {
@@ -40,6 +40,8 @@ def retention_days(days: int) -> logs.RetentionDays:
 
 
 _ENV_SUFFIX_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 def environment_suffix(scope) -> str:
@@ -60,6 +62,52 @@ def environment_suffix(scope) -> str:
             "and single hyphens between segments"
         )
     return suffix
+
+
+def parse_optional_bool(raw_value) -> bool | None:
+    """Parse common bool-like values, returning None when unset."""
+    if raw_value is None:
+        return None
+
+    normalized = str(raw_value).strip().lower()
+    if not normalized:
+        return None
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    return None
+
+
+def retain_stateful_resources(scope) -> bool:
+    """Whether long-lived stateful resources should use RemovalPolicy.RETAIN."""
+    raw_value = os.environ.get("RETAIN_STATEFUL_RESOURCES")
+    if raw_value is None:
+        raw_value = scope.node.try_get_context("retain_stateful_resources")
+
+    parsed = parse_optional_bool(raw_value)
+    if raw_value is not None and str(raw_value).strip() and parsed is None:
+        raise ValueError(
+            "retain_stateful_resources/RETAIN_STATEFUL_RESOURCES must be one of: "
+            "true, false, 1, 0, yes, no, on, off"
+        )
+    if parsed is None:
+        return True
+    return parsed
+
+
+def stateful_removal_policy(scope) -> RemovalPolicy:
+    """Return the configured removal policy for long-lived stateful resources."""
+    return (
+        RemovalPolicy.RETAIN
+        if retain_stateful_resources(scope)
+        else RemovalPolicy.DESTROY
+    )
+
+
+def auto_delete_bucket_objects(scope) -> bool:
+    """Delete bucket contents automatically when stateful retention is disabled."""
+    return not retain_stateful_resources(scope)
 
 
 @dataclass(frozen=True)

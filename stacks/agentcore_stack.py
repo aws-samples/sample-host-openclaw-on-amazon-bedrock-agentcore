@@ -20,7 +20,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import DeploymentNamer
+from stacks import DeploymentNamer, auto_delete_bucket_objects, stateful_removal_policy
 
 # Regions where AgentCore Browser (CfnBrowserCustom) is confirmed available.
 BROWSER_SUPPORTED_REGIONS = {"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "ap-southeast-2"}
@@ -332,7 +332,8 @@ class AgentCoreStack(Stack):
                 encryption=s3.BucketEncryption.KMS,
                 encryption_key=user_files_cmk,
                 block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
-                removal_policy=RemovalPolicy.RETAIN,
+                removal_policy=stateful_removal_policy(self),
+                auto_delete_objects=auto_delete_bucket_objects(self),
                 lifecycle_rules=[
                     s3.LifecycleRule(
                         id="expire-old-user-files",

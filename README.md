@@ -215,16 +215,19 @@ If you keep multiple env files, the scripts load **one file only**:
 
 - default: `.env`
 - override: `OPENCLAW_ENV_FILE=/path/to/file`
+- shortcut: `--env <name>` loads `.env.<name>`
 
 Examples:
 
 ```bash
-OPENCLAW_ENV_FILE=.env.dev ./scripts/deploy.sh
-OPENCLAW_ENV_FILE=.env.prod ./scripts/deploy.sh
-OPENCLAW_ENV_FILE=.env.prod ./scripts/undeploy.sh --all
+./scripts/deploy.sh --env dev
+./scripts/deploy.sh --env prod
+./scripts/undeploy.sh --env prod --all
 ```
 
-The scripts do **not** merge `.env` with `.env.prod` or `.env.dev`. The selected file is sourced as-is, and its values become the deployment settings for that run.
+The scripts do **not** merge `.env` with `.env.prod` or `.env.dev`. The selected file is sourced as-is, and its values become the deployment settings for that run. `--env prod` is shorthand for selecting `.env.prod`, and it also requires the final `OPENCLAW_ENV_SUFFIX` to be `prod`.
+
+`deploy.sh` now fails fast before deployment if required settings are missing or inconsistent. For example, it rejects a missing `OPENCLAW_ENV_FILE`, a non-numeric `TELEGRAM_ADMIN_USER_ID`, an invalid-looking `TELEGRAM_BOT_TOKEN`, or Telegram bootstrap settings used with a mode that does not deploy the Router stack.
 
 If you also set these Telegram values, deployment will bootstrap the bot automatically:
 
@@ -233,7 +236,7 @@ TELEGRAM_BOT_TOKEN=123456:your-bot-token
 TELEGRAM_ADMIN_USER_ID=123456789
 ```
 
-That makes `./scripts/deploy.sh` do all of the following without a separate setup step:
+That makes `./scripts/deploy.sh` pass Router-stack bootstrap parameters so a custom resource can do all of the following without a separate setup step:
 1. Store the Telegram bot token in Secrets Manager
 2. Register the Telegram webhook against the deployed Router URL
 3. Add your Telegram account to the DynamoDB allowlist
@@ -245,14 +248,14 @@ cdk synth          # validate (runs cdk-nag security checks)
 ./scripts/deploy.sh
 ```
 
-By default, this repository uses **unsuffixed** stack names unless you set `OPENCLAW_ENV_SUFFIX`. If you follow `.env.template` as written, you will deploy the **`dev`** environment and get stack names like `OpenClawVpc-dev`, `OpenClawAgentCore-dev`, and `OpenClawRouter-dev`. You can either set `OPENCLAW_ENV_SUFFIX=prod` inside the selected env file, or override it per run with `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh`.
+By default, this repository uses **unsuffixed** stack names unless you set `OPENCLAW_ENV_SUFFIX`. If you follow `.env.template` as written, you will deploy the **`dev`** environment and get stack names like `OpenClawVpc-dev`, `OpenClawAgentCore-dev`, and `OpenClawRouter-dev`. You can either set `OPENCLAW_ENV_SUFFIX=prod` inside the selected env file, pass `./scripts/deploy.sh --env prod`, or override it per run with `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh`.
 
 The deploy script runs three phases automatically:
 1. **Phase 1 (CDK)** — VPC, Security, Guardrails, Observability stacks
 2. **Phase 2 (CDK)** — AgentCore runtime stack (container asset, runtime, endpoint, browser, session storage)
 3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring stacks
 
-The script runs pre-flight checks (AWS credentials, CDK CLI, Python venv bootstrap, and Docker when needed) before starting.
+The script runs pre-flight checks (AWS credentials, CDK CLI, Python venv bootstrap, Docker when needed, and required deployment setting validation) before starting.
 
 **Bedrock invocation logging is shared per AWS account + region.** It is not isolated by `OPENCLAW_ENV_SUFFIX`. Because of that, exactly one environment in a given account+region should own the Bedrock invocation logging configuration and the CloudWatch Logs subscription filter. Configure that explicitly with:
 
@@ -457,6 +460,7 @@ All tunable parameters are in `cdk.json`:
 | Parameter | Default | Description |
 |---|---|---|
 | `environment_suffix` | `""` | Environment suffix appended to stack names and fixed physical names so multiple deployments can coexist in one account/region. Set it in `.env` or `OPENCLAW_ENV_SUFFIX` when you want suffixed environments like `dev` or `prod` |
+| `retain_stateful_resources` | `true` | Controls whether stateful resources use `RemovalPolicy.RETAIN` or `RemovalPolicy.DESTROY`. You can set it in `cdk.json`, but `.env` `RETAIN_STATEFUL_RESOURCES=true|false` is also honored by `deploy.sh` |
 | `reuse_existing_user_files_bucket` | `false` | Reuse an existing user-files S3 bucket instead of creating it. If left unset, the AgentCore stack now uses boto3 `head_bucket()` during synth to auto-import a retained bucket with the expected name when it already exists |
 | `manage_bedrock_invocation_logging` | `false` | Whether this environment owns the shared Bedrock model invocation logging configuration and CloudWatch Logs subscription. Set this to `true` in exactly one environment per AWS account+region |
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
@@ -485,7 +489,23 @@ All tunable parameters are in `cdk.json`:
 | `guardrails_pii_action` | `ANONYMIZE` | PII handling: `ANONYMIZE` (redact) or `BLOCK` (reject). Credit cards always BLOCK regardless |
 | `enable_browser` | `false` | Enable headless Chromium browser inside the container. CDK creates the browser resource and wires `BROWSER_IDENTIFIER` automatically |
 
-Set `environment_suffix` in `cdk.json` or override it per run with `OPENCLAW_ENV_SUFFIX`, for example `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh`. The deploy, undeploy, setup, and E2E helper scripts derive the same suffixed stack names, secret IDs, and DynamoDB table names automatically.
+Set `environment_suffix` in `cdk.json` or override it per run with `OPENCLAW_ENV_SUFFIX`, for example `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh` or `./scripts/deploy.sh --env prod`. The deploy, undeploy, setup, and E2E helper scripts derive the same suffixed stack names, secret IDs, and DynamoDB table names automatically.
+
+Named resources that are intentionally long-lived are auto-reused during synth when they already exist with the expected suffixed name. Today that includes:
+
+- VPC flow log group
+- AgentCore user-files S3 bucket
+- Router identity DynamoDB table
+- Router API access log group
+- Token monitoring DynamoDB table
+- Security KMS key alias for secrets
+- Optional CloudTrail bucket
+- Security Secrets Manager secrets
+- Security Cognito user pool and proxy app client
+
+Retained resources are expected to be reused, not silently replaced with newly generated names. Shared account-level resources still keep their separate guards: for example, Bedrock invocation logging stays behind `manage_bedrock_invocation_logging` because that log group is account+region shared rather than environment-owned.
+
+If you set `RETAIN_STATEFUL_RESOURCES=false`, the stacks switch those stateful resources to `RemovalPolicy.DESTROY` instead. Stack-managed S3 buckets also enable automatic object cleanup so CloudFormation can delete them even when they still contain files or object versions.
 
 Network mode is currently keyed to the literal suffix in code: **`environment_suffix == "dev"` uses AgentCore public network mode**. Any other suffix value, including an empty suffix, uses **VPC mode** for the AgentCore runtime.
 
@@ -494,15 +514,16 @@ Network mode is currently keyed to the literal suffix in code: **`environment_su
 All helper scripts (`deploy.sh`, `undeploy.sh`, `setup-telegram.sh`, `setup-slack.sh`, `setup-feishu.sh`, `manage-allowlist.sh`, and `e2e-deploy-and-test.sh`) use the same env-file loader:
 
 - If `OPENCLAW_ENV_FILE` is set, that file is loaded
+- Otherwise, if `--env <name>` is passed, the script loads `.env.<name>`
 - Otherwise, the script loads `.env` from the repository root
 
 Examples:
 
 ```bash
 ./scripts/deploy.sh                             # loads ./.env
-OPENCLAW_ENV_FILE=.env.dev ./scripts/deploy.sh
-OPENCLAW_ENV_FILE=.env.prod ./scripts/deploy.sh
-OPENCLAW_ENV_FILE=.env.prod ./scripts/undeploy.sh --all
+./scripts/deploy.sh --env dev                  # loads ./.env.dev
+./scripts/deploy.sh --env prod                 # loads ./.env.prod
+./scripts/undeploy.sh --env prod --all         # loads ./.env.prod
 ```
 
 Recommended pattern:
@@ -965,6 +986,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 | **ClawHub skills** | 5 pre-installed; available only after full OpenClaw startup (~1-2 min). During warm-up, built-in web_fetch/web_search tools are available |
 | **Single region** | AgentCore Runtime deployed in one region; no multi-region failover |
 | **No voice/video** | Only text and images supported; no audio or video messages |
+| **Prod teardown delay** | `OpenClaw*-prod` stacks may not delete in a single pass because AgentCore Runtime can keep its VPC ENI attached for hours after runtime deletion starts. Re-run your teardown wrapper (`underlying.sh`/`undeploy.sh`) after about 8 hours |
 
 ## Gotchas
 
@@ -989,9 +1011,12 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 
 ```bash
 ./scripts/undeploy.sh
+./scripts/undeploy.sh --env prod
 ```
 
 `undeploy.sh` no longer scans DynamoDB for session IDs. It now uses only runtime-scoped AgentCore session discovery when the installed AWS tooling exposes that API; otherwise, stop any active sessions manually or wait for them to idle out before VPC teardown.
+
+> **Known issue:** production teardown is not always one-shot. The AgentCore Runtime control plane does not always release its ENI immediately, so the `OpenClawAgentCore-prod` / `OpenClawVpc-prod` cleanup can block on VPC dependencies even after the runtime delete starts. If that happens, wait about **8 hours** and re-run your teardown wrapper (`underlying.sh` if that is what you use, or `./scripts/undeploy.sh` in this repo).
 
 There are **two separate cleanup layers**:
 
@@ -1000,16 +1025,20 @@ There are **two separate cleanup layers**:
 
 That means **`--all` does not override `RemovalPolicy.RETAIN`**. A stack can be deleted successfully while some of its resources are intentionally left behind.
 
+If you deploy with `RETAIN_STATEFUL_RESOURCES=false`, the stack-managed stateful resources switch to `RemovalPolicy.DESTROY` instead. In that mode, the stack-managed S3 buckets enable automatic object cleanup, so CloudFormation can remove them without a separate manual bucket-emptying step.
+
 Common cleanup variants:
 
 ```bash
 ./scripts/undeploy.sh                                   # destroy deployable stacks, keep OpenClawSecurity
+./scripts/undeploy.sh --env dev                        # same as above, but loads ./.env.dev
 ./scripts/undeploy.sh --delete-user-files-bucket        # also delete the retained S3 user-files bucket
 ./scripts/undeploy.sh --all                             # also destroy OpenClawSecurity
+./scripts/undeploy.sh --env prod --all                 # destroy the prod-suffixed stacks
 ./scripts/undeploy.sh --all --delete-user-files-bucket  # destroy all included stacks and also delete the user-files bucket
 ```
 
-The undeploy script destroys the matching AgentCore stack separately (default: `OpenClawAgentCore-dev`), waits for AgentCore-managed `agentic_ai` ENIs to leave the VPC before deleting the matching VPC stack, and falls back to retaining the AgentCore runtime security group if CloudFormation gets stuck on security-group cleanup.
+The undeploy script destroys the matching AgentCore stack separately (default: `OpenClawAgentCore-dev`), waits for AgentCore-managed `agentic_ai` ENIs to leave the VPC before deleting the matching VPC stack, and falls back to retaining the AgentCore runtime security group if CloudFormation gets stuck on security-group cleanup. For `prod`, do not assume the first teardown run will finish the job — AgentCore may keep the ENI around well after delete starts, so plan to retry roughly **8 hours later**.
 
 ### What `--all` really means
 
@@ -1019,7 +1048,7 @@ It does **not** mean: **force-delete every resource created by every stack**.
 
 ### What can still remain after `./scripts/undeploy.sh --all`
 
-These resources are currently retained by CDK policy or by undeploy fallback logic:
+When `RETAIN_STATEFUL_RESOURCES=true` (the default), these resources are currently retained by CDK policy or by undeploy fallback logic:
 
 | Resource | Why it can remain after `--all` |
 | --- | --- |

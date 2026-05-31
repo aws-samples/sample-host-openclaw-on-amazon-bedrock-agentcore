@@ -16,9 +16,61 @@ VENV_DIR="$PROJECT_DIR/.venv"
 VENV_ACTIVATE="$VENV_DIR/bin/activate"
 VENV_STAMP="$VENV_DIR/.requirements.sha256"
 
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/undeploy.sh [--env <name>] [--all] [--delete-user-files-bucket]
+
+Options:
+  --env <name>                Load .env.<name> (for example .env.dev or .env.prod)
+                              and require OPENCLAW_ENV_SUFFIX to match that name.
+  --all                       Also destroy OpenClawSecurity.
+  --delete-user-files-bucket  Delete the retained S3 user-files bucket after stack teardown.
+  -h, --help                  Show this help text.
+
+Environment:
+  DESTROY_TIMEOUT_SECONDS     Max seconds to wait for AgentCore ENIs / stack deletion (default: 900)
+  POLL_INTERVAL_SECONDS       Poll interval while waiting (default: 15)
+EOF
+}
+
+OPENCLAW_ENV_NAME="${OPENCLAW_ENV_NAME:-}"
+POSITIONAL_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --env)
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "ERROR: --env requires a value."
+        exit 1
+      fi
+      OPENCLAW_ENV_NAME="$2"
+      shift 2
+      ;;
+    --env=*)
+      OPENCLAW_ENV_NAME="${1#*=}"
+      if [ -z "$OPENCLAW_ENV_NAME" ]; then
+        echo "ERROR: --env requires a value."
+        exit 1
+      fi
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL_ARGS[@]}"
+export OPENCLAW_ENV_NAME
+
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/openclaw-env.sh"
-load_project_env "$PROJECT_DIR"
+load_project_env "$PROJECT_DIR" "$OPENCLAW_ENV_NAME"
+apply_named_environment "$OPENCLAW_ENV_NAME"
 
 context_value() {
   local key="$1"
@@ -50,22 +102,6 @@ DESTROY_SECURITY=false
 DELETE_USER_FILES_BUCKET=false
 DESTROY_TIMEOUT_SECONDS="${DESTROY_TIMEOUT_SECONDS:-900}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-15}"
-
-usage() {
-  cat <<'EOF'
-Usage:
-  ./scripts/undeploy.sh [--all] [--delete-user-files-bucket]
-
-Options:
-  --all                       Also destroy OpenClawSecurity.
-  --delete-user-files-bucket  Delete the retained S3 user-files bucket after stack teardown.
-  -h, --help                  Show this help text.
-
-Environment:
-  DESTROY_TIMEOUT_SECONDS     Max seconds to wait for AgentCore ENIs / stack deletion (default: 900)
-  POLL_INTERVAL_SECONDS       Poll interval while waiting (default: 15)
-EOF
-}
 
 for arg in "$@"; do
   case "$arg" in
@@ -587,10 +623,16 @@ fi
 echo "=== OpenClaw CDK Undeploy ==="
 echo "  Account:                  $ACCOUNT"
 echo "  Region:                   $REGION"
+if [ -n "${OPENCLAW_ENV_NAME:-}" ]; then
+  echo "  Env name:                 $OPENCLAW_ENV_NAME"
+fi
 if [ -n "$OPENCLAW_ENV_SUFFIX" ]; then
   echo "  Env suffix:               $OPENCLAW_ENV_SUFFIX"
 else
   echo "  Env suffix:               (none)"
+fi
+if [ -n "${OPENCLAW_SELECTED_ENV_FILE:-}" ] && [ -f "${OPENCLAW_SELECTED_ENV_FILE}" ]; then
+  echo "  Env file:                 $OPENCLAW_SELECTED_ENV_FILE"
 fi
 echo "  Destroy security stack:   $DESTROY_SECURITY"
 echo "  Delete user files bucket: $DELETE_USER_FILES_BUCKET"

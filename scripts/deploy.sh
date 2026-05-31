@@ -37,9 +37,61 @@ VENV_DIR="$PROJECT_DIR/.venv"
 VENV_ACTIVATE="$VENV_DIR/bin/activate"
 VENV_STAMP="$VENV_DIR/.requirements.sha256"
 
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/deploy.sh [--env <name>] [--cdk-only|--runtime-only|--phase1|--phase3]
+
+Options:
+  --env <name>       Load .env.<name> (for example .env.dev or .env.prod) and
+                     require OPENCLAW_ENV_SUFFIX to match that name.
+  --phase1           Deploy foundation stacks only.
+  --runtime-only     Deploy the runtime stack only.
+  --phase3           Deploy dependent stacks only.
+  --cdk-only         Deploy all CDK-managed stacks.
+  -h, --help         Show this help text.
+EOF
+}
+
+OPENCLAW_ENV_NAME="${OPENCLAW_ENV_NAME:-}"
+POSITIONAL_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --env)
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "ERROR: --env requires a value."
+        usage
+        exit 1
+      fi
+      OPENCLAW_ENV_NAME="$2"
+      shift 2
+      ;;
+    --env=*)
+      OPENCLAW_ENV_NAME="${1#*=}"
+      if [ -z "$OPENCLAW_ENV_NAME" ]; then
+        echo "ERROR: --env requires a value."
+        usage
+        exit 1
+      fi
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL_ARGS[@]}"
+export OPENCLAW_ENV_NAME
+
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/openclaw-env.sh"
-load_project_env "$PROJECT_DIR"
+load_project_env "$PROJECT_DIR" "$OPENCLAW_ENV_NAME"
+apply_named_environment "$OPENCLAW_ENV_NAME"
 
 context_value() {
   local key="$1"
@@ -286,6 +338,52 @@ preflight() {
   fi
 }
 
+validate_required_settings() {
+  local errors=0
+
+  if [ -z "$REGION" ]; then
+    echo "ERROR: CDK_DEFAULT_REGION/AWS_REGION is required."
+    errors=$((errors + 1))
+  fi
+
+  if [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ] && ! [[ "${TELEGRAM_ADMIN_USER_ID}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: TELEGRAM_ADMIN_USER_ID must be numeric. Got: ${TELEGRAM_ADMIN_USER_ID}"
+    errors=$((errors + 1))
+  fi
+
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [[ "${TELEGRAM_BOT_TOKEN}" != *:* ]]; then
+    echo "ERROR: TELEGRAM_BOT_TOKEN does not look like a Telegram bot token (expected <bot_id>:<secret>)."
+    errors=$((errors + 1))
+  fi
+
+  if [ -n "${RETAIN_STATEFUL_RESOURCES:-}" ]; then
+    case "${RETAIN_STATEFUL_RESOURCES,,}" in
+      1|0|true|false|yes|no|on|off)
+        ;;
+      *)
+        echo "ERROR: RETAIN_STATEFUL_RESOURCES must be one of: true, false, 1, 0, yes, no, on, off."
+        errors=$((errors + 1))
+        ;;
+    esac
+  fi
+
+  case "$MODE" in
+    --phase1|--runtime-only)
+      if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
+        echo "ERROR: TELEGRAM_BOT_TOKEN/TELEGRAM_ADMIN_USER_ID require a deployment mode that includes the Router stack."
+        echo "Use ./scripts/deploy.sh, ./scripts/deploy.sh --cdk-only, or ./scripts/deploy.sh --phase3."
+        errors=$((errors + 1))
+      fi
+      ;;
+  esac
+
+  if [ "$errors" -gt 0 ]; then
+    echo ""
+    echo "Fix the required configuration above and re-run."
+    exit 1
+  fi
+}
+
 use_project_node
 ensure_python_venv
 resolve_build_mode
@@ -303,8 +401,6 @@ TELEGRAM_SECRET_ID="$(with_suffix 'openclaw/channels/telegram')"
 WEBHOOK_SECRET_ID="$(with_suffix 'openclaw/webhook-secret')"
 IDENTITY_TABLE_NAME="$(with_suffix 'openclaw-identity')"
 telegram_setup_attempted=0
-telegram_webhook_configured=0
-telegram_allowlist_configured=0
 
 # Resolve account and region
 ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
@@ -337,21 +433,60 @@ preflight
 echo "=== OpenClaw CDK Deploy ==="
 echo "  Account:    $ACCOUNT"
 echo "  Region:     $REGION"
+if [ -n "${OPENCLAW_ENV_NAME:-}" ]; then
+  echo "  Env name:   $OPENCLAW_ENV_NAME"
+fi
 if [ -n "$OPENCLAW_ENV_SUFFIX" ]; then
   echo "  Env suffix: $OPENCLAW_ENV_SUFFIX"
 else
   echo "  Env suffix: (none)"
 fi
+if [ -n "${OPENCLAW_SELECTED_ENV_FILE:-}" ] && [ -f "${OPENCLAW_SELECTED_ENV_FILE}" ]; then
+  echo "  Env file:   $OPENCLAW_SELECTED_ENV_FILE"
+fi
 echo "  Build mode: $BUILD_MODE"
 echo ""
 
-MODE="${1:-full}"
+MODE="full"
+for arg in "$@"; do
+  case "$arg" in
+    --phase1|--runtime-only|--phase3|--cdk-only)
+      if [ "$MODE" != "full" ]; then
+        echo "ERROR: Specify only one deployment mode."
+        usage
+        exit 1
+      fi
+      MODE="$arg"
+      ;;
+    *)
+      echo "ERROR: Unknown option '$arg'."
+      usage
+      exit 1
+      ;;
+  esac
+done
+
 CDK_DEPLOY_FLAGS=(--require-approval never)
 if [ "$BUILD_MODE" = "codebuild" ]; then
   CDK_DEPLOY_FLAGS+=(--asset-publishing-codebuild)
 fi
 if [ -n "$RESOLVED_AVAILABILITY_ZONES_JSON" ]; then
   CDK_DEPLOY_FLAGS+=(-c "availability_zones=$RESOLVED_AVAILABILITY_ZONES_JSON")
+fi
+ROUTER_CDK_DEPLOY_FLAGS=("${CDK_DEPLOY_FLAGS[@]}")
+if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+  telegram_setup_attempted=1
+  ROUTER_CDK_DEPLOY_FLAGS+=(
+    --parameters
+    "${STACK_ROUTER}:TelegramBotToken=${TELEGRAM_BOT_TOKEN}"
+  )
+fi
+if [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
+  telegram_setup_attempted=1
+  ROUTER_CDK_DEPLOY_FLAGS+=(
+    --parameters
+    "${STACK_ROUTER}:TelegramAdminUserId=${TELEGRAM_ADMIN_USER_ID}"
+  )
 fi
 
 activate_venv() {
@@ -361,108 +496,7 @@ activate_venv() {
   fi
 }
 
-update_telegram_secret() {
-  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-    return 0
-  fi
-
-  echo "--- Updating Telegram bot token secret ---"
-  aws secretsmanager update-secret \
-    --secret-id "$TELEGRAM_SECRET_ID" \
-    --secret-string "$TELEGRAM_BOT_TOKEN" \
-    --region "$REGION" >/dev/null
-}
-
-register_telegram_webhook() {
-  local telegram_token="$1"
-  local api_url
-  local webhook_secret
-  local webhook_result
-
-  api_url=$(aws cloudformation describe-stacks \
-    --stack-name "$STACK_ROUTER" \
-    --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
-    --output text \
-    --region "$REGION")
-
-  webhook_secret=$(aws secretsmanager get-secret-value \
-    --secret-id "$WEBHOOK_SECRET_ID" \
-    --region "$REGION" \
-    --query SecretString \
-    --output text)
-
-  webhook_result=$(curl -fsS \
-    "https://api.telegram.org/bot${telegram_token}/setWebhook?url=${api_url}webhook/telegram&secret_token=${webhook_secret}")
-  echo "Telegram webhook result: $webhook_result"
-
-  if ! echo "$webhook_result" | grep -q '"ok":true'; then
-    echo "ERROR: Telegram webhook registration failed."
-    exit 1
-  fi
-
-  telegram_webhook_configured=1
-}
-
-allowlist_telegram_admin() {
-  local channel_key
-  local now_iso
-
-  if ! [[ "${TELEGRAM_ADMIN_USER_ID:-}" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: TELEGRAM_ADMIN_USER_ID must be numeric. Got: ${TELEGRAM_ADMIN_USER_ID:-}"
-    exit 1
-  fi
-
-  channel_key="telegram:${TELEGRAM_ADMIN_USER_ID}"
-  now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-  aws dynamodb put-item \
-    --table-name "$IDENTITY_TABLE_NAME" \
-    --region "$REGION" \
-    --item "{
-      \"PK\": {\"S\": \"ALLOW#${channel_key}\"},
-      \"SK\": {\"S\": \"ALLOW\"},
-      \"channelKey\": {\"S\": \"${channel_key}\"},
-      \"addedAt\": {\"S\": \"${now_iso}\"}
-    }" >/dev/null
-
-  echo "Allowlisted $channel_key"
-  telegram_allowlist_configured=1
-}
-
-configure_telegram_bootstrap() {
-  local telegram_token=""
-
-  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && [ -z "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
-    return 0
-  fi
-
-  telegram_setup_attempted=1
-  update_telegram_secret
-
-  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-    telegram_token="$TELEGRAM_BOT_TOKEN"
-  else
-    telegram_token=$(aws secretsmanager get-secret-value \
-      --secret-id "$TELEGRAM_SECRET_ID" \
-      --region "$REGION" \
-      --query SecretString \
-      --output text 2>/dev/null || true)
-  fi
-
-  if [ -n "$telegram_token" ]; then
-    echo "--- Registering Telegram webhook ---"
-    register_telegram_webhook "$telegram_token"
-  else
-    echo "WARNING: TELEGRAM_BOT_TOKEN not set and no stored token was found; skipping Telegram webhook registration."
-  fi
-
-  if [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
-    echo "--- Adding Telegram admin to allowlist ---"
-    allowlist_telegram_admin
-  else
-    echo "INFO: TELEGRAM_ADMIN_USER_ID not set; skipping Telegram allowlist bootstrap."
-  fi
-}
+validate_required_settings
 
 # --- Phase 1: CDK foundation stacks ---
 phase1_cdk() {
@@ -505,9 +539,7 @@ phase3_cdk() {
     "$STACK_ROUTER" \
     "$STACK_CRON" \
     "$STACK_TOKEN_MONITORING" \
-    "${CDK_DEPLOY_FLAGS[@]}"
-
-  configure_telegram_bootstrap
+    "${ROUTER_CDK_DEPLOY_FLAGS[@]}"
 
   echo "  Phase 3 complete."
   echo ""
@@ -538,15 +570,8 @@ esac
 echo "=== Deploy complete ==="
 echo ""
 if [ "$telegram_setup_attempted" -eq 1 ]; then
-  echo "Telegram bootstrap:"
-  if [ "$telegram_webhook_configured" -eq 1 ]; then
-    echo "  - webhook configured"
-  fi
-  if [ "$telegram_allowlist_configured" -eq 1 ]; then
-    echo "  - admin allowlisted"
-  fi
+  echo "Telegram bootstrap was requested via Router custom resource parameters."
 else
   echo "Telegram bootstrap was skipped."
-  echo "Add TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_USER_ID to .env to include it in deployment,"
-  echo "or run ./scripts/setup-telegram.sh later."
+  echo "Add TELEGRAM_BOT_TOKEN and/or TELEGRAM_ADMIN_USER_ID to .env to include it in deployment."
 fi

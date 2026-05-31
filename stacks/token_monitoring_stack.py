@@ -1,7 +1,10 @@
 """Token Monitoring Stack — DynamoDB, Lambda, custom CW metrics, budget alarms."""
 
 import os
+import boto3
+from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError
 from aws_cdk import (
+    Annotations,
     Stack,
     Duration,
     RemovalPolicy,
@@ -19,7 +22,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import DeploymentNamer
+from stacks import DeploymentNamer, stateful_removal_policy
 
 
 class TokenMonitoringStack(Stack):
@@ -36,6 +39,8 @@ class TokenMonitoringStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         namer = DeploymentNamer.from_scope(self)
+        region = Stack.of(self).region
+        account = Stack.of(self).account
         daily_token_budget = self.node.try_get_context("daily_token_budget") or 1_000_000
         daily_cost_budget = self.node.try_get_context("daily_cost_budget_usd") or 5
         anomaly_band = self.node.try_get_context("anomaly_band_width") or 2
@@ -53,63 +58,108 @@ class TokenMonitoringStack(Stack):
         }
 
         # --- DynamoDB Token Usage Table -----------------------------------
-        # CMK encryption is optional — uncomment the two lines below if the
-        # table already exists and supports CUSTOMER_MANAGED encryption.
-        # token_cmk = kms.Key.from_key_arn(self, "TokenUsageTableCmk", cmk_arn)
-        self.table = dynamodb.Table(
-            self,
-            "TokenUsageTable2",
-            partition_key=dynamodb.Attribute(
-                name="PK", type=dynamodb.AttributeType.STRING
-            ),
-            sort_key=dynamodb.Attribute(
-                name="SK", type=dynamodb.AttributeType.STRING
-            ),
-            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
-            removal_policy=RemovalPolicy.RETAIN,
-            time_to_live_attribute="ttl",
-            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
-                point_in_time_recovery_enabled=True,
-            ),
-            # encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
-            # encryption_key=token_cmk,
-        )
+        token_table_name = namer.name("openclaw-token-usage")
+        token_table_arn = f"arn:aws:dynamodb:{region}:{account}:table/{token_table_name}"
+        dynamodb_client = boto3.client("dynamodb", region_name=region)
+        try:
+            token_table_description = dynamodb_client.describe_table(
+                TableName=token_table_name
+            )["Table"]
+            existing_gsis = {
+                index.get("IndexName", "")
+                for index in token_table_description.get("GlobalSecondaryIndexes", [])
+            }
+            required_gsis = {"GSI1", "GSI2", "GSI3"}
+            missing_gsis = sorted(required_gsis - existing_gsis)
+            if missing_gsis:
+                raise ValueError(
+                    "Existing token usage table is incompatible with the current schema. "
+                    f"Table={token_table_name}. Missing GSIs: {', '.join(missing_gsis)}"
+                )
+            reuse_token_table = True
+            Annotations.of(self).add_info(
+                f"Reusing existing token usage table: {token_table_name}"
+            )
+        except ClientError as err:
+            error_code = str(err.response.get("Error", {}).get("Code", ""))
+            if error_code == "ResourceNotFoundException":
+                reuse_token_table = False
+            else:
+                raise ValueError(
+                    "Failed to determine whether the token usage table already exists. "
+                    f"Table={token_table_name}. Fix the DynamoDB lookup error: {error_code}"
+                ) from err
+        except (NoCredentialsError, EndpointConnectionError) as err:
+            raise ValueError(
+                "Failed to determine whether the token usage table already exists because "
+                "AWS credentials or the DynamoDB endpoint are unavailable."
+            ) from err
 
-        # GSI1: Channel aggregation
-        self.table.add_global_secondary_index(
-            index_name="GSI1",
-            partition_key=dynamodb.Attribute(
-                name="GSI1PK", type=dynamodb.AttributeType.STRING
-            ),
-            sort_key=dynamodb.Attribute(
-                name="GSI1SK", type=dynamodb.AttributeType.STRING
-            ),
-            projection_type=dynamodb.ProjectionType.ALL,
-        )
+        if reuse_token_table:
+            self.table = dynamodb.Table.from_table_arn(
+                self,
+                "TokenUsageTable2",
+                table_arn=token_table_arn,
+            )
+        else:
+            # CMK encryption is optional — uncomment the two lines below if the
+            # table already exists and supports CUSTOMER_MANAGED encryption.
+            # token_cmk = kms.Key.from_key_arn(self, "TokenUsageTableCmk", cmk_arn)
+            self.table = dynamodb.Table(
+                self,
+                "TokenUsageTable2",
+                table_name=token_table_name,
+                partition_key=dynamodb.Attribute(
+                    name="PK", type=dynamodb.AttributeType.STRING
+                ),
+                sort_key=dynamodb.Attribute(
+                    name="SK", type=dynamodb.AttributeType.STRING
+                ),
+                billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+                removal_policy=stateful_removal_policy(self),
+                time_to_live_attribute="ttl",
+                point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                    point_in_time_recovery_enabled=True,
+                ),
+                # encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+                # encryption_key=token_cmk,
+            )
 
-        # GSI2: Model aggregation
-        self.table.add_global_secondary_index(
-            index_name="GSI2",
-            partition_key=dynamodb.Attribute(
-                name="GSI2PK", type=dynamodb.AttributeType.STRING
-            ),
-            sort_key=dynamodb.Attribute(
-                name="GSI2SK", type=dynamodb.AttributeType.STRING
-            ),
-            projection_type=dynamodb.ProjectionType.ALL,
-        )
+            # GSI1: Channel aggregation
+            self.table.add_global_secondary_index(
+                index_name="GSI1",
+                partition_key=dynamodb.Attribute(
+                    name="GSI1PK", type=dynamodb.AttributeType.STRING
+                ),
+                sort_key=dynamodb.Attribute(
+                    name="GSI1SK", type=dynamodb.AttributeType.STRING
+                ),
+                projection_type=dynamodb.ProjectionType.ALL,
+            )
 
-        # GSI3: Daily cost ranking
-        self.table.add_global_secondary_index(
-            index_name="GSI3",
-            partition_key=dynamodb.Attribute(
-                name="GSI3PK", type=dynamodb.AttributeType.STRING
-            ),
-            sort_key=dynamodb.Attribute(
-                name="GSI3SK", type=dynamodb.AttributeType.STRING
-            ),
-            projection_type=dynamodb.ProjectionType.ALL,
-        )
+            # GSI2: Model aggregation
+            self.table.add_global_secondary_index(
+                index_name="GSI2",
+                partition_key=dynamodb.Attribute(
+                    name="GSI2PK", type=dynamodb.AttributeType.STRING
+                ),
+                sort_key=dynamodb.Attribute(
+                    name="GSI2SK", type=dynamodb.AttributeType.STRING
+                ),
+                projection_type=dynamodb.ProjectionType.ALL,
+            )
+
+            # GSI3: Daily cost ranking
+            self.table.add_global_secondary_index(
+                index_name="GSI3",
+                partition_key=dynamodb.Attribute(
+                    name="GSI3PK", type=dynamodb.AttributeType.STRING
+                ),
+                sort_key=dynamodb.Attribute(
+                    name="GSI3SK", type=dynamodb.AttributeType.STRING
+                ),
+                projection_type=dynamodb.ProjectionType.ALL,
+            )
 
         # --- Token Metrics Lambda -----------------------------------------
         lambda_log_group = logs.LogGroup(

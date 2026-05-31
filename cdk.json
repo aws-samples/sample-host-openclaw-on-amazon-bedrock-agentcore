@@ -4,6 +4,7 @@
     "account": "",
     "region": "",
     "environment_suffix": "",
+    "retain_stateful_resources": true,
     "availability_zones": [],
     "agentcore_supported_availability_zone_ids": [],
     "browser_supported_availability_zones": [],
