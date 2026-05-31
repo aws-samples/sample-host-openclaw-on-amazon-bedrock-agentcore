@@ -20,6 +20,13 @@
 #                       codebuild: builds in AWS CodeBuild (no Docker required, adds cost)
 #   CDK_DEFAULT_ACCOUNT AWS account ID (auto-detected if not set)
 #   CDK_DEFAULT_REGION  AWS region (falls back to cdk.json, then aws configure)
+#   AGENTCORE_SUPPORTED_AZ_IDS
+#                       Optional comma/space-separated list or JSON array of
+#                       stable AZ IDs supported by AgentCore Runtime
+#                       (for example: use1-az4,use1-az1,use1-az2). The deploy
+#                       script resolves them to this account's AZ names and
+#                       passes those names into CDK so the VPC matches
+#                       AgentCore's subnet requirements.
 
 set -euo pipefail
 
@@ -58,6 +65,99 @@ sha256_file() {
   else
     shasum -a 256 "$file" | awk '{print $1}'
   fi
+}
+
+normalize_jsonish_list() {
+  local raw="${1:-}"
+  python3 - "$raw" <<'PY'
+import json
+import re
+import sys
+
+raw = (sys.argv[1] or "").strip()
+if not raw or raw in {"[]", "None", "null"}:
+    print("")
+    raise SystemExit(0)
+
+items = None
+if raw.startswith("["):
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            items = parsed
+    except json.JSONDecodeError:
+        items = None
+
+if items is None:
+    items = re.split(r"[\s,]+", raw)
+
+normalized = []
+for item in items:
+    value = str(item).strip().strip('"').strip("'")
+    if value:
+        normalized.append(value)
+
+print(json.dumps(normalized))
+PY
+}
+
+resolve_agentcore_availability_zones() {
+  local supported_az_ids_raw="${AGENTCORE_SUPPORTED_AZ_IDS:-}"
+  local supported_az_ids_json=""
+  local az_catalog=""
+
+  if [ -z "$supported_az_ids_raw" ]; then
+    supported_az_ids_raw="$(context_value agentcore_supported_availability_zone_ids 2>/dev/null || echo "")"
+  fi
+
+  supported_az_ids_json="$(normalize_jsonish_list "$supported_az_ids_raw")"
+  if [ -z "$supported_az_ids_json" ] || [ "$supported_az_ids_json" = "[]" ]; then
+    RESOLVED_AVAILABILITY_ZONES_JSON=""
+    return 0
+  fi
+
+  az_catalog="$(
+    aws ec2 describe-availability-zones \
+      --region "$REGION" \
+      --all-availability-zones \
+      --query 'AvailabilityZones[].[ZoneId,ZoneName,State]' \
+      --output json
+  )"
+
+  RESOLVED_AVAILABILITY_ZONES_JSON="$(
+    python3 - "$supported_az_ids_json" "$az_catalog" <<'PY'
+import json
+import sys
+
+supported = json.loads(sys.argv[1])
+catalog = json.loads(sys.argv[2])
+
+zone_name_by_id = {}
+state_by_id = {}
+for zone_id, zone_name, state in catalog:
+    zone_name_by_id[str(zone_id)] = str(zone_name)
+    state_by_id[str(zone_id)] = str(state)
+
+missing = [zone_id for zone_id in supported if zone_id not in zone_name_by_id]
+if missing:
+    raise SystemExit(
+        "ERROR: Could not resolve AZ IDs in this account/region: " + ", ".join(missing)
+    )
+
+unavailable = [zone_id for zone_id in supported if state_by_id.get(zone_id) != "available"]
+if unavailable:
+    raise SystemExit(
+        "ERROR: The following AZ IDs are not currently available in this account/region: "
+        + ", ".join(f"{zone_id} ({state_by_id.get(zone_id, 'unknown')})" for zone_id in unavailable)
+    )
+
+resolved = [zone_name_by_id[zone_id] for zone_id in supported]
+print(json.dumps(resolved))
+PY
+  )"
+
+  echo "INFO: AgentCore-supported AZ IDs: $supported_az_ids_json"
+  echo "INFO: Resolved VPC AZ names:      $RESOLVED_AVAILABILITY_ZONES_JSON"
 }
 
 # --- Build mode ---
@@ -228,6 +328,9 @@ fi
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT"
 export CDK_DEFAULT_REGION="$REGION"
 
+RESOLVED_AVAILABILITY_ZONES_JSON=""
+resolve_agentcore_availability_zones
+
 # Run pre-flight checks
 preflight
 
@@ -246,6 +349,9 @@ MODE="${1:-full}"
 CDK_DEPLOY_FLAGS=(--require-approval never)
 if [ "$BUILD_MODE" = "codebuild" ]; then
   CDK_DEPLOY_FLAGS+=(--asset-publishing-codebuild)
+fi
+if [ -n "$RESOLVED_AVAILABILITY_ZONES_JSON" ]; then
+  CDK_DEPLOY_FLAGS+=(-c "availability_zones=$RESOLVED_AVAILABILITY_ZONES_JSON")
 fi
 
 activate_venv() {

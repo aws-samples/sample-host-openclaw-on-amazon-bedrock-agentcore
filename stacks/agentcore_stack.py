@@ -2,6 +2,8 @@
 
 import os
 
+import boto3
+from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError
 from aws_cdk import (
     Annotations,
     CfnOutput,
@@ -283,9 +285,40 @@ class AgentCoreStack(Stack):
         )
         user_files_cmk = kms.Key.from_key_arn(self, "UserFilesCmk", cmk_arn)
         bucket_name = namer.name(f"openclaw-user-files-{account}-{region}")
-        reuse_existing_bucket = str(
-            self.node.try_get_context("reuse_existing_user_files_bucket") or ""
-        ).lower() in {"1", "true", "yes", "on"}
+        reuse_existing_bucket_raw = (
+            self.node.try_get_context("reuse_existing_user_files_bucket")
+            or os.environ.get("REUSE_EXISTING_USER_FILES_BUCKET")
+            or ""
+        )
+        reuse_existing_bucket_normalized = str(reuse_existing_bucket_raw).lower()
+        if reuse_existing_bucket_normalized in {"1", "true", "yes", "on"}:
+            reuse_existing_bucket = True
+        elif reuse_existing_bucket_normalized in {"0", "false", "no", "off"}:
+            reuse_existing_bucket = False
+        else:
+            s3_client = boto3.client("s3", region_name=region)
+            try:
+                s3_client.head_bucket(Bucket=bucket_name)
+                reuse_existing_bucket = True
+                Annotations.of(self).add_info(
+                    f"Reusing existing user-files bucket: {bucket_name}"
+                )
+            except ClientError as err:
+                error_code = str(err.response.get("Error", {}).get("Code", ""))
+                if error_code in {"404", "NoSuchBucket", "NotFound"}:
+                    reuse_existing_bucket = False
+                else:
+                    raise ValueError(
+                        "Failed to determine whether the user-files bucket already exists. "
+                        f"Bucket={bucket_name}. Set reuse_existing_user_files_bucket explicitly "
+                        f"or fix the S3 lookup error: {error_code}"
+                    ) from err
+            except (NoCredentialsError, EndpointConnectionError) as err:
+                raise ValueError(
+                    "Failed to determine whether the user-files bucket already exists because "
+                    "AWS credentials or the S3 endpoint are unavailable. Set "
+                    "reuse_existing_user_files_bucket explicitly or fix AWS access."
+                ) from err
 
         if reuse_existing_bucket:
             self.user_files_bucket = s3.Bucket.from_bucket_name(

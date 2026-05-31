@@ -40,6 +40,17 @@ class TokenMonitoringStack(Stack):
         daily_cost_budget = self.node.try_get_context("daily_cost_budget_usd") or 5
         anomaly_band = self.node.try_get_context("anomaly_band_width") or 2
         ttl_days = self.node.try_get_context("token_ttl_days") or 90
+        manage_bedrock_logging_raw = (
+            self.node.try_get_context("manage_bedrock_invocation_logging")
+            or os.environ.get("MANAGE_BEDROCK_INVOCATION_LOGGING")
+            or ""
+        )
+        manage_bedrock_logging = str(manage_bedrock_logging_raw).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         # --- DynamoDB Token Usage Table -----------------------------------
         # CMK encryption is optional — uncomment the two lines below if the
@@ -142,14 +153,15 @@ class TokenMonitoringStack(Stack):
             )
         )
 
-        # CloudWatch Logs subscription filter
-        logs.SubscriptionFilter(
-            self,
-            "InvocationLogSubscription",
-            log_group=invocation_log_group,
-            destination=log_destinations.LambdaDestination(self.token_lambda),
-            filter_pattern=logs.FilterPattern.all_events(),
-        )
+        if manage_bedrock_logging:
+            # CloudWatch Logs subscription filter for the shared Bedrock invocation log group.
+            logs.SubscriptionFilter(
+                self,
+                "InvocationLogSubscription",
+                log_group=invocation_log_group,
+                destination=log_destinations.LambdaDestination(self.token_lambda),
+                filter_pattern=logs.FilterPattern.all_events(),
+            )
 
         # --- Custom Metrics -----------------------------------------------
         ns = "OpenClaw/TokenUsage"

@@ -187,6 +187,16 @@ get_stack_resource_id() {
     --output text 2>/dev/null || true
 }
 
+get_stack_output_value() {
+  local stack_name="$1"
+  local output_key="$2"
+  aws cloudformation describe-stacks \
+    --region "$REGION" \
+    --stack-name "$stack_name" \
+    --query "Stacks[0].Outputs[?OutputKey=='$output_key'].OutputValue | [0]" \
+    --output text 2>/dev/null || true
+}
+
 wait_for_stack_delete() {
   local stack_name="$1"
   local status=""
@@ -270,6 +280,154 @@ wait_for_agentcore_enis() {
   return 1
 }
 
+stop_agentcore_runtime_sessions() {
+  local runtime_arn=""
+  local qualifier=""
+  local list_help=""
+  local list_output=""
+  local extract_status=0
+  local session_count=0
+  local stopped_count=0
+  local session_id=""
+  local output=""
+  local python_bin=""
+  local -a list_args=()
+  local -a session_ids=()
+  local stop_args=()
+
+  if ! stack_exists "$STACK_AGENTCORE"; then
+    return 0
+  fi
+
+  runtime_arn="$(get_stack_output_value "$STACK_AGENTCORE" "RuntimeArn")"
+  qualifier="$(get_stack_output_value "$STACK_AGENTCORE" "RuntimeEndpointId")"
+
+  if [ -z "$runtime_arn" ] || [ "$runtime_arn" = "None" ]; then
+    echo "Skipping AgentCore session shutdown: RuntimeArn output not found."
+    return 0
+  fi
+
+  list_help="$(aws --no-cli-pager bedrock-agentcore list-runtime-sessions help 2>&1 || true)"
+  if printf '%s' "$list_help" | grep -q "Found invalid choice 'list-runtime-sessions'"; then
+    echo "Skipping AgentCore session shutdown: current AWS CLI does not expose list-runtime-sessions for runtime-scoped discovery."
+    echo "If AgentCore sessions are still active, stop them manually or wait for the idle timeout before tearing down the VPC."
+    return 0
+  fi
+
+  list_args=(
+    --agent-runtime-arn "$runtime_arn"
+    --region "$REGION"
+    --output json
+  )
+  if [ -n "$qualifier" ] && [ "$qualifier" != "None" ]; then
+    list_args+=(--qualifier "$qualifier")
+  fi
+
+  list_output="$(
+    aws bedrock-agentcore list-runtime-sessions "${list_args[@]}" 2>&1
+  )" || true
+
+  if [ -z "$list_output" ]; then
+    echo "No AgentCore runtime sessions returned for $runtime_arn."
+    return 0
+  fi
+
+  if printf '%s' "$list_output" | grep -qE 'Exception|UnknownOperationException|ValidationException|Error'; then
+    echo "Skipping AgentCore session shutdown: failed to list runtime sessions for $runtime_arn."
+    echo "$list_output"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python_bin="python3"
+  elif command -v python >/dev/null 2>&1; then
+    python_bin="python"
+  else
+    echo "Skipping AgentCore session shutdown: Python is required to parse the runtime session list response."
+    return 0
+  fi
+
+  mapfile -t session_ids < <(
+    printf '%s' "$list_output" | "$python_bin" - <<'PY'
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+found = []
+
+def walk(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in ("runtimeSessionId", "sessionId") and isinstance(child, str):
+                found.append(child)
+            walk(child)
+    elif isinstance(value, list):
+        for item in value:
+            walk(item)
+
+walk(payload)
+
+seen = set()
+for session_id in found:
+    if session_id and session_id not in seen:
+        seen.add(session_id)
+        print(session_id)
+PY
+  )
+  extract_status=$?
+
+  if [ "$extract_status" -ne 0 ]; then
+    echo "Skipping AgentCore session shutdown: could not parse the runtime session list response."
+    return 0
+  fi
+
+  if [ "${#session_ids[@]}" -eq 0 ]; then
+    echo "No active AgentCore runtime sessions found for $runtime_arn."
+    return 0
+  fi
+
+  echo "Stopping AgentCore runtime sessions before teardown..."
+  for session_id in "${session_ids[@]}"; do
+    [ -n "${session_id:-}" ] || continue
+    [ "$session_id" != "None" ] || continue
+    session_count=$((session_count + 1))
+
+    stop_args=(
+      --agent-runtime-arn "$runtime_arn"
+      --runtime-session-id "$session_id"
+      --region "$REGION"
+    )
+    if [ -n "$qualifier" ] && [ "$qualifier" != "None" ]; then
+      stop_args+=(--qualifier "$qualifier")
+    fi
+
+    output="$(
+      aws bedrock-agentcore stop-runtime-session "${stop_args[@]}" 2>&1
+    )" || true
+
+    if [ -z "$output" ] || ! printf '%s' "$output" | grep -qE 'Exception|Error'; then
+      stopped_count=$((stopped_count + 1))
+      echo "  stopped ${session_id}"
+      continue
+    fi
+
+    if printf '%s' "$output" | grep -q 'ResourceNotFoundException'; then
+      echo "  already stopped ${session_id}"
+      continue
+    fi
+
+    echo "ERROR: Failed to stop runtime session $session_id"
+    echo "$output"
+    return 1
+  done
+
+  echo "Stopped $stopped_count of $session_count AgentCore runtime sessions."
+}
+
 destroy_stack_group() {
   local stacks=()
   local stack_name
@@ -287,7 +445,7 @@ destroy_stack_group() {
   echo "Destroying stacks: ${stacks[*]}"
   cd "$PROJECT_DIR"
   activate_venv
-  cdk destroy "${stacks[@]}" --force
+  cdk destroy "${stacks[@]}" --force --exclusively
 }
 
 destroy_agentcore_stack() {
@@ -303,7 +461,7 @@ destroy_agentcore_stack() {
   activate_venv
 
   set +e
-  cdk destroy "$STACK_AGENTCORE" --force
+  cdk destroy "$STACK_AGENTCORE" --force --exclusively
   local destroy_exit=$?
   set -e
 
@@ -355,7 +513,11 @@ delete_user_files_bucket() {
 
   while IFS=$'\t' read -r key version_id; do
     [ -n "$key" ] || continue
-    aws s3api delete-object --bucket "$bucket_name" --key "$key" --version-id "$version_id" >/dev/null
+    if [ -n "${version_id:-}" ] && [ "$version_id" != "None" ]; then
+      aws s3api delete-object --bucket "$bucket_name" --key "$key" --version-id "$version_id" >/dev/null
+    else
+      aws s3api delete-object --bucket "$bucket_name" --key "$key" >/dev/null
+    fi
   done < <(
     aws s3api list-object-versions \
       --bucket "$bucket_name" \
@@ -365,7 +527,11 @@ delete_user_files_bucket() {
 
   while IFS=$'\t' read -r key version_id; do
     [ -n "$key" ] || continue
-    aws s3api delete-object --bucket "$bucket_name" --key "$key" --version-id "$version_id" >/dev/null
+    if [ -n "${version_id:-}" ] && [ "$version_id" != "None" ]; then
+      aws s3api delete-object --bucket "$bucket_name" --key "$key" --version-id "$version_id" >/dev/null
+    else
+      aws s3api delete-object --bucket "$bucket_name" --key "$key" >/dev/null
+    fi
   done < <(
     aws s3api list-object-versions \
       --bucket "$bucket_name" \
@@ -437,6 +603,7 @@ if ! aws cloudformation describe-stacks \
   --output text >/dev/null 2>&1; then
   echo "No matching OpenClaw stacks found in $REGION."
 else
+  stop_agentcore_runtime_sessions
   destroy_stack_group "$STACK_ROUTER" "$STACK_CRON" "$STACK_TOKEN_MONITORING"
   destroy_agentcore_stack
   destroy_stack_group "$STACK_GUARDRAILS" "$STACK_OBSERVABILITY"

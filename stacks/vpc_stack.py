@@ -1,5 +1,7 @@
 """VPC Foundation Stack — subnets, NAT, VPC endpoints, security groups, flow logs."""
 
+import json
+
 from aws_cdk import (
     Stack,
     aws_ec2 as ec2,
@@ -24,7 +26,29 @@ class VpcStack(Stack):
         # --- VPC ----------------------------------------------------------
         # Allow users to override AZs via context if AgentCore Runtime has AZ restrictions
         # Context: "availability_zones": ["us-east-1b", "us-east-1c"]
-        availability_zones = self.node.try_get_context("availability_zones")
+        availability_zones_raw = self.node.try_get_context("availability_zones")
+        if isinstance(availability_zones_raw, str):
+            availability_zones_raw = availability_zones_raw.strip()
+            if availability_zones_raw:
+                if availability_zones_raw.startswith("["):
+                    try:
+                        availability_zones = json.loads(availability_zones_raw)
+                    except json.JSONDecodeError:
+                        availability_zones = [
+                            zone.strip()
+                            for zone in availability_zones_raw.split(",")
+                            if zone.strip()
+                        ]
+                else:
+                    availability_zones = [
+                        zone.strip()
+                        for zone in availability_zones_raw.split(",")
+                        if zone.strip()
+                    ]
+            else:
+                availability_zones = []
+        else:
+            availability_zones = availability_zones_raw or []
 
         vpc_kwargs = {
             "ip_addresses": ec2.IpAddresses.cidr("10.0.0.0/16"),

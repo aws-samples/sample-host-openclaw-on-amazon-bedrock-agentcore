@@ -44,6 +44,8 @@ Users can send **text and images** — photos sent via Telegram or Slack are dow
 
 ## Architecture
 
+### Shared logical flow
+
 ```mermaid
 flowchart LR
     subgraph Channels
@@ -73,6 +75,40 @@ flowchart LR
 
 **How it works:** Messages from Telegram/Slack hit the Router Lambda, which resolves user identity and routes to a per-user AgentCore container. Each user gets isolated compute, persistent workspace, and access to the configured Bedrock model.
 
+### `dev` architecture (`PUBLIC` network mode)
+
+```mermaid
+flowchart LR
+    TG[Telegram / Slack] --> APIGW[API Gateway]
+    APIGW --> ROUTER[Router Lambda]
+    ROUTER --> DDB[(DynamoDB)]
+    ROUTER --> AGENT[AgentCore Runtime<br/>Public network mode]
+    AGENT --> BEDROCK[Bedrock]
+    AGENT --> S3[S3 user files]
+    AGENT --> SM[Secrets Manager]
+    AGENT --> CW[CloudWatch]
+```
+
+### non-`dev` architecture (`VPC` network mode)
+
+```mermaid
+flowchart LR
+    TG[Telegram / Slack] --> APIGW[API Gateway]
+    APIGW --> ROUTER[Router Lambda]
+    ROUTER --> DDB[(DynamoDB)]
+
+    subgraph VPC[VPC]
+        subgraph Private[Private subnets]
+            AGENT[AgentCore Runtime<br/>VPC mode]
+        end
+        VPCE[VPC endpoints<br/>S3, Secrets Manager,<br/>ECR, CloudWatch, Bedrock]
+    end
+
+    ROUTER --> AGENT
+    AGENT --> VPCE
+    VPCE --> AWS[AWS services]
+```
+
 See [docs/architecture-detailed.md](docs/architecture-detailed.md) for technical details (sequence diagrams, container internals, data flows).
 
 ### Why S3 Workspace Sync?
@@ -85,7 +121,7 @@ This lets the system behave like a persistent server (continuous conversation hi
 
 This solution applies **defense-in-depth** across network, application, identity, and data layers. Key controls include:
 
-- **Network isolation**: Private VPC subnets with VPC endpoints; no direct internet exposure for containers
+- **Network isolation**: Non-`dev` environments run the AgentCore runtime in private VPC subnets with VPC endpoints; the default `dev` environment uses AgentCore public network mode instead
 - **Webhook authentication**: Cryptographic validation (Telegram secret token, Slack HMAC-SHA256 with replay protection)
 - **Per-user isolation**: Each user runs in their own AgentCore microVM with dedicated S3 namespace
 - **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3 and DynamoDB to the user's namespace/records — prevents cross-user data access even through shell tools
@@ -97,6 +133,20 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
 See [docs/security.md](docs/security.md) for the complete security architecture.
+
+**Dev network mode note:** the default `dev` environment does **not** attach the AgentCore runtime to the VPC. It is still protected by IAM-authenticated runtime access, the Router Lambda entry path, webhook validation, per-user session isolation, scoped AWS credentials, and TLS, but it does **not** have the extra private-subnet and VPC-endpoint isolation used by non-`dev` environments.
+
+| Aspect | `dev` | non-`dev` |
+| --- | --- | --- |
+| AgentCore runtime network mode | Public network | VPC mode |
+| Attached to project VPC | No | Yes |
+| Private subnets | No | Yes |
+| VPC endpoints | No | Yes |
+| IAM-authenticated runtime access | Yes | Yes |
+| Router Lambda + webhook validation | Yes | Yes |
+| Per-user isolation + scoped credentials | Yes | Yes |
+| TLS to AWS services | Yes | Yes |
+| Network isolation strength | Lower | Higher |
 
 ## Prerequisites
 
@@ -160,6 +210,21 @@ OPENCLAW_ENV_SUFFIX=dev
 CDK_DEFAULT_REGION=us-east-1
 ```
 
+If you keep multiple env files, the scripts load **one file only**:
+
+- default: `.env`
+- override: `OPENCLAW_ENV_FILE=/path/to/file`
+
+Examples:
+
+```bash
+OPENCLAW_ENV_FILE=.env.dev ./scripts/deploy.sh
+OPENCLAW_ENV_FILE=.env.prod ./scripts/deploy.sh
+OPENCLAW_ENV_FILE=.env.prod ./scripts/undeploy.sh --all
+```
+
+The scripts do **not** merge `.env` with `.env.prod` or `.env.dev`. The selected file is sourced as-is, and its values become the deployment settings for that run.
+
 If you also set these Telegram values, deployment will bootstrap the bot automatically:
 
 ```bash
@@ -179,7 +244,7 @@ cdk synth          # validate (runs cdk-nag security checks)
 ./scripts/deploy.sh
 ```
 
-By default, this repository uses **unsuffixed** stack names unless you set `OPENCLAW_ENV_SUFFIX`. If you follow `.env.template` as written, you will deploy the **`dev`** environment and get stack names like `OpenClawVpc-dev`, `OpenClawAgentCore-dev`, and `OpenClawRouter-dev`. Override per run with `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh` if you want a different environment.
+By default, this repository uses **unsuffixed** stack names unless you set `OPENCLAW_ENV_SUFFIX`. If you follow `.env.template` as written, you will deploy the **`dev`** environment and get stack names like `OpenClawVpc-dev`, `OpenClawAgentCore-dev`, and `OpenClawRouter-dev`. You can either set `OPENCLAW_ENV_SUFFIX=prod` inside the selected env file, or override it per run with `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh`.
 
 The deploy script runs three phases automatically:
 1. **Phase 1 (CDK)** — VPC, Security, Guardrails, Observability stacks
@@ -188,7 +253,45 @@ The deploy script runs three phases automatically:
 
 The script runs pre-flight checks (AWS credentials, CDK CLI, Python venv bootstrap, and Docker when needed) before starting.
 
-**Note on Availability Zones:** Bedrock AgentCore Runtime may not be available in all AZs in a region. If deployment fails with an "unsupported availability zones" error, specify supported AZs in `cdk.json`:
+**Bedrock invocation logging is shared per AWS account + region.** It is not isolated by `OPENCLAW_ENV_SUFFIX`. Because of that, exactly one environment in a given account+region should own the Bedrock invocation logging configuration and the CloudWatch Logs subscription filter. Configure that explicitly with:
+
+```bash
+MANAGE_BEDROCK_INVOCATION_LOGGING=true
+```
+
+Set it in one environment only (typically prod) and leave it `false` elsewhere.
+
+Example:
+
+```bash
+# .env.prod
+MANAGE_BEDROCK_INVOCATION_LOGGING=true
+
+# .env.dev
+MANAGE_BEDROCK_INVOCATION_LOGGING=false
+```
+
+**Note on Availability Zones:** Bedrock AgentCore Runtime may not be available in all AZs in a region, and AZ names like `us-east-1a` are account-specific aliases. The better fix is to supply the stable **AZ IDs** that AgentCore reports and let the deploy script resolve them to the correct AZ names for your account before creating the VPC.
+
+Add this to your selected env file:
+
+```bash
+AGENTCORE_SUPPORTED_AZ_IDS=use1-az4,use1-az1,use1-az2
+```
+
+Or set the same data in `cdk.json`:
+
+```json
+{
+  "context": {
+    "agentcore_supported_availability_zone_ids": ["use1-az4", "use1-az1", "use1-az2"]
+  }
+}
+```
+
+At deploy time, `./scripts/deploy.sh` resolves those stable AZ IDs to this account's AZ names (for example `us-east-1b`, `us-east-1c`) and passes the resolved names into CDK. That means the **VPC is created to match AgentCore's supported subnets**, instead of relying on CDK's default AZ ordering.
+
+If you need a manual override, you can still set `availability_zones` directly in `cdk.json`:
 
 ```json
 {
@@ -198,11 +301,11 @@ The script runs pre-flight checks (AWS credentials, CDK CLI, Python venv bootstr
 }
 ```
 
-To find supported AZs for your region:
-1. Check the error message from the failed deployment (it lists supported AZ IDs like `use1-az1`, `use1-az2`)
-2. Map AZ IDs to AZ names in your account: `aws ec2 describe-availability-zones --region us-east-1`
-3. Update `availability_zones` in `cdk.json` with the AZ names that match the supported AZ IDs
-4. Redeploy: `cdk destroy OpenClawVpc-dev --force && ./scripts/deploy.sh`
+To recover from an AZ mismatch:
+1. Check the AgentCore error message for the supported AZ IDs (for example `use1-az4,use1-az1,use1-az2`)
+2. Put those IDs into `AGENTCORE_SUPPORTED_AZ_IDS` in your selected env file
+3. Redeploy with `./scripts/deploy.sh`
+4. If the VPC was already created in unsupported AZs, destroy the VPC stack first, then deploy again
 
 #### Build modes
 
@@ -353,7 +456,8 @@ All tunable parameters are in `cdk.json`:
 | Parameter | Default | Description |
 |---|---|---|
 | `environment_suffix` | `""` | Environment suffix appended to stack names and fixed physical names so multiple deployments can coexist in one account/region. Set it in `.env` or `OPENCLAW_ENV_SUFFIX` when you want suffixed environments like `dev` or `prod` |
-| `reuse_existing_user_files_bucket` | `false` | Reuse an existing user-files S3 bucket instead of creating it. Set this explicitly when you are importing a pre-existing bucket into the stack; CDK no longer probes S3 during synth |
+| `reuse_existing_user_files_bucket` | `false` | Reuse an existing user-files S3 bucket instead of creating it. If left unset, the AgentCore stack now uses boto3 `head_bucket()` during synth to auto-import a retained bucket with the expected name when it already exists |
+| `manage_bedrock_invocation_logging` | `false` | Whether this environment owns the shared Bedrock model invocation logging configuration and CloudWatch Logs subscription. Set this to `true` in exactly one environment per AWS account+region |
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
 | `region` | `""` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
 | `availability_zones` | `["us-east-1b", "us-east-1c"]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
@@ -381,6 +485,32 @@ All tunable parameters are in `cdk.json`:
 | `enable_browser` | `false` | Enable headless Chromium browser inside the container. CDK creates the browser resource and wires `BROWSER_IDENTIFIER` automatically |
 
 Set `environment_suffix` in `cdk.json` or override it per run with `OPENCLAW_ENV_SUFFIX`, for example `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh`. The deploy, undeploy, setup, and E2E helper scripts derive the same suffixed stack names, secret IDs, and DynamoDB table names automatically.
+
+Network mode is currently suffix-based in code: **`dev` uses AgentCore public network mode**, while non-`dev` environments use **VPC mode** for the AgentCore runtime.
+
+### Selecting the env file
+
+All helper scripts (`deploy.sh`, `undeploy.sh`, `setup-telegram.sh`, `setup-slack.sh`, `setup-feishu.sh`, `manage-allowlist.sh`, and `e2e-deploy-and-test.sh`) use the same env-file loader:
+
+- If `OPENCLAW_ENV_FILE` is set, that file is loaded
+- Otherwise, the script loads `.env` from the repository root
+
+Examples:
+
+```bash
+./scripts/deploy.sh                             # loads ./.env
+OPENCLAW_ENV_FILE=.env.dev ./scripts/deploy.sh
+OPENCLAW_ENV_FILE=.env.prod ./scripts/deploy.sh
+OPENCLAW_ENV_FILE=.env.prod ./scripts/undeploy.sh --all
+```
+
+Recommended pattern:
+
+- `.env.dev` for development
+- `.env.prod` for production-like deployment
+- `.env` only if you want one default local environment
+
+The scripts do **not** layer multiple env files together. Pick exactly one file per run.
 
 > **Guardrails cost**: Bedrock Guardrails are enabled by default and add ~$0.75 per 1,000 text units on top of model inference costs. To disable, set `"enable_guardrails": false` in `cdk.json`. See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling removes content-level protections but other security layers (STS scoping, tool deny list, SSRF protection) remain active.
 
@@ -860,18 +990,53 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 ./scripts/undeploy.sh
 ```
 
+`undeploy.sh` no longer scans DynamoDB for session IDs. It now uses only runtime-scoped AgentCore session discovery when the installed AWS tooling exposes that API; otherwise, stop any active sessions manually or wait for them to idle out before VPC teardown.
+
+There are **two separate cleanup layers**:
+
+1. `./scripts/undeploy.sh --all` controls **which stacks** CloudFormation is asked to destroy.
+2. Each resource's `RemovalPolicy` controls whether that resource is **actually deleted or retained** when its stack is destroyed.
+
+That means **`--all` does not override `RemovalPolicy.RETAIN`**. A stack can be deleted successfully while some of its resources are intentionally left behind.
+
 Common cleanup variants:
 
 ```bash
 ./scripts/undeploy.sh                                   # destroy deployable stacks, keep OpenClawSecurity
-./scripts/undeploy.sh --delete-user-files-bucket        # also delete retained S3 user-files bucket
+./scripts/undeploy.sh --delete-user-files-bucket        # also delete the retained S3 user-files bucket
 ./scripts/undeploy.sh --all                             # also destroy OpenClawSecurity
-./scripts/undeploy.sh --all --delete-user-files-bucket  # full reset
+./scripts/undeploy.sh --all --delete-user-files-bucket  # destroy all included stacks and also delete the user-files bucket
 ```
 
-The undeploy script destroys the matching AgentCore stack separately (default: `OpenClawAgentCore-dev`), falls back to retaining the AgentCore runtime security group if CloudFormation gets stuck on it, and waits for AgentCore-managed `agentic_ai` ENIs to leave the VPC before deleting the matching VPC stack.
+The undeploy script destroys the matching AgentCore stack separately (default: `OpenClawAgentCore-dev`), waits for AgentCore-managed `agentic_ai` ENIs to leave the VPC before deleting the matching VPC stack, and falls back to retaining the AgentCore runtime security group if CloudFormation gets stuck on security-group cleanup.
 
-Note: KMS keys and the Cognito User Pool have `RETAIN` removal policies and will not be deleted automatically even with `--all`. Remove them manually if needed.
+### What `--all` really means
+
+`--all` means: **also include `OpenClawSecurity-*` in the destroy operation**.
+
+It does **not** mean: **force-delete every resource created by every stack**.
+
+### What can still remain after `./scripts/undeploy.sh --all`
+
+These resources are currently retained by CDK policy or by undeploy fallback logic:
+
+| Resource | Why it can remain after `--all` |
+| --- | --- |
+| DynamoDB identity table | `RemovalPolicy.RETAIN` |
+| API Gateway access log group | `RemovalPolicy.RETAIN` |
+| S3 user-files bucket | `RemovalPolicy.RETAIN`; only removed when `--delete-user-files-bucket` is passed |
+| DynamoDB token-monitoring table | `RemovalPolicy.RETAIN` |
+| VPC flow log group | `RemovalPolicy.RETAIN` |
+| KMS key in `OpenClawSecurity-*` | `RemovalPolicy.RETAIN` |
+| Cognito user pool in `OpenClawSecurity-*` | `RemovalPolicy.RETAIN` |
+| CloudTrail bucket (if enabled) | `RemovalPolicy.RETAIN` |
+| AgentCore runtime security group | undeploy fallback may call `delete-stack --retain-resources` if CloudFormation is stuck on SG cleanup |
+
+So the correct mental model is:
+
+- **stack destroyed** != **every resource deleted**
+- **`--all`** = destroy more stacks
+- **`RETAIN`** = keep specific resources even if their stack is destroyed
 
 ## Security
 

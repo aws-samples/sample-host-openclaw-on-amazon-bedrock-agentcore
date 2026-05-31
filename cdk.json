@@ -5,6 +5,7 @@
     "region": "",
     "environment_suffix": "",
     "availability_zones": [],
+    "agentcore_supported_availability_zone_ids": [],
     "browser_supported_availability_zones": [],
     "default_model_id": "moonshotai.kimi-k2.5",
     "subagent_model_id": "",
