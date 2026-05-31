@@ -20,7 +20,7 @@ Running an AI agent with tool access (bash, web fetch, file operations) on a loc
 |---|---|---|
 | **Multi-tenant data leakage** | Shared filesystem; one user can read another's data | Per-user Firecracker microVMs + STS session-scoped S3 credentials restrict access to `{namespace}/*` |
 | **Credential theft** | Plaintext `.env` files, shell history | Secrets Manager (KMS-encrypted, audited via CloudTrail); credentials never written to disk or env vars |
-| **Network exposure** | Open ports, direct internet exposure | VPC private subnets, no public IPs on containers, 7+ VPC endpoints keep traffic on AWS backbone |
+| **Network exposure** | Open ports, direct internet exposure | `environment_suffix == "dev"` uses AgentCore public network mode with app-layer protections; other suffixes use VPC private subnets, NAT, and VPC endpoints |
 | **Abuse / runaway costs** | No budget controls | Daily token budget (1M tokens), daily cost budget ($5 USD), anomaly detection, CloudWatch alarms |
 | **Audit trail** | None or manual log review | CloudTrail (most accounts already have one; optional dedicated trail available), CloudWatch access logs, Bedrock invocation logging |
 | **Lateral movement** | Full host access, all env vars | STS scoped credentials + tool deny list + credential env var blocklist; zero-access fallback if STS fails |
@@ -37,19 +37,23 @@ Running an AI agent with tool access (bash, web fetch, file operations) on a loc
 
 ### 3.1 Network Security
 
-All AgentCore containers run in VPC private subnets with no public IP addresses. AWS API traffic stays on the AWS backbone via VPC endpoints.
+Network behavior is currently **suffix-based in code**:
+
+- **`environment_suffix == "dev"`**: AgentCore runtime uses **public network mode** and is **not** attached to the VPC. The `VpcStack` still exists, but it creates **public subnets only** with **no NAT gateway** and **no VPC endpoints**.
+- **`environment_suffix != "dev"`**: AgentCore runtime uses **VPC mode** in private subnets, with **1 NAT gateway** and the configured **VPC endpoints**.
 
 | Control | Implementation | CDK Stack |
 |---|---|---|
-| VPC with private subnets | `10.0.0.0/16`, 2 AZs, `PRIVATE_WITH_EGRESS` subnets | `VpcStack` |
-| NAT Gateway | Single NAT for controlled outbound access | `VpcStack` |
-| 7 Interface VPC endpoints | Bedrock Runtime, SSM, ECR (API + Docker), Secrets Manager, CloudWatch Logs, CloudWatch Monitoring | `VpcStack` |
-| 1 Gateway VPC endpoint | S3 (free, no security group needed) | `VpcStack` |
+| `environment_suffix == "dev"` | Public subnets only; no private subnets, no NAT, no VPC endpoints | `VpcStack` |
+| `environment_suffix != "dev"` | `10.0.0.0/16`, 2 AZs, public + `PRIVATE_WITH_EGRESS` subnets | `VpcStack` |
+| NAT Gateway | Single NAT for controlled outbound access when `environment_suffix != "dev"` | `VpcStack` |
+| Interface VPC endpoints | Bedrock Runtime, SSM, ECR (API + Docker), Secrets Manager, CloudWatch Logs, CloudWatch Monitoring when `environment_suffix != "dev"` | `VpcStack` |
+| Gateway VPC endpoint | S3 when `environment_suffix != "dev"` | `VpcStack` |
 | VPC endpoint security group | HTTPS-only ingress from VPC CIDR (`10.0.0.0/16`), no outbound | `VpcStack` |
-| Container security group | Egress: TCP 443 only (HTTPS). Ingress: TCP 443 from VPC CIDR | `AgentCoreStack` |
+| Container security group | Created in the VPC stack path; egress TCP 443 only (HTTPS), ingress TCP 443 from VPC CIDR | `AgentCoreStack` |
 | VPC flow logs | All traffic logged to CloudWatch (configurable retention) | `VpcStack` |
 
-**Why it matters**: Containers cannot be reached directly from the internet. All AWS service calls transit VPC endpoints (never the public internet). The only internet-facing component is API Gateway, which has its own security controls.
+**Why it matters**: The VPC-mode path gives stronger network isolation and keeps AWS API traffic on the AWS backbone via VPC endpoints. The `dev` path does **not** have that extra network layer, but it is still protected by IAM-authenticated runtime access, Router Lambda entry, webhook validation, per-user isolation, scoped credentials, and TLS.
 
 ### 3.2 API Gateway & Webhook Security
 
@@ -330,7 +334,7 @@ These are the security capabilities that AWS managed services provide — capabi
 | **AgentCore Runtime** | Per-user Firecracker microVM isolation; managed serverless containers; no shared OS kernel between users; automatic session lifecycle management |
 | **KMS** | Customer-managed encryption keys with automatic annual rotation; envelope encryption; all key usage audited via CloudTrail |
 | **Secrets Manager** | Centralized secret storage with KMS encryption; audit trail for every access; no secrets in code, env files, or container images |
-| **VPC Endpoints** | AWS API traffic never traverses the public internet; reduces network attack surface; private DNS resolution |
+| **VPC Endpoints** | Used only when `environment_suffix != "dev"`; keep AWS API traffic on the AWS backbone and reduce network attack surface |
 | **CloudTrail** | Immutable API audit log; cryptographic file validation detects tampering; provides compliance evidence. Most accounts already have one — optional dedicated trail available via `enable_cloudtrail` |
 | **CloudWatch** | Real-time operational monitoring; anomaly detection on token usage; budget alarms; two operational dashboards |
 | **S3** | Versioned, KMS-encrypted storage with SSL enforcement, public access blocking, and lifecycle-managed expiration |
@@ -354,7 +358,7 @@ All 8 CDK stacks run cdk-nag `AwsSolutions` checks at `cdk synth` time. This cat
 |---|---|
 | **IAM** | No wildcard `*` actions/resources without justification; no AWS-managed policies where custom policies are feasible; least-privilege enforcement |
 | **Encryption** | S3 buckets encrypted; DynamoDB tables encrypted; SNS topics use KMS; Secrets Manager secrets have rotation configured |
-| **Network** | Security groups don't allow unrestricted ingress (`0.0.0.0/0`); VPC flow logs enabled |
+| **Network** | In VPC mode, security groups don't allow unrestricted ingress (`0.0.0.0/0`) and VPC flow logs are enabled; the `dev` suffix uses the public-network AgentCore path instead |
 | **API Gateway** | Access logging configured; authorization on all routes; throttling enabled |
 | **Lambda** | Latest runtime versions; no overly permissive execution roles |
 | **Cognito** | Password complexity; MFA enforcement; advanced security features |

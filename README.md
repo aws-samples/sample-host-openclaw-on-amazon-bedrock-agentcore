@@ -75,7 +75,7 @@ flowchart LR
 
 **How it works:** Messages from Telegram/Slack hit the Router Lambda, which resolves user identity and routes to a per-user AgentCore container. Each user gets isolated compute, persistent workspace, and access to the configured Bedrock model.
 
-### `dev` architecture (`PUBLIC` network mode)
+### `environment_suffix == "dev"` architecture (`PUBLIC` network mode)
 
 ```mermaid
 flowchart LR
@@ -89,7 +89,7 @@ flowchart LR
     AGENT --> CW[CloudWatch]
 ```
 
-### non-`dev` architecture (`VPC` network mode)
+### `environment_suffix != "dev"` architecture (`VPC` network mode)
 
 ```mermaid
 flowchart LR
@@ -121,7 +121,7 @@ This lets the system behave like a persistent server (continuous conversation hi
 
 This solution applies **defense-in-depth** across network, application, identity, and data layers. Key controls include:
 
-- **Network isolation**: Non-`dev` environments run the AgentCore runtime in private VPC subnets with VPC endpoints; the default `dev` environment uses AgentCore public network mode instead
+- **Network isolation**: The code treats `environment_suffix == "dev"` as the public-network case. Any other suffix value, including an empty suffix, uses VPC mode for the AgentCore runtime
 - **Webhook authentication**: Cryptographic validation (Telegram secret token, Slack HMAC-SHA256 with replay protection)
 - **Per-user isolation**: Each user runs in their own AgentCore microVM with dedicated S3 namespace
 - **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3 and DynamoDB to the user's namespace/records — prevents cross-user data access even through shell tools
@@ -134,13 +134,14 @@ This solution applies **defense-in-depth** across network, application, identity
 
 See [docs/security.md](docs/security.md) for the complete security architecture.
 
-**Dev network mode note:** the default `dev` environment does **not** attach the AgentCore runtime to the VPC. It is still protected by IAM-authenticated runtime access, the Router Lambda entry path, webhook validation, per-user session isolation, scoped AWS credentials, and TLS, but it does **not** have the extra private-subnet and VPC-endpoint isolation used by non-`dev` environments.
+**Suffix-based network mode note:** this behavior is currently keyed to the **literal suffix value**. When `environment_suffix == "dev"`, the AgentCore runtime uses public network mode and is **not** attached to the project VPC. The `dev` VPC stack also uses **public subnets only with `nat_gateways = 0`**, so there is **no NAT gateway** in that case. For any other suffix value, including `prod`, `staging`, or an empty suffix, the AgentCore runtime uses **VPC mode**. The `dev` case is still protected by IAM-authenticated runtime access, the Router Lambda entry path, webhook validation, per-user session isolation, scoped AWS credentials, and TLS, but it does **not** have the extra private-subnet and VPC-endpoint isolation used by the VPC-mode case.
 
-| Aspect | `dev` | non-`dev` |
+| Aspect | `environment_suffix == "dev"` | `environment_suffix != "dev"` |
 | --- | --- | --- |
 | AgentCore runtime network mode | Public network | VPC mode |
 | Attached to project VPC | No | Yes |
 | Private subnets | No | Yes |
+| NAT gateway | No | Yes |
 | VPC endpoints | No | Yes |
 | IAM-authenticated runtime access | Yes | Yes |
 | Router Lambda + webhook validation | Yes | Yes |
@@ -379,7 +380,7 @@ openclaw-on-agentcore/
   requirements.txt                # Python deps (aws-cdk-lib, cdk-nag)
   stacks/
     __init__.py                   # Shared helper (RetentionDays converter)
-    vpc_stack.py                  # VPC, subnets, NAT, 7 VPC endpoints, flow logs
+    vpc_stack.py                  # VPC foundation; `dev` = public-only/no endpoints, other suffixes = private subnets + NAT + VPC endpoints
     security_stack.py             # KMS CMK, Secrets Manager, Cognito, optional CloudTrail
     agentcore_stack.py            # Runtime, WorkloadIdentity, ECR, S3, IAM
     router_stack.py               # Router Lambda + API Gateway HTTP API + DynamoDB identity
@@ -438,10 +439,10 @@ openclaw-on-agentcore/
 
 | Stack | Resources | Dependencies |
 |---|---|---|
-| **OpenClawVpc** | VPC (2 AZ), private/public subnets, NAT, 7 VPC endpoints, flow logs | None |
+| **OpenClawVpc** | VPC foundation. `environment_suffix == "dev"`: public subnets only, no NAT, no VPC endpoints. Other suffixes: public + private subnets, NAT, VPC endpoints, flow logs | None |
 | **OpenClawSecurity** | KMS CMK, Secrets Manager (7 secrets incl. webhook validation), Cognito User Pool, optional CloudTrail | None |
 | **OpenClawGuardrails** | CfnGuardrail (content filters, topic denial, PII, word filters, regex), CfnGuardrailVersion | Security |
-| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM | Vpc, Security, Guardrails |
+| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM. Runtime network mode is `PUBLIC` only when `environment_suffix == "dev"`; otherwise it uses VPC mode | Vpc, Security, Guardrails |
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms (errors, latency, throttles), SNS, Bedrock logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
@@ -486,7 +487,7 @@ All tunable parameters are in `cdk.json`:
 
 Set `environment_suffix` in `cdk.json` or override it per run with `OPENCLAW_ENV_SUFFIX`, for example `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh`. The deploy, undeploy, setup, and E2E helper scripts derive the same suffixed stack names, secret IDs, and DynamoDB table names automatically.
 
-Network mode is currently suffix-based in code: **`dev` uses AgentCore public network mode**, while non-`dev` environments use **VPC mode** for the AgentCore runtime.
+Network mode is currently keyed to the literal suffix in code: **`environment_suffix == "dev"` uses AgentCore public network mode**. Any other suffix value, including an empty suffix, uses **VPC mode** for the AgentCore runtime.
 
 ### Selecting the env file
 
