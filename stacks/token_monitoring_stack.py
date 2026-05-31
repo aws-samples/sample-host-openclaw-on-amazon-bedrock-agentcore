@@ -19,6 +19,8 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
+from stacks import DeploymentNamer
+
 
 class TokenMonitoringStack(Stack):
     def __init__(
@@ -33,6 +35,7 @@ class TokenMonitoringStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        namer = DeploymentNamer.from_scope(self)
         daily_token_budget = self.node.try_get_context("daily_token_budget") or 1_000_000
         daily_cost_budget = self.node.try_get_context("daily_cost_budget_usd") or 5
         anomaly_band = self.node.try_get_context("anomaly_band_width") or 2
@@ -101,7 +104,7 @@ class TokenMonitoringStack(Stack):
         lambda_log_group = logs.LogGroup(
             self,
             "TokenMetricsLogGroup",
-            log_group_name="/openclaw/lambda/token-metrics",
+            log_group_name=namer.name("/openclaw/lambda/token-metrics"),
             retention=logs.RetentionDays.ONE_MONTH,
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -109,7 +112,7 @@ class TokenMonitoringStack(Stack):
         self.token_lambda = lambda_.Function(
             self,
             "TokenMetricsFunction",
-            function_name="openclaw-token-metrics",
+            function_name=namer.name("openclaw-token-metrics"),
             runtime=lambda_.Runtime.PYTHON_3_12,
             handler="index.handler",
             code=lambda_.Code.from_asset(
@@ -185,7 +188,7 @@ class TokenMonitoringStack(Stack):
         dashboard = cw.Dashboard(
             self,
             "TokenAnalyticsDashboard",
-            dashboard_name="OpenClaw-Token-Analytics",
+            dashboard_name=namer.name("OpenClaw-Token-Analytics"),
         )
 
         dashboard.add_widgets(
@@ -226,7 +229,7 @@ class TokenMonitoringStack(Stack):
         total_tokens.create_alarm(
             self,
             "DailyTokenBudgetAlarm",
-            alarm_name="openclaw-daily-token-budget",
+            alarm_name=namer.name("openclaw-daily-token-budget"),
             threshold=daily_token_budget,
             evaluation_periods=1,
             comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
@@ -237,7 +240,7 @@ class TokenMonitoringStack(Stack):
         estimated_cost.create_alarm(
             self,
             "DailyCostBudgetAlarm",
-            alarm_name="openclaw-daily-cost-budget",
+            alarm_name=namer.name("openclaw-daily-cost-budget"),
             threshold=daily_cost_budget,
             evaluation_periods=1,
             comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,

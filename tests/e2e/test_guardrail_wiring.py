@@ -42,10 +42,12 @@ def _has_guardrail_configured() -> bool:
         from botocore.exceptions import ClientError
 
         from .config import _resolve_region
+        from .config import _resolve_env_suffix, _with_suffix
 
         region = _resolve_region()
+        stack_name = _with_suffix("OpenClawAgentCore", _resolve_env_suffix())
         cf = boto3.client("cloudformation", region_name=region)
-        stacks = cf.describe_stacks(StackName="OpenClawAgentCore")
+        stacks = cf.describe_stacks(StackName=stack_name)
         outputs = {
             o["OutputKey"]: o["OutputValue"]
             for o in stacks["Stacks"][0].get("Outputs", [])

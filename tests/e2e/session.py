@@ -78,7 +78,7 @@ def _stop_agentcore_session(cfg: E2EConfig) -> bool:
     # Resolve the runtime ARN from CloudFormation outputs
     cf = boto3.client("cloudformation", region_name=cfg.region)
     try:
-        stacks = cf.describe_stacks(StackName="OpenClawAgentCore")
+        stacks = cf.describe_stacks(StackName=cfg.agentcore_stack_name)
         outputs = stacks["Stacks"][0].get("Outputs", [])
         runtime_arn = next(
             (o["OutputValue"] for o in outputs if o["OutputKey"] == "RuntimeArn"),
@@ -139,7 +139,7 @@ def get_agent_status(cfg: E2EConfig) -> Optional[dict]:
     # Resolve runtime ARN and qualifier from CloudFormation
     cf = boto3.client("cloudformation", region_name=cfg.region)
     try:
-        stacks = cf.describe_stacks(StackName="OpenClawAgentCore")
+        stacks = cf.describe_stacks(StackName=cfg.agentcore_stack_name)
         outputs = stacks["Stacks"][0].get("Outputs", [])
         runtime_arn = next(
             (o["OutputValue"] for o in outputs if o["OutputKey"] == "RuntimeArn"),

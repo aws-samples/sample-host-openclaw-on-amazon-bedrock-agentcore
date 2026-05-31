@@ -28,7 +28,7 @@ Deploy an AI-powered multi-channel messaging bot (Telegram, Slack) on AWS Bedroc
 
 OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Router Lambda handles webhook ingestion from Telegram and Slack, resolves user identity via DynamoDB, and invokes per-user AgentCore sessions. Each user gets their own microVM with workspace persistence (`.openclaw/` directory synced to S3). The agent has built-in tools (web, filesystem, runtime, sessions, automation), custom skills for file storage and cron scheduling, and **EventBridge-based cron scheduling** for recurring tasks.
 
-Users can send **text and images** — photos sent via Telegram or Slack are downloaded by the Router Lambda, stored in S3, and passed to Claude as multimodal content via Bedrock's ConverseStream API. Supported formats: JPEG, PNG, GIF, WebP (max 3.75 MB).
+Users can send **text and images** — photos sent via Telegram or Slack are downloaded by the Router Lambda, stored in S3, and passed to the configured Bedrock model as multimodal content via Bedrock's ConverseStream API. Supported formats: JPEG, PNG, GIF, WebP (max 3.75 MB).
 
 ### Features
 
@@ -56,7 +56,7 @@ flowchart LR
         ROUTER[Router Lambda]
         DDB[(DynamoDB<br/>Identity + Access)]
         AGENT[AgentCore Runtime<br/>Per-User Container]
-        BEDROCK[Amazon Bedrock<br/>Claude]
+        BEDROCK[Amazon Bedrock<br/>Kimi]
         CRON[EventBridge<br/>Scheduler]
         CRONLAMBDA[Cron Lambda]
     end
@@ -71,7 +71,7 @@ flowchart LR
     CRONLAMBDA -->|Bot API| TG & SL
 ```
 
-**How it works:** Messages from Telegram/Slack hit the Router Lambda, which resolves user identity and routes to a per-user AgentCore container. Each user gets isolated compute, persistent workspace, and access to Claude via Bedrock.
+**How it works:** Messages from Telegram/Slack hit the Router Lambda, which resolves user identity and routes to a per-user AgentCore container. Each user gets isolated compute, persistent workspace, and access to the configured Bedrock model.
 
 See [docs/architecture-detailed.md](docs/architecture-detailed.md) for technical details (sequence diagrams, container internals, data flows).
 
@@ -106,7 +106,6 @@ See [docs/security.md](docs/security.md) for the complete security architecture.
 - **Python** >= 3.11 (for CDK app)
 - **Docker** (for building the bridge container image; ARM64 support via Docker Desktop or buildx). Not required if using `BUILD_MODE=codebuild`
 - **AWS CDK** v2 (`npm install -g aws-cdk`)
-- **AgentCore Starter Toolkit** (`pip install bedrock-agentcore-toolkit`)
 - **Telegram Bot Token** from [@BotFather](https://t.me/BotFather)
 
 ## Quick Start
@@ -146,15 +145,32 @@ pip install -r requirements.txt
 cdk bootstrap aws://$CDK_DEFAULT_ACCOUNT/$CDK_DEFAULT_REGION
 ```
 
-### 4. Install the AgentCore Starter Toolkit
+### 4. Create your local deployment env file
 
-The project uses a **hybrid deployment model**: CDK manages infrastructure (VPC, Lambda, DynamoDB, S3, etc.) while the AgentCore Starter Toolkit manages the Runtime (container image, ECR, lifecycle config).
+Copy the template and fill in the values you want to drive deployment with:
 
 ```bash
-pip install bedrock-agentcore-toolkit
+cp .env.template .env
 ```
 
-> After installing, ensure `agentcore` is in your PATH (`which agentcore` should succeed). On some systems, pip installs to `~/.local/bin` which may not be in PATH — add it with `export PATH="$HOME/.local/bin:$PATH"`.
+At minimum, set your environment suffix in `.env`:
+
+```bash
+OPENCLAW_ENV_SUFFIX=dev
+CDK_DEFAULT_REGION=us-east-1
+```
+
+If you also set these Telegram values, deployment will bootstrap the bot automatically:
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:your-bot-token
+TELEGRAM_ADMIN_USER_ID=123456789
+```
+
+That makes `./scripts/deploy.sh` do all of the following without a separate setup step:
+1. Store the Telegram bot token in Secrets Manager
+2. Register the Telegram webhook against the deployed Router URL
+3. Add your Telegram account to the DynamoDB allowlist
 
 ### 5. Deploy
 
@@ -163,12 +179,14 @@ cdk synth          # validate (runs cdk-nag security checks)
 ./scripts/deploy.sh
 ```
 
-The deploy script runs three phases automatically:
-1. **Phase 1 (CDK)** — VPC, Security, AgentCore base, Observability stacks
-2. **Phase 2 (Starter Toolkit)** — Reads CDK outputs, auto-generates `.bedrock_agentcore.yaml`, builds ARM64 container image, deploys AgentCore Runtime
-3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring stacks (depend on Runtime ID from Phase 2)
+By default, this repository uses **unsuffixed** stack names unless you set `OPENCLAW_ENV_SUFFIX`. If you follow `.env.template` as written, you will deploy the **`dev`** environment and get stack names like `OpenClawVpc-dev`, `OpenClawAgentCore-dev`, and `OpenClawRouter-dev`. Override per run with `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh` if you want a different environment.
 
-The script runs pre-flight checks (AWS credentials, CDK CLI, Docker, agentcore CLI) before starting.
+The deploy script runs three phases automatically:
+1. **Phase 1 (CDK)** — VPC, Security, Guardrails, Observability stacks
+2. **Phase 2 (CDK)** — AgentCore runtime stack (container asset, runtime, endpoint, browser, session storage)
+3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring stacks
+
+The script runs pre-flight checks (AWS credentials, CDK CLI, Python venv bootstrap, and Docker when needed) before starting.
 
 **Note on Availability Zones:** Bedrock AgentCore Runtime may not be available in all AZs in a region. If deployment fails with an "unsupported availability zones" error, specify supported AZs in `cdk.json`:
 
@@ -184,42 +202,30 @@ To find supported AZs for your region:
 1. Check the error message from the failed deployment (it lists supported AZ IDs like `use1-az1`, `use1-az2`)
 2. Map AZ IDs to AZ names in your account: `aws ec2 describe-availability-zones --region us-east-1`
 3. Update `availability_zones` in `cdk.json` with the AZ names that match the supported AZ IDs
-4. Redeploy: `cdk destroy OpenClawVpc --force && ./scripts/deploy.sh`
+4. Redeploy: `cdk destroy OpenClawVpc-dev --force && ./scripts/deploy.sh`
 
 #### Build modes
 
-By default, the container image is built **locally** with Docker (`--local-build`). If you don't have Docker or prefer cloud builds, set `BUILD_MODE=codebuild`:
+By default, the deploy script chooses the best supported build path automatically. If Docker buildx can build `linux/arm64`, it uses a local Docker asset build. Otherwise it falls back to CDK's CodeBuild-backed asset publishing.
 
 | Mode | Command | Requires | Notes |
 |------|---------|----------|-------|
-| **local-build** (default) | `./scripts/deploy.sh` | Docker | Builds ARM64 image locally. On x86 hosts, uses QEMU emulation via Docker buildx |
-| **codebuild** | `BUILD_MODE=codebuild ./scripts/deploy.sh` | — | Builds in AWS CodeBuild (no Docker needed, adds ~2 min + CodeBuild cost) |
+| **auto** (default) | `./scripts/deploy.sh` | Docker *or* CodeBuild bootstrap | Uses local Docker buildx for `linux/arm64` when available; otherwise uses CodeBuild |
+| **local-build** | `BUILD_MODE=local-build ./scripts/deploy.sh` | Docker buildx with `linux/arm64` support | Builds the AgentCore image locally and publishes it via CDK assets |
+| **codebuild** | `BUILD_MODE=codebuild ./scripts/deploy.sh` | CDK bootstrap with CodeBuild asset publishing support | Builds and publishes the image through AWS CodeBuild |
 
 #### Running individual phases
 
 ```bash
 ./scripts/deploy.sh --phase1         # CDK foundation only
-./scripts/deploy.sh --runtime-only   # Starter Toolkit only (Phase 2)
+./scripts/deploy.sh --runtime-only   # AgentCore runtime stack only (Phase 2)
 ./scripts/deploy.sh --phase3         # CDK dependent stacks only
-./scripts/deploy.sh --cdk-only       # CDK stacks only (skip toolkit)
+./scripts/deploy.sh --cdk-only       # all CDK phases only
 ```
 
-> **Note:** `.bedrock_agentcore.yaml` is auto-generated by `deploy.sh` from CDK CloudFormation outputs. It contains account-specific values and is gitignored — do not commit it.
+### 6. Optional manual Telegram setup
 
-### 6. Store your Telegram bot token
-
-> **Timing:** The secret is created (empty) by CDK in Phase 1. Store your bot token any time after Phase 1 completes, before testing the bot. It does not need to be stored before running `./scripts/deploy.sh`.
-
-```bash
-aws secretsmanager update-secret \
-  --secret-id openclaw/channels/telegram \
-  --secret-string 'YOUR_TELEGRAM_BOT_TOKEN' \
-  --region $CDK_DEFAULT_REGION
-```
-
-### 7. Set up Telegram webhook and add yourself to the allowlist
-
-The setup script registers the webhook and adds you to the bot's allowlist in one step:
+If you prefer not to put Telegram bootstrap values in `.env`, you can still do the old manual flow after deployment. The setup script now also reads `.env` if present, so you can mix both approaches.
 
 ```bash
 ./scripts/setup-telegram.sh
@@ -227,7 +233,7 @@ The setup script registers the webhook and adds you to the bot's allowlist in on
 
 The script will:
 1. Register the Telegram webhook with API Gateway (with secret token for request validation)
-2. Prompt you for your Telegram user ID (find it via [@userinfobot](https://t.me/userinfobot) on Telegram)
+2. Prompt you for your Telegram user ID unless `TELEGRAM_ADMIN_USER_ID` is already set
 3. Add you to the DynamoDB allowlist so you can use the bot immediately
 
 <details>
@@ -236,18 +242,18 @@ The script will:
 ```bash
 # Get Router API URL
 API_URL=$(aws cloudformation describe-stacks \
-  --stack-name OpenClawRouter \
+  --stack-name OpenClawRouter-dev \
   --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
   --output text --region $CDK_DEFAULT_REGION)
 
 # Get the webhook secret (used for request validation)
 WEBHOOK_SECRET=$(aws secretsmanager get-secret-value \
-  --secret-id openclaw/webhook-secret \
+  --secret-id openclaw/webhook-secret-dev \
   --region $CDK_DEFAULT_REGION --query SecretString --output text)
 
 # Point Telegram to the webhook with secret_token for validation
 TELEGRAM_TOKEN=$(aws secretsmanager get-secret-value \
-  --secret-id openclaw/channels/telegram \
+  --secret-id openclaw/channels/telegram-dev \
   --region $CDK_DEFAULT_REGION --query SecretString --output text)
 curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}webhook/telegram&secret_token=${WEBHOOK_SECRET}"
 
@@ -338,28 +344,32 @@ openclaw-on-agentcore/
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
 | **OpenClawCron** | EventBridge Scheduler group, Cron executor Lambda, Scheduler IAM role | AgentCore, Router, Security |
 
+Physical stack names are suffixed by `environment_suffix`. For example, with `OPENCLAW_ENV_SUFFIX=dev` they become `OpenClawVpc-dev`, `OpenClawAgentCore-dev`, `OpenClawRouter-dev`, and so on.
+
 ## Configuration
 
 All tunable parameters are in `cdk.json`:
 
 | Parameter | Default | Description |
 |---|---|---|
+| `environment_suffix` | `""` | Environment suffix appended to stack names and fixed physical names so multiple deployments can coexist in one account/region. Set it in `.env` or `OPENCLAW_ENV_SUFFIX` when you want suffixed environments like `dev` or `prod` |
+| `reuse_existing_user_files_bucket` | `false` | Reuse an existing user-files S3 bucket instead of creating it. Set this explicitly when you are importing a pre-existing bucket into the stack; CDK no longer probes S3 during synth |
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
-| `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
-| `availability_zones` | `[]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
-| `default_model_id` | `global.anthropic.claude-sonnet-4-6` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
-| `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Set to e.g. `global.anthropic.claude-sonnet-4-6-v1` for faster/cheaper sub-agents |
+| `region` | `""` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
+| `availability_zones` | `["us-east-1b", "us-east-1c"]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
+| `default_model_id` | `moonshotai.kimi-k2.5` | Bedrock model ID used by the main agent runtime |
+| `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Set it explicitly only if you want sub-agents on a different model |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Daily token budget alarm threshold |
 | `daily_cost_budget_usd` | `5` | Daily cost budget alarm threshold (USD) |
 | `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |
 | `session_max_lifetime` | `28800` | Per-user session max lifetime (seconds) |
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
-| `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
+| `router_lambda_timeout_seconds` | `600` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
-| `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
+| `image_version` | `"70"` | Bridge container version tag. Bump to force container redeploy |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
 | `cron_lambda_timeout_seconds` | `600` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
@@ -368,7 +378,9 @@ All tunable parameters are in `cdk.json`:
 | `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. Set `false` to disable (reduces safety but saves cost) |
 | `guardrails_content_filter_level` | `HIGH` | Content filter strength for all categories: `LOW`, `MEDIUM`, or `HIGH` |
 | `guardrails_pii_action` | `ANONYMIZE` | PII handling: `ANONYMIZE` (redact) or `BLOCK` (reject). Credit cards always BLOCK regardless |
-| `enable_browser` | `false` | Enable headless Chromium browser inside the container. Requires `BROWSER_IDENTIFIER` env var |
+| `enable_browser` | `false` | Enable headless Chromium browser inside the container. CDK creates the browser resource and wires `BROWSER_IDENTIFIER` automatically |
+
+Set `environment_suffix` in `cdk.json` or override it per run with `OPENCLAW_ENV_SUFFIX`, for example `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh`. The deploy, undeploy, setup, and E2E helper scripts derive the same suffixed stack names, secret IDs, and DynamoDB table names automatically.
 
 > **Guardrails cost**: Bedrock Guardrails are enabled by default and add ~$0.75 per 1,000 text units on top of model inference costs. To disable, set `"enable_guardrails": false` in `cdk.json`. See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling removes content-level protections but other security layers (STS scoping, tool deny list, SSRF protection) remain active.
 
@@ -382,10 +394,11 @@ All tunable parameters are in `cdk.json`:
 4. Store it in Secrets Manager:
    ```bash
    aws secretsmanager update-secret \
-     --secret-id openclaw/channels/telegram \
+     --secret-id openclaw/channels/telegram-dev \
      --secret-string 'YOUR_BOT_TOKEN' \
      --region $CDK_DEFAULT_REGION
    ```
+   With the default `dev` environment, the secret ID is `openclaw/channels/telegram-dev`.
 5. Set up the webhook (see Quick Start step 7)
 
 ### Slack
@@ -418,7 +431,7 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
 9. Get your API Gateway URL (you'll need this for the Request URL):
     ```bash
     aws cloudformation describe-stacks \
-      --stack-name OpenClawRouter \
+      --stack-name OpenClawRouter-dev \
       --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
       --output text --region $CDK_DEFAULT_REGION
     ```
@@ -440,7 +453,7 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
 16. Store both values:
     ```bash
     aws secretsmanager update-secret \
-      --secret-id openclaw/channels/slack \
+      --secret-id openclaw/channels/slack-dev \
       --secret-string '{"botToken":"xoxb-YOUR-BOT-TOKEN","signingSecret":"YOUR-SIGNING-SECRET"}' \
       --region $CDK_DEFAULT_REGION
     ```
@@ -490,7 +503,7 @@ Users can send photos alongside text messages. The system supports JPEG, PNG, GI
 3. The message payload sent to AgentCore becomes a structured object: `{"text": "caption text", "images": [{"s3Key": "...", "contentType": "image/jpeg"}]}`
 4. **Contract server** converts this to a string with an appended marker: `caption text\n\n[OPENCLAW_IMAGES:[...]]`
 5. **Proxy** extracts the marker, fetches the image bytes from S3 (validating the S3 key belongs to the user's namespace), and builds Bedrock multimodal content blocks
-6. **Bedrock ConverseStream** receives both text and image content, enabling Claude to reason about the image
+6. **Bedrock ConverseStream** receives both text and image content, enabling the configured model to reason about the image
 
 **Telegram**: Photos use the `caption` field for text (not `text`). The Router Lambda checks both. The largest photo size in the `photo` array is used.
 
@@ -557,8 +570,8 @@ The bot will ask for your **timezone** (e.g., `Australia/Sydney`, `America/New_Y
 
 **How it works under the hood:**
 
-1. The bot uses the `eventbridge-cron` skill to create an EventBridge Scheduler rule in the `openclaw-cron` schedule group
-2. At the scheduled time, EventBridge invokes the Cron executor Lambda (`openclaw-cron-executor`)
+1. The bot uses the `eventbridge-cron` skill to create an EventBridge Scheduler rule in the environment-specific schedule group (default: `openclaw-cron-dev`)
+2. At the scheduled time, EventBridge invokes the Cron executor Lambda (default: `openclaw-cron-executor-dev`)
 3. The Lambda warms up the user's AgentCore session (or waits for it to initialize if cold)
 4. The Lambda sends the scheduled message to the agent via AgentCore
 5. The agent processes the message and the Lambda delivers the response to the user's chat channel
@@ -600,7 +613,7 @@ The agent also **proactively detects API keys** — if you paste something that 
 
 The agent can browse the web using a headless Chromium browser running inside the AgentCore container. This is **opt-in** — disabled by default.
 
-**Enable it:** Set `enable_browser` to `true` in `cdk.json` and ensure `BROWSER_IDENTIFIER` is configured in the AgentCore environment. The contract server creates a browser session on init, and the `agentcore-browser` skill scripts communicate with it via a session file.
+**Enable it:** Set `enable_browser` to `true` in `cdk.json`. CDK creates the browser resource and injects `BROWSER_IDENTIFIER` into the runtime environment automatically. The contract server creates a browser session on init, and the `agentcore-browser` skill scripts communicate with it via a session file.
 
 **What you can do:**
 
@@ -677,7 +690,7 @@ During the warm-up phase (~first 1-2 min on cold start), the **lightweight agent
 
 The Router Lambda validates all incoming webhook requests:
 
-- **Telegram**: Validates the `X-Telegram-Bot-Api-Secret-Token` header against the `openclaw/webhook-secret` stored in Secrets Manager. The secret is registered with Telegram via the `secret_token` parameter on `setWebhook`.
+- **Telegram**: Validates the `X-Telegram-Bot-Api-Secret-Token` header against the environment-specific webhook secret stored in Secrets Manager (default: `openclaw/webhook-secret-dev`). The secret is registered with Telegram via the `secret_token` parameter on `setWebhook`.
 - **Slack**: Validates the `X-Slack-Signature` HMAC-SHA256 header using the Slack app's signing secret. Includes 5-minute timestamp check to prevent replay attacks.
 - **API Gateway**: Only explicit routes are exposed (`POST /webhook/telegram`, `POST /webhook/slack`, `GET /health`). All other paths return 404 from API Gateway without invoking the Lambda. Rate limiting is applied (burst: 50, sustained: 100 req/s).
 
@@ -693,7 +706,7 @@ Bedrock invocation logs flow to CloudWatch, where a Lambda processor extracts to
 
 ```bash
 RUNTIME_ID=$(aws cloudformation describe-stacks \
-  --stack-name OpenClawAgentCore \
+  --stack-name OpenClawAgentCore-dev \
   --query "Stacks[0].Outputs[?OutputKey=='RuntimeId'].OutputValue" \
   --output text --region $CDK_DEFAULT_REGION)
 
@@ -705,7 +718,7 @@ aws bedrock-agentcore get-runtime \
 ### Check DynamoDB identity table
 
 ```bash
-aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
+aws dynamodb scan --table-name openclaw-identity-dev --region $CDK_DEFAULT_REGION
 ```
 
 ### Deploy new bridge version
@@ -724,7 +737,7 @@ aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
 docker push \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 # 3. CDK deploy
-cdk deploy OpenClawAgentCore --require-approval never
+cdk deploy OpenClawAgentCore-dev --require-approval never
 # 4. New sessions will use the new image automatically (per-user idle termination)
 ```
 
@@ -780,7 +793,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 - **Signing secret mismatch**: The Lambda validates `X-Slack-Signature` using the signing secret stored in Secrets Manager. Verify it matches:
   ```bash
   aws secretsmanager get-secret-value \
-    --secret-id openclaw/channels/slack \
+   --secret-id openclaw/channels/slack-dev \
     --region $CDK_DEFAULT_REGION \
     --query SecretString --output text
   ```
@@ -792,7 +805,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 - **Token invalid**: Check that the Telegram token in Secrets Manager is correct:
   ```bash
   aws secretsmanager get-secret-value \
-    --secret-id openclaw/channels/telegram \
+   --secret-id openclaw/channels/telegram-dev \
     --region $CDK_DEFAULT_REGION \
     --query SecretString --output text
   ```
@@ -805,7 +818,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 ### 502 / Bedrock authorization errors
 
 - **Model access not enabled**: Enable model access in the Bedrock console for your region.
-- **Cross-region inference**: The default model ID `global.anthropic.claude-opus-4-6-v1` uses a global cross-region inference profile that routes to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions.
+- **Model permissions**: The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` so you can swap Bedrock models in `cdk.json` without changing the role policy.
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
 
@@ -836,18 +849,29 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **ClawHub `--force` flag**: Some skills are flagged by VirusTotal for external API calls. Use `--no-input --force` for non-interactive Docker builds.
 - **`default-user` fallback**: If identity resolution fails, requests fall back to `actorId = "default-user"` — meaning all such users share one S3 namespace. The `USER_ID` env var path (set by contract server) should prevent this in per-user mode.
 - **actorId vs namespace format**: The actorId uses colon format (`telegram:123456789`) while skill scripts expect namespace/underscore format (`telegram_123456789`). The lightweight agent's `chat()` function converts via `userId.replace(/:/g, "_")` before passing to tool scripts. The proxy and workspace sync also use namespace format for S3 keys.
-- **Image version bumps are required**: After pushing a new bridge container image, you must bump `image_version` in `cdk.json` and redeploy `OpenClawAgentCore`. AgentCore caches images by digest and only re-pulls when the runtime endpoint configuration changes. Without the bump, existing sessions continue using the old image.
+- **Image version bumps are required**: After pushing a new bridge container image, you must bump `image_version` in `cdk.json` and redeploy the matching AgentCore stack (default: `OpenClawAgentCore-dev`). AgentCore caches images by digest and only re-pulls when the runtime endpoint configuration changes. Without the bump, existing sessions continue using the old image.
 - **Image upload size limit**: Bedrock Converse API limits images to 3.75 MB. The Router Lambda checks this before uploading to S3.
-- **agentcore CLI urllib3 warnings**: The `agentcore` CLI may emit a `RequestsDependencyWarning` to stdout before its JSON output. This is benign — `deploy.sh` handles mixed output gracefully.
+- **OpenClaw gateway protocol version**: Current OpenClaw gateway clients connect with protocol `4`. The contract bridge now defaults to protocol `4` and retries once with the server-advertised `expectedProtocol` on `PROTOCOL_MISMATCH`, which avoids intermittent `Auth failed: protocol mismatch` errors during mixed-version rollouts or stale sessions.
 - **OpenClaw 2026.3.2 WebSocket origin enforcement**: OpenClaw enforces origin checks on all WebSocket connections carrying an `Origin` header. The `ws` Node.js library must use the `origin` **option** (not `headers.Origin`) to correctly set the header on the HTTP upgrade request. The `controlUi` config requires `allowedOrigins: ["*"]` to accept the origin. Without both the client `origin` option and config `allowedOrigins`, connections fail with: `Auth failed: origin not allowed`.
 
 ## Cleanup
 
 ```bash
-cdk destroy --all
+./scripts/undeploy.sh
 ```
 
-Note: KMS keys and the Cognito User Pool have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed.
+Common cleanup variants:
+
+```bash
+./scripts/undeploy.sh                                   # destroy deployable stacks, keep OpenClawSecurity
+./scripts/undeploy.sh --delete-user-files-bucket        # also delete retained S3 user-files bucket
+./scripts/undeploy.sh --all                             # also destroy OpenClawSecurity
+./scripts/undeploy.sh --all --delete-user-files-bucket  # full reset
+```
+
+The undeploy script destroys the matching AgentCore stack separately (default: `OpenClawAgentCore-dev`), falls back to retaining the AgentCore runtime security group if CloudFormation gets stuck on it, and waits for AgentCore-managed `agentic_ai` ENIs to leave the VPC before deleting the matching VPC stack.
+
+Note: KMS keys and the Cognito User Pool have `RETAIN` removal policies and will not be deleted automatically even with `--all`. Remove them manually if needed.
 
 ## Security
 

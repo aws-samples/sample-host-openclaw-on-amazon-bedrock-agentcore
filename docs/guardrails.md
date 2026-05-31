@@ -85,7 +85,7 @@ Then redeploy:
 
 ```bash
 source .venv/bin/activate
-cdk deploy OpenClawGuardrails OpenClawAgentCore --require-approval never
+cdk deploy OpenClawGuardrails-dev OpenClawAgentCore-dev --require-approval never
 ```
 
 When disabled, the `GuardrailsStack` creates no resources. The proxy receives empty guardrail env vars and skips `guardrailConfig` injection.
@@ -98,9 +98,9 @@ When disabled, the `GuardrailsStack` creates no resources. The proxy receives em
 2. Deploy the guardrails stack:
    ```bash
    source .venv/bin/activate
-   cdk deploy OpenClawGuardrails --require-approval never
+   cdk deploy OpenClawGuardrails-dev --require-approval never
    ```
-3. A new `CfnGuardrailVersion` is created automatically. The container picks up the new version on the next session start (or after redeploying `OpenClawAgentCore`)
+3. A new `CfnGuardrailVersion` is created automatically. The container picks up the new version on the next session start (or after redeploying `OpenClawAgentCore-dev`)
 4. Run the red team eval to verify the change didn't regress pass rates:
    ```bash
    cd redteam && npx promptfoo@latest eval --config evalconfig.yaml

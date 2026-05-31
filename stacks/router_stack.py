@@ -23,7 +23,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import retention_days
+from stacks import DeploymentNamer, retention_days
 
 
 class RouterStack(Stack):
@@ -35,10 +35,15 @@ class RouterStack(Stack):
         runtime_arn: str,
         runtime_endpoint_id: str,
         gateway_token_secret_name: str,
+        gateway_token_secret_arn: str,
         telegram_token_secret_name: str,
+        telegram_token_secret_arn: str,
         slack_token_secret_name: str,
+        slack_token_secret_arn: str,
         feishu_token_secret_name: str,
+        feishu_token_secret_arn: str,
         webhook_secret_name: str,
+        webhook_secret_arn: str,
         cmk_arn: str,
         user_files_bucket_name: str,
         user_files_bucket_arn: str,
@@ -46,19 +51,31 @@ class RouterStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        namer = DeploymentNamer.from_scope(self)
         region = Stack.of(self).region
         account = Stack.of(self).account
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
+        router_function_name = namer.name("openclaw-router")
+        router_api_name = namer.name("openclaw-router")
+        router_log_group_name = namer.name("/openclaw/lambda/router")
+        api_access_log_group_name = namer.name("/openclaw/api-access")
+        secret_resource_arns = [
+            gateway_token_secret_arn,
+            telegram_token_secret_arn,
+            slack_token_secret_arn,
+            feishu_token_secret_arn,
+            webhook_secret_arn,
+        ]
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
         self.identity_table = dynamodb.Table(
             self,
             "IdentityTable",
-            table_name="openclaw-identity",
+            table_name=namer.name("openclaw-identity"),
             partition_key=dynamodb.Attribute(
                 name="PK", type=dynamodb.AttributeType.STRING
             ),
@@ -79,7 +96,7 @@ class RouterStack(Stack):
         router_log_group = logs.LogGroup(
             self,
             "RouterLogGroup",
-            log_group_name="/openclaw/lambda/router",
+            log_group_name=router_log_group_name,
             retention=retention_days(log_retention),
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -88,7 +105,7 @@ class RouterStack(Stack):
         self.router_fn = _lambda.Function(
             self,
             "RouterFn",
-            function_name="openclaw-router",
+            function_name=router_function_name,
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="index.handler",
             code=_lambda.Code.from_asset("lambda/router"),
@@ -120,7 +137,7 @@ class RouterStack(Stack):
         self.http_api = apigwv2.HttpApi(
             self,
             "RouterApi",
-            api_name="openclaw-router",
+            api_name=router_api_name,
             description="OpenClaw webhook ingestion API (explicit routes only)",
         )
 
@@ -150,7 +167,7 @@ class RouterStack(Stack):
         access_log_group = logs.LogGroup(
             self,
             "ApiAccessLogGroup",
-            log_group_name="/openclaw/api-access",
+            log_group_name=api_access_log_group_name,
             retention=retention_days(log_retention),
             removal_policy=RemovalPolicy.RETAIN,
         )
@@ -195,7 +212,7 @@ class RouterStack(Stack):
             iam.PolicyStatement(
                 actions=["lambda:InvokeFunction"],
                 resources=[
-                    f"arn:aws:lambda:{region}:{account}:function:openclaw-router",
+                    f"arn:aws:lambda:{region}:{account}:function:{router_function_name}",
                 ],
             )
         )
@@ -207,9 +224,7 @@ class RouterStack(Stack):
                     "secretsmanager:GetSecretValue",
                     "secretsmanager:DescribeSecret",
                 ],
-                resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
-                ],
+                resources=secret_resource_arns,
             )
         )
 
@@ -265,14 +280,16 @@ class RouterStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
-                    "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
+                    "Secrets Manager scoped to the router's channel and webhook "
+                    "secrets. DynamoDB "
                     "grant_read_write_data adds index wildcards and KMS wildcards "
                     "for CMK-encrypted table. S3 PutObject scoped to */_uploads/* "
                     "prefix for image uploads.",
                     applies_to=[
-                        f"Resource::{runtime_arn}/*",
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
+                        "Resource::<Runtime99E3DDFA.AgentRuntimeArn>/*",
+                        *[f"Resource::{secret_arn}" for secret_arn in secret_resource_arns],
                         f"Resource::{self.identity_table.table_arn}/index/*",
+                        f"Resource::arn:aws:s3:::{user_files_bucket_name}/*/_uploads/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
                         "Action::kms:GenerateDataKey*",
                         "Action::kms:ReEncrypt*",
@@ -299,7 +316,7 @@ class RouterStack(Stack):
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-APIG1",
                     reason="Access logging IS configured via L1 escape hatch "
-                    "(CfnStage.access_log_settings) to /openclaw/api-access log group. "
+                    "(CfnStage.access_log_settings) to the API access log group. "
                     "cdk-nag cannot detect L1-level access log configuration.",
                 ),
             ],

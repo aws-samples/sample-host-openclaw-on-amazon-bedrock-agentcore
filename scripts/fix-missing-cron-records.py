@@ -8,14 +8,30 @@ the current userId so the ownership check passes.
 """
 import boto3
 import json
+import os
+import re
 import sys
 import time
 
+
+def _resolve_env_suffix() -> str:
+    raw = os.environ.get("OPENCLAW_ENV_SUFFIX", "")
+    suffix = raw.strip().lower().strip("-")
+    if suffix and not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", suffix):
+        raise ValueError("OPENCLAW_ENV_SUFFIX must use lowercase letters, digits, and hyphens only")
+    return suffix
+
+
+def _with_suffix(base: str) -> str:
+    suffix = _resolve_env_suffix()
+    return f"{base}-{suffix}" if suffix else base
+
+
 REGION = "ap-southeast-2"
-SCHEDULE_GROUP = "openclaw-cron"
+SCHEDULE_GROUP = _with_suffix("openclaw-cron")
 NAMESPACE_PREFIX = "openclaw-telegram_6087229962-"
 CURRENT_USER_ID = "user_9dc5386ba1124fbd"
-TABLE_NAME = "openclaw-identity"
+TABLE_NAME = _with_suffix("openclaw-identity")
 
 DRY_RUN = "--dry-run" in sys.argv
 

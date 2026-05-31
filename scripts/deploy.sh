@@ -1,33 +1,156 @@
 #!/usr/bin/env bash
-# deploy.sh — Hybrid deployment: CDK + AgentCore Starter Toolkit.
+# deploy.sh — CDK deployment for OpenClaw on Bedrock AgentCore.
 #
 # Three-phase deployment:
-#   Phase 1: CDK deploys foundation (VPC, Security, AgentCore base, Observability)
-#   Phase 2: Starter Toolkit deploys Runtime (ECR, Docker build, Runtime, Endpoint)
+#   Phase 1: CDK deploys foundation (VPC, Security, Guardrails, Observability)
+#   Phase 2: CDK deploys AgentCore runtime (ECR asset, Runtime, Endpoint, Browser)
 #   Phase 3: CDK deploys dependent stacks (Router, Cron, TokenMonitoring)
 #
 # Usage:
 #   ./scripts/deploy.sh                  # full 3-phase deploy
-#   ./scripts/deploy.sh --cdk-only       # CDK stacks only (skip toolkit)
-#   ./scripts/deploy.sh --runtime-only   # toolkit deploy only (Phase 2)
+#   ./scripts/deploy.sh --cdk-only       # all CDK phases only
+#   ./scripts/deploy.sh --runtime-only   # runtime stack only (Phase 2)
 #   ./scripts/deploy.sh --phase1         # Phase 1 only
-#   ./scripts/deploy.sh --phase3         # Phase 3 only (assumes runtime already deployed)
+#   ./scripts/deploy.sh --phase3         # Phase 3 only
 #
 # Environment variables:
-#   BUILD_MODE          local-build (default) or codebuild
-#                       local-build: builds ARM64 container locally with Docker (recommended)
+#   BUILD_MODE          auto (default), local-build, or codebuild
+#                       auto: uses local-build on ARM64 hosts, codebuild on amd64/x86_64 hosts
+#                       local-build: builds ARM64 container locally with Docker
 #                       codebuild: builds in AWS CodeBuild (no Docker required, adds cost)
 #   CDK_DEFAULT_ACCOUNT AWS account ID (auto-detected if not set)
 #   CDK_DEFAULT_REGION  AWS region (falls back to cdk.json, then aws configure)
-#   AGENTCORE_CLI       Path to agentcore CLI (auto-detected)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+VENV_DIR="$PROJECT_DIR/.venv"
+VENV_ACTIVATE="$VENV_DIR/bin/activate"
+VENV_STAMP="$VENV_DIR/.requirements.sha256"
+
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/openclaw-env.sh"
+load_project_env "$PROJECT_DIR"
+
+context_value() {
+  local key="$1"
+  python3 - "$PROJECT_DIR" "$key" <<'PY'
+import json
+import pathlib
+import sys
+
+project_dir = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+try:
+    with open(project_dir / "cdk.json", encoding="utf-8") as fh:
+        print(json.load(fh).get("context", {}).get(key, ""))
+except FileNotFoundError:
+    print("")
+PY
+}
+
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  else
+    shasum -a 256 "$file" | awk '{print $1}'
+  fi
+}
 
 # --- Build mode ---
-BUILD_MODE="${BUILD_MODE:-local-build}"
+BUILD_MODE="${BUILD_MODE:-auto}"
+
+supports_arm64_docker_build() {
+  command -v docker &>/dev/null &&
+    docker info &>/dev/null 2>&1 &&
+    docker buildx ls 2>/dev/null | grep -q "linux/arm64"
+}
+
+resolve_build_mode() {
+  case "$BUILD_MODE" in
+    auto)
+      if supports_arm64_docker_build; then
+        BUILD_MODE="local-build"
+      else
+        BUILD_MODE="codebuild"
+        echo "INFO: Docker buildx linux/arm64 support is unavailable; using BUILD_MODE=codebuild."
+      fi
+      ;;
+    local-build)
+      if ! supports_arm64_docker_build; then
+        echo "ERROR: BUILD_MODE=local-build requires Docker buildx support for linux/arm64."
+        echo "Either configure Docker buildx/QEMU for arm64 or use BUILD_MODE=codebuild."
+        exit 1
+      fi
+      ;;
+    codebuild)
+      ;;
+    *)
+      echo "ERROR: Unsupported BUILD_MODE='$BUILD_MODE'. Use auto, local-build, or codebuild."
+      exit 1
+      ;;
+  esac
+}
+
+activate_nvm() {
+  if [ -s "$NVM_DIR/nvm.sh" ]; then
+    # shellcheck disable=SC1090
+    source "$NVM_DIR/nvm.sh"
+    return 0
+  fi
+  return 1
+}
+
+use_project_node() {
+  if [ ! -f "$PROJECT_DIR/.nvmrc" ]; then
+    return 0
+  fi
+
+  if ! activate_nvm; then
+    echo "WARNING: .nvmrc found but nvm is not available; continuing with system Node ($(node -v 2>/dev/null || echo unknown))."
+    return 0
+  fi
+
+  if ! nvm use --silent >/dev/null 2>&1; then
+    echo "ERROR: Node version $(tr -d '[:space:]' < "$PROJECT_DIR/.nvmrc") from .nvmrc is not installed in nvm."
+    echo "Run: nvm install"
+    exit 1
+  fi
+
+  hash -r
+}
+
+ensure_python_venv() {
+  local requirements_hash
+  local current_hash=""
+
+  if ! command -v python3 &>/dev/null; then
+    echo "ERROR: python3 not found. Install Python 3 to bootstrap $VENV_DIR."
+    exit 1
+  fi
+
+  if [ ! -f "$VENV_ACTIVATE" ]; then
+    echo "--- Creating Python virtualenv ---"
+    python3 -m venv "$VENV_DIR"
+  fi
+
+  # shellcheck disable=SC1091
+  source "$VENV_ACTIVATE"
+
+  requirements_hash=$(sha256_file "$PROJECT_DIR/requirements.txt")
+  if [ -f "$VENV_STAMP" ]; then
+    current_hash=$(cat "$VENV_STAMP")
+  fi
+
+  if [ "$current_hash" != "$requirements_hash" ] || ! python -c "import aws_cdk, cdk_nag, constructs" &>/dev/null; then
+    echo "--- Installing Python dependencies into $VENV_DIR ---"
+    python -m pip install --disable-pip-version-check -r "$PROJECT_DIR/requirements.txt"
+    printf '%s\n' "$requirements_hash" > "$VENV_STAMP"
+  fi
+}
 
 # --- Pre-flight checks ---
 preflight() {
@@ -41,13 +164,7 @@ preflight() {
 
   # CDK CLI
   if ! command -v cdk &>/dev/null; then
-    echo "ERROR: AWS CDK CLI not found. Install with: npm install -g aws-cdk"
-    errors=$((errors + 1))
-  fi
-
-  # Python venv
-  if [ ! -f "$PROJECT_DIR/.venv/bin/activate" ]; then
-    echo "ERROR: Python venv not found. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
+    echo "ERROR: AWS CDK CLI not found for Node $(node -v 2>/dev/null || echo unknown). Install with: npm install -g aws-cdk@latest"
     errors=$((errors + 1))
   fi
 
@@ -62,12 +179,6 @@ preflight() {
     fi
   fi
 
-  # Agentcore CLI
-  if ! command -v "${AGENTCORE_CLI:-agentcore}" &>/dev/null && [ ! -x "$HOME/.local/bin/agentcore" ]; then
-    echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-cli"
-    errors=$((errors + 1))
-  fi
-
   if [ "$errors" -gt 0 ]; then
     echo ""
     echo "Fix the above errors and re-run."
@@ -75,11 +186,31 @@ preflight() {
   fi
 }
 
+use_project_node
+ensure_python_venv
+resolve_build_mode
+OPENCLAW_ENV_SUFFIX="$(resolve_env_suffix "$PROJECT_DIR")"
+export OPENCLAW_ENV_SUFFIX
+STACK_VPC="$(with_suffix OpenClawVpc)"
+STACK_SECURITY="$(with_suffix OpenClawSecurity)"
+STACK_GUARDRAILS="$(with_suffix OpenClawGuardrails)"
+STACK_OBSERVABILITY="$(with_suffix OpenClawObservability)"
+STACK_AGENTCORE="$(with_suffix OpenClawAgentCore)"
+STACK_ROUTER="$(with_suffix OpenClawRouter)"
+STACK_CRON="$(with_suffix OpenClawCron)"
+STACK_TOKEN_MONITORING="$(with_suffix OpenClawTokenMonitoring)"
+TELEGRAM_SECRET_ID="$(with_suffix 'openclaw/channels/telegram')"
+WEBHOOK_SECRET_ID="$(with_suffix 'openclaw/webhook-secret')"
+IDENTITY_TABLE_NAME="$(with_suffix 'openclaw-identity')"
+telegram_setup_attempted=0
+telegram_webhook_configured=0
+telegram_allowlist_configured=0
+
 # Resolve account and region
 ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
-REGION="${CDK_DEFAULT_REGION:-}"
+REGION="${CDK_DEFAULT_REGION:-${AWS_REGION:-}}"
 if [ -z "$REGION" ]; then
-  REGION=$(python3 -c "import json; r=json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('region',''); print(r)" 2>/dev/null || echo "")
+  REGION=$(context_value region 2>/dev/null || echo "")
 fi
 if [ -z "$REGION" ]; then
   REGION=$(aws configure get region 2>/dev/null || echo "")
@@ -97,27 +228,133 @@ fi
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT"
 export CDK_DEFAULT_REGION="$REGION"
 
-# Agentcore CLI path
-AGENTCORE_CLI="${AGENTCORE_CLI:-agentcore}"
-if ! command -v "$AGENTCORE_CLI" &>/dev/null; then
-  AGENTCORE_CLI="$HOME/.local/bin/agentcore"
-fi
-
 # Run pre-flight checks
 preflight
 
-echo "=== OpenClaw Hybrid Deploy ==="
+echo "=== OpenClaw CDK Deploy ==="
 echo "  Account:    $ACCOUNT"
 echo "  Region:     $REGION"
+if [ -n "$OPENCLAW_ENV_SUFFIX" ]; then
+  echo "  Env suffix: $OPENCLAW_ENV_SUFFIX"
+else
+  echo "  Env suffix: (none)"
+fi
 echo "  Build mode: $BUILD_MODE"
 echo ""
 
 MODE="${1:-full}"
+CDK_DEPLOY_FLAGS=(--require-approval never)
+if [ "$BUILD_MODE" = "codebuild" ]; then
+  CDK_DEPLOY_FLAGS+=(--asset-publishing-codebuild)
+fi
 
 activate_venv() {
-  if [ -f "$PROJECT_DIR/.venv/bin/activate" ]; then
+  if [ -f "$VENV_ACTIVATE" ]; then
     # shellcheck disable=SC1091
-    source "$PROJECT_DIR/.venv/bin/activate"
+    source "$VENV_ACTIVATE"
+  fi
+}
+
+update_telegram_secret() {
+  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+    return 0
+  fi
+
+  echo "--- Updating Telegram bot token secret ---"
+  aws secretsmanager update-secret \
+    --secret-id "$TELEGRAM_SECRET_ID" \
+    --secret-string "$TELEGRAM_BOT_TOKEN" \
+    --region "$REGION" >/dev/null
+}
+
+register_telegram_webhook() {
+  local telegram_token="$1"
+  local api_url
+  local webhook_secret
+  local webhook_result
+
+  api_url=$(aws cloudformation describe-stacks \
+    --stack-name "$STACK_ROUTER" \
+    --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+    --output text \
+    --region "$REGION")
+
+  webhook_secret=$(aws secretsmanager get-secret-value \
+    --secret-id "$WEBHOOK_SECRET_ID" \
+    --region "$REGION" \
+    --query SecretString \
+    --output text)
+
+  webhook_result=$(curl -fsS \
+    "https://api.telegram.org/bot${telegram_token}/setWebhook?url=${api_url}webhook/telegram&secret_token=${webhook_secret}")
+  echo "Telegram webhook result: $webhook_result"
+
+  if ! echo "$webhook_result" | grep -q '"ok":true'; then
+    echo "ERROR: Telegram webhook registration failed."
+    exit 1
+  fi
+
+  telegram_webhook_configured=1
+}
+
+allowlist_telegram_admin() {
+  local channel_key
+  local now_iso
+
+  if ! [[ "${TELEGRAM_ADMIN_USER_ID:-}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: TELEGRAM_ADMIN_USER_ID must be numeric. Got: ${TELEGRAM_ADMIN_USER_ID:-}"
+    exit 1
+  fi
+
+  channel_key="telegram:${TELEGRAM_ADMIN_USER_ID}"
+  now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  aws dynamodb put-item \
+    --table-name "$IDENTITY_TABLE_NAME" \
+    --region "$REGION" \
+    --item "{
+      \"PK\": {\"S\": \"ALLOW#${channel_key}\"},
+      \"SK\": {\"S\": \"ALLOW\"},
+      \"channelKey\": {\"S\": \"${channel_key}\"},
+      \"addedAt\": {\"S\": \"${now_iso}\"}
+    }" >/dev/null
+
+  echo "Allowlisted $channel_key"
+  telegram_allowlist_configured=1
+}
+
+configure_telegram_bootstrap() {
+  local telegram_token=""
+
+  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && [ -z "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
+    return 0
+  fi
+
+  telegram_setup_attempted=1
+  update_telegram_secret
+
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+    telegram_token="$TELEGRAM_BOT_TOKEN"
+  else
+    telegram_token=$(aws secretsmanager get-secret-value \
+      --secret-id "$TELEGRAM_SECRET_ID" \
+      --region "$REGION" \
+      --query SecretString \
+      --output text 2>/dev/null || true)
+  fi
+
+  if [ -n "$telegram_token" ]; then
+    echo "--- Registering Telegram webhook ---"
+    register_telegram_webhook "$telegram_token"
+  else
+    echo "WARNING: TELEGRAM_BOT_TOKEN not set and no stored token was found; skipping Telegram webhook registration."
+  fi
+
+  if [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
+    echo "--- Adding Telegram admin to allowlist ---"
+    allowlist_telegram_admin
+  else
+    echo "INFO: TELEGRAM_ADMIN_USER_ID not set; skipping Telegram allowlist bootstrap."
   fi
 }
 
@@ -128,288 +365,25 @@ phase1_cdk() {
   activate_venv
 
   cdk deploy \
-    OpenClawVpc \
-    OpenClawSecurity \
-    OpenClawGuardrails \
-    OpenClawAgentCore \
-    OpenClawObservability \
-    --require-approval never
+    "$STACK_VPC" \
+    "$STACK_SECURITY" \
+    "$STACK_GUARDRAILS" \
+    "$STACK_OBSERVABILITY" \
+    "${CDK_DEPLOY_FLAGS[@]}"
 
   echo "  Phase 1 complete."
   echo ""
 }
 
-# --- Read CDK outputs for toolkit config ---
-read_cdk_outputs() {
-  echo "--- Reading CDK outputs ---"
-
-  EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawAgentCore --region "$REGION" \
-    --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" \
-    --output text)
-
-  SECURITY_GROUP_ID=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawAgentCore --region "$REGION" \
-    --query "Stacks[0].Outputs[?OutputKey=='SecurityGroupId'].OutputValue" \
-    --output text)
-
-  PRIVATE_SUBNET_IDS=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawAgentCore --region "$REGION" \
-    --query "Stacks[0].Outputs[?OutputKey=='PrivateSubnetIds'].OutputValue" \
-    --output text)
-
-  USER_FILES_BUCKET=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawAgentCore --region "$REGION" \
-    --query "Stacks[0].Outputs[?OutputKey=='UserFilesBucketName'].OutputValue" \
-    --output text)
-
-  GATEWAY_TOKEN_SECRET=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'GatewayTokenSecret')].OutputValue" \
-    --output text)
-  # Extract secret name from ARN (last segment after last colon, strip random suffix)
-  GATEWAY_TOKEN_SECRET_ID="openclaw/gateway-token"
-
-  COGNITO_USER_POOL_ID=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'IdentityPoolEC8A1A0D')].OutputValue" \
-    --output text)
-
-  COGNITO_CLIENT_ID=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'IdentityPoolProxyClient')].OutputValue" \
-    --output text)
-
-  COGNITO_PASSWORD_SECRET_ID="openclaw/cognito-password-secret"
-  TELEGRAM_CHANNEL_SECRET_ID="openclaw/channels/telegram"
-
-  CMK_ARN=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'SecretsCmk')].OutputValue" \
-    --output text)
-
-  # Read config values from cdk.json
-  DEFAULT_MODEL_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('default_model_id','global.anthropic.claude-opus-4-6-v1'))")
-  SUBAGENT_MODEL_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('subagent_model_id',''))")
-  IMAGE_VERSION=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('image_version','1'))")
-  WORKSPACE_SYNC_MS=$(python3 -c "import json; print(int(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('workspace_sync_interval_seconds',300))*1000)")
-  CRON_LEAD_TIME=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('cron_lead_time_minutes',5))")
-  SESSION_IDLE=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('session_idle_timeout',1800))")
-  SESSION_MAX=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('session_max_lifetime',28800))")
-
-  echo "  Execution Role: $EXECUTION_ROLE_ARN"
-  echo "  Security Group: $SECURITY_GROUP_ID"
-  echo "  Subnets:        $PRIVATE_SUBNET_IDS"
-  echo "  S3 Bucket:      $USER_FILES_BUCKET"
-}
-
-# --- Check ARM64 build capability (for local-build mode) ---
-check_arm64_build() {
-  local arch
-  arch=$(uname -m)
-  if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
-    return 0  # native ARM64, no QEMU needed
-  fi
-  # x86 host — check for ARM64 emulation via buildx/QEMU
-  if docker buildx ls 2>/dev/null | grep -q "linux/arm64"; then
-    return 0
-  fi
-  echo "WARNING: ARM64 emulation not available. Attempting to register QEMU..."
-  docker run --rm --privileged tonistiigi/binfmt --install arm64 || {
-    echo "ERROR: Could not set up ARM64 emulation. Install QEMU or use BUILD_MODE=codebuild."
-    exit 1
-  }
-}
-
-# --- Phase 2: Starter Toolkit deploy ---
-phase2_toolkit() {
-  echo "=== Phase 2: Starter Toolkit deploy ==="
+# --- Phase 2: CDK runtime deploy ---
+phase2_runtime() {
+  echo "=== Phase 2: AgentCore runtime stack ==="
   cd "$PROJECT_DIR"
+  activate_venv
 
-  read_cdk_outputs
-
-  # Configure the agent (creates/updates .bedrock_agentcore.yaml)
-  echo "--- Configuring agent ---"
-  "$AGENTCORE_CLI" configure \
-    --name openclaw_agent \
-    --entrypoint bridge/agentcore-contract.js \
-    --execution-role "$EXECUTION_ROLE_ARN" \
-    --region "$REGION" \
-    --vpc \
-    --subnets "$PRIVATE_SUBNET_IDS" \
-    --security-groups "$SECURITY_GROUP_ID" \
-    --idle-timeout "$SESSION_IDLE" \
-    --max-lifetime "$SESSION_MAX" \
-    --deployment-type container \
-    --language typescript \
-    --non-interactive
-
-  # Fix: agentcore configure expands source_path to project root, but our
-  # Dockerfile COPY commands expect paths relative to bridge/. Patch it back.
-  local yaml_file="$PROJECT_DIR/.bedrock_agentcore.yaml"
-  if grep -q "source_path:.*$PROJECT_DIR$" "$yaml_file" 2>/dev/null; then
-    local tmp_file="${yaml_file}.tmp"
-    sed "s|source_path: $PROJECT_DIR$|source_path: $PROJECT_DIR/bridge|" "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
-    echo "  (patched source_path -> bridge/)"
-  fi
-
-  # Ensure the generated Dockerfile matches our actual Dockerfile
-  local gen_dockerfile="$PROJECT_DIR/.bedrock_agentcore/openclaw_agent/Dockerfile"
-  if [ -f "$gen_dockerfile" ] && [ -f "$PROJECT_DIR/bridge/Dockerfile" ]; then
-    cp "$PROJECT_DIR/bridge/Dockerfile" "$gen_dockerfile"
-    echo "  (synced Dockerfile from bridge/)"
-  fi
-
-  # Build deploy command based on BUILD_MODE
-  echo "--- Deploying runtime (mode: $BUILD_MODE) ---"
-  local deploy_flags=()
-  if [ "$BUILD_MODE" = "local-build" ]; then
-    check_arm64_build
-    deploy_flags+=("--local-build")
-  fi
-  # codebuild mode: no extra flags (default behavior)
-
-  "$AGENTCORE_CLI" deploy \
-    --agent openclaw_agent \
-    --auto-update-on-conflict \
-    "${deploy_flags[@]}" \
-    --env "AWS_REGION=$REGION" \
-    --env "BEDROCK_MODEL_ID=$DEFAULT_MODEL_ID" \
-    --env "GATEWAY_TOKEN_SECRET_ID=$GATEWAY_TOKEN_SECRET_ID" \
-    --env "COGNITO_USER_POOL_ID=$COGNITO_USER_POOL_ID" \
-    --env "COGNITO_CLIENT_ID=$COGNITO_CLIENT_ID" \
-    --env "COGNITO_PASSWORD_SECRET_ID=$COGNITO_PASSWORD_SECRET_ID" \
-    --env "S3_USER_FILES_BUCKET=$USER_FILES_BUCKET" \
-    --env "WORKSPACE_SYNC_INTERVAL_MS=$WORKSPACE_SYNC_MS" \
-    --env "IMAGE_VERSION=$IMAGE_VERSION" \
-    --env "EXECUTION_ROLE_ARN=$EXECUTION_ROLE_ARN" \
-    --env "CMK_ARN=$CMK_ARN" \
-    --env "EVENTBRIDGE_SCHEDULE_GROUP=openclaw-cron" \
-    --env "CRON_LAMBDA_ARN=arn:aws:lambda:${REGION}:${ACCOUNT}:function:openclaw-cron-executor" \
-    --env "EVENTBRIDGE_ROLE_ARN=arn:aws:iam::${ACCOUNT}:role/openclaw-cron-scheduler-role-${REGION}" \
-    --env "IDENTITY_TABLE_NAME=openclaw-identity" \
-    --env "CRON_LEAD_TIME_MINUTES=$CRON_LEAD_TIME" \
-    --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID" \
-    --env "TELEGRAM_CHANNEL_SECRET_ID=$TELEGRAM_CHANNEL_SECRET_ID"
-
-  # --- Configure session storage (not supported by agentcore CLI yet) ---
-  echo "--- Configuring session storage ---"
-  # Read runtime ID early for the update-agent-runtime call
-  local _early_runtime_id
-  _early_runtime_id=$(python3 -c "
-import re
-with open('$PROJECT_DIR/.bedrock_agentcore.yaml') as f:
-    text = f.read()
-m = re.search(r'agent_id:\s*(\S+)', text)
-print(m.group(1) if m else '')
-" 2>/dev/null || echo "")
-
-  if [ -n "$_early_runtime_id" ]; then
-    python3 -c "
-import boto3, json, sys
-
-client = boto3.client('bedrock-agentcore-control', region_name='$REGION')
-
-# Get current runtime config to preserve all fields
-rt = client.get_agent_runtime(agentRuntimeId='$_early_runtime_id')
-
-# Check if session storage is already configured
-existing_fs = rt.get('filesystemConfigurations', [])
-has_session_storage = any(
-    'sessionStorage' in fs for fs in existing_fs
-)
-
-if has_session_storage:
-    print('  Session storage already configured — skipping.')
-    sys.exit(0)
-
-# Add session storage config (full replace — must include all fields)
-print('  Adding filesystemConfigurations to runtime...')
-client.update_agent_runtime(
-    agentRuntimeId='$_early_runtime_id',
-    agentRuntimeArtifact=rt['agentRuntimeArtifact'],
-    roleArn=rt['roleArn'],
-    networkConfiguration=rt['networkConfiguration'],
-    environmentVariables=rt.get('environmentVariables', {}),
-    filesystemConfigurations=[
-        {'sessionStorage': {'mountPath': '/mnt/workspace'}}
-    ],
-)
-print('  Session storage configured: /mnt/workspace')
-" 2>&1 || echo "  WARNING: Failed to configure session storage (non-fatal)."
-  else
-    echo "  WARNING: Could not determine runtime ID — skipping session storage config."
-  fi
-
-  # Read runtime ID and endpoint ID from toolkit
-  echo "--- Reading runtime info ---"
-  TOOLKIT_STATUS=$("$AGENTCORE_CLI" status --agent openclaw_agent --verbose 2>&1 || true)
-
-  # Extract runtime_id from status output (handles non-JSON prefix lines from warnings)
-  RUNTIME_ID=$(echo "$TOOLKIT_STATUS" | python3 -c "
-import sys, re, json
-text = sys.stdin.read()
-# Try to find JSON object in the output
-m = re.search(r'\{.*\}', text, re.DOTALL)
-if m:
-    try:
-        data = json.loads(m.group())
-        # Navigate nested structure: {config: {agent_id: ...}} or flat {agent_id: ...}
-        cfg = data.get('config', data)
-        rid = cfg.get('agent_id', cfg.get('runtime_id', ''))
-        if rid:
-            print(rid)
-            sys.exit(0)
-    except json.JSONDecodeError:
-        pass
-# Regex fallback
-m = re.search(r'\"agent_id\"\s*:\s*\"([a-zA-Z0-9_-]+)\"', text)
-print(m.group(1) if m else '')
-" 2>/dev/null || echo "")
-
-  # Fallback: read from .bedrock_agentcore.yaml (uses simple text parsing, no yaml dep)
-  if [ -z "$RUNTIME_ID" ]; then
-    RUNTIME_ID=$(python3 -c "
-import re
-with open('$PROJECT_DIR/.bedrock_agentcore.yaml') as f:
-    text = f.read()
-m = re.search(r'agent_id:\s*(\S+)', text)
-print(m.group(1) if m else '')
-" 2>/dev/null || echo "")
-  fi
-
-  if [ -z "$RUNTIME_ID" ]; then
-    echo "WARNING: Could not extract runtime_id from toolkit. You may need to set it manually in cdk.json."
-  else
-    echo "  Runtime ID: $RUNTIME_ID"
-  fi
-
-  # Get endpoint ID
-  ENDPOINT_ID=""
-  if [ -n "$RUNTIME_ID" ]; then
-    ENDPOINT_ID=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
-      --agent-runtime-id "$RUNTIME_ID" \
-      --region "$REGION" \
-      --query "runtimeEndpoints[?name=='DEFAULT'].id | [0]" \
-      --output text 2>/dev/null || echo "")
-    echo "  Endpoint ID: $ENDPOINT_ID"
-  fi
-
-  # Update cdk.json with runtime info
-  if [ -n "$RUNTIME_ID" ] && [ -n "$ENDPOINT_ID" ]; then
-    echo "--- Updating cdk.json with runtime info ---"
-    python3 -c "
-import json
-with open('$PROJECT_DIR/cdk.json') as f:
-    cfg = json.load(f)
-cfg['context']['runtime_id'] = '$RUNTIME_ID'
-cfg['context']['runtime_endpoint_id'] = '$ENDPOINT_ID'
-with open('$PROJECT_DIR/cdk.json', 'w') as f:
-    json.dump(cfg, f, indent=2)
-    f.write('\n')
-"
-    echo "  cdk.json updated."
-  fi
+  cdk deploy \
+    "$STACK_AGENTCORE" \
+    "${CDK_DEPLOY_FLAGS[@]}"
 
   echo "  Phase 2 complete."
   echo ""
@@ -421,18 +395,13 @@ phase3_cdk() {
   cd "$PROJECT_DIR"
   activate_venv
 
-  # Verify runtime_id is set
-  RUNTIME_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_id',''))")
-  if [ -z "$RUNTIME_ID" ] || [ "$RUNTIME_ID" = "PLACEHOLDER" ]; then
-    echo "ERROR: runtime_id not set in cdk.json. Run Phase 2 first."
-    exit 1
-  fi
-
   cdk deploy \
-    OpenClawRouter \
-    OpenClawCron \
-    OpenClawTokenMonitoring \
-    --require-approval never
+    "$STACK_ROUTER" \
+    "$STACK_CRON" \
+    "$STACK_TOKEN_MONITORING" \
+    "${CDK_DEPLOY_FLAGS[@]}"
+
+  configure_telegram_bootstrap
 
   echo "  Phase 3 complete."
   echo ""
@@ -443,28 +412,35 @@ case "$MODE" in
     phase1_cdk
     ;;
   --runtime-only)
-    phase2_toolkit
+    phase2_runtime
     ;;
   --phase3)
     phase3_cdk
     ;;
   --cdk-only)
     phase1_cdk
+    phase2_runtime
     phase3_cdk
     ;;
   *)
     phase1_cdk
-    phase2_toolkit
+    phase2_runtime
     phase3_cdk
     ;;
 esac
 
 echo "=== Deploy complete ==="
 echo ""
-echo "Next steps:"
-echo "  1. Store your Telegram bot token:"
-echo "     aws secretsmanager update-secret --secret-id openclaw/channels/telegram \\"
-echo "       --secret-string 'YOUR_BOT_TOKEN' --region $REGION"
-echo ""
-echo "  2. Set up webhook:"
-echo "     ./scripts/setup-telegram.sh"
+if [ "$telegram_setup_attempted" -eq 1 ]; then
+  echo "Telegram bootstrap:"
+  if [ "$telegram_webhook_configured" -eq 1 ]; then
+    echo "  - webhook configured"
+  fi
+  if [ "$telegram_allowlist_configured" -eq 1 ]; then
+    echo "  - admin allowlisted"
+  fi
+else
+  echo "Telegram bootstrap was skipped."
+  echo "Add TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_USER_ID to .env to include it in deployment,"
+  echo "or run ./scripts/setup-telegram.sh later."
+fi

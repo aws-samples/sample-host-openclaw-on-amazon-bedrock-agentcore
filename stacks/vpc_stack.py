@@ -10,7 +10,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import retention_days
+from stacks import DeploymentNamer, retention_days
 
 
 class VpcStack(Stack):
@@ -18,6 +18,8 @@ class VpcStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
+        suffix = DeploymentNamer.from_scope(self).suffix
+        is_dev = suffix == "dev"
 
         # --- VPC ----------------------------------------------------------
         # Allow users to override AZs via context if AgentCore Runtime has AZ restrictions
@@ -26,20 +28,24 @@ class VpcStack(Stack):
 
         vpc_kwargs = {
             "ip_addresses": ec2.IpAddresses.cidr("10.0.0.0/16"),
-            "nat_gateways": 1,
+            "nat_gateways": 0 if is_dev else 1,
             "subnet_configuration": [
                 ec2.SubnetConfiguration(
                     name="Public",
                     subnet_type=ec2.SubnetType.PUBLIC,
                     cidr_mask=24,
                 ),
+            ],
+        }
+
+        if not is_dev:
+            vpc_kwargs["subnet_configuration"].append(
                 ec2.SubnetConfiguration(
                     name="Private",
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
                     cidr_mask=24,
-                ),
-            ],
-        }
+                )
+            )
 
         if availability_zones:
             vpc_kwargs["availability_zones"] = availability_zones
@@ -84,51 +90,52 @@ class VpcStack(Stack):
             description="HTTPS from VPC (Fargate tasks)",
         )
 
-        # --- VPC Endpoints ------------------------------------------------
-        private_subnets = ec2.SubnetSelection(
-            subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
-        )
-
-        # Bedrock Runtime endpoint: Private DNS disabled so global/* cross-region
-        # inference profiles (e.g. global.anthropic.claude-sonnet-4-6) can route
-        # via NAT gateway to AWS's global routing layer. With private DNS enabled,
-        # bedrock-runtime.{region}.amazonaws.com resolves to the VPC endpoint IP
-        # even when the proxy sets a custom endpoint URL, blocking cross-region calls.
-        # Regional model calls still work — they route via NAT to the public endpoint.
-        self.vpc.add_interface_endpoint(
-            "BedrockRuntimeEndpoint",
-            service=ec2.InterfaceVpcEndpointAwsService.BEDROCK_RUNTIME,
-            subnets=private_subnets,
-            security_groups=[self.vpce_sg],
-            private_dns_enabled=False,  # Disabled: cross-region profiles need NAT→global routing
-        )
-
-        interface_endpoints = {
-            # NOTE: bedrock-agentcore-runtime VPC endpoint service does not exist
-            # in ap-southeast-2 yet. Re-add when the service becomes available.
-            "Ssm": ec2.InterfaceVpcEndpointAwsService.SSM,
-            "EcrApi": ec2.InterfaceVpcEndpointAwsService.ECR,
-            "EcrDkr": ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
-            "SecretsManager": ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
-            "CwLogs": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS,
-            "Monitoring": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_MONITORING,
-        }
-
-        for name, service in interface_endpoints.items():
-            self.vpc.add_interface_endpoint(
-                f"{name}Endpoint",
-                service=service,
-                subnets=private_subnets,
-                security_groups=[self.vpce_sg],
-                private_dns_enabled=True,
+        # --- VPC Endpoints (Only in non-dev) ------------------------------
+        if not is_dev:
+            private_subnets = ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
             )
 
-        # S3 gateway endpoint (free, no SG needed)
-        self.vpc.add_gateway_endpoint(
-            "S3Endpoint",
-            service=ec2.GatewayVpcEndpointAwsService.S3,
-            subnets=[private_subnets],
-        )
+            # Bedrock Runtime endpoint: Private DNS disabled so global/* cross-region
+            # inference profiles (e.g. global.anthropic.claude-sonnet-4-6) can route
+            # via NAT gateway to AWS's global routing layer. With private DNS enabled,
+            # bedrock-runtime.{region}.amazonaws.com resolves to the VPC endpoint IP
+            # even when the proxy sets a custom endpoint URL, blocking cross-region calls.
+            # Regional model calls still work — they route via NAT to the public endpoint.
+            self.vpc.add_interface_endpoint(
+                "BedrockRuntimeEndpoint",
+                service=ec2.InterfaceVpcEndpointAwsService.BEDROCK_RUNTIME,
+                subnets=private_subnets,
+                security_groups=[self.vpce_sg],
+                private_dns_enabled=False,  # Disabled: cross-region profiles need NAT→global routing
+            )
+
+            interface_endpoints = {
+                # NOTE: bedrock-agentcore-runtime VPC endpoint service does not exist
+                # in ap-southeast-2 yet. Re-add when the service becomes available.
+                "Ssm": ec2.InterfaceVpcEndpointAwsService.SSM,
+                "EcrApi": ec2.InterfaceVpcEndpointAwsService.ECR,
+                "EcrDkr": ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
+                "SecretsManager": ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
+                "CwLogs": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS,
+                "Monitoring": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_MONITORING,
+            }
+
+            for name, service in interface_endpoints.items():
+                self.vpc.add_interface_endpoint(
+                    f"{name}Endpoint",
+                    service=service,
+                    subnets=private_subnets,
+                    security_groups=[self.vpce_sg],
+                    private_dns_enabled=True,
+                )
+
+            # S3 gateway endpoint (free, no SG needed)
+            self.vpc.add_gateway_endpoint(
+                "S3Endpoint",
+                service=ec2.GatewayVpcEndpointAwsService.S3,
+                subnets=[private_subnets],
+            )
 
         # --- cdk-nag suppressions ---
         cdk_nag.NagSuppressions.add_resource_suppressions(

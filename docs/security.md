@@ -98,7 +98,7 @@ On container init, the contract server calls `STS:AssumeRole` on the execution r
 | S3 list | Prefix condition: `{namespace}/*` and `{namespace}` |
 | Secrets Manager | `openclaw/user/{namespace}/*` — per-user API key storage, max 10 secrets |
 | DynamoDB | `ForAllValues:StringLike` on `dynamodb:LeadingKeys`: `USER#{actorId}`, `CHANNEL#{actorId}`, and `USER#{internalUserId}` (for CRON# and SESSION records stored under the internal user ID) |
-| EventBridge | Schedule group: `openclaw-cron/*` |
+| EventBridge | Schedule group: environment-specific (default: `openclaw-cron-dev/*`) |
 | IAM PassRole | Only the EventBridge scheduler role |
 | KMS | `kms:Decrypt`, `kms:GenerateDataKey`, `kms:GenerateDataKeyWithoutPlaintext` on project CMK only (when set) |
 
@@ -156,13 +156,15 @@ Seven system secrets are stored in AWS Secrets Manager, all encrypted with the p
 
 | Secret | Purpose |
 |---|---|
-| `openclaw/gateway-token` | Auto-generated 64-char token for WebSocket auth |
-| `openclaw/webhook-secret` | 64-char token for Telegram/Slack webhook validation |
-| `openclaw/cognito-password-secret` | HMAC key for deriving Cognito user passwords |
-| `openclaw/channels/telegram` | Telegram Bot API token |
-| `openclaw/channels/slack` | Slack bot token + signing secret (JSON) |
-| `openclaw/channels/discord` | Discord bot token (placeholder) |
-| `openclaw/channels/whatsapp` | WhatsApp bot token (placeholder) |
+| `openclaw/gateway-token-dev` | Auto-generated 64-char token for WebSocket auth |
+| `openclaw/webhook-secret-dev` | 64-char token for Telegram/Slack webhook validation |
+| `openclaw/cognito-password-secret-dev` | HMAC key for deriving Cognito user passwords |
+| `openclaw/channels/telegram-dev` | Telegram Bot API token |
+| `openclaw/channels/slack-dev` | Slack bot token + signing secret (JSON) |
+| `openclaw/channels/discord-dev` | Discord bot token (placeholder) |
+| `openclaw/channels/whatsapp-dev` | WhatsApp bot token (placeholder) |
+
+The default environment suffix is empty. Set `OPENCLAW_ENV_SUFFIX` or `context.environment_suffix` when you want a named environment such as `dev` or `prod`.
 
 #### Per-User API Key Storage (Secrets Manager)
 
@@ -440,13 +442,13 @@ The `TestGuardrailSecurity` class in `tests/e2e/bot_test.py` validates guardrail
 ```bash
 # Rotate a channel bot token
 aws secretsmanager update-secret \
-  --secret-id openclaw/channels/telegram \
+  --secret-id openclaw/channels/telegram-dev \
   --secret-string 'NEW_BOT_TOKEN' \
   --region $CDK_DEFAULT_REGION
 
 # The Router Lambda will pick up the new value within 15 minutes (cache TTL).
 # To force immediate refresh, redeploy the Lambda:
-cdk deploy OpenClawRouter --require-approval never
+cdk deploy OpenClawRouter-dev --require-approval never
 ```
 
 ### Managing the User Allowlist
