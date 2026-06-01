@@ -51,6 +51,7 @@ credentials.json
 # ──────────────────────────────────────────────
 .idea/
 .vscode/
+.antigravitycli/
 *.swp
 *.swo
 *~
