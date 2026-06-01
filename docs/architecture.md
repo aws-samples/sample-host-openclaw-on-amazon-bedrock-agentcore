@@ -58,11 +58,11 @@
 |  |  +----------------------------------------------+ |                                    |
 |  |  |  Public Subnets (2 AZ)                       | |                                    |
 |  |  |  +----------------+  +---------------------+ | |                                    |
-|  |  |  | NAT Gateway    |  | Internet Gateway    | | |                                    |
+|  |  |  | NAT Gateway*   |  | Internet Gateway    | | |                                    |
 |  |  |  +-------+--------+  +----------+----------+ | |                                    |
 |  |  +----------|-------------------------|---------+ |                                    |
 |  |  |          v                         |           |                                    |
-|  |  |  Private Subnets (2 AZ)            |           |                                    |
+|  |  |  Private Subnets (2 AZ)*           |           |                                    |
 |  |  |                                                |                                    |
 |  |  |  +------------------------------------------+  |                                    |
 |  |  |  |  AgentCore Runtime Container (ARM64)     |  |                                    |
@@ -88,7 +88,7 @@
 |  |  |  +---------------------|--------------------+  |                                    |
 |  |  |                        |                       |                                    |
 |  |  |  +---------------------v--------------------+  |                                    |
-|  |  |  |  VPC Endpoints (Interface)               |  |                                    |
+|  |  |  |  VPC Endpoints (Interface)*              |  |                                    |
 |  |  |  |  - bedrock-runtime    - ecr.api          |  |                                    |
 |  |  |  |  - secretsmanager     - ecr.dkr          |  |                                    |
 |  |  |  |  - logs               - monitoring       |  |                                    |
@@ -108,6 +108,8 @@
 |  |                                                                                         |
 +--+-----------------------------------------------------------------------------------------+
 ```
+
+\* This diagram shows the **`environment_suffix != "dev"`** deployment shape. In the current CDK code, **`environment_suffix == "dev"`** uses **AgentCore public network mode**, with **public subnets only**, **no private subnets**, **no NAT gateway**, and **no VPC endpoints**.
 
 ## Per-User Session Lifecycle
 
@@ -361,9 +363,9 @@
 | API Gateway | Throttling | Burst: 50, sustained: 100 req/s |
 | Webhook | Telegram validation | `X-Telegram-Bot-Api-Secret-Token` header against Secrets Manager secret |
 | Webhook | Slack validation | `X-Slack-Signature` HMAC-SHA256 with 5-minute replay window |
-| Network | VPC + private subnets | Container runs in private subnets, egress via NAT |
-| Network | SG egress HTTPS only | Container outbound traffic restricted to TCP 443 |
-| Network | VPC endpoints (7) | Bedrock, ECR, Secrets Manager, Logs, Metrics, SSM, S3 |
+| Network | `environment_suffix != "dev"` | AgentCore runtime uses VPC mode, private subnets, NAT, and VPC endpoints |
+| Network | `environment_suffix == "dev"` | AgentCore runtime uses public network mode; VPC stack is public-subnets-only with no NAT and no VPC endpoints |
+| Network | SG egress HTTPS only | In VPC mode, container outbound traffic is restricted to TCP 443 |
 | Encryption | KMS CMK | All data encrypted with customer-managed key (S3, DynamoDB, SNS, CloudTrail, Secrets Manager) |
 | Secrets | Secrets Manager | 7 secrets: gateway token, webhook secret, cognito HMAC, 4 channel tokens |
 | Identity | DynamoDB | Channel-to-user mapping, cross-channel binding, session management |

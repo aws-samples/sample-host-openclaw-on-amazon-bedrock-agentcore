@@ -7,14 +7,21 @@
 #   ./scripts/manage-allowlist.sh remove telegram:123456
 #   ./scripts/manage-allowlist.sh list
 #
-# Uses the openclaw-identity DynamoDB table.
+# Uses the environment-specific identity DynamoDB table.
 # Requires: aws cli, appropriate IAM permissions.
 # Set AWS_PROFILE and AWS_REGION as needed.
 
 set -euo pipefail
 
-TABLE_NAME="${IDENTITY_TABLE_NAME:-openclaw-identity}"
-REGION="${AWS_REGION:-us-west-2}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/openclaw-env.sh"
+load_project_env "$PROJECT_DIR"
+
+OPENCLAW_ENV_SUFFIX="$(resolve_env_suffix "$PROJECT_DIR")"
+TABLE_NAME="${IDENTITY_TABLE_NAME:-$(with_suffix "openclaw-identity")}"
+REGION="${CDK_DEFAULT_REGION:-${AWS_REGION:-us-west-2}}"
 PROFILE_ARG=""
 if [ -n "${AWS_PROFILE:-}" ]; then
     PROFILE_ARG="--profile $AWS_PROFILE"

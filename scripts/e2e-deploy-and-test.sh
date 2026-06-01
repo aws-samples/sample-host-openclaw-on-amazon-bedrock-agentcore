@@ -4,11 +4,44 @@
 # Usage: ./scripts/e2e-deploy-and-test.sh [--skip-deploy] [--test-filter PATTERN]
 set -euo pipefail
 
-REGION="ap-southeast-2"
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SKIP_DEPLOY=false
 TEST_FILTER="${2:-}"
+# shellcheck disable=SC1091
+source "$PROJECT_DIR/scripts/lib/openclaw-env.sh"
+load_project_env "$PROJECT_DIR"
+
+context_value() {
+  local key="$1"
+  python3 - "$PROJECT_DIR" "$key" <<'PY'
+import json
+import pathlib
+import sys
+
+project_dir = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+try:
+    with open(project_dir / "cdk.json", encoding="utf-8") as fh:
+        print(json.load(fh).get("context", {}).get(key, ""))
+except FileNotFoundError:
+    print("")
+PY
+}
+
+OPENCLAW_ENV_SUFFIX="$(resolve_env_suffix "$PROJECT_DIR")"
+REGION="${CDK_DEFAULT_REGION:-${AWS_REGION:-}}"
+if [ -z "$REGION" ]; then
+  REGION=$(context_value region 2>/dev/null || echo "")
+fi
+if [ -z "$REGION" ]; then
+  REGION=$(aws configure get region 2>/dev/null || echo "")
+fi
+if [ -z "$REGION" ]; then
+  echo "ERROR: Could not determine AWS region. Set CDK_DEFAULT_REGION, configure region in cdk.json, or run 'aws configure'."
+  exit 1
+fi
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+TELEGRAM_SECRET_ID="$(with_suffix "openclaw/channels/telegram")"
 
 for arg in "$@"; do
   case $arg in
@@ -23,7 +56,7 @@ send_telegram() {
   local msg="$1"
   local token
   token=$(aws secretsmanager get-secret-value \
-    --secret-id openclaw/channels/telegram \
+    --secret-id "$TELEGRAM_SECRET_ID" \
     --region "$REGION" --query SecretString --output text 2>/dev/null) || return 0
   curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
     -H "Content-Type: application/json" \
@@ -46,7 +79,7 @@ Step 1/4: Deploying to AWS..."
   echo "── Step 1: CDK Deploy ──────────────────────────"
   source .venv/bin/activate
 
-  # Bump image_version
+  # Bump image_version so the CDK asset runtime is republished
   CURRENT_VERSION=$(python3 -c "import json; print(json.load(open('cdk.json'))['context']['image_version'])")
   NEW_VERSION=$((CURRENT_VERSION + 1))
   python3 -c "
@@ -60,28 +93,10 @@ print(f'Bumped image_version: $CURRENT_VERSION → $NEW_VERSION')
   echo "Running cdk synth..."
   cdk synth --quiet 2>&1 | tail -5
 
-  echo "Deploying all stacks..."
-  cdk deploy --all --require-approval never 2>&1 | tail -30
-
-  echo ""
-  echo "── Step 2: Build + Push Docker Image ──────────"
-  ECR_URI=$(aws ecr describe-repositories \
-    --repository-names openclaw-bridge \
-    --region "$REGION" \
-    --query "repositories[0].repositoryUri" --output text 2>/dev/null)
-
-  aws ecr get-login-password --region "$REGION" | \
-    docker login --username AWS --password-stdin "$ECR_URI" 2>/dev/null
-
-  echo "Building ARM64 image v${NEW_VERSION}..."
-  docker build --platform linux/arm64 -t "openclaw-bridge:v${NEW_VERSION}" bridge/ 2>&1 | tail -10
-
-  docker tag "openclaw-bridge:v${NEW_VERSION}" "${ECR_URI}:v${NEW_VERSION}"
-  echo "Pushing ${ECR_URI}:v${NEW_VERSION}..."
-  docker push "${ECR_URI}:v${NEW_VERSION}" 2>&1 | tail -5
+  echo "Deploying with CDK asset pipeline..."
+  ./scripts/deploy.sh 2>&1 | tail -30
 
   send_telegram "✅ *Deploy complete*
-Image v${NEW_VERSION} pushed to ECR.
 Step 2/4: Resetting sessions..."
 else
   echo "── Skipping deploy (--skip-deploy) ────────────"

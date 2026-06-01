@@ -1026,7 +1026,7 @@ class TestCronSchedule:
     SCHEDULE_EXPR = "cron(0 0 1 1 ? 2099)"
     SCHEDULE_TZ = "UTC"
     SCHEDULE_MSG = "E2E cron test - should never fire"
-    SCHEDULE_GROUP = "openclaw-cron"
+    SCHEDULE_GROUP = None
 
     # Populated by test_create_schedule for use by later tests
     _schedule_id = None
@@ -1034,6 +1034,7 @@ class TestCronSchedule:
     @pytest.fixture(autouse=True, scope="class")
     def fresh_session(self, e2e_config):
         """Reset session to start clean, then clean up stale test schedules."""
+        type(self).SCHEDULE_GROUP = e2e_config.schedule_group
         # Clean up any leftover test schedules from prior runs
         self._cleanup_stale_schedules(e2e_config)
         reset_session(e2e_config)
@@ -1272,8 +1273,8 @@ class TestCronExecution:
     Run with: pytest tests/e2e/bot_test.py -v -k TestCronExecution
     """
 
-    SCHEDULE_GROUP = "openclaw-cron"
-    CRON_LAMBDA_NAME = "openclaw-cron-executor"
+    SCHEDULE_GROUP = None
+    CRON_LAMBDA_NAME = None
 
     SCHEDULE_NAME = "e2e-exec-test"
     SCHEDULE_EXPR = "cron(0 0 1 1 ? 2099)"
@@ -1288,6 +1289,8 @@ class TestCronExecution:
     @pytest.fixture(autouse=True, scope="class")
     def fresh_session(self, e2e_config):
         """Reset session to start clean, then clean up stale test schedules."""
+        type(self).SCHEDULE_GROUP = e2e_config.schedule_group
+        type(self).CRON_LAMBDA_NAME = e2e_config.cron_lambda_name
         self._cleanup_stale_schedules(e2e_config)
         reset_session(e2e_config)
         time.sleep(2)

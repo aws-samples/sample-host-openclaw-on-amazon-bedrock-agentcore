@@ -28,7 +28,7 @@ Deploy an AI-powered multi-channel messaging bot (Telegram, Slack) on AWS Bedroc
 
 OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Router Lambda handles webhook ingestion from Telegram and Slack, resolves user identity via DynamoDB, and invokes per-user AgentCore sessions. Each user gets their own microVM with workspace persistence (`.openclaw/` directory synced to S3). The agent has built-in tools (web, filesystem, runtime, sessions, automation), custom skills for file storage and cron scheduling, and **EventBridge-based cron scheduling** for recurring tasks.
 
-Users can send **text and images** — photos sent via Telegram or Slack are downloaded by the Router Lambda, stored in S3, and passed to Claude as multimodal content via Bedrock's ConverseStream API. Supported formats: JPEG, PNG, GIF, WebP (max 3.75 MB).
+Users can send **text and images** — photos sent via Telegram or Slack are downloaded by the Router Lambda, stored in S3, and passed to the configured Bedrock model as multimodal content via Bedrock's ConverseStream API. Supported formats: JPEG, PNG, GIF, WebP (max 3.75 MB).
 
 ### Features
 
@@ -44,6 +44,8 @@ Users can send **text and images** — photos sent via Telegram or Slack are dow
 
 ## Architecture
 
+### Shared logical flow
+
 ```mermaid
 flowchart LR
     subgraph Channels
@@ -56,7 +58,7 @@ flowchart LR
         ROUTER[Router Lambda]
         DDB[(DynamoDB<br/>Identity + Access)]
         AGENT[AgentCore Runtime<br/>Per-User Container]
-        BEDROCK[Amazon Bedrock<br/>Claude]
+        BEDROCK[Amazon Bedrock<br/>Kimi]
         CRON[EventBridge<br/>Scheduler]
         CRONLAMBDA[Cron Lambda]
     end
@@ -71,7 +73,41 @@ flowchart LR
     CRONLAMBDA -->|Bot API| TG & SL
 ```
 
-**How it works:** Messages from Telegram/Slack hit the Router Lambda, which resolves user identity and routes to a per-user AgentCore container. Each user gets isolated compute, persistent workspace, and access to Claude via Bedrock.
+**How it works:** Messages from Telegram/Slack hit the Router Lambda, which resolves user identity and routes to a per-user AgentCore container. Each user gets isolated compute, persistent workspace, and access to the configured Bedrock model.
+
+### `environment_suffix == "dev"` architecture (`PUBLIC` network mode)
+
+```mermaid
+flowchart LR
+    TG[Telegram / Slack] --> APIGW[API Gateway]
+    APIGW --> ROUTER[Router Lambda]
+    ROUTER --> DDB[(DynamoDB)]
+    ROUTER --> AGENT[AgentCore Runtime<br/>Public network mode]
+    AGENT --> BEDROCK[Bedrock]
+    AGENT --> S3[S3 user files]
+    AGENT --> SM[Secrets Manager]
+    AGENT --> CW[CloudWatch]
+```
+
+### `environment_suffix != "dev"` architecture (`VPC` network mode)
+
+```mermaid
+flowchart LR
+    TG[Telegram / Slack] --> APIGW[API Gateway]
+    APIGW --> ROUTER[Router Lambda]
+    ROUTER --> DDB[(DynamoDB)]
+
+    subgraph VPC[VPC]
+        subgraph Private[Private subnets]
+            AGENT[AgentCore Runtime<br/>VPC mode]
+        end
+        VPCE[VPC endpoints<br/>S3, Secrets Manager,<br/>ECR, CloudWatch, Bedrock]
+    end
+
+    ROUTER --> AGENT
+    AGENT --> VPCE
+    VPCE --> AWS[AWS services]
+```
 
 See [docs/architecture-detailed.md](docs/architecture-detailed.md) for technical details (sequence diagrams, container internals, data flows).
 
@@ -85,7 +121,7 @@ This lets the system behave like a persistent server (continuous conversation hi
 
 This solution applies **defense-in-depth** across network, application, identity, and data layers. Key controls include:
 
-- **Network isolation**: Private VPC subnets with VPC endpoints; no direct internet exposure for containers
+- **Network isolation**: The code treats `environment_suffix == "dev"` as the public-network case. Any other suffix value, including an empty suffix, uses VPC mode for the AgentCore runtime
 - **Webhook authentication**: Cryptographic validation (Telegram secret token, Slack HMAC-SHA256 with replay protection)
 - **Per-user isolation**: Each user runs in their own AgentCore microVM with dedicated S3 namespace
 - **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3 and DynamoDB to the user's namespace/records — prevents cross-user data access even through shell tools
@@ -98,6 +134,21 @@ This solution applies **defense-in-depth** across network, application, identity
 
 See [docs/security.md](docs/security.md) for the complete security architecture.
 
+**Suffix-based network mode note:** this behavior is currently keyed to the **literal suffix value**. When `environment_suffix == "dev"`, the AgentCore runtime uses public network mode and is **not** attached to the project VPC. The `dev` VPC stack also uses **public subnets only with `nat_gateways = 0`**, so there is **no NAT gateway** in that case. For any other suffix value, including `prod`, `staging`, or an empty suffix, the AgentCore runtime uses **VPC mode**. The `dev` case is still protected by IAM-authenticated runtime access, the Router Lambda entry path, webhook validation, per-user session isolation, scoped AWS credentials, and TLS, but it does **not** have the extra private-subnet and VPC-endpoint isolation used by the VPC-mode case.
+
+| Aspect | `environment_suffix == "dev"` | `environment_suffix != "dev"` |
+| --- | --- | --- |
+| AgentCore runtime network mode | Public network | VPC mode |
+| Attached to project VPC | No | Yes |
+| Private subnets | No | Yes |
+| NAT gateway | No | Yes |
+| VPC endpoints | No | Yes |
+| IAM-authenticated runtime access | Yes | Yes |
+| Router Lambda + webhook validation | Yes | Yes |
+| Per-user isolation + scoped credentials | Yes | Yes |
+| TLS to AWS services | Yes | Yes |
+| Network isolation strength | Lower | Higher |
+
 ## Prerequisites
 
 - **AWS Account** with Bedrock access
@@ -106,7 +157,6 @@ See [docs/security.md](docs/security.md) for the complete security architecture.
 - **Python** >= 3.11 (for CDK app)
 - **Docker** (for building the bridge container image; ARM64 support via Docker Desktop or buildx). Not required if using `BUILD_MODE=codebuild`
 - **AWS CDK** v2 (`npm install -g aws-cdk`)
-- **AgentCore Starter Toolkit** (`pip install bedrock-agentcore-toolkit`)
 - **Telegram Bot Token** from [@BotFather](https://t.me/BotFather)
 
 ## Quick Start
@@ -146,15 +196,50 @@ pip install -r requirements.txt
 cdk bootstrap aws://$CDK_DEFAULT_ACCOUNT/$CDK_DEFAULT_REGION
 ```
 
-### 4. Install the AgentCore Starter Toolkit
+### 4. Create your local deployment env file
 
-The project uses a **hybrid deployment model**: CDK manages infrastructure (VPC, Lambda, DynamoDB, S3, etc.) while the AgentCore Starter Toolkit manages the Runtime (container image, ECR, lifecycle config).
+Copy the template and fill in the values you want to drive deployment with:
 
 ```bash
-pip install bedrock-agentcore-toolkit
+cp .env.template .env
 ```
 
-> After installing, ensure `agentcore` is in your PATH (`which agentcore` should succeed). On some systems, pip installs to `~/.local/bin` which may not be in PATH — add it with `export PATH="$HOME/.local/bin:$PATH"`.
+At minimum, set your environment suffix in `.env`:
+
+```bash
+OPENCLAW_ENV_SUFFIX=dev
+CDK_DEFAULT_REGION=us-east-1
+```
+
+If you keep multiple env files, the scripts load **one file only**:
+
+- default: `.env`
+- override: `OPENCLAW_ENV_FILE=/path/to/file`
+- shortcut: `--env <name>` loads `.env.<name>`
+
+Examples:
+
+```bash
+./scripts/deploy.sh --env dev
+./scripts/deploy.sh --env prod
+./scripts/undeploy.sh --env prod --all
+```
+
+The scripts do **not** merge `.env` with `.env.prod` or `.env.dev`. The selected file is sourced as-is, and its values become the deployment settings for that run. `--env prod` is shorthand for selecting `.env.prod`, and it also requires the final `OPENCLAW_ENV_SUFFIX` to be `prod`.
+
+`deploy.sh` now fails fast before deployment if required settings are missing or inconsistent. For example, it rejects a missing `OPENCLAW_ENV_FILE`, a non-numeric `TELEGRAM_ADMIN_USER_ID`, an invalid-looking `TELEGRAM_BOT_TOKEN`, or Telegram bootstrap settings used with a mode that does not deploy the Router stack.
+
+If you also set these Telegram values, deployment will bootstrap the bot automatically:
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:your-bot-token
+TELEGRAM_ADMIN_USER_ID=123456789
+```
+
+That makes `./scripts/deploy.sh` pass Router-stack bootstrap parameters so a custom resource can do all of the following without a separate setup step:
+1. Store the Telegram bot token in Secrets Manager
+2. Register the Telegram webhook against the deployed Router URL
+3. Add your Telegram account to the DynamoDB allowlist
 
 ### 5. Deploy
 
@@ -163,14 +248,54 @@ cdk synth          # validate (runs cdk-nag security checks)
 ./scripts/deploy.sh
 ```
 
+By default, this repository uses **unsuffixed** stack names unless you set `OPENCLAW_ENV_SUFFIX`. If you follow `.env.template` as written, you will deploy the **`dev`** environment and get stack names like `OpenClawVpc-dev`, `OpenClawAgentCore-dev`, and `OpenClawRouter-dev`. You can either set `OPENCLAW_ENV_SUFFIX=prod` inside the selected env file, pass `./scripts/deploy.sh --env prod`, or override it per run with `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh`.
+
 The deploy script runs three phases automatically:
-1. **Phase 1 (CDK)** — VPC, Security, AgentCore base, Observability stacks
-2. **Phase 2 (Starter Toolkit)** — Reads CDK outputs, auto-generates `.bedrock_agentcore.yaml`, builds ARM64 container image, deploys AgentCore Runtime
-3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring stacks (depend on Runtime ID from Phase 2)
+1. **Phase 1 (CDK)** — VPC, Security, Guardrails, Observability stacks
+2. **Phase 2 (CDK)** — AgentCore runtime stack (container asset, runtime, endpoint, browser, session storage)
+3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring stacks
 
-The script runs pre-flight checks (AWS credentials, CDK CLI, Docker, agentcore CLI) before starting.
+The script runs pre-flight checks (AWS credentials, CDK CLI, Python venv bootstrap, Docker when needed, and required deployment setting validation) before starting.
 
-**Note on Availability Zones:** Bedrock AgentCore Runtime may not be available in all AZs in a region. If deployment fails with an "unsupported availability zones" error, specify supported AZs in `cdk.json`:
+**Bedrock invocation logging is shared per AWS account + region.** It is not isolated by `OPENCLAW_ENV_SUFFIX`. Because of that, exactly one environment in a given account+region should own the Bedrock invocation logging configuration and the CloudWatch Logs subscription filter. Configure that explicitly with:
+
+```bash
+MANAGE_BEDROCK_INVOCATION_LOGGING=true
+```
+
+Set it in one environment only (typically prod) and leave it `false` elsewhere.
+
+Example:
+
+```bash
+# .env.prod
+MANAGE_BEDROCK_INVOCATION_LOGGING=true
+
+# .env.dev
+MANAGE_BEDROCK_INVOCATION_LOGGING=false
+```
+
+**Note on Availability Zones:** Bedrock AgentCore Runtime may not be available in all AZs in a region, and AZ names like `us-east-1a` are account-specific aliases. The better fix is to supply the stable **AZ IDs** that AgentCore reports and let the deploy script resolve them to the correct AZ names for your account before creating the VPC.
+
+Add this to your selected env file:
+
+```bash
+AGENTCORE_SUPPORTED_AZ_IDS=use1-az4,use1-az1,use1-az2
+```
+
+Or set the same data in `cdk.json`:
+
+```json
+{
+  "context": {
+    "agentcore_supported_availability_zone_ids": ["use1-az4", "use1-az1", "use1-az2"]
+  }
+}
+```
+
+At deploy time, `./scripts/deploy.sh` resolves those stable AZ IDs to this account's AZ names (for example `us-east-1b`, `us-east-1c`) and passes the resolved names into CDK. That means the **VPC is created to match AgentCore's supported subnets**, instead of relying on CDK's default AZ ordering.
+
+If you need a manual override, you can still set `availability_zones` directly in `cdk.json`:
 
 ```json
 {
@@ -180,46 +305,34 @@ The script runs pre-flight checks (AWS credentials, CDK CLI, Docker, agentcore C
 }
 ```
 
-To find supported AZs for your region:
-1. Check the error message from the failed deployment (it lists supported AZ IDs like `use1-az1`, `use1-az2`)
-2. Map AZ IDs to AZ names in your account: `aws ec2 describe-availability-zones --region us-east-1`
-3. Update `availability_zones` in `cdk.json` with the AZ names that match the supported AZ IDs
-4. Redeploy: `cdk destroy OpenClawVpc --force && ./scripts/deploy.sh`
+To recover from an AZ mismatch:
+1. Check the AgentCore error message for the supported AZ IDs (for example `use1-az4,use1-az1,use1-az2`)
+2. Put those IDs into `AGENTCORE_SUPPORTED_AZ_IDS` in your selected env file
+3. Redeploy with `./scripts/deploy.sh`
+4. If the VPC was already created in unsupported AZs, destroy the VPC stack first, then deploy again
 
 #### Build modes
 
-By default, the container image is built **locally** with Docker (`--local-build`). If you don't have Docker or prefer cloud builds, set `BUILD_MODE=codebuild`:
+By default, the deploy script chooses the best supported build path automatically. If Docker buildx can build `linux/arm64`, it uses a local Docker asset build. Otherwise it falls back to CDK's CodeBuild-backed asset publishing.
 
 | Mode | Command | Requires | Notes |
 |------|---------|----------|-------|
-| **local-build** (default) | `./scripts/deploy.sh` | Docker | Builds ARM64 image locally. On x86 hosts, uses QEMU emulation via Docker buildx |
-| **codebuild** | `BUILD_MODE=codebuild ./scripts/deploy.sh` | — | Builds in AWS CodeBuild (no Docker needed, adds ~2 min + CodeBuild cost) |
+| **auto** (default) | `./scripts/deploy.sh` | Docker *or* CodeBuild bootstrap | Uses local Docker buildx for `linux/arm64` when available; otherwise uses CodeBuild |
+| **local-build** | `BUILD_MODE=local-build ./scripts/deploy.sh` | Docker buildx with `linux/arm64` support | Builds the AgentCore image locally and publishes it via CDK assets |
+| **codebuild** | `BUILD_MODE=codebuild ./scripts/deploy.sh` | CDK bootstrap with CodeBuild asset publishing support | Builds and publishes the image through AWS CodeBuild |
 
 #### Running individual phases
 
 ```bash
 ./scripts/deploy.sh --phase1         # CDK foundation only
-./scripts/deploy.sh --runtime-only   # Starter Toolkit only (Phase 2)
+./scripts/deploy.sh --runtime-only   # AgentCore runtime stack only (Phase 2)
 ./scripts/deploy.sh --phase3         # CDK dependent stacks only
-./scripts/deploy.sh --cdk-only       # CDK stacks only (skip toolkit)
+./scripts/deploy.sh --cdk-only       # all CDK phases only
 ```
 
-> **Note:** `.bedrock_agentcore.yaml` is auto-generated by `deploy.sh` from CDK CloudFormation outputs. It contains account-specific values and is gitignored — do not commit it.
+### 6. Optional manual Telegram setup
 
-### 6. Store your Telegram bot token
-
-> **Timing:** The secret is created (empty) by CDK in Phase 1. Store your bot token any time after Phase 1 completes, before testing the bot. It does not need to be stored before running `./scripts/deploy.sh`.
-
-```bash
-aws secretsmanager update-secret \
-  --secret-id openclaw/channels/telegram \
-  --secret-string 'YOUR_TELEGRAM_BOT_TOKEN' \
-  --region $CDK_DEFAULT_REGION
-```
-
-### 7. Set up Telegram webhook and add yourself to the allowlist
-
-The setup script registers the webhook and adds you to the bot's allowlist in one step:
+If you prefer not to put Telegram bootstrap values in `.env`, you can still do the old manual flow after deployment. The setup script now also reads `.env` if present, so you can mix both approaches.
 
 ```bash
 ./scripts/setup-telegram.sh
@@ -227,7 +340,7 @@ The setup script registers the webhook and adds you to the bot's allowlist in on
 
 The script will:
 1. Register the Telegram webhook with API Gateway (with secret token for request validation)
-2. Prompt you for your Telegram user ID (find it via [@userinfobot](https://t.me/userinfobot) on Telegram)
+2. Prompt you for your Telegram user ID unless `TELEGRAM_ADMIN_USER_ID` is already set
 3. Add you to the DynamoDB allowlist so you can use the bot immediately
 
 <details>
@@ -236,18 +349,18 @@ The script will:
 ```bash
 # Get Router API URL
 API_URL=$(aws cloudformation describe-stacks \
-  --stack-name OpenClawRouter \
+  --stack-name OpenClawRouter-dev \
   --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
   --output text --region $CDK_DEFAULT_REGION)
 
 # Get the webhook secret (used for request validation)
 WEBHOOK_SECRET=$(aws secretsmanager get-secret-value \
-  --secret-id openclaw/webhook-secret \
+  --secret-id openclaw/webhook-secret-dev \
   --region $CDK_DEFAULT_REGION --query SecretString --output text)
 
 # Point Telegram to the webhook with secret_token for validation
 TELEGRAM_TOKEN=$(aws secretsmanager get-secret-value \
-  --secret-id openclaw/channels/telegram \
+  --secret-id openclaw/channels/telegram-dev \
   --region $CDK_DEFAULT_REGION --query SecretString --output text)
 curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}webhook/telegram&secret_token=${WEBHOOK_SECRET}"
 
@@ -270,7 +383,7 @@ openclaw-on-agentcore/
   requirements.txt                # Python deps (aws-cdk-lib, cdk-nag)
   stacks/
     __init__.py                   # Shared helper (RetentionDays converter)
-    vpc_stack.py                  # VPC, subnets, NAT, 7 VPC endpoints, flow logs
+    vpc_stack.py                  # VPC foundation; `dev` = public-only/no endpoints, other suffixes = private subnets + NAT + VPC endpoints
     security_stack.py             # KMS CMK, Secrets Manager, Cognito, optional CloudTrail
     agentcore_stack.py            # Runtime, WorkloadIdentity, ECR, S3, IAM
     router_stack.py               # Router Lambda + API Gateway HTTP API + DynamoDB identity
@@ -329,14 +442,16 @@ openclaw-on-agentcore/
 
 | Stack | Resources | Dependencies |
 |---|---|---|
-| **OpenClawVpc** | VPC (2 AZ), private/public subnets, NAT, 7 VPC endpoints, flow logs | None |
+| **OpenClawVpc** | VPC foundation. `environment_suffix == "dev"`: public subnets only, no NAT, no VPC endpoints. Other suffixes: public + private subnets, NAT, VPC endpoints, flow logs | None |
 | **OpenClawSecurity** | KMS CMK, Secrets Manager (7 secrets incl. webhook validation), Cognito User Pool, optional CloudTrail | None |
 | **OpenClawGuardrails** | CfnGuardrail (content filters, topic denial, PII, word filters, regex), CfnGuardrailVersion | Security |
-| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM | Vpc, Security, Guardrails |
+| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM. Runtime network mode is `PUBLIC` only when `environment_suffix == "dev"`; otherwise it uses VPC mode | Vpc, Security, Guardrails |
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms (errors, latency, throttles), SNS, Bedrock logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
 | **OpenClawCron** | EventBridge Scheduler group, Cron executor Lambda, Scheduler IAM role | AgentCore, Router, Security |
+
+Physical stack names are suffixed by `environment_suffix`. For example, with `OPENCLAW_ENV_SUFFIX=dev` they become `OpenClawVpc-dev`, `OpenClawAgentCore-dev`, `OpenClawRouter-dev`, and so on.
 
 ## Configuration
 
@@ -344,22 +459,26 @@ All tunable parameters are in `cdk.json`:
 
 | Parameter | Default | Description |
 |---|---|---|
+| `environment_suffix` | `""` | Environment suffix appended to stack names and fixed physical names so multiple deployments can coexist in one account/region. Set it in `.env` or `OPENCLAW_ENV_SUFFIX` when you want suffixed environments like `dev` or `prod` |
+| `retain_stateful_resources` | `true` | Controls whether stateful resources use `RemovalPolicy.RETAIN` or `RemovalPolicy.DESTROY`. You can set it in `cdk.json`, but `.env` `RETAIN_STATEFUL_RESOURCES=true|false` is also honored by `deploy.sh` |
+| `reuse_existing_user_files_bucket` | `false` | Reuse an existing user-files S3 bucket instead of creating it. If left unset, the AgentCore stack now uses boto3 `head_bucket()` during synth to auto-import a retained bucket with the expected name when it already exists |
+| `manage_bedrock_invocation_logging` | `false` | Whether this environment owns the shared Bedrock model invocation logging configuration and CloudWatch Logs subscription. Set this to `true` in exactly one environment per AWS account+region |
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
-| `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
-| `availability_zones` | `[]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
-| `default_model_id` | `global.anthropic.claude-sonnet-4-6` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
-| `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Set to e.g. `global.anthropic.claude-sonnet-4-6-v1` for faster/cheaper sub-agents |
+| `region` | `""` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
+| `availability_zones` | `["us-east-1b", "us-east-1c"]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
+| `default_model_id` | `moonshotai.kimi-k2.5` | Bedrock model ID used by the main agent runtime |
+| `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Set it explicitly only if you want sub-agents on a different model |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Daily token budget alarm threshold |
 | `daily_cost_budget_usd` | `5` | Daily cost budget alarm threshold (USD) |
 | `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |
 | `session_max_lifetime` | `28800` | Per-user session max lifetime (seconds) |
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
-| `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
+| `router_lambda_timeout_seconds` | `600` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
-| `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
+| `image_version` | `"70"` | Bridge container version tag. Bump to force container redeploy |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
 | `cron_lambda_timeout_seconds` | `600` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
@@ -368,7 +487,52 @@ All tunable parameters are in `cdk.json`:
 | `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. Set `false` to disable (reduces safety but saves cost) |
 | `guardrails_content_filter_level` | `HIGH` | Content filter strength for all categories: `LOW`, `MEDIUM`, or `HIGH` |
 | `guardrails_pii_action` | `ANONYMIZE` | PII handling: `ANONYMIZE` (redact) or `BLOCK` (reject). Credit cards always BLOCK regardless |
-| `enable_browser` | `false` | Enable headless Chromium browser inside the container. Requires `BROWSER_IDENTIFIER` env var |
+| `enable_browser` | `false` | Enable headless Chromium browser inside the container. CDK creates the browser resource and wires `BROWSER_IDENTIFIER` automatically |
+
+Set `environment_suffix` in `cdk.json` or override it per run with `OPENCLAW_ENV_SUFFIX`, for example `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh` or `./scripts/deploy.sh --env prod`. The deploy, undeploy, setup, and E2E helper scripts derive the same suffixed stack names, secret IDs, and DynamoDB table names automatically.
+
+Named resources that are intentionally long-lived are auto-reused during synth when they already exist with the expected suffixed name. Today that includes:
+
+- VPC flow log group
+- AgentCore user-files S3 bucket
+- Router identity DynamoDB table
+- Router API access log group
+- Token monitoring DynamoDB table
+- Security KMS key alias for secrets
+- Optional CloudTrail bucket
+- Security Secrets Manager secrets
+- Security Cognito user pool and proxy app client
+
+Retained resources are expected to be reused, not silently replaced with newly generated names. Shared account-level resources still keep their separate guards: for example, Bedrock invocation logging stays behind `manage_bedrock_invocation_logging` because that log group is account+region shared rather than environment-owned.
+
+If you set `RETAIN_STATEFUL_RESOURCES=false`, the stacks switch those stateful resources to `RemovalPolicy.DESTROY` instead. Stack-managed S3 buckets also enable automatic object cleanup so CloudFormation can delete them even when they still contain files or object versions.
+
+Network mode is currently keyed to the literal suffix in code: **`environment_suffix == "dev"` uses AgentCore public network mode**. Any other suffix value, including an empty suffix, uses **VPC mode** for the AgentCore runtime.
+
+### Selecting the env file
+
+All helper scripts (`deploy.sh`, `undeploy.sh`, `setup-telegram.sh`, `setup-slack.sh`, `setup-feishu.sh`, `manage-allowlist.sh`, and `e2e-deploy-and-test.sh`) use the same env-file loader:
+
+- If `OPENCLAW_ENV_FILE` is set, that file is loaded
+- Otherwise, if `--env <name>` is passed, the script loads `.env.<name>`
+- Otherwise, the script loads `.env` from the repository root
+
+Examples:
+
+```bash
+./scripts/deploy.sh                             # loads ./.env
+./scripts/deploy.sh --env dev                  # loads ./.env.dev
+./scripts/deploy.sh --env prod                 # loads ./.env.prod
+./scripts/undeploy.sh --env prod --all         # loads ./.env.prod
+```
+
+Recommended pattern:
+
+- `.env.dev` for development
+- `.env.prod` for production-like deployment
+- `.env` only if you want one default local environment
+
+The scripts do **not** layer multiple env files together. Pick exactly one file per run.
 
 > **Guardrails cost**: Bedrock Guardrails are enabled by default and add ~$0.75 per 1,000 text units on top of model inference costs. To disable, set `"enable_guardrails": false` in `cdk.json`. See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling removes content-level protections but other security layers (STS scoping, tool deny list, SSRF protection) remain active.
 
@@ -382,10 +546,11 @@ All tunable parameters are in `cdk.json`:
 4. Store it in Secrets Manager:
    ```bash
    aws secretsmanager update-secret \
-     --secret-id openclaw/channels/telegram \
+     --secret-id openclaw/channels/telegram-dev \
      --secret-string 'YOUR_BOT_TOKEN' \
      --region $CDK_DEFAULT_REGION
    ```
+   With the default `dev` environment, the secret ID is `openclaw/channels/telegram-dev`.
 5. Set up the webhook (see Quick Start step 7)
 
 ### Slack
@@ -418,7 +583,7 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
 9. Get your API Gateway URL (you'll need this for the Request URL):
     ```bash
     aws cloudformation describe-stacks \
-      --stack-name OpenClawRouter \
+      --stack-name OpenClawRouter-dev \
       --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
       --output text --region $CDK_DEFAULT_REGION
     ```
@@ -440,7 +605,7 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
 16. Store both values:
     ```bash
     aws secretsmanager update-secret \
-      --secret-id openclaw/channels/slack \
+      --secret-id openclaw/channels/slack-dev \
       --secret-string '{"botToken":"xoxb-YOUR-BOT-TOKEN","signingSecret":"YOUR-SIGNING-SECRET"}' \
       --region $CDK_DEFAULT_REGION
     ```
@@ -490,7 +655,7 @@ Users can send photos alongside text messages. The system supports JPEG, PNG, GI
 3. The message payload sent to AgentCore becomes a structured object: `{"text": "caption text", "images": [{"s3Key": "...", "contentType": "image/jpeg"}]}`
 4. **Contract server** converts this to a string with an appended marker: `caption text\n\n[OPENCLAW_IMAGES:[...]]`
 5. **Proxy** extracts the marker, fetches the image bytes from S3 (validating the S3 key belongs to the user's namespace), and builds Bedrock multimodal content blocks
-6. **Bedrock ConverseStream** receives both text and image content, enabling Claude to reason about the image
+6. **Bedrock ConverseStream** receives both text and image content, enabling the configured model to reason about the image
 
 **Telegram**: Photos use the `caption` field for text (not `text`). The Router Lambda checks both. The largest photo size in the `photo` array is used.
 
@@ -557,8 +722,8 @@ The bot will ask for your **timezone** (e.g., `Australia/Sydney`, `America/New_Y
 
 **How it works under the hood:**
 
-1. The bot uses the `eventbridge-cron` skill to create an EventBridge Scheduler rule in the `openclaw-cron` schedule group
-2. At the scheduled time, EventBridge invokes the Cron executor Lambda (`openclaw-cron-executor`)
+1. The bot uses the `eventbridge-cron` skill to create an EventBridge Scheduler rule in the environment-specific schedule group (default: `openclaw-cron-dev`)
+2. At the scheduled time, EventBridge invokes the Cron executor Lambda (default: `openclaw-cron-executor-dev`)
 3. The Lambda warms up the user's AgentCore session (or waits for it to initialize if cold)
 4. The Lambda sends the scheduled message to the agent via AgentCore
 5. The agent processes the message and the Lambda delivers the response to the user's chat channel
@@ -600,7 +765,7 @@ The agent also **proactively detects API keys** — if you paste something that 
 
 The agent can browse the web using a headless Chromium browser running inside the AgentCore container. This is **opt-in** — disabled by default.
 
-**Enable it:** Set `enable_browser` to `true` in `cdk.json` and ensure `BROWSER_IDENTIFIER` is configured in the AgentCore environment. The contract server creates a browser session on init, and the `agentcore-browser` skill scripts communicate with it via a session file.
+**Enable it:** Set `enable_browser` to `true` in `cdk.json`. CDK creates the browser resource and injects `BROWSER_IDENTIFIER` into the runtime environment automatically. The contract server creates a browser session on init, and the `agentcore-browser` skill scripts communicate with it via a session file.
 
 **What you can do:**
 
@@ -677,7 +842,7 @@ During the warm-up phase (~first 1-2 min on cold start), the **lightweight agent
 
 The Router Lambda validates all incoming webhook requests:
 
-- **Telegram**: Validates the `X-Telegram-Bot-Api-Secret-Token` header against the `openclaw/webhook-secret` stored in Secrets Manager. The secret is registered with Telegram via the `secret_token` parameter on `setWebhook`.
+- **Telegram**: Validates the `X-Telegram-Bot-Api-Secret-Token` header against the environment-specific webhook secret stored in Secrets Manager (default: `openclaw/webhook-secret-dev`). The secret is registered with Telegram via the `secret_token` parameter on `setWebhook`.
 - **Slack**: Validates the `X-Slack-Signature` HMAC-SHA256 header using the Slack app's signing secret. Includes 5-minute timestamp check to prevent replay attacks.
 - **API Gateway**: Only explicit routes are exposed (`POST /webhook/telegram`, `POST /webhook/slack`, `GET /health`). All other paths return 404 from API Gateway without invoking the Lambda. Rate limiting is applied (burst: 50, sustained: 100 req/s).
 
@@ -693,7 +858,7 @@ Bedrock invocation logs flow to CloudWatch, where a Lambda processor extracts to
 
 ```bash
 RUNTIME_ID=$(aws cloudformation describe-stacks \
-  --stack-name OpenClawAgentCore \
+  --stack-name OpenClawAgentCore-dev \
   --query "Stacks[0].Outputs[?OutputKey=='RuntimeId'].OutputValue" \
   --output text --region $CDK_DEFAULT_REGION)
 
@@ -705,7 +870,7 @@ aws bedrock-agentcore get-runtime \
 ### Check DynamoDB identity table
 
 ```bash
-aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
+aws dynamodb scan --table-name openclaw-identity-dev --region $CDK_DEFAULT_REGION
 ```
 
 ### Deploy new bridge version
@@ -724,7 +889,7 @@ aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
 docker push \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 # 3. CDK deploy
-cdk deploy OpenClawAgentCore --require-approval never
+cdk deploy OpenClawAgentCore-dev --require-approval never
 # 4. New sessions will use the new image automatically (per-user idle termination)
 ```
 
@@ -780,7 +945,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 - **Signing secret mismatch**: The Lambda validates `X-Slack-Signature` using the signing secret stored in Secrets Manager. Verify it matches:
   ```bash
   aws secretsmanager get-secret-value \
-    --secret-id openclaw/channels/slack \
+   --secret-id openclaw/channels/slack-dev \
     --region $CDK_DEFAULT_REGION \
     --query SecretString --output text
   ```
@@ -792,7 +957,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 - **Token invalid**: Check that the Telegram token in Secrets Manager is correct:
   ```bash
   aws secretsmanager get-secret-value \
-    --secret-id openclaw/channels/telegram \
+   --secret-id openclaw/channels/telegram-dev \
     --region $CDK_DEFAULT_REGION \
     --query SecretString --output text
   ```
@@ -805,7 +970,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 ### 502 / Bedrock authorization errors
 
 - **Model access not enabled**: Enable model access in the Bedrock console for your region.
-- **Cross-region inference**: The default model ID `global.anthropic.claude-opus-4-6-v1` uses a global cross-region inference profile that routes to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions.
+- **Model permissions**: The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` so you can swap Bedrock models in `cdk.json` without changing the role policy.
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
 
@@ -821,6 +986,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 | **ClawHub skills** | 5 pre-installed; available only after full OpenClaw startup (~1-2 min). During warm-up, built-in web_fetch/web_search tools are available |
 | **Single region** | AgentCore Runtime deployed in one region; no multi-region failover |
 | **No voice/video** | Only text and images supported; no audio or video messages |
+| **Prod teardown delay** | `OpenClaw*-prod` stacks may not delete in a single pass because AgentCore Runtime can keep its VPC ENI attached for hours after runtime deletion starts. Re-run your teardown wrapper (`underlying.sh`/`undeploy.sh`) after about 8 hours |
 
 ## Gotchas
 
@@ -836,18 +1002,71 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **ClawHub `--force` flag**: Some skills are flagged by VirusTotal for external API calls. Use `--no-input --force` for non-interactive Docker builds.
 - **`default-user` fallback**: If identity resolution fails, requests fall back to `actorId = "default-user"` — meaning all such users share one S3 namespace. The `USER_ID` env var path (set by contract server) should prevent this in per-user mode.
 - **actorId vs namespace format**: The actorId uses colon format (`telegram:123456789`) while skill scripts expect namespace/underscore format (`telegram_123456789`). The lightweight agent's `chat()` function converts via `userId.replace(/:/g, "_")` before passing to tool scripts. The proxy and workspace sync also use namespace format for S3 keys.
-- **Image version bumps are required**: After pushing a new bridge container image, you must bump `image_version` in `cdk.json` and redeploy `OpenClawAgentCore`. AgentCore caches images by digest and only re-pulls when the runtime endpoint configuration changes. Without the bump, existing sessions continue using the old image.
+- **Image version bumps are required**: After pushing a new bridge container image, you must bump `image_version` in `cdk.json` and redeploy the matching AgentCore stack (default: `OpenClawAgentCore-dev`). AgentCore caches images by digest and only re-pulls when the runtime endpoint configuration changes. Without the bump, existing sessions continue using the old image.
 - **Image upload size limit**: Bedrock Converse API limits images to 3.75 MB. The Router Lambda checks this before uploading to S3.
-- **agentcore CLI urllib3 warnings**: The `agentcore` CLI may emit a `RequestsDependencyWarning` to stdout before its JSON output. This is benign — `deploy.sh` handles mixed output gracefully.
-- **OpenClaw 2026.3.2 WebSocket origin enforcement**: OpenClaw enforces origin checks on all WebSocket connections carrying an `Origin` header. The `ws` Node.js library must use the `origin` **option** (not `headers.Origin`) to correctly set the header on the HTTP upgrade request. The `controlUi` config requires `allowedOrigins: ["*"]` to accept the origin. Without both the client `origin` option and config `allowedOrigins`, connections fail with: `Auth failed: origin not allowed`.
+- **OpenClaw gateway protocol version**: Current OpenClaw gateway clients connect with protocol `4`. The contract bridge now defaults to protocol `4` and retries once with the server-advertised `expectedProtocol` on `PROTOCOL_MISMATCH`, which avoids intermittent `Auth failed: protocol mismatch` errors during mixed-version rollouts or stale sessions.
+- **OpenClaw 2026.5.19 WebSocket origin enforcement**: OpenClaw enforces origin checks on all WebSocket connections carrying an `Origin` header. The `ws` Node.js library must use the `origin` **option** (not `headers.Origin`) to correctly set the header on the HTTP upgrade request. The `controlUi` config requires `allowedOrigins: ["*"]` to accept the origin. Without both the client `origin` option and config `allowedOrigins`, connections fail with: `Auth failed: origin not allowed`.
 
 ## Cleanup
 
 ```bash
-cdk destroy --all
+./scripts/undeploy.sh
+./scripts/undeploy.sh --env prod
 ```
 
-Note: KMS keys and the Cognito User Pool have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed.
+`undeploy.sh` no longer scans DynamoDB for session IDs. It now uses only runtime-scoped AgentCore session discovery when the installed AWS tooling exposes that API; otherwise, stop any active sessions manually or wait for them to idle out before VPC teardown.
+
+> **Known issue:** production teardown is not always one-shot. The AgentCore Runtime control plane does not always release its ENI immediately, so the `OpenClawAgentCore-prod` / `OpenClawVpc-prod` cleanup can block on VPC dependencies even after the runtime delete starts. If that happens, wait about **8 hours** and re-run your teardown wrapper (`underlying.sh` if that is what you use, or `./scripts/undeploy.sh` in this repo).
+
+There are **two separate cleanup layers**:
+
+1. `./scripts/undeploy.sh --all` controls **which stacks** CloudFormation is asked to destroy.
+2. Each resource's `RemovalPolicy` controls whether that resource is **actually deleted or retained** when its stack is destroyed.
+
+That means **`--all` does not override `RemovalPolicy.RETAIN`**. A stack can be deleted successfully while some of its resources are intentionally left behind.
+
+If you deploy with `RETAIN_STATEFUL_RESOURCES=false`, the stack-managed stateful resources switch to `RemovalPolicy.DESTROY` instead. In that mode, the stack-managed S3 buckets enable automatic object cleanup, so CloudFormation can remove them without a separate manual bucket-emptying step.
+
+Common cleanup variants:
+
+```bash
+./scripts/undeploy.sh                                   # destroy deployable stacks, keep OpenClawSecurity
+./scripts/undeploy.sh --env dev                        # same as above, but loads ./.env.dev
+./scripts/undeploy.sh --delete-user-files-bucket        # also delete the retained S3 user-files bucket
+./scripts/undeploy.sh --all                             # also destroy OpenClawSecurity
+./scripts/undeploy.sh --env prod --all                 # destroy the prod-suffixed stacks
+./scripts/undeploy.sh --all --delete-user-files-bucket  # destroy all included stacks and also delete the user-files bucket
+```
+
+The undeploy script destroys the matching AgentCore stack separately (default: `OpenClawAgentCore-dev`), waits for AgentCore-managed `agentic_ai` ENIs to leave the VPC before deleting the matching VPC stack, and falls back to retaining the AgentCore runtime security group if CloudFormation gets stuck on security-group cleanup. For `prod`, do not assume the first teardown run will finish the job — AgentCore may keep the ENI around well after delete starts, so plan to retry roughly **8 hours later**.
+
+### What `--all` really means
+
+`--all` means: **also include `OpenClawSecurity-*` in the destroy operation**.
+
+It does **not** mean: **force-delete every resource created by every stack**.
+
+### What can still remain after `./scripts/undeploy.sh --all`
+
+When `RETAIN_STATEFUL_RESOURCES=true` (the default), these resources are currently retained by CDK policy or by undeploy fallback logic:
+
+| Resource | Why it can remain after `--all` |
+| --- | --- |
+| DynamoDB identity table | `RemovalPolicy.RETAIN` |
+| API Gateway access log group | `RemovalPolicy.RETAIN` |
+| S3 user-files bucket | `RemovalPolicy.RETAIN`; only removed when `--delete-user-files-bucket` is passed |
+| DynamoDB token-monitoring table | `RemovalPolicy.RETAIN` |
+| VPC flow log group | `RemovalPolicy.RETAIN` |
+| KMS key in `OpenClawSecurity-*` | `RemovalPolicy.RETAIN` |
+| Cognito user pool in `OpenClawSecurity-*` | `RemovalPolicy.RETAIN` |
+| CloudTrail bucket (if enabled) | `RemovalPolicy.RETAIN` |
+| AgentCore runtime security group | undeploy fallback may call `delete-stack --retain-resources` if CloudFormation is stuck on SG cleanup |
+
+So the correct mental model is:
+
+- **stack destroyed** != **every resource deleted**
+- **`--all`** = destroy more stacks
+- **`RETAIN`** = keep specific resources even if their stack is destroyed
 
 ## Security
 

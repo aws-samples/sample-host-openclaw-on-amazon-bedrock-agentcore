@@ -20,8 +20,17 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/openclaw-env.sh"
+load_project_env "$PROJECT_DIR"
+
+OPENCLAW_ENV_SUFFIX="$(resolve_env_suffix "$PROJECT_DIR")"
 REGION="${CDK_DEFAULT_REGION:-${AWS_REGION:-us-west-2}}"
-TABLE_NAME="${IDENTITY_TABLE_NAME:-openclaw-identity}"
+ROUTER_STACK_NAME="$(with_suffix OpenClawRouter)"
+TABLE_NAME="${IDENTITY_TABLE_NAME:-$(with_suffix "openclaw-identity")}"
+FEISHU_SECRET_ID="$(with_suffix "openclaw/channels/feishu")"
 PROFILE_ARG=""
 if [ -n "${AWS_PROFILE:-}" ]; then
     PROFILE_ARG="--profile $AWS_PROFILE"
@@ -35,7 +44,7 @@ echo "Step 1: Webhook URL"
 echo ""
 
 API_URL=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawRouter \
+    --stack-name "$ROUTER_STACK_NAME" \
     --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
     --output text --region "$REGION" $PROFILE_ARG)
 
@@ -84,7 +93,7 @@ read -rp "Enter your Encrypt Key: " ENCRYPT_KEY
 
 echo "Storing credentials in Secrets Manager..."
 aws secretsmanager update-secret \
-    --secret-id openclaw/channels/feishu \
+    --secret-id "$FEISHU_SECRET_ID" \
     --secret-string "{\"appId\":\"${APP_ID}\",\"appSecret\":\"${APP_SECRET}\",\"verificationToken\":\"${VERIFICATION_TOKEN}\",\"encryptKey\":\"${ENCRYPT_KEY}\"}" \
     --region "$REGION" $PROFILE_ARG
 

@@ -1,5 +1,6 @@
 """Observability Stack — Bedrock invocation logging, dashboards, alarms, SNS."""
 
+import os
 from aws_cdk import (
     Stack,
     Duration,
@@ -16,7 +17,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import retention_days
+from stacks import DeploymentNamer, retention_days
 
 
 class ObservabilityStack(Stack):
@@ -30,95 +31,119 @@ class ObservabilityStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        namer = DeploymentNamer.from_scope(self)
         region = Stack.of(self).region
-        account = Stack.of(self).account
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
+        topic_name = namer.name("openclaw-alarms")
+        router_function_name = namer.name("openclaw-router")
+        manage_bedrock_logging_raw = (
+            self.node.try_get_context("manage_bedrock_invocation_logging")
+            or os.environ.get("MANAGE_BEDROCK_INVOCATION_LOGGING")
+            or ""
+        )
+        manage_bedrock_logging = str(manage_bedrock_logging_raw).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        invocation_log_group_name = "/aws/bedrock/invocation-logs"
+        bedrock_logging_resource_id = namer.name("bedrock-invocation-logging")
+        self.logging_cr: cr.AwsCustomResource | None = None
 
         # --- SNS Topic for alarms -----------------------------------------
         alarm_cmk = kms.Key.from_key_arn(self, "AlarmTopicCmk", cmk_arn)
         self.alarm_topic = sns.Topic(
             self,
             "AlarmTopic",
-            topic_name="openclaw-alarms",
-            display_name="OpenClaw Alarms",
+            topic_name=topic_name,
+            display_name=namer.name("OpenClaw Alarms"),
             master_key=alarm_cmk,
         )
 
         # --- Bedrock Invocation Log Group ---------------------------------
-        self.invocation_log_group = logs.LogGroup(
-            self,
-            "BedrockInvocationLogGroup",
-            log_group_name="/aws/bedrock/invocation-logs",
-            retention=retention_days(log_retention),
-            removal_policy=RemovalPolicy.DESTROY,
-        )
+        if manage_bedrock_logging:
+            self.invocation_log_group = logs.LogGroup(
+                self,
+                "BedrockInvocationLogGroup",
+                log_group_name=invocation_log_group_name,
+                retention=retention_days(log_retention),
+                removal_policy=RemovalPolicy.DESTROY,
+            )
+        else:
+            self.invocation_log_group = logs.LogGroup.from_log_group_name(
+                self,
+                "BedrockInvocationLogGroup",
+                invocation_log_group_name,
+            )
 
         # IAM role for Bedrock to write to CloudWatch Logs
-        bedrock_logging_role = iam.Role(
-            self,
-            "BedrockLoggingRole",
-            assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com"),
-        )
-        self.invocation_log_group.grant_write(bedrock_logging_role)
+        if manage_bedrock_logging:
+            bedrock_logging_role = iam.Role(
+                self,
+                "BedrockLoggingRole",
+                assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com"),
+            )
+            self.invocation_log_group.grant_write(bedrock_logging_role)
 
-        # Enable Bedrock Model Invocation Logging via custom resource
-        self.logging_cr = cr.AwsCustomResource(
-            self,
-            "EnableBedrockInvocationLogging",
-            on_create=cr.AwsSdkCall(
-                service="Bedrock",
-                action="PutModelInvocationLoggingConfiguration",
-                parameters={
-                    "loggingConfig": {
-                        "cloudWatchConfig": {
-                            "logGroupName": self.invocation_log_group.log_group_name,
-                            "roleArn": bedrock_logging_role.role_arn,
+            # Enable Bedrock Model Invocation Logging via custom resource
+            self.logging_cr = cr.AwsCustomResource(
+                self,
+                "EnableBedrockInvocationLogging",
+                on_create=cr.AwsSdkCall(
+                    service="Bedrock",
+                    action="PutModelInvocationLoggingConfiguration",
+                    parameters={
+                        "loggingConfig": {
+                            "cloudWatchConfig": {
+                                "logGroupName": self.invocation_log_group.log_group_name,
+                                "roleArn": bedrock_logging_role.role_arn,
+                            },
+                            "textDataDeliveryEnabled": True,
+                            "imageDataDeliveryEnabled": False,
+                            "embeddingDataDeliveryEnabled": False,
                         },
-                        "textDataDeliveryEnabled": True,
-                        "imageDataDeliveryEnabled": False,
-                        "embeddingDataDeliveryEnabled": False,
                     },
-                },
-                physical_resource_id=cr.PhysicalResourceId.of("bedrock-invocation-logging"),
-            ),
-            on_update=cr.AwsSdkCall(
-                service="Bedrock",
-                action="PutModelInvocationLoggingConfiguration",
-                parameters={
-                    "loggingConfig": {
-                        "cloudWatchConfig": {
-                            "logGroupName": self.invocation_log_group.log_group_name,
-                            "roleArn": bedrock_logging_role.role_arn,
+                    physical_resource_id=cr.PhysicalResourceId.of(bedrock_logging_resource_id),
+                ),
+                on_update=cr.AwsSdkCall(
+                    service="Bedrock",
+                    action="PutModelInvocationLoggingConfiguration",
+                    parameters={
+                        "loggingConfig": {
+                            "cloudWatchConfig": {
+                                "logGroupName": self.invocation_log_group.log_group_name,
+                                "roleArn": bedrock_logging_role.role_arn,
+                            },
+                            "textDataDeliveryEnabled": True,
+                            "imageDataDeliveryEnabled": False,
+                            "embeddingDataDeliveryEnabled": False,
                         },
-                        "textDataDeliveryEnabled": True,
-                        "imageDataDeliveryEnabled": False,
-                        "embeddingDataDeliveryEnabled": False,
                     },
-                },
-                physical_resource_id=cr.PhysicalResourceId.of("bedrock-invocation-logging"),
-            ),
-            policy=cr.AwsCustomResourcePolicy.from_statements(
-                [
-                    iam.PolicyStatement(
-                        actions=[
-                            "bedrock:PutModelInvocationLoggingConfiguration",
-                            "bedrock:GetModelInvocationLoggingConfiguration",
-                        ],
-                        resources=["*"],
-                    ),
-                    iam.PolicyStatement(
-                        actions=["iam:PassRole"],
-                        resources=[bedrock_logging_role.role_arn],
-                    ),
-                ]
-            ),
-        )
+                    physical_resource_id=cr.PhysicalResourceId.of(bedrock_logging_resource_id),
+                ),
+                policy=cr.AwsCustomResourcePolicy.from_statements(
+                    [
+                        iam.PolicyStatement(
+                            actions=[
+                                "bedrock:PutModelInvocationLoggingConfiguration",
+                                "bedrock:GetModelInvocationLoggingConfiguration",
+                            ],
+                            resources=["*"],
+                        ),
+                        iam.PolicyStatement(
+                            actions=["iam:PassRole"],
+                            resources=[bedrock_logging_role.role_arn],
+                        ),
+                    ]
+                ),
+            )
 
         # --- Operations Dashboard -----------------------------------------
         dashboard = cw.Dashboard(
             self,
             "OperationsDashboard",
-            dashboard_name="OpenClaw-Operations",
+            dashboard_name=namer.name("OpenClaw-Operations"),
         )
 
         # Bedrock metrics
@@ -171,28 +196,28 @@ class ObservabilityStack(Stack):
         router_invocations = cw.Metric(
             namespace="AWS/Lambda",
             metric_name="Invocations",
-            dimensions_map={"FunctionName": "openclaw-router"},
+            dimensions_map={"FunctionName": router_function_name},
             period=Duration.minutes(5),
             statistic="Sum",
         )
         router_errors = cw.Metric(
             namespace="AWS/Lambda",
             metric_name="Errors",
-            dimensions_map={"FunctionName": "openclaw-router"},
+            dimensions_map={"FunctionName": router_function_name},
             period=Duration.minutes(5),
             statistic="Sum",
         )
         router_duration = cw.Metric(
             namespace="AWS/Lambda",
             metric_name="Duration",
-            dimensions_map={"FunctionName": "openclaw-router"},
+            dimensions_map={"FunctionName": router_function_name},
             period=Duration.minutes(5),
             statistic="p99",
         )
         router_throttles = cw.Metric(
             namespace="AWS/Lambda",
             metric_name="Throttles",
-            dimensions_map={"FunctionName": "openclaw-router"},
+            dimensions_map={"FunctionName": router_function_name},
             period=Duration.minutes(5),
             statistic="Sum",
         )
@@ -239,7 +264,7 @@ class ObservabilityStack(Stack):
         bedrock_errors.create_alarm(
             self,
             "BedrockErrorAlarm",
-            alarm_name="openclaw-bedrock-errors",
+            alarm_name=namer.name("openclaw-bedrock-errors"),
             threshold=5,
             evaluation_periods=3,
             comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
@@ -250,7 +275,7 @@ class ObservabilityStack(Stack):
         bedrock_latency.create_alarm(
             self,
             "BedrockLatencyAlarm",
-            alarm_name="openclaw-bedrock-latency",
+            alarm_name=namer.name("openclaw-bedrock-latency"),
             threshold=10000,
             evaluation_periods=3,
             comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
@@ -261,7 +286,7 @@ class ObservabilityStack(Stack):
         router_errors.create_alarm(
             self,
             "RouterLambdaErrorAlarm",
-            alarm_name="openclaw-router-errors",
+            alarm_name=namer.name("openclaw-router-errors"),
             threshold=5,
             evaluation_periods=3,
             comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
@@ -272,7 +297,7 @@ class ObservabilityStack(Stack):
         bedrock_throttles.create_alarm(
             self,
             "BedrockThrottleAlarm",
-            alarm_name="openclaw-bedrock-throttles",
+            alarm_name=namer.name("openclaw-bedrock-throttles"),
             threshold=1,
             evaluation_periods=3,
             comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
@@ -299,55 +324,56 @@ class ObservabilityStack(Stack):
                 ),
             ],
         )
-        cdk_nag.NagSuppressions.add_resource_suppressions(
-            self.logging_cr,
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-IAM5",
-                    reason="Bedrock PutModelInvocationLoggingConfiguration is an account-level "
-                    "API that does not support resource-level ARNs; wildcard is required.",
-                    applies_to=["Resource::*"],
-                ),
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-IAM4",
-                    reason="CDK AwsCustomResource uses AWSLambdaBasicExecutionRole for its "
-                    "backing Lambda. This is a CDK-managed construct.",
-                    applies_to=[
-                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-                    ],
-                ),
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-L1",
-                    reason="Lambda runtime is managed by CDK AwsCustomResource and "
-                    "cannot be overridden to the latest version.",
-                ),
-            ],
-            apply_to_children=True,
-        )
-        # CDK AwsCustomResource singleton Lambda
-        cr_lambda_path = f"/{construct_id}/AWS679f53fac002430cb0da5b7982bd2287"
-        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
-            self,
-            f"{cr_lambda_path}/ServiceRole/Resource",
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-IAM4",
-                    reason="CDK AwsCustomResource singleton Lambda uses AWSLambdaBasicExecutionRole. "
-                    "This is managed by CDK and cannot be customised.",
-                    applies_to=[
-                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-                    ],
-                ),
-            ],
-        )
-        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
-            self,
-            f"{cr_lambda_path}/Resource",
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-L1",
-                    reason="Lambda runtime is managed by CDK AwsCustomResource singleton "
-                    "and cannot be overridden.",
-                ),
-            ],
-        )
+        if self.logging_cr is not None:
+            cdk_nag.NagSuppressions.add_resource_suppressions(
+                self.logging_cr,
+                [
+                    cdk_nag.NagPackSuppression(
+                        id="AwsSolutions-IAM5",
+                        reason="Bedrock PutModelInvocationLoggingConfiguration is an account-level "
+                        "API that does not support resource-level ARNs; wildcard is required.",
+                        applies_to=["Resource::*"],
+                    ),
+                    cdk_nag.NagPackSuppression(
+                        id="AwsSolutions-IAM4",
+                        reason="CDK AwsCustomResource uses AWSLambdaBasicExecutionRole for its "
+                        "backing Lambda. This is a CDK-managed construct.",
+                        applies_to=[
+                            "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                        ],
+                    ),
+                    cdk_nag.NagPackSuppression(
+                        id="AwsSolutions-L1",
+                        reason="Lambda runtime is managed by CDK AwsCustomResource and "
+                        "cannot be overridden to the latest version.",
+                    ),
+                ],
+                apply_to_children=True,
+            )
+            # CDK AwsCustomResource singleton Lambda
+            cr_lambda_path = f"/{construct_id}/AWS679f53fac002430cb0da5b7982bd2287"
+            cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
+                self,
+                f"{cr_lambda_path}/ServiceRole/Resource",
+                [
+                    cdk_nag.NagPackSuppression(
+                        id="AwsSolutions-IAM4",
+                        reason="CDK AwsCustomResource singleton Lambda uses AWSLambdaBasicExecutionRole. "
+                        "This is managed by CDK and cannot be customised.",
+                        applies_to=[
+                            "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                        ],
+                    ),
+                ],
+            )
+            cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
+                self,
+                f"{cr_lambda_path}/Resource",
+                [
+                    cdk_nag.NagPackSuppression(
+                        id="AwsSolutions-L1",
+                        reason="Lambda runtime is managed by CDK AwsCustomResource singleton "
+                        "and cannot be overridden.",
+                    ),
+                ],
+            )

@@ -7,6 +7,8 @@ from aws_cdk import (
 )
 from constructs import Construct
 
+from stacks import DeploymentNamer
+
 
 class GuardrailsStack(Stack):
     def __init__(
@@ -19,6 +21,7 @@ class GuardrailsStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        namer = DeploymentNamer.from_scope(self)
         enable_guardrails = self.node.try_get_context("enable_guardrails")
         if enable_guardrails is None:
             enable_guardrails = True  # default ON — security-first
@@ -35,7 +38,7 @@ class GuardrailsStack(Stack):
         self.guardrail = bedrock.CfnGuardrail(
             self,
             "ContentGuardrail",
-            name="openclaw_content_guardrail",
+            name=namer.runtime_name("openclaw_content_guardrail"),
             description="Content filtering for OpenClaw multi-user AI bot",
             blocked_input_messaging=(
                 "I can't process that request. Please rephrase your message."
@@ -156,9 +159,11 @@ class GuardrailsStack(Stack):
                     bedrock.CfnGuardrail.WordConfigProperty(text="AKIA"),
                     bedrock.CfnGuardrail.WordConfigProperty(text="aws_secret_access_key"),
                     bedrock.CfnGuardrail.WordConfigProperty(text="aws_access_key_id"),
-                    bedrock.CfnGuardrail.WordConfigProperty(text="openclaw/gateway-token"),
                     bedrock.CfnGuardrail.WordConfigProperty(
-                        text="openclaw/cognito-password-secret"
+                        text=namer.name("openclaw/gateway-token")
+                    ),
+                    bedrock.CfnGuardrail.WordConfigProperty(
+                        text=namer.name("openclaw/cognito-password-secret")
                     ),
                     bedrock.CfnGuardrail.WordConfigProperty(text="/tmp/scoped-creds"),
                     bedrock.CfnGuardrail.WordConfigProperty(text="credential_process"),

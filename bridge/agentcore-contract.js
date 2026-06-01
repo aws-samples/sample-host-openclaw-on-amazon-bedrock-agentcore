@@ -33,6 +33,7 @@ const scopedCreds = require("./scoped-credentials");
 const PORT = 8080;
 const PROXY_PORT = 18790;
 const OPENCLAW_PORT = 18789;
+const GATEWAY_PROTOCOL_VERSION = 4;
 
 // Session storage mount path (set via filesystemConfigurations on Runtime)
 const SESSION_STORAGE_MOUNT = "/mnt/workspace";
@@ -1340,12 +1341,22 @@ function enqueueMessage(message, onDelta) {
  * @param {string} message - The message to send
  * @param {number} timeoutMs - Timeout in milliseconds
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
+ * @param {number} [protocolVersion] - Gateway protocol version to use for the connect handshake
+ * @param {boolean} [allowProtocolFallback] - Retry once with the server-advertised expected protocol
  */
-async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
+async function bridgeMessage(
+  message,
+  timeoutMs = 620000,
+  onDelta,
+  protocolVersion = GATEWAY_PROTOCOL_VERSION,
+  allowProtocolFallback = true,
+) {
   const { randomUUID } = require("crypto");
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
-    console.log(`[contract] Connecting to WebSocket: ${wsUrl}`);
+    console.log(
+      `[contract] Connecting to WebSocket: ${wsUrl} protocol=${protocolVersion}`,
+    );
     const ws = new WebSocket(wsUrl, {
       origin: `http://127.0.0.1:${OPENCLAW_PORT}`,
     });
@@ -1406,8 +1417,8 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
             id: connectReqId,
             method: "connect",
             params: {
-              minProtocol: 3,
-              maxProtocol: 3,
+              minProtocol: protocolVersion,
+              maxProtocol: protocolVersion,
               client: {
                 id: "openclaw-control-ui",
                 mode: "backend",
@@ -1427,9 +1438,39 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
       // Step 2: Server responds to connect request -> send chat.send
       if (msg.type === "res" && msg.id === connectReqId) {
         if (!msg.ok) {
+          const expectedProtocol = Number(
+            msg.error?.details?.expectedProtocol ??
+            msg.payload?.expectedProtocol ??
+            msg.payload?.details?.expectedProtocol,
+          );
           console.error(
             `[contract] Connect rejected: ${JSON.stringify(msg.error || msg.payload)}`,
           );
+          if (
+            allowProtocolFallback &&
+            msg.error?.details?.code === "PROTOCOL_MISMATCH" &&
+            Number.isInteger(expectedProtocol) &&
+            expectedProtocol > 0 &&
+            expectedProtocol !== protocolVersion
+          ) {
+            console.warn(
+              `[contract] Retrying WebSocket auth with expected protocol ${expectedProtocol} (was ${protocolVersion})`,
+            );
+            resolved = true;
+            clearTimeout(timer);
+            ws.removeAllListeners();
+            try {
+              ws.close();
+            } catch {}
+            bridgeMessage(
+              message,
+              timeoutMs,
+              onDelta,
+              expectedProtocol,
+              false,
+            ).then(resolve);
+            return;
+          }
           done(
             `Auth failed: ${msg.error?.message || JSON.stringify(msg.payload)}`,
           );

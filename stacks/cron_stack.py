@@ -21,7 +21,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import retention_days
+from stacks import DeploymentNamer, retention_days
 
 
 class CronStack(Stack):
@@ -35,32 +35,45 @@ class CronStack(Stack):
         identity_table_name: str,
         identity_table_arn: str,
         telegram_token_secret_name: str,
+        telegram_token_secret_arn: str,
         slack_token_secret_name: str,
+        slack_token_secret_arn: str,
         feishu_token_secret_name: str,
+        feishu_token_secret_arn: str,
         cmk_arn: str,
         agentcore_execution_role: iam.IRole,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        namer = DeploymentNamer.from_scope(self)
         region = Stack.of(self).region
         account = Stack.of(self).account
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("cron_lambda_timeout_seconds") or "600")
         lambda_memory = int(self.node.try_get_context("cron_lambda_memory_mb") or "256")
+        schedule_group_name = namer.name("openclaw-cron")
+        scheduler_role_name = namer.name(f"openclaw-cron-scheduler-role-{region}")
+        cron_log_group_name = namer.name("/openclaw/lambda/cron")
+        cron_lambda_name = namer.name("openclaw-cron-executor")
+        secret_resource_arns = [
+            telegram_token_secret_arn,
+            slack_token_secret_arn,
+            feishu_token_secret_arn,
+        ]
 
         # --- EventBridge Scheduler Group ---
         self.schedule_group = scheduler.CfnScheduleGroup(
             self,
             "CronScheduleGroup",
-            name="openclaw-cron",
+            name=schedule_group_name,
         )
 
         # --- Scheduler IAM Role (assumed by EventBridge Scheduler to invoke Lambda) ---
         self.scheduler_role = iam.Role(
             self,
             "CronSchedulerRole",
-            role_name=f"openclaw-cron-scheduler-role-{region}",
+            role_name=scheduler_role_name,
             assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"),
             description="Role assumed by EventBridge Scheduler to invoke the cron executor Lambda",
         )
@@ -69,7 +82,7 @@ class CronStack(Stack):
         cron_log_group = logs.LogGroup(
             self,
             "CronLogGroup",
-            log_group_name="/openclaw/lambda/cron",
+            log_group_name=cron_log_group_name,
             retention=retention_days(log_retention),
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -78,7 +91,7 @@ class CronStack(Stack):
         self.cron_fn = _lambda.Function(
             self,
             "CronExecutorFn",
-            function_name="openclaw-cron-executor",
+            function_name=cron_lambda_name,
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="index.handler",
             code=_lambda.Code.from_asset("lambda/cron"),
@@ -110,7 +123,7 @@ class CronStack(Stack):
             "AllowEventBridgeScheduler",
             principal=iam.ServicePrincipal("scheduler.amazonaws.com"),
             action="lambda:InvokeFunction",
-            source_arn=f"arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*",
+            source_arn=f"arn:aws:scheduler:{region}:{account}:schedule/{schedule_group_name}/*",
         )
 
         # --- Cron Lambda IAM Permissions ---
@@ -152,9 +165,7 @@ class CronStack(Stack):
                     "secretsmanager:GetSecretValue",
                     "secretsmanager:DescribeSecret",
                 ],
-                resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
-                ],
+                resources=secret_resource_arns,
             )
         )
 
@@ -179,14 +190,14 @@ class CronStack(Stack):
                     "scheduler:ListSchedules",
                 ],
                 resources=[
-                    f"arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*",
+                    f"arn:aws:scheduler:{region}:{account}:schedule/{schedule_group_name}/*",
                 ],
             )
         )
 
         # Allow the container to pass the scheduler role to EventBridge
         # Use deterministic ARN to avoid cross-stack cyclic dependency
-        scheduler_role_arn = f"arn:aws:iam::{account}:role/openclaw-cron-scheduler-role-{region}"
+        scheduler_role_arn = f"arn:aws:iam::{account}:role/{scheduler_role_name}"
         agentcore_execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["iam:PassRole"],
@@ -243,11 +254,11 @@ class CronStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
-                    "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
+                    "Secrets Manager scoped to the cron delivery channel secrets. DynamoDB "
                     "index wildcard needed for query operations.",
                     applies_to=[
-                        f"Resource::{runtime_arn}/*",
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
+                        "Resource::<Runtime99E3DDFA.AgentRuntimeArn>/*",
+                    *[f"Resource::{secret_arn}" for secret_arn in secret_resource_arns],
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                     ],
                 ),
@@ -263,11 +274,12 @@ class CronStack(Stack):
             [
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
-                    reason="EventBridge Scheduler actions scoped to openclaw-cron/* group. "
+                    reason="EventBridge Scheduler actions scoped to the environment-specific "
+                    "schedule group. "
                     "DynamoDB actions scoped to identity table for CRON# records. "
                     "iam:PassRole restricted to scheduler.amazonaws.com service.",
                     applies_to=[
-                        f"Resource::arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*",
+                        f"Resource::arn:aws:scheduler:{region}:{account}:schedule/{schedule_group_name}/*",
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                     ],
                 ),

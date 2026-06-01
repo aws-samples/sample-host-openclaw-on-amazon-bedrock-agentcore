@@ -306,7 +306,7 @@ s3://openclaw-user-files-{account}-{region}/
 
 ## DynamoDB Schema
 
-**Table: `openclaw-identity`**
+**Table: `openclaw-identity-dev`** (example with `OPENCLAW_ENV_SUFFIX=dev`)
 
 | PK | SK | Purpose | TTL |
 |---|---|---|---|
