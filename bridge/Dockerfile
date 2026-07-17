@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Builder — install all dependencies and tools
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim AS builder
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim AS builder
 
 # Install system dependencies
 RUN apt-get update && \
@@ -11,23 +11,24 @@ RUN apt-get update && \
 # Install AWS CLI (for Secrets Manager in entrypoint)
 RUN pip3 install --no-cache-dir --break-system-packages awscli
 
-# Install OpenClaw and ClawHub CLI globally
-# Pinned to tested versions — update intentionally to avoid unexpected breaking changes.
-# To upgrade: test the new version locally first, then bump both pins here.
-#   openclaw release notes: https://github.com/openclaw/openclaw/releases
-RUN npm install -g openclaw@2026.3.8 clawhub@0.8.0
-
-# Install ClawHub community skills (5 high-value marketplace skills)
-# Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
-# hackernews (niche), news-feed (niche) to reduce startup time.
-# --no-input --force: non-interactive, skip VirusTotal warnings
-RUN for skill in jina-reader deep-research-pro telegram-compose transcript task-decomposer; do \
-      for attempt in 1 2 3 4 5; do \
-        clawhub install "$skill" --no-input --force && break; \
-        echo "Retry $attempt for $skill (waiting 15s)..."; \
-        sleep 15; \
-      done; \
-    done
+# The approved 2026.7.2 runtime is an unreleased source snapshot. Fetch the
+# audited commit directly, verify its declared version, and build with its
+# integrity-pinned package manager and frozen lockfile.
+ARG OPENCLAW_VERSION=2026.7.2
+ARG OPENCLAW_SOURCE_COMMIT=4bfaccafd62ac2ff2e70ca1decc40fb1297ab438
+RUN git init /opt/openclaw && \
+    cd /opt/openclaw && \
+    git remote add origin https://github.com/openclaw/openclaw.git && \
+    git fetch --depth 1 origin "$OPENCLAW_SOURCE_COMMIT" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "$OPENCLAW_SOURCE_COMMIT" && \
+    test "$(node -p 'require("./package.json").version')" = "$OPENCLAW_VERSION" && \
+    corepack enable && \
+    corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate && \
+    pnpm install --frozen-lockfile && \
+    pnpm build && \
+    pnpm ui:build && \
+    rm -rf /opt/openclaw/.git
 
 # Create app directory
 RUN mkdir -p /app
@@ -72,7 +73,7 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 # Stage 2: Runtime — minimal image with only needed artifacts
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim
 
 # Install only runtime system dependencies (no git, no pip, no build tools)
 RUN apt-get update && \
@@ -84,15 +85,10 @@ COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/lib/python3.*/dist-packages /usr/local/lib/python3.11/dist-packages
 COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-packages
 
-# Copy OpenClaw and ClawHub from builder (global npm modules + binaries)
-COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
-# Re-create symlinks instead of COPY (which resolves symlinks and breaks
-# relative imports like ./dist/entry.js in the openclaw ESM binary)
-RUN ln -s /usr/local/lib/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw && \
-    ln -s /usr/local/lib/node_modules/clawhub/bin/clawdhub.js /usr/local/bin/clawhub
-
-# Copy ClawHub installed skills (clawhub installs to /skills/ in builder)
-COPY --from=builder /skills/ /skills/
+# Copy the verified source build and expose its CLI without a mutable registry
+# install. Relative imports continue to resolve inside /opt/openclaw.
+COPY --from=builder /opt/openclaw /opt/openclaw
+RUN ln -s /opt/openclaw/openclaw.mjs /usr/local/bin/openclaw
 
 # Copy app directory (node_modules, compile cache)
 COPY --from=builder /app/node_modules /app/node_modules
@@ -124,10 +120,6 @@ RUN chmod +x /skills/s3-user-files/*.js
 # Copy EventBridge cron scheduling skill
 COPY skills/eventbridge-cron /skills/eventbridge-cron
 RUN chmod +x /skills/eventbridge-cron/*.js
-
-# Copy ClawHub skill management skill
-COPY skills/clawhub-manage /skills/clawhub-manage
-RUN chmod +x /skills/clawhub-manage/*.js
 
 # Copy API key management skill (dual-mode: native file + Secrets Manager)
 COPY skills/api-keys /skills/api-keys

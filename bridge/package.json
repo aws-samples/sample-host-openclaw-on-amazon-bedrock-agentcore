@@ -2,7 +2,13 @@
   "name": "openclaw-bridge",
   "version": "1.0.0",
   "private": true,
-  "description": "OpenClaw AgentCore bridge container",
+  "description": "Personal Operator OpenClaw AgentCore bridge container",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1"
+  },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.0.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.0.0",

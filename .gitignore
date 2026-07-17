@@ -82,6 +82,7 @@ docker-compose.override.yml
 *.bak
 SYNC.md
 .claude/skills/
+.superpowers/
 
 # Internal post-deploy script (not for GitHub)
 post-deploy.sh
