@@ -129,12 +129,22 @@ describe("generated OpenClaw configuration", () => {
       path.join(__dirname, "agentcore-contract.js"),
       "utf8",
     );
-    assert.match(contractSource, /scopes:\s*runtimePolicy\.GATEWAY_CLIENT_SCOPES/);
+    const gatewaySource = fs.readFileSync(
+      path.join(__dirname, "gateway-invocation.js"),
+      "utf8",
+    );
+    assert.match(gatewaySource, /scopes:\s*GATEWAY_CLIENT_SCOPES/);
+    assert.match(contractSource, /buildGatewayConnectRequest\(/);
+    assert.match(contractSource, /assertGrantedGatewayScopes\(msg\.payload\)/);
     assert.doesNotMatch(contractSource, /operator\.admin/);
-    assert.match(contractSource, /minProtocol:\s*4/);
-    assert.match(contractSource, /maxProtocol:\s*4/);
-    assert.match(contractSource, /id:\s*"gateway-client"/);
-    assert.doesNotMatch(contractSource, /id:\s*"openclaw-control-ui"/);
+    assert.doesNotMatch(gatewaySource, /operator\.admin/);
+    assert.match(gatewaySource, /minProtocol:\s*4/);
+    assert.match(gatewaySource, /maxProtocol:\s*4/);
+    assert.match(gatewaySource, /id:\s*"cli"/);
+    assert.match(gatewaySource, /mode:\s*"cli"/);
+    assert.doesNotMatch(gatewaySource, /mode:\s*"backend"/);
+    assert.doesNotMatch(gatewaySource, /id:\s*"gateway-client"/);
+    assert.doesNotMatch(gatewaySource, /id:\s*"openclaw-control-ui"/);
   });
 
   it("rejects a missing local gateway token", () => {

@@ -84,6 +84,7 @@ COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY runtime-policy.js /app/runtime-policy.js
+COPY gateway-invocation.js /app/gateway-invocation.js
 COPY workspace-sync.js /app/workspace-sync.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js

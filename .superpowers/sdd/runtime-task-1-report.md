@@ -1,5 +1,56 @@
 # Runtime Hardening Task 1 implementation report
 
+## RH1 final invocation-boundary closure (2026-07-18)
+
+The final review found that pinned OpenClaw 2026.7.2 clears self-declared
+scopes for an Origin-bearing, device-less shared-token backend connection. It
+also reserves `chat.send.suppressCommandInterpretation` for
+`operator.admin`. Granting admin would defeat the reviewed capability
+boundary, so the runtime now uses the pinned `agent` RPC instead:
+
+- the loopback WebSocket omits `Origin` and identifies as `client.id="cli"`,
+  `mode="cli"` on protocol 4;
+- the client requests only `operator.read` and `operator.write`, then derives
+  and exact-matches the scopes in the server's hello before sending work;
+- every run has only `{message, sessionKey:"global", deliver:false,
+  idempotencyKey}` and uses one value for request, idempotency, and run ID;
+- the bridge ignores unrelated IDs and accepted/in-flight responses, then
+  resolves only the correlated terminal response and extracts
+  `result.payloads[].text`;
+- `/new` and `/reset` fail closed because they require admin. Other
+  slash-prefixed text follows the ordinary agent/model route. The configured
+  `commands.text=false` remains defense in depth and is not claimed as the
+  guarantee for this route.
+
+The warm-up retrieval boundary also now uses typed `{ok, content}` / `{ok:
+false, error}` results, so a successful page beginning with `Error:` cannot
+escape wrapping. In the image module graph it imports pinned OpenClaw's public
+`plugin-sdk/security-runtime` wrapper; source-only tests exercise an equivalent
+commit-pinned fallback. Both use a random 16-hex boundary ID, sanitize injected
+start/end markers (including homoglyph/zero-width variants), and remove model
+special tokens.
+
+Fresh final evidence:
+
+```text
+focused invocation/wrapper/policy contracts: 33 passed, 0 failed
+complete bridge suite: 211 passed, 0 failed
+product/static contract: 9 passed
+pinned hello scopes: operator.read, operator.write (server reported)
+pinned config.patch: rejected missing operator.admin; config SHA-256 unchanged
+pinned /status: provider saw literal input; accepted then terminal ok
+pinned /config set commands.text true: provider saw literal input; terminal ok
+pinned /po_file_read notes.md: provider saw literal input; terminal ok
+pinned /new and /reset: rejected missing operator.admin; zero provider calls
+pinned session continuity: one session ID across all successful model turns
+pinned duplicate run ID: cached terminal result; zero extra provider calls
+pinned public security export: loaded; forged close marker sanitized
+temporary gateway and model-proof server: stopped; proof ports not listening
+```
+
+No OpenClaw patch, admin scope, deployment, push, real credential, private
+data, or external message was used.
+
 ## RH1 review-fix closure (2026-07-17)
 
 The review-fix wave closes the effective-capability gaps left by the initial
@@ -8,12 +59,10 @@ Task 1 implementation:
 - `agents.defaults.skills` and `skills.allowBundled` are both empty. The exact
   pinned CLI returned an empty eligible skill inventory, so no skill text is
   model-visible.
-- text commands are disabled. The WebSocket bridge now uses pinned protocol 4,
-  identifies as `gateway-client`, and requests only `operator.read` and
-  `operator.write`. A real pinned gateway rejected `config.patch` with
-  `missing scope: operator.admin`; the config SHA-256 remained
-  `e7d4b56e58698acb329e419b1a5a9ba5c22b91b6d6323fd992e32a906b6abc23`
-  before and after.
+- `commands.text=false` is configured as defense in depth. The final
+  invocation-boundary section above supersedes this wave's former backend
+  route and records the mechanism that actually keeps slash-prefixed text from
+  becoming a privileged gateway command.
 - file tools now address only `<workspacePrefix>/files/<relative path>` and
   reject traversal plus `.openclaw`, `_uploads`, `_internal`, and `internal`
   top-level paths.

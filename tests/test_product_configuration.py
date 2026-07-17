@@ -67,6 +67,7 @@ def test_bridge_image_copies_only_the_reviewed_plugin() -> None:
     assert "COPY skills/" not in dockerfile
     assert "/skills/" not in dockerfile
     assert "ln -s /opt/openclaw /app/node_modules/openclaw" in dockerfile
+    assert "COPY gateway-invocation.js /app/gateway-invocation.js" in dockerfile
 
 
 def test_legacy_executable_skill_trees_are_absent() -> None:

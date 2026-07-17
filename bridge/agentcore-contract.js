@@ -31,6 +31,7 @@ const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
 const runtimePolicy = require("./runtime-policy");
+const gatewayInvocation = require("./gateway-invocation");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -849,15 +850,13 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
     console.log(`[contract] Connecting to WebSocket: ${wsUrl}`);
-    const ws = new WebSocket(wsUrl, {
-      origin: `http://127.0.0.1:${OPENCLAW_PORT}`,
-    });
+    const ws = gatewayInvocation.createGatewaySocket(WebSocket, wsUrl);
     let responseText = "";
     let authenticated = false;
-    let chatSent = false;
+    let agentSent = false;
     let resolved = false;
     let connectReqId = null;
-    let chatReqId = null;
+    let agentReqId = null;
     let unhandledMsgs = [];
 
     const done = (text) => {
@@ -876,7 +875,7 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           ? ` unhandled=[${unhandledMsgs.slice(0, 5).join(" | ")}]`
           : "";
       console.warn(
-        `[contract] WebSocket timeout after ${timeoutMs}ms (auth=${authenticated}, chatSent=${chatSent}, responseLen=${responseText.length})${debugInfo}`,
+        `[contract] WebSocket timeout after ${timeoutMs}ms (auth=${authenticated}, agentSent=${agentSent}, responseLen=${responseText.length})${debugInfo}`,
       );
       // Return "" on timeout so caller can fall back to lightweight agent
       done(responseText || "");
@@ -904,30 +903,17 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
         );
         connectReqId = randomUUID();
         ws.send(
-          JSON.stringify({
-            type: "req",
-            id: connectReqId,
-            method: "connect",
-            params: {
-              minProtocol: 4,
-              maxProtocol: 4,
-              client: {
-                id: "gateway-client",
-                mode: "backend",
-                version: "dev",
-                platform: "linux",
-              },
-              caps: [],
-              auth: { token: GATEWAY_TOKEN },
-              role: "operator",
-              scopes: runtimePolicy.GATEWAY_CLIENT_SCOPES,
-            },
-          }),
+          JSON.stringify(
+            gatewayInvocation.buildGatewayConnectRequest({
+              id: connectReqId,
+              token: GATEWAY_TOKEN,
+            }),
+          ),
         );
         return;
       }
 
-      // Step 2: Server responds to connect request -> send chat.send
+      // Step 2: Server responds to connect request -> send the agent RPC.
       if (msg.type === "res" && msg.id === connectReqId) {
         if (!msg.ok) {
           console.error(
@@ -938,24 +924,27 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           );
           return;
         }
+        try {
+          gatewayInvocation.assertGrantedGatewayScopes(msg.payload);
+        } catch (error) {
+          console.error(`[contract] Gateway scope mismatch: ${error.message}`);
+          done(`Auth failed: ${error.message}`);
+          return;
+        }
         authenticated = true;
         console.log(
-          "[contract] Authenticated successfully, sending chat.send...",
+          "[contract] Authenticated successfully, sending agent request...",
         );
-        chatReqId = randomUUID();
+        agentReqId = randomUUID();
         ws.send(
-          JSON.stringify({
-            type: "req",
-            id: chatReqId,
-            method: "chat.send",
-            params: {
-              sessionKey: "global",
-              message: message,
-              idempotencyKey: chatReqId,
-            },
-          }),
+          JSON.stringify(
+            gatewayInvocation.buildAgentRequest({
+              id: agentReqId,
+              message,
+            }),
+          ),
         );
-        chatSent = true;
+        agentSent = true;
         return;
       }
 
@@ -969,11 +958,11 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
         );
       };
 
-      // Step 3: Chat events — state: "delta" (streaming) or "final" (complete)
-      // OpenClaw puts content in payload.message.content (usual) or
-      // directly in payload.message (string or content-blocks array).
+      // Correlated chat events preserve streaming while the authoritative
+      // terminal result remains the second agent response with this request ID.
       if (msg.type === "event" && msg.event === "chat") {
         const payload = msg.payload || {};
+        if (payload.runId !== agentReqId) return;
 
         if (payload.state === "delta") {
           const text = extractFromPayload(payload);
@@ -985,20 +974,11 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
         }
 
         if (payload.state === "final") {
-          // Final message may include the complete text
           const text = extractFromPayload(payload);
           if (text) responseText = text;
-          console.log(`[contract] Chat final (${responseText.length} chars)`);
-          if (responseText) {
-            done(responseText);
-          } else {
-            // Empty final — log full payload for diagnostics and return ""
-            // to signal caller that the bridge got no content.
-            console.warn(
-              `[contract] Empty final event — payload: ${JSON.stringify(payload).slice(0, 1000)}`,
-            );
-            done("");
-          }
+          console.log(
+            `[contract] Correlated agent stream final (${responseText.length} chars)`,
+          );
           return;
         }
 
@@ -1006,43 +986,47 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           console.error(
             `[contract] Chat error event: ${payload.errorMessage || "unknown"}`,
           );
-          done(
-            responseText || `Chat error: ${payload.errorMessage || "unknown"}`,
-          );
+          responseText =
+            responseText || `Agent error: ${payload.errorMessage || "unknown"}`;
           return;
         }
 
         if (payload.state === "aborted") {
-          done(responseText || "Chat aborted.");
+          responseText = responseText || "Agent aborted.";
           return;
         }
         return;
       }
 
-      // Step 4: Response to chat.send request (accepted/final)
-      if (msg.type === "res" && msg.id === chatReqId) {
+      // Step 3: the agent RPC sends accepted, then a terminal response using
+      // the same request/idempotency/run ID. Ignore every other response.
+      const agentResponseKind =
+        gatewayInvocation.classifyAgentResponse(msg, agentReqId);
+      if (agentResponseKind !== "ignore") {
         if (!msg.ok) {
           console.error(
-            `[contract] Chat error: ${JSON.stringify(msg.error || msg.payload)}`,
+            `[contract] Agent error: ${JSON.stringify(msg.error || msg.payload)}`,
           );
           done(
-            responseText || `Chat error: ${msg.error?.message || "unknown"}`,
+            responseText || `Agent error: ${msg.error?.message || "unknown"}`,
           );
           return;
         }
-        // Log full payload for debugging
         const status = msg.payload?.status;
         console.log(
-          `[contract] Chat res status=${status} payload=${JSON.stringify(msg.payload).slice(0, 500)}`,
+          `[contract] Agent res status=${status} payload=${JSON.stringify(msg.payload).slice(0, 500)}`,
         );
-        // "started" or "accepted" = in progress, wait for streaming events
-        if (status === "started" || status === "accepted") return;
-        // "final" or "done" = completed — return "" if no content (bridge empty)
+        if (agentResponseKind === "pending") return;
+        if (status === "ok") {
+          const terminalText =
+            gatewayInvocation.extractAgentResponseText(msg.payload);
+          if (terminalText) responseText = terminalText;
+        }
         if (responseText) {
           done(responseText);
         } else {
           console.warn(
-            `[contract] Chat response completed with no streaming content — payload: ${JSON.stringify(msg.payload).slice(0, 500)}`,
+            `[contract] Agent response completed with no content — payload: ${JSON.stringify(msg.payload).slice(0, 500)}`,
           );
           done("");
         }
@@ -1066,7 +1050,7 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           ? ` unhandled=[${unhandledMsgs.slice(0, 3).join(" | ")}]`
           : "";
       console.warn(
-        `[contract] WebSocket closed: code=${code} reason=${reasonStr} auth=${authenticated} chatSent=${chatSent} responseLen=${responseText.length}${debugInfo}`,
+        `[contract] WebSocket closed: code=${code} reason=${reasonStr} auth=${authenticated} agentSent=${agentSent} responseLen=${responseText.length}${debugInfo}`,
       );
       // Return "" on unexpected close so caller can fall back to lightweight agent
       done(responseText || "");
