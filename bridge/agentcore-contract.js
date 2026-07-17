@@ -6,9 +6,8 @@
  *   - POST /invocations  -> Chat handler with hybrid init
  *
  * Each AgentCore session is dedicated to a single user. On first invocation:
- *   1. Generate an ephemeral local gateway token and pre-fetch only the
- *      proxy's infrastructure identity secret
- *   2. Start proxy + OpenClaw + workspace restore in parallel
+ *   1. Bind the exact internal identity and mint scoped workspace credentials
+ *   2. Start the execution-role proxy and scoped OpenClaw/workspace paths
  *   3. Once proxy is ready (~5s), route via lightweight agent shim
  *   4. Once OpenClaw is ready (~1-2 min), route via WebSocket bridge
  *
@@ -22,16 +21,16 @@ const http = require("http");
 const fs = require("fs");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
-const {
-  SecretsManagerClient,
-  GetSecretValueCommand,
-} = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
 const runtimePolicy = require("./runtime-policy");
 const gatewayInvocation = require("./gateway-invocation");
+const { SessionBinding } = require("./session-binding");
+const { createInvocationHandler } = require("./invocation-handler");
+
+const RUNTIME_REGION = scopedCreds.requireExactRegion(process.env);
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -44,10 +43,6 @@ const OPENCLAW_DIR = process.env.HOME ? `${process.env.HOME}/.openclaw` : "/root
 // Ephemeral, microVM-local authentication for the loopback gateway only.
 const GATEWAY_TOKEN = runtimePolicy.createLocalGatewayToken();
 
-// Cognito password secret — fetched from Secrets Manager eagerly at boot.
-// Stored in-process only, never written to process.env.
-let COGNITO_PASSWORD_SECRET = null;
-
 // Maximum request body size (1MB) to prevent memory exhaustion
 const MAX_BODY_SIZE = 1 * 1024 * 1024;
 
@@ -57,22 +52,19 @@ let lastPingLogTime = 0;
 const PING_LOG_INTERVAL_MS = 60000; // Log ping stats every 60s
 
 // State tracking
-let currentUserId = null;
+let currentInternalUserId = null;
 let currentNamespace = null;
 let openclawProcess = null;
 let proxyProcess = null;
 let openclawReady = false;
 let gatewayQuarantined = null;
 let proxyReady = false;
-let secretsReady = false;
 let initInProgress = false;
 let initPromise = null;
-let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
-const IDENTITY_FILE = "/tmp/current-identity.json";
 const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
 
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
@@ -105,11 +97,34 @@ let activeTaskCount = 0;
 // Initialized to startup time; updated on each chat/warmup invocation.
 let lastActivityTime = Math.floor(Date.now() / 1000);
 
-/**
- * Write current actorId and channel to a shared file so the proxy process
- * can pick up cross-channel identity changes (the proxy's env vars are
- * fixed at spawn time and cannot be updated for a running child process).
- */
+function createRuntimeInvocationAdmission({
+  sessionBinding = new SessionBinding(),
+  handlers = {
+    status: (context) => context,
+    warmup: (context) => context,
+    chat: (context) => context,
+  },
+} = {}) {
+  return createInvocationHandler({ sessionBinding, handlers });
+}
+
+function hashBoundInvocation({ identity, delivery, request } = {}) {
+  const gatewayRunId = gatewayInvocation.deriveGatewayRunId({
+    invocationId: request?.invocationId,
+  });
+  const requestHash = gatewayInvocation.hashTrustedInvocationRequest({
+    // RH1's frozen canonical hash schema names this slot `userId`. Its value
+    // is exclusively the internal identity retained by SessionBinding.
+    userId: identity?.internalUserId,
+    actorId: delivery?.actorId || null,
+    channel: delivery?.channel || null,
+    message: request?.message,
+  });
+  return Object.freeze({ gatewayRunId, requestHash });
+}
+
+const runtimeInvocationHandler = createRuntimeInvocationAdmission();
+
 /**
  * Set up symlink from ~/.openclaw to session storage mount.
  * Returns true if session storage is available and symlink was created.
@@ -158,41 +173,6 @@ function setupSessionStorageSymlink() {
     console.warn(`[contract] Session storage setup failed: ${err.message}`);
     return false;
   }
-}
-
-function updateIdentityFile(actorId, channel) {
-  try {
-    fs.writeFileSync(
-      IDENTITY_FILE,
-      JSON.stringify({ actorId, channel }),
-      "utf-8",
-    );
-  } catch (err) {
-    console.warn(`[contract] Failed to write identity file: ${err.message}`);
-  }
-}
-
-/**
- * Pre-fetch secrets from Secrets Manager at container boot.
- * Runs in the background — does not block /ping health checks.
- */
-async function prefetchSecrets() {
-  const region = process.env.AWS_REGION || "eu-west-1";
-  const smClient = new SecretsManagerClient({ region });
-
-  const cognitoSecretId = process.env.COGNITO_PASSWORD_SECRET_ID;
-  if (cognitoSecretId) {
-    const resp = await smClient.send(
-      new GetSecretValueCommand({ SecretId: cognitoSecretId }),
-    );
-    if (resp.SecretString) {
-      COGNITO_PASSWORD_SECRET = resp.SecretString;
-      console.log("[contract] Cognito password secret pre-fetched");
-    }
-  }
-
-  secretsReady = true;
-  console.log("[contract] Secrets pre-fetch complete");
 }
 
 /**
@@ -489,70 +469,76 @@ function scheduleOpenClawRestart(namespace) {
 /**
  * Initialization — called on first /invocations request.
  *
- * Uses pre-fetched secrets. Starts proxy, OpenClaw, and workspace restore
- * in parallel. Only waits for proxy readiness (~5s), then returns.
+ * Mints scoped workspace credentials, then starts proxy, OpenClaw, and
+ * workspace restore. Only waits for proxy readiness (~5s), then returns.
  * OpenClaw readiness is polled in the background.
  */
-async function init(userId, actorId, channel) {
+function quarantineForCredentialFailure(error) {
+  gatewayQuarantined = Object.freeze({
+    code: "SCOPED_CREDENTIAL_FAILURE",
+    message: "Scoped workspace credentials could not be maintained",
+  });
+  openclawReady = false;
+  proxyReady = false;
+  if (credentialRefreshTimer) {
+    clearInterval(credentialRefreshTimer);
+    credentialRefreshTimer = null;
+  }
+  void workspaceSync.cleanup(null).catch(() => {});
+  for (const child of [openclawProcess, proxyProcess]) {
+    try {
+      child?.kill("SIGTERM");
+    } catch {}
+  }
+  console.error(`[contract] Fatal scoped credential failure: ${error.message}`);
+  const fatalExitTimer = setTimeout(() => process.exit(1), 2_000);
+  fatalExitTimer.unref();
+}
+
+async function init(internalUserId, namespace) {
   if (proxyReady) return; // Already initialized
   if (initInProgress) return initPromise;
   initInProgress = true;
 
   initPromise = (async () => {
-    const namespace = actorId.replace(/:/g, "_");
-    currentUserId = userId;
+    console.log("[contract] Creating scoped S3 credentials");
+    const credentials = await scopedCreds.createScopedCredentials(namespace);
+    const credentialFiles = scopedCreds.writeCredentialFiles(
+      credentials,
+      SCOPED_CREDS_DIR,
+    );
+    workspaceSync.configureCredentials(credentials);
+
+    const scopedEnvironment = scopedCreds.buildOpenClawEnv({
+      credDir: SCOPED_CREDS_DIR,
+      baseEnv: process.env,
+    });
+    const workspaceEnvironment = {
+      AWS_REGION: RUNTIME_REGION,
+      AWS_DEFAULT_REGION: RUNTIME_REGION,
+      S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET,
+      PERSONAL_OPERATOR_WORKSPACE_PREFIX: namespace,
+      PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
+        credentialFiles.credentialsPath,
+    };
+    await agent.configureWorkspaceRuntime({ env: workspaceEnvironment });
+
+    currentInternalUserId = internalUserId;
     currentNamespace = namespace;
     await cwLogger.init(`${namespace}-${Date.now()}`);
+    console.log(`[contract] Init for internalUserId=${internalUserId}`);
 
-    // The in-process warm-up store and the OpenClaw plugin read only this
-    // server-derived prefix; model/tool arguments cannot replace it.
-    process.env.PERSONAL_OPERATOR_WORKSPACE_PREFIX = namespace;
-
-    // Write initial identity file for the proxy to read
-    updateIdentityFile(actorId, channel);
-
-    console.log(
-      `[contract] Init for user=${userId} actor=${actorId} namespace=${namespace}`,
-    );
-
-    // 0. Wait for pre-fetched secrets (should already be done by now)
-    if (!secretsReady && secretsPrefetchPromise) {
-      console.log("[contract] Waiting for secrets pre-fetch to complete...");
-      await secretsPrefetchPromise;
-    }
-
-    // 1b. Create scoped S3 credentials (per-user IAM isolation)
-    // Restricts S3 access to the user's namespace prefix.
-    let scopedCredsAvailable = false;
-    if (process.env.EXECUTION_ROLE_ARN) {
+    if (credentialRefreshTimer) clearInterval(credentialRefreshTimer);
+    credentialRefreshTimer = setInterval(async () => {
       try {
-        console.log("[contract] Creating scoped S3 credentials for namespace=", namespace);
-        const creds = await scopedCreds.createScopedCredentials(namespace, { internalUserId: userId });
-        scopedCreds.writeCredentialFiles(creds, SCOPED_CREDS_DIR);
-        workspaceSync.configureCredentials(creds);
-        scopedCredsAvailable = true;
-        console.log("[contract] Scoped S3 credentials created and applied");
-
-        // Refresh credentials before expiry (45 min timer, max 1 hour session)
-        if (credentialRefreshTimer) clearInterval(credentialRefreshTimer);
-        credentialRefreshTimer = setInterval(async () => {
-          try {
-            console.log("[contract] Refreshing scoped S3 credentials...");
-            const refreshed = await scopedCreds.createScopedCredentials(namespace, { internalUserId: userId });
-            scopedCreds.writeCredentialFiles(refreshed, SCOPED_CREDS_DIR);
-            workspaceSync.configureCredentials(refreshed);
-            console.log("[contract] Scoped S3 credentials refreshed");
-          } catch (err) {
-            console.error(`[contract] Credential refresh failed: ${err.message}`);
-          }
-        }, 45 * 60 * 1000); // 45 minutes
-      } catch (err) {
-        console.warn(`[contract] Scoped credentials failed (falling back to full role): ${err.message}`);
-        // Non-fatal — fall back to full execution role credentials
+        const refreshed = await scopedCreds.createScopedCredentials(namespace);
+        scopedCreds.writeCredentialFiles(refreshed, SCOPED_CREDS_DIR);
+        workspaceSync.configureCredentials(refreshed);
+        console.log("[contract] Scoped S3 credentials refreshed");
+      } catch (error) {
+        quarantineForCredentialFailure(error);
       }
-    } else {
-      console.log("[contract] EXECUTION_ROLE_ARN not set — skipping credential scoping");
-    }
+    }, 45 * 60 * 1000);
 
     // 1c. Clean up stale lock files restored from S3 (non-blocking)
     // Runs in parallel with proxy startup — does not block init.
@@ -560,24 +546,13 @@ async function init(userId, actorId, channel) {
       console.warn(`[contract] Lock cleanup failed: ${err.message}`);
     });
 
-    // 2. Start the Bedrock proxy with user identity env vars
-    // Only pass required env vars — avoid leaking secrets via process.env spread
     console.log("[contract] Starting Bedrock proxy...");
-    const proxyEnv = {
-      PATH: process.env.PATH,
-      HOME: process.env.HOME || "/root",
-      NODE_PATH: process.env.NODE_PATH || "/app/node_modules",
-      NODE_OPTIONS: process.env.NODE_OPTIONS || "",
-      AWS_REGION: process.env.AWS_REGION || "eu-west-1",
-      BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "",
-      COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
-      COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
-      COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
-      S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
-      USER_ID: actorId,
-      INTERNAL_USER_ID: userId,
-      CHANNEL: channel,
-    };
+    const proxyEnv = runtimePolicy.buildProxyChildEnv({
+      baseEnv: process.env,
+      internalUserId,
+      namespace,
+      scopedCredentialsFile: credentialFiles.credentialsPath,
+    });
     proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
       env: proxyEnv,
       stdio: ["inherit", "pipe", "pipe"],
@@ -599,27 +574,6 @@ async function init(userId, actorId, channel) {
     // Write OpenClaw config and start gateway (non-blocking)
     writeOpenClawConfig();
     console.log("[contract] Starting OpenClaw gateway (headless)...");
-    // Build scoped env for OpenClaw — excludes container credentials,
-    // uses credential_process for scoped S3 access only.
-    // Falls back to full process.env if scoped credentials failed.
-    let scopedEnvironment;
-    if (scopedCredsAvailable) {
-      scopedEnvironment = scopedCreds.buildOpenClawEnv({
-        credDir: SCOPED_CREDS_DIR,
-        baseEnv: process.env,
-      });
-    } else {
-      // SECURITY: Never start OpenClaw with full execution role credentials.
-      // Build a safe env that strips ALL AWS credential sources.
-      // OpenClaw will have zero AWS access — tools fail gracefully.
-      console.error(
-        "[contract] WARNING: Scoped credentials failed — starting OpenClaw with zero AWS access",
-      );
-      scopedEnvironment = scopedCreds.buildOpenClawEnv({
-        credDir: null,
-        baseEnv: process.env,
-      });
-    }
     const openclawEnv = runtimePolicy.buildOpenClawChildEnv({
       scopedEnv: scopedEnvironment,
       workspacePrefix: namespace,
@@ -709,7 +663,7 @@ async function init(userId, actorId, channel) {
   try {
     await initPromise;
   } catch (err) {
-    // Reset initPromise on failure so concurrent requests don't await a stale rejected promise
+    quarantineForCredentialFailure(err);
     initPromise = null;
     throw err;
   } finally {
@@ -915,21 +869,35 @@ const server = http.createServer(async (req, res) => {
       if (aborted) return;
       try {
         const payload = body ? JSON.parse(body) : {};
-        const action = payload.action || "status";
+        const action = payload.action === undefined ? "status" : payload.action;
+        let boundInvocation;
+        try {
+          boundInvocation = runtimeInvocationHandler.handle(payload);
+        } catch (identityError) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              response: "This invocation does not match the bound runtime identity.",
+              status: "failed",
+              errorCode:
+                identityError.code || "INVALID_SESSION_IDENTITY",
+            }),
+          );
+          return;
+        }
+        const { identity, delivery, request } = boundInvocation;
 
-        // Status check (no init needed)
         if (action === "status") {
-          // Fetch proxy /health for request counters (non-blocking — null on failure)
           const proxyHealth = await checkProxyHealth();
 
           const diag = {
             buildVersion: BUILD_VERSION,
             uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
-            currentUserId,
+            currentInternalUserId,
+            boundInternalUserId: identity.internalUserId,
             openclawReady,
             gatewayQuarantined,
             proxyReady,
-            secretsReady,
             openclawExitCode,
             openclawPid: openclawProcess?.pid || null,
             openclawLogs: openclawLogs.slice(-20),
@@ -956,15 +924,14 @@ const server = http.createServer(async (req, res) => {
           }
 
           lastActivityTime = Math.floor(Date.now() / 1000);
-          const { userId, actorId, channel } = payload;
           if (openclawReady && proxyReady) {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "ready" }));
             return;
           }
           // Trigger init in background if not already running
-          if (!initInProgress && userId && actorId) {
-            init(userId, actorId, channel || "unknown").catch((err) => {
+          if (!initInProgress) {
+            init(identity.internalUserId, identity.namespace).catch((err) => {
               console.error(`[contract] Warmup init failed: ${err.message}`);
             });
           }
@@ -975,36 +942,28 @@ const server = http.createServer(async (req, res) => {
 
         // Chat action — lazy init and bridge
         if (action === "chat") {
-          const { userId, actorId, channel, message } = payload;
-          if (!userId || !actorId || !message) {
+          const { message, invocationId } = request;
+          if (message === undefined) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(
-              JSON.stringify({ error: "Missing userId, actorId, or message" }),
+              JSON.stringify({ error: "Missing message" }),
             );
             return;
           }
 
           let gatewayRunId;
           let requestHash;
-          const requestChannel = channel || "unknown";
           try {
-            gatewayRunId = gatewayInvocation.deriveGatewayRunId({
-              invocationId: payload.invocationId,
-            });
-            requestHash = gatewayInvocation.hashTrustedInvocationRequest({
-              userId,
-              actorId,
-              channel: requestChannel,
-              message,
-            });
+            ({ gatewayRunId, requestHash } = hashBoundInvocation(
+              boundInvocation,
+            ));
           } catch {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
               JSON.stringify({
                 response:
                   "This request has no valid trusted invocation identity and was not executed.",
-                userId,
-                sessionId: payload.sessionId || null,
+                internalUserId: identity.internalUserId,
                 status: "failed",
                 errorCode: "INVALID_INVOCATION_IDENTITY",
               }),
@@ -1017,7 +976,7 @@ const server = http.createServer(async (req, res) => {
           let responseErrorCode;
           try {
             const outcome = await trustedInvocationRegistry.invoke({
-              invocationId: payload.invocationId,
+              invocationId,
               requestHash,
               execute: async () => {
                 if (gatewayQuarantined) {
@@ -1029,12 +988,9 @@ const server = http.createServer(async (req, res) => {
                   };
                 }
 
-                // Identity, initialization, and executor selection all sit
-                // behind the same trusted-invocation single-flight boundary.
-                updateIdentityFile(actorId, requestChannel);
                 if (!proxyReady && !initInProgress) {
                   try {
-                    await init(userId, actorId, requestChannel);
+                    await init(identity.internalUserId, identity.namespace);
                   } catch (err) {
                     console.error(`[contract] Init failed: ${err.message}`);
                     return {
@@ -1076,7 +1032,6 @@ const server = http.createServer(async (req, res) => {
                           invokeFallback: () =>
                             agent.chat(
                               bridgeText,
-                              actorId,
                               Date.now() + 30000,
                             ),
                         });
@@ -1107,7 +1062,6 @@ const server = http.createServer(async (req, res) => {
                     try {
                       executionText = await agent.chat(
                         bridgeText,
-                        actorId,
                         Date.now() + 620000,
                       );
                     } catch (agentErr) {
@@ -1161,8 +1115,7 @@ const server = http.createServer(async (req, res) => {
           res.end(
             JSON.stringify({
               response: responseText,
-              userId: currentUserId,
-              sessionId: payload.sessionId || null,
+              internalUserId: identity.internalUserId,
               ...(responseStatus ? { status: responseStatus } : {}),
               ...(responseErrorCode ? { errorCode: responseErrorCode } : {}),
             }),
@@ -1195,7 +1148,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 // --- SIGTERM handler: save workspace and exit gracefully ---
-process.on("SIGTERM", async () => {
+async function shutdownRuntime() {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(
@@ -1237,18 +1190,26 @@ process.on("SIGTERM", async () => {
   await cwLogger.shutdown();
   console.log("[contract] Shutdown complete");
   process.exit(0);
-});
+}
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
-  );
-  console.log(
-    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup}",
-  );
-
-  // Pre-fetch secrets in background (saves ~2-3s from first-message critical path)
-  secretsPrefetchPromise = prefetchSecrets().catch((err) => {
-    console.warn(`[contract] Secret prefetch failed: ${err.message}`);
+function startContractServer() {
+  process.once("SIGTERM", shutdownRuntime);
+  return server.listen(PORT, "0.0.0.0", () => {
+    console.log(
+      `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
+    );
+    console.log(
+      "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup}",
+    );
   });
-});
+}
+
+if (require.main === module) {
+  startContractServer();
+}
+
+module.exports = {
+  createRuntimeInvocationAdmission,
+  hashBoundInvocation,
+  startContractServer,
+};

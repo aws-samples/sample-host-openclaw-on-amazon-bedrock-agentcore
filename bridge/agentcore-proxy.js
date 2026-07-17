@@ -8,20 +8,15 @@
 
 const http = require("http");
 const crypto = require("crypto");
-const fs = require("fs");
+const fs = require("node:fs");
+const { canonicalNamespace } = require("./session-binding");
+const { requireExactRegion } = require("./scoped-credentials");
 
 const PORT = 18790;
-const AWS_REGION = process.env.AWS_REGION;
-if (!AWS_REGION) {
-  console.error("[proxy] FATAL: AWS_REGION environment variable is not set.");
-  process.exit(1);
-}
+const AWS_REGION = requireExactRegion(process.env);
 const MODEL_ID =
   process.env.BEDROCK_MODEL_ID || "minimax.minimax-m2.1";
 
-// Log credential env vars at startup for debugging
-console.log(`[proxy] AWS_REGION=${AWS_REGION} MODEL_ID=${MODEL_ID}`);
-console.log(`[proxy] Credential env: RELATIVE_URI=${!!process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI} FULL_URI=${!!process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI} AUTH_TOKEN=${!!process.env.AWS_CONTAINER_AUTHORIZATION_TOKEN}`);
 
 // Subagent model routing — distinct model name lets proxy detect subagent requests
 const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcore-subagent";
@@ -36,11 +31,6 @@ const guardrailConfig = GUARDRAIL_ID
 if (guardrailConfig) {
   console.log(`[proxy] Bedrock Guardrails enabled: ${GUARDRAIL_ID} v${GUARDRAIL_VERSION}`);
 }
-
-// Cognito identity configuration
-const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
-const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID || "";
-const COGNITO_PASSWORD_SECRET = process.env.COGNITO_PASSWORD_SECRET || "";
 
 // Diagnostic state — exposed via /health for observability (container stdout not in CloudWatch)
 let lastIdentityDiag = null;
@@ -91,296 +81,86 @@ function bedrockClientOptions(modelId) {
   return opts;
 }
 
-// Session tracking (in-memory, per container instance)
-const sessionMap = new Map();
+function createBedrockClient(modelId, { BedrockRuntimeClient } = {}) {
+  const Constructor =
+    BedrockRuntimeClient ||
+    require("@aws-sdk/client-bedrock-runtime").BedrockRuntimeClient;
+  return new Constructor({
+    region: AWS_REGION,
+    requestHandler: bedrockClientOptions(modelId),
+  });
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Extract session metadata from request headers and body.
- * Returns { sessionId, actorId, channel }.
- */
-function extractSessionMetadata(parsed, headers) {
-  let actorId = "";
-  let channel = "unknown";
-  let sessionId = "";
-  let idSource = "none";
-
-  // 0. Check shared identity file (updated by contract server on each message,
-  //    supports cross-channel identity changes for bound users). Falls back to
-  //    env vars if the file doesn't exist or can't be read.
-  try {
-    const identity = JSON.parse(
-      fs.readFileSync("/tmp/current-identity.json", "utf-8"),
-    );
-    if (identity.actorId) {
-      actorId = identity.actorId;
-      channel = identity.channel || "unknown";
-      idSource = "identity-file";
-    }
-  } catch (_) {
-    // File not yet written or unreadable — fall back to env vars
+function resolveRuntimeIdentity(env = process.env) {
+  const internalUserId = canonicalNamespace(env.INTERNAL_USER_ID);
+  const namespace = canonicalNamespace(env.PERSONAL_OPERATOR_WORKSPACE_PREFIX);
+  if (namespace !== internalUserId) {
+    throw new Error("Proxy namespace must exactly equal internal user identity");
   }
-  if (!actorId && process.env.USER_ID) {
-    actorId = process.env.USER_ID;
-    channel = process.env.CHANNEL || "unknown";
-    idSource = "environment";
-  }
-  if (actorId && (idSource === "identity-file" || idSource === "environment")) {
-    // Generate stable session ID for this user
-    const key = `${actorId}:${channel}`;
-    if (!sessionMap.has(key)) {
-      const ts = Date.now().toString(36);
-      const rand = crypto.randomBytes(12).toString("hex");
-      sessionMap.set(
-        key,
-        `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
-      );
-    }
-    sessionId = sessionMap.get(key);
-    return { sessionId, actorId, channel, idSource };
-  }
-
-  // 1. Check custom headers (future: OpenClaw might set these)
-  actorId = headers["x-openclaw-actor-id"] || "";
-  channel = headers["x-openclaw-channel"] || "unknown";
-  sessionId = headers["x-openclaw-session-id"] || "";
-  if (actorId) idSource = "header";
-
-  // 2. Check OpenAI 'user' field (OpenClaw may populate this)
-  if (!actorId && parsed.user) {
-    actorId = parsed.user;
-    idSource = "openai-user-field";
-  }
-
-  // Helper: extract text content from string or array (multimodal) format
-  function getTextContent(content) {
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      const textPart = content.find((p) => p.type === "text" && p.text);
-      return textPart ? textPart.text : "";
-    }
-    return "";
-  }
-
-  // 3. Extract from message envelope headers
-  // OpenClaw wraps user messages with channel-specific prefixes. Three known formats:
-  //
-  // Format C (metadata JSON — checked FIRST, highest priority):
-  //   Conversation info (untrusted metadata):
-  //   ```json
-  //   { "message_id": "542", "sender": "123456789" }
-  //   ```
-  //   NOT anchored — OpenClaw may PREPEND a Slack "System: [...]" line before
-  //   the metadata block. Used by ALL channels. Contains the platform user ID
-  //   (Telegram numeric, Slack U-prefixed, Discord snowflake) which is the
-  //   most stable identifier for namespacing.
-  //
-  // Format A (fallback — display-name-based):
-  //   System: [2026-02-22 11:16:42 UTC] Slack DM from Sen-Outlook: message
-  //   Pattern: System: [TIMESTAMP] CHANNEL TYPE from SENDER: message
-  //   Uses display names which can change — only used when Format C is absent.
-  //
-  // Format B (legacy, hypothetical):
-  //   [Telegram John Doe id:12345 timestamp] message
-  //
-  // IMPORTANT: Iterate in REVERSE (most recent message first) to prevent
-  // cross-channel identity leakage from older messages in the conversation.
-  // A single message can contain both a Slack "System:" prefix and Telegram
-  // metadata when OpenClaw merges cross-channel context — Format C's sender
-  // ID pattern detection resolves the actual channel correctly.
-  if (!actorId && parsed.messages) {
-    for (let i = parsed.messages.length - 1; i >= 0; i--) {
-      const msg = parsed.messages[i];
-      if (msg.role !== "user") continue;
-      const text = getTextContent(msg.content);
-      if (!text) continue;
-
-      // Format C: Metadata JSON block (all channels)
-      // Checked FIRST — contains platform user IDs (stable, unique).
-      // NOT anchored — OpenClaw may prepend "System: [...] Slack message edited..."
-      const formatC = text.match(
-        /Conversation info \(untrusted metadata\):\s*```json\s*(\{[\s\S]*?\})\s*```/,
-      );
-      if (formatC) {
-        try {
-          const meta = JSON.parse(formatC[1]);
-          if (meta.sender) {
-            const senderId = String(meta.sender)
-              .replace(/[^a-zA-Z0-9_-]/g, "")
-              .slice(0, 64);
-            // Determine channel from sender ID format:
-            //   meta.channel field (most authoritative if present)
-            //   /^[UW][A-Z0-9]{8,}/i → Slack user ID (e.g., U0AGD41CBGS)
-            //   /^\d{15,}/ → Discord snowflake ID
-            //   /^\d{5,14}/ → Telegram numeric ID
-            let channelName = "";
-            if (meta.channel) {
-              channelName = String(meta.channel)
-                .toLowerCase()
-                .replace(/[^a-z]/g, "");
-            }
-            if (!channelName) {
-              if (/^[UW][A-Z0-9]{8,}$/i.test(senderId)) {
-                channelName = "slack";
-              } else if (/^\d{15,}$/.test(senderId)) {
-                channelName = "discord";
-              } else if (/^\d{5,14}$/.test(senderId)) {
-                channelName = "telegram";
-              }
-            }
-            if (!channelName) channelName = "telegram"; // safe fallback for numeric IDs
-            actorId = `${channelName}:${senderId}`;
-            channel = channelName;
-            idSource = "metadata-json";
-            break;
-          }
-        } catch {
-          // JSON parse failed, fall through to other formats
-        }
-      }
-
-      // Format A: "System: [TIMESTAMP] Channel TYPE from SenderName: message"
-      // Fallback — uses display names (can change). Only reached when Format C
-      // is absent from the message.
-      const formatA = text.match(
-        /System:\s*\[[^\]]+\]\s*(Slack|Telegram|Discord|WhatsApp)\s+\S+\s+from\s+([^:]+):/i,
-      );
-      if (formatA) {
-        const channelName = formatA[1].toLowerCase();
-        const senderName = formatA[2].trim();
-        if (senderName) {
-          const sanitizedName = senderName
-            .toLowerCase()
-            .replace(/[^a-z0-9_-]/g, "_")
-            .slice(0, 64);
-          actorId = `${channelName}:${sanitizedName}`;
-          channel = channelName;
-          idSource = "envelope-formatA";
-        }
-        break;
-      }
-
-      // Format B: "[Channel ... id:IDENTIFIER ...]"
-      const formatB = text.match(
-        /^\[(Slack|Telegram|Discord|WhatsApp)\s+[^\]]*?\bid:(\S+)/i,
-      );
-      if (formatB) {
-        const channelName = formatB[1].toLowerCase();
-        const rawId = formatB[2]
-          .replace(/\)$/, "")
-          .replace(/[^a-zA-Z0-9_-]/g, "")
-          .slice(0, 64);
-        if (rawId) {
-          actorId = `${channelName}:${rawId}`;
-          channel = channelName;
-          idSource = "envelope-formatB";
-        }
-        break;
-      }
-    }
-  }
-
-  // 4. Extract from message name fields (if OpenClaw sets them)
-  if (!actorId && parsed.messages) {
-    const userMsg = parsed.messages.find((m) => m.role === "user" && m.name);
-    if (userMsg && userMsg.name) {
-      actorId = userMsg.name;
-      idSource = "message-name";
-    }
-  }
-
-  // 5. Fallback to default (with warning)
-  if (!actorId) {
-    actorId = "default-user";
-    idSource = "fallback";
-    console.warn(
-      "[proxy] WARNING: No user identity found in request — using default-user fallback. " +
-        "All users share the same S3 namespace.",
-    );
-  }
-
-  // 5b. Validate actorId format to prevent prompt injection.
-  // Only allow channel:alphanumeric patterns or known fallback values.
-  const VALID_ACTOR_ID =
-    /^(telegram|slack|discord|whatsapp):[A-Za-z0-9_-]{1,64}$/;
-  if (actorId !== "default-user" && !VALID_ACTOR_ID.test(actorId)) {
-    console.warn(
-      `[proxy] WARNING: actorId "${actorId.slice(0, 80)}" failed validation — falling back to default-user.`,
-    );
-    actorId = "default-user";
-    idSource = "fallback-invalid";
-  }
-
-  // Diagnostic: log the first user message prefix to verify envelope format
-  if (parsed.messages) {
-    const firstUserMsg = parsed.messages.find(
-      (m) => m.role === "user" && typeof m.content === "string",
-    );
-    if (firstUserMsg) {
-      // Only log the envelope prefix (up to closing bracket), never full message content
-      const bracketEnd = firstUserMsg.content.indexOf("]");
-      const prefix =
-        bracketEnd > 0
-          ? firstUserMsg.content.slice(0, bracketEnd + 1)
-          : firstUserMsg.content.slice(0, 60);
-    }
-  }
-  console.log(
-    `[proxy][identity] actorId=${actorId}, channel=${channel}, source=${idSource}`,
-  );
-
-  // 6. Generate stable session ID (AgentCore requires min 33 chars)
-  if (!sessionId) {
-    const key = `${actorId}:${channel}`;
-    if (!sessionMap.has(key)) {
-      const ts = Date.now().toString(36);
-      const rand = crypto.randomBytes(12).toString("hex");
-      sessionMap.set(
-        key,
-        `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
-      );
-    }
-    sessionId = sessionMap.get(key);
-  }
-
-  return { sessionId, actorId, channel, idSource };
+  return Object.freeze({ internalUserId, namespace });
 }
 
-/**
- * Derive a deterministic password for a Cognito user from the HMAC secret.
- */
-function derivePassword(actorId) {
-  return crypto
-    .createHmac("sha256", COGNITO_PASSWORD_SECRET)
-    .update(actorId)
-    .digest("base64url")
-    .slice(0, 32);
-}
-
-// JWT token cache: actorId → { token, expiresAt }
-const tokenCache = new Map();
-
-// Lazily initialized Cognito client
-let _cognitoClient = null;
-function getCognitoClient() {
-  if (!_cognitoClient) {
-    const {
-      CognitoIdentityProviderClient,
-    } = require("@aws-sdk/client-cognito-identity-provider");
-    _cognitoClient = new CognitoIdentityProviderClient({ region: AWS_REGION });
-  }
-  return _cognitoClient;
-}
+const RUNTIME_IDENTITY = resolveRuntimeIdentity(process.env);
 
 // Lazily initialized S3 client
 let _s3Client = null;
+function createScopedCredentialFileProvider(
+  credentialsFile,
+  { readFile = fs.readFileSync, now = () => Date.now() } = {},
+) {
+  if (typeof credentialsFile !== "string" || credentialsFile.length === 0) {
+    throw new Error("An explicit scoped credential file is required for S3");
+  }
+  return async () => {
+    let document;
+    try {
+      document = JSON.parse(readFile(credentialsFile, "utf8"));
+    } catch (error) {
+      throw new Error(`Scoped credential file cannot be read: ${error.message}`);
+    }
+    const expiration = new Date(document?.Expiration);
+    if (
+      document?.Version !== 1 ||
+      typeof document.AccessKeyId !== "string" ||
+      document.AccessKeyId.length === 0 ||
+      typeof document.SecretAccessKey !== "string" ||
+      document.SecretAccessKey.length === 0 ||
+      typeof document.SessionToken !== "string" ||
+      document.SessionToken.length === 0 ||
+      !Number.isFinite(expiration.getTime()) ||
+      expiration.getTime() <= now()
+    ) {
+      throw new Error("Scoped credentials are incomplete or expired");
+    }
+    return {
+      accessKeyId: document.AccessKeyId,
+      secretAccessKey: document.SecretAccessKey,
+      sessionToken: document.SessionToken,
+      expiration,
+    };
+  };
+}
+
+function createScopedS3Client({
+  env = process.env,
+  S3ClientConstructor,
+} = {}) {
+  const region = requireExactRegion(env);
+  const credentials = createScopedCredentialFileProvider(
+    env.PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE,
+  );
+  const Constructor =
+    S3ClientConstructor || require("@aws-sdk/client-s3").S3Client;
+  return new Constructor({ region, credentials });
+}
+
 function getS3Client() {
   if (!_s3Client) {
-    const { S3Client } = require("@aws-sdk/client-s3");
-    _s3Client = new S3Client({ region: AWS_REGION });
+    _s3Client = createScopedS3Client();
   }
   return _s3Client;
 }
@@ -403,6 +183,7 @@ const CONTENT_TYPE_TO_BEDROCK_FORMAT = {
 };
 const IMAGE_MARKER_REGEX = /\n?\n?\[OPENCLAW_IMAGES:(\[.*?\])\]\s*$/;
 const MAX_IMAGE_BYTES = 3_750_000; // 3.75 MB — Bedrock limit
+const IMAGE_KEY_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
 
 /**
  * Extract image references from text that contains the [OPENCLAW_IMAGES:...] marker.
@@ -433,23 +214,35 @@ function extractImageReferences(text) {
 
 const VALID_BEDROCK_FORMATS = new Set(["jpeg", "png", "gif", "webp"]);
 
+function isValidImageKey(s3Key, expectedNamespace) {
+  let namespace;
+  try {
+    namespace = canonicalNamespace(expectedNamespace);
+  } catch {
+    return false;
+  }
+  if (
+    typeof s3Key !== "string" ||
+    s3Key.length === 0 ||
+    s3Key.includes("..") ||
+    s3Key.includes("\\") ||
+    IMAGE_KEY_CONTROL_CHARACTERS.test(s3Key)
+  ) {
+    return false;
+  }
+  const expectedPrefix = `${namespace}/_uploads/`;
+  return s3Key.startsWith(expectedPrefix) && s3Key.length > expectedPrefix.length;
+}
+
 /**
  * Fetch an image from S3 by key. Returns { bytes: Buffer, format: string } or null.
  * Validates that the key belongs to the expected user namespace and contains no
  * path traversal sequences.
  */
 async function fetchImageFromS3(s3Key, expectedNamespace) {
-  // Reject path traversal attempts
-  if (s3Key.includes("..")) {
-    console.warn(`[proxy] Rejected S3 image key with path traversal: ${s3Key}`);
-    return null;
-  }
-
-  // Validate key belongs to the expected user namespace
-  const expectedPrefix = expectedNamespace + "/_uploads/";
-  if (!s3Key.startsWith(expectedPrefix)) {
+  if (!isValidImageKey(s3Key, expectedNamespace)) {
     console.warn(
-      `[proxy] Rejected S3 image key outside user namespace: ${s3Key} (expected prefix: ${expectedPrefix})`,
+      `[proxy] Rejected S3 image key outside the bound namespace`,
     );
     return null;
   }
@@ -499,97 +292,6 @@ async function fetchImageFromS3(s3Key, expectedNamespace) {
     );
     return null;
   }
-}
-
-/**
- * Ensure a Cognito user exists for the given actorId. Creates one if not found.
- */
-async function ensureCognitoUser(actorId) {
-  const {
-    AdminGetUserCommand,
-    AdminCreateUserCommand,
-    AdminSetUserPasswordCommand,
-  } = require("@aws-sdk/client-cognito-identity-provider");
-  const client = getCognitoClient();
-
-  try {
-    await client.send(
-      new AdminGetUserCommand({
-        UserPoolId: COGNITO_USER_POOL_ID,
-        Username: actorId,
-      }),
-    );
-  } catch (err) {
-    if (err.name === "UserNotFoundException") {
-      const password = derivePassword(actorId);
-      await client.send(
-        new AdminCreateUserCommand({
-          UserPoolId: COGNITO_USER_POOL_ID,
-          Username: actorId,
-          MessageAction: "SUPPRESS",
-          TemporaryPassword: password,
-        }),
-      );
-      await client.send(
-        new AdminSetUserPasswordCommand({
-          UserPoolId: COGNITO_USER_POOL_ID,
-          Username: actorId,
-          Password: password,
-          Permanent: true,
-        }),
-      );
-      console.log(`[proxy] Cognito user provisioned: ${actorId}`);
-    } else {
-      throw err;
-    }
-  }
-}
-
-/**
- * Get a JWT token for the given actorId (cached, auto-refreshes).
- * Returns null if Cognito is not configured.
- */
-async function getCognitoToken(actorId) {
-  if (!COGNITO_USER_POOL_ID || !COGNITO_CLIENT_ID || !COGNITO_PASSWORD_SECRET) {
-    return null;
-  }
-
-  // Check cache
-  const cached = tokenCache.get(actorId);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.token;
-  }
-
-  await ensureCognitoUser(actorId);
-
-  const {
-    AdminInitiateAuthCommand,
-  } = require("@aws-sdk/client-cognito-identity-provider");
-  const client = getCognitoClient();
-
-  const response = await client.send(
-    new AdminInitiateAuthCommand({
-      UserPoolId: COGNITO_USER_POOL_ID,
-      ClientId: COGNITO_CLIENT_ID,
-      AuthFlow: "ADMIN_USER_PASSWORD_AUTH",
-      AuthParameters: {
-        USERNAME: actorId,
-        PASSWORD: derivePassword(actorId),
-      },
-    }),
-  );
-
-  const token = response.AuthenticationResult.IdToken;
-  const expiresIn = response.AuthenticationResult.ExpiresIn || 3600;
-  tokenCache.set(actorId, {
-    token,
-    expiresAt: Date.now() + (expiresIn - 60) * 1000,
-  });
-
-  console.log(
-    `[proxy] Cognito token acquired for ${actorId} (expires in ${expiresIn}s)`,
-  );
-  return token;
 }
 
 /**
@@ -759,15 +461,9 @@ function resolveModelId(requestedModel) {
  * Accepts optional systemTextOverride and toolConfig for tool use.
  */
 async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel) {
-  const {
-    BedrockRuntimeClient,
-    ConverseCommand,
-  } = require("@aws-sdk/client-bedrock-runtime");
+  const { ConverseCommand } = require("@aws-sdk/client-bedrock-runtime");
   const modelId = resolveModelId(requestedModel);
-  const client = new BedrockRuntimeClient({
-    region: AWS_REGION,
-    requestHandler: bedrockClientOptions(modelId),
-  });
+  const client = createBedrockClient(modelId);
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
 
@@ -858,15 +554,9 @@ async function invokeBedrockStreaming(
   systemTextOverride,
   toolConfig,
 ) {
-  const {
-    BedrockRuntimeClient,
-    ConverseStreamCommand,
-  } = require("@aws-sdk/client-bedrock-runtime");
+  const { ConverseStreamCommand } = require("@aws-sdk/client-bedrock-runtime");
   const modelId = resolveModelId(model);
-  const client = new BedrockRuntimeClient({
-    region: AWS_REGION,
-    requestHandler: bedrockClientOptions(modelId),
-  });
+  const client = createBedrockClient(modelId);
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
 
@@ -1111,7 +801,6 @@ const server = http.createServer(async (req, res) => {
         model: MODEL_ID,
         subagent_model: SUBAGENT_BEDROCK_MODEL_ID,
         subagent_model_name: SUBAGENT_MODEL_NAME,
-        cognito: COGNITO_USER_POOL_ID ? "configured" : "disabled",
         total_requests: chatRequestCount,
         subagent_requests: subagentRequestCount,
       }),
@@ -1133,9 +822,6 @@ const server = http.createServer(async (req, res) => {
           `[proxy] Incoming request: ${messages.length} messages, model=${parsed.model || MODEL_ID}, stream=${stream}`,
         );
 
-        // Extract identity for all modes (used for logging + Cognito)
-        const { sessionId, actorId, channel, idSource } =
-          extractSessionMetadata(parsed, req.headers);
         chatRequestCount++;
 
         // Detect and count subagent requests
@@ -1149,24 +835,13 @@ const server = http.createServer(async (req, res) => {
 
         // Store identity diagnostic (visible via /health since container stdout not in CloudWatch)
         lastIdentityDiag = {
-          actorId,
-          channel,
-          idSource,
+          internalUserId: RUNTIME_IDENTITY.internalUserId,
+          namespace: RUNTIME_IDENTITY.namespace,
+          idSource: "server-environment",
           msgCount: messages.length,
           toolCount: parsed.tools ? parsed.tools.length : 0,
           timestamp: new Date().toISOString(),
         };
-
-        // Acquire Cognito JWT (non-blocking failure — logs warning and continues)
-        let cognitoToken = null;
-        try {
-          cognitoToken = await getCognitoToken(actorId);
-        } catch (err) {
-          console.warn(
-            `[proxy] Cognito token acquisition failed for ${actorId}:`,
-            err.message,
-          );
-        }
 
         // --- Convert OpenAI tools to Bedrock toolConfig ---
         const toolConfig = convertTools(parsed.tools);
@@ -1178,7 +853,7 @@ const server = http.createServer(async (req, res) => {
 
         // --- Preprocess images: extract markers from last user message ---
         let processedMessages = messages;
-        const namespace = actorId.replace(/:/g, "_");
+        const namespace = RUNTIME_IDENTITY.namespace;
         const lastUserIdx = messages.reduce(
           (acc, m, i) => (m.role === "user" ? i : acc),
           -1,
@@ -1308,11 +983,24 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(
-    `[proxy] Bedrock proxy adapter listening on http://127.0.0.1:${PORT} (model: ${MODEL_ID})`,
-  );
-  console.log(
-    `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`,
-  );
-});
+function startProxyServer() {
+  console.log(`[proxy] AWS_REGION=${AWS_REGION} MODEL_ID=${MODEL_ID}`);
+  return server.listen(PORT, "127.0.0.1", () => {
+    console.log(
+      `[proxy] Bedrock proxy adapter listening on http://127.0.0.1:${PORT} (model: ${MODEL_ID})`,
+    );
+  });
+}
+
+if (require.main === module) startProxyServer();
+
+module.exports = {
+  resolveRuntimeIdentity,
+  createBedrockClient,
+  createScopedCredentialFileProvider,
+  createScopedS3Client,
+  extractImageReferences,
+  isValidImageKey,
+  fetchImageFromS3,
+  startProxyServer,
+};

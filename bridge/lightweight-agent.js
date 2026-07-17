@@ -492,13 +492,24 @@ function createToolExecutor({
   };
 }
 
-let defaultToolExecutorPromise;
+let defaultToolExecutorPromise = null;
+async function configureWorkspaceRuntime({
+  env,
+  loadPlugin = () => import("./plugins/personal-operator/index.js"),
+} = {}) {
+  if (!env || typeof env !== "object") {
+    throw new Error("Explicit scoped workspace environment is required");
+  }
+  const workspacePlugin = await loadPlugin();
+  const workspaceStore = workspacePlugin.createWorkspaceStore({ env });
+  const executor = createToolExecutor({ workspaceStore });
+  defaultToolExecutorPromise = Promise.resolve(executor);
+  return executor;
+}
+
 async function getDefaultToolExecutor() {
   if (!defaultToolExecutorPromise) {
-    defaultToolExecutorPromise = import("./plugins/personal-operator/index.js").then(
-      (workspacePlugin) =>
-        createToolExecutor({ workspaceStore: workspacePlugin.createWorkspaceStore() }),
-    );
+    throw new Error("Lightweight workspace is not configured with scoped credentials");
   }
   return defaultToolExecutorPromise;
 }
@@ -544,7 +555,7 @@ function callProxy(messages) {
   });
 }
 
-async function chat(userMessage, _unusedActorId, deadlineMs = 0) {
+async function chat(userMessage, deadlineMs = 0) {
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
     { role: "user", content: userMessage },
@@ -595,6 +606,8 @@ module.exports = {
   LIGHTWEIGHT_TOOL_NAMES,
   chat,
   createToolExecutor,
+  configureWorkspaceRuntime,
+  getDefaultToolExecutor,
   executeWebFetch,
   validateUrlSafety,
   resolveSafeRedirect,

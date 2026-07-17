@@ -5,13 +5,15 @@
  * periodically saves it back. Uses the same S3 bucket and client pattern
  * as the proxy's workspace files (readUserFileFromS3/writeUserFileToS3).
  *
- * Namespace format: {actorId.replace(/:/g, "_")} (e.g., "telegram_123456789")
+ * Namespace format: the exact canonical internal user ID retained by the
+ * runtime session binding.
  * S3 prefix: {namespace}/.openclaw/
  * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/)
  */
 
 const fs = require("fs");
 const path = require("path");
+const { requireExactRegion } = require("./scoped-credentials");
 
 // Lazy-require AWS SDK (only available inside Docker image, not in local dev/test)
 let _s3Sdk = null;
@@ -66,19 +68,22 @@ const CREDENTIAL_SCAN_EXEMPT = "user-api-keys.json";
 // S3 client singleton (same pattern as agentcore-proxy.js)
 let _s3Client = null;
 let _scopedCredentials = null;
+let _S3ClientConstructor = null;
 
 function getS3Client() {
   if (!_s3Client) {
-    const { S3Client } = getS3Sdk();
-    const opts = { region: process.env.AWS_REGION };
-    if (_scopedCredentials) {
-      opts.credentials = {
+    if (!_scopedCredentials) {
+      throw new Error("workspace-sync: explicit scoped credentials are required");
+    }
+    const S3Client = _S3ClientConstructor || getS3Sdk().S3Client;
+    _s3Client = new S3Client({
+      region: requireExactRegion(process.env),
+      credentials: {
         accessKeyId: _scopedCredentials.accessKeyId,
         secretAccessKey: _scopedCredentials.secretAccessKey,
         sessionToken: _scopedCredentials.sessionToken,
-      };
-    }
-    _s3Client = new S3Client(opts);
+      },
+    });
   }
   return _s3Client;
 }
@@ -92,18 +97,28 @@ function getS3Client() {
  * @param {string} credentials.secretAccessKey
  * @param {string} [credentials.sessionToken]
  */
-function configureCredentials(credentials) {
+function configureCredentials(credentials, { S3Client } = {}) {
+  requireExactRegion(process.env);
   if (!credentials || !credentials.accessKeyId) {
     throw new Error("configureCredentials: accessKeyId is required");
   }
   if (!credentials.secretAccessKey) {
     throw new Error("configureCredentials: secretAccessKey is required");
   }
+  if (!credentials.sessionToken) {
+    throw new Error("configureCredentials: sessionToken is required");
+  }
+  const expiration = new Date(credentials.expiration);
+  if (!Number.isFinite(expiration.getTime()) || expiration.getTime() <= Date.now()) {
+    throw new Error("configureCredentials: unexpired credentials are required");
+  }
   _scopedCredentials = {
     accessKeyId: credentials.accessKeyId,
     secretAccessKey: credentials.secretAccessKey,
     sessionToken: credentials.sessionToken,
+    expiration,
   };
+  _S3ClientConstructor = S3Client || null;
   // Reset client so next getS3Client() picks up new credentials
   _s3Client = null;
 }

@@ -160,13 +160,18 @@ describe("OpenClaw child environment", () => {
   it("forwards only runtime data and never product or provider authority", () => {
     const childEnv = policyModule.buildOpenClawChildEnv({
       scopedEnv: {
-        PATH: "/usr/bin",
-        HOME: "/root",
-        NODE_PATH: "/app/node_modules",
-        NODE_OPTIONS: "--dns-result-order=ipv4first",
+        PATH: "/tmp/attacker-bin",
+        HOME: "/tmp/attacker-home",
+        NODE_PATH: "/tmp/attacker-modules",
+        NODE_OPTIONS: "--require /tmp/evil.js",
         AWS_REGION: "eu-west-1",
+        AWS_DEFAULT_REGION: "eu-west-1",
         AWS_CONFIG_FILE: "/tmp/scoped/config",
         AWS_SDK_LOAD_CONFIG: "1",
+        AWS_EC2_METADATA_DISABLED: "true",
+        AWS_SHARED_CREDENTIALS_FILE: "/dev/null",
+        PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
+          "/tmp/scoped/scoped-creds.json",
         S3_USER_FILES_BUCKET: "user-files",
         TELEGRAM_BOT_TOKEN: "telegram-secret",
         TELEGRAM_CHANNEL_SECRET_ID: "telegram-secret-id",
@@ -183,17 +188,73 @@ describe("OpenClaw child environment", () => {
     });
 
     assert.deepEqual(childEnv, {
-      PATH: "/usr/bin",
+      PATH: "/usr/local/bin:/usr/bin:/bin",
       HOME: "/root",
       NODE_PATH: "/app/node_modules",
-      NODE_OPTIONS: "--dns-result-order=ipv4first",
+      NODE_OPTIONS:
+        "--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js",
       AWS_REGION: "eu-west-1",
+      AWS_DEFAULT_REGION: "eu-west-1",
       AWS_CONFIG_FILE: "/tmp/scoped/config",
       AWS_SDK_LOAD_CONFIG: "1",
+      AWS_EC2_METADATA_DISABLED: "true",
+      AWS_SHARED_CREDENTIALS_FILE: "/dev/null",
       S3_USER_FILES_BUCKET: "user-files",
+      PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
+        "/tmp/scoped/scoped-creds.json",
       PERSONAL_OPERATOR_WORKSPACE_PREFIX: "user_abcd1234",
       OPENCLAW_SKIP_CRON: "1",
     });
+  });
+
+  it("rejects incomplete scoped configuration and explicit region poison", () => {
+    const safe = {
+      AWS_REGION: "eu-west-1",
+      AWS_DEFAULT_REGION: "eu-west-1",
+      AWS_CONFIG_FILE: "/tmp/scoped/config",
+      AWS_SDK_LOAD_CONFIG: "1",
+      AWS_EC2_METADATA_DISABLED: "true",
+      AWS_SHARED_CREDENTIALS_FILE: "/dev/null",
+      S3_USER_FILES_BUCKET: "user-files",
+      PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
+        "/tmp/scoped/scoped-creds.json",
+    };
+    for (const required of [
+      "AWS_CONFIG_FILE",
+      "PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE",
+      "S3_USER_FILES_BUCKET",
+    ]) {
+      const incomplete = { ...safe };
+      delete incomplete[required];
+      assert.throws(
+        () =>
+          policyModule.buildOpenClawChildEnv({
+            scopedEnv: incomplete,
+            workspacePrefix: "user_A",
+          }),
+        /scoped|bucket|credential/i,
+      );
+    }
+    assert.throws(
+      () =>
+        policyModule.buildOpenClawChildEnv({
+          scopedEnv: { ...safe, AWS_REGION: "us-west-2" },
+          workspacePrefix: "user_A",
+        }),
+      /eu-west-1|region/i,
+    );
+  });
+
+  it("overwrites inherited executable and module search configuration", () => {
+    const source = fs.readFileSync(
+      path.join(__dirname, "entrypoint.sh"),
+      "utf8",
+    );
+    assert.match(
+      source,
+      /NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection -r \/app\/force-ipv4\.js"/,
+    );
+    assert.doesNotMatch(source, /NODE_OPTIONS:-/);
   });
 
   it("generates independent high-entropy local gateway tokens", () => {
@@ -203,5 +264,93 @@ describe("OpenClaw child environment", () => {
     assert.match(first, /^[A-Za-z0-9_-]{43}$/);
     assert.match(second, /^[A-Za-z0-9_-]{43}$/);
     assert.notEqual(first, second);
+  });
+});
+
+describe("Bedrock proxy child environment", () => {
+  it("keeps execution-role sources only in proxy while S3 receives the scoped file", () => {
+    const result = policyModule.buildProxyChildEnv({
+      baseEnv: {
+        AWS_REGION: "eu-west-1",
+        AWS_DEFAULT_REGION: "eu-west-1",
+        BEDROCK_MODEL_ID: "global.anthropic.test",
+        S3_USER_FILES_BUCKET: "user-files",
+        AWS_ACCESS_KEY_ID: "execution-key",
+        AWS_SECRET_ACCESS_KEY: "execution-secret",
+        AWS_SESSION_TOKEN: "execution-token",
+        AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/execution",
+        AWS_CONTAINER_AUTHORIZATION_TOKEN: "container-auth",
+        AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: "/var/run/container-auth",
+        AWS_WEB_IDENTITY_TOKEN_FILE: "/var/run/token",
+        AWS_ROLE_ARN: "arn:aws:iam::123456789012:role/execution",
+        AWS_CONFIG_FILE: "/tmp/scoped/config-must-not-reach-proxy",
+        AWS_PROFILE: "admin",
+        NODE_OPTIONS: "--require /tmp/evil.js",
+      },
+      internalUserId: "user_A",
+      namespace: "user_A",
+      scopedCredentialsFile: "/tmp/scoped/scoped-creds.json",
+    });
+
+    assert.deepEqual(result, {
+      PATH: "/usr/local/bin:/usr/bin:/bin",
+      HOME: "/root",
+      NODE_PATH: "/app/node_modules",
+      NODE_OPTIONS:
+        "--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js",
+      AWS_REGION: "eu-west-1",
+      AWS_DEFAULT_REGION: "eu-west-1",
+      AWS_EC2_METADATA_DISABLED: "true",
+      AWS_SHARED_CREDENTIALS_FILE: "/dev/null",
+      AWS_CONFIG_FILE: "/dev/null",
+      BEDROCK_MODEL_ID: "global.anthropic.test",
+      S3_USER_FILES_BUCKET: "user-files",
+      INTERNAL_USER_ID: "user_A",
+      PERSONAL_OPERATOR_WORKSPACE_PREFIX: "user_A",
+      PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
+        "/tmp/scoped/scoped-creds.json",
+      AWS_ACCESS_KEY_ID: "execution-key",
+      AWS_SECRET_ACCESS_KEY: "execution-secret",
+      AWS_SESSION_TOKEN: "execution-token",
+      AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/execution",
+      AWS_CONTAINER_AUTHORIZATION_TOKEN: "container-auth",
+      AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: "/var/run/container-auth",
+      AWS_WEB_IDENTITY_TOKEN_FILE: "/var/run/token",
+      AWS_ROLE_ARN: "arn:aws:iam::123456789012:role/execution",
+    });
+    assert.equal(result.AWS_CONFIG_FILE, "/dev/null");
+    assert.equal("AWS_PROFILE" in result, false);
+  });
+
+  it("rejects identity mismatch, missing scoped file, and region poison", () => {
+    const base = {
+      AWS_REGION: "eu-west-1",
+      S3_USER_FILES_BUCKET: "user-files",
+    };
+    for (const options of [
+      {
+        baseEnv: base,
+        internalUserId: "user_A",
+        namespace: "user_B",
+        scopedCredentialsFile: "/tmp/scoped/creds.json",
+      },
+      {
+        baseEnv: base,
+        internalUserId: "user_A",
+        namespace: "user_A",
+        scopedCredentialsFile: "",
+      },
+      {
+        baseEnv: { ...base, AWS_REGION: "us-west-2" },
+        internalUserId: "user_A",
+        namespace: "user_A",
+        scopedCredentialsFile: "/tmp/scoped/creds.json",
+      },
+    ]) {
+      assert.throws(
+        () => policyModule.buildProxyChildEnv(options),
+        /identity|namespace|scoped|eu-west-1|region/i,
+      );
+    }
   });
 });

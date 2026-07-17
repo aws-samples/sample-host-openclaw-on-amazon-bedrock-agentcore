@@ -6,13 +6,15 @@ import {
   S3Client,
 } from "@aws-sdk/client-s3";
 import { Type } from "typebox";
+import { readFileSync } from "node:fs";
 
 export const MAX_PATH_BYTES = 512;
 export const MAX_FILE_BYTES = 256 * 1024;
 export const MAX_LIST_ITEMS = 1000;
 export const MAX_LIST_PAGES = 20;
 
-const WORKSPACE_PREFIX_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{1,64}$/;
+const WORKSPACE_PREFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$/;
+const RUNTIME_REGION = "eu-west-1";
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
 const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
 const SYMLINK_LIKE_SEGMENT = /(?:^|\.)symlink$/i;
@@ -75,11 +77,58 @@ function resolveConfiguration(runtimeEnv) {
   ) {
     throw new Error("A valid server-derived workspace prefix is required");
   }
+  for (const key of ["AWS_REGION", "AWS_DEFAULT_REGION"]) {
+    if (
+      runtimeEnv[key] !== undefined &&
+      runtimeEnv[key] !== "" &&
+      runtimeEnv[key] !== RUNTIME_REGION
+    ) {
+      throw new Error(`${key} must be exactly ${RUNTIME_REGION}`);
+    }
+  }
   return {
     bucket,
     workspacePrefix,
     objectPrefix: `${workspacePrefix}/files/`,
-    region: runtimeEnv.AWS_REGION || "eu-west-1",
+    region: RUNTIME_REGION,
+    credentialsFile: runtimeEnv.PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE,
+  };
+}
+
+export function createCredentialFileProvider(
+  credentialsFile,
+  { readFile = readFileSync, now = () => Date.now() } = {},
+) {
+  if (typeof credentialsFile !== "string" || credentialsFile.length === 0) {
+    throw new Error("An explicit scoped credential file is required");
+  }
+  return async () => {
+    let document;
+    try {
+      document = JSON.parse(readFile(credentialsFile, "utf8"));
+    } catch (error) {
+      throw new Error(`Scoped credential file cannot be read: ${error.message}`);
+    }
+    const expiration = new Date(document?.Expiration);
+    if (
+      document?.Version !== 1 ||
+      typeof document.AccessKeyId !== "string" ||
+      document.AccessKeyId.length === 0 ||
+      typeof document.SecretAccessKey !== "string" ||
+      document.SecretAccessKey.length === 0 ||
+      typeof document.SessionToken !== "string" ||
+      document.SessionToken.length === 0 ||
+      !Number.isFinite(expiration.getTime()) ||
+      expiration.getTime() <= now()
+    ) {
+      throw new Error("Scoped credential file is incomplete or expired");
+    }
+    return {
+      accessKeyId: document.AccessKeyId,
+      secretAccessKey: document.SecretAccessKey,
+      sessionToken: document.SessionToken,
+      expiration,
+    };
   };
 }
 
@@ -125,9 +174,18 @@ async function readBodyBounded(body) {
   }
 }
 
-export function createWorkspaceStore({ s3Client, env = process.env } = {}) {
+export function createWorkspaceStore({
+  s3Client,
+  S3ClientConstructor = S3Client,
+  env = process.env,
+} = {}) {
   const configuration = resolveConfiguration(env);
-  const client = s3Client || new S3Client({ region: configuration.region });
+  const client =
+    s3Client ||
+    new S3ClientConstructor({
+      region: configuration.region,
+      credentials: createCredentialFileProvider(configuration.credentialsFile),
+    });
 
   const objectKey = (filePath) =>
     `${configuration.objectPrefix}${validateRelativePath(filePath)}`;

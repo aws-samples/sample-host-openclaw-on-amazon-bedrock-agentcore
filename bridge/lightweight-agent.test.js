@@ -71,6 +71,54 @@ describe("lightweight tool boundary", () => {
 });
 
 describe("lightweight workspace execution", () => {
+  it("does not create a default workspace client before trusted configuration", async () => {
+    await assert.rejects(
+      () => agentModule.getDefaultToolExecutor(),
+      /workspace.*configured|scoped/i,
+    );
+  });
+
+  it("configures its production workspace store from explicit server env", async () => {
+    const seen = [];
+    const workspaceStore = {
+      list: async () => [],
+      read: async () => "",
+      write: async (filePath, content) => ({
+        path: filePath,
+        bytes: Buffer.byteLength(content),
+      }),
+      delete: async (filePath) => ({ path: filePath, deleted: true }),
+    };
+    await agentModule.configureWorkspaceRuntime({
+      env: {
+        AWS_REGION: "eu-west-1",
+        S3_USER_FILES_BUCKET: "personal-operator-workspace",
+        PERSONAL_OPERATOR_WORKSPACE_PREFIX: "user_A",
+        PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
+          "/tmp/scoped/scoped-creds.json",
+      },
+      loadPlugin: async () => ({
+        createWorkspaceStore: (options) => {
+          seen.push(options);
+          return workspaceStore;
+        },
+      }),
+    });
+
+    assert.deepEqual(seen, [
+      {
+        env: {
+          AWS_REGION: "eu-west-1",
+          S3_USER_FILES_BUCKET: "personal-operator-workspace",
+          PERSONAL_OPERATOR_WORKSPACE_PREFIX: "user_A",
+          PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
+            "/tmp/scoped/scoped-creds.json",
+        },
+      },
+    ]);
+    assert.match(await (await agentModule.getDefaultToolExecutor())("po_file_list"), /No workspace files/);
+  });
+
   it("dispatches file calls to an injected store without caller identity", async () => {
     const calls = [];
     const workspaceStore = {

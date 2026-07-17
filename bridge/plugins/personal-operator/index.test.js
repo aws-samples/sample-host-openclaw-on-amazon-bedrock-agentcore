@@ -1,6 +1,7 @@
 import { Readable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -160,6 +161,101 @@ describe("workspace namespace boundary", () => {
         }),
       /workspace prefix/i,
     );
+  });
+
+  it("uses the exact 2-64 character canonical internal ID grammar", async () => {
+    const module = await loadPlugin();
+    const fake = new FakeS3Client(() => ({ Contents: [] }));
+    for (const workspacePrefix of ["7f9a-legacy", "a".repeat(64)]) {
+      const store = module.createWorkspaceStore({
+        s3Client: fake,
+        env: env({ PERSONAL_OPERATOR_WORKSPACE_PREFIX: workspacePrefix }),
+      });
+      assert.deepEqual(await store.list(), []);
+    }
+    for (const workspacePrefix of ["a", "a".repeat(65), "telegram:123"] ) {
+      assert.throws(
+        () =>
+          module.createWorkspaceStore({
+            s3Client: fake,
+            env: env({ PERSONAL_OPERATOR_WORKSPACE_PREFIX: workspacePrefix }),
+          }),
+        /workspace prefix/i,
+      );
+    }
+  });
+
+  it("rejects an explicit wrong region before constructing or calling S3", async () => {
+    const module = await loadPlugin();
+    const s3 = new FakeS3Client(() => assert.fail("S3 must not be called"));
+    assert.throws(
+      () =>
+        module.createWorkspaceStore({
+          s3Client: s3,
+          env: env({ AWS_REGION: "us-west-2" }),
+        }),
+      /eu-west-1|region/i,
+    );
+    assert.equal(s3.calls.length, 0);
+  });
+
+  it("requires an explicit scoped credential file for its production S3 client", async () => {
+    const module = await loadPlugin();
+    assert.throws(
+      () => module.createWorkspaceStore({ env: env() }),
+      /scoped credential/i,
+    );
+  });
+
+  it("constructs production S3 with a refreshing explicit file provider", async () => {
+    const module = await loadPlugin();
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plugin-creds-"));
+    const credentialsPath = path.join(tmpDir, "scoped-creds.json");
+    const writeCredentials = (accessKeyId) =>
+      fs.writeFileSync(
+        credentialsPath,
+        JSON.stringify({
+          Version: 1,
+          AccessKeyId: accessKeyId,
+          SecretAccessKey: "secret",
+          SessionToken: "token",
+          Expiration: new Date(Date.now() + 60_000).toISOString(),
+        }),
+      );
+    writeCredentials("ASIA_FIRST");
+    const constructorOptions = [];
+    class FakeConstructor {
+      constructor(options) {
+        constructorOptions.push(options);
+      }
+      async send() {
+        return { Contents: [] };
+      }
+    }
+
+    try {
+      const store = module.createWorkspaceStore({
+        S3ClientConstructor: FakeConstructor,
+        env: env({
+          PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE: credentialsPath,
+        }),
+      });
+      assert.equal(constructorOptions.length, 1);
+      assert.equal(constructorOptions[0].region, "eu-west-1");
+      assert.equal(typeof constructorOptions[0].credentials, "function");
+      assert.equal(
+        (await constructorOptions[0].credentials()).accessKeyId,
+        "ASIA_FIRST",
+      );
+      writeCredentials("ASIA_SECOND");
+      assert.equal(
+        (await constructorOptions[0].credentials()).accessKeyId,
+        "ASIA_SECOND",
+      );
+      assert.deepEqual(await store.list(), []);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 

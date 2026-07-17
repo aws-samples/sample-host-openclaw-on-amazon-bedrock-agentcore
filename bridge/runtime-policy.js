@@ -1,6 +1,11 @@
 "use strict";
 
 const { randomBytes } = require("node:crypto");
+const { canonicalNamespace } = require("./session-binding");
+const {
+  requireExactRegion,
+  FIXED_CHILD_ENV,
+} = require("./scoped-credentials");
 
 const APPROVED_TOOLS = Object.freeze([
   "session_status",
@@ -31,9 +36,30 @@ const CHILD_ENV_ALLOWLIST = Object.freeze([
   "NODE_PATH",
   "NODE_OPTIONS",
   "AWS_REGION",
+  "AWS_DEFAULT_REGION",
   "AWS_CONFIG_FILE",
   "AWS_SDK_LOAD_CONFIG",
+  "AWS_EC2_METADATA_DISABLED",
+  "AWS_SHARED_CREDENTIALS_FILE",
   "S3_USER_FILES_BUCKET",
+  "PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE",
+]);
+
+const REQUIRED_SCOPED_ENV = Object.freeze([
+  "AWS_CONFIG_FILE",
+  "PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE",
+  "S3_USER_FILES_BUCKET",
+]);
+const PROXY_AMBIENT_CREDENTIAL_ENV_KEYS = Object.freeze([
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+  "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+  "AWS_WEB_IDENTITY_TOKEN_FILE",
+  "AWS_ROLE_ARN",
 ]);
 
 function buildRuntimePolicy() {
@@ -97,8 +123,19 @@ function buildOpenClawConfig({
 }
 
 function buildOpenClawChildEnv({ scopedEnv = {}, workspacePrefix } = {}) {
-  if (typeof workspacePrefix !== "string" || workspacePrefix.length === 0) {
-    throw new Error("A server-derived workspace prefix is required");
+  const canonicalPrefix = canonicalNamespace(workspacePrefix);
+  requireExactRegion(scopedEnv);
+  for (const key of REQUIRED_SCOPED_ENV) {
+    if (typeof scopedEnv[key] !== "string" || scopedEnv[key].length === 0) {
+      throw new Error(`Scoped child environment requires ${key}`);
+    }
+  }
+  if (
+    scopedEnv.AWS_EC2_METADATA_DISABLED !== "true" ||
+    scopedEnv.AWS_SHARED_CREDENTIALS_FILE !== "/dev/null" ||
+    scopedEnv.AWS_SDK_LOAD_CONFIG !== "1"
+  ) {
+    throw new Error("Scoped child credential providers are not fail-closed");
   }
 
   const env = {};
@@ -107,8 +144,62 @@ function buildOpenClawChildEnv({ scopedEnv = {}, workspacePrefix } = {}) {
       env[key] = scopedEnv[key];
     }
   }
-  env.PERSONAL_OPERATOR_WORKSPACE_PREFIX = workspacePrefix;
+  Object.assign(env, FIXED_CHILD_ENV);
+  env.PERSONAL_OPERATOR_WORKSPACE_PREFIX = canonicalPrefix;
   env.OPENCLAW_SKIP_CRON = "1";
+  return env;
+}
+
+function buildProxyChildEnv({
+  baseEnv = {},
+  internalUserId,
+  namespace,
+  scopedCredentialsFile,
+} = {}) {
+  const region = requireExactRegion(baseEnv);
+  const canonical = canonicalNamespace(internalUserId);
+  if (canonicalNamespace(namespace) !== canonical) {
+    throw new Error("Proxy namespace must exactly equal internal identity");
+  }
+  if (
+    typeof scopedCredentialsFile !== "string" ||
+    scopedCredentialsFile.length === 0
+  ) {
+    throw new Error("Proxy requires an explicit scoped credential file for S3");
+  }
+  if (
+    typeof baseEnv.S3_USER_FILES_BUCKET !== "string" ||
+    baseEnv.S3_USER_FILES_BUCKET.length === 0
+  ) {
+    throw new Error("Proxy requires the S3 user-files bucket");
+  }
+
+  const env = {
+    ...FIXED_CHILD_ENV,
+    AWS_REGION: region,
+    AWS_DEFAULT_REGION: region,
+    AWS_EC2_METADATA_DISABLED: "true",
+    AWS_SHARED_CREDENTIALS_FILE: "/dev/null",
+    AWS_CONFIG_FILE: "/dev/null",
+    S3_USER_FILES_BUCKET: baseEnv.S3_USER_FILES_BUCKET,
+    INTERNAL_USER_ID: canonical,
+    PERSONAL_OPERATOR_WORKSPACE_PREFIX: canonical,
+    PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE: scopedCredentialsFile,
+  };
+  for (const key of [
+    "BEDROCK_MODEL_ID",
+    "BEDROCK_GUARDRAIL_ID",
+    "BEDROCK_GUARDRAIL_VERSION",
+  ]) {
+    if (typeof baseEnv[key] === "string" && baseEnv[key].length > 0) {
+      env[key] = baseEnv[key];
+    }
+  }
+  for (const key of PROXY_AMBIENT_CREDENTIAL_ENV_KEYS) {
+    if (typeof baseEnv[key] === "string" && baseEnv[key].length > 0) {
+      env[key] = baseEnv[key];
+    }
+  }
   return env;
 }
 
@@ -123,8 +214,10 @@ module.exports = {
   PLUGIN_PATH,
   GATEWAY_CLIENT_SCOPES,
   CHILD_ENV_ALLOWLIST,
+  PROXY_AMBIENT_CREDENTIAL_ENV_KEYS,
   buildRuntimePolicy,
   buildOpenClawConfig,
   buildOpenClawChildEnv,
+  buildProxyChildEnv,
   createLocalGatewayToken,
 };

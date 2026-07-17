@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start the contract server immediately — AgentCore requires a fast /ping response.
-# Secrets are fetched by the contract server itself via the AWS SDK.
+# The contract server mints scoped workspace credentials during trusted init.
 # Do NOT use set -e — the contract server must start regardless of any pre-flight issues.
 
 echo "[openclaw-agentcore] Starting OpenClaw on AgentCore Runtime (per-user session mode)..."
@@ -16,7 +16,7 @@ if [ -d /app/.compile-cache ]; then
 fi
 
 # --- Force IPv4 for Node.js 22 VPC compatibility ---
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js"
+export NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js"
 
 # Disable IPv6 at the OS level if writable (best-effort)
 if [ -w /proc/sys/net/ipv6/conf/all/disable_ipv6 ]; then
@@ -28,7 +28,7 @@ fi
 
 # --- Start the AgentCore contract server (port 8080) ---
 # Must be the first thing to start — AgentCore health-checks /ping very quickly.
-# Secrets are pre-fetched at boot. Lightweight agent handles messages while OpenClaw starts.
+# Lightweight agent handles messages after scoped init while OpenClaw starts.
 echo "[openclaw-agentcore] Starting AgentCore contract server on port 8080..."
 echo "[openclaw-agentcore] Hybrid mode: lightweight agent (~10s) -> OpenClaw handoff (~1-2min)"
 exec node /app/agentcore-contract.js

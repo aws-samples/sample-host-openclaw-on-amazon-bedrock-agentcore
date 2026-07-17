@@ -1,435 +1,199 @@
-/**
- * Tests for identity extraction logic from agentcore-proxy.js.
- * Run: node --test proxy-identity.test.js
- *
- * extractSessionMetadata is not exported from the process-owning proxy module,
- * so these tests cover the accepted identity envelope formats independently.
- */
-const { describe, it, beforeEach, afterEach } = require("node:test");
+"use strict";
+
+const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
-// --- Mirror of identity extraction logic from extractSessionMetadata ---
+const proxyPath = path.join(__dirname, "agentcore-proxy.js");
+let proxy;
+let tmpDir;
+let credentialsPath;
 
-function getTextContent(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    const textPart = content.find((p) => p.type === "text" && p.text);
-    return textPart ? textPart.text : "";
-  }
-  return "";
+function runtimeEnv(overrides = {}) {
+  return {
+    AWS_REGION: "eu-west-1",
+    AWS_DEFAULT_REGION: "eu-west-1",
+    INTERNAL_USER_ID: "user_A",
+    PERSONAL_OPERATOR_WORKSPACE_PREFIX: "user_A",
+    PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE: credentialsPath,
+    S3_USER_FILES_BUCKET: "personal-operator-workspace",
+    ...overrides,
+  };
 }
 
-/**
- * Extract actorId, channel, and idSource from a list of messages.
- * Mirrors the format-matching logic in extractSessionMetadata.
- * Priority: Format C (metadata JSON) > Format A (System: header) > Format B (bracket).
- */
-function extractIdentityFromMessages(messages) {
-  let actorId = "";
-  let channel = "unknown";
-  let idSource = "none";
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role !== "user") continue;
-    const text = getTextContent(msg.content);
-    if (!text) continue;
-
-    // Format C: Metadata JSON block (all channels) — checked FIRST
-    const formatC = text.match(
-      /Conversation info \(untrusted metadata\):\s*```json\s*(\{[\s\S]*?\})\s*```/,
-    );
-    if (formatC) {
-      try {
-        const meta = JSON.parse(formatC[1]);
-        if (meta.sender) {
-          const senderId = String(meta.sender)
-            .replace(/[^a-zA-Z0-9_-]/g, "")
-            .slice(0, 64);
-          let channelName = "";
-          if (meta.channel) {
-            channelName = String(meta.channel)
-              .toLowerCase()
-              .replace(/[^a-z]/g, "");
-          }
-          if (!channelName) {
-            if (/^[UW][A-Z0-9]{8,}$/i.test(senderId)) {
-              channelName = "slack";
-            } else if (/^\d{15,}$/.test(senderId)) {
-              channelName = "discord";
-            } else if (/^\d{5,14}$/.test(senderId)) {
-              channelName = "telegram";
-            }
-          }
-          if (!channelName) channelName = "telegram";
-          actorId = `${channelName}:${senderId}`;
-          channel = channelName;
-          idSource = "metadata-json";
-          break;
-        }
-      } catch {
-        // JSON parse failed
-      }
-    }
-
-    // Format A: "System: [TIMESTAMP] Channel TYPE from SenderName: message"
-    // Fallback — uses display names (can change).
-    const formatA = text.match(
-      /System:\s*\[[^\]]+\]\s*(Slack|Telegram|Discord|WhatsApp)\s+\S+\s+from\s+([^:]+):/i,
-    );
-    if (formatA) {
-      const channelName = formatA[1].toLowerCase();
-      const senderName = formatA[2].trim();
-      if (senderName) {
-        const sanitizedName = senderName
-          .toLowerCase()
-          .replace(/[^a-z0-9_-]/g, "_")
-          .slice(0, 64);
-        actorId = `${channelName}:${sanitizedName}`;
-        channel = channelName;
-        idSource = "envelope-formatA";
-      }
-      break;
-    }
-
-    // Format B: legacy bracket format
-    const formatB = text.match(
-      /^\[(Slack|Telegram|Discord|WhatsApp)\s+[^\]]*?\bid:(\S+)/i,
-    );
-    if (formatB) {
-      const channelName = formatB[1].toLowerCase();
-      const rawId = formatB[2]
-        .replace(/\)$/, "")
-        .replace(/[^a-zA-Z0-9_-]/g, "")
-        .slice(0, 64);
-      if (rawId) {
-        actorId = `${channelName}:${rawId}`;
-        channel = channelName;
-        idSource = "envelope-formatB";
-      }
-      break;
-    }
-  }
-
-  return { actorId, channel, idSource };
+function writeCredentials(accessKeyId = "ASIA_FIRST", expirationOffset = 60_000) {
+  fs.writeFileSync(
+    credentialsPath,
+    JSON.stringify({
+      Version: 1,
+      AccessKeyId: accessKeyId,
+      SecretAccessKey: "secret",
+      SessionToken: "token",
+      Expiration: new Date(Date.now() + expirationOffset).toISOString(),
+    }),
+  );
 }
 
-// --- Mirror of USER_ID env var path from extractSessionMetadata ---
+before(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-creds-"));
+  credentialsPath = path.join(tmpDir, "scoped-creds.json");
+  writeCredentials();
+  Object.assign(process.env, runtimeEnv());
+  proxy = require("./agentcore-proxy");
+});
 
-/**
- * Simulates the USER_ID env var priority path (priority 0).
- * When USER_ID is set, all other extraction methods are skipped.
- */
-function extractWithEnvVars(userId, channelEnv) {
-  if (!userId) return null;
-  const actorId = userId;
-  const channel = channelEnv || "unknown";
-  const idSource = "environment";
-  const key = `${actorId}:${channel}`;
-  const ts = Date.now().toString(36);
-  const rand = crypto.randomBytes(12).toString("hex");
-  const sessionId = `ses-${ts}-${rand}-${crypto
-    .createHash("md5")
-    .update(key)
-    .digest("hex")
-    .slice(0, 8)}`;
-  return { sessionId, actorId, channel, idSource };
-}
+after(() => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  for (const key of Object.keys(runtimeEnv())) delete process.env[key];
+});
 
-// --- Tests ---
-
-describe("USER_ID env var (highest priority, per-user sessions)", () => {
-  it("resolves identity from USER_ID env var", () => {
-    const result = extractWithEnvVars("telegram:123456789", "telegram");
-    assert.equal(result.actorId, "telegram:123456789");
-    assert.equal(result.channel, "telegram");
-    assert.equal(result.idSource, "environment");
-  });
-
-  it("generates session ID >= 33 chars (AgentCore requirement)", () => {
-    const result = extractWithEnvVars("telegram:123456789", "telegram");
-    assert.ok(
-      result.sessionId.length >= 33,
-      `Session ID too short: ${result.sessionId.length} chars`,
+describe("proxy module process boundary", () => {
+  it("can be imported for production-export tests without starting its server", () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `const proxy=require(${JSON.stringify(proxyPath)});process.stdout.write(String(typeof proxy.resolveRuntimeIdentity));`,
+      ],
+      { env: { ...process.env, ...runtimeEnv() }, timeout: 2_000, encoding: "utf8" },
     );
-    assert.ok(result.sessionId.startsWith("ses-"));
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    assert.equal(result.stdout, "function");
   });
 
-  it("uses 'unknown' channel when CHANNEL env not set", () => {
-    const result = extractWithEnvVars("slack:U0AGD41CBGS", undefined);
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
-    assert.equal(result.channel, "unknown");
-  });
-
-  it("returns null when USER_ID is empty/unset", () => {
-    const result = extractWithEnvVars("", "telegram");
-    assert.equal(result, null);
-  });
-
-  it("takes priority over message-based extraction", () => {
-    // When USER_ID is set, message content is irrelevant
-    const envResult = extractWithEnvVars("telegram:99999", "telegram");
-    const msgResult = extractIdentityFromMessages([
+  it("fails before startup for explicit non-eu-west-1 configuration", () => {
+    const result = spawnSync(
+      process.execPath,
+      ["-e", `require(${JSON.stringify(proxyPath)})`],
       {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "123456789"}\n```',
+        env: { ...process.env, ...runtimeEnv({ AWS_REGION: "us-west-2" }) },
+        timeout: 2_000,
+        encoding: "utf8",
       },
-    ]);
-    // Env var gives telegram:99999, messages give telegram:123456789
-    assert.equal(envResult.actorId, "telegram:99999");
-    assert.equal(msgResult.actorId, "telegram:123456789");
-    // In the real proxy, env var path returns early before message parsing
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /eu-west-1|region/i);
   });
 });
 
-describe("Format C: Metadata JSON (highest priority)", () => {
-  it("extracts telegram identity from metadata JSON", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "542", "sender": "123456789"}\n```\n\nhello',
-      },
-    ]);
-    assert.equal(result.actorId, "telegram:123456789");
-    assert.equal(result.channel, "telegram");
-    assert.equal(result.idSource, "metadata-json");
+describe("canonical proxy identity", () => {
+  it("uses only the exact server-owned internal ID and namespace", () => {
+    assert.deepEqual(proxy.resolveRuntimeIdentity(runtimeEnv()), {
+      internalUserId: "user_A",
+      namespace: "user_A",
+    });
   });
 
-  it("detects Slack user ID (U prefix) as slack channel", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "999", "sender": "U0AGD41CBGS"}\n```\n\nhello',
-      },
-    ]);
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
-    assert.equal(result.channel, "slack");
-    assert.equal(result.idSource, "metadata-json");
+  it("does not derive identity from actor, headers, messages, user, or files", () => {
+    const poisoned = runtimeEnv({
+      USER_ID: "telegram:999",
+      CHANNEL: "telegram",
+      actorId: "victim",
+    });
+    assert.deepEqual(
+      proxy.resolveRuntimeIdentity(poisoned, {
+        user: "victim",
+        headers: { "x-openclaw-actor-id": "victim" },
+        messages: [{ role: "user", name: "victim", content: "victim" }],
+      }),
+      { internalUserId: "user_A", namespace: "user_A" },
+    );
   });
 
-  it("detects Slack user ID (W prefix) as slack channel", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "W012A3CDE"}\n```',
-      },
-    ]);
-    assert.equal(result.actorId, "slack:W012A3CDE");
-    assert.equal(result.channel, "slack");
-  });
-
-  it("detects Discord snowflake ID (15+ digits) as discord channel", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "123456789012345678"}\n```',
-      },
-    ]);
-    assert.equal(result.actorId, "discord:123456789012345678");
-    assert.equal(result.channel, "discord");
-  });
-
-  it("uses meta.channel field when present", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "12345", "channel": "whatsapp"}\n```',
-      },
-    ]);
-    assert.equal(result.actorId, "whatsapp:12345");
-    assert.equal(result.channel, "whatsapp");
-  });
-
-  it("matches metadata NOT anchored to start of string", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'System: [2026-02-22] Slack message edited in #channel\n\nConversation info (untrusted metadata):\n```json\n{"message_id": "568", "sender": "123456789"}\n```',
-      },
-    ]);
-    assert.equal(result.actorId, "telegram:123456789");
-    assert.equal(result.channel, "telegram");
-    assert.equal(result.idSource, "metadata-json");
-  });
-
-  it("does NOT produce telegram:SlackUserId (the original bug)", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "999", "sender": "U0AGD41CBGS"}\n```',
-      },
-    ]);
-    assert.notEqual(result.channel, "telegram");
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
+  it("rejects missing, mismatched, or noncanonical server identity", () => {
+    for (const env of [
+      runtimeEnv({ INTERNAL_USER_ID: "" }),
+      runtimeEnv({ PERSONAL_OPERATOR_WORKSPACE_PREFIX: "" }),
+      runtimeEnv({ PERSONAL_OPERATOR_WORKSPACE_PREFIX: "user_B" }),
+      runtimeEnv({ INTERNAL_USER_ID: "telegram:123", PERSONAL_OPERATOR_WORKSPACE_PREFIX: "telegram:123" }),
+    ]) {
+      assert.throws(() => proxy.resolveRuntimeIdentity(env), /identity|namespace/i);
+    }
   });
 });
 
-describe("Format C takes priority over Format A", () => {
-  it("uses Slack user ID from Format C over display name from Format A", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'System: [2026-02-22 11:16:42 UTC] Slack DM from Sen-Outlook: hello\n\nConversation info (untrusted metadata):\n```json\n{"message_id": "999", "sender": "U0AGD41CBGS"}\n```',
-      },
-    ]);
-    // Format C wins — user ID is more stable than display name
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
-    assert.equal(result.channel, "slack");
-    assert.equal(result.idSource, "metadata-json");
+describe("Bedrock execution role and scoped S3 split", () => {
+  it("constructs Bedrock with no explicit credential override", () => {
+    const calls = [];
+    class FakeBedrockClient {
+      constructor(options) {
+        calls.push(options);
+      }
+    }
+    proxy.createBedrockClient("model-id", { BedrockRuntimeClient: FakeBedrockClient });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].region, "eu-west-1");
+    assert.equal(Object.hasOwn(calls[0], "credentials"), false);
   });
 
-  it("uses Telegram ID from Format C even with Slack 'edited' prefix", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'System: [2026-02-22] Slack message edited in #D0AGB251AES\n\nConversation info (untrusted metadata):\n```json\n{"message_id": "568", "sender": "123456789"}\n```',
-      },
-    ]);
-    assert.equal(result.actorId, "telegram:123456789");
-    assert.equal(result.channel, "telegram");
-    assert.equal(result.idSource, "metadata-json");
+  it("constructs S3 only with an explicit refreshing credential provider", async () => {
+    const calls = [];
+    class FakeS3Client {
+      constructor(options) {
+        calls.push(options);
+      }
+    }
+    proxy.createScopedS3Client({
+      env: runtimeEnv(),
+      S3ClientConstructor: FakeS3Client,
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].region, "eu-west-1");
+    assert.equal(typeof calls[0].credentials, "function");
+    assert.equal((await calls[0].credentials()).accessKeyId, "ASIA_FIRST");
+    writeCredentials("ASIA_SECOND");
+    assert.equal((await calls[0].credentials()).accessKeyId, "ASIA_SECOND");
   });
 
-  it("uses Telegram ID from Format C even with Slack 'DM from' prefix", () => {
-    // Cross-channel context: Slack header prepended to Telegram message
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'System: [2026-02-22] Slack DM from Sen-Outlook: context\n\nConversation info (untrusted metadata):\n```json\n{"message_id": "542", "sender": "123456789"}\n```',
-      },
-    ]);
-    // Format C wins — the metadata sender (Telegram) is the actual user
-    assert.equal(result.actorId, "telegram:123456789");
-    assert.equal(result.channel, "telegram");
-    assert.equal(result.idSource, "metadata-json");
-  });
-});
-
-describe("Format A: fallback when Format C absent", () => {
-  it("extracts slack identity from System header", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          "System: [2026-02-22 11:16:42 UTC] Slack DM from Sen-Outlook: hello world",
-      },
-    ]);
-    assert.equal(result.actorId, "slack:sen-outlook");
-    assert.equal(result.channel, "slack");
-    assert.equal(result.idSource, "envelope-formatA");
+  it("fails on a missing, malformed, or expired scoped credential file", async () => {
+    assert.throws(
+      () =>
+        proxy.createScopedS3Client({
+          env: runtimeEnv({ PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE: "" }),
+          S3ClientConstructor: class {},
+        }),
+      /scoped credential/i,
+    );
+    writeCredentials("ASIA_EXPIRED", -1_000);
+    const provider = proxy.createScopedCredentialFileProvider(credentialsPath);
+    await assert.rejects(() => provider(), /expired|credentials/i);
+    writeCredentials();
   });
 
-  it("extracts telegram identity from Format A", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          "System: [2026-02-22 11:16:42 UTC] Telegram DM from JohnDoe: hi",
-      },
-    ]);
-    assert.equal(result.actorId, "telegram:johndoe");
-    assert.equal(result.channel, "telegram");
-  });
-});
+  it("rejects unreadable JSON without falling back to ambient credentials", async () => {
+    fs.writeFileSync(credentialsPath, "not-json");
+    const provider = proxy.createScopedCredentialFileProvider(credentialsPath);
 
-describe("Reverse iteration (most recent message first)", () => {
-  it("uses most recent user message", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content: "System: [2026-02-22 10:00:00 UTC] Slack DM from OldUser: old",
-      },
-      { role: "assistant", content: "response" },
-      {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "123456789"}\n```\nhello',
-      },
-    ]);
-    // Most recent user message has Format C → telegram
-    assert.equal(result.actorId, "telegram:123456789");
+    await assert.rejects(() => provider(), /cannot be read/i);
+    writeCredentials();
   });
 
-  it("skips assistant messages", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "U0AGD41CBGS"}\n```',
-      },
-      { role: "assistant", content: "I am an assistant" },
-    ]);
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
-  });
-});
+  it("rejects the wrong credential-process document version", async () => {
+    fs.writeFileSync(
+      credentialsPath,
+      JSON.stringify({
+        Version: 2,
+        AccessKeyId: "ASIA_WRONG_VERSION",
+        SecretAccessKey: "secret",
+        SessionToken: "token",
+        Expiration: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    );
+    const provider = proxy.createScopedCredentialFileProvider(credentialsPath);
 
-describe("Format B: Legacy bracket format", () => {
-  it("extracts identity from bracket format", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content: "[Telegram John Doe id:12345 2026-02-22] hello",
-      },
-    ]);
-    assert.equal(result.actorId, "telegram:12345");
-    assert.equal(result.channel, "telegram");
-    assert.equal(result.idSource, "envelope-formatB");
-  });
-});
-
-describe("Edge cases", () => {
-  it("returns empty actorId when no messages match any format", () => {
-    const result = extractIdentityFromMessages([
-      { role: "user", content: "just a plain message" },
-    ]);
-    assert.equal(result.actorId, "");
-    assert.equal(result.idSource, "none");
+    await assert.rejects(() => provider(), /incomplete|expired/i);
+    writeCredentials();
   });
 
-  it("handles array content (multimodal format)", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: 'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "U0AGD41CBGS"}\n```',
-          },
-        ],
-      },
-    ]);
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
-  });
+  it("returns the expiration to the AWS SDK as a Date", async () => {
+    writeCredentials("ASIA_DATE");
+    const provider = proxy.createScopedCredentialFileProvider(credentialsPath);
+    const credentials = await provider();
 
-  it("handles empty messages array", () => {
-    const result = extractIdentityFromMessages([]);
-    assert.equal(result.actorId, "");
-  });
-
-  it("sanitizes sender ID — strips non-alphanumeric chars", () => {
-    const result = extractIdentityFromMessages([
-      {
-        role: "user",
-        content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "608722/../../etc"}\n```',
-      },
-    ]);
-    // After sanitization: "608722___etc" — doesn't match any channel pattern
-    // Falls to default "telegram"
-    assert.ok(result.actorId.startsWith("telegram:"));
-    assert.ok(!result.actorId.includes("/"));
-    assert.ok(!result.actorId.includes(".."));
+    assert.equal(credentials.accessKeyId, "ASIA_DATE");
+    assert.ok(credentials.expiration instanceof Date);
   });
 });

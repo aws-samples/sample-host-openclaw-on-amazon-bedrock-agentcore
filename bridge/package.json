@@ -12,9 +12,7 @@
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.0.0",
     "@aws-sdk/client-cloudwatch-logs": "^3.0.0",
-    "@aws-sdk/client-cognito-identity-provider": "^3.0.0",
     "@aws-sdk/client-s3": "^3.0.0",
-    "@aws-sdk/client-secrets-manager": "^3.0.0",
     "@aws-sdk/client-sts": "^3.0.0",
     "@aws-sdk/s3-request-presigner": "^3.0.0",
     "ipaddr.js": "2.4.0",

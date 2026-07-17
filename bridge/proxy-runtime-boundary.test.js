@@ -37,5 +37,17 @@ describe("Bedrock proxy runtime boundary", () => {
   it("keeps identity tests coupled to production behavior instead of mirrored prompt code", () => {
     assert.doesNotMatch(identityTestSource, /WORKSPACE_FILES|WORKSPACE_DEFAULTS/);
     assert.doesNotMatch(identityTestSource, /buildUserIdentityContext/);
+    assert.match(identityTestSource, /require\("\.\/agentcore-proxy"\)/);
+    assert.match(identityTestSource, /resolveRuntimeIdentity/);
+  });
+
+  it("contains no caller-derived identity, mutable identity file, or Cognito actor path", () => {
+    assert.doesNotMatch(source, /current-identity|default-user/);
+    assert.doesNotMatch(source, /x-openclaw-actor-id|x-openclaw-session-id/);
+    assert.doesNotMatch(source, /extractSessionMetadata|metadata-json|message-name/);
+    assert.doesNotMatch(source, /\bUSER_ID\b/);
+    assert.doesNotMatch(source, /Cognito|cognito|client-cognito-identity-provider/);
+    assert.match(source, /resolveRuntimeIdentity\(process\.env\)/);
+    assert.match(source, /RUNTIME_IDENTITY\.namespace/);
   });
 });

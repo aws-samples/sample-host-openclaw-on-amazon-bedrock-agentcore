@@ -41,9 +41,7 @@ RUN npm ci --omit=dev
 RUN mkdir -p /app/.compile-cache && \
     NODE_COMPILE_CACHE=/app/.compile-cache node -e " \
       require('@aws-sdk/client-bedrock-runtime'); \
-      require('@aws-sdk/client-cognito-identity-provider'); \
       require('@aws-sdk/client-s3'); \
-      require('@aws-sdk/client-secrets-manager'); \
       require('@aws-sdk/client-sts'); \
       require('typebox'); \
       require('ws'); \
@@ -73,6 +71,7 @@ RUN ln -s /opt/openclaw /app/node_modules/openclaw
 
 # Ensure skills can resolve npm packages from /app/node_modules
 ENV NODE_PATH=/app/node_modules
+ENV AWS_REGION=eu-west-1 AWS_DEFAULT_REGION=eu-west-1
 
 WORKDIR /app
 
@@ -85,6 +84,8 @@ COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY runtime-policy.js /app/runtime-policy.js
 COPY gateway-invocation.js /app/gateway-invocation.js
+COPY session-binding.js /app/session-binding.js
+COPY invocation-handler.js /app/invocation-handler.js
 COPY workspace-sync.js /app/workspace-sync.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js

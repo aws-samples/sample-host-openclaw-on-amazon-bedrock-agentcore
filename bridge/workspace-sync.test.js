@@ -16,13 +16,16 @@ describe("workspace-sync credentials", () => {
   beforeEach(() => {
     // Fresh module on each test
     delete require.cache[require.resolve("./workspace-sync")];
-    process.env.AWS_REGION = "us-west-2";
+    process.env.AWS_REGION = "eu-west-1";
+    process.env.AWS_DEFAULT_REGION = "eu-west-1";
     process.env.S3_USER_FILES_BUCKET = "test-bucket";
     workspaceSync = require("./workspace-sync");
   });
 
   afterEach(() => {
     delete process.env.S3_USER_FILES_BUCKET;
+    delete process.env.AWS_REGION;
+    delete process.env.AWS_DEFAULT_REGION;
   });
 
   it("exports configureCredentials function", () => {
@@ -33,13 +36,98 @@ describe("workspace-sync credentials", () => {
     assert.equal(typeof workspaceSync.getS3Client, "function");
   });
 
+  it("refuses to construct an ambient S3 client before scoped credentials", () => {
+    assert.throws(() => workspaceSync.getS3Client(), /scoped credentials/i);
+  });
+
   it("configureCredentials accepts valid credentials without throwing", () => {
     // Should not throw (S3Client created lazily, not at configureCredentials time)
     workspaceSync.configureCredentials({
       accessKeyId: "AKIAIOSFODNN7EXAMPLE",
       secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
       sessionToken: "FwoGZXIvYXdzEBYaDH...",
+      expiration: new Date(Date.now() + 60_000),
     });
+  });
+
+  it("constructs S3 with exact region and explicit scoped credentials", () => {
+    const calls = [];
+    class FakeS3Client {
+      constructor(options) {
+        calls.push(options);
+      }
+    }
+    workspaceSync.configureCredentials(
+      {
+        accessKeyId: "ASIA_FIRST",
+        secretAccessKey: "secret-first",
+        sessionToken: "token-first",
+        expiration: new Date(Date.now() + 60_000),
+      },
+      { S3Client: FakeS3Client },
+    );
+    workspaceSync.getS3Client();
+    assert.deepEqual(calls, [
+      {
+        region: "eu-west-1",
+        credentials: {
+          accessKeyId: "ASIA_FIRST",
+          secretAccessKey: "secret-first",
+          sessionToken: "token-first",
+        },
+      },
+    ]);
+  });
+
+  it("refresh replaces the explicit client credentials", () => {
+    const calls = [];
+    class FakeS3Client {
+      constructor(options) {
+        calls.push(options);
+      }
+    }
+    const configure = (accessKeyId) =>
+      workspaceSync.configureCredentials(
+        {
+          accessKeyId,
+          secretAccessKey: "secret",
+          sessionToken: "token",
+          expiration: new Date(Date.now() + 60_000),
+        },
+        { S3Client: FakeS3Client },
+      );
+    configure("ASIA_FIRST");
+    workspaceSync.getS3Client();
+    configure("ASIA_SECOND");
+    workspaceSync.getS3Client();
+    assert.deepEqual(
+      calls.map((options) => options.credentials.accessKeyId),
+      ["ASIA_FIRST", "ASIA_SECOND"],
+    );
+  });
+
+  it("rejects explicit non-eu-west-1 before constructing S3", () => {
+    process.env.AWS_REGION = "us-west-2";
+    let constructed = false;
+    class FakeS3Client {
+      constructor() {
+        constructed = true;
+      }
+    }
+    assert.throws(
+      () =>
+        workspaceSync.configureCredentials(
+          {
+            accessKeyId: "ASIA_FIRST",
+            secretAccessKey: "secret",
+            sessionToken: "token",
+            expiration: new Date(Date.now() + 60_000),
+          },
+          { S3Client: FakeS3Client },
+        ),
+      /eu-west-1|region/i,
+    );
+    assert.equal(constructed, false);
   });
 
   it("rejects configureCredentials with missing accessKeyId", () => {
@@ -61,6 +149,18 @@ describe("workspace-sync credentials", () => {
           sessionToken: "token",
         }),
       /secretAccessKey/i,
+    );
+  });
+
+  it("rejects configureCredentials with missing sessionToken", () => {
+    assert.throws(
+      () =>
+        workspaceSync.configureCredentials({
+          accessKeyId: "AKIAEXAMPLE",
+          secretAccessKey: "secret",
+          expiration: new Date(Date.now() + 60_000),
+        }),
+      /sessionToken/i,
     );
   });
 
@@ -86,7 +186,7 @@ describe("shouldSkip", () => {
 
   beforeEach(() => {
     delete require.cache[require.resolve("./workspace-sync")];
-    process.env.AWS_REGION = "us-west-2";
+    process.env.AWS_REGION = "eu-west-1";
     process.env.S3_USER_FILES_BUCKET = "test-bucket";
     shouldSkip = require("./workspace-sync").shouldSkip;
   });
@@ -159,7 +259,7 @@ describe("detectCredentials", () => {
 
   beforeEach(() => {
     delete require.cache[require.resolve("./workspace-sync")];
-    process.env.AWS_REGION = "us-west-2";
+    process.env.AWS_REGION = "eu-west-1";
     process.env.S3_USER_FILES_BUCKET = "test-bucket";
     detectCredentials = require("./workspace-sync").detectCredentials;
   });
@@ -238,7 +338,7 @@ describe("CREDENTIAL_SCAN_EXEMPT", () => {
 
   beforeEach(() => {
     delete require.cache[require.resolve("./workspace-sync")];
-    process.env.AWS_REGION = "us-west-2";
+    process.env.AWS_REGION = "eu-west-1";
     process.env.S3_USER_FILES_BUCKET = "test-bucket";
     CREDENTIAL_SCAN_EXEMPT = require("./workspace-sync").CREDENTIAL_SCAN_EXEMPT;
   });
