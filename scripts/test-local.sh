@@ -35,7 +35,7 @@ run_check "Node.js 24.15 or newer" \
 
 run_check "Python unit tests" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
-  "$PYTHON" -m pytest lambda/router tests/test_product_configuration.py -v
+  "$PYTHON" -m pytest lambda/router lambda/cron tests/test_product_configuration.py -v
 
 run_check "Bridge Node tests (serialized)" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \

@@ -157,13 +157,20 @@ def get_agent_status(cfg: E2EConfig) -> Optional[dict]:
         return None
 
     client = boto3.client("bedrock-agentcore", region_name=cfg.region)
-    payload = json.dumps({"action": "status"}).encode()
+    payload = json.dumps(
+        {
+            "action": "status",
+            "internalUserId": user_id,
+            "namespace": user_id,
+        }
+    ).encode()
 
     try:
         resp = client.invoke_agent_runtime(
             agentRuntimeArn=runtime_arn,
             qualifier=qualifier or "",
             runtimeSessionId=session_id,
+            runtimeUserId=user_id,
             payload=payload,
             contentType="application/json",
             accept="application/json",

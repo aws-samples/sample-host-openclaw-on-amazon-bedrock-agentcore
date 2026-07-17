@@ -7,10 +7,10 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 # Set required env vars before importing the module
-os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/test")
+os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/test")
 os.environ.setdefault("AGENTCORE_QUALIFIER", "test-endpoint")
 os.environ.setdefault("IDENTITY_TABLE_NAME", "openclaw-identity")
-os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-us-west-2")
+os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-eu-west-1")
 
 # Mock boto3 before importing the module
 sys.modules["boto3"] = MagicMock()
@@ -59,14 +59,14 @@ class TestUploadImageToS3(unittest.TestCase):
             "telegram", 1001, "user-a"
         )
         result = index._upload_image_to_s3(
-            image_bytes, "telegram_123", "image/jpeg", invocation_id
+            image_bytes, "user_test123", "image/jpeg", invocation_id
         )
 
         self.assertIsNotNone(result)
         content_hash = index.hashlib.sha256(image_bytes).hexdigest()
         self.assertEqual(
             result,
-            f"telegram_123/_uploads/img_{invocation_id}_{content_hash}.jpeg",
+            f"user_test123/_uploads/img_{invocation_id}_{content_hash}.jpeg",
         )
         self.assertTrue(result.endswith(".jpeg"))
         mock_s3.put_object.assert_called_once()
@@ -82,16 +82,16 @@ class TestUploadImageToS3(unittest.TestCase):
         )
 
         first = index._upload_image_to_s3(
-            image_bytes, "slack_U123", "image/png", invocation_id
+            image_bytes, "user_a", "image/png", invocation_id
         )
         retry = index._upload_image_to_s3(
-            image_bytes, "slack_U123", "image/png", invocation_id
+            image_bytes, "user_a", "image/png", invocation_id
         )
         changed_event = index._upload_image_to_s3(
-            image_bytes, "slack_U123", "image/png", changed_event_id
+            image_bytes, "user_a", "image/png", changed_event_id
         )
         changed_image = index._upload_image_to_s3(
-            image_bytes + b"changed", "slack_U123", "image/png", invocation_id
+            image_bytes + b"changed", "user_a", "image/png", invocation_id
         )
 
         self.assertEqual(first, retry)
@@ -298,7 +298,7 @@ class TestHandleTelegramWithImages(unittest.TestCase):
     @patch.object(index, "resolve_user", return_value=("user_test123", False))
     @patch.object(index, "send_telegram_typing")
     @patch.object(index, "send_telegram_message")
-    @patch.object(index, "_upload_image_to_s3", return_value="telegram_123/_uploads/img_test.jpeg")
+    @patch.object(index, "_upload_image_to_s3", return_value="user_test123/_uploads/img_test.jpeg")
     @patch.object(index, "_download_telegram_image", return_value=(b"image_data", "image/jpeg", "photo.jpg"))
     @patch.object(index, "_get_telegram_token", return_value="test-token")
     def test_photo_message(self, mock_token, mock_download, mock_upload,
@@ -322,6 +322,7 @@ class TestHandleTelegramWithImages(unittest.TestCase):
             "telegram", 1001, "user_test123"
         )
         self.assertEqual(mock_upload.call_args[0][3], expected_invocation_id)
+        self.assertEqual(mock_upload.call_args[0][1], "user_test123")
         # invoke_agent_runtime should receive structured message
         call_args = mock_invoke.call_args
         msg = call_args[0][4]  # 5th positional arg is message

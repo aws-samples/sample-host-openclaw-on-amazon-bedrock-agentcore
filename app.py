@@ -8,7 +8,7 @@ idle-terminate naturally.
 Hybrid deployment model:
   Phase 1 (CDK): VPC, Security, AgentCore-base (Role/SG/S3), Observability
   Phase 2 (Starter Toolkit): Runtime, Endpoint, ECR, Docker build
-  Phase 3 (CDK): Router, Cron, TokenMonitoring (needs runtime_id/endpoint_id)
+  Phase 3 (CDK): Router, Cron tombstone, TokenMonitoring
 """
 
 import os
@@ -25,11 +25,26 @@ from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
 
+REQUIRED_REGION = "eu-west-1"
+
+
 app = cdk.App()
+
+context_region = app.node.try_get_context("region")
+for source, configured_region in (
+    ("cdk context region", context_region),
+    ("CDK_DEFAULT_REGION", os.environ.get("CDK_DEFAULT_REGION")),
+    ("AWS_REGION", os.environ.get("AWS_REGION")),
+    ("AWS_DEFAULT_REGION", os.environ.get("AWS_DEFAULT_REGION")),
+):
+    if configured_region and configured_region != REQUIRED_REGION:
+        raise RuntimeError(
+            f"{source} must be exactly {REQUIRED_REGION}; got {configured_region}"
+        )
 
 env = cdk.Environment(
     account=app.node.try_get_context("account") or os.environ.get("CDK_DEFAULT_ACCOUNT"),
-    region=app.node.try_get_context("region") or os.environ.get("CDK_DEFAULT_REGION"),
+    region=REQUIRED_REGION,
 )
 
 # --- Foundation ---
@@ -54,11 +69,6 @@ agentcore_stack = AgentCoreStack(
     cmk_arn=security_stack.cmk.key_arn,
     vpc=vpc_stack.vpc,
     private_subnet_ids=[s.subnet_id for s in vpc_stack.vpc.private_subnets],
-    cognito_issuer_url=security_stack.cognito_issuer_url,
-    cognito_client_id=security_stack.user_pool_client_id,
-    cognito_user_pool_id=security_stack.user_pool_id,
-    cognito_password_secret_name=security_stack.cognito_password_secret.secret_name,
-    gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
     env=env,
 )
 
@@ -68,7 +78,6 @@ router_stack = RouterStack(
     "OpenClawRouter",
     runtime_arn=agentcore_stack.runtime_arn,
     runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
-    gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
     slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
     feishu_token_secret_name=security_stack.channel_secrets["feishu"].secret_name,
@@ -79,28 +88,9 @@ router_stack = RouterStack(
     env=env,
 )
 
-# --- Cron (EventBridge Scheduler + Lambda executor) ---
-# Use deterministic string ARNs for identity table to avoid cyclic dependency
-# (AgentCore <- Router already exists; CronStack adds policies to AgentCore role)
-_region = env.region or os.environ.get("CDK_DEFAULT_REGION", "")
-_account = env.account or os.environ.get("CDK_DEFAULT_ACCOUNT", "")
-_identity_table_name = "openclaw-identity"
-_identity_table_arn = f"arn:aws:dynamodb:{_region}:{_account}:table/{_identity_table_name}"
-
-cron_stack = CronStack(
-    app,
-    "OpenClawCron",
-    runtime_arn=agentcore_stack.runtime_arn,
-    runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
-    identity_table_name=_identity_table_name,
-    identity_table_arn=_identity_table_arn,
-    telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
-    slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
-    feishu_token_secret_name=security_stack.channel_secrets["feishu"].secret_name,
-    cmk_arn=security_stack.cmk.key_arn,
-    agentcore_execution_role=agentcore_stack.execution_role,
-    env=env,
-)
+# Same-ID tombstone deployment removes any legacy Scheduler/Lambda/IAM
+# resources from an existing OpenClawCron CloudFormation stack.
+cron_stack = CronStack(app, "OpenClawCron", env=env)
 
 # --- Observability (dashboards + alarms) ---
 observability_stack = ObservabilityStack(

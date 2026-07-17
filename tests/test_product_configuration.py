@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -166,3 +167,356 @@ def test_cdk_nag_guard_rejects_missing_reports(tmp_path: Path) -> None:
 
     assert completed.returncode == 1
     assert "No AwsSolutions NagReport CSV files found" in completed.stderr
+
+
+def test_runtime_role_is_separated_from_workspace_and_legacy_cron_authority() -> None:
+    agentcore = (ROOT / "stacks/agentcore_stack.py").read_text(encoding="utf-8")
+    cron = (ROOT / "stacks/cron_stack.py").read_text(encoding="utf-8")
+
+    assert "WorkspaceSessionRole" in agentcore
+    assert "WorkspaceSessionRoleArn" in agentcore
+    assert "workspace_session_role" in agentcore
+    assert "self.user_files_bucket.grant_read_write(self.execution_role)" not in agentcore
+    assert 'actions=["sts:AssumeRole"]' in agentcore
+    assert "scheduler:" not in agentcore.casefold()
+    assert "dynamodb:" not in agentcore.casefold()
+    assert "iam:PassRole" not in agentcore
+    assert "DIRECT_CRON_DISABLED" in cron
+    assert "aws_scheduler" not in cron
+
+
+def test_workspace_role_policy_is_exact_s3_and_cmk_only() -> None:
+    source = (ROOT / "stacks/agentcore_stack.py").read_text(encoding="utf-8")
+
+    required_actions = {
+        '"s3:ListBucket"',
+        '"s3:GetObject"',
+        '"s3:PutObject"',
+        '"s3:DeleteObject"',
+        '"kms:Encrypt"',
+        '"kms:Decrypt"',
+        '"kms:GenerateDataKey"',
+    }
+    for action in required_actions:
+        assert action in source
+    assert '"kms:ViaService": "s3.eu-west-1.amazonaws.com"' in source
+    assert '"kms:CallerAccount": account' in source
+
+
+def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
+    deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+    local = (ROOT / "scripts/test-local.sh").read_text(encoding="utf-8")
+    e2e = (ROOT / "scripts/e2e-deploy-and-test.sh").read_text(encoding="utf-8")
+    app = (ROOT / "app.py").read_text(encoding="utf-8")
+
+    assert 'REQUIRED_REGION="eu-west-1"' in deploy
+    assert 'WORKSPACE_SESSION_ROLE_ARN=$(aws cloudformation describe-stacks' in deploy
+    assert '--env "WORKSPACE_SESSION_ROLE_ARN=$WORKSPACE_SESSION_ROLE_ARN"' in deploy
+    assert "EVENTBRIDGE_SCHEDULE_GROUP" not in deploy
+    assert "CRON_LAMBDA_ARN" not in deploy
+    assert "EVENTBRIDGE_ROLE_ARN" not in deploy
+    assert 'AWS_TEST_REGION="eu-west-1"' in local
+    assert 'REQUIRED_REGION="eu-west-1"' in e2e
+    assert 'CronStack(app, "OpenClawCron", env=env)' in app
+    assert 'REQUIRED_REGION = "eu-west-1"' in app
+
+
+def test_e2e_region_resolver_rejects_explicit_wrong_region_before_clients(monkeypatch) -> None:
+    from tests.e2e import config
+
+    monkeypatch.setenv("CDK_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setattr(
+        config.boto3,
+        "client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("AWS client must not be created")
+        ),
+    )
+
+    try:
+        config.load_config()
+    except RuntimeError as error:
+        assert "eu-west-1" in str(error)
+    else:
+        raise AssertionError("wrong region was accepted")
+
+
+def _synth_agentcore_template(region: str = "eu-west-1") -> dict:
+    from aws_cdk import App, Environment, Stack, aws_ec2 as ec2
+    from aws_cdk.assertions import Template
+
+    from stacks.agentcore_stack import AgentCoreStack
+
+    account = "123456789012"
+    app = App(
+        context={
+            "runtime_id": "runtime-test",
+            "runtime_endpoint_id": "endpoint-test",
+            "user_files_ttl_days": "30",
+            "enable_browser": "false",
+        }
+    )
+    env = Environment(account=account, region=region)
+    network = Stack(app, f"Network{region.replace('-', '')}", env=env)
+    vpc = ec2.Vpc(network, "Vpc", max_azs=2, nat_gateways=0)
+    stack = AgentCoreStack(
+        app,
+        f"AgentCore{region.replace('-', '')}",
+        cmk_arn=f"arn:aws:kms:{region}:{account}:key/test-key",
+        vpc=vpc,
+        private_subnet_ids=["subnet-00000000000000001"],
+        env=env,
+    )
+    return Template.from_stack(stack).to_json()
+
+
+def _role_and_statements(template: dict, role_name: str) -> tuple[dict, list[dict]]:
+    resources = template["Resources"]
+    role_id, role = next(
+        (logical_id, resource)
+        for logical_id, resource in resources.items()
+        if resource["Type"] == "AWS::IAM::Role"
+        and resource["Properties"].get("RoleName") == role_name
+    )
+    statements = []
+    for resource in resources.values():
+        if resource["Type"] != "AWS::IAM::Policy":
+            continue
+        roles = resource["Properties"].get("Roles", [])
+        if {"Ref": role_id} in roles:
+            statements.extend(
+                resource["Properties"]["PolicyDocument"].get("Statement", [])
+            )
+    return role, statements
+
+
+def _flatten_statement_actions(statements: list[dict]) -> list[str]:
+    actions = []
+    for statement in statements:
+        value = statement.get("Action", [])
+        actions.extend(value if isinstance(value, list) else [value])
+    return actions
+
+
+def test_synthesized_workspace_role_has_exact_trust_and_base_authority() -> None:
+    template = _synth_agentcore_template()
+    role, statements = _role_and_statements(
+        template, "openclaw-workspace-session-role-eu-west-1"
+    )
+
+    trust = role["Properties"]["AssumeRolePolicyDocument"]["Statement"]
+    assert len(trust) == 1
+    assert trust[0]["Action"] == "sts:AssumeRole"
+    assert trust[0]["Principal"] == {
+        "AWS": {
+            "Fn::Join": [
+                "",
+                [
+                    "arn:",
+                    {"Ref": "AWS::Partition"},
+                    ":iam::123456789012:root",
+                ],
+            ]
+        }
+    }
+    assert trust[0]["Condition"] == {
+        "ArnEquals": {
+            "aws:PrincipalArn": (
+                "arn:aws:iam::123456789012:role/"
+                "openclaw-agentcore-execution-role-eu-west-1"
+            )
+        },
+        "StringLike": {"sts:RoleSessionName": "workspace-*"},
+    }
+
+    assert set(_flatten_statement_actions(statements)) == {
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+    }
+    assert all(statement.get("Resource") != "*" for statement in statements)
+    list_statement = next(
+        statement for statement in statements if statement["Action"] == "s3:ListBucket"
+    )
+    object_statement = next(
+        statement
+        for statement in statements
+        if isinstance(statement["Action"], list)
+        and "s3:GetObject" in statement["Action"]
+    )
+    assert list_statement["Resource"] == {
+        "Fn::GetAtt": ["UserFilesBucketCFDFD8C0", "Arn"]
+    }
+    assert "Condition" not in list_statement
+    assert object_statement["Resource"] == {
+        "Fn::Join": [
+            "",
+            [
+                {"Fn::GetAtt": ["UserFilesBucketCFDFD8C0", "Arn"]},
+                "/*",
+            ],
+        ]
+    }
+    kms_statement = next(
+        statement
+        for statement in statements
+        if "kms:Encrypt" in (
+            statement["Action"]
+            if isinstance(statement["Action"], list)
+            else [statement["Action"]]
+        )
+    )
+    assert kms_statement["Resource"] == (
+        "arn:aws:kms:eu-west-1:123456789012:key/test-key"
+    )
+    assert kms_statement["Condition"] == {
+        "StringEquals": {
+            "kms:ViaService": "s3.eu-west-1.amazonaws.com",
+            "kms:CallerAccount": "123456789012",
+        }
+    }
+
+
+def test_synthesized_execution_role_has_only_exact_workspace_assume_authority() -> None:
+    template = _synth_agentcore_template()
+    _, statements = _role_and_statements(
+        template, "openclaw-agentcore-execution-role-eu-west-1"
+    )
+    actions = _flatten_statement_actions(statements)
+    forbidden_prefixes = ("s3:", "scheduler:", "events:", "dynamodb:")
+
+    assert not any(action.startswith(forbidden_prefixes) for action in actions)
+    assert not any(action.startswith("secretsmanager:") for action in actions)
+    assert not any(action.startswith("iam:") for action in actions)
+    assert "iam:PassRole" not in actions
+    assert [action for action in actions if action.startswith("sts:")] == [
+        "sts:AssumeRole"
+    ]
+    assume_statements = [
+        statement
+        for statement in statements
+        if statement.get("Action") == "sts:AssumeRole"
+    ]
+    assert assume_statements == [
+        {
+            "Action": "sts:AssumeRole",
+            "Effect": "Allow",
+            "Resource": (
+                "arn:aws:iam::123456789012:role/"
+                "openclaw-workspace-session-role-eu-west-1"
+            ),
+        }
+    ]
+
+
+def test_agentcore_stack_rejects_wrong_region() -> None:
+    try:
+        _synth_agentcore_template("us-west-2")
+    except ValueError as error:
+        assert "eu-west-1" in str(error)
+    else:
+        raise AssertionError("AgentCoreStack accepted a non-canonical region")
+
+
+def test_synthesized_cron_tombstone_has_no_runtime_resources() -> None:
+    from aws_cdk import App, Environment
+    from aws_cdk.assertions import Template
+
+    from stacks.cron_stack import CronStack
+
+    app = App()
+    stack = CronStack(
+        app,
+        "OpenClawCron",
+        env=Environment(account="123456789012", region="eu-west-1"),
+    )
+    template = Template.from_stack(stack).to_json()
+
+    assert template.get("Resources", {}) == {}
+    assert template["Outputs"]["DirectCronStatus"]["Value"] == (
+        "DIRECT_CRON_DISABLED"
+    )
+
+
+def test_shell_region_guards_fail_before_aws_cli(tmp_path: Path) -> None:
+    poison_bin = tmp_path / "bin"
+    poison_bin.mkdir()
+    marker = tmp_path / "aws-called"
+    aws = poison_bin / "aws"
+    aws.write_text(
+        '#!/usr/bin/env bash\ntouch "$AWS_POISON_MARKER"\nexit 97\n',
+        encoding="utf-8",
+    )
+    aws.chmod(0o755)
+
+    for relative_script in ("scripts/deploy.sh", "scripts/e2e-deploy-and-test.sh"):
+        env = os.environ.copy()
+        env.pop("CDK_DEFAULT_REGION", None)
+        env.pop("AWS_DEFAULT_REGION", None)
+        env.update(
+            {
+                "AWS_REGION": "us-west-2",
+                "AWS_POISON_MARKER": str(marker),
+                "PATH": f"{poison_bin}:{env['PATH']}",
+            }
+        )
+        completed = subprocess.run(
+            ["bash", str(ROOT / relative_script)],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 1
+        assert "must be exactly eu-west-1" in completed.stderr
+        assert not marker.exists(), f"{relative_script} called aws before region gate"
+
+
+def test_unused_cognito_and_gateway_infrastructure_is_absent() -> None:
+    source = (ROOT / "stacks/security_stack.py").read_text(encoding="utf-8")
+    deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+
+    assert "aws_cognito" not in source
+    assert "GatewayTokenSecret" not in source
+    assert "gateway_token_secret" not in source
+    assert "CognitoPasswordSecret" not in source
+    assert "cognito_password_secret" not in source
+    assert 'channel_names = ["telegram", "slack", "feishu"]' in source
+    assert "GATEWAY_TOKEN_SECRET_ID" not in deploy
+    assert "COGNITO_USER_POOL_ID" not in deploy
+    assert "COGNITO_CLIENT_ID" not in deploy
+    assert "COGNITO_PASSWORD_SECRET_ID" not in deploy
+
+
+def test_synthesized_security_stack_has_only_active_control_plane_secrets() -> None:
+    from aws_cdk import App, Environment
+    from aws_cdk.assertions import Template
+
+    from stacks.security_stack import SecurityStack
+
+    app = App(context={"enable_cloudtrail": False})
+    stack = SecurityStack(
+        app,
+        "Security",
+        env=Environment(account="123456789012", region="eu-west-1"),
+    )
+    template = Template.from_stack(stack).to_json()
+    resources = template.get("Resources", {}).values()
+
+    assert not any(resource["Type"].startswith("AWS::Cognito::") for resource in resources)
+    secret_names = {
+        resource["Properties"]["Name"]
+        for resource in resources
+        if resource["Type"] == "AWS::SecretsManager::Secret"
+    }
+    assert secret_names == {
+        "openclaw/channels/telegram",
+        "openclaw/channels/slack",
+        "openclaw/channels/feishu",
+        "openclaw/webhook-secret",
+    }

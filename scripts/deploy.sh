@@ -4,7 +4,7 @@
 # Three-phase deployment:
 #   Phase 1: CDK deploys foundation (VPC, Security, AgentCore base, Observability)
 #   Phase 2: Starter Toolkit deploys Runtime (ECR, Docker build, Runtime, Endpoint)
-#   Phase 3: CDK deploys dependent stacks (Router, Cron, TokenMonitoring)
+#   Phase 3: CDK deploys Router, the legacy Cron tombstone, and TokenMonitoring
 #
 # Usage:
 #   ./scripts/deploy.sh                  # full 3-phase deploy
@@ -18,7 +18,7 @@
 #                       local-build: builds ARM64 container locally with Docker (recommended)
 #                       codebuild: builds in AWS CodeBuild (no Docker required, adds cost)
 #   CDK_DEFAULT_ACCOUNT AWS account ID (auto-detected if not set)
-#   CDK_DEFAULT_REGION  AWS region (falls back to cdk.json, then aws configure)
+#   CDK_DEFAULT_REGION  AWS region; must be exactly eu-west-1
 #   AGENTCORE_CLI       Path to agentcore CLI (auto-detected)
 
 set -euo pipefail
@@ -28,6 +28,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- Build mode ---
 BUILD_MODE="${BUILD_MODE:-local-build}"
+REQUIRED_REGION="eu-west-1"
 
 # --- Pre-flight checks ---
 preflight() {
@@ -75,19 +76,27 @@ preflight() {
   fi
 }
 
-# Resolve account and region
-ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
+# Resolve and validate every explicit region before the first AWS CLI call.
+for region_variable in CDK_DEFAULT_REGION AWS_REGION AWS_DEFAULT_REGION; do
+  configured_region="${!region_variable:-}"
+  if [ -n "$configured_region" ] && [ "$configured_region" != "$REQUIRED_REGION" ]; then
+    echo "ERROR: $region_variable must be exactly $REQUIRED_REGION; got $configured_region." >&2
+    exit 1
+  fi
+done
 REGION="${CDK_DEFAULT_REGION:-}"
 if [ -z "$REGION" ]; then
   REGION=$(python3 -c "import json; r=json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('region',''); print(r)" 2>/dev/null || echo "")
 fi
 if [ -z "$REGION" ]; then
-  REGION=$(aws configure get region 2>/dev/null || echo "")
+  REGION="$REQUIRED_REGION"
 fi
-if [ -z "$REGION" ]; then
-  echo "ERROR: Could not determine AWS region. Set CDK_DEFAULT_REGION, configure region in cdk.json, or run 'aws configure'."
+if [ "$REGION" != "$REQUIRED_REGION" ]; then
+  echo "ERROR: AWS region must be exactly $REQUIRED_REGION; got $REGION." >&2
   exit 1
 fi
+
+ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
 
 if [ -z "$ACCOUNT" ]; then
   echo "ERROR: Could not determine AWS account. Set CDK_DEFAULT_ACCOUNT or configure AWS CLI."
@@ -148,6 +157,15 @@ read_cdk_outputs() {
     --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" \
     --output text)
 
+  WORKSPACE_SESSION_ROLE_ARN=$(aws cloudformation describe-stacks \
+    --stack-name OpenClawAgentCore --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='WorkspaceSessionRoleArn'].OutputValue" \
+    --output text)
+  if [[ ! "$WORKSPACE_SESSION_ROLE_ARN" =~ ^arn:aws:iam::${ACCOUNT}:role/openclaw-workspace-session-role-eu-west-1$ ]]; then
+    echo "ERROR: Invalid or missing WorkspaceSessionRoleArn output: $WORKSPACE_SESSION_ROLE_ARN" >&2
+    exit 1
+  fi
+
   SECURITY_GROUP_ID=$(aws cloudformation describe-stacks \
     --stack-name OpenClawAgentCore --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='SecurityGroupId'].OutputValue" \
@@ -163,26 +181,6 @@ read_cdk_outputs() {
     --query "Stacks[0].Outputs[?OutputKey=='UserFilesBucketName'].OutputValue" \
     --output text)
 
-  GATEWAY_TOKEN_SECRET=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'GatewayTokenSecret')].OutputValue" \
-    --output text)
-  # Extract secret name from ARN (last segment after last colon, strip random suffix)
-  GATEWAY_TOKEN_SECRET_ID="openclaw/gateway-token"
-
-  COGNITO_USER_POOL_ID=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'IdentityPoolEC8A1A0D')].OutputValue" \
-    --output text)
-
-  COGNITO_CLIENT_ID=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'IdentityPoolProxyClient')].OutputValue" \
-    --output text)
-
-  COGNITO_PASSWORD_SECRET_ID="openclaw/cognito-password-secret"
-  TELEGRAM_CHANNEL_SECRET_ID="openclaw/channels/telegram"
-
   CMK_ARN=$(aws cloudformation describe-stacks \
     --stack-name OpenClawSecurity --region "$REGION" \
     --query "Stacks[0].Outputs[?contains(OutputKey,'SecretsCmk')].OutputValue" \
@@ -190,14 +188,13 @@ read_cdk_outputs() {
 
   # Read config values from cdk.json
   DEFAULT_MODEL_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('default_model_id','global.anthropic.claude-opus-4-6-v1'))")
-  SUBAGENT_MODEL_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('subagent_model_id',''))")
   IMAGE_VERSION=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('image_version','1'))")
   WORKSPACE_SYNC_MS=$(python3 -c "import json; print(int(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('workspace_sync_interval_seconds',300))*1000)")
-  CRON_LEAD_TIME=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('cron_lead_time_minutes',5))")
   SESSION_IDLE=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('session_idle_timeout',1800))")
   SESSION_MAX=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('session_max_lifetime',28800))")
 
   echo "  Execution Role: $EXECUTION_ROLE_ARN"
+  echo "  Workspace Role: $WORKSPACE_SESSION_ROLE_ARN"
   echo "  Security Group: $SECURITY_GROUP_ID"
   echo "  Subnets:        $PRIVATE_SUBNET_IDS"
   echo "  S3 Bucket:      $USER_FILES_BUCKET"
@@ -275,22 +272,11 @@ phase2_toolkit() {
     "${deploy_flags[@]}" \
     --env "AWS_REGION=$REGION" \
     --env "BEDROCK_MODEL_ID=$DEFAULT_MODEL_ID" \
-    --env "GATEWAY_TOKEN_SECRET_ID=$GATEWAY_TOKEN_SECRET_ID" \
-    --env "COGNITO_USER_POOL_ID=$COGNITO_USER_POOL_ID" \
-    --env "COGNITO_CLIENT_ID=$COGNITO_CLIENT_ID" \
-    --env "COGNITO_PASSWORD_SECRET_ID=$COGNITO_PASSWORD_SECRET_ID" \
     --env "S3_USER_FILES_BUCKET=$USER_FILES_BUCKET" \
     --env "WORKSPACE_SYNC_INTERVAL_MS=$WORKSPACE_SYNC_MS" \
     --env "IMAGE_VERSION=$IMAGE_VERSION" \
-    --env "EXECUTION_ROLE_ARN=$EXECUTION_ROLE_ARN" \
-    --env "CMK_ARN=$CMK_ARN" \
-    --env "EVENTBRIDGE_SCHEDULE_GROUP=openclaw-cron" \
-    --env "CRON_LAMBDA_ARN=arn:aws:lambda:${REGION}:${ACCOUNT}:function:openclaw-cron-executor" \
-    --env "EVENTBRIDGE_ROLE_ARN=arn:aws:iam::${ACCOUNT}:role/openclaw-cron-scheduler-role-${REGION}" \
-    --env "IDENTITY_TABLE_NAME=openclaw-identity" \
-    --env "CRON_LEAD_TIME_MINUTES=$CRON_LEAD_TIME" \
-    --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID" \
-    --env "TELEGRAM_CHANNEL_SECRET_ID=$TELEGRAM_CHANNEL_SECRET_ID"
+    --env "WORKSPACE_SESSION_ROLE_ARN=$WORKSPACE_SESSION_ROLE_ARN" \
+    --env "CMK_ARN=$CMK_ARN"
 
   # --- Configure session storage (not supported by agentcore CLI yet) ---
   echo "--- Configuring session storage ---"

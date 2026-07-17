@@ -26,6 +26,9 @@ from constructs import Construct
 from stacks import retention_days
 
 
+REQUIRED_REGION = "eu-west-1"
+
+
 class RouterStack(Stack):
     def __init__(
         self,
@@ -34,7 +37,6 @@ class RouterStack(Stack):
         *,
         runtime_arn: str,
         runtime_endpoint_id: str,
-        gateway_token_secret_name: str,
         telegram_token_secret_name: str,
         slack_token_secret_name: str,
         feishu_token_secret_name: str,
@@ -48,6 +50,10 @@ class RouterStack(Stack):
 
         region = Stack.of(self).region
         account = Stack.of(self).account
+        if region != REQUIRED_REGION:
+            raise ValueError(
+                f"RouterStack must be deployed in {REQUIRED_REGION}; got {region}"
+            )
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
@@ -234,6 +240,12 @@ class RouterStack(Stack):
             iam.PolicyStatement(
                 actions=["kms:GenerateDataKey"],
                 resources=[cmk_arn],
+                conditions={
+                    "StringEquals": {
+                        "kms:ViaService": "s3.eu-west-1.amazonaws.com",
+                        "kms:CallerAccount": account,
+                    }
+                },
             )
         )
 

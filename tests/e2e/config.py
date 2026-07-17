@@ -9,18 +9,31 @@ import boto3
 from botocore.exceptions import ClientError
 
 
+REQUIRED_REGION = "eu-west-1"
+
+
 def _resolve_region() -> str:
-    """Resolve AWS region: env var -> cdk.json -> boto3 session."""
-    region = os.environ.get("CDK_DEFAULT_REGION")
-    if region:
-        return region
+    """Resolve only the canonical region, rejecting every explicit mismatch."""
+    explicit = {
+        name: os.environ.get(name)
+        for name in ("CDK_DEFAULT_REGION", "AWS_REGION", "AWS_DEFAULT_REGION")
+    }
+    for name, region in explicit.items():
+        if region and region != REQUIRED_REGION:
+            raise RuntimeError(
+                f"{name} must be exactly {REQUIRED_REGION}; got {region}"
+            )
     cdk_json = Path(__file__).resolve().parents[2] / "cdk.json"
     if cdk_json.exists():
         with open(cdk_json) as f:
             ctx = json.load(f).get("context", {})
-            if ctx.get("region"):
-                return ctx["region"]
-    return boto3.session.Session().region_name or "ap-southeast-2"
+            context_region = ctx.get("region")
+            if context_region and context_region != REQUIRED_REGION:
+                raise RuntimeError(
+                    f"cdk context region must be exactly {REQUIRED_REGION}; "
+                    f"got {context_region}"
+                )
+    return REQUIRED_REGION
 
 
 @dataclass(frozen=True)
@@ -30,6 +43,7 @@ class E2EConfig:
     webhook_secret: str
     telegram_chat_id: str
     telegram_user_id: str
+    workspace_session_role_arn: str
     log_group: str = "/openclaw/lambda/router"
     identity_table: str = "openclaw-identity"
 
@@ -50,6 +64,21 @@ def load_config() -> E2EConfig:
 
     if not api_url:
         raise RuntimeError("ApiUrl output not found in OpenClawRouter stack")
+
+    try:
+        resp = cf.describe_stacks(StackName="OpenClawAgentCore")
+        outputs = {
+            output["OutputKey"]: output["OutputValue"]
+            for output in resp["Stacks"][0].get("Outputs", [])
+        }
+        workspace_session_role_arn = outputs.get("WorkspaceSessionRoleArn", "")
+    except (ClientError, IndexError, KeyError) as e:
+        raise RuntimeError(f"Cannot read OpenClawAgentCore stack outputs: {e}") from e
+
+    if not workspace_session_role_arn:
+        raise RuntimeError(
+            "WorkspaceSessionRoleArn output not found in OpenClawAgentCore stack"
+        )
 
     # Webhook secret from Secrets Manager
     try:
@@ -73,4 +102,5 @@ def load_config() -> E2EConfig:
         webhook_secret=webhook_secret,
         telegram_chat_id=chat_id,
         telegram_user_id=user_id,
+        workspace_session_role_arn=workspace_session_role_arn,
     )

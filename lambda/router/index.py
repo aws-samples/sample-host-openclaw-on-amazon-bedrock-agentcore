@@ -39,7 +39,21 @@ FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
-AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+REQUIRED_REGION = "eu-west-1"
+
+
+def _require_region():
+    """Fail before any AWS client is created when a different region is explicit."""
+    for variable in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        configured = os.environ.get(variable)
+        if configured and configured != REQUIRED_REGION:
+            raise RuntimeError(
+                f"{variable} must be exactly {REQUIRED_REGION}; got {configured}"
+            )
+    return REQUIRED_REGION
+
+
+AWS_REGION = _require_region()
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
@@ -414,7 +428,11 @@ def resolve_user(channel, channel_user_id, display_name=""):
     try:
         resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"})
         if "Item" in resp:
-            return resp["Item"]["userId"], False
+            try:
+                return _canonical_namespace(resp["Item"]["userId"]), False
+            except (KeyError, ValueError):
+                logger.error("Rejected corrupt channel identity mapping for %s", channel_key)
+                return None, False
     except ClientError as e:
         logger.error("DynamoDB get_item failed: %s", e)
 
@@ -468,7 +486,11 @@ def resolve_user(channel, channel_user_id, display_name=""):
             # Another invocation created it first — read and return theirs
             resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"})
             if "Item" in resp:
-                return resp["Item"]["userId"], False
+                try:
+                    return _canonical_namespace(resp["Item"]["userId"]), False
+                except (KeyError, ValueError):
+                    logger.error("Rejected corrupt raced identity mapping for %s", channel_key)
+                    return None, False
         logger.error("Failed to create channel mapping: %s", e)
 
     # User -> channel back-reference
@@ -492,6 +514,7 @@ def resolve_user(channel, channel_user_id, display_name=""):
 
 def get_or_create_session(user_id):
     """Get or create a session ID for the user. Session IDs must be >= 33 chars."""
+    user_id = _canonical_namespace(user_id)
     pk = f"USER#{user_id}"
 
     try:
@@ -537,6 +560,7 @@ def get_or_create_session(user_id):
 
 def create_bind_code(user_id):
     """Generate an 8-char bind code and store it in DynamoDB with TTL."""
+    user_id = _canonical_namespace(user_id)
     code = uuid.uuid4().hex[:8].upper()  # 16^8 = 4.3B keyspace
     ttl = int(time.time()) + BIND_CODE_TTL_SECONDS
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -568,7 +592,7 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
         if item.get("ttl", 0) < int(time.time()):
             return None, False
 
-        user_id = item["userId"]
+        user_id = _canonical_namespace(item["userId"])
         channel_key = f"{channel}:{channel_user_id}"
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -599,7 +623,7 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 
         logger.info("Bind code %s redeemed: %s -> %s", code, channel_key, user_id)
         return user_id, True
-    except ClientError as e:
+    except (ClientError, KeyError, ValueError) as e:
         logger.error("Bind code redemption failed: %s", e)
         return None, False
 
@@ -613,11 +637,19 @@ def _build_runtime_invocation_id(channel, platform_event_id, internal_user_id):
     if channel not in {"telegram", "slack", "feishu"}:
         raise ValueError("unsupported invocation channel")
     event_id = str(platform_event_id or "").strip()
-    user_id = str(internal_user_id or "").strip()
-    if not event_id or len(event_id) > 512 or not user_id or len(user_id) > 256:
+    user_id = _canonical_namespace(internal_user_id)
+    if not event_id or len(event_id) > 512:
         raise ValueError("missing immutable platform event or internal user identity")
     canonical = f"personal-operator-invocation-v1\0{channel}\0{user_id}\0{event_id}"
     return "po1_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _canonical_namespace(internal_user_id):
+    """Return the exact validated server-resolved internal user identifier."""
+    user_id = str(internal_user_id or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}", user_id):
+        raise ValueError("invalid internal user identity")
+    return user_id
 
 
 def invoke_agent_runtime(session_id, user_id, actor_id, channel, message, invocation_id):
@@ -625,9 +657,11 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message, invoca
 
     Message can be a plain string or a structured dict with text + images.
     """
+    namespace = _canonical_namespace(user_id)
     payload = json.dumps({
         "action": "chat",
-        "userId": user_id,
+        "internalUserId": namespace,
+        "namespace": namespace,
         "actorId": actor_id,
         "channel": channel,
         "message": message,
@@ -640,7 +674,7 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message, invoca
             agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
             qualifier=AGENTCORE_QUALIFIER,
             runtimeSessionId=session_id,
-            runtimeUserId=actor_id,
+            runtimeUserId=namespace,
             payload=payload,
             contentType="application/json",
             accept="application/json",
@@ -688,6 +722,20 @@ def _extract_text_from_content_blocks(text):
     if not text or not isinstance(text, str):
         return text
     result = text
+    # Recover the common one-block trailing-comma form before the truncated
+    # content fail-closed path strips it. The captured JSON string is decoded
+    # normally so escapes and control characters are handled consistently.
+    trailing_comma = re.fullmatch(
+        r'\s*\[\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*'
+        r'"((?:[^"\\]|\\.)*)"\s*\}\s*,\s*\]\s*',
+        result,
+        flags=re.DOTALL,
+    )
+    if trailing_comma:
+        try:
+            return json.loads('"' + trailing_comma.group(1) + '"')
+        except (json.JSONDecodeError, ValueError):
+            pass
     decoder = json.JSONDecoder(strict=False)
     for _ in range(10):
         prev = result
@@ -1075,6 +1123,11 @@ def _extract_screenshots(text: str) -> tuple:
 
 def _fetch_s3_image(s3_key: str, namespace: str):
     """Fetch image bytes from S3. Returns None on error or invalid key."""
+    try:
+        namespace = _canonical_namespace(namespace)
+    except ValueError:
+        logger.error("Rejected screenshot fetch without canonical internal user identity")
+        return None
     # Validate: reject path traversal
     if ".." in s3_key:
         logger.error("Rejected S3 screenshot key with path traversal: %s", s3_key)
@@ -1244,6 +1297,11 @@ def _upload_image_to_s3(image_bytes, namespace, content_type, invocation_id):
     RH2 will migrate the still-current actor namespace atomically across every
     router, proxy, credential, and runtime consumer.
     """
+    try:
+        namespace = _canonical_namespace(namespace)
+    except ValueError:
+        logger.warning("Rejected image upload without canonical internal user identity")
+        return None
     if not USER_FILES_BUCKET:
         logger.warning("USER_FILES_BUCKET not configured — cannot upload image")
         return None
@@ -1448,6 +1506,13 @@ def handle_telegram(body):
         )
         return
 
+    try:
+        resolved_user_id = _canonical_namespace(resolved_user_id)
+    except ValueError:
+        logger.error("Telegram resolved a non-canonical internal user identity")
+        send_telegram_message(chat_id, "Sorry, your account mapping is invalid.", token)
+        return
+
     # Handle link-accounts command (generate bind code for existing users)
     if _is_link_command(text):
         code = create_bind_code(resolved_user_id)
@@ -1469,7 +1534,7 @@ def handle_telegram(body):
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
     if has_image:
-        namespace = actor_id.replace(":", "_")
+        namespace = _canonical_namespace(resolved_user_id)
         image_bytes, content_type, _ = _download_telegram_image(message, token)
         if image_bytes:
             s3_key = _upload_image_to_s3(
@@ -1610,6 +1675,13 @@ def handle_slack(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    try:
+        resolved_user_id = _canonical_namespace(resolved_user_id)
+    except ValueError:
+        logger.error("Slack resolved a non-canonical internal user identity")
+        send_slack_message(channel_id, "Sorry, your account mapping is invalid.", bot_token)
+        return {"statusCode": 200, "body": "ok"}
+
     # Handle link-accounts command (generate bind code for existing users)
     if _is_link_command(text):
         code = create_bind_code(resolved_user_id)
@@ -1628,7 +1700,7 @@ def handle_slack(body, headers=None):
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
     if has_image:
-        namespace = actor_id.replace(":", "_")
+        namespace = _canonical_namespace(resolved_user_id)
         # Use first image file
         file_info = image_files[0]
         image_bytes, content_type, _ = _download_slack_file(file_info, bot_token)
@@ -1780,6 +1852,13 @@ def handle_feishu(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    try:
+        resolved_user_id = _canonical_namespace(resolved_user_id)
+    except ValueError:
+        logger.error("Feishu resolved a non-canonical internal user identity")
+        send_feishu_message(chat_id, "Sorry, your account mapping is invalid.")
+        return {"statusCode": 200, "body": "ok"}
+
     # Handle link-accounts command
     if _is_link_command(text):
         bind_code = create_bind_code(resolved_user_id)
@@ -1799,7 +1878,7 @@ def handle_feishu(body, headers=None):
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text or "hi"
     if has_image:
-        namespace = actor_id.replace(":", "_")
+        namespace = _canonical_namespace(resolved_user_id)
         image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
         if image_bytes:
             s3_key = _upload_image_to_s3(

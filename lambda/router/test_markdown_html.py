@@ -6,10 +6,10 @@ import sys
 import unittest
 from unittest.mock import MagicMock
 
-os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/test")
+os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/test")
 os.environ.setdefault("AGENTCORE_QUALIFIER", "test-endpoint")
 os.environ.setdefault("IDENTITY_TABLE_NAME", "openclaw-identity")
-os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-us-west-2")
+os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-eu-west-1")
 
 sys.modules["boto3"] = MagicMock()
 sys.modules["botocore"] = MagicMock()

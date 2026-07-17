@@ -4,9 +4,37 @@
 # Usage: ./scripts/e2e-deploy-and-test.sh [--skip-deploy] [--test-filter PATTERN]
 set -euo pipefail
 
-REGION="ap-southeast-2"
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+REQUIRED_REGION="eu-west-1"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+for region_variable in CDK_DEFAULT_REGION AWS_REGION AWS_DEFAULT_REGION; do
+  configured_region="${!region_variable:-}"
+  if [ -n "$configured_region" ] && [ "$configured_region" != "$REQUIRED_REGION" ]; then
+    echo "ERROR: $region_variable must be exactly $REQUIRED_REGION; got $configured_region." >&2
+    exit 1
+  fi
+done
+REGION="${CDK_DEFAULT_REGION:-}"
+if [ -z "$REGION" ]; then
+  REGION=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('region',''))")
+fi
+if [ -z "$REGION" ]; then
+  REGION="$REQUIRED_REGION"
+fi
+if [ "$REGION" != "$REQUIRED_REGION" ]; then
+  echo "ERROR: AWS region must be exactly $REQUIRED_REGION; got $REGION." >&2
+  exit 1
+fi
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+WORKSPACE_SESSION_ROLE_ARN=$(aws cloudformation describe-stacks \
+  --stack-name OpenClawAgentCore \
+  --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='WorkspaceSessionRoleArn'].OutputValue" \
+  --output text)
+if [[ ! "$WORKSPACE_SESSION_ROLE_ARN" =~ ^arn:aws:iam::${ACCOUNT}:role/openclaw-workspace-session-role-eu-west-1$ ]]; then
+  echo "ERROR: Invalid or missing WorkspaceSessionRoleArn output: $WORKSPACE_SESSION_ROLE_ARN" >&2
+  exit 1
+fi
+export WORKSPACE_SESSION_ROLE_ARN
 SKIP_DEPLOY=false
 TEST_FILTER="${2:-}"
 
