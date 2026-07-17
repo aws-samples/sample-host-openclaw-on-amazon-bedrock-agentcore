@@ -245,8 +245,19 @@ describe("immutable generation commit", () => {
   it("preserves the exact opaque quoted ETag in the next pointer IfMatch", async (t) => {
     const liveDir = makeLiveTree(t);
     const { store, s3 } = storeFixture();
+    let injected = false;
+    s3.before = ({ name, input, s3: fake }) => {
+      if (
+        !injected &&
+        name === "PutObjectCommand" &&
+        input.Key === currentPointerKey("user_A")
+      ) {
+        injected = true;
+        fake.putDirect(input.Key, input.Body, '"opaque/quoted:etag"');
+        throw awsError("PreconditionFailed", 412);
+      }
+    };
     const first = await store.commit({ liveDir, assertWritable: async () => {} });
-    s3.etags.set(currentPointerKey("user_A"), '"opaque/quoted:etag"');
     write(liveDir, "workspace/a.txt", "second");
 
     const second = await store.commit({ liveDir, assertWritable: async () => {} });
@@ -254,7 +265,7 @@ describe("immutable generation commit", () => {
     const pointerPuts = s3.calls.filter(
       ({ name, input }) => name === "PutObjectCommand" && input.Key === currentPointerKey("user_A"),
     );
-    assert.equal(first.etag, '"etag-3"');
+    assert.equal(first.etag, '"opaque/quoted:etag"');
     assert.equal(pointerPuts[1].input.IfMatch, '"opaque/quoted:etag"');
     assert.equal(pointerPuts[1].input.IfNoneMatch, undefined);
     assert.equal(second.parent, G1);
@@ -383,6 +394,44 @@ describe("CAS reconciliation and failure boundaries", () => {
     assert.equal(s3.calls.filter(({ name }) => name === "DeleteObjectCommand").length, 0);
     assert.ok(s3.objects.has(manifestKey("user_A", G1)));
     assert.ok(s3.objects.has(manifestKey("user_A", G2)));
+  });
+
+  it("rejects a stale restored writer instead of rebasing its tree onto a rival commit", async (t) => {
+    const s3 = new FakeS3();
+    const initialTree = makeLiveTree(t, { "workspace/state.txt": "G" });
+    const initial = storeFixture({ s3, uuids: [G1_UUID] }).store;
+    await initial.commit({ liveDir: initialTree, assertWritable: async () => {} });
+
+    const writerA = storeFixture({ s3, uuids: [G2_UUID] }).store;
+    const writerB = storeFixture({ s3, uuids: [G3_UUID] }).store;
+    const seed = makeLiveTree(t, {});
+    const treeA = path.join(temporaryDirectory(t, "workspace-writer-a-"), "live");
+    const treeB = path.join(temporaryDirectory(t, "workspace-writer-b-"), "live");
+    await writerA.restore({ targetDir: treeA, seedDir: seed });
+    await writerB.restore({ targetDir: treeB, seedDir: seed });
+
+    write(treeB, "workspace/state.txt", "B1");
+    const committedB = await writerB.commit({
+      liveDir: treeB,
+      assertWritable: async () => {},
+    });
+    write(treeA, "workspace/state.txt", "A1");
+
+    await assert.rejects(
+      writerA.commit({ liveDir: treeA, assertWritable: async () => {} }),
+      (error) => assertCode(error, WorkspaceConflictError, "WORKSPACE_CONFLICT"),
+    );
+
+    const current = parsePointer(currentBytes(s3));
+    assert.equal(current.generation, committedB.generation);
+    assert.equal(current.parent, G1);
+    const pointerPuts = s3.calls.filter(
+      ({ name, input }) =>
+        name === "PutObjectCommand" &&
+        input.Key === currentPointerKey("user_A"),
+    );
+    assert.equal(pointerPuts.at(-1).input.IfMatch, '"etag-3"');
+    assert.notEqual(current.generation, G2);
   });
 
   it("never writes current when payload, manifest, or writable-lease validation fails", async (t) => {
@@ -686,6 +735,34 @@ describe("restore and logical deletion", () => {
       newUser: true,
     });
     assert.equal(fs.readFileSync(path.join(targetDir, "workspace/welcome.md"), "utf8"), "welcome");
+  });
+
+  it("keeps a restored new user bound to absence and retries current only with IfNoneMatch", async (t) => {
+    const seedDir = makeLiveTree(t, { "workspace/welcome.md": "welcome" });
+    const targetDir = path.join(temporaryDirectory(t, "workspace-new-user-parent-"), "live");
+    const s3 = new FakeS3();
+    const store = storeFixture({ s3, uuids: [G1_UUID] }).store;
+    await store.restore({ targetDir, seedDir });
+
+    const rivalTree = makeLiveTree(t, { "workspace/rival.md": "rival" });
+    const rival = storeFixture({ s3, uuids: [G2_UUID] }).store;
+    await rival.commit({ liveDir: rivalTree, assertWritable: async () => {} });
+    write(targetDir, "workspace/welcome.md", "personalized");
+    await assert.rejects(
+      store.commit({ liveDir: targetDir, assertWritable: async () => {} }),
+      (error) => assertCode(error, WorkspaceConflictError, "WORKSPACE_CONFLICT"),
+    );
+
+    const pointerPut = s3.calls.filter(
+      ({ name, input }) =>
+        name === "PutObjectCommand" &&
+        input.Key === currentPointerKey("user_A"),
+    ).at(-1);
+    assert.equal(pointerPut.input.IfNoneMatch, "*");
+    assert.equal(pointerPut.input.IfMatch, undefined);
+    const current = parsePointer(currentBytes(s3));
+    assert.equal(current.generation, G2);
+    assert.equal(current.parent, null);
   });
 
   it("fails closed on legacy flat state, malformed current, missing payload, and corrupt payload", async (t) => {

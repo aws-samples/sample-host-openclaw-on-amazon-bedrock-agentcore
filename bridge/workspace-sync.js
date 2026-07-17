@@ -234,6 +234,7 @@ class WorkspaceSnapshotStore {
     this.limits = resolveWorkspaceLimits(limits);
     this.quarantined = null;
     this.lastGcError = null;
+    this.expectedHead = undefined;
   }
 
   _assertUsable() {
@@ -980,7 +981,10 @@ class WorkspaceSnapshotStore {
     if (typeof assertWritable !== "function") {
       throw new TypeError("commit requires an injected assertWritable function");
     }
-    const head = await this.loadHead();
+    if (this.expectedHead === undefined) {
+      this.expectedHead = await this.loadHead();
+    }
+    const head = this.expectedHead;
     const capture = await this._captureTree(liveDir);
     const generation = createGeneration(this.uuid);
     const parent = head?.generation || null;
@@ -1005,14 +1009,29 @@ class WorkspaceSnapshotStore {
     );
     await assertWritable();
 
-    const pointerBytes = encodePointer({
+    const pointer = {
       committedAt: this._commitTimestamp(),
       format: POINTER_FORMAT,
       generation,
       manifestSha256,
       parent,
-    });
+    };
+    const pointerBytes = encodePointer(pointer);
     const etag = await this._putCurrent(pointerBytes, head);
+
+    // Only a successful PUT carrying an exact opaque ETag, or a strong readback
+    // of the exact intended pointer bytes, advances this writer's expectation.
+    // A conflicting writer can therefore never be adopted as our new parent.
+    this.expectedHead = Object.freeze({
+      generation,
+      manifestSha256,
+      parent,
+      etag,
+      pointer: Object.freeze(pointer),
+      pointerBytes,
+      manifest: Object.freeze(manifest),
+      manifestBytes,
+    });
 
     // Pointer durability is the commit point. GC cannot invalidate the new
     // generation, so cleanup failures are retained for diagnostics and bucket
@@ -1239,7 +1258,8 @@ class WorkspaceSnapshotStore {
     ) {
       throw new TypeError("restore requires absolute targetDir and seedDir paths");
     }
-    const head = await this.loadHead();
+    const wasBound = this.expectedHead !== undefined;
+    const head = wasBound ? this.expectedHead : await this.loadHead();
     const parentDirectory = path.dirname(targetDir);
     this.fs.mkdirSync(parentDirectory, { recursive: true, mode: 0o700 });
     const stageDir = this.fs.mkdtempSync(
@@ -1257,6 +1277,7 @@ class WorkspaceSnapshotStore {
       this.fs.renameSync(stageDir, targetDir);
       activated = true;
       targetClaim = null;
+      if (!wasBound) this.expectedHead = head;
       if (head === null) {
         return Object.freeze({
           generation: null,
