@@ -234,12 +234,16 @@ class AgentCoreStack(Stack):
             bucket_name=f"openclaw-user-files-{account}-{region}",
             encryption=s3.BucketEncryption.KMS,
             encryption_key=user_files_cmk,
+            bucket_key_enabled=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             removal_policy=RemovalPolicy.RETAIN,
             lifecycle_rules=[
                 s3.LifecycleRule(
-                    id="expire-old-user-files",
-                    expiration=Duration.days(user_files_ttl_days),
+                    id="clean-noncurrent-workspace-versions",
+                    noncurrent_version_expiration=Duration.days(
+                        user_files_ttl_days
+                    ),
+                    abort_incomplete_multipart_upload_after=Duration.days(7),
                 ),
             ],
             enforce_ssl=True,
@@ -295,21 +299,30 @@ class AgentCoreStack(Stack):
         runtime_endpoint_id = str(
             self.node.try_get_context("runtime_endpoint_id") or ""
         )
+        runtime_endpoint_name = str(
+            self.node.try_get_context("runtime_endpoint_name") or ""
+        )
         runtime_arn = str(self.node.try_get_context("runtime_arn") or "")
-        runtime_values = (runtime_id, runtime_endpoint_id, runtime_arn)
+        runtime_values = (
+            runtime_id,
+            runtime_endpoint_id,
+            runtime_endpoint_name,
+            runtime_arn,
+        )
         if not any(runtime_values):
             # Offline/foundation synthesis happens before Starter Toolkit has
             # created a runtime. The dependent Router stack is not deployable
             # until Phase 2 replaces all three placeholders atomically.
             self.runtime_id = "PLACEHOLDER"
             self.runtime_endpoint_id = "PLACEHOLDER"
+            self.runtime_endpoint_name = "PLACEHOLDER"
             self.runtime_arn = "PLACEHOLDER"
             self.runtime_iam_arn = "PLACEHOLDER"
         else:
             if not all(runtime_values):
                 raise ValueError(
-                    "runtime_id, runtime_endpoint_id, and runtime_arn must be "
-                    "set together"
+                    "runtime_id, runtime_endpoint_id, runtime_endpoint_name, "
+                    "and runtime_arn must be set together"
                 )
             runtime_id_pattern = r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
             runtime_arn_pattern = (
@@ -324,6 +337,10 @@ class AgentCoreStack(Stack):
                 raise ValueError(
                     f"runtime_endpoint_id is not canonical: {runtime_endpoint_id}"
                 )
+            if runtime_endpoint_name != "DEFAULT":
+                raise ValueError(
+                    "runtime_endpoint_name must be the exact DEFAULT qualifier"
+                )
             if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
                 raise ValueError(
                     "runtime_arn must be the exact AgentCore ARN returned for "
@@ -331,6 +348,7 @@ class AgentCoreStack(Stack):
                 )
             self.runtime_id = runtime_id
             self.runtime_endpoint_id = runtime_endpoint_id
+            self.runtime_endpoint_name = runtime_endpoint_name
             self.runtime_arn = runtime_arn
             # AgentCore has two distinct ARN namespaces. GetAgentRuntime's
             # agent/<uuid>:<version> ARN is the invocation identity above;

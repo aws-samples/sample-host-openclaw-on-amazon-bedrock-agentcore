@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,6 +45,8 @@ class E2EConfig:
     telegram_chat_id: str
     telegram_user_id: str
     workspace_session_role_arn: str
+    runtime_arn: str
+    runtime_endpoint_name: str
     log_group: str = "/openclaw/lambda/router"
     identity_table: str = "openclaw-identity"
 
@@ -51,6 +54,19 @@ class E2EConfig:
 def load_config() -> E2EConfig:
     """Build config from AWS resources. Raises on missing critical values."""
     region = _resolve_region()
+    cdk_json = Path(__file__).resolve().parents[2] / "cdk.json"
+    context = json.loads(cdk_json.read_text(encoding="utf-8")).get("context", {})
+    runtime_arn = str(context.get("runtime_arn") or "")
+    runtime_endpoint_name = str(context.get("runtime_endpoint_name") or "")
+    if re.fullmatch(
+        r"arn:aws:bedrock-agentcore:eu-west-1:[0-9]{12}:agent/"
+        r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+        r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}:[1-9][0-9]{0,4}",
+        runtime_arn,
+    ) is None:
+        raise RuntimeError("cdk context has no exact deployed runtime ARN")
+    if runtime_endpoint_name != "DEFAULT":
+        raise RuntimeError("cdk context endpoint qualifier must be exactly DEFAULT")
     cf = boto3.client("cloudformation", region_name=region)
     sm = boto3.client("secretsmanager", region_name=region)
 
@@ -103,4 +119,6 @@ def load_config() -> E2EConfig:
         telegram_chat_id=chat_id,
         telegram_user_id=user_id,
         workspace_session_role_arn=workspace_session_role_arn,
+        runtime_arn=runtime_arn,
+        runtime_endpoint_name=runtime_endpoint_name,
     )

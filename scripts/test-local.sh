@@ -35,7 +35,12 @@ run_check "Node.js 24.15 or newer" \
 
 run_check "Python unit tests" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
-  "$PYTHON" -m pytest lambda/router lambda/cron tests/test_product_configuration.py -v
+  "$PYTHON" -m pytest lambda/router lambda/cron \
+  tests/test_product_configuration.py tests/test_verify_agentcore_storage.py -v
+
+run_check "E2E session-control unit tests" \
+  env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
+  "$PYTHON" -m pytest tests/e2e/test_session_control.py -v
 
 run_check "Bridge Node tests (serialized)" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
@@ -45,7 +50,7 @@ run_check "JavaScript syntax" \
   bash -c 'while IFS= read -r file; do node --check "$file" || exit 1; done < <(find bridge -type f -name "*.js" -not -path "*/node_modules/*" | sort)'
 
 run_check "Python syntax" \
-  "$PYTHON" -m compileall -q app.py stacks lambda tests
+  "$PYTHON" -m compileall -q app.py stacks lambda scripts tests
 
 CDK_CONTEXT_JSON="$($PYTHON -c 'import json; print(json.dumps(json.load(open("cdk.json", encoding="utf-8"))["context"]))')"
 SYNTH_OUT="$(mktemp -d "${TMPDIR:-/tmp}/personal-operator-cdk.XXXXXX")"

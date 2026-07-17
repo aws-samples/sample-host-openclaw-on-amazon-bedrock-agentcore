@@ -132,6 +132,7 @@ validate_deployed_runtime() {
 
   RUNTIME_ID=$(read_context runtime_id)
   RUNTIME_ENDPOINT_ID=$(read_context runtime_endpoint_id)
+  RUNTIME_ENDPOINT_NAME=$(read_context runtime_endpoint_name)
   RUNTIME_ARN=$(read_context runtime_arn)
   MODEL_ID=$(read_context default_model_id)
   if [[ ! "$RUNTIME_ID" =~ ^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$ ]]; then
@@ -142,6 +143,7 @@ validate_deployed_runtime() {
     echo "ERROR: cdk.json does not contain a deployed runtime_endpoint_id." >&2
     exit 1
   fi
+  require_equal "runtime endpoint qualifier" "DEFAULT" "$RUNTIME_ENDPOINT_NAME"
   if [[ ! "$RUNTIME_ARN" =~ ^arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT}:agent/[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}$ ]]; then
     echo "ERROR: cdk.json does not contain a canonical deployed runtime_arn." >&2
     exit 1
@@ -195,6 +197,15 @@ validate_deployed_runtime() {
   require_equal "runtime CMK" "$CMK_ARN" "$ACTUAL_CMK_ARN"
   require_equal "runtime endpoint" "$RUNTIME_ENDPOINT_ID" "$ACTUAL_ENDPOINT_ID"
 
+  "$PROJECT_DIR/.venv/bin/python" \
+    "$PROJECT_DIR/scripts/verify-agentcore-storage.py" \
+    --runtime-id "$RUNTIME_ID" \
+    --endpoint-name DEFAULT \
+    --runtime-arn "$RUNTIME_ARN" \
+    --execution-role-arn "$EXECUTION_ROLE_ARN" \
+    --bucket "$USER_FILES_BUCKET" \
+    --kms-key-arn "$CMK_ARN"
+
   # AgentCore invocation and IAM authorization intentionally use different
   # resource grammars. Validate the deployed Router against both so an
   # agent/<uuid>:<version> ARN can never leak into the IAM policy and the
@@ -234,7 +245,7 @@ validate_deployed_runtime() {
   done
   ROUTER_AGENTCORE_RESOURCES=$(printf '%s\n' "$ROUTER_AGENTCORE_RESOURCES" \
     | tr '\t\n' '  ' | awk '{$1=$1; print}')
-  EXPECTED_ROUTER_IAM_RESOURCES="${RUNTIME_IAM_ARN} ${RUNTIME_IAM_ARN}/*"
+  EXPECTED_ROUTER_IAM_RESOURCES="${RUNTIME_IAM_ARN} ${RUNTIME_IAM_ARN}/runtime-endpoint/DEFAULT"
   require_equal \
     "router IAM runtime resources" \
     "$EXPECTED_ROUTER_IAM_RESOURCES" \
@@ -286,15 +297,13 @@ python3 - <<'PY'
 import sys
 sys.path.insert(0, ".")
 from tests.e2e.config import load_config
-from tests.e2e.session import reset_session, _stop_agentcore_session
+from tests.e2e.session import prepare_cold_start
 
 cfg = load_config()
-print("Stopping AgentCore session for E2E user...")
-stopped = _stop_agentcore_session(cfg)
-print(f"  Session stopped: {stopped}")
-print("Resetting session record in DynamoDB (preserving user identity)...")
-reset = reset_session(cfg)
-print(f"  Session reset: {reset}")
+result = prepare_cold_start(cfg)
+print(f"Cold-start gate: {result}")
+if result["hadSession"] and not result["recordDeleted"]:
+    raise RuntimeError("existing E2E session record was not deleted")
 PY
 
 send_telegram "✅ *E2E session reset*\nRunning the current-product gate."

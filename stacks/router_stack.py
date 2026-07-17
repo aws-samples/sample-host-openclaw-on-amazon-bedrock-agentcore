@@ -39,7 +39,7 @@ class RouterStack(Stack):
         *,
         runtime_arn: str,
         runtime_iam_arn: str,
-        runtime_endpoint_id: str,
+        runtime_endpoint_name: str,
         telegram_token_secret_name: str,
         slack_token_secret_name: str,
         feishu_token_secret_name: str,
@@ -58,7 +58,7 @@ class RouterStack(Stack):
                 f"RouterStack must be deployed in {REQUIRED_REGION}; got {region}"
             )
 
-        runtime_values = (runtime_arn, runtime_iam_arn, runtime_endpoint_id)
+        runtime_values = (runtime_arn, runtime_iam_arn, runtime_endpoint_name)
         if runtime_values == ("PLACEHOLDER", "PLACEHOLDER", "PLACEHOLDER"):
             # Foundation/offline synthesis precedes creation of the runtime.
             # Partial placeholders are rejected below so they cannot reach a
@@ -88,8 +88,10 @@ class RouterStack(Stack):
                 raise ValueError(
                     "runtime_iam_arn must be the exact AgentCore IAM runtime resource"
                 )
-            if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
-                raise ValueError("runtime_endpoint_id is not canonical")
+            if runtime_endpoint_name != "DEFAULT":
+                raise ValueError(
+                    "runtime_endpoint_name must be the exact DEFAULT qualifier"
+                )
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
@@ -138,7 +140,7 @@ class RouterStack(Stack):
             memory_size=lambda_memory,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
-                "AGENTCORE_QUALIFIER": runtime_endpoint_id,
+                "AGENTCORE_QUALIFIER": runtime_endpoint_name,
                 "IDENTITY_TABLE_NAME": self.identity_table.table_name,
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
@@ -223,7 +225,7 @@ class RouterStack(Stack):
                 ],
                 resources=[
                     runtime_iam_arn,
-                    f"{runtime_iam_arn}/*",
+                    f"{runtime_iam_arn}/runtime-endpoint/{runtime_endpoint_name}",
                 ],
             )
         )
@@ -311,14 +313,11 @@ class RouterStack(Stack):
                 ),
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
-                    reason="AgentCore InvokeAgentRuntime IAM resource must include "
-                    "runtime-endpoint sub-resource path (runtime/{id}/*). "
-                    "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
+                    reason="Secrets Manager scoped to openclaw/* prefix. DynamoDB "
                     "grant_read_write_data adds index wildcards and KMS wildcards "
                     "for CMK-encrypted table. S3 PutObject scoped to */_uploads/* "
                     "prefix for image uploads.",
                     applies_to=[
-                        f"Resource::{runtime_iam_arn}/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",

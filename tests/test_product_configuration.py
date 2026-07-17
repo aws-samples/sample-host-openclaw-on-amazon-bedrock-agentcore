@@ -48,6 +48,7 @@ def _create_e2e_script_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Pa
                     "default_model_id": "eu.anthropic.claude-sonnet-4-6",
                     "runtime_id": "openclaw_agent-0123456789",
                     "runtime_endpoint_id": "DEFAULT-0123456789",
+                    "runtime_endpoint_name": "DEFAULT",
                     "runtime_arn": (
                         "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
                         "agent/12345678-1234-1234-1234-123456789abc:1"
@@ -92,7 +93,7 @@ case "$args" in
   *"lambda get-function-configuration"*"AGENTCORE_RUNTIME_ARN"*) echo "${E2E_FAKE_ROUTER_RUNTIME_ARN:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:agent/12345678-1234-1234-1234-123456789abc:1}" ;;
   *"lambda get-function-configuration"*"Role"*) echo 'arn:aws:iam::123456789012:role/OpenClawRouter-RouterFnServiceRole-test' ;;
   *"iam list-role-policies"*) echo 'OpenClawRouter-RouterFnServiceRoleDefaultPolicy-test' ;;
-  *"iam get-role-policy"*) printf '%s\n' "${E2E_FAKE_ROUTER_IAM_RESOURCES:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789 arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789/*}" ;;
+  *"iam get-role-policy"*) printf '%s\n' "${E2E_FAKE_ROUTER_IAM_RESOURCES:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789 arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789/runtime-endpoint/DEFAULT}" ;;
   *"describe-repositories"*) echo 'example.invalid/openclaw-bridge' ;;
   *"get-login-password"*) echo 'not-a-password' ;;
   *"get-secret-value"*) echo 'not-a-token' ;;
@@ -149,6 +150,7 @@ def test_cdk_product_defaults_are_frozen() -> None:
     assert context["enable_browser"] is False
     assert context["runtime_id"] == ""
     assert context["runtime_endpoint_id"] == ""
+    assert context["runtime_endpoint_name"] == ""
     assert context["runtime_arn"] == ""
     assert context["image_version"] == "71"
 
@@ -345,6 +347,35 @@ def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
     assert 'REQUIRED_REGION = "eu-west-1"' in app
 
 
+def test_deploy_makes_session_storage_and_exact_version_verification_fatal() -> None:
+    deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+    e2e = (ROOT / "scripts/e2e-deploy-and-test.sh").read_text(encoding="utf-8")
+    local = (ROOT / "scripts/test-local.sh").read_text(encoding="utf-8")
+
+    assert '"filesystemConfigurations": expected' in deploy
+    assert '{"sessionStorage": {"mountPath": "/mnt/workspace"}}' in deploy
+    assert "update_agent_runtime(" in deploy
+    assert "update-agent-runtime-endpoint" in deploy
+    assert "--agent-runtime-version" in deploy
+    assert '"$PROJECT_DIR/scripts/verify-agentcore-storage.py"' in deploy
+    assert '"$PROJECT_DIR/scripts/verify-agentcore-storage.py"' in e2e
+    assert "tests/test_verify_agentcore_storage.py" in local
+    assert "WARNING: Failed to configure session storage" not in deploy
+    assert "skipping session storage config" not in deploy.casefold()
+
+
+def test_workspace_bucket_never_expires_the_authoritative_current_objects() -> None:
+    source = (ROOT / "stacks/agentcore_stack.py").read_text(encoding="utf-8")
+
+    assert "expiration=Duration.days(user_files_ttl_days)" not in source
+    assert re.search(
+        r"noncurrent_version_expiration=Duration\.days\(\s*user_files_ttl_days\s*\)",
+        source,
+    )
+    assert "abort_incomplete_multipart_upload_after=Duration.days(7)" in source
+    assert "bucket_key_enabled=True" in source
+
+
 def test_deploy_runtime_metadata_validator_is_fail_closed() -> None:
     deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
     match = re.search(
@@ -365,6 +396,7 @@ def test_deploy_runtime_metadata_validator_is_fail_closed() -> None:
     valid = {
         "agentRuntimeId": runtime_id,
         "agentRuntimeArn": TEST_RUNTIME_ARN,
+        "agentRuntimeVersion": "1",
         "status": "READY",
         "roleArn": role_arn,
     }
@@ -382,12 +414,14 @@ def test_deploy_runtime_metadata_validator_is_fail_closed() -> None:
 
     completed = run(valid)
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.splitlines() == [runtime_id, TEST_RUNTIME_ARN]
+    assert completed.stdout.splitlines() == [runtime_id, TEST_RUNTIME_ARN, "1"]
 
     invalid_documents = [
         {**valid, "agentRuntimeId": "other_agent-0123456789"},
         {**valid, "agentRuntimeArn": TEST_RUNTIME_ARN.replace(":agent/", ":runtime/")},
         {**valid, "agentRuntimeArn": TEST_RUNTIME_ARN.replace("eu-west-1", "us-east-1")},
+        {**valid, "agentRuntimeVersion": "0"},
+        {**valid, "agentRuntimeVersion": "2"},
         {**valid, "status": "UPDATING"},
         {**valid, "roleArn": role_arn.replace("openclaw-agentcore", "unexpected")},
     ]
@@ -618,6 +652,7 @@ def test_e2e_region_resolver_rejects_explicit_wrong_region_before_clients(monkey
 
 TEST_RUNTIME_ID = "openclaw_agent-0123456789"
 TEST_RUNTIME_ENDPOINT_ID = "DEFAULT-0123456789"
+TEST_RUNTIME_ENDPOINT_NAME = "DEFAULT"
 TEST_RUNTIME_ARN = (
     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
     "agent/12345678-1234-1234-1234-123456789abc:1"
@@ -638,6 +673,7 @@ def _build_agentcore_stack(
     context = {
         "runtime_id": TEST_RUNTIME_ID,
         "runtime_endpoint_id": TEST_RUNTIME_ENDPOINT_ID,
+        "runtime_endpoint_name": TEST_RUNTIME_ENDPOINT_NAME,
         "runtime_arn": TEST_RUNTIME_ARN,
         "user_files_ttl_days": "30",
         "enable_browser": "false",
@@ -673,6 +709,7 @@ def test_agentcore_stack_uses_only_persisted_runtime_arn() -> None:
     assert stack.runtime_arn == TEST_RUNTIME_ARN
     assert stack.runtime_iam_arn == TEST_RUNTIME_IAM_ARN
     assert stack.runtime_endpoint_id == TEST_RUNTIME_ENDPOINT_ID
+    assert stack.runtime_endpoint_name == TEST_RUNTIME_ENDPOINT_NAME
 
 
 def test_agentcore_stack_allows_only_fully_empty_offline_runtime_context() -> None:
@@ -680,6 +717,7 @@ def test_agentcore_stack_allows_only_fully_empty_offline_runtime_context() -> No
         context_overrides={
             "runtime_id": "",
             "runtime_endpoint_id": "",
+            "runtime_endpoint_name": "",
             "runtime_arn": "",
         }
     )
@@ -687,6 +725,7 @@ def test_agentcore_stack_allows_only_fully_empty_offline_runtime_context() -> No
     assert stack.runtime_arn == "PLACEHOLDER"
     assert stack.runtime_iam_arn == "PLACEHOLDER"
     assert stack.runtime_endpoint_id == "PLACEHOLDER"
+    assert stack.runtime_endpoint_name == "PLACEHOLDER"
 
 
 def test_agentcore_stack_rejects_incomplete_or_noncanonical_runtime_context() -> None:
@@ -694,6 +733,7 @@ def test_agentcore_stack_rejects_incomplete_or_noncanonical_runtime_context() ->
         {"runtime_arn": ""},
         {"runtime_id": ""},
         {"runtime_endpoint_id": ""},
+        {"runtime_endpoint_name": ""},
         {
             "runtime_arn": (
                 "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
@@ -712,6 +752,7 @@ def test_agentcore_stack_rejects_incomplete_or_noncanonical_runtime_context() ->
         },
         {"runtime_id": "runtime-test"},
         {"runtime_endpoint_id": "endpoint-test"},
+        {"runtime_endpoint_name": "NOT_DEFAULT"},
     ]
 
     for context_overrides in invalid_contexts:
@@ -729,7 +770,7 @@ def _synth_router_template(
     *,
     runtime_arn: str = TEST_RUNTIME_ARN,
     runtime_iam_arn: str = TEST_RUNTIME_IAM_ARN,
-    runtime_endpoint_id: str = TEST_RUNTIME_ENDPOINT_ID,
+    runtime_endpoint_name: str = TEST_RUNTIME_ENDPOINT_NAME,
 ) -> dict:
     from aws_cdk import App, Environment
     from aws_cdk.assertions import Template
@@ -743,7 +784,7 @@ def _synth_router_template(
         "Router",
         runtime_arn=runtime_arn,
         runtime_iam_arn=runtime_iam_arn,
-        runtime_endpoint_id=runtime_endpoint_id,
+        runtime_endpoint_name=runtime_endpoint_name,
         telegram_token_secret_name="openclaw/channels/telegram",
         slack_token_secret_name="openclaw/channels/slack",
         feishu_token_secret_name="openclaw/channels/feishu",
@@ -787,9 +828,12 @@ def test_router_separates_invocation_arn_from_iam_runtime_resource() -> None:
     assert router["Properties"]["Environment"]["Variables"][
         "AGENTCORE_RUNTIME_ARN"
     ] == TEST_RUNTIME_ARN
+    assert router["Properties"]["Environment"]["Variables"][
+        "AGENTCORE_QUALIFIER"
+    ] == TEST_RUNTIME_ENDPOINT_NAME
     assert invocation["Resource"] == [
         TEST_RUNTIME_IAM_ARN,
-        f"{TEST_RUNTIME_IAM_ARN}/*",
+        f"{TEST_RUNTIME_IAM_ARN}/runtime-endpoint/{TEST_RUNTIME_ENDPOINT_NAME}",
     ]
     assert TEST_RUNTIME_ARN not in invocation["Resource"]
 
@@ -798,7 +842,7 @@ def test_router_accepts_only_matching_grammar_or_all_placeholders() -> None:
     _synth_router_template(
         runtime_arn="PLACEHOLDER",
         runtime_iam_arn="PLACEHOLDER",
-        runtime_endpoint_id="PLACEHOLDER",
+        runtime_endpoint_name="PLACEHOLDER",
     )
     invalid_values = [
         {
@@ -818,7 +862,7 @@ def test_router_accepts_only_matching_grammar_or_all_placeholders() -> None:
             ),
         },
         {"runtime_iam_arn": "PLACEHOLDER"},
-        {"runtime_endpoint_id": "PLACEHOLDER"},
+        {"runtime_endpoint_name": "PLACEHOLDER"},
     ]
     for overrides in invalid_values:
         try:

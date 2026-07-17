@@ -232,6 +232,7 @@ runtime_arn_pattern = re.compile(
 
 actual_runtime_id = runtime.get("agentRuntimeId", "")
 actual_runtime_arn = runtime.get("agentRuntimeArn", "")
+actual_runtime_version = runtime.get("agentRuntimeVersion", "")
 if runtime_id_pattern.fullmatch(candidate_runtime_id) is None:
     fail(f"toolkit returned a noncanonical runtime ID: {candidate_runtime_id}")
 if actual_runtime_id != candidate_runtime_id:
@@ -241,6 +242,10 @@ if actual_runtime_id != candidate_runtime_id:
     )
 if runtime_arn_pattern.fullmatch(actual_runtime_arn) is None:
     fail("GetAgentRuntime returned a noncanonical runtime ARN")
+if re.fullmatch(r"[1-9][0-9]{0,4}", actual_runtime_version) is None:
+    fail("GetAgentRuntime returned a noncanonical runtime version")
+if not actual_runtime_arn.endswith(f":{actual_runtime_version}"):
+    fail("GetAgentRuntime ARN is not bound to its reported version")
 if runtime.get("status") != "READY":
     fail(f"AgentCore runtime is not READY: {runtime.get('status', '<missing>')}")
 if runtime.get("roleArn") != expected_role_arn:
@@ -248,6 +253,7 @@ if runtime.get("roleArn") != expected_role_arn:
 
 print(actual_runtime_id)
 print(actual_runtime_arn)
+print(actual_runtime_version)
 PY
 }
 
@@ -306,6 +312,7 @@ check_arm64_build() {
 phase2_toolkit() {
   echo "=== Phase 2: Starter Toolkit deploy ==="
   cd "$PROJECT_DIR"
+  activate_venv
 
   read_cdk_outputs
 
@@ -362,55 +369,6 @@ phase2_toolkit() {
     --env "WORKSPACE_SESSION_ROLE_ARN=$WORKSPACE_SESSION_ROLE_ARN" \
     --env "CMK_ARN=$CMK_ARN"
 
-  # --- Configure session storage (not supported by agentcore CLI yet) ---
-  echo "--- Configuring session storage ---"
-  # Read runtime ID early for the update-agent-runtime call
-  local _early_runtime_id
-  _early_runtime_id=$(python3 -c "
-import re
-with open('$PROJECT_DIR/.bedrock_agentcore.yaml') as f:
-    text = f.read()
-m = re.search(r'agent_id:\s*(\S+)', text)
-print(m.group(1) if m else '')
-" 2>/dev/null || echo "")
-
-  if [ -n "$_early_runtime_id" ]; then
-    python3 -c "
-import boto3, json, sys
-
-client = boto3.client('bedrock-agentcore-control', region_name='$REGION')
-
-# Get current runtime config to preserve all fields
-rt = client.get_agent_runtime(agentRuntimeId='$_early_runtime_id')
-
-# Check if session storage is already configured
-existing_fs = rt.get('filesystemConfigurations', [])
-has_session_storage = any(
-    'sessionStorage' in fs for fs in existing_fs
-)
-
-if has_session_storage:
-    print('  Session storage already configured — skipping.')
-    sys.exit(0)
-
-# Add session storage config (full replace — must include all fields)
-print('  Adding filesystemConfigurations to runtime...')
-client.update_agent_runtime(
-    agentRuntimeId='$_early_runtime_id',
-    agentRuntimeArtifact=rt['agentRuntimeArtifact'],
-    roleArn=rt['roleArn'],
-    networkConfiguration=rt['networkConfiguration'],
-    environmentVariables=rt.get('environmentVariables', {}),
-    filesystemConfigurations=[
-        {'sessionStorage': {'mountPath': '/mnt/workspace'}}
-    ],
-)
-print('  Session storage configured: /mnt/workspace')
-" 2>&1 || echo "  WARNING: Failed to configure session storage (non-fatal)."
-  else
-    echo "  WARNING: Could not determine runtime ID — skipping session storage config."
-  fi
-
   # Read runtime ID and endpoint ID from toolkit
   echo "--- Reading runtime info ---"
   TOOLKIT_STATUS=$("$AGENTCORE_CLI" status --agent openclaw_agent --verbose 2>&1 || true)
@@ -454,38 +412,124 @@ print(m.group(1) if m else '')
   fi
   echo "  Runtime ID candidate: $RUNTIME_ID"
 
+  # Toolkit deploy is asynchronous; never layer a storage update onto a
+  # runtime that is still creating or updating.
+  wait_for_runtime_ready "$RUNTIME_ID" >/dev/null
+
+  # The toolkit does not yet configure managed session storage. Reissue the
+  # exact runtime configuration with one mount, preserving every supported
+  # optional field. Any read/update error is fatal under set -e.
+  echo "--- Enforcing exact session storage ---"
+  python3 - "$RUNTIME_ID" "$REGION" <<'PY'
+import boto3
+import sys
+
+runtime_id, region = sys.argv[1:]
+client = boto3.client("bedrock-agentcore-control", region_name=region)
+runtime = client.get_agent_runtime(agentRuntimeId=runtime_id)
+expected = [{"sessionStorage": {"mountPath": "/mnt/workspace"}}]
+if runtime.get("filesystemConfigurations") == expected:
+    print("  Exact session storage already configured.")
+    raise SystemExit(0)
+
+required = ("agentRuntimeArtifact", "roleArn", "networkConfiguration")
+missing = [key for key in required if key not in runtime]
+if missing:
+    raise RuntimeError(
+        f"GetAgentRuntime omitted fields required for safe update: {missing}"
+    )
+request = {
+    "agentRuntimeId": runtime_id,
+    "agentRuntimeArtifact": runtime["agentRuntimeArtifact"],
+    "roleArn": runtime["roleArn"],
+    "networkConfiguration": runtime["networkConfiguration"],
+    "filesystemConfigurations": expected,
+}
+for key in (
+    "description",
+    "authorizerConfiguration",
+    "requestHeaderConfiguration",
+    "protocolConfiguration",
+    "lifecycleConfiguration",
+    "metadataConfiguration",
+    "environmentVariables",
+):
+    if runtime.get(key) is not None:
+        request[key] = runtime[key]
+response = client.update_agent_runtime(**request)
+if response.get("status") in {"CREATE_FAILED", "UPDATE_FAILED", "DELETING"}:
+    raise RuntimeError(
+        f"session-storage update entered terminal status {response.get('status')}"
+    )
+print("  Exact session storage update accepted.")
+PY
+
   # GetAgentRuntime is authoritative for runtime identity. The ARN contains an
   # opaque UUID and positive version and must never be synthesized from the ID.
   RUNTIME_METADATA_JSON=$(wait_for_runtime_ready "$RUNTIME_ID")
   VALIDATED_RUNTIME=$(validate_runtime_metadata "$RUNTIME_METADATA_JSON" "$RUNTIME_ID")
   VALIDATED_RUNTIME_ID=$(printf '%s\n' "$VALIDATED_RUNTIME" | sed -n '1p')
   RUNTIME_ARN=$(printf '%s\n' "$VALIDATED_RUNTIME" | sed -n '2p')
-  if [ "$VALIDATED_RUNTIME_ID" != "$RUNTIME_ID" ] || [ -z "$RUNTIME_ARN" ]; then
+  RUNTIME_VERSION=$(printf '%s\n' "$VALIDATED_RUNTIME" | sed -n '3p')
+  if [ "$VALIDATED_RUNTIME_ID" != "$RUNTIME_ID" ] || [ -z "$RUNTIME_ARN" ] || [[ ! "$RUNTIME_VERSION" =~ ^[1-9][0-9]{0,4}$ ]]; then
     echo "ERROR: Validated AgentCore runtime metadata was incomplete." >&2
     exit 1
   fi
   echo "  Runtime ARN: $RUNTIME_ARN"
 
-  # Get endpoint ID
-  ENDPOINT_ID=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
-    --agent-runtime-id "$RUNTIME_ID" \
-    --region "$REGION" \
-    --query "runtimeEndpoints[?name=='DEFAULT'].id | [0]" \
-    --output text)
-  ENDPOINT_STATUS=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
-    --agent-runtime-id "$RUNTIME_ID" \
-    --region "$REGION" \
-    --query "runtimeEndpoints[?id=='${ENDPOINT_ID}'].status | [0]" \
-    --output text)
+  # The storage update can create a new runtime version after toolkit deploy.
+  # Bind DEFAULT to that exact version, then poll the endpoint to READY.
+  ENDPOINT_TARGET=$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
+    --agent-runtime-id "$RUNTIME_ID" --endpoint-name DEFAULT \
+    --region "$REGION" --query targetVersion --output text)
+  if [ "$ENDPOINT_TARGET" != "$RUNTIME_VERSION" ]; then
+    aws bedrock-agentcore-control update-agent-runtime-endpoint \
+      --agent-runtime-id "$RUNTIME_ID" \
+      --endpoint-name DEFAULT \
+      --agent-runtime-version "$RUNTIME_VERSION" \
+      --region "$REGION" >/dev/null
+  fi
+
+  ENDPOINT_METADATA_JSON=""
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    ENDPOINT_METADATA_JSON=$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
+      --agent-runtime-id "$RUNTIME_ID" --endpoint-name DEFAULT \
+      --region "$REGION" --output json)
+    ENDPOINT_STATUS=$(ENDPOINT_METADATA_JSON="$ENDPOINT_METADATA_JSON" python3 -c \
+      'import json, os; print(json.loads(os.environ["ENDPOINT_METADATA_JSON"]).get("status", ""))')
+    case "$ENDPOINT_STATUS" in
+      READY)
+        break
+        ;;
+      CREATE_FAILED|UPDATE_FAILED|DELETING|"")
+        echo "ERROR: AgentCore DEFAULT endpoint entered terminal status ${ENDPOINT_STATUS:-<missing>}." >&2
+        exit 1
+        ;;
+      *)
+        echo "  Waiting for DEFAULT endpoint READY ($ENDPOINT_STATUS, attempt $attempt/60)..."
+        sleep 5
+        ;;
+    esac
+  done
+  if [ "$ENDPOINT_STATUS" != "READY" ]; then
+    echo "ERROR: Timed out waiting for AgentCore DEFAULT endpoint READY." >&2
+    exit 1
+  fi
+  ENDPOINT_ID=$(ENDPOINT_METADATA_JSON="$ENDPOINT_METADATA_JSON" python3 -c \
+    'import json, os; print(json.loads(os.environ["ENDPOINT_METADATA_JSON"]).get("id", ""))')
   if [[ ! "$ENDPOINT_ID" =~ ^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$ ]]; then
     echo "ERROR: AgentCore DEFAULT endpoint ID is missing or noncanonical." >&2
     exit 1
   fi
-  if [ "$ENDPOINT_STATUS" != "READY" ]; then
-    echo "ERROR: AgentCore DEFAULT endpoint is not READY: $ENDPOINT_STATUS." >&2
-    exit 1
-  fi
   echo "  Endpoint ID: $ENDPOINT_ID"
+
+  python3 "$PROJECT_DIR/scripts/verify-agentcore-storage.py" \
+    --runtime-id "$RUNTIME_ID" \
+    --endpoint-name DEFAULT \
+    --runtime-arn "$RUNTIME_ARN" \
+    --execution-role-arn "$EXECUTION_ROLE_ARN" \
+    --bucket "$USER_FILES_BUCKET" \
+    --kms-key-arn "$CMK_ARN"
 
   # Persist the exact API-returned ARN atomically with its ID and endpoint.
   echo "--- Updating cdk.json with runtime info ---"
@@ -495,6 +539,7 @@ with open('$PROJECT_DIR/cdk.json') as f:
     cfg = json.load(f)
 cfg['context']['runtime_id'] = '$RUNTIME_ID'
 cfg['context']['runtime_endpoint_id'] = '$ENDPOINT_ID'
+cfg['context']['runtime_endpoint_name'] = 'DEFAULT'
 cfg['context']['runtime_arn'] = '$RUNTIME_ARN'
 with open('$PROJECT_DIR/cdk.json', 'w') as f:
     json.dump(cfg, f, indent=2)
@@ -514,8 +559,9 @@ phase3_cdk() {
 
   # AgentCoreStack validates that all exact runtime fields are present together.
   RUNTIME_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_id',''))")
+  RUNTIME_ENDPOINT_NAME=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_endpoint_name',''))")
   RUNTIME_ARN=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_arn',''))")
-  if [ -z "$RUNTIME_ID" ] || [ -z "$RUNTIME_ARN" ]; then
+  if [ -z "$RUNTIME_ID" ] || [ "$RUNTIME_ENDPOINT_NAME" != "DEFAULT" ] || [ -z "$RUNTIME_ARN" ]; then
     echo "ERROR: exact runtime identity not set in cdk.json. Run Phase 2 first."
     exit 1
   fi

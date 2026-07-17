@@ -9,12 +9,16 @@ from botocore.exceptions import ClientError
 from .config import E2EConfig
 
 
+class E2ESessionError(RuntimeError):
+    """The E2E gate could not prove or enforce its session state."""
+
+
 def _get_table(cfg: E2EConfig):
     dynamodb = boto3.resource("dynamodb", region_name=cfg.region)
     return dynamodb.Table(cfg.identity_table)
 
 
-def get_user_id(cfg: E2EConfig) -> Optional[str]:
+def get_user_id(cfg: E2EConfig, *, strict: bool = False) -> Optional[str]:
     """Look up the user ID for the E2E Telegram user."""
     table = _get_table(cfg)
     channel_key = f"telegram:{cfg.telegram_user_id}"
@@ -22,28 +26,38 @@ def get_user_id(cfg: E2EConfig) -> Optional[str]:
         resp = table.get_item(Key={"PK": f"CHANNEL#{channel_key}", "SK": "PROFILE"})
         item = resp.get("Item")
         return item["userId"] if item else None
-    except ClientError:
+    except ClientError as error:
+        if strict:
+            raise E2ESessionError("cannot read E2E user identity") from error
         return None
 
 
-def get_session_id(cfg: E2EConfig, user_id: str) -> Optional[str]:
+def get_session_id(
+    cfg: E2EConfig, user_id: str, *, strict: bool = False
+) -> Optional[str]:
     """Get the current session ID for a user."""
     table = _get_table(cfg)
     try:
         resp = table.get_item(Key={"PK": f"USER#{user_id}", "SK": "SESSION"})
         item = resp.get("Item")
         return item["sessionId"] if item else None
-    except ClientError:
+    except ClientError as error:
+        if strict:
+            raise E2ESessionError("cannot read E2E runtime session record") from error
         return None
 
 
-def reset_session(cfg: E2EConfig) -> bool:
+def reset_session(
+    cfg: E2EConfig, *, strict: bool = False, user_id: str | None = None
+) -> bool:
     """Delete the session record for the E2E user, forcing a new session on next message.
 
     Returns True if a session was deleted, False if no session existed.
     """
-    user_id = get_user_id(cfg)
+    user_id = user_id or get_user_id(cfg, strict=strict)
     if not user_id:
+        if strict:
+            raise E2ESessionError("E2E user identity does not exist")
         return False
 
     table = _get_table(cfg)
@@ -53,11 +67,19 @@ def reset_session(cfg: E2EConfig) -> bool:
             ReturnValues="ALL_OLD",
         )
         return "Attributes" in resp
-    except ClientError:
+    except ClientError as error:
+        if strict:
+            raise E2ESessionError("cannot delete E2E runtime session record") from error
         return False
 
 
-def _stop_agentcore_session(cfg: E2EConfig) -> bool:
+def _stop_agentcore_session(
+    cfg: E2EConfig,
+    *,
+    strict: bool = False,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> bool:
     """Stop the AgentCore runtime session for the E2E user.
 
     This terminates the container, ensuring the next message triggers a
@@ -65,40 +87,51 @@ def _stop_agentcore_session(cfg: E2EConfig) -> bool:
 
     Returns True if session was stopped, False if already terminated.
     """
-    user_id = get_user_id(cfg)
+    user_id = user_id or get_user_id(cfg, strict=strict)
     if not user_id:
+        if strict:
+            raise E2ESessionError("E2E user identity does not exist")
         return False
 
-    session_id = get_session_id(cfg, user_id)
+    session_id = session_id or get_session_id(cfg, user_id, strict=strict)
     if not session_id:
         return False
 
     client = boto3.client("bedrock-agentcore", region_name=cfg.region)
 
-    # Resolve the runtime ARN from CloudFormation outputs
-    cf = boto3.client("cloudformation", region_name=cfg.region)
-    try:
-        stacks = cf.describe_stacks(StackName="OpenClawAgentCore")
-        outputs = stacks["Stacks"][0].get("Outputs", [])
-        runtime_arn = next(
-            (o["OutputValue"] for o in outputs if o["OutputKey"] == "RuntimeArn"),
-            None,
-        )
-    except (ClientError, StopIteration, IndexError):
-        return False
-
-    if not runtime_arn:
-        return False
-
     try:
         client.stop_runtime_session(
-            agentRuntimeArn=runtime_arn,
+            agentRuntimeArn=cfg.runtime_arn,
+            qualifier=cfg.runtime_endpoint_name,
             runtimeSessionId=session_id,
         )
         return True
-    except ClientError:
-        # Session already terminated
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code", "")
+        if error_code in {"ResourceNotFoundException", "ResourceNotFound"}:
+            return False
+        if strict:
+            raise E2ESessionError("cannot stop the existing AgentCore session") from error
         return False
+
+
+def prepare_cold_start(cfg: E2EConfig) -> dict[str, bool]:
+    """Fail closed while making the next invocation use a fresh runtime session."""
+
+    user_id = get_user_id(cfg, strict=True)
+    if not user_id:
+        raise E2ESessionError("E2E user identity does not exist")
+    session_id = get_session_id(cfg, user_id, strict=True)
+    if not session_id:
+        return {"hadSession": False, "stopped": False, "recordDeleted": False}
+    stopped = _stop_agentcore_session(
+        cfg,
+        strict=True,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    deleted = reset_session(cfg, strict=True, user_id=user_id)
+    return {"hadSession": True, "stopped": stopped, "recordDeleted": deleted}
 
 
 def reset_user(cfg: E2EConfig) -> int:
@@ -136,26 +169,6 @@ def get_agent_status(cfg: E2EConfig) -> Optional[dict]:
     if not session_id:
         return None
 
-    # Resolve runtime ARN and qualifier from CloudFormation
-    cf = boto3.client("cloudformation", region_name=cfg.region)
-    try:
-        stacks = cf.describe_stacks(StackName="OpenClawAgentCore")
-        outputs = stacks["Stacks"][0].get("Outputs", [])
-        runtime_arn = next(
-            (o["OutputValue"] for o in outputs if o["OutputKey"] == "RuntimeArn"),
-            None,
-        )
-        qualifier = next(
-            (o["OutputValue"] for o in outputs
-             if o["OutputKey"] == "RuntimeEndpointArn"),
-            None,
-        )
-    except (ClientError, StopIteration, IndexError):
-        return None
-
-    if not runtime_arn:
-        return None
-
     client = boto3.client("bedrock-agentcore", region_name=cfg.region)
     payload = json.dumps(
         {
@@ -167,8 +180,8 @@ def get_agent_status(cfg: E2EConfig) -> Optional[dict]:
 
     try:
         resp = client.invoke_agent_runtime(
-            agentRuntimeArn=runtime_arn,
-            qualifier=qualifier or "",
+            agentRuntimeArn=cfg.runtime_arn,
+            qualifier=cfg.runtime_endpoint_name,
             runtimeSessionId=session_id,
             runtimeUserId=user_id,
             payload=payload,
