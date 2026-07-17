@@ -200,6 +200,90 @@ read_cdk_outputs() {
   echo "  S3 Bucket:      $USER_FILES_BUCKET"
 }
 
+validate_runtime_metadata() {
+  local runtime_metadata_json="$1"
+  local candidate_runtime_id="$2"
+  RUNTIME_METADATA_JSON="$runtime_metadata_json" python3 - \
+    "$ACCOUNT" "$REGION" "$EXECUTION_ROLE_ARN" "$candidate_runtime_id" <<'PY'
+import json
+import os
+import re
+import sys
+
+account, region, expected_role_arn, candidate_runtime_id = sys.argv[1:]
+
+
+def fail(message: str) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+try:
+    runtime = json.loads(os.environ["RUNTIME_METADATA_JSON"])
+except (KeyError, json.JSONDecodeError) as error:
+    fail(f"GetAgentRuntime returned invalid JSON: {error}")
+
+runtime_id_pattern = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}")
+runtime_arn_pattern = re.compile(
+    rf"arn:aws:bedrock-agentcore:{re.escape(region)}:{re.escape(account)}:agent/"
+    r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
+    r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
+)
+
+actual_runtime_id = runtime.get("agentRuntimeId", "")
+actual_runtime_arn = runtime.get("agentRuntimeArn", "")
+if runtime_id_pattern.fullmatch(candidate_runtime_id) is None:
+    fail(f"toolkit returned a noncanonical runtime ID: {candidate_runtime_id}")
+if actual_runtime_id != candidate_runtime_id:
+    fail(
+        "GetAgentRuntime ID does not match the toolkit runtime ID: "
+        f"{actual_runtime_id} != {candidate_runtime_id}"
+    )
+if runtime_arn_pattern.fullmatch(actual_runtime_arn) is None:
+    fail("GetAgentRuntime returned a noncanonical runtime ARN")
+if runtime.get("status") != "READY":
+    fail(f"AgentCore runtime is not READY: {runtime.get('status', '<missing>')}")
+if runtime.get("roleArn") != expected_role_arn:
+    fail("AgentCore runtime execution role does not match the deployed role")
+
+print(actual_runtime_id)
+print(actual_runtime_arn)
+PY
+}
+
+wait_for_runtime_ready() {
+  local runtime_id="$1"
+  local runtime_metadata=""
+  local runtime_status=""
+  local attempt
+
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    runtime_metadata=$(aws bedrock-agentcore-control get-agent-runtime \
+      --agent-runtime-id "$runtime_id" \
+      --region "$REGION" \
+      --output json)
+    runtime_status=$(RUNTIME_METADATA_JSON="$runtime_metadata" python3 -c \
+      'import json, os; print(json.loads(os.environ["RUNTIME_METADATA_JSON"]).get("status", ""))')
+    case "$runtime_status" in
+      READY)
+        printf '%s' "$runtime_metadata"
+        return 0
+        ;;
+      CREATE_FAILED|UPDATE_FAILED|DELETING|"")
+        echo "ERROR: AgentCore runtime entered terminal status ${runtime_status:-<missing>}." >&2
+        return 1
+        ;;
+      *)
+        echo "  Waiting for AgentCore runtime READY ($runtime_status, attempt $attempt/60)..." >&2
+        sleep 5
+        ;;
+    esac
+  done
+
+  echo "ERROR: Timed out waiting for AgentCore runtime READY." >&2
+  return 1
+}
+
 # --- Check ARM64 build capability (for local-build mode) ---
 check_arm64_build() {
   local arch
@@ -364,38 +448,59 @@ print(m.group(1) if m else '')
 " 2>/dev/null || echo "")
   fi
 
-  if [ -z "$RUNTIME_ID" ]; then
-    echo "WARNING: Could not extract runtime_id from toolkit. You may need to set it manually in cdk.json."
-  else
-    echo "  Runtime ID: $RUNTIME_ID"
+  if [[ ! "$RUNTIME_ID" =~ ^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$ ]]; then
+    echo "ERROR: Could not extract a canonical runtime_id from AgentCore Toolkit." >&2
+    exit 1
   fi
+  echo "  Runtime ID candidate: $RUNTIME_ID"
+
+  # GetAgentRuntime is authoritative for runtime identity. The ARN contains an
+  # opaque UUID and positive version and must never be synthesized from the ID.
+  RUNTIME_METADATA_JSON=$(wait_for_runtime_ready "$RUNTIME_ID")
+  VALIDATED_RUNTIME=$(validate_runtime_metadata "$RUNTIME_METADATA_JSON" "$RUNTIME_ID")
+  VALIDATED_RUNTIME_ID=$(printf '%s\n' "$VALIDATED_RUNTIME" | sed -n '1p')
+  RUNTIME_ARN=$(printf '%s\n' "$VALIDATED_RUNTIME" | sed -n '2p')
+  if [ "$VALIDATED_RUNTIME_ID" != "$RUNTIME_ID" ] || [ -z "$RUNTIME_ARN" ]; then
+    echo "ERROR: Validated AgentCore runtime metadata was incomplete." >&2
+    exit 1
+  fi
+  echo "  Runtime ARN: $RUNTIME_ARN"
 
   # Get endpoint ID
-  ENDPOINT_ID=""
-  if [ -n "$RUNTIME_ID" ]; then
-    ENDPOINT_ID=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
-      --agent-runtime-id "$RUNTIME_ID" \
-      --region "$REGION" \
-      --query "runtimeEndpoints[?name=='DEFAULT'].id | [0]" \
-      --output text 2>/dev/null || echo "")
-    echo "  Endpoint ID: $ENDPOINT_ID"
+  ENDPOINT_ID=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
+    --agent-runtime-id "$RUNTIME_ID" \
+    --region "$REGION" \
+    --query "runtimeEndpoints[?name=='DEFAULT'].id | [0]" \
+    --output text)
+  ENDPOINT_STATUS=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
+    --agent-runtime-id "$RUNTIME_ID" \
+    --region "$REGION" \
+    --query "runtimeEndpoints[?id=='${ENDPOINT_ID}'].status | [0]" \
+    --output text)
+  if [[ ! "$ENDPOINT_ID" =~ ^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$ ]]; then
+    echo "ERROR: AgentCore DEFAULT endpoint ID is missing or noncanonical." >&2
+    exit 1
   fi
+  if [ "$ENDPOINT_STATUS" != "READY" ]; then
+    echo "ERROR: AgentCore DEFAULT endpoint is not READY: $ENDPOINT_STATUS." >&2
+    exit 1
+  fi
+  echo "  Endpoint ID: $ENDPOINT_ID"
 
-  # Update cdk.json with runtime info
-  if [ -n "$RUNTIME_ID" ] && [ -n "$ENDPOINT_ID" ]; then
-    echo "--- Updating cdk.json with runtime info ---"
-    python3 -c "
+  # Persist the exact API-returned ARN atomically with its ID and endpoint.
+  echo "--- Updating cdk.json with runtime info ---"
+  python3 -c "
 import json
 with open('$PROJECT_DIR/cdk.json') as f:
     cfg = json.load(f)
 cfg['context']['runtime_id'] = '$RUNTIME_ID'
 cfg['context']['runtime_endpoint_id'] = '$ENDPOINT_ID'
+cfg['context']['runtime_arn'] = '$RUNTIME_ARN'
 with open('$PROJECT_DIR/cdk.json', 'w') as f:
     json.dump(cfg, f, indent=2)
     f.write('\n')
 "
-    echo "  cdk.json updated."
-  fi
+  echo "  cdk.json updated."
 
   echo "  Phase 2 complete."
   echo ""
@@ -407,10 +512,11 @@ phase3_cdk() {
   cd "$PROJECT_DIR"
   activate_venv
 
-  # Verify runtime_id is set
+  # AgentCoreStack validates that all exact runtime fields are present together.
   RUNTIME_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_id',''))")
-  if [ -z "$RUNTIME_ID" ] || [ "$RUNTIME_ID" = "PLACEHOLDER" ]; then
-    echo "ERROR: runtime_id not set in cdk.json. Run Phase 2 first."
+  RUNTIME_ARN=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_arn',''))")
+  if [ -z "$RUNTIME_ID" ] || [ -z "$RUNTIME_ARN" ]; then
+    echo "ERROR: exact runtime identity not set in cdk.json. Run Phase 2 first."
     exit 1
   fi
 

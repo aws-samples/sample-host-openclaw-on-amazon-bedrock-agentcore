@@ -17,6 +17,125 @@ def _json(path: str) -> dict:
     return json.loads((ROOT / path).read_text(encoding="utf-8"))
 
 
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _without_aws_regions() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in ("CDK_DEFAULT_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"):
+        env.pop(name, None)
+    return env
+
+
+def _create_e2e_script_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
+    """Copy the real E2E script into a fake project with inert command shims."""
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    e2e_script = scripts / "e2e-deploy-and-test.sh"
+    e2e_script.write_text(
+        (ROOT / "scripts/e2e-deploy-and-test.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    e2e_script.chmod(0o755)
+    (project / "cdk.json").write_text(
+        json.dumps(
+            {
+                "context": {
+                    "region": "eu-west-1",
+                    "default_model_id": "eu.anthropic.claude-sonnet-4-6",
+                    "runtime_id": "openclaw_agent-0123456789",
+                    "runtime_endpoint_id": "DEFAULT-0123456789",
+                    "runtime_arn": (
+                        "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
+                        "agent/12345678-1234-1234-1234-123456789abc:1"
+                    ),
+                    "image_version": "71",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    call_log = tmp_path / "calls.log"
+    deploy = scripts / "deploy.sh"
+    _write_executable(
+        deploy,
+        '#!/usr/bin/env bash\nprintf "DEPLOY <%s>\\n" "$*" >> "$E2E_CALL_LOG"\n',
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "aws",
+        r'''#!/usr/bin/env bash
+printf 'AWS <%s>\n' "$*" >> "$E2E_CALL_LOG"
+args="$*"
+case "$args" in
+  "sts get-caller-identity"*) echo '123456789012' ;;
+  *"WorkspaceSessionRoleArn"*) echo 'arn:aws:iam::123456789012:role/openclaw-workspace-session-role-eu-west-1' ;;
+  *"ExecutionRoleArn"*) echo 'arn:aws:iam::123456789012:role/openclaw-agentcore-execution-role-eu-west-1' ;;
+  *"UserFilesBucketName"*) echo 'openclaw-user-files-test' ;;
+  *"SecretsCmk"*) echo 'arn:aws:kms:eu-west-1:123456789012:key/test-key' ;;
+  *"get-agent-runtime"*"agentRuntimeArn"*) echo "${E2E_FAKE_RUNTIME_ARN:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:agent/12345678-1234-1234-1234-123456789abc:1}" ;;
+  *"get-agent-runtime"*"agentRuntimeId"*) echo 'openclaw_agent-0123456789' ;;
+  *"get-agent-runtime"*"status"*) echo 'READY' ;;
+  *"get-agent-runtime"*"roleArn"*) echo "${E2E_FAKE_RUNTIME_ROLE:-arn:aws:iam::123456789012:role/openclaw-agentcore-execution-role-eu-west-1}" ;;
+  *"get-agent-runtime"*"WORKSPACE_SESSION_ROLE_ARN"*) echo 'arn:aws:iam::123456789012:role/openclaw-workspace-session-role-eu-west-1' ;;
+  *"get-agent-runtime"*"AWS_REGION"*) echo 'eu-west-1' ;;
+  *"get-agent-runtime"*"BEDROCK_MODEL_ID"*) echo 'eu.anthropic.claude-sonnet-4-6' ;;
+  *"get-agent-runtime"*"S3_USER_FILES_BUCKET"*) echo 'openclaw-user-files-test' ;;
+  *"get-agent-runtime"*"CMK_ARN"*) echo 'arn:aws:kms:eu-west-1:123456789012:key/test-key' ;;
+  *"list-agent-runtime-endpoints"*) echo 'DEFAULT-0123456789' ;;
+  *"lambda get-function-configuration"*"AGENTCORE_RUNTIME_ARN"*) echo "${E2E_FAKE_ROUTER_RUNTIME_ARN:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:agent/12345678-1234-1234-1234-123456789abc:1}" ;;
+  *"lambda get-function-configuration"*"Role"*) echo 'arn:aws:iam::123456789012:role/OpenClawRouter-RouterFnServiceRole-test' ;;
+  *"iam list-role-policies"*) echo 'OpenClawRouter-RouterFnServiceRoleDefaultPolicy-test' ;;
+  *"iam get-role-policy"*) printf '%s\n' "${E2E_FAKE_ROUTER_IAM_RESOURCES:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789 arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789/*}" ;;
+  *"describe-repositories"*) echo 'example.invalid/openclaw-bridge' ;;
+  *"get-login-password"*) echo 'not-a-password' ;;
+  *"get-secret-value"*) echo 'not-a-token' ;;
+  *) echo "unexpected fake aws call: $args" >&2; exit 98 ;;
+esac
+''',
+    )
+    for name in ("cdk", "docker", "curl", "sleep"):
+        _write_executable(
+            fake_bin / name,
+            f'#!/usr/bin/env bash\nprintf "{name.upper()} <%s>\\n" "$*" >> "$E2E_CALL_LOG"\n',
+        )
+
+    venv_bin = project / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "activate").write_text(
+        f'export PATH="{venv_bin}:$PATH"\nhash -r\n', encoding="utf-8"
+    )
+    python_shim = r'''#!/usr/bin/env bash
+printf 'PYTHON' >> "$E2E_CALL_LOG"
+for arg in "$@"; do printf ' <%s>' "$arg" >> "$E2E_CALL_LOG"; done
+printf '\n' >> "$E2E_CALL_LOG"
+case "$*" in
+  *"image_version"*) echo '71' ;;
+  *"json.dumps"*) echo '"notification"' ;;
+  *) cat >/dev/null || true ;;
+esac
+'''
+    _write_executable(venv_bin / "python", python_shim)
+    _write_executable(venv_bin / "python3", python_shim)
+
+    env = _without_aws_regions()
+    env.update(
+        {
+            "E2E_CALL_LOG": str(call_log),
+            "E2E_TELEGRAM_CHAT_ID": "10001",
+            "E2E_TELEGRAM_USER_ID": "10002",
+            "PATH": f"{fake_bin}:{env['PATH']}",
+        }
+    )
+    return e2e_script, env, call_log
+
+
 def test_cdk_product_defaults_are_frozen() -> None:
     context = _json("cdk.json")["context"]
 
@@ -30,6 +149,7 @@ def test_cdk_product_defaults_are_frozen() -> None:
     assert context["enable_browser"] is False
     assert context["runtime_id"] == ""
     assert context["runtime_endpoint_id"] == ""
+    assert context["runtime_arn"] == ""
     assert context["image_version"] == "71"
 
 
@@ -212,13 +332,268 @@ def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
     assert 'REQUIRED_REGION="eu-west-1"' in deploy
     assert 'WORKSPACE_SESSION_ROLE_ARN=$(aws cloudformation describe-stacks' in deploy
     assert '--env "WORKSPACE_SESSION_ROLE_ARN=$WORKSPACE_SESSION_ROLE_ARN"' in deploy
+    assert "get-agent-runtime" in deploy
+    assert "validate_runtime_metadata" in deploy
+    assert "runtime_arn" in deploy
     assert "EVENTBRIDGE_SCHEDULE_GROUP" not in deploy
     assert "CRON_LAMBDA_ARN" not in deploy
     assert "EVENTBRIDGE_ROLE_ARN" not in deploy
     assert 'AWS_TEST_REGION="eu-west-1"' in local
     assert 'REQUIRED_REGION="eu-west-1"' in e2e
     assert 'CronStack(app, "OpenClawCron", env=env)' in app
+    assert "runtime_iam_arn=agentcore_stack.runtime_iam_arn" in app
     assert 'REQUIRED_REGION = "eu-west-1"' in app
+
+
+def test_deploy_runtime_metadata_validator_is_fail_closed() -> None:
+    deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r"validate_runtime_metadata\(\) \{.*?<<'PY'\n"
+        r"(?P<validator>.*?)\nPY\n\}",
+        deploy,
+        flags=re.DOTALL,
+    )
+    assert match is not None, "could not locate embedded runtime metadata validator"
+    validator = match.group("validator")
+    account = "123456789012"
+    region = "eu-west-1"
+    role_arn = (
+        "arn:aws:iam::123456789012:role/"
+        "openclaw-agentcore-execution-role-eu-west-1"
+    )
+    runtime_id = TEST_RUNTIME_ID
+    valid = {
+        "agentRuntimeId": runtime_id,
+        "agentRuntimeArn": TEST_RUNTIME_ARN,
+        "status": "READY",
+        "roleArn": role_arn,
+    }
+
+    def run(document: dict) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["RUNTIME_METADATA_JSON"] = json.dumps(document)
+        return subprocess.run(
+            [sys.executable, "-c", validator, account, region, role_arn, runtime_id],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    completed = run(valid)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [runtime_id, TEST_RUNTIME_ARN]
+
+    invalid_documents = [
+        {**valid, "agentRuntimeId": "other_agent-0123456789"},
+        {**valid, "agentRuntimeArn": TEST_RUNTIME_ARN.replace(":agent/", ":runtime/")},
+        {**valid, "agentRuntimeArn": TEST_RUNTIME_ARN.replace("eu-west-1", "us-east-1")},
+        {**valid, "status": "UPDATING"},
+        {**valid, "roleArn": role_arn.replace("openclaw-agentcore", "unexpected")},
+    ]
+    for invalid in invalid_documents:
+        completed = run(invalid)
+        assert completed.returncode != 0, invalid
+        assert completed.stderr, invalid
+
+
+def test_e2e_non_skip_deploys_canonical_runtime_before_validation(
+    tmp_path: Path,
+) -> None:
+    script, env, call_log = _create_e2e_script_harness(tmp_path)
+
+    completed = subprocess.run(
+        ["bash", str(script), "--test-filter", "TestSmoke"],
+        cwd=script.parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    deploy_index = next(i for i, call in enumerate(calls) if call.startswith("DEPLOY"))
+    workspace_output_index = next(
+        i for i, call in enumerate(calls) if "WorkspaceSessionRoleArn" in call
+    )
+    assert deploy_index < workspace_output_index
+    assert not any(call.startswith(("CDK ", "DOCKER ")) for call in calls)
+    assert any("get-agent-runtime" in call for call in calls)
+    assert any("list-agent-runtime-endpoints" in call for call in calls)
+    assert any("lambda get-function-configuration" in call for call in calls)
+    assert any("iam get-role-policy" in call for call in calls)
+    pytest_call = next(call for call in calls if call.startswith("PYTHON <-m> <pytest>"))
+    assert "not TestSubagent" in pytest_call
+    assert "not TestApiKeyManagement" in pytest_call
+    assert "not TestSkillManagement" in pytest_call
+    assert "TestSmoke" in pytest_call
+
+
+def test_e2e_skip_deploy_validates_existing_runtime(tmp_path: Path) -> None:
+    script, env, call_log = _create_e2e_script_harness(tmp_path)
+
+    completed = subprocess.run(
+        ["bash", str(script), "--skip-deploy"],
+        cwd=script.parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("DEPLOY") for call in calls)
+    assert any("WorkspaceSessionRoleArn" in call for call in calls)
+    assert any("get-agent-runtime" in call for call in calls)
+    assert any("list-agent-runtime-endpoints" in call for call in calls)
+
+
+def test_e2e_skip_deploy_rejects_runtime_configuration_drift(tmp_path: Path) -> None:
+    script, env, call_log = _create_e2e_script_harness(tmp_path)
+    env["E2E_FAKE_RUNTIME_ROLE"] = (
+        "arn:aws:iam::123456789012:role/unexpected-runtime-role"
+    )
+
+    completed = subprocess.run(
+        ["bash", str(script), "--skip-deploy"],
+        cwd=script.parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "runtime execution role mismatch" in completed.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("PYTHON <-m> <pytest>") for call in calls)
+
+
+def test_e2e_skip_deploy_rejects_runtime_arn_drift(tmp_path: Path) -> None:
+    script, env, call_log = _create_e2e_script_harness(tmp_path)
+    env["E2E_FAKE_RUNTIME_ARN"] = (
+        "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
+        "agent/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:2"
+    )
+
+    completed = subprocess.run(
+        ["bash", str(script), "--skip-deploy"],
+        cwd=script.parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "runtime ARN mismatch" in completed.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("PYTHON <-m> <pytest>") for call in calls)
+
+
+def test_e2e_rejects_router_invocation_arn_drift(tmp_path: Path) -> None:
+    script, env, call_log = _create_e2e_script_harness(tmp_path)
+    env["E2E_FAKE_ROUTER_RUNTIME_ARN"] = TEST_RUNTIME_IAM_ARN
+
+    completed = subprocess.run(
+        ["bash", str(script), "--skip-deploy"],
+        cwd=script.parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "router invocation ARN mismatch" in completed.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("PYTHON <-m> <pytest>") for call in calls)
+
+
+def test_e2e_rejects_router_iam_resource_drift(tmp_path: Path) -> None:
+    script, env, call_log = _create_e2e_script_harness(tmp_path)
+    env["E2E_FAKE_ROUTER_IAM_RESOURCES"] = (
+        f"{TEST_RUNTIME_ARN} {TEST_RUNTIME_ARN}/*"
+    )
+
+    completed = subprocess.run(
+        ["bash", str(script), "--skip-deploy"],
+        cwd=script.parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "router IAM runtime resources mismatch" in completed.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("PYTHON <-m> <pytest>") for call in calls)
+
+
+def test_e2e_option_errors_fail_before_aws(tmp_path: Path) -> None:
+    poison_bin = tmp_path / "bin"
+    poison_bin.mkdir()
+    marker = tmp_path / "aws-called"
+    _write_executable(
+        poison_bin / "aws",
+        '#!/usr/bin/env bash\ntouch "$AWS_POISON_MARKER"\nexit 97\n',
+    )
+    env = _without_aws_regions()
+    env.update(
+        {
+            "AWS_POISON_MARKER": str(marker),
+            "PATH": f"{poison_bin}:{env['PATH']}",
+        }
+    )
+
+    for args in (["--unknown"], ["--test-filter"]):
+        marker.unlink(missing_ok=True)
+        completed = subprocess.run(
+            ["bash", str(ROOT / "scripts/e2e-deploy-and-test.sh"), *args],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 2
+        assert "Usage:" in completed.stderr
+        assert not marker.exists(), f"AWS was called for invalid arguments: {args}"
+
+
+def test_e2e_test_filter_remains_one_argument(tmp_path: Path) -> None:
+    script, env, call_log = _create_e2e_script_harness(tmp_path)
+    injected_marker = tmp_path / "injected"
+    requested_filter = f"TestSmoke; touch {injected_marker}"
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--skip-deploy",
+            "--test-filter",
+            requested_filter,
+        ],
+        cwd=script.parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not injected_marker.exists()
+    pytest_call = next(
+        call
+        for call in call_log.read_text(encoding="utf-8").splitlines()
+        if call.startswith("PYTHON <-m> <pytest>")
+    )
+    python_args = re.findall(r"<([^>]*)>", pytest_call)
+    filter_arg = python_args[python_args.index("-k") + 1]
+    assert requested_filter in filter_arg
 
 
 def test_e2e_region_resolver_rejects_explicit_wrong_region_before_clients(monkeypatch) -> None:
@@ -241,20 +616,35 @@ def test_e2e_region_resolver_rejects_explicit_wrong_region_before_clients(monkey
         raise AssertionError("wrong region was accepted")
 
 
-def _synth_agentcore_template(region: str = "eu-west-1") -> dict:
-    from aws_cdk import App, Environment, Stack, aws_ec2 as ec2
-    from aws_cdk.assertions import Template
+TEST_RUNTIME_ID = "openclaw_agent-0123456789"
+TEST_RUNTIME_ENDPOINT_ID = "DEFAULT-0123456789"
+TEST_RUNTIME_ARN = (
+    "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
+    "agent/12345678-1234-1234-1234-123456789abc:1"
+)
+TEST_RUNTIME_IAM_ARN = (
+    "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
+    f"runtime/{TEST_RUNTIME_ID}"
+)
 
+
+def _build_agentcore_stack(
+    region: str = "eu-west-1", context_overrides: dict | None = None
+):
+    from aws_cdk import App, Environment, Stack, aws_ec2 as ec2
     from stacks.agentcore_stack import AgentCoreStack
 
     account = "123456789012"
+    context = {
+        "runtime_id": TEST_RUNTIME_ID,
+        "runtime_endpoint_id": TEST_RUNTIME_ENDPOINT_ID,
+        "runtime_arn": TEST_RUNTIME_ARN,
+        "user_files_ttl_days": "30",
+        "enable_browser": "false",
+    }
+    context.update(context_overrides or {})
     app = App(
-        context={
-            "runtime_id": "runtime-test",
-            "runtime_endpoint_id": "endpoint-test",
-            "user_files_ttl_days": "30",
-            "enable_browser": "false",
-        }
+        context=context
     )
     env = Environment(account=account, region=region)
     network = Stack(app, f"Network{region.replace('-', '')}", env=env)
@@ -267,7 +657,176 @@ def _synth_agentcore_template(region: str = "eu-west-1") -> dict:
         private_subnet_ids=["subnet-00000000000000001"],
         env=env,
     )
+    return stack
+
+
+def _synth_agentcore_template(region: str = "eu-west-1") -> dict:
+    from aws_cdk.assertions import Template
+
+    stack = _build_agentcore_stack(region)
     return Template.from_stack(stack).to_json()
+
+
+def test_agentcore_stack_uses_only_persisted_runtime_arn() -> None:
+    stack = _build_agentcore_stack()
+
+    assert stack.runtime_arn == TEST_RUNTIME_ARN
+    assert stack.runtime_iam_arn == TEST_RUNTIME_IAM_ARN
+    assert stack.runtime_endpoint_id == TEST_RUNTIME_ENDPOINT_ID
+
+
+def test_agentcore_stack_allows_only_fully_empty_offline_runtime_context() -> None:
+    stack = _build_agentcore_stack(
+        context_overrides={
+            "runtime_id": "",
+            "runtime_endpoint_id": "",
+            "runtime_arn": "",
+        }
+    )
+
+    assert stack.runtime_arn == "PLACEHOLDER"
+    assert stack.runtime_iam_arn == "PLACEHOLDER"
+    assert stack.runtime_endpoint_id == "PLACEHOLDER"
+
+
+def test_agentcore_stack_rejects_incomplete_or_noncanonical_runtime_context() -> None:
+    invalid_contexts = [
+        {"runtime_arn": ""},
+        {"runtime_id": ""},
+        {"runtime_endpoint_id": ""},
+        {
+            "runtime_arn": (
+                "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
+                f"runtime/{TEST_RUNTIME_ID}"
+            )
+        },
+        {
+            "runtime_arn": TEST_RUNTIME_ARN.replace(
+                ":eu-west-1:123456789012:", ":us-east-1:123456789012:"
+            )
+        },
+        {
+            "runtime_arn": TEST_RUNTIME_ARN.replace(
+                ":123456789012:", ":999999999999:"
+            )
+        },
+        {"runtime_id": "runtime-test"},
+        {"runtime_endpoint_id": "endpoint-test"},
+    ]
+
+    for context_overrides in invalid_contexts:
+        try:
+            _build_agentcore_stack(context_overrides=context_overrides)
+        except ValueError as error:
+            assert "runtime" in str(error).casefold()
+        else:
+            raise AssertionError(
+                f"AgentCoreStack accepted invalid runtime context: {context_overrides}"
+            )
+
+
+def _synth_router_template(
+    *,
+    runtime_arn: str = TEST_RUNTIME_ARN,
+    runtime_iam_arn: str = TEST_RUNTIME_IAM_ARN,
+    runtime_endpoint_id: str = TEST_RUNTIME_ENDPOINT_ID,
+) -> dict:
+    from aws_cdk import App, Environment
+    from aws_cdk.assertions import Template
+
+    from stacks.router_stack import RouterStack
+
+    account = "123456789012"
+    app = App(context={"registration_open": "false"})
+    stack = RouterStack(
+        app,
+        "Router",
+        runtime_arn=runtime_arn,
+        runtime_iam_arn=runtime_iam_arn,
+        runtime_endpoint_id=runtime_endpoint_id,
+        telegram_token_secret_name="openclaw/channels/telegram",
+        slack_token_secret_name="openclaw/channels/slack",
+        feishu_token_secret_name="openclaw/channels/feishu",
+        webhook_secret_name="openclaw/webhook-secret",
+        cmk_arn=f"arn:aws:kms:eu-west-1:{account}:key/test-key",
+        user_files_bucket_name="openclaw-user-files-test",
+        user_files_bucket_arn=(
+            f"arn:aws:s3:::openclaw-user-files-{account}-eu-west-1"
+        ),
+        env=Environment(account=account, region="eu-west-1"),
+    )
+    return Template.from_stack(stack).to_json()
+
+
+def test_router_separates_invocation_arn_from_iam_runtime_resource() -> None:
+    template = _synth_router_template()
+    resources = template["Resources"].values()
+    router = next(
+        resource
+        for resource in resources
+        if resource["Type"] == "AWS::Lambda::Function"
+        and resource["Properties"].get("FunctionName") == "openclaw-router"
+    )
+    policies = [
+        statement
+        for resource in resources
+        if resource["Type"] == "AWS::IAM::Policy"
+        for statement in resource["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    invocation = next(
+        statement
+        for statement in policies
+        if "bedrock-agentcore:InvokeAgentRuntime"
+        in (
+            statement["Action"]
+            if isinstance(statement["Action"], list)
+            else [statement["Action"]]
+        )
+    )
+
+    assert router["Properties"]["Environment"]["Variables"][
+        "AGENTCORE_RUNTIME_ARN"
+    ] == TEST_RUNTIME_ARN
+    assert invocation["Resource"] == [
+        TEST_RUNTIME_IAM_ARN,
+        f"{TEST_RUNTIME_IAM_ARN}/*",
+    ]
+    assert TEST_RUNTIME_ARN not in invocation["Resource"]
+
+
+def test_router_accepts_only_matching_grammar_or_all_placeholders() -> None:
+    _synth_router_template(
+        runtime_arn="PLACEHOLDER",
+        runtime_iam_arn="PLACEHOLDER",
+        runtime_endpoint_id="PLACEHOLDER",
+    )
+    invalid_values = [
+        {
+            "runtime_arn": TEST_RUNTIME_IAM_ARN,
+            "runtime_iam_arn": TEST_RUNTIME_IAM_ARN,
+        },
+        {
+            "runtime_arn": TEST_RUNTIME_ARN,
+            "runtime_iam_arn": TEST_RUNTIME_ARN,
+        },
+        {
+            "runtime_arn": TEST_RUNTIME_ARN.replace("eu-west-1", "us-east-1"),
+        },
+        {
+            "runtime_iam_arn": TEST_RUNTIME_IAM_ARN.replace(
+                "123456789012", "999999999999"
+            ),
+        },
+        {"runtime_iam_arn": "PLACEHOLDER"},
+        {"runtime_endpoint_id": "PLACEHOLDER"},
+    ]
+    for overrides in invalid_values:
+        try:
+            _synth_router_template(**overrides)
+        except ValueError as error:
+            assert "runtime" in str(error).casefold()
+        else:
+            raise AssertionError(f"RouterStack accepted invalid runtime values: {overrides}")
 
 
 def _role_and_statements(template: dict, role_name: str) -> tuple[dict, list[dict]]:
@@ -549,6 +1108,97 @@ def test_shell_region_guards_fail_before_aws_cli(tmp_path: Path) -> None:
         assert completed.returncode == 1
         assert "must be exactly eu-west-1" in completed.stderr
         assert not marker.exists(), f"{relative_script} called aws before region gate"
+
+
+def test_setup_and_allowlist_scripts_default_to_canonical_region(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    call_log = tmp_path / "aws-calls"
+    _write_executable(
+        fake_bin / "aws",
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$AWS_CALL_LOG"\nexit 97\n',
+    )
+    env = _without_aws_regions()
+    env.update(
+        {
+            "AWS_CALL_LOG": str(call_log),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+        }
+    )
+    invocations = {
+        "scripts/setup-telegram.sh": [],
+        "scripts/setup-slack.sh": [],
+        "scripts/setup-feishu.sh": [],
+        "scripts/manage-allowlist.sh": ["list"],
+    }
+
+    for relative_script, args in invocations.items():
+        call_log.unlink(missing_ok=True)
+        completed = subprocess.run(
+            ["bash", str(ROOT / relative_script), *args],
+            cwd=ROOT,
+            env=env,
+            input="",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 97
+        first_call = call_log.read_text(encoding="utf-8").splitlines()[0]
+        assert "--region eu-west-1" in first_call, relative_script
+        assert "us-west-2" not in first_call, relative_script
+
+
+def test_setup_and_allowlist_reject_wrong_region_before_aws(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "aws-called"
+    _write_executable(
+        fake_bin / "aws",
+        '#!/usr/bin/env bash\ntouch "$AWS_POISON_MARKER"\nexit 97\n',
+    )
+    invocations = {
+        "scripts/setup-telegram.sh": [],
+        "scripts/setup-slack.sh": [],
+        "scripts/setup-feishu.sh": [],
+        "scripts/manage-allowlist.sh": ["list"],
+    }
+
+    for relative_script, args in invocations.items():
+        for region_variable in (
+            "CDK_DEFAULT_REGION",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+        ):
+            marker.unlink(missing_ok=True)
+            env = _without_aws_regions()
+            env.update(
+                {
+                    region_variable: "us-west-2",
+                    "AWS_POISON_MARKER": str(marker),
+                    "PATH": f"{fake_bin}:{env['PATH']}",
+                }
+            )
+            completed = subprocess.run(
+                ["bash", str(ROOT / relative_script), *args],
+                cwd=ROOT,
+                env=env,
+                input="",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert completed.returncode == 1, (
+                relative_script,
+                region_variable,
+                completed.stderr,
+            )
+            assert "must be exactly eu-west-1" in completed.stderr
+            assert not marker.exists(), (
+                f"{relative_script} called aws before rejecting {region_variable}"
+            )
 
 
 def test_unused_cognito_and_gateway_infrastructure_is_absent() -> None:

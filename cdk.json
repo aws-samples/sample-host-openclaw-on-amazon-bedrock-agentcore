@@ -25,6 +25,7 @@
     "enable_browser": false,
     "runtime_id": "",
     "runtime_endpoint_id": "",
+    "runtime_arn": "",
     "cron_lead_time_minutes": 5,
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:stackRelativeExports": true,

@@ -77,6 +77,7 @@ router_stack = RouterStack(
     app,
     "OpenClawRouter",
     runtime_arn=agentcore_stack.runtime_arn,
+    runtime_iam_arn=agentcore_stack.runtime_iam_arn,
     runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
     slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,

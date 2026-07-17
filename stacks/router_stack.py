@@ -7,6 +7,8 @@ is enforced inside the Lambda. Also creates the DynamoDB identity table
 for user resolution and cross-channel binding.
 """
 
+import re
+
 from aws_cdk import (
     CfnOutput,
     Duration,
@@ -36,6 +38,7 @@ class RouterStack(Stack):
         construct_id: str,
         *,
         runtime_arn: str,
+        runtime_iam_arn: str,
         runtime_endpoint_id: str,
         telegram_token_secret_name: str,
         slack_token_secret_name: str,
@@ -54,6 +57,39 @@ class RouterStack(Stack):
             raise ValueError(
                 f"RouterStack must be deployed in {REQUIRED_REGION}; got {region}"
             )
+
+        runtime_values = (runtime_arn, runtime_iam_arn, runtime_endpoint_id)
+        if runtime_values == ("PLACEHOLDER", "PLACEHOLDER", "PLACEHOLDER"):
+            # Foundation/offline synthesis precedes creation of the runtime.
+            # Partial placeholders are rejected below so they cannot reach a
+            # deployable Router template.
+            pass
+        else:
+            if "PLACEHOLDER" in runtime_values:
+                raise ValueError(
+                    "runtime ARN, IAM ARN, and endpoint must be concrete together"
+                )
+            runtime_id_pattern = r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
+            invocation_arn_pattern = (
+                rf"arn:aws:bedrock-agentcore:{re.escape(region)}:"
+                rf"{re.escape(account)}:agent/"
+                r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
+                r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
+            )
+            iam_arn_pattern = (
+                rf"arn:aws:bedrock-agentcore:{re.escape(region)}:"
+                rf"{re.escape(account)}:runtime/{runtime_id_pattern}"
+            )
+            if re.fullmatch(invocation_arn_pattern, runtime_arn) is None:
+                raise ValueError(
+                    "runtime_arn must be the exact AgentCore invocation ARN"
+                )
+            if re.fullmatch(iam_arn_pattern, runtime_iam_arn) is None:
+                raise ValueError(
+                    "runtime_iam_arn must be the exact AgentCore IAM runtime resource"
+                )
+            if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
+                raise ValueError("runtime_endpoint_id is not canonical")
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
@@ -186,8 +222,8 @@ class RouterStack(Stack):
                     "bedrock-agentcore:InvokeAgentRuntimeForUser",
                 ],
                 resources=[
-                    runtime_arn,
-                    f"{runtime_arn}/*",
+                    runtime_iam_arn,
+                    f"{runtime_iam_arn}/*",
                 ],
             )
         )
@@ -282,7 +318,7 @@ class RouterStack(Stack):
                     "for CMK-encrypted table. S3 PutObject scoped to */_uploads/* "
                     "prefix for image uploads.",
                     applies_to=[
-                        f"Resource::{runtime_arn}/*",
+                        f"Resource::{runtime_iam_arn}/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",

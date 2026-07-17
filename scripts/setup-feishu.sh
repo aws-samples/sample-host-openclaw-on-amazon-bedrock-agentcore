@@ -15,12 +15,22 @@
 #   - aws cli configured with appropriate permissions
 #
 # Environment:
-#   CDK_DEFAULT_REGION -- AWS region (default: us-west-2)
+#   CDK_DEFAULT_REGION -- AWS region (must be eu-west-1)
+#   AWS_REGION         -- AWS region (must be eu-west-1)
+#   AWS_DEFAULT_REGION -- AWS region (must be eu-west-1)
 #   AWS_PROFILE        -- AWS CLI profile (optional)
 
 set -euo pipefail
 
-REGION="${CDK_DEFAULT_REGION:-${AWS_REGION:-us-west-2}}"
+REQUIRED_REGION="eu-west-1"
+for region_variable in CDK_DEFAULT_REGION AWS_REGION AWS_DEFAULT_REGION; do
+    configured_region="${!region_variable:-}"
+    if [ -n "$configured_region" ] && [ "$configured_region" != "$REQUIRED_REGION" ]; then
+        echo "ERROR: $region_variable must be exactly $REQUIRED_REGION; got $configured_region." >&2
+        exit 1
+    fi
+done
+REGION="$REQUIRED_REGION"
 TABLE_NAME="${IDENTITY_TABLE_NAME:-openclaw-identity}"
 PROFILE_ARG=""
 if [ -n "${AWS_PROFILE:-}" ]; then

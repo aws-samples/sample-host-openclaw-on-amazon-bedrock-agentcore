@@ -13,6 +13,8 @@ passes the execution role ARN, subnet IDs, and security group ID from
 this stack to the toolkit.
 """
 
+import re
+
 from aws_cdk import (
     Annotations,
     CfnOutput,
@@ -289,10 +291,56 @@ class AgentCoreStack(Stack):
         # Runtime/Endpoint/ECR managed by Starter Toolkit (`agentcore deploy`),
         # not CDK. These are populated by the deploy script after `agentcore deploy`
         # and passed to the dependent Router stack.
-        runtime_id = self.node.try_get_context("runtime_id") or "PLACEHOLDER"
-        runtime_endpoint_id = self.node.try_get_context("runtime_endpoint_id") or "PLACEHOLDER"
-        self.runtime_arn = f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{runtime_id}"
-        self.runtime_endpoint_id = runtime_endpoint_id
+        runtime_id = str(self.node.try_get_context("runtime_id") or "")
+        runtime_endpoint_id = str(
+            self.node.try_get_context("runtime_endpoint_id") or ""
+        )
+        runtime_arn = str(self.node.try_get_context("runtime_arn") or "")
+        runtime_values = (runtime_id, runtime_endpoint_id, runtime_arn)
+        if not any(runtime_values):
+            # Offline/foundation synthesis happens before Starter Toolkit has
+            # created a runtime. The dependent Router stack is not deployable
+            # until Phase 2 replaces all three placeholders atomically.
+            self.runtime_id = "PLACEHOLDER"
+            self.runtime_endpoint_id = "PLACEHOLDER"
+            self.runtime_arn = "PLACEHOLDER"
+            self.runtime_iam_arn = "PLACEHOLDER"
+        else:
+            if not all(runtime_values):
+                raise ValueError(
+                    "runtime_id, runtime_endpoint_id, and runtime_arn must be "
+                    "set together"
+                )
+            runtime_id_pattern = r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
+            runtime_arn_pattern = (
+                rf"arn:aws:bedrock-agentcore:{re.escape(region)}:"
+                rf"{re.escape(account)}:agent/"
+                r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
+                r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
+            )
+            if re.fullmatch(runtime_id_pattern, runtime_id) is None:
+                raise ValueError(f"runtime_id is not canonical: {runtime_id}")
+            if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
+                raise ValueError(
+                    f"runtime_endpoint_id is not canonical: {runtime_endpoint_id}"
+                )
+            if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
+                raise ValueError(
+                    "runtime_arn must be the exact AgentCore ARN returned for "
+                    f"account {account} in {region}"
+                )
+            self.runtime_id = runtime_id
+            self.runtime_endpoint_id = runtime_endpoint_id
+            self.runtime_arn = runtime_arn
+            # AgentCore has two distinct ARN namespaces. GetAgentRuntime's
+            # agent/<uuid>:<version> ARN is the invocation identity above;
+            # IAM authorization uses the documented runtime/<runtime-id>
+            # resource grammar. Derive the latter only after validating the
+            # canonical runtime ID, account, and region.
+            self.runtime_iam_arn = (
+                f"arn:aws:bedrock-agentcore:{region}:{account}:"
+                f"runtime/{runtime_id}"
+            )
 
         # --- AgentCore Browser (optional) -------------------------------------
         enable_browser = str(self.node.try_get_context("enable_browser") or "false").lower() == "true"
