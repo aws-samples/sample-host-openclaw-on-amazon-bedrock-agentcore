@@ -19,6 +19,8 @@
 
 const http = require("http");
 const fs = require("fs");
+const path = require("path");
+const { randomUUID } = require("crypto");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
 const workspaceSync = require("./workspace-sync");
@@ -29,6 +31,10 @@ const runtimePolicy = require("./runtime-policy");
 const gatewayInvocation = require("./gateway-invocation");
 const { SessionBinding } = require("./session-binding");
 const { createInvocationHandler } = require("./invocation-handler");
+const { SqliteSnapshot } = require("./sqlite-snapshot");
+const { WorkspaceLifecycle } = require("./workspace-lifecycle");
+const { WorkspacePathPolicy } = require("./workspace-path-policy");
+const { RefreshingScopedS3 } = require("./workspace-s3-client");
 
 const RUNTIME_REGION = scopedCreds.requireExactRegion(process.env);
 
@@ -36,9 +42,19 @@ const PORT = 8080;
 const PROXY_PORT = 18790;
 const OPENCLAW_PORT = 18789;
 
-// Session storage mount path (set via filesystemConfigurations on Runtime)
 const SESSION_STORAGE_MOUNT = "/mnt/workspace";
-const OPENCLAW_DIR = process.env.HOME ? `${process.env.HOME}/.openclaw` : "/root/.openclaw";
+const WORKSPACE_SEED_DIR = "/opt/personal-operator/seed";
+const OPENCLAW_HOME_LINK = "/root/.openclaw";
+const OPENCLAW_CONFIG_PATH = runtimePolicy.OPENCLAW_CONFIG_PATH;
+const OPENCLAW_STATE_DIR = runtimePolicy.OPENCLAW_STATE_DIR;
+const OPENCLAW_WORKSPACE_DIR = runtimePolicy.OPENCLAW_WORKSPACE_DIR;
+const WORKSPACE_SYNC_INTERVAL_MS = (() => {
+  const value = Number(process.env.WORKSPACE_SYNC_INTERVAL_MS || "300000");
+  if (!Number.isSafeInteger(value) || value < 10_000 || value > 3_600_000) {
+    throw new Error("WORKSPACE_SYNC_INTERVAL_MS must be between 10000 and 3600000");
+  }
+  return value;
+})();
 
 // Ephemeral, microVM-local authentication for the loopback gateway only.
 const GATEWAY_TOKEN = runtimePolicy.createLocalGatewayToken();
@@ -64,6 +80,7 @@ let initPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
+let workspaceLifecycle = null;
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
 
@@ -124,97 +141,6 @@ function hashBoundInvocation({ identity, delivery, request } = {}) {
 }
 
 const runtimeInvocationHandler = createRuntimeInvocationAdmission();
-
-/**
- * Set up symlink from ~/.openclaw to session storage mount.
- * Returns true if session storage is available and symlink was created.
- */
-function setupSessionStorageSymlink() {
-  try {
-    // Check if session storage mount exists (only available during invocation)
-    if (!fs.existsSync(SESSION_STORAGE_MOUNT)) {
-      console.log("[contract] Session storage not available at", SESSION_STORAGE_MOUNT);
-      return false;
-    }
-
-    const mountedDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
-    fs.mkdirSync(mountedDir, { recursive: true });
-
-    // Check existing .openclaw — may be a symlink, directory, or missing
-    let existingType = null;
-    try {
-      const stat = fs.lstatSync(OPENCLAW_DIR);
-      if (stat.isSymbolicLink()) {
-        const target = fs.readlinkSync(OPENCLAW_DIR);
-        if (target === mountedDir) {
-          console.log("[contract] Session storage symlink already in place");
-          return true;
-        }
-        existingType = "symlink";
-        fs.unlinkSync(OPENCLAW_DIR);
-      } else if (stat.isDirectory()) {
-        existingType = "directory";
-        // Copy contents to session storage (cross-device, can't use rename)
-        const { execSync } = require("child_process");
-        execSync(`cp -a ${OPENCLAW_DIR}/. ${mountedDir}/ 2>/dev/null || true`);
-        fs.rmSync(OPENCLAW_DIR, { recursive: true, force: true });
-      } else {
-        existingType = "file";
-        fs.unlinkSync(OPENCLAW_DIR);
-      }
-    } catch {
-      // OPENCLAW_DIR doesn't exist yet — that's fine
-    }
-
-    fs.symlinkSync(mountedDir, OPENCLAW_DIR);
-    console.log(`[contract] Session storage symlink: ${OPENCLAW_DIR} -> ${mountedDir} (was: ${existingType || "missing"})`);
-    return true;
-  } catch (err) {
-    console.warn(`[contract] Session storage setup failed: ${err.message}`);
-    return false;
-  }
-}
-
-/**
- * Clean up stale .lock files in the .openclaw directory (async, non-blocking).
- * Prevents "session file locked" errors after workspace restore from S3.
- */
-async function cleanupLockFiles() {
-  const fs = require("fs");
-  const path = require("path");
-  const homeDir = process.env.HOME || "/root";
-  const openclawDir = path.join(homeDir, ".openclaw");
-
-  try {
-    await fs.promises.access(openclawDir);
-  } catch {
-    return; // Directory doesn't exist yet — nothing to clean
-  }
-
-  async function walkAndClean(dir) {
-    let entries;
-    try {
-      entries = await fs.promises.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    const tasks = [];
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        tasks.push(walkAndClean(fullPath));
-      } else if (entry.name.endsWith(".lock")) {
-        tasks.push(
-          fs.promises.unlink(fullPath).catch(() => {}),
-        );
-      }
-    }
-    await Promise.all(tasks);
-  }
-
-  await walkAndClean(openclawDir);
-  console.log("[contract] Lock file cleanup complete (async)");
-}
 
 /**
  * Check if the proxy health endpoint responds.
@@ -332,27 +258,62 @@ async function waitForPort(port, label, timeoutMs = 300000, intervalMs = 3000) {
  * Write the frozen headless OpenClaw configuration and user-facing capability
  * instructions. Policy construction is pure and covered independently.
  */
+function writeTrustedFileAtomically(targetPath, content) {
+  const directory = path.dirname(targetPath);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(directory, 0o700);
+  const temporaryPath = `${targetPath}.${randomUUID()}.tmp`;
+  const descriptor = fs.openSync(
+    temporaryPath,
+    fs.constants.O_CREAT |
+      fs.constants.O_EXCL |
+      fs.constants.O_WRONLY |
+      (fs.constants.O_NOFOLLOW || 0),
+    0o600,
+  );
+  let completed = false;
+  try {
+    fs.writeFileSync(descriptor, content);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    fs.renameSync(temporaryPath, targetPath);
+    const directoryDescriptor = fs.openSync(directory, fs.constants.O_RDONLY);
+    try {
+      fs.fsyncSync(directoryDescriptor);
+    } finally {
+      fs.closeSync(directoryDescriptor);
+    }
+    completed = true;
+  } finally {
+    if (!completed) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {}
+      try {
+        fs.unlinkSync(temporaryPath);
+      } catch {}
+    }
+  }
+}
+
 function writeOpenClawConfig() {
-  const fs = require("fs");
   const config = runtimePolicy.buildOpenClawConfig({
     gatewayToken: GATEWAY_TOKEN,
     proxyPort: PROXY_PORT,
     gatewayPort: OPENCLAW_PORT,
   });
 
-  const homeDir = process.env.HOME || "/root";
-  fs.mkdirSync(`${homeDir}/.openclaw`, { recursive: true });
-  fs.writeFileSync(
-    `${homeDir}/.openclaw/openclaw.json`,
+  writeTrustedFileAtomically(
+    OPENCLAW_CONFIG_PATH,
     JSON.stringify(config, null, 2),
   );
   console.log("[contract] OpenClaw headless config written");
 
   // Always overwrite restored instructions so stale capability claims cannot
   // widen the model-visible surface.
-  const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
+  const agentsMdPath = `${OPENCLAW_WORKSPACE_DIR}/AGENTS.md`;
   {
-    fs.writeFileSync(
+    writeTrustedFileAtomically(
       agentsMdPath,
       [
         "# Agent Instructions",
@@ -393,7 +354,7 @@ async function pollOpenClawReadiness(namespace) {
   const ready = await waitForPort(OPENCLAW_PORT, "OpenClaw", 300000, 5000);
   if (ready && !gatewayQuarantined) {
     openclawReady = true;
-    workspaceSync.startPeriodicSave(namespace);
+    workspaceLifecycle.startPeriodic(WORKSPACE_SYNC_INTERVAL_MS);
     console.log(
       "[contract] OpenClaw ready — switching from lightweight agent to full OpenClaw",
     );
@@ -469,14 +430,15 @@ function scheduleOpenClawRestart(namespace) {
 /**
  * Initialization — called on first /invocations request.
  *
- * Mints scoped workspace credentials, then starts proxy, OpenClaw, and
- * workspace restore. Only waits for proxy readiness (~5s), then returns.
+ * Mints scoped workspace credentials, restores and verifies the authoritative
+ * workspace, then starts the proxy and OpenClaw. Only waits for proxy
+ * readiness (~5s), then returns.
  * OpenClaw readiness is polled in the background.
  */
-function quarantineForCredentialFailure(error) {
+function quarantineRuntime(error, code = "RUNTIME_INITIALIZATION_FAILED") {
   gatewayQuarantined = Object.freeze({
-    code: "SCOPED_CREDENTIAL_FAILURE",
-    message: "Scoped workspace credentials could not be maintained",
+    code,
+    message: "The trusted runtime boundary could not be maintained",
   });
   openclawReady = false;
   proxyReady = false;
@@ -484,15 +446,66 @@ function quarantineForCredentialFailure(error) {
     clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = null;
   }
-  void workspaceSync.cleanup(null).catch(() => {});
   for (const child of [openclawProcess, proxyProcess]) {
     try {
       child?.kill("SIGTERM");
     } catch {}
   }
-  console.error(`[contract] Fatal scoped credential failure: ${error.message}`);
+  console.error(`[contract] Fatal runtime failure: ${error.message}`);
   const fatalExitTimer = setTimeout(() => process.exit(1), 2_000);
   fatalExitTimer.unref();
+}
+
+function stopChildProcess(child, label, graceMs = 5_000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let killTimer;
+    let failureTimer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      clearTimeout(failureTimer);
+      child.removeListener("exit", onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onExit = () => finish();
+    child.once("exit", onExit);
+    try {
+      child.kill("SIGTERM");
+    } catch (error) {
+      finish(error);
+      return;
+    }
+    killTimer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch (error) {
+        finish(error);
+      }
+    }, graceMs);
+    failureTimer = setTimeout(
+      () => finish(new Error(`${label} did not exit after SIGKILL`)),
+      graceMs + 2_000,
+    );
+  });
+}
+
+async function stopOpenClawForSnapshot() {
+  openclawReady = false;
+  await stopChildProcess(openclawProcess, "OpenClaw");
+  openclawProcess = null;
+}
+
+async function stopSupportProcesses() {
+  proxyReady = false;
+  await stopChildProcess(proxyProcess, "Bedrock proxy");
+  proxyProcess = null;
+  await cwLogger.shutdown();
 }
 
 async function init(internalUserId, namespace) {
@@ -507,7 +520,8 @@ async function init(internalUserId, namespace) {
       credentials,
       SCOPED_CREDS_DIR,
     );
-    workspaceSync.configureCredentials(credentials);
+    const refreshingS3 = new RefreshingScopedS3();
+    refreshingS3.setCredentials(credentials);
 
     const scopedEnvironment = scopedCreds.buildOpenClawEnv({
       credDir: SCOPED_CREDS_DIR,
@@ -521,30 +535,47 @@ async function init(internalUserId, namespace) {
       PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
         credentialFiles.credentialsPath,
     };
-    await agent.configureWorkspaceRuntime({ env: workspaceEnvironment });
-
     currentInternalUserId = internalUserId;
     currentNamespace = namespace;
     await cwLogger.init(`${namespace}-${Date.now()}`);
     console.log(`[contract] Init for internalUserId=${internalUserId}`);
+
+    const snapshotStore = new workspaceSync.WorkspaceSnapshotStore({
+      s3: refreshingS3,
+      bucket: process.env.S3_USER_FILES_BUCKET,
+      namespace,
+      pathPolicy: new WorkspacePathPolicy(),
+      sqliteSnapshot: new SqliteSnapshot(),
+      fs,
+      clock: () => new Date(),
+      uuid: randomUUID,
+    });
+    workspaceLifecycle = new WorkspaceLifecycle({
+      snapshotStore,
+      namespace,
+      seedDir: WORKSPACE_SEED_DIR,
+      mountedDir: SESSION_STORAGE_MOUNT,
+      homeLinkPath: OPENCLAW_HOME_LINK,
+      stopOpenClaw: stopOpenClawForSnapshot,
+      stopSupportProcesses,
+    });
+    await workspaceLifecycle.initialize();
+    await agent.configureWorkspaceRuntime({ env: workspaceEnvironment });
 
     if (credentialRefreshTimer) clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = setInterval(async () => {
       try {
         const refreshed = await scopedCreds.createScopedCredentials(namespace);
         scopedCreds.writeCredentialFiles(refreshed, SCOPED_CREDS_DIR);
-        workspaceSync.configureCredentials(refreshed);
+        refreshingS3.setCredentials(refreshed);
         console.log("[contract] Scoped S3 credentials refreshed");
       } catch (error) {
-        quarantineForCredentialFailure(error);
+        quarantineRuntime(error, "SCOPED_CREDENTIAL_FAILURE");
       }
     }, 45 * 60 * 1000);
+    credentialRefreshTimer.unref?.();
 
-    // 1c. Clean up stale lock files restored from S3 (non-blocking)
-    // Runs in parallel with proxy startup — does not block init.
-    const lockCleanupPromise = cleanupLockFiles().catch((err) => {
-      console.warn(`[contract] Lock cleanup failed: ${err.message}`);
-    });
+    writeOpenClawConfig();
 
     console.log("[contract] Starting Bedrock proxy...");
     const proxyEnv = runtimePolicy.buildProxyChildEnv({
@@ -568,11 +599,6 @@ async function init(internalUserId, namespace) {
       proxyReady = false;
     });
 
-    // Wait for lock cleanup to complete before starting OpenClaw
-    await lockCleanupPromise;
-
-    // Write OpenClaw config and start gateway (non-blocking)
-    writeOpenClawConfig();
     console.log("[contract] Starting OpenClaw gateway (headless)...");
     const openclawEnv = runtimePolicy.buildOpenClawChildEnv({
       scopedEnv: scopedEnvironment,
@@ -610,34 +636,6 @@ async function init(internalUserId, namespace) {
       scheduleOpenClawRestart(currentNamespace);
     });
 
-    // Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available
-    const sessionStorageAvailable = setupSessionStorageSymlink();
-
-    // Restore workspace from S3 if session storage is empty or unavailable
-    if (sessionStorageAvailable) {
-      // Check if session storage .openclaw dir has content (non-empty = resumed session)
-      const mountedOpenclawDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
-      let hasContent = false;
-      try {
-        const entries = fs.readdirSync(mountedOpenclawDir);
-        hasContent = entries.length > 0;
-      } catch { /* dir doesn't exist yet */ }
-
-      if (hasContent) {
-        console.log("[contract] Session storage has existing data — skipping S3 restore");
-      } else {
-        console.log("[contract] Session storage is empty — restoring from S3 backup");
-        workspaceSync.restoreWorkspace(namespace).catch((err) => {
-          console.warn(`[contract] Workspace restore failed: ${err.message}`);
-        });
-      }
-    } else {
-      // No session storage — use S3 sync as primary (existing behavior)
-      workspaceSync.restoreWorkspace(namespace).catch((err) => {
-        console.warn(`[contract] Workspace restore failed: ${err.message}`);
-      });
-    }
-
     // 2. Wait only for proxy readiness (~5s)
     proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
     if (!proxyReady) {
@@ -663,7 +661,7 @@ async function init(internalUserId, namespace) {
   try {
     await initPromise;
   } catch (err) {
-    quarantineForCredentialFailure(err);
+    quarantineRuntime(err);
     initPromise = null;
     throw err;
   } finally {
@@ -897,6 +895,7 @@ const server = http.createServer(async (req, res) => {
             boundInternalUserId: identity.internalUserId,
             openclawReady,
             gatewayQuarantined,
+            workspaceLifecycle: workspaceLifecycle?.status() || null,
             proxyReady,
             openclawExitCode,
             openclawPid: openclawProcess?.pid || null,
@@ -1017,11 +1016,30 @@ const server = http.createServer(async (req, res) => {
                 }
 
                 const bridgeText = buildBridgeText(message);
+                let workspaceTurn;
+                try {
+                  workspaceTurn = workspaceLifecycle.beginTurn();
+                } catch (workspaceError) {
+                  gatewayQuarantined =
+                    workspaceLifecycle?.status().quarantine ||
+                    Object.freeze({
+                      code: workspaceError.code || "WORKSPACE_TURN_REJECTED",
+                      message: "The durable workspace is unavailable",
+                    });
+                  return {
+                    responseText:
+                      "The durable workspace is unavailable, so this request was not run.",
+                    status: "quarantined",
+                    errorCode:
+                      workspaceError.code || "WORKSPACE_TURN_REJECTED",
+                  };
+                }
                 lastActivityTime = Math.floor(Date.now() / 1000);
                 activeTaskCount++;
                 let executionText;
                 let executionStatus;
                 let executionErrorCode;
+                let unexpectedExecutionError;
                 try {
                   if (openclawReady) {
                     try {
@@ -1079,9 +1097,30 @@ const server = http.createServer(async (req, res) => {
                     executionStatus = "failed";
                     executionErrorCode = "RUNTIME_NOT_READY";
                   }
+                } catch (executionError) {
+                  unexpectedExecutionError = executionError;
                 } finally {
                   activeTaskCount = Math.max(0, activeTaskCount - 1);
                 }
+
+                try {
+                  await workspaceLifecycle.commitAfterTurn(workspaceTurn);
+                } catch (workspaceError) {
+                  gatewayQuarantined =
+                    workspaceLifecycle.status().quarantine ||
+                    Object.freeze({
+                      code: "WORKSPACE_PERSISTENCE_FAILED",
+                      message: "Workspace persistence failed",
+                    });
+                  openclawReady = false;
+                  void stopOpenClawForSnapshot().catch((stopError) => {
+                    console.error(
+                      `[contract] OpenClaw quarantine stop failed: ${stopError.message}`,
+                    );
+                  });
+                  throw workspaceError;
+                }
+                if (unexpectedExecutionError) throw unexpectedExecutionError;
 
                 if (executionText) {
                   executionText = extractTextFromContent(executionText);
@@ -1105,8 +1144,13 @@ const server = http.createServer(async (req, res) => {
             responseText =
               invocationErr.code === "INVOCATION_ID_CONFLICT"
                 ? "This request identity was already used for different work and was not executed."
-                : "This request could not be executed safely.";
-            responseStatus = "failed";
+                : invocationErr.code === "WORKSPACE_PERSISTENCE_FAILED"
+                  ? "The request finished, but its state could not be saved durably. Start a fresh runtime before retrying."
+                  : "This request could not be executed safely.";
+            responseStatus =
+              invocationErr.code === "WORKSPACE_PERSISTENCE_FAILED"
+                ? "retryable"
+                : "failed";
             responseErrorCode =
               invocationErr.code || "TRUSTED_INVOCATION_FAILED";
           }
@@ -1147,12 +1191,12 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
-// --- SIGTERM handler: save workspace and exit gracefully ---
+// --- SIGTERM handler: drain, close WAL, snapshot, then stop support ---
 async function shutdownRuntime() {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(
-    "[contract] SIGTERM received — saving workspace and shutting down",
+    "[contract] SIGTERM received — draining and persisting workspace",
   );
 
   // Stop credential refresh timer
@@ -1161,35 +1205,21 @@ async function shutdownRuntime() {
     credentialRefreshTimer = null;
   }
 
-  // Save workspace to S3 (10s max)
-  const saveTimeout = setTimeout(() => {
-    console.warn("[contract] Workspace save timeout — exiting");
-    process.exit(0);
-  }, 10000);
-
+  let exitCode = 0;
   try {
-    await workspaceSync.cleanup(currentNamespace);
+    if (workspaceLifecycle) {
+      await workspaceLifecycle.shutdown();
+    } else {
+      await stopOpenClawForSnapshot();
+      await stopSupportProcesses();
+    }
   } catch (err) {
-    console.warn(`[contract] Workspace cleanup error: ${err.message}`);
+    exitCode = 1;
+    console.error(`[contract] Fatal shutdown error: ${err.message}`);
   }
-
-  clearTimeout(saveTimeout);
-
-  // Kill child processes
-  if (openclawProcess) {
-    try {
-      openclawProcess.kill("SIGTERM");
-    } catch {}
-  }
-  if (proxyProcess) {
-    try {
-      proxyProcess.kill("SIGTERM");
-    } catch {}
-  }
-
-  await cwLogger.shutdown();
-  console.log("[contract] Shutdown complete");
-  process.exit(0);
+  console.log(`[contract] Shutdown complete (exit=${exitCode})`);
+  if (exitCode === 0) process.exit(0);
+  process.exit(1);
 }
 
 function startContractServer() {

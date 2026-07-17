@@ -1,7 +1,15 @@
 #!/bin/bash
 # Start the contract server immediately — AgentCore requires a fast /ping response.
 # The contract server mints scoped workspace credentials during trusted init.
-# Do NOT use set -e — the contract server must start regardless of any pre-flight issues.
+set -euo pipefail
+umask 077
+
+export PATH="/usr/local/bin:/usr/bin:/bin"
+export HOME="/root"
+export NODE_PATH="/app/node_modules"
+export OPENCLAW_CONFIG_PATH="/run/personal-operator/openclaw.json"
+export OPENCLAW_STATE_DIR="/mnt/workspace/live"
+export OPENCLAW_WORKSPACE_DIR="/mnt/workspace/live/workspace"
 
 echo "[openclaw-agentcore] Starting OpenClaw on AgentCore Runtime (per-user session mode)..."
 echo "[openclaw-agentcore] Node: $(node --version 2>&1 || echo 'not found')"

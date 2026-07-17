@@ -203,6 +203,9 @@ describe("OpenClaw child environment", () => {
       PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
         "/tmp/scoped/scoped-creds.json",
       PERSONAL_OPERATOR_WORKSPACE_PREFIX: "user_abcd1234",
+      OPENCLAW_CONFIG_PATH: "/run/personal-operator/openclaw.json",
+      OPENCLAW_STATE_DIR: "/mnt/workspace/live",
+      OPENCLAW_WORKSPACE_DIR: "/mnt/workspace/live/workspace",
       OPENCLAW_SKIP_CRON: "1",
     });
   });
@@ -255,6 +258,37 @@ describe("OpenClaw child environment", () => {
       /NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection -r \/app\/force-ipv4\.js"/,
     );
     assert.doesNotMatch(source, /NODE_OPTIONS:-/);
+  });
+
+  it("pins config outside durable state and exposes only the activated live tree", () => {
+    const childEnv = policyModule.buildOpenClawChildEnv({
+      scopedEnv: {
+        AWS_REGION: "eu-west-1",
+        AWS_DEFAULT_REGION: "eu-west-1",
+        AWS_CONFIG_FILE: "/tmp/scoped/config",
+        AWS_SDK_LOAD_CONFIG: "1",
+        AWS_EC2_METADATA_DISABLED: "true",
+        AWS_SHARED_CREDENTIALS_FILE: "/dev/null",
+        PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
+          "/tmp/scoped/scoped-creds.json",
+        S3_USER_FILES_BUCKET: "user-files",
+        OPENCLAW_CONFIG_PATH: "/tmp/caller-config.json",
+        OPENCLAW_STATE_DIR: "/tmp/caller-state",
+        OPENCLAW_WORKSPACE_DIR: "/tmp/caller-workspace",
+      },
+      workspacePrefix: "user_A",
+    });
+
+    assert.equal(
+      childEnv.OPENCLAW_CONFIG_PATH,
+      "/run/personal-operator/openclaw.json",
+    );
+    assert.equal(childEnv.OPENCLAW_STATE_DIR, "/mnt/workspace/live");
+    assert.equal(
+      childEnv.OPENCLAW_WORKSPACE_DIR,
+      "/mnt/workspace/live/workspace",
+    );
+    assert.equal(childEnv.OPENCLAW_CONFIG_PATH.startsWith(childEnv.OPENCLAW_STATE_DIR), false);
   });
 
   it("generates independent high-entropy local gateway tokens", () => {

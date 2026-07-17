@@ -21,11 +21,12 @@ foundation stage.
 
 ## Current state
 
-The foundation and first runtime-hardening gate are implemented locally. The
-runtime now has a frozen tool and plugin boundary, but session rebinding,
-least-privilege credential policy, and lossless workspace lifecycle remain
-separate hardening gates. Nothing in this repository has been deployed and no
-real credentials or messages were used.
+The foundation and all three runtime-hardening gates are implemented locally.
+The runtime now has a frozen tool boundary, immutable per-user identity,
+S3-only scoped workspace credentials, and a manifest-based lossless workspace
+lifecycle. The final workspace integration is still undergoing exact-commit
+review. Nothing in this repository has been deployed and no real credentials
+or messages were used.
 
 The implementation proceeds in reviewed tasks described by the approved
 [design](docs/superpowers/specs/2026-07-17-personal-operator-v0-design.md) and
@@ -54,10 +55,24 @@ The implementation proceeds in reviewed tasks described by the approved
   marketplace-plugin, and user credential capabilities.
 - The loopback gateway token is generated inside each runtime. Telegram delivery remains outside the runtime, which never fetches a Telegram token or
   calls the Telegram API.
+- A warm runtime binds synchronously to one server-resolved internal user ID.
+  Later mismatched invocations fail before initialization, workspace access,
+  model execution, or mutable counters. The runtime receives only expiring,
+  explicit S3 credentials for that user's exact namespace.
+- S3 is authoritative for durable OpenClaw state. Each save writes immutable
+  content-addressed payloads and a canonical manifest, then advances one
+  compare-and-swap pointer. Deletion is represented by absence from the new
+  manifest, and ambiguous writes quarantine the runtime instead of guessing.
+- Startup verifies the exact writable AgentCore mount, restores into private
+  staging, validates every streamed hash, atomically activates the live tree,
+  and starts OpenClaw only afterward. SQLite state is copied through the pinned
+  database backup helper rather than by copying live database or WAL bytes.
+- Successful turns are held until their durable pointer commit completes.
+  Shutdown drains active work, stops OpenClaw to close SQLite, takes a final
+  verified snapshot, and exits nonzero if persistence cannot be proven.
 
-This is not the complete security boundary. Immutable user binding and the
-exact S3-only session policy are Runtime Hardening Task 2; lossless
-restore/mount/synchronization is Task 3.
+These are pre-production controls. Their local tests and offline synthesis do
+not prove the behavior of a deployed AgentCore runtime, S3 bucket, or IAM role.
 
 ## Frozen runtime baseline
 

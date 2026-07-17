@@ -25,6 +25,7 @@ RUN git init /opt/openclaw && \
     pnpm install --frozen-lockfile && \
     pnpm build && \
     pnpm ui:build && \
+    test -f /opt/openclaw/dist/backup-DE9-5vmG.js && \
     rm -rf /opt/openclaw/.git
 
 # Create app directory
@@ -75,8 +76,11 @@ ENV AWS_REGION=eu-west-1 AWS_DEFAULT_REGION=eu-west-1
 
 WORKDIR /app
 
-# Pre-create OpenClaw workspace directory (avoids mkdir at runtime)
-RUN mkdir -p /root/.openclaw
+# The mounted workspace is restored before either child starts. The first-user
+# seed is image-owned and immutable; generated config remains outside it.
+RUN mkdir -p /opt/personal-operator/seed/workspace /run/personal-operator && \
+    chmod 0700 /run/personal-operator && \
+    chmod -R a-w /opt/personal-operator/seed
 
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
@@ -86,7 +90,12 @@ COPY runtime-policy.js /app/runtime-policy.js
 COPY gateway-invocation.js /app/gateway-invocation.js
 COPY session-binding.js /app/session-binding.js
 COPY invocation-handler.js /app/invocation-handler.js
+COPY workspace-path-policy.js /app/workspace-path-policy.js
+COPY workspace-manifest.js /app/workspace-manifest.js
+COPY sqlite-snapshot.js /app/sqlite-snapshot.js
 COPY workspace-sync.js /app/workspace-sync.js
+COPY workspace-lifecycle.js /app/workspace-lifecycle.js
+COPY workspace-s3-client.js /app/workspace-s3-client.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js

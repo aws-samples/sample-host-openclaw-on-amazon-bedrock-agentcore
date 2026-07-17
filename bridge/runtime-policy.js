@@ -50,6 +50,9 @@ const REQUIRED_SCOPED_ENV = Object.freeze([
   "PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE",
   "S3_USER_FILES_BUCKET",
 ]);
+const OPENCLAW_CONFIG_PATH = "/run/personal-operator/openclaw.json";
+const OPENCLAW_STATE_DIR = "/mnt/workspace/live";
+const OPENCLAW_WORKSPACE_DIR = "/mnt/workspace/live/workspace";
 const PROXY_AMBIENT_CREDENTIAL_ENV_KEYS = Object.freeze([
   "AWS_ACCESS_KEY_ID",
   "AWS_SECRET_ACCESS_KEY",
@@ -146,6 +149,9 @@ function buildOpenClawChildEnv({ scopedEnv = {}, workspacePrefix } = {}) {
   }
   Object.assign(env, FIXED_CHILD_ENV);
   env.PERSONAL_OPERATOR_WORKSPACE_PREFIX = canonicalPrefix;
+  env.OPENCLAW_CONFIG_PATH = OPENCLAW_CONFIG_PATH;
+  env.OPENCLAW_STATE_DIR = OPENCLAW_STATE_DIR;
+  env.OPENCLAW_WORKSPACE_DIR = OPENCLAW_WORKSPACE_DIR;
   env.OPENCLAW_SKIP_CRON = "1";
   return env;
 }
@@ -215,6 +221,9 @@ module.exports = {
   GATEWAY_CLIENT_SCOPES,
   CHILD_ENV_ALLOWLIST,
   PROXY_AMBIENT_CREDENTIAL_ENV_KEYS,
+  OPENCLAW_CONFIG_PATH,
+  OPENCLAW_STATE_DIR,
+  OPENCLAW_WORKSPACE_DIR,
   buildRuntimePolicy,
   buildOpenClawConfig,
   buildOpenClawChildEnv,
