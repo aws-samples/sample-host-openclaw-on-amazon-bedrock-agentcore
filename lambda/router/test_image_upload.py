@@ -23,6 +23,25 @@ import importlib
 index = importlib.import_module("index")
 
 
+class TestRuntimeInvocationIdentity(unittest.TestCase):
+    def test_is_stable_for_retry_and_domain_separated(self):
+        first = index._build_runtime_invocation_id("telegram", 1001, "user-a")
+        retry = index._build_runtime_invocation_id("telegram", 1001, "user-a")
+        different_event = index._build_runtime_invocation_id("telegram", 1002, "user-a")
+        different_user = index._build_runtime_invocation_id("telegram", 1001, "user-b")
+        different_channel = index._build_runtime_invocation_id("slack", 1001, "user-a")
+
+        self.assertEqual(first, retry)
+        self.assertRegex(first, r"^po1_[0-9a-f]{64}$")
+        self.assertEqual(
+            len({first, different_event, different_user, different_channel}), 4
+        )
+
+    def test_rejects_missing_immutable_event_identity(self):
+        with self.assertRaises(ValueError):
+            index._build_runtime_invocation_id("telegram", None, "user-a")
+
+
 class TestUploadImageToS3(unittest.TestCase):
     """Tests for _upload_image_to_s3."""
 
@@ -241,6 +260,7 @@ class TestHandleTelegramWithImages(unittest.TestCase):
                            mock_send, mock_typing, mock_resolve, mock_session, mock_invoke):
         """Photo message triggers image download, upload, and structured message."""
         body = json.dumps({
+            "update_id": 1001,
             "message": {
                 "chat": {"id": 123},
                 "from": {"id": 456, "first_name": "Test"},
@@ -259,6 +279,10 @@ class TestHandleTelegramWithImages(unittest.TestCase):
         self.assertIsInstance(msg, dict)
         self.assertEqual(msg["text"], "What's this?")
         self.assertEqual(len(msg["images"]), 1)
+        self.assertEqual(
+            call_args[0][5],
+            index._build_runtime_invocation_id("telegram", 1001, "user_test123"),
+        )
 
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Hello!"})
     @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012345678")
@@ -270,6 +294,7 @@ class TestHandleTelegramWithImages(unittest.TestCase):
                                         mock_resolve, mock_session, mock_invoke):
         """Text-only messages still work as plain strings."""
         body = json.dumps({
+            "update_id": 1002,
             "message": {
                 "chat": {"id": 123},
                 "from": {"id": 456, "first_name": "Test"},

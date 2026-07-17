@@ -50,6 +50,7 @@ function resolveModelProofUrl(config) {
 
 function createModelProofServer(modelUrl, capture) {
   const responseText = "MODEL_RECEIVED_LITERAL_SLASH_STATUS";
+  const abortProofInput = "hold for exact abort proof";
   const server = http.createServer((request, response) => {
     let body = "";
     request.setEncoding("utf8");
@@ -64,6 +65,36 @@ function createModelProofServer(modelUrl, capture) {
           .find((message) => message?.role === "user");
         capture.userTexts.push(extractText(userText?.content));
         capture.requestCount += 1;
+
+        if (capture.userTexts.at(-1) === abortProofInput) {
+          response.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          response.write(
+            `data: ${JSON.stringify({
+              id: "chatcmpl-abort-proof",
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: payload.model || "bedrock-agentcore",
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    role: "assistant",
+                    content: "UNCOMMITTED_ABORT_PROOF_DELTA",
+                  },
+                  finish_reason: null,
+                },
+              ],
+            })}\n\n`,
+          );
+          response.on("close", () => {
+            capture.abortProofProviderClosed = true;
+          });
+          return;
+        }
 
         if (payload.stream === true) {
           response.writeHead(200, {
@@ -137,7 +168,11 @@ function createModelProofServer(modelUrl, capture) {
 async function main() {
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const modelUrl = resolveModelProofUrl(config);
-  const capture = { requestCount: 0, userTexts: [] };
+  const capture = {
+    requestCount: 0,
+    userTexts: [],
+    abortProofProviderClosed: false,
+  };
   const modelServer = await createModelProofServer(modelUrl, capture);
   const before = digest();
   const connectId = randomUUID();
@@ -155,6 +190,7 @@ async function main() {
     { input: "/reset", outcome: "reject" },
     { input: "/config set commands.text true", outcome: "model" },
     { input: "/po_file_read notes.md", outcome: "model" },
+    { input: "hold for exact abort proof", outcome: "abort" },
   ].map((testCase) => {
     const id = testCase.id || randomUUID();
     return {
@@ -170,6 +206,8 @@ async function main() {
   let connectedScopes = null;
   let mutationResponse = null;
   let activeCase = null;
+  let abortResponse = null;
+  let abortWaitResponse = null;
   const results = [];
   let finished = false;
 
@@ -182,6 +220,31 @@ async function main() {
     activeCase.providerRequestCountBefore = capture.requestCount;
     activeCase.configSha256Before = digest();
     socket.send(JSON.stringify(activeCase.request));
+  };
+
+  const sendAbortWhenProviderStarted = (testCase, attempts = 0) => {
+    if (finished || activeCase !== testCase || testCase.abortRequestId) return;
+    const providerStarted = capture.userTexts.some(
+      (text) =>
+        text === testCase.input || text.endsWith(`] ${testCase.input}`),
+    );
+    if (!providerStarted) {
+      if (attempts >= 100) {
+        finish(new Error("abort proof provider request did not start"));
+        return;
+      }
+      setTimeout(() => sendAbortWhenProviderStarted(testCase, attempts + 1), 20);
+      return;
+    }
+    testCase.abortRequestId = randomUUID();
+    socket.send(
+      JSON.stringify(
+        gatewayInvocation.buildAgentAbortRequest({
+          id: testCase.abortRequestId,
+          runId: testCase.id,
+        }),
+      ),
+    );
   };
 
   const finish = (error) => {
@@ -206,6 +269,7 @@ async function main() {
     const rejectedResults = results.filter(
       (result) => result.outcome === "reject",
     );
+    const abortResult = results.find((result) => result.outcome === "abort");
     const modelInputs = [
       "/status",
       "/config set commands.text true",
@@ -245,6 +309,13 @@ async function main() {
       capture.userTexts.filter(
         (text) => text === "/status" || text.endsWith("] /status"),
       ).length === 1;
+    const exactRunAbortConfirmed =
+      abortResult?.accepted === true &&
+      abortResult?.abortAccepted === true &&
+      abortResult?.abortedRunIds?.includes(abortResult.id) &&
+      ["error", "timeout"].includes(abortResult?.waitStatus) &&
+      abortResult?.waitStopReason === "rpc" &&
+      abortResult?.providerRequestDelta === 1;
     const unchanged = before === after;
     const report = {
       requestedScopes: connectRequest.params.scopes,
@@ -261,6 +332,10 @@ async function main() {
       controlsRejected,
       sessionContinuous,
       duplicateIdempotencySingleProvider,
+      exactRunAbortConfirmed,
+      abortResponse,
+      abortWaitResponse,
+      abortProofProviderClosed: capture.abortProofProviderClosed,
       modelRequestCount: capture.requestCount,
       modelUserTexts: capture.userTexts,
       modelSawLiteralInputs,
@@ -276,6 +351,7 @@ async function main() {
       !controlsRejected ||
       !sessionContinuous ||
       !duplicateIdempotencySingleProvider ||
+      !exactRunAbortConfirmed ||
       !modelSawLiteralInputs
     ) {
       process.exitCode = 1;
@@ -331,6 +407,69 @@ async function main() {
 
       if (
         message.type === "res" &&
+        activeCase?.outcome === "abort" &&
+        message.id === activeCase.abortRequestId
+      ) {
+        abortResponse = message;
+        if (!message.ok) {
+          finish(
+            new Error(
+              `exact-run abort rejected: ${JSON.stringify(message.error)}`,
+            ),
+          );
+          return;
+        }
+        activeCase.abortAccepted =
+          message.payload?.aborted === true &&
+          Array.isArray(message.payload?.runIds) &&
+          message.payload.runIds.includes(activeCase.id);
+        activeCase.abortedRunIds = message.payload?.runIds || [];
+        activeCase.waitRequestId = randomUUID();
+        socket.send(
+          JSON.stringify({
+            type: "req",
+            id: activeCase.waitRequestId,
+            method: "agent.wait",
+            params: { runId: activeCase.id, timeoutMs: 5_000 },
+          }),
+        );
+        return;
+      }
+
+      if (
+        message.type === "res" &&
+        activeCase?.outcome === "abort" &&
+        message.id === activeCase.waitRequestId
+      ) {
+        abortWaitResponse = message;
+        if (!message.ok) {
+          finish(
+            new Error(
+              `aborted-run reconciliation rejected: ${JSON.stringify(message.error)}`,
+            ),
+          );
+          return;
+        }
+        results.push({
+          id: activeCase.id,
+          input: activeCase.input,
+          outcome: activeCase.outcome,
+          accepted: activeCase.accepted === true,
+          abortAccepted: activeCase.abortAccepted === true,
+          abortedRunIds: activeCase.abortedRunIds,
+          waitStatus: message.payload?.status,
+          waitStopReason: message.payload?.stopReason,
+          providerRequestDelta:
+            capture.requestCount - activeCase.providerRequestCountBefore,
+          configUnchangedDuring:
+            digest() === activeCase.configSha256Before,
+        });
+        sendNextCase();
+        return;
+      }
+
+      if (
+        message.type === "res" &&
         activeCase &&
         message.id === activeCase.id
       ) {
@@ -370,6 +509,13 @@ async function main() {
           "pending"
         ) {
           activeCase.accepted = true;
+          if (activeCase.outcome === "abort") {
+            sendAbortWhenProviderStarted(activeCase);
+          }
+          return;
+        }
+        if (activeCase.outcome === "abort") {
+          activeCase.observedTerminalBeforeAbort = message.payload?.status;
           return;
         }
         const text = gatewayInvocation.extractAgentResponseText(message.payload);

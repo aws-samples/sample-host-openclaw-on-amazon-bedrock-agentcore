@@ -62,6 +62,7 @@ let currentNamespace = null;
 let openclawProcess = null;
 let proxyProcess = null;
 let openclawReady = false;
+let gatewayQuarantined = null;
 let proxyReady = false;
 let secretsReady = false;
 let initInProgress = false;
@@ -79,6 +80,16 @@ const OPENCLAW_LOG_LIMIT = 50;
 let openclawLogs = [];
 let openclawExitCode = null;
 let lastOpenClawEnv = null;
+
+const gatewayRuntimeBoundary = gatewayInvocation.createGatewayRuntimeBoundary({
+  getGatewayProcess: () => openclawProcess,
+  terminateGraceMs: 2_000,
+});
+const trustedInvocationRegistry =
+  gatewayInvocation.createTrustedInvocationRegistry({
+    ttlMs: 60 * 60 * 1_000,
+    maxSettledEntries: 1_000,
+  });
 
 // OpenClaw auto-restart on crash
 let openclawRestartCount = 0;
@@ -401,7 +412,7 @@ function writeOpenClawConfig() {
  */
 async function pollOpenClawReadiness(namespace) {
   const ready = await waitForPort(OPENCLAW_PORT, "OpenClaw", 300000, 5000);
-  if (ready) {
+  if (ready && !gatewayQuarantined) {
     openclawReady = true;
     workspaceSync.startPeriodicSave(namespace);
     console.log(
@@ -420,7 +431,7 @@ async function pollOpenClawReadiness(namespace) {
  * Does not restart during shutdown or if OpenClaw recovered on its own.
  */
 function scheduleOpenClawRestart(namespace) {
-  if (shuttingDown) return;
+  if (shuttingDown || gatewayQuarantined) return;
   if (openclawRestartCount >= OPENCLAW_MAX_RESTARTS) {
     console.error(
       `[contract] OpenClaw crashed ${openclawRestartCount} times — giving up, lightweight agent will handle messages`,
@@ -433,7 +444,7 @@ function scheduleOpenClawRestart(namespace) {
     `[contract] Scheduling OpenClaw restart #${openclawRestartCount} in ${delay}ms...`,
   );
   setTimeout(() => {
-    if (shuttingDown || openclawReady) return;
+    if (shuttingDown || openclawReady || gatewayQuarantined) return;
     console.log(
       `[contract] Restarting OpenClaw (attempt #${openclawRestartCount})...`,
     );
@@ -806,13 +817,13 @@ async function processMessageQueue() {
   processingMessage = true;
 
   while (messageQueue.length > 0) {
-    const { message, onDelta, resolve, reject } = messageQueue.shift();
+    const { message, runId, onDelta, resolve, reject } = messageQueue.shift();
     console.log(
       `[contract] Processing queued message (${messageQueue.length} remaining)`,
     );
 
     try {
-      const response = await bridgeMessage(message, 620000, onDelta);
+      const response = await bridgeMessage(message, 620000, onDelta, runId);
       resolve(response);
     } catch (err) {
       reject(err);
@@ -827,9 +838,9 @@ async function processMessageQueue() {
  * @param {string} message - The message to send
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-function enqueueMessage(message, onDelta) {
+function enqueueMessage(message, runId, onDelta) {
   return new Promise((resolve, reject) => {
-    messageQueue.push({ message, onDelta, resolve, reject });
+    messageQueue.push({ message, runId, onDelta, resolve, reject });
     console.log(
       `[contract] Message enqueued (queue length: ${messageQueue.length})`,
     );
@@ -845,216 +856,18 @@ function enqueueMessage(message, onDelta) {
  * @param {number} timeoutMs - Timeout in milliseconds
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
-  const { randomUUID } = require("crypto");
-  return new Promise((resolve) => {
-    const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
-    console.log(`[contract] Connecting to WebSocket: ${wsUrl}`);
-    const ws = gatewayInvocation.createGatewaySocket(WebSocket, wsUrl);
-    let responseText = "";
-    let authenticated = false;
-    let agentSent = false;
-    let resolved = false;
-    let connectReqId = null;
-    let agentReqId = null;
-    let unhandledMsgs = [];
-
-    const done = (text) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      try {
-        ws.close();
-      } catch {}
-      resolve(text);
-    };
-
-    const timer = setTimeout(() => {
-      const debugInfo =
-        unhandledMsgs.length > 0
-          ? ` unhandled=[${unhandledMsgs.slice(0, 5).join(" | ")}]`
-          : "";
-      console.warn(
-        `[contract] WebSocket timeout after ${timeoutMs}ms (auth=${authenticated}, agentSent=${agentSent}, responseLen=${responseText.length})${debugInfo}`,
-      );
-      // Return "" on timeout so caller can fall back to lightweight agent
-      done(responseText || "");
-    }, timeoutMs);
-
-    ws.on("open", () => {
-      console.log("[contract] WebSocket connected, waiting for challenge...");
-    });
-
-    ws.on("message", (data) => {
-      const raw = data.toString();
-      console.log(`[contract] WS rx: ${raw.slice(0, 500)}`);
-      let msg;
-      try {
-        msg = JSON.parse(raw);
-      } catch (e) {
-        console.log(`[contract] WS parse error: ${e.message}`);
-        return;
-      }
-
-      // Step 1: Server sends connect.challenge event -> client sends connect request
-      if (msg.type === "event" && msg.event === "connect.challenge") {
-        console.log(
-          "[contract] Received challenge, sending connect request...",
-        );
-        connectReqId = randomUUID();
-        ws.send(
-          JSON.stringify(
-            gatewayInvocation.buildGatewayConnectRequest({
-              id: connectReqId,
-              token: GATEWAY_TOKEN,
-            }),
-          ),
-        );
-        return;
-      }
-
-      // Step 2: Server responds to connect request -> send the agent RPC.
-      if (msg.type === "res" && msg.id === connectReqId) {
-        if (!msg.ok) {
-          console.error(
-            `[contract] Connect rejected: ${JSON.stringify(msg.error || msg.payload)}`,
-          );
-          done(
-            `Auth failed: ${msg.error?.message || JSON.stringify(msg.payload)}`,
-          );
-          return;
-        }
-        try {
-          gatewayInvocation.assertGrantedGatewayScopes(msg.payload);
-        } catch (error) {
-          console.error(`[contract] Gateway scope mismatch: ${error.message}`);
-          done(`Auth failed: ${error.message}`);
-          return;
-        }
-        authenticated = true;
-        console.log(
-          "[contract] Authenticated successfully, sending agent request...",
-        );
-        agentReqId = randomUUID();
-        ws.send(
-          JSON.stringify(
-            gatewayInvocation.buildAgentRequest({
-              id: agentReqId,
-              message,
-            }),
-          ),
-        );
-        agentSent = true;
-        return;
-      }
-
-      // Helper: try all known content locations in a payload
-      const extractFromPayload = (pl) => {
-        return (
-          extractTextFromContent(pl.message?.content) ||
-          extractTextFromContent(pl.message) ||
-          extractTextFromContent(pl.text) ||
-          extractTextFromContent(pl.content)
-        );
-      };
-
-      // Correlated chat events preserve streaming while the authoritative
-      // terminal result remains the second agent response with this request ID.
-      if (msg.type === "event" && msg.event === "chat") {
-        const payload = msg.payload || {};
-        if (payload.runId !== agentReqId) return;
-
-        if (payload.state === "delta") {
-          const text = extractFromPayload(payload);
-          if (text) {
-            responseText = text; // Delta replaces (accumulates progressively)
-            if (onDelta) onDelta(text);
-          }
-          return;
-        }
-
-        if (payload.state === "final") {
-          const text = extractFromPayload(payload);
-          if (text) responseText = text;
-          console.log(
-            `[contract] Correlated agent stream final (${responseText.length} chars)`,
-          );
-          return;
-        }
-
-        if (payload.state === "error") {
-          console.error(
-            `[contract] Chat error event: ${payload.errorMessage || "unknown"}`,
-          );
-          responseText =
-            responseText || `Agent error: ${payload.errorMessage || "unknown"}`;
-          return;
-        }
-
-        if (payload.state === "aborted") {
-          responseText = responseText || "Agent aborted.";
-          return;
-        }
-        return;
-      }
-
-      // Step 3: the agent RPC sends accepted, then a terminal response using
-      // the same request/idempotency/run ID. Ignore every other response.
-      const agentResponseKind =
-        gatewayInvocation.classifyAgentResponse(msg, agentReqId);
-      if (agentResponseKind !== "ignore") {
-        if (!msg.ok) {
-          console.error(
-            `[contract] Agent error: ${JSON.stringify(msg.error || msg.payload)}`,
-          );
-          done(
-            responseText || `Agent error: ${msg.error?.message || "unknown"}`,
-          );
-          return;
-        }
-        const status = msg.payload?.status;
-        console.log(
-          `[contract] Agent res status=${status} payload=${JSON.stringify(msg.payload).slice(0, 500)}`,
-        );
-        if (agentResponseKind === "pending") return;
-        if (status === "ok") {
-          const terminalText =
-            gatewayInvocation.extractAgentResponseText(msg.payload);
-          if (terminalText) responseText = terminalText;
-        }
-        if (responseText) {
-          done(responseText);
-        } else {
-          console.warn(
-            `[contract] Agent response completed with no content — payload: ${JSON.stringify(msg.payload).slice(0, 500)}`,
-          );
-          done("");
-        }
-        return;
-      }
-
-      // Unhandled message — log for debugging
-      unhandledMsgs.push(raw.slice(0, 300));
-    });
-
-    ws.on("error", (err) => {
-      console.error(`[contract] WebSocket error: ${err.message}`);
-      // Return "" on error so caller can fall back to lightweight agent
-      done(responseText || "");
-    });
-
-    ws.on("close", (code, reason) => {
-      const reasonStr = reason ? reason.toString() : "";
-      const debugInfo =
-        unhandledMsgs.length > 0
-          ? ` unhandled=[${unhandledMsgs.slice(0, 3).join(" | ")}]`
-          : "";
-      console.warn(
-        `[contract] WebSocket closed: code=${code} reason=${reasonStr} auth=${authenticated} agentSent=${agentSent} responseLen=${responseText.length}${debugInfo}`,
-      );
-      // Return "" on unexpected close so caller can fall back to lightweight agent
-      done(responseText || "");
-    });
+async function bridgeMessage(message, timeoutMs = 620000, onDelta, runId) {
+  const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
+  console.log(`[contract] Invoking committed agent state machine: ${wsUrl}`);
+  return gatewayInvocation.invokeGatewayAgent({
+    WebSocketConstructor: WebSocket,
+    url: wsUrl,
+    token: GATEWAY_TOKEN,
+    message,
+    runId,
+    timeoutMs,
+    onDelta,
+    logger: console,
   });
 }
 
@@ -1145,6 +958,7 @@ const server = http.createServer(async (req, res) => {
             uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
             currentUserId,
             openclawReady,
+            gatewayQuarantined,
             proxyReady,
             secretsReady,
             openclawExitCode,
@@ -1161,6 +975,17 @@ const server = http.createServer(async (req, res) => {
 
         // Warmup action — trigger lazy init without blocking for a chat response
         if (action === "warmup") {
+          if (gatewayQuarantined) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                status: "quarantined",
+                errorCode: "AGENT_RUNTIME_QUARANTINED",
+              }),
+            );
+            return;
+          }
+
           lastActivityTime = Math.floor(Date.now() / 1000);
           const { userId, actorId, channel } = payload;
           if (openclawReady && proxyReady) {
@@ -1190,153 +1015,178 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
-          // Update shared identity file so proxy picks up cross-channel changes
-          updateIdentityFile(actorId, channel || "unknown");
-
-          // Trigger init if not done yet (blocks until proxy is ready)
-          if (!proxyReady && !initInProgress) {
-            try {
-              await init(userId, actorId, channel || "unknown");
-            } catch (err) {
-              console.error(`[contract] Init failed: ${err.message}`);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(
-                JSON.stringify({
-                  response:
-                    "I'm having trouble starting up. Please try again in a moment.",
-                  userId,
-                  sessionId: payload.sessionId || null,
-                  status: "error",
-                }),
-              );
-              return;
-            }
-          } else if (!proxyReady && initInProgress) {
-            // Init already in progress — wait for it
-            try {
-              await initPromise;
-            } catch (err) {
-              console.error(
-                `[contract] Init (in-progress) failed: ${err.message}`,
-              );
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(
-                JSON.stringify({
-                  response:
-                    "I'm still starting up. Please try again in a moment.",
-                  userId,
-                  sessionId: payload.sessionId || null,
-                  status: "initializing",
-                }),
-              );
-              return;
-            }
-          }
-
-          const bridgeText = buildBridgeText(message);
-
-          // Track active task to prevent idle termination during chat processing
-          lastActivityTime = Math.floor(Date.now() / 1000);
-          activeTaskCount++;
-          let responseText;
+          let gatewayRunId;
+          let requestHash;
+          const requestChannel = channel || "unknown";
           try {
-            // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
-            if (openclawReady) {
-              // Full OpenClaw path — WebSocket bridge
-              try {
-                responseText = await enqueueMessage(bridgeText);
-              } catch (bridgeErr) {
-                console.error(
-                  `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
-                );
-                responseText = "";
-              }
-              // If bridge returned empty (OpenClaw sent no content), check whether
-              // OpenClaw is mid-run before falling back to lightweight agent.
-              // A tool-call-only response can produce an empty bridge response
-              // that is not necessarily a failure.
-              if (!responseText || !responseText.trim()) {
-                // Brief retry — transient empty responses resolve quickly
-                await new Promise((r) => setTimeout(r, 300));
-
-                // Probe OpenClaw to see if it is still busy
-                let openclawBusy = false;
-                try {
-                  const pingData = await new Promise((resolve, reject) => {
-                    const pingReq = http.get(
-                      `http://127.0.0.1:${OPENCLAW_PORT}`,
-                      (pingRes) => {
-                        let data = "";
-                        pingRes.on("data", (c) => (data += c));
-                        pingRes.on("end", () => resolve(data));
-                      },
-                    );
-                    pingReq.on("error", reject);
-                    pingReq.setTimeout(2000, () => {
-                      pingReq.destroy();
-                      reject(new Error("ping timeout"));
-                    });
-                  });
-                  // OpenClaw may return JSON with activeTasks count
-                  try {
-                    const parsed = JSON.parse(pingData);
-                    if (parsed.activeTasks > 0) openclawBusy = true;
-                  } catch {
-                    // Non-JSON response — OpenClaw is alive but format unknown
-                  }
-                } catch {
-                  // OpenClaw not responding — not busy, allow fallback
-                }
-
-                // Also treat a still-running process (no exit code) as busy
-                if (openclawExitCode === null) openclawBusy = true;
-
-                if (openclawBusy) {
-                  console.log(
-                    "[contract] Bridge returned empty but OpenClaw is mid-run — returning busy message",
-                  );
-                  responseText =
-                    "I'm still working on your previous request — check back in a moment.";
-                } else {
-                  console.warn(
-                    "[contract] Bridge returned empty — falling back to lightweight agent",
-                  );
-                  try {
-                    responseText = await agent.chat(
-                      bridgeText,
-                      actorId,
-                      Date.now() + 30000,
-                    );
-                  } catch (agentErr) {
-                    responseText =
-                      "I'm having trouble right now. Please try again in a moment.";
-                    console.error(
-                      `[contract] Lightweight agent fallback error: ${agentErr.message}`,
-                    );
-                  }
-                }
-              }
-            } else if (proxyReady) {
-              // Warm-up shim path — lightweight agent via proxy
-              console.log("[contract] Routing via lightweight agent (warm-up)");
-              try {
-                responseText = await agent.chat(bridgeText, actorId, Date.now() + 620000);
-              } catch (agentErr) {
-                responseText = `I'm having trouble right now. Please try again in a moment.`;
-                console.error(
-                  `[contract] Lightweight agent error: ${agentErr.message}`,
-                );
-              }
-            } else {
-              // Proxy not ready yet (should be rare — init awaits proxy)
-              responseText = "I'm starting up — please try again in a moment.";
-            }
-          } finally {
-            activeTaskCount = Math.max(0, activeTaskCount - 1);
+            gatewayRunId = gatewayInvocation.deriveGatewayRunId({
+              invocationId: payload.invocationId,
+            });
+            requestHash = gatewayInvocation.hashTrustedInvocationRequest({
+              userId,
+              actorId,
+              channel: requestChannel,
+              message,
+            });
+          } catch {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                response:
+                  "This request has no valid trusted invocation identity and was not executed.",
+                userId,
+                sessionId: payload.sessionId || null,
+                status: "failed",
+                errorCode: "INVALID_INVOCATION_IDENTITY",
+              }),
+            );
+            return;
           }
 
-          // Belt-and-suspenders: strip any remaining content-block JSON wrappers
-          if (responseText) responseText = extractTextFromContent(responseText);
+          let responseText;
+          let responseStatus;
+          let responseErrorCode;
+          try {
+            const outcome = await trustedInvocationRegistry.invoke({
+              invocationId: payload.invocationId,
+              requestHash,
+              execute: async () => {
+                if (gatewayQuarantined) {
+                  return {
+                    responseText:
+                      "This runtime is quarantined because an earlier request could not be reconciled. Start a fresh runtime before sending more work.",
+                    status: "quarantined",
+                    errorCode: "AGENT_RUNTIME_QUARANTINED",
+                  };
+                }
+
+                // Identity, initialization, and executor selection all sit
+                // behind the same trusted-invocation single-flight boundary.
+                updateIdentityFile(actorId, requestChannel);
+                if (!proxyReady && !initInProgress) {
+                  try {
+                    await init(userId, actorId, requestChannel);
+                  } catch (err) {
+                    console.error(`[contract] Init failed: ${err.message}`);
+                    return {
+                      responseText:
+                        "I'm having trouble starting up. Please try again in a moment.",
+                      status: "failed",
+                      errorCode: "RUNTIME_INIT_FAILED",
+                    };
+                  }
+                } else if (!proxyReady && initInProgress) {
+                  try {
+                    await initPromise;
+                  } catch (err) {
+                    console.error(
+                      `[contract] Init (in-progress) failed: ${err.message}`,
+                    );
+                    return {
+                      responseText:
+                        "I'm still starting up. Please try again in a moment.",
+                      status: "failed",
+                      errorCode: "RUNTIME_INIT_FAILED",
+                    };
+                  }
+                }
+
+                const bridgeText = buildBridgeText(message);
+                lastActivityTime = Math.floor(Date.now() / 1000);
+                activeTaskCount++;
+                let executionText;
+                let executionStatus;
+                let executionErrorCode;
+                try {
+                  if (openclawReady) {
+                    try {
+                      const gatewayOutcome =
+                        await gatewayRuntimeBoundary.invoke({
+                          invokePrimary: () =>
+                            enqueueMessage(bridgeText, gatewayRunId),
+                          invokeFallback: () =>
+                            agent.chat(
+                              bridgeText,
+                              actorId,
+                              Date.now() + 30000,
+                            ),
+                        });
+                      executionText = gatewayOutcome.text;
+                    } catch (bridgeErr) {
+                      gatewayQuarantined =
+                        gatewayRuntimeBoundary.getQuarantine();
+                      if (gatewayQuarantined) openclawReady = false;
+                      console.error(
+                        `[contract] Committed gateway invocation failed: ${bridgeErr.code || "UNKNOWN"} ${bridgeErr.message}`,
+                      );
+                      executionErrorCode =
+                        bridgeErr.code || "GATEWAY_INVOCATION_FAILED";
+                      if (bridgeErr.code === "UNCERTAIN_AGENT_RUN") {
+                        executionStatus = "uncertain";
+                        executionText =
+                          "I couldn't confirm whether that request stopped, so I won't run it again. Check its status before retrying.";
+                      } else {
+                        executionStatus = "failed";
+                        executionText =
+                          "The request failed without a committed response and was not run again.";
+                      }
+                    }
+                  } else if (proxyReady) {
+                    console.log(
+                      "[contract] Routing via lightweight agent (warm-up)",
+                    );
+                    try {
+                      executionText = await agent.chat(
+                        bridgeText,
+                        actorId,
+                        Date.now() + 620000,
+                      );
+                    } catch (agentErr) {
+                      executionText =
+                        "I'm having trouble right now. Please try again in a moment.";
+                      executionStatus = "failed";
+                      executionErrorCode = "LIGHTWEIGHT_AGENT_FAILED";
+                      console.error(
+                        `[contract] Lightweight agent error: ${agentErr.message}`,
+                      );
+                    }
+                  } else {
+                    executionText =
+                      "I'm starting up — please try again in a moment.";
+                    executionStatus = "failed";
+                    executionErrorCode = "RUNTIME_NOT_READY";
+                  }
+                } finally {
+                  activeTaskCount = Math.max(0, activeTaskCount - 1);
+                }
+
+                if (executionText) {
+                  executionText = extractTextFromContent(executionText);
+                }
+                return {
+                  responseText: executionText,
+                  ...(executionStatus ? { status: executionStatus } : {}),
+                  ...(executionErrorCode
+                    ? { errorCode: executionErrorCode }
+                    : {}),
+                };
+              },
+            });
+            responseText = outcome.responseText;
+            responseStatus = outcome.status;
+            responseErrorCode = outcome.errorCode;
+          } catch (invocationErr) {
+            console.error(
+              `[contract] Trusted invocation rejected: ${invocationErr.code || "UNKNOWN"} ${invocationErr.message}`,
+            );
+            responseText =
+              invocationErr.code === "INVOCATION_ID_CONFLICT"
+                ? "This request identity was already used for different work and was not executed."
+                : "This request could not be executed safely.";
+            responseStatus = "failed";
+            responseErrorCode =
+              invocationErr.code || "TRUSTED_INVOCATION_FAILED";
+          }
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
@@ -1344,6 +1194,8 @@ const server = http.createServer(async (req, res) => {
               response: responseText,
               userId: currentUserId,
               sessionId: payload.sessionId || null,
+              ...(responseStatus ? { status: responseStatus } : {}),
+              ...(responseErrorCode ? { errorCode: responseErrorCode } : {}),
             }),
           );
           return;

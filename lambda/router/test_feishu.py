@@ -165,6 +165,12 @@ class TestHandleFeishuTextMessage(unittest.TestCase):
         self.assertEqual(result["statusCode"], 200)
         mock_resolve.assert_called_once_with("feishu", "ou_test123")
         mock_invoke.assert_called_once()
+        self.assertEqual(
+            mock_invoke.call_args[0][5],
+            index._build_runtime_invocation_id(
+                "feishu", event["header"]["event_id"], "user_abc123"
+            ),
+        )
         mock_send.assert_called()
         # Last call should be the response
         last_call_text = mock_send.call_args_list[-1][0][1]

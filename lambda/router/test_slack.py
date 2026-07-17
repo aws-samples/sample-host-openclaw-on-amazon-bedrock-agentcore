@@ -39,6 +39,7 @@ def _make_slack_message_event(text="Hello", user_id="U12345USER", channel_id="C1
     """Build a Slack message event payload."""
     event = {
         "type": "event_callback",
+        "event_id": "Ev1234567890",
         "event": {
             "type": "message",
             "user": user_id,
@@ -61,6 +62,7 @@ def _make_slack_app_mention_event(text="<@UBOT123> Hello", user_id="U12345USER",
     """Build a Slack app_mention event payload."""
     return {
         "type": "event_callback",
+        "event_id": "Ev1234567891",
         "event": {
             "type": "app_mention",
             "user": user_id,
@@ -97,6 +99,12 @@ class TestSlackEventTypeFiltering(unittest.TestCase):
         event = _make_slack_message_event()
         result = index.handle_slack(json.dumps(event))
         self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(
+            mock_invoke.call_args[0][5],
+            index._build_runtime_invocation_id(
+                "slack", "Ev1234567890", "user_abc123"
+            ),
+        )
 
     @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))

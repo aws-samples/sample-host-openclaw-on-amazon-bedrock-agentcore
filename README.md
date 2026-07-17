@@ -44,9 +44,11 @@ The implementation proceeds in reviewed tasks described by the approved
 - Workspace tools accept only relative paths and bounded UTF-8 content. Their
   S3 keys are confined to `<server workspace prefix>/files/`; root runtime
   state, `.openclaw`, `_uploads`, and internal namespaces are unreachable.
-- Text commands are disabled. The gateway bridge requests only
-  `operator.read` and `operator.write`; a live pinned-gateway proof rejected
-  `config.patch` for missing `operator.admin` and left the config byte-identical.
+- For the gateway bridge, ordinary slash-prefixed input is model text. The
+  exact `/new` and `/reset` controls fail closed because they require admin,
+  while the bridge requests only `operator.read` and `operator.write`; a live
+  pinned-gateway proof rejected `config.patch` for missing `operator.admin`
+  and left the config byte-identical.
 - In the runtime, arbitrary shell execution is disabled, along with generic filesystem,
   process, scheduling, UI automation, cross-session, delegated-worker, MCP,
   marketplace-plugin, and user credential capabilities.

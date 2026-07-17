@@ -134,8 +134,9 @@ describe("generated OpenClaw configuration", () => {
       "utf8",
     );
     assert.match(gatewaySource, /scopes:\s*GATEWAY_CLIENT_SCOPES/);
-    assert.match(contractSource, /buildGatewayConnectRequest\(/);
-    assert.match(contractSource, /assertGrantedGatewayScopes\(msg\.payload\)/);
+    assert.match(contractSource, /invokeGatewayAgent\(\{/);
+    assert.match(gatewaySource, /buildGatewayConnectRequest\(/);
+    assert.match(gatewaySource, /assertGrantedGatewayScopes\(frame\.payload\)/);
     assert.doesNotMatch(contractSource, /operator\.admin/);
     assert.doesNotMatch(gatewaySource, /operator\.admin/);
     assert.match(gatewaySource, /minProtocol:\s*4/);

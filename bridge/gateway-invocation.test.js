@@ -113,6 +113,278 @@ describe("gateway invocation boundary", () => {
     );
   });
 
+  it("derives a stable server run identity from the trusted channel invocation", () => {
+    const input = {
+      invocationId: `po1_${"a".repeat(64)}`,
+    };
+    const first = gatewayInvocation.deriveGatewayRunId(input);
+    const retry = gatewayInvocation.deriveGatewayRunId(input);
+    const next = gatewayInvocation.deriveGatewayRunId({
+      invocationId: `po1_${"b".repeat(64)}`,
+    });
+
+    assert.equal(first, retry);
+    assert.notEqual(first, next);
+    assert.match(first, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    assert.throws(
+      () => gatewayInvocation.deriveGatewayRunId({ ...input, invocationId: "" }),
+      /invocation identity/i,
+    );
+  });
+
+  it("single-flights one canonical trusted invocation across executor changes", async () => {
+    const registry = gatewayInvocation.createTrustedInvocationRegistry({
+      ttlMs: 60_000,
+      maxSettledEntries: 10,
+    });
+    const invocationId = `po1_${"c".repeat(64)}`;
+    const requestHash = gatewayInvocation.hashTrustedInvocationRequest({
+      userId: "user-1",
+      actorId: "actor-1",
+      channel: "slack",
+      message: "do the work",
+    });
+    let releaseFallback;
+    let fallbackCalls = 0;
+    let gatewayCalls = 0;
+
+    const first = registry.invoke({
+      invocationId,
+      requestHash,
+      execute: async () => {
+        fallbackCalls += 1;
+        return new Promise((resolve) => {
+          releaseFallback = () =>
+            resolve({ status: "ok", response: "fallback result" });
+        });
+      },
+    });
+    const retryAfterReadinessChange = registry.invoke({
+      invocationId,
+      requestHash,
+      execute: async () => {
+        gatewayCalls += 1;
+        return { status: "ok", response: "gateway result" };
+      },
+    });
+
+    assert.equal(fallbackCalls, 1);
+    assert.equal(gatewayCalls, 0);
+    releaseFallback();
+    assert.deepEqual(await first, {
+      status: "ok",
+      response: "fallback result",
+    });
+    assert.deepEqual(await retryAfterReadinessChange, {
+      status: "ok",
+      response: "fallback result",
+    });
+    assert.equal(fallbackCalls, 1);
+    assert.equal(gatewayCalls, 0);
+  });
+
+  it("binds a trusted invocation ID to the canonical request hash", async () => {
+    const registry = gatewayInvocation.createTrustedInvocationRegistry();
+    const invocationId = `po1_${"d".repeat(64)}`;
+    let executorCalls = 0;
+
+    await registry.invoke({
+      invocationId,
+      requestHash: "1".repeat(64),
+      execute: async () => {
+        executorCalls += 1;
+        return { status: "failed", errorCode: "TEST_FAILURE" };
+      },
+    });
+
+    await assert.rejects(
+      registry.invoke({
+        invocationId,
+        requestHash: "2".repeat(64),
+        execute: async () => {
+          executorCalls += 1;
+          return { status: "ok" };
+        },
+      }),
+      (error) =>
+        error instanceof gatewayInvocation.GatewayInvocationError &&
+        error.code === "INVOCATION_ID_CONFLICT" &&
+        error.safeToFallback === false,
+    );
+    assert.equal(executorCalls, 1);
+  });
+
+  it("canonicalizes structured image work and rejects a changed image under the same ID", async () => {
+    const registry = gatewayInvocation.createTrustedInvocationRegistry();
+    const invocationId = `po1_${"8".repeat(64)}`;
+    const firstMessage = {
+      text: "inspect this",
+      images: [
+        { s3Key: "users/u-1/image-a.png", contentType: "image/png" },
+      ],
+    };
+    const sameMessage = {
+      images: [
+        { contentType: "image/png", s3Key: "users/u-1/image-a.png" },
+      ],
+      text: "inspect this",
+    };
+    const changedMessage = {
+      text: "inspect this",
+      images: [
+        { s3Key: "users/u-1/image-b.png", contentType: "image/png" },
+      ],
+    };
+    const hash = (message) =>
+      gatewayInvocation.hashTrustedInvocationRequest({
+        userId: "user-1",
+        actorId: "actor-1",
+        channel: "telegram",
+        message,
+      });
+    let calls = 0;
+
+    assert.equal(hash(firstMessage), hash(sameMessage));
+    await registry.invoke({
+      invocationId,
+      requestHash: hash(firstMessage),
+      execute: async () => {
+        calls += 1;
+        return { status: "ok", response: "image result" };
+      },
+    });
+    assert.deepEqual(
+      await registry.invoke({
+        invocationId,
+        requestHash: hash(sameMessage),
+        execute: async () => {
+          calls += 1;
+          return { status: "ok", response: "wrong" };
+        },
+      }),
+      { status: "ok", response: "image result" },
+    );
+    await assert.rejects(
+      registry.invoke({
+        invocationId,
+        requestHash: hash(changedMessage),
+        execute: async () => {
+          calls += 1;
+          return { status: "ok" };
+        },
+      }),
+      (error) => error.code === "INVOCATION_ID_CONFLICT",
+    );
+    assert.equal(calls, 1);
+  });
+
+  it("never evicts in-flight or originating uncertain outcomes from the runtime registry", async () => {
+    let now = 1_000;
+    const registry = gatewayInvocation.createTrustedInvocationRegistry({
+      ttlMs: 10,
+      maxSettledEntries: 1,
+      now: () => now,
+    });
+    const uncertainId = `po1_${"e".repeat(64)}`;
+    const inFlightId = `po1_${"f".repeat(64)}`;
+    let uncertainCalls = 0;
+    let inFlightCalls = 0;
+    let releaseInFlight;
+
+    const uncertain = await registry.invoke({
+      invocationId: uncertainId,
+      requestHash: "3".repeat(64),
+      execute: async () => {
+        uncertainCalls += 1;
+        return {
+          status: "uncertain",
+          errorCode: "UNCERTAIN_AGENT_RUN",
+        };
+      },
+    });
+    const inFlight = registry.invoke({
+      invocationId: inFlightId,
+      requestHash: "4".repeat(64),
+      execute: async () => {
+        inFlightCalls += 1;
+        return new Promise((resolve) => {
+          releaseInFlight = resolve;
+        });
+      },
+    });
+
+    now += 100;
+    await registry.invoke({
+      invocationId: `po1_${"9".repeat(64)}`,
+      requestHash: "5".repeat(64),
+      execute: async () => ({ status: "ok" }),
+    });
+
+    assert.deepEqual(
+      await registry.invoke({
+        invocationId: uncertainId,
+        requestHash: "3".repeat(64),
+        execute: async () => {
+          uncertainCalls += 1;
+          return { status: "ok" };
+        },
+      }),
+      uncertain,
+    );
+    const inFlightRetry = registry.invoke({
+      invocationId: inFlightId,
+      requestHash: "4".repeat(64),
+      execute: async () => {
+        inFlightCalls += 1;
+        return { status: "wrong-executor" };
+      },
+    });
+    assert.equal(uncertainCalls, 1);
+    assert.equal(inFlightCalls, 1);
+    releaseInFlight({ status: "ok", response: "one execution" });
+    assert.deepEqual(await inFlight, {
+      status: "ok",
+      response: "one execution",
+    });
+    assert.deepEqual(await inFlightRetry, {
+      status: "ok",
+      response: "one execution",
+    });
+  });
+
+  it("bounds a flood of settled post-quarantine rejections", async () => {
+    const registry = gatewayInvocation.createTrustedInvocationRegistry({
+      ttlMs: 60_000,
+      maxSettledEntries: 2,
+    });
+    await registry.invoke({
+      invocationId: `po1_${"a".repeat(64)}`,
+      requestHash: "a".repeat(64),
+      execute: async () => ({
+        status: "uncertain",
+        errorCode: "UNCERTAIN_AGENT_RUN",
+      }),
+    });
+
+    for (const digit of ["1", "2", "3", "4", "5"]) {
+      await registry.invoke({
+        invocationId: `po1_${digit.repeat(64)}`,
+        requestHash: digit.repeat(64),
+        execute: async () => ({
+          status: "quarantined",
+          errorCode: "AGENT_RUNTIME_QUARANTINED",
+        }),
+      });
+    }
+
+    assert.deepEqual(registry.getStats(), {
+      total: 3,
+      inFlight: 0,
+      pinned: 1,
+      settledEvictable: 2,
+    });
+  });
+
   it("extracts the correlated terminal agent response", () => {
     assert.equal(
       gatewayInvocation.extractAgentResponseText({
@@ -202,16 +474,28 @@ describe("production gateway coupling", () => {
     );
 
     assert.match(source, /require\("\.\/gateway-invocation"\)/);
-    assert.match(source, /createGatewaySocket\(WebSocket,\s*wsUrl\)/);
-    assert.match(source, /buildGatewayConnectRequest\(/);
-    assert.match(source, /assertGrantedGatewayScopes\(msg\.payload\)/);
-    assert.match(source, /buildAgentRequest\(/);
-    assert.match(source, /extractAgentResponseText\(msg\.payload\)/);
-    assert.match(source, /classifyAgentResponse\(msg,\s*agentReqId\)/);
+    assert.match(source, /createGatewayRuntimeBoundary\(\{/);
+    assert.match(source, /invokeGatewayAgent\(\{/);
+    assert.match(source, /gatewayRuntimeBoundary\.invoke\(\{/);
+    assert.match(source, /deriveGatewayRunId\(\{/);
+    assert.match(source, /createTrustedInvocationRegistry\(\{/);
+    assert.match(source, /trustedInvocationRegistry\.invoke\(\{/);
+    assert.match(source, /hashTrustedInvocationRequest\(\{/);
+    assert.match(source, /gatewayQuarantined/);
+    assert.match(source, /UNCERTAIN_AGENT_RUN/);
+    assert.match(
+      source,
+      /if \(shuttingDown \|\| openclawReady \|\| gatewayQuarantined\) return;/,
+    );
+    assert.match(
+      source,
+      /gatewayQuarantined\s*=\s*gatewayRuntimeBoundary\.getQuarantine\(\);[\s\S]{0,80}if \(gatewayQuarantined\) openclawReady = false;/,
+    );
     assert.doesNotMatch(source, /chat\.send/);
     assert.doesNotMatch(source, /new WebSocket\(wsUrl,\s*\{/);
     assert.doesNotMatch(source, /origin\s*:/i);
     assert.doesNotMatch(source, /extraSystemPrompt|promptMode|internalRuntimeHandoff/);
+    assert.doesNotMatch(source, /still working on your previous request/i);
   });
 
   it("makes the pinned proof consume server-reported scopes and production requests", () => {

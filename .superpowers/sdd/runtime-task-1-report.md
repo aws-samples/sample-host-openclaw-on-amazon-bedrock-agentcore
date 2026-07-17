@@ -1,5 +1,72 @@
 # Runtime Hardening Task 1 implementation report
 
+## RH1 uncertain-run and duplicate-delivery closure (2026-07-18)
+
+The accepted-run review found a commit ambiguity in the bridge: streamed
+deltas and terminal output shared one buffer, and transport failure after an
+accepted run could return partial text or select the lightweight executor. The
+production route is now an explicit fail-closed state machine:
+
+- only a same-run terminal `status:"ok"` response commits output; stream
+  deltas are presentation-only and terminal `error` / `timeout` responses are
+  typed failures;
+- sending the `agent` request is the uncertainty boundary, because a transport
+  failure can hide the accepted acknowledgement after provider work starts;
+- while the owning socket remains open, timeout/error first sends exact-run
+  `chat.abort`, then requires same-run `agent.wait` evidence with terminal
+  `error` / `timeout`, `stopReason:"rpc"`, and `endedAt` before considering the
+  run contained;
+- reconciliation is hard-capped at five seconds, below pinned OpenClaw's
+  15-second synthetic cancellation-snapshot grace. A close/lost socket or any
+  unproven settlement becomes `UNCERTAIN_AGENT_RUN`;
+- uncertainty permanently quarantines the process, terminates the OpenClaw
+  child with `SIGTERM` then bounded `SIGKILL`, blocks scheduled restart, and
+  rejects later work without invoking either executor.
+
+The router now derives a fixed `po1_<sha256>` invocation identity from the
+channel, immutable platform event ID, and internal user ID. Before any identity
+write or initialization, the runtime binds that ID to a canonical request hash
+covering actor, channel, and either exact text or normalized image references.
+A process-lifetime registry single-flights concurrent duplicates across both
+OpenClaw and the lightweight executor, rejects same-ID/different-work conflicts,
+caches typed outcomes, never evicts in-flight or originating uncertain entries,
+and bounds ordinary settled entries to one hour / 1,000 entries. Therefore a
+retry cannot switch executors merely because readiness changed.
+
+This is deliberately not a durable exactly-once claim. Pinned OpenClaw's own
+RPC dedupe is in-memory, five minutes / 1,000 entries, and disappears on
+restart. The runtime registry also disappears with its process. Runtime
+Hardening Task 4 still needs the durable router update ledger for late retries
+and cross-runtime replay suppression.
+
+RED evidence captured during this closure included missing state-machine APIs,
+accepted-delta close/error/timeout paths returning ambiguously, dispatch-before-
+ack transport failure classified as retryable, missing persistent quarantine
+and delayed-restart guards, abort acknowledgement accepted without terminal
+reconciliation, no stable trusted run identity, no cross-executor registry,
+same-ID/different-image conflicts, and caller-expandable reconciliation beyond
+the pinned synthetic-snapshot window.
+
+Fresh local evidence:
+
+```text
+focused production state machine and registry: 28 passed, 0 failed
+complete bridge suite: 230 passed, 0 failed
+Telegram/Slack/Feishu router contracts: 64 passed
+product/static contract: 9 passed
+pinned source commit: 4bfaccafd62ac2ff2e70ca1decc40fb1297ab438
+pinned exact abort run: dcd57cd3-38c0-4af0-860c-233199846351
+pinned chat.abort: ok=true, aborted=true, runIds contained the exact run
+pinned agent.wait: status=error, stopReason=rpc, finite startedAt/endedAt
+pinned exact-run abort/reconciliation assertion: true
+temporary gateway and proof-model ports 18889/18890: not listening
+```
+
+The live proof used only a loopback dummy provider and the least-privilege
+`operator.read` / `operator.write` connection. No admin/backend/OpenResponses
+route, patch, deploy, push, real credential, private data, or external message
+was used.
+
 ## RH1 final invocation-boundary closure (2026-07-18)
 
 The final review found that pinned OpenClaw 2026.7.2 clears self-declared

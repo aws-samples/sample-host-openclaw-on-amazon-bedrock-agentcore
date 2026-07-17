@@ -142,6 +142,9 @@ def test_readme_records_the_enforced_runtime_boundary() -> None:
     assert "`po_file_delete`" in readme
     assert "arbitrary shell execution is disabled" in readme
     assert "Telegram delivery remains outside the runtime" in readme
+    assert "ordinary slash-prefixed input is model text" in readme
+    assert "exact `/new` and `/reset`" in readme
+    assert "Text commands are disabled" not in readme
 
 
 def test_cdk_nag_guard_rejects_missing_reports(tmp_path: Path) -> None:

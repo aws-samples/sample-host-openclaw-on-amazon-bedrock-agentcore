@@ -18,7 +18,6 @@ import os
 import re
 import threading
 import time
-import hashlib
 import uuid
 from urllib import request as urllib_request
 from urllib.parse import quote
@@ -609,7 +608,19 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 # AgentCore invocation
 # ---------------------------------------------------------------------------
 
-def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
+def _build_runtime_invocation_id(channel, platform_event_id, internal_user_id):
+    """Build the fixed trusted retry identity without using message content."""
+    if channel not in {"telegram", "slack", "feishu"}:
+        raise ValueError("unsupported invocation channel")
+    event_id = str(platform_event_id or "").strip()
+    user_id = str(internal_user_id or "").strip()
+    if not event_id or len(event_id) > 512 or not user_id or len(user_id) > 256:
+        raise ValueError("missing immutable platform event or internal user identity")
+    canonical = f"personal-operator-invocation-v1\0{channel}\0{user_id}\0{event_id}"
+    return "po1_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def invoke_agent_runtime(session_id, user_id, actor_id, channel, message, invocation_id):
     """Invoke the AgentCore Runtime with a per-user session.
 
     Message can be a plain string or a structured dict with text + images.
@@ -620,6 +631,7 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
         "actorId": actor_id,
         "channel": channel,
         "message": message,
+        "invocationId": invocation_id,
     }).encode()
 
     try:
@@ -1477,7 +1489,17 @@ def handle_telegram(body):
     )
     typing_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message)
+        invocation_id = _build_runtime_invocation_id(
+            "telegram", update.get("update_id"), resolved_user_id
+        )
+        result = invoke_agent_runtime(
+            session_id,
+            resolved_user_id,
+            actor_id,
+            "telegram",
+            agent_message,
+            invocation_id,
+        )
     finally:
         stop_typing.set()
         typing_thread.join(timeout=2)
@@ -1624,7 +1646,17 @@ def handle_slack(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message)
+        invocation_id = _build_runtime_invocation_id(
+            "slack", event_data.get("event_id"), resolved_user_id
+        )
+        result = invoke_agent_runtime(
+            session_id,
+            resolved_user_id,
+            actor_id,
+            "slack",
+            agent_message,
+            invocation_id,
+        )
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -1778,7 +1810,19 @@ def handle_feishu(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message)
+        invocation_id = _build_runtime_invocation_id(
+            "feishu",
+            header.get("event_id") or message.get("message_id"),
+            resolved_user_id,
+        )
+        result = invoke_agent_runtime(
+            session_id,
+            resolved_user_id,
+            actor_id,
+            "feishu",
+            agent_message,
+            invocation_id,
+        )
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
