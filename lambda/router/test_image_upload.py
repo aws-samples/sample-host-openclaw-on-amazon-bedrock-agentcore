@@ -3,7 +3,6 @@
 import json
 import os
 import sys
-import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -56,45 +55,91 @@ class TestUploadImageToS3(unittest.TestCase):
     def test_valid_jpeg_upload(self, mock_s3):
         """Valid JPEG upload returns an S3 key."""
         image_bytes = b"\xff\xd8" + b"\x00" * 100
-        result = index._upload_image_to_s3(image_bytes, "telegram_123", "image/jpeg")
+        invocation_id = index._build_runtime_invocation_id(
+            "telegram", 1001, "user-a"
+        )
+        result = index._upload_image_to_s3(
+            image_bytes, "telegram_123", "image/jpeg", invocation_id
+        )
 
         self.assertIsNotNone(result)
-        self.assertTrue(result.startswith("telegram_123/_uploads/img_"))
+        content_hash = index.hashlib.sha256(image_bytes).hexdigest()
+        self.assertEqual(
+            result,
+            f"telegram_123/_uploads/img_{invocation_id}_{content_hash}.jpeg",
+        )
         self.assertTrue(result.endswith(".jpeg"))
         mock_s3.put_object.assert_called_once()
 
     @patch.object(index, "s3_client")
-    def test_valid_png_upload(self, mock_s3):
-        """Valid PNG upload returns an S3 key."""
+    def test_retry_is_same_key_and_changed_event_or_image_is_different(self, mock_s3):
         image_bytes = b"\x89PNG" + b"\x00" * 100
-        result = index._upload_image_to_s3(image_bytes, "slack_U123", "image/png")
+        invocation_id = index._build_runtime_invocation_id(
+            "slack", "Ev-1", "user-a"
+        )
+        changed_event_id = index._build_runtime_invocation_id(
+            "slack", "Ev-2", "user-a"
+        )
 
-        self.assertIsNotNone(result)
-        self.assertTrue(result.endswith(".png"))
+        first = index._upload_image_to_s3(
+            image_bytes, "slack_U123", "image/png", invocation_id
+        )
+        retry = index._upload_image_to_s3(
+            image_bytes, "slack_U123", "image/png", invocation_id
+        )
+        changed_event = index._upload_image_to_s3(
+            image_bytes, "slack_U123", "image/png", changed_event_id
+        )
+        changed_image = index._upload_image_to_s3(
+            image_bytes + b"changed", "slack_U123", "image/png", invocation_id
+        )
+
+        self.assertEqual(first, retry)
+        self.assertEqual(len({first, changed_event, changed_image}), 3)
+        self.assertEqual(
+            mock_s3.put_object.call_args_list[0].kwargs["Key"],
+            mock_s3.put_object.call_args_list[1].kwargs["Key"],
+        )
 
     def test_invalid_content_type(self):
         """Non-image content type is rejected."""
-        result = index._upload_image_to_s3(b"data", "ns", "application/pdf")
+        result = index._upload_image_to_s3(
+            b"data", "ns", "application/pdf", f"po1_{'a' * 64}"
+        )
         self.assertIsNone(result)
 
     def test_oversized_image(self):
         """Image exceeding 3.75 MB is rejected."""
         big = b"\x00" * (3_750_001)
-        result = index._upload_image_to_s3(big, "ns", "image/jpeg")
+        result = index._upload_image_to_s3(
+            big, "ns", "image/jpeg", f"po1_{'a' * 64}"
+        )
         self.assertIsNone(result)
 
     def test_no_bucket_configured(self):
         """Returns None when USER_FILES_BUCKET is empty."""
         index.USER_FILES_BUCKET = ""
-        result = index._upload_image_to_s3(b"data", "ns", "image/jpeg")
+        result = index._upload_image_to_s3(
+            b"data", "ns", "image/jpeg", f"po1_{'a' * 64}"
+        )
         self.assertIsNone(result)
 
     @patch.object(index, "s3_client")
     def test_s3_error(self, mock_s3):
         """Returns None when S3 put_object fails."""
         mock_s3.put_object.side_effect = Exception("S3 error")
-        result = index._upload_image_to_s3(b"data", "ns", "image/jpeg")
+        result = index._upload_image_to_s3(
+            b"data", "ns", "image/jpeg", f"po1_{'a' * 64}"
+        )
         self.assertIsNone(result)
+
+    @patch.object(index, "s3_client")
+    def test_invalid_invocation_identity_fails_before_upload(self, mock_s3):
+        result = index._upload_image_to_s3(
+            b"data", "ns", "image/jpeg", "attacker-controlled"
+        )
+        self.assertIsNone(result)
+        mock_s3.put_object.assert_not_called()
 
 
 class TestDownloadTelegramImage(unittest.TestCase):
@@ -273,6 +318,10 @@ class TestHandleTelegramWithImages(unittest.TestCase):
 
         mock_download.assert_called_once()
         mock_upload.assert_called_once()
+        expected_invocation_id = index._build_runtime_invocation_id(
+            "telegram", 1001, "user_test123"
+        )
+        self.assertEqual(mock_upload.call_args[0][3], expected_invocation_id)
         # invoke_agent_runtime should receive structured message
         call_args = mock_invoke.call_args
         msg = call_args[0][4]  # 5th positional arg is message
@@ -281,7 +330,7 @@ class TestHandleTelegramWithImages(unittest.TestCase):
         self.assertEqual(len(msg["images"]), 1)
         self.assertEqual(
             call_args[0][5],
-            index._build_runtime_invocation_id("telegram", 1001, "user_test123"),
+            expected_invocation_id,
         )
 
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Hello!"})

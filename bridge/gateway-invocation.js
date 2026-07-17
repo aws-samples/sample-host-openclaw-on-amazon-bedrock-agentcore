@@ -211,6 +211,7 @@ function hashTrustedInvocationRequest({
 function createTrustedInvocationRegistry({
   ttlMs = 60 * 60 * 1_000,
   maxSettledEntries = 1_000,
+  maxInFlightEntries = 8,
   now = Date.now,
 } = {}) {
   if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
@@ -218,6 +219,9 @@ function createTrustedInvocationRegistry({
   }
   if (!Number.isInteger(maxSettledEntries) || maxSettledEntries < 1) {
     throw new Error("Trusted invocation settled-entry limit must be positive");
+  }
+  if (!Number.isInteger(maxInFlightEntries) || maxInFlightEntries < 1) {
+    throw new Error("Trusted invocation in-flight limit must be positive");
   }
 
   const entries = new Map();
@@ -291,6 +295,23 @@ function createTrustedInvocationRegistry({
       return existing.promise;
     }
 
+    let inFlightEntries = 0;
+    for (const entry of entries.values()) {
+      if (!entry.settled) inFlightEntries += 1;
+    }
+    if (inFlightEntries >= maxInFlightEntries) {
+      return Promise.reject(
+        new GatewayInvocationError(
+          "Runtime has reached its trusted invocation capacity",
+          {
+            code: "RUNTIME_OVERLOADED",
+            accepted: false,
+            safeToFallback: false,
+          },
+        ),
+      );
+    }
+
     let resolveEntry;
     let rejectEntry;
     const promise = new Promise((resolve, reject) => {
@@ -345,6 +366,60 @@ function createTrustedInvocationRegistry({
   };
 
   return { invoke, getStats };
+}
+
+/**
+ * Serialize gateway calls without retaining an unbounded number of message
+ * closures. The running task is separate from the strict pending-task cap.
+ */
+function createBoundedSerialExecutor({ maxPending = 7 } = {}) {
+  if (!Number.isInteger(maxPending) || maxPending < 0) {
+    throw new Error("Serialized executor pending limit must be non-negative");
+  }
+  const pending = [];
+  let running = false;
+
+  const drain = async () => {
+    if (running) return;
+    const next = pending.shift();
+    if (!next) return;
+    running = true;
+    try {
+      next.resolve(await next.task());
+    } catch (error) {
+      next.reject(error);
+    } finally {
+      running = false;
+      void drain();
+    }
+  };
+
+  const submit = (task) => {
+    if (typeof task !== "function") {
+      return Promise.reject(new TypeError("task must be a function"));
+    }
+    if (running && pending.length >= maxPending) {
+      return Promise.reject(
+        new GatewayInvocationError(
+          "Runtime gateway queue has reached its pending-work capacity",
+          {
+            code: "RUNTIME_OVERLOADED",
+            accepted: false,
+            safeToFallback: false,
+          },
+        ),
+      );
+    }
+    return new Promise((resolve, reject) => {
+      pending.push({ task, resolve, reject });
+      void drain();
+    });
+  };
+
+  return {
+    submit,
+    getStats: () => ({ running, pending: pending.length }),
+  };
 }
 
 function extractAgentResponseText(payload) {
@@ -885,6 +960,7 @@ module.exports = {
   deriveGatewayRunId,
   hashTrustedInvocationRequest,
   createTrustedInvocationRegistry,
+  createBoundedSerialExecutor,
   extractAgentResponseText,
   classifyAgentResponse,
   invokeGatewayAgent,

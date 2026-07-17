@@ -1,5 +1,63 @@
 # Runtime Hardening Task 1 implementation report
 
+## RH1 bounded-admission and deterministic-image closure (2026-07-18)
+
+The Wave 4 review found two remaining retention/idempotency gaps. The trusted
+invocation registry could retain unlimited unique in-flight request closures,
+and the hand-written gateway queue could retain unlimited pending messages.
+Image retries also used timestamp/random object names, so the same platform
+event produced a different canonical request hash on every delivery.
+
+The runtime now enforces both admission bounds before work can multiply:
+
+- at most eight unique trusted invocation IDs may be in flight; a ninth new ID
+  fails closed with typed `RUNTIME_OVERLOADED` and cannot escape through the
+  fallback executor;
+- an existing same-ID/same-request retry remains admissible at capacity and
+  shares the original promise, while same-ID/different-work still conflicts;
+- the unbounded message array is replaced by a serial executor with exactly
+  one running gateway call and at most seven retained pending tasks; excess
+  work returns the same typed fail-closed overload;
+- in-flight and originating uncertain registry entries remain non-evictable;
+  ordinary settled outcomes are retained for at most one hour and capped at 64
+  entries (at the router's 500 KB response ceiling, at most about 32 MB of
+  response text).
+
+The router now derives and validates the trusted invocation ID before image
+download/upload. Image filenames are deterministic from that stable event ID
+and the SHA-256 of the exact downloaded bytes. An identical platform delivery
+therefore overwrites the same S3 object and sends the same structured request
+to the runtime; a changed event ID or changed image bytes produces different
+work, and reusing the old event ID with changed work is rejected by the runtime
+request-hash binding. This wave intentionally leaves the key under the current
+effective actor namespace. RH2 must migrate router, proxy, credentials, and
+runtime namespace atomically rather than introducing a split namespace here.
+
+RED evidence was captured first: the focused Node contract admitted a third
+unique in-flight ID, lacked the bounded executor, and still contained the
+unbounded production queue (3 failures); the image contract lacked the stable
+upload identity and handler propagation (8 failures). A handler-level Slack
+platform-event test now processes an identical image event twice with the real
+key builder and mocked S3, proving equal S3 keys, invocation IDs, and structured
+runtime work; changed event/image input differs.
+
+Fresh Wave 4 evidence:
+
+```text
+focused production state machine/admission contracts: 30 passed, 0 failed
+focused Telegram/Slack/Feishu image contracts: 66 passed, 0 failed
+complete bridge suite: 232 passed, 0 failed
+complete router suite: 155 passed; 1 documented pre-existing malformed-content parser failure
+product/static contract: 9 passed, 0 failed
+JavaScript syntax, Python byte-compile, and git diff checks: passed
+```
+
+The unrelated router baseline failure is
+`test_formatting_integration.py::TestFullPipeline::test_regex_fallback_for_malformed_json`;
+the Wave 4 diff does not touch that parser. Per review direction it remains out
+of this security commit and must close before release. No deploy, push, real
+credential, private data, or external message was used.
+
 ## RH1 uncertain-run and duplicate-delivery closure (2026-07-18)
 
 The accepted-run review found a commit ambiguity in the bridge: streamed
@@ -30,7 +88,7 @@ covering actor, channel, and either exact text or normalized image references.
 A process-lifetime registry single-flights concurrent duplicates across both
 OpenClaw and the lightweight executor, rejects same-ID/different-work conflicts,
 caches typed outcomes, never evicts in-flight or originating uncertain entries,
-and bounds ordinary settled entries to one hour / 1,000 entries. Therefore a
+and bounds ordinary settled entries to one hour / 64 entries. Therefore a
 retry cannot switch executors merely because readiness changed.
 
 This is deliberately not a durable exactly-once claim. Pinned OpenClaw's own

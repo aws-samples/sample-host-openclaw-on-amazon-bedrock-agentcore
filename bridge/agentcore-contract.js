@@ -88,8 +88,11 @@ const gatewayRuntimeBoundary = gatewayInvocation.createGatewayRuntimeBoundary({
 const trustedInvocationRegistry =
   gatewayInvocation.createTrustedInvocationRegistry({
     ttlMs: 60 * 60 * 1_000,
-    maxSettledEntries: 1_000,
+    maxSettledEntries: 64,
+    maxInFlightEntries: 8,
   });
+const gatewayMessageExecutor =
+  gatewayInvocation.createBoundedSerialExecutor({ maxPending: 7 });
 
 // OpenClaw auto-restart on crash
 let openclawRestartCount = 0;
@@ -101,10 +104,6 @@ let activeTaskCount = 0;
 // Last activity timestamp (epoch seconds) — reported in /ping so AgentCore can track idle time.
 // Initialized to startup time; updated on each chat/warmup invocation.
 let lastActivityTime = Math.floor(Date.now() / 1000);
-
-// Message queue for serializing concurrent requests (OpenClaw WebSocket path)
-let messageQueue = [];
-let processingMessage = false;
 
 /**
  * Write current actorId and channel to a shared file so the proxy process
@@ -810,44 +809,14 @@ function extractTextFromContent(content) {
 }
 
 /**
- * Process the message queue serially to prevent concurrent WebSocket race conditions.
- */
-async function processMessageQueue() {
-  if (processingMessage || messageQueue.length === 0) return;
-  processingMessage = true;
-
-  while (messageQueue.length > 0) {
-    const { message, runId, onDelta, resolve, reject } = messageQueue.shift();
-    console.log(
-      `[contract] Processing queued message (${messageQueue.length} remaining)`,
-    );
-
-    try {
-      const response = await bridgeMessage(message, 620000, onDelta, runId);
-      resolve(response);
-    } catch (err) {
-      reject(err);
-    }
-  }
-
-  processingMessage = false;
-}
-
-/**
- * Enqueue a message and wait for its response (serialized processing).
+ * Submit bounded serialized gateway work.
  * @param {string} message - The message to send
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
 function enqueueMessage(message, runId, onDelta) {
-  return new Promise((resolve, reject) => {
-    messageQueue.push({ message, runId, onDelta, resolve, reject });
-    console.log(
-      `[contract] Message enqueued (queue length: ${messageQueue.length})`,
-    );
-    processMessageQueue().catch((err) => {
-      console.error(`[contract] Queue processing error: ${err.message}`);
-    });
-  });
+  return gatewayMessageExecutor.submit(() =>
+    bridgeMessage(message, 620000, onDelta, runId),
+  );
 }
 
 /**

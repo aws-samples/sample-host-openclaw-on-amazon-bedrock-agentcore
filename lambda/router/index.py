@@ -1237,10 +1237,12 @@ CONTENT_TYPE_TO_EXT = {
 }
 
 
-def _upload_image_to_s3(image_bytes, namespace, content_type):
+def _upload_image_to_s3(image_bytes, namespace, content_type, invocation_id):
     """Upload image bytes to S3 and return the S3 key, or None on failure.
 
-    S3 key: {namespace}/_uploads/img_{timestamp}_{hex}.{ext}
+    The filename is deterministic for one trusted event and exact image bytes.
+    RH2 will migrate the still-current actor namespace atomically across every
+    router, proxy, credential, and runtime consumer.
     """
     if not USER_FILES_BUCKET:
         logger.warning("USER_FILES_BUCKET not configured — cannot upload image")
@@ -1251,11 +1253,16 @@ def _upload_image_to_s3(image_bytes, namespace, content_type):
     if len(image_bytes) > MAX_IMAGE_BYTES:
         logger.warning("Rejected image: %d bytes exceeds limit of %d", len(image_bytes), MAX_IMAGE_BYTES)
         return None
+    if not re.fullmatch(r"po1_[0-9a-f]{64}", str(invocation_id or "")):
+        logger.warning("Rejected image upload without trusted invocation identity")
+        return None
 
     ext = CONTENT_TYPE_TO_EXT.get(content_type, "bin")
-    timestamp = int(time.time())
-    hex_suffix = uuid.uuid4().hex[:8]
-    s3_key = f"{namespace}/_uploads/img_{timestamp}_{hex_suffix}.{ext}"
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
+    s3_key = (
+        f"{namespace}/_uploads/"
+        f"img_{invocation_id}_{content_hash}.{ext}"
+    )
 
     try:
         s3_client.put_object(
@@ -1452,6 +1459,10 @@ def handle_telegram(body):
         )
         return
 
+    invocation_id = _build_runtime_invocation_id(
+        "telegram", update.get("update_id"), resolved_user_id
+    )
+
     # Send typing indicator
     send_telegram_typing(chat_id, token)
 
@@ -1461,7 +1472,9 @@ def handle_telegram(body):
         namespace = actor_id.replace(":", "_")
         image_bytes, content_type, _ = _download_telegram_image(message, token)
         if image_bytes:
-            s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+            s3_key = _upload_image_to_s3(
+                image_bytes, namespace, content_type, invocation_id
+            )
             if s3_key:
                 agent_message = _build_structured_message(text, s3_key, content_type)
             else:
@@ -1489,9 +1502,6 @@ def handle_telegram(body):
     )
     typing_thread.start()
     try:
-        invocation_id = _build_runtime_invocation_id(
-            "telegram", update.get("update_id"), resolved_user_id
-        )
         result = invoke_agent_runtime(
             session_id,
             resolved_user_id,
@@ -1611,6 +1621,10 @@ def handle_slack(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    invocation_id = _build_runtime_invocation_id(
+        "slack", event_data.get("event_id"), resolved_user_id
+    )
+
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
     if has_image:
@@ -1619,7 +1633,9 @@ def handle_slack(body, headers=None):
         file_info = image_files[0]
         image_bytes, content_type, _ = _download_slack_file(file_info, bot_token)
         if image_bytes:
-            s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+            s3_key = _upload_image_to_s3(
+                image_bytes, namespace, content_type, invocation_id
+            )
             if s3_key:
                 agent_message = _build_structured_message(text, s3_key, content_type)
             else:
@@ -1646,9 +1662,6 @@ def handle_slack(body, headers=None):
     )
     notify_thread.start()
     try:
-        invocation_id = _build_runtime_invocation_id(
-            "slack", event_data.get("event_id"), resolved_user_id
-        )
         result = invoke_agent_runtime(
             session_id,
             resolved_user_id,
@@ -1777,13 +1790,21 @@ def handle_feishu(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    invocation_id = _build_runtime_invocation_id(
+        "feishu",
+        header.get("event_id") or message.get("message_id"),
+        resolved_user_id,
+    )
+
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text or "hi"
     if has_image:
         namespace = actor_id.replace(":", "_")
         image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
         if image_bytes:
-            s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+            s3_key = _upload_image_to_s3(
+                image_bytes, namespace, content_type, invocation_id
+            )
             if s3_key:
                 agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
             else:
@@ -1810,11 +1831,6 @@ def handle_feishu(body, headers=None):
     )
     notify_thread.start()
     try:
-        invocation_id = _build_runtime_invocation_id(
-            "feishu",
-            header.get("event_id") or message.get("message_id"),
-            resolved_user_id,
-        )
         result = invoke_agent_runtime(
             session_id,
             resolved_user_id,

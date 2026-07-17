@@ -183,6 +183,112 @@ describe("gateway invocation boundary", () => {
     assert.equal(gatewayCalls, 0);
   });
 
+  it("caps new in-flight IDs while allowing an existing duplicate to coalesce", async () => {
+    const registry = gatewayInvocation.createTrustedInvocationRegistry({
+      ttlMs: 60_000,
+      maxSettledEntries: 10,
+      maxInFlightEntries: 2,
+    });
+    const releases = [];
+    let executions = 0;
+    const start = (digit) =>
+      registry.invoke({
+        invocationId: `po1_${digit.repeat(64)}`,
+        requestHash: digit.repeat(64),
+        execute: async () => {
+          executions += 1;
+          return new Promise((resolve) => releases.push(resolve));
+        },
+      });
+
+    const first = start("1");
+    const second = start("2");
+    const firstDuplicate = registry.invoke({
+      invocationId: `po1_${"1".repeat(64)}`,
+      requestHash: "1".repeat(64),
+      execute: async () => {
+        executions += 1;
+        return { status: "wrong-executor" };
+      },
+    });
+
+    await assert.rejects(
+      registry.invoke({
+        invocationId: `po1_${"3".repeat(64)}`,
+        requestHash: "3".repeat(64),
+        execute: async () => {
+          executions += 1;
+          return { status: "over-admitted" };
+        },
+      }),
+      (error) =>
+        error instanceof gatewayInvocation.GatewayInvocationError &&
+        error.code === "RUNTIME_OVERLOADED" &&
+        error.safeToFallback === false,
+    );
+    assert.equal(executions, 2);
+    assert.deepEqual(registry.getStats(), {
+      total: 2,
+      inFlight: 2,
+      pinned: 0,
+      settledEvictable: 0,
+    });
+
+    releases[0]({ status: "ok", response: "first" });
+    releases[1]({ status: "ok", response: "second" });
+    assert.deepEqual(await first, { status: "ok", response: "first" });
+    assert.deepEqual(await firstDuplicate, {
+      status: "ok",
+      response: "first",
+    });
+    assert.deepEqual(await second, { status: "ok", response: "second" });
+  });
+
+  it("bounds pending serialized gateway work and fails excess work closed", async () => {
+    const executor = gatewayInvocation.createBoundedSerialExecutor({
+      maxPending: 2,
+    });
+    const order = [];
+    let releaseFirst;
+    const first = executor.submit(
+      () =>
+        new Promise((resolve) => {
+          order.push("first:start");
+          releaseFirst = () => {
+            order.push("first:end");
+            resolve("first");
+          };
+        }),
+    );
+    const second = executor.submit(async () => {
+      order.push("second");
+      return "second";
+    });
+    const third = executor.submit(async () => {
+      order.push("third");
+      return "third";
+    });
+
+    await assert.rejects(
+      executor.submit(async () => {
+        order.push("excess");
+      }),
+      (error) =>
+        error instanceof gatewayInvocation.GatewayInvocationError &&
+        error.code === "RUNTIME_OVERLOADED" &&
+        error.safeToFallback === false,
+    );
+    assert.deepEqual(executor.getStats(), { running: true, pending: 2 });
+    assert.deepEqual(order, ["first:start"]);
+
+    releaseFirst();
+    assert.equal(await first, "first");
+    assert.equal(await second, "second");
+    assert.equal(await third, "third");
+    assert.deepEqual(order, ["first:start", "first:end", "second", "third"]);
+    assert.deepEqual(executor.getStats(), { running: false, pending: 0 });
+  });
+
   it("binds a trusted invocation ID to the canonical request hash", async () => {
     const registry = gatewayInvocation.createTrustedInvocationRegistry();
     const invocationId = `po1_${"d".repeat(64)}`;
@@ -479,8 +585,12 @@ describe("production gateway coupling", () => {
     assert.match(source, /gatewayRuntimeBoundary\.invoke\(\{/);
     assert.match(source, /deriveGatewayRunId\(\{/);
     assert.match(source, /createTrustedInvocationRegistry\(\{/);
+    assert.match(source, /maxSettledEntries:\s*64/);
+    assert.match(source, /maxInFlightEntries:\s*8/);
     assert.match(source, /trustedInvocationRegistry\.invoke\(\{/);
     assert.match(source, /hashTrustedInvocationRequest\(\{/);
+    assert.match(source, /createBoundedSerialExecutor\(\{/);
+    assert.doesNotMatch(source, /messageQueue\.push/);
     assert.match(source, /gatewayQuarantined/);
     assert.match(source, /UNCERTAIN_AGENT_RUN/);
     assert.match(
