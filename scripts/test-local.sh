@@ -70,7 +70,15 @@ from pathlib import Path
 
 assembly = Path(sys.argv[1])
 findings = []
-for report in sorted(assembly.glob("AwsSolutions--*-NagReport.csv")):
+reports = sorted(assembly.glob("AwsSolutions--*-NagReport.csv"))
+if not reports:
+    print(
+        f"No AwsSolutions NagReport CSV files found in {assembly}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+for report in reports:
     with report.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             if row["Compliance"] == "Non-Compliant":

@@ -35,24 +35,11 @@ RUN mkdir -p /app
 
 WORKDIR /app
 
-# Install AWS SDK and WebSocket library (production only)
-# Skip browser binary download — we only need playwright-core for CDP client (connectOverCDP)
+# Install the bridge's exact locked production dependency graph. Skip browser
+# binary download — only playwright-core is needed for CDP client connections.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-RUN cd /app && npm init -y > /dev/null 2>&1 && \
-    npm install --omit=dev \
-                @aws-sdk/client-bedrock-agentcore \
-                @aws-sdk/client-bedrock-runtime \
-                @aws-sdk/client-cognito-identity-provider \
-                @aws-sdk/client-s3 \
-                @aws-sdk/client-secrets-manager \
-                @aws-sdk/client-scheduler \
-                @aws-sdk/client-dynamodb \
-                @aws-sdk/client-sts \
-                @aws-sdk/lib-dynamodb \
-                playwright-core \
-                @aws-sdk/s3-request-presigner \
-                @aws-sdk/client-cloudwatch-logs \
-                ws
+COPY package.json package-lock.json /app/
+RUN npm ci --omit=dev
 
 # Pre-warm V8 compile cache for heavy AWS SDK modules.
 # This populates the bytecode cache at build time so runtime module loading is faster.

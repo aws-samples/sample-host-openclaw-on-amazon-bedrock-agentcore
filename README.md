@@ -30,6 +30,24 @@ The implementation proceeds in reviewed tasks described by the approved
 [design](docs/superpowers/specs/2026-07-17-personal-operator-v0-design.md) and
 [plan](docs/superpowers/plans/2026-07-17-personal-operator-v0.md).
 
+## Current imported runtime behavior
+
+The foundation checkout still contains inherited behavior that is outside the
+target product boundary:
+
+- The `api-keys` skill is still copied into the bridge image, and its runtime
+  code and credential permissions remain. Its two known baseline test failures
+  are recorded in `docs/BASELINE.md`.
+- The `clawhub-manage` source and imported runtime references still exist,
+  although Task 1 no longer copies that skill or preinstalls community packages
+  in the bridge image.
+- The imported tool policy and credential surface have not yet received the
+  Task 2 least-privilege rewrite.
+
+These paths remain explicitly unaccepted until Task 2 removes them under its
+own test-first change. The configuration below must not be read as proof that
+the complete target security boundary is already enforced.
+
 ## Frozen runtime baseline
 
 | Setting | v0 value |
@@ -46,8 +64,9 @@ The implementation proceeds in reviewed tasks described by the approved
 
 OpenClaw `2026.7.2` is not a published npm release. The bridge image fetches
 the audited immutable source commit, verifies the package version, and builds
-it with the source lockfile. It does not install community marketplace skills.
-See [docs/UPSTREAM.md](docs/UPSTREAM.md) for the source ledger.
+it with the source lockfile. Task 1 does not preinstall community marketplace
+packages; the remaining imported management paths are disclosed above and are
+Task 2 work. See [docs/UPSTREAM.md](docs/UPSTREAM.md) for the source ledger.
 
 ## Local validation
 
@@ -76,15 +95,17 @@ synthesis contract using a synthetic account number. It never deploys or
 requires cloud credentials. Until later tasks remove the imported defects, the
 aggregate command is expected to report them and exit non-zero.
 
-## Product boundaries
+## Target product boundaries (not yet fully enforced)
 
-- Invite-only access; browser automation is disabled for v0.
-- No arbitrary marketplace skill, MCP server, plugin, or user API-key install.
-- OpenClaw never receives Telegram, Google, database, approval-signing, or
-  cross-user credentials.
-- Raw Gmail bodies are transient and must not be persisted or logged.
-- External effects require a trusted capability gateway and exact approval.
-- Provider timeouts become `UNCERTAIN` and must be reconciled before retry.
+- The completed v0 must remain invite-only with browser automation disabled.
+- The target runtime must not allow arbitrary marketplace skill, MCP server,
+  plugin, or user API-key installation.
+- The target OpenClaw boundary must never receive Telegram, Google, database,
+  approval-signing, or cross-user credentials.
+- Raw Gmail bodies must remain transient and must not be persisted or logged.
+- External effects must require a trusted capability gateway and exact
+  approval.
+- Provider timeouts must become `UNCERTAIN` and be reconciled before retry.
 - No deployment, push, paid resource creation, or real message is part of the
   local baseline workflow.
 
