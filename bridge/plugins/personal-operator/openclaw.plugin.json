@@ -1,0 +1,21 @@
+{
+  "id": "personal-operator",
+  "name": "Personal Operator Workspace",
+  "description": "Bounded UTF-8 workspace files in the server-owned user namespace.",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "po_file_list",
+      "po_file_read",
+      "po_file_write",
+      "po_file_delete"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

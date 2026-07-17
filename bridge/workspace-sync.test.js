@@ -262,24 +262,12 @@ describe("AGENTS.md template in agentcore-contract.js", () => {
     "utf-8",
   );
 
-  it("does not tell the LLM to 'Read' skill files (read tool is denied)", () => {
-    // The read tool is denied in OpenClaw's tool profile, so AGENTS.md must not
-    // instruct the LLM to read SKILL.md files — it will fail and confuse the LLM.
-    assert.ok(
-      !source.includes("Read the eventbridge-cron SKILL.md"),
-      "AGENTS.md should not tell the LLM to 'Read the eventbridge-cron SKILL.md' — read tool is denied",
-    );
-  });
-
-  it("includes explicit eventbridge-cron exec commands", () => {
-    // The LLM needs explicit node commands for the eventbridge-cron skill
-    assert.ok(
-      source.includes("node /skills/eventbridge-cron/create.js"),
-      "AGENTS.md should include explicit create schedule command",
-    );
-    assert.ok(
-      source.includes("node /skills/eventbridge-cron/list.js"),
-      "AGENTS.md should include explicit list schedules command",
+  it("advertises only web retrieval and personal workspace files", () => {
+    assert.match(source, /po_file_read/);
+    assert.match(source, /po_file_write/);
+    assert.doesNotMatch(
+      source,
+      /\/skills\/|eventbridge-cron|clawhub-manage|api-keys|agentcore-browser/i,
     );
   });
 });

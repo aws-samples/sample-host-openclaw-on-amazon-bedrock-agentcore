@@ -6,7 +6,8 @@
  *   - POST /invocations  -> Chat handler with hybrid init
  *
  * Each AgentCore session is dedicated to a single user. On first invocation:
- *   1. Use pre-fetched secrets (fetched eagerly at boot)
+ *   1. Generate an ephemeral local gateway token and pre-fetch only the
+ *      proxy's infrastructure identity secret
  *   2. Start proxy + OpenClaw + workspace restore in parallel
  *   3. Once proxy is ready (~5s), route via lightweight agent shim
  *   4. Once OpenClaw is ready (~1-2 min), route via WebSocket bridge
@@ -29,6 +30,7 @@ const workspaceSync = require("./workspace-sync");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
+const runtimePolicy = require("./runtime-policy");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -38,13 +40,8 @@ const OPENCLAW_PORT = 18789;
 const SESSION_STORAGE_MOUNT = "/mnt/workspace";
 const OPENCLAW_DIR = process.env.HOME ? `${process.env.HOME}/.openclaw` : "/root/.openclaw";
 
-// Gateway token — fetched from Secrets Manager eagerly at boot.
-// No fallback — container will fail to authenticate WebSocket if not set.
-let GATEWAY_TOKEN = null;
-
-// Telegram bot token — fetched from Secrets Manager eagerly at boot.
-// Used for typing indicator during processing + single final message delivery.
-let TELEGRAM_BOT_TOKEN = null;
+// Ephemeral, microVM-local authentication for the loopback gateway only.
+const GATEWAY_TOKEN = runtimePolicy.createLocalGatewayToken();
 
 // Cognito password secret — fetched from Secrets Manager eagerly at boot.
 // Stored in-process only, never written to process.env.
@@ -72,27 +69,9 @@ let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
-let browserHeaderRefreshTimer = null;
-let currentBrowserSessionId = null;
-let currentBrowserEndpoint = null;
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const IDENTITY_FILE = "/tmp/current-identity.json";
-const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
-const BROWSER_SESSION_TIMEOUT_SECONDS = 3600;
 const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
-
-// Derive EVENTBRIDGE_ROLE_ARN from EXECUTION_ROLE_ARN + AWS_REGION if not already set.
-// The agentcore toolkit doesn't support injecting arbitrary env vars into the container,
-// so we derive it: arn:aws:iam::{account}:role/openclaw-cron-scheduler-role-{region}
-if (!process.env.EVENTBRIDGE_ROLE_ARN && process.env.EXECUTION_ROLE_ARN) {
-  const match = process.env.EXECUTION_ROLE_ARN.match(/arn:aws:iam::(\d+):role\//);
-  if (match) {
-    const account = match[1];
-    const region = process.env.AWS_REGION || "us-west-2";
-    process.env.EVENTBRIDGE_ROLE_ARN = `arn:aws:iam::${account}:role/openclaw-cron-scheduler-role-${region}`;
-    console.log(`[contract] Derived EVENTBRIDGE_ROLE_ARN from execution role (account=${account}, region=${region})`);
-  }
-}
 
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
 const OPENCLAW_LOG_LIMIT = 50;
@@ -108,7 +87,7 @@ const OPENCLAW_RESTART_DELAY_MS = 5000;
 // Active task tracking — HealthyBusy prevents AgentCore from terminating during long tasks
 let activeTaskCount = 0;
 // Last activity timestamp (epoch seconds) — reported in /ping so AgentCore can track idle time.
-// Initialized to startup time; updated on each chat/cron/warmup invocation.
+// Initialized to startup time; updated on each chat/warmup invocation.
 let lastActivityTime = Math.floor(Date.now() / 1000);
 
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
@@ -187,19 +166,8 @@ function updateIdentityFile(actorId, channel) {
  * Runs in the background — does not block /ping health checks.
  */
 async function prefetchSecrets() {
-  const region = process.env.AWS_REGION || "us-west-2";
+  const region = process.env.AWS_REGION || "eu-west-1";
   const smClient = new SecretsManagerClient({ region });
-
-  const gatewaySecretId = process.env.GATEWAY_TOKEN_SECRET_ID;
-  if (gatewaySecretId) {
-    const resp = await smClient.send(
-      new GetSecretValueCommand({ SecretId: gatewaySecretId }),
-    );
-    if (resp.SecretString) {
-      GATEWAY_TOKEN = resp.SecretString;
-      console.log("[contract] Gateway token pre-fetched from Secrets Manager");
-    }
-  }
 
   const cognitoSecretId = process.env.COGNITO_PASSWORD_SECRET_ID;
   if (cognitoSecretId) {
@@ -209,32 +177,6 @@ async function prefetchSecrets() {
     if (resp.SecretString) {
       COGNITO_PASSWORD_SECRET = resp.SecretString;
       console.log("[contract] Cognito password secret pre-fetched");
-    }
-  }
-
-  const telegramSecretId = process.env.TELEGRAM_CHANNEL_SECRET_ID;
-  if (telegramSecretId) {
-    try {
-      const resp = await smClient.send(
-        new GetSecretValueCommand({ SecretId: telegramSecretId }),
-      );
-      if (resp.SecretString) {
-        // Secret may be a plain token or JSON with bot_token/token key
-        try {
-          const parsed = JSON.parse(resp.SecretString);
-          TELEGRAM_BOT_TOKEN =
-            parsed.bot_token || parsed.token || resp.SecretString;
-        } catch {
-          TELEGRAM_BOT_TOKEN = resp.SecretString;
-        }
-        console.log(
-          "[contract] Telegram bot token pre-fetched from Secrets Manager",
-        );
-      }
-    } catch (err) {
-      console.warn(
-        `[contract] Telegram secret fetch failed (streaming disabled): ${err.message}`,
-      );
     }
   }
 
@@ -395,91 +337,17 @@ async function waitForPort(port, label, timeoutMs = 300000, intervalMs = 3000) {
   return false;
 }
 
-// Distinct subagent model name — proxy uses this to detect and route subagent requests.
-// Must match the SUBAGENT_MODEL_NAME env var passed to the proxy.
-const SUBAGENT_MODEL_NAME = "bedrock-agentcore-subagent";
-
 /**
- * Write a headless OpenClaw config (no channels — messages bridged via WebSocket).
- * Full tool profile with deny list for unsafe/irrelevant tools.
- * Sub-agents enabled for deep-research-pro and task-decomposer skills.
- * Sandbox disabled — AgentCore microVMs provide per-user isolation.
+ * Write the frozen headless OpenClaw configuration and user-facing capability
+ * instructions. Policy construction is pure and covered independently.
  */
 function writeOpenClawConfig() {
   const fs = require("fs");
-
-  // Sub-agent model uses a distinct name so the proxy can identify subagent requests.
-  // The proxy maps this name → SUBAGENT_BEDROCK_MODEL_ID (or MODEL_ID fallback).
-  const subagentModel = `agentcore/${SUBAGENT_MODEL_NAME}`;
-
-  const config = {
-    models: {
-      providers: {
-        agentcore: {
-          baseUrl: `http://127.0.0.1:${PROXY_PORT}/v1`,
-          apiKey: "local",
-          api: "openai-completions",
-          models: [
-            { id: "bedrock-agentcore", name: "Bedrock AgentCore" },
-            { id: SUBAGENT_MODEL_NAME, name: "Bedrock AgentCore Subagent" },
-          ],
-        },
-      },
-    },
-    agents: {
-      defaults: {
-        model: { primary: "agentcore/bedrock-agentcore" },
-        subagents: {
-          model: subagentModel,
-          maxConcurrent: 2,
-          runTimeoutSeconds: 900,
-          archiveAfterMinutes: 60,
-        },
-        sandbox: {
-          mode: "off", // No Docker in AgentCore container; microVMs provide isolation
-        },
-      },
-    },
-    tools: {
-      profile: "full",
-      exec: {
-        host: "gateway",  // Run on container host — microVM provides isolation, no Docker sandbox
-        security: "full", // Full shell access; container is already isolated
-        ask: "off",       // Headless container — no approval UI
-      },
-      deny: [
-        "write", // Local writes don't persist — use S3 skill instead
-        "edit", // Local edits are ephemeral — use S3 skill instead
-        "apply_patch", // Code patching not needed for chat assistant
-        "read", // Blocks local file reads — prevents reading sibling process environ; use s3-user-files
-        "browser", // Deny built-in browser tool — use agentcore-browser skill instead (via exec)
-        "canvas", // No UI rendering in headless chat context
-        "cron", // EventBridge handles scheduling, not OpenClaw's built-in cron
-        "gateway", // Admin tool — not needed for end users
-      ],
-      // Note: `exec` is intentionally NOT denied — skills like clawhub-manage
-      // need Bash(node:*) to run scripts. Scoped STS credentials ensure
-      // OpenClaw only has access to the user's S3 namespace prefix.
-    },
-    skills: {
-      allowBundled: [],
-      load: { extraDirs: ["/skills"] },
-    },
-    gateway: {
-      mode: "local",
-      port: OPENCLAW_PORT,
-      trustedProxies: ["127.0.0.1"],
-      auth: { mode: "token", token: GATEWAY_TOKEN },
-      controlUi: {
-        enabled: false,
-        allowInsecureAuth: true,
-        dangerouslyDisableDeviceAuth: true,
-        dangerouslyAllowHostHeaderOriginFallback: true,
-        allowedOrigins: ["*"],
-      },
-    },
-    channels: {}, // No channels — messages bridged via WebSocket
-  };
+  const config = runtimePolicy.buildOpenClawConfig({
+    gatewayToken: GATEWAY_TOKEN,
+    proxyPort: PROXY_PORT,
+    gatewayPort: OPENCLAW_PORT,
+  });
 
   const homeDir = process.env.HOME || "/root";
   fs.mkdirSync(`${homeDir}/.openclaw`, { recursive: true });
@@ -489,9 +357,8 @@ function writeOpenClawConfig() {
   );
   console.log("[contract] OpenClaw headless config written");
 
-  // Write AGENTS.md — OpenClaw loads this as workspace bootstrap instructions.
-  // Always overwrite to ensure instructions match the current container version
-  // (workspace restore from S3 may carry stale AGENTS.md without new features like browser).
+  // Always overwrite restored instructions so stale capability claims cannot
+  // widen the model-visible surface.
   const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
   {
     fs.writeFileSync(
@@ -500,11 +367,11 @@ function writeOpenClawConfig() {
         "# Agent Instructions",
         "",
         "You are a helpful AI assistant running in a per-user container on AWS.",
-        "You have built-in web tools, file storage, scheduling, and many community skills.",
+        "You have web retrieval and four bounded persistent workspace tools.",
         "",
         "## Response Formatting",
         "",
-        "Format responses for chat messaging apps (Telegram, Slack):",
+        "Format responses for a chat interface:",
         "- **No markdown tables** — use bullet lists or plain text paragraphs instead",
         "- Tables do not render in most chat apps; bullets always work",
         "- Keep responses concise and chat-appropriate",
@@ -517,114 +384,10 @@ function writeOpenClawConfig() {
         "",
         "Use these for real-time information, news, research, and reading web pages.",
         "",
-        "## Scheduling & Cron Jobs",
-        "",
-        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to set up reminders,",
-        "recurring tasks, or cron jobs, use these commands via Bash. Do NOT say cron is disabled.",
-        "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
-        "",
-        "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
-        "",
-        "**Commands** (run via Bash):",
-        "- Create: `node /skills/eventbridge-cron/create.js <user_id> <cron_expression> <timezone> <message> [channel] [channel_target] [schedule_name]`",
-        "- List: `node /skills/eventbridge-cron/list.js <user_id>`",
-        "- Update: `node /skills/eventbridge-cron/update.js <user_id> <schedule_id> [--expression \"cron(...)\"] [--timezone \"TZ\"] [--message \"msg\"] [--enable] [--disable]`",
-        "- Delete: `node /skills/eventbridge-cron/delete.js <user_id> <schedule_id>`",
-        "",
-        "Cron format: `cron(min hour day-of-month month day-of-week year)` — e.g., `cron(0 9 * * ? *)` for daily at 9 AM.",
-        "Rate format: `rate(1 hour)`, `rate(5 minutes)`.",
-        "",
         "## File Storage",
         "",
-        "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
-        "",
-        "## Community Skills (ClawHub)",
-        "",
-        "The following community skills are pre-installed:",
-        "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)",
-        "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)",
-        "- **telegram-compose**: Rich HTML formatting for Telegram messages",
-        "- **transcript**: YouTube video transcript extraction",
-        "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)",
-        "",
-        "### Installing More Skills",
-        "",
-        "You have the **clawhub-manage** skill to install/uninstall additional community skills from the ClawHub marketplace.",
-        "When a user asks to install or add a skill, use this skill — do NOT say it's not possible or that exec is blocked.",
-        "**Use Bash to run the skill scripts** (Bash is available, only exec is denied):",
-        "- Install: `node /skills/clawhub-manage/install.js <skill-name>`",
-        "- Uninstall: `node /skills/clawhub-manage/uninstall.js <skill-name>`",
-        "- List: `node /skills/clawhub-manage/list.js`",
-        "",
-        "After install/uninstall, the skill will be available on the next session start (after idle timeout or new conversation).",
-        "",
-        "## API Key Storage",
-        "",
-        "You have the **api-keys** skill for secure API key storage.",
-        "",
-        "### Proactive Detection",
-        "",
-        "If a user message contains what looks like an API key or secret token — even without explicitly asking to save it — you MUST proactively offer to store it securely. Common patterns:",
-        "- `sk-...`, `sk-proj-...` (OpenAI)",
-        "- `key-...`, `pk-...` (generic)",
-        "- `ghp_...`, `gho_...` (GitHub)",
-        "- `xoxb-...`, `xoxp-...` (Slack)",
-        "- `AKIA...` (AWS access key)",
-        "- Any long alphanumeric string (20+ chars) that the user labels as a key, token, or secret",
-        "",
-        "When detected, say something like: *\"That looks like an API key. Let me store it securely so you don't lose it. I'll use Secrets Manager (recommended) — OK?\"* Then store it immediately using Secrets Manager unless the user prefers native storage. Infer the key name from context (e.g., `openai_api_key`, `github_token`).",
-        "",
-        "### Storage Options",
-        "",
-        "When a user explicitly asks to save an API key, present both options:",
-        "",
-        "**Option 1 — Native (file-based)**:",
-        "- `node /skills/api-keys/native.js <user_id> set <key_name> <key_value>`",
-        "- Stored in your workspace file, persists across sessions via S3 sync",
-        "- KMS-encrypted at rest in S3, isolated to your user namespace",
-        "",
-        "**Option 2 — Secure (AWS Secrets Manager)** (recommended):",
-        "- `node /skills/api-keys/secret.js <user_id> set <key_name> <key_value>`",
-        "- Stored in AWS Secrets Manager, KMS-encrypted, auditable via CloudTrail",
-        "- NOT stored in workspace files — stronger isolation",
-        "",
-        "**Unified retrieval** (checks SM first, falls back to native):",
-        "- `node /skills/api-keys/retrieve.js <user_id> <key_name>`",
-        "",
-        "**Migration** between backends:",
-        "- `node /skills/api-keys/migrate.js <user_id> <key_name> native-to-secure`",
-        "- `node /skills/api-keys/migrate.js <user_id> <key_name> secure-to-native`",
-        "",
-        "Actions for both native.js and secret.js: `set`, `get`, `list`, `delete`",
-        "",
-        "**Important**: The `<user_id>` is your namespace (e.g. `telegram_12345`). Never write API keys to regular user files (s3-user-files). Always use the api-keys skill.",
-        "",
-        ...(process.env.BROWSER_IDENTIFIER
-          ? [
-              "## Browser (AgentCore Browser)",
-              "",
-              "You have the **agentcore-browser** skill for headless Chromium browsing. Use it when users ask to:",
-              "- Visit or navigate to a web page",
-              "- Take a screenshot of a website",
-              "- Interact with page elements (click buttons, fill forms, scroll)",
-              "",
-              "**Commands** (run via Bash):",
-              '- Navigate: `node /skills/agentcore-browser/navigate.js \'{"url": "https://example.com"}\'`',
-              '- Screenshot: `node /skills/agentcore-browser/screenshot.js \'{"description": "Page screenshot"}\'`',
-              '- Click: `node /skills/agentcore-browser/interact.js \'{"action": "click", "selector": "#btn"}\'`',
-              '- Type: `node /skills/agentcore-browser/interact.js \'{"action": "type", "selector": "#input", "text": "hello"}\'`',
-              '- Scroll: `node /skills/agentcore-browser/interact.js \'{"action": "scroll"}\'`',
-              '- Wait: `node /skills/agentcore-browser/interact.js \'{"action": "wait", "selector": ".results"}\'`',
-              "",
-              "Screenshots are uploaded to S3 and delivered as images to the user's chat.",
-              "The browser session is pre-created at startup — no setup needed.",
-              "",
-            ]
-          : []),
-        "## Sub-agents",
-        "",
-        "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.",
-        "Sub-agents share the same model and capabilities. Sandbox is disabled (the container is already isolated).",
+        "Use only `po_file_list`, `po_file_read`, `po_file_write`, and `po_file_delete` for persistent files.",
+        "Paths are relative to this user's server-owned workspace. Never ask for or invent a user ID or namespace.",
         "",
       ].join("\n"),
     );
@@ -648,132 +411,6 @@ async function pollOpenClawReadiness(namespace) {
     console.error(
       "[contract] OpenClaw failed to start — lightweight agent will continue handling messages",
     );
-  }
-}
-
-/**
- * Generate SigV4-signed HTTP headers for a WebSocket CDP endpoint.
- * The browser automation stream requires IAM authentication — Playwright's
- * connectOverCDP sends these as HTTP upgrade request headers.
- *
- * @param {string} wsEndpoint - WebSocket URL (wss://...)
- * @returns {object} Signed headers (Authorization, X-Amz-Date, X-Amz-Security-Token, Host)
- */
-async function signBrowserEndpoint(wsEndpoint) {
-  const { SignatureV4 } = require("@smithy/signature-v4");
-  const { Sha256 } = require("@aws-crypto/sha256-js");
-  const { defaultProvider } = require("@aws-sdk/credential-provider-node");
-
-  const url = new URL(wsEndpoint.replace(/^wss:/, "https:"));
-  const region = process.env.AWS_REGION || "us-east-1";
-
-  const signer = new SignatureV4({
-    service: "bedrock-agentcore",
-    region,
-    credentials: defaultProvider(),
-    sha256: Sha256,
-  });
-
-  const signed = await signer.sign({
-    method: "GET",
-    protocol: url.protocol,
-    hostname: url.hostname,
-    port: url.port ? Number(url.port) : undefined,
-    path: url.pathname + url.search,
-    headers: {
-      host: url.host,
-    },
-  });
-
-  // Return only the auth-relevant headers
-  const result = {};
-  for (const [k, v] of Object.entries(signed.headers)) {
-    if (/^(authorization|x-amz-|host)$/i.test(k) || k.startsWith("x-amz-")) {
-      result[k] = v;
-    }
-  }
-  return result;
-}
-
-/**
- * Start an AgentCore Browser session for the given user.
- * Non-fatal — logs and continues if browser feature is not enabled or SDK fails.
- */
-async function initBrowserSession(userId) {
-  const browserIdentifier = process.env.BROWSER_IDENTIFIER;
-  if (!browserIdentifier) return; // Feature not enabled
-
-  // Per-user sessions use a single userId; check state vars directly
-  if (currentBrowserSessionId) return; // Already initialized
-
-  try {
-    const { BedrockAgentCoreClient, StartBrowserSessionCommand } =
-      await import("@aws-sdk/client-bedrock-agentcore");
-    const client = new BedrockAgentCoreClient({ region: process.env.AWS_REGION || "us-east-1" });
-
-    const response = await client.send(new StartBrowserSessionCommand({
-      browserIdentifier,
-      name: userId.replace(/[^a-zA-Z0-9-]/g, "-").slice(0, 64),
-      sessionTimeoutSeconds: BROWSER_SESSION_TIMEOUT_SECONDS,
-      viewportConfiguration: {
-        width: 1280,
-        height: 720,
-      },
-    }));
-
-    const endpoint = response.streams?.automationStream?.streamEndpoint;
-    if (!endpoint) throw new Error("No automation stream endpoint returned");
-
-    currentBrowserSessionId = response.sessionId;
-    currentBrowserEndpoint = endpoint;
-
-    // Generate SigV4 auth headers for the WebSocket CDP connection
-    const headers = await signBrowserEndpoint(endpoint);
-
-    // Write endpoint + headers to file for skill processes to read
-    fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify({
-      endpoint, sessionId: response.sessionId, headers,
-    }));
-
-    // Refresh SigV4 headers every 4 min (signatures expire after ~5 min)
-    browserHeaderRefreshTimer = setInterval(async () => {
-      try {
-        const refreshed = await signBrowserEndpoint(currentBrowserEndpoint);
-        const data = JSON.parse(fs.readFileSync(BROWSER_SESSION_FILE, "utf8"));
-        data.headers = refreshed;
-        fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify(data));
-      } catch (e) {
-        console.error("[browser] Failed to refresh SigV4 headers:", e.message);
-      }
-    }, 4 * 60 * 1000);
-
-    console.log("[browser] Session started for", userId, "-", response.sessionId);
-  } catch (err) {
-    console.error("[browser] Failed to start session for", userId, "-", err.message);
-    // Non-fatal — continue without browser
-  }
-}
-
-/**
- * Stop all active browser sessions. Called during SIGTERM shutdown.
- */
-async function stopBrowserSessions() {
-  const browserIdentifier = process.env.BROWSER_IDENTIFIER;
-  if (!browserIdentifier) return;
-  if (!currentBrowserSessionId) return;
-
-  try {
-    const { BedrockAgentCoreClient, StopBrowserSessionCommand } =
-      await import("@aws-sdk/client-bedrock-agentcore");
-    const client = new BedrockAgentCoreClient({ region: process.env.AWS_REGION || "us-east-1" });
-
-    await client.send(new StopBrowserSessionCommand({
-      browserIdentifier,
-      sessionId: currentBrowserSessionId,
-    }));
-    console.log("[browser] Stopped session for user (sessionId:", currentBrowserSessionId + ")");
-  } catch (err) {
-    console.error("[browser] Stop failed (sessionId:", currentBrowserSessionId + ") -", err.message);
   }
 }
 
@@ -857,11 +494,9 @@ async function init(userId, actorId, channel) {
     currentNamespace = namespace;
     await cwLogger.init(`${namespace}-${Date.now()}`);
 
-    // Expose USER_ID so child processes (OpenClaw skill scripts) inherit it
-    process.env.USER_ID = actorId;
-    // Expose INTERNAL_USER_ID for lightweight agent tool env (eventbridge-cron authorization)
-    process.env.INTERNAL_USER_ID = userId;
-    agent.TOOL_ENV.INTERNAL_USER_ID = userId;
+    // The in-process warm-up store and the OpenClaw plugin read only this
+    // server-derived prefix; model/tool arguments cannot replace it.
+    process.env.PERSONAL_OPERATOR_WORKSPACE_PREFIX = namespace;
 
     // Write initial identity file for the proxy to read
     updateIdentityFile(actorId, channel);
@@ -876,22 +511,8 @@ async function init(userId, actorId, channel) {
       await secretsPrefetchPromise;
     }
 
-    // Retry secrets fetch inline if pre-fetch failed (transient error recovery)
-    if (!GATEWAY_TOKEN) {
-      console.log(
-        "[contract] Gateway token missing — retrying secrets fetch...",
-      );
-      await prefetchSecrets();
-    }
-    if (!GATEWAY_TOKEN) {
-      throw new Error(
-        "Gateway token not available — cannot authenticate WebSocket connections",
-      );
-    }
-
     // 1b. Create scoped S3 credentials (per-user IAM isolation)
-    // Restricts S3 access to the user's namespace prefix, preventing cross-user
-    // data access even through OpenClaw's bash/code execution tools.
+    // Restricts S3 access to the user's namespace prefix.
     let scopedCredsAvailable = false;
     if (process.env.EXECUTION_ROLE_ARN) {
       try {
@@ -937,18 +558,15 @@ async function init(userId, actorId, channel) {
       HOME: process.env.HOME || "/root",
       NODE_PATH: process.env.NODE_PATH || "/app/node_modules",
       NODE_OPTIONS: process.env.NODE_OPTIONS || "",
-      AWS_REGION: process.env.AWS_REGION || "us-west-2",
+      AWS_REGION: process.env.AWS_REGION || "eu-west-1",
       BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "",
       COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
       COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
       COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
       S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
-      SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
-      SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
       USER_ID: actorId,
-      INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
+      INTERNAL_USER_ID: userId,
       CHANNEL: channel,
-      OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
     };
     proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
       env: proxyEnv,
@@ -974,9 +592,9 @@ async function init(userId, actorId, channel) {
     // Build scoped env for OpenClaw — excludes container credentials,
     // uses credential_process for scoped S3 access only.
     // Falls back to full process.env if scoped credentials failed.
-    let openclawEnv;
+    let scopedEnvironment;
     if (scopedCredsAvailable) {
-      openclawEnv = scopedCreds.buildOpenClawEnv({
+      scopedEnvironment = scopedCreds.buildOpenClawEnv({
         credDir: SCOPED_CREDS_DIR,
         baseEnv: process.env,
       });
@@ -987,15 +605,15 @@ async function init(userId, actorId, channel) {
       console.error(
         "[contract] WARNING: Scoped credentials failed — starting OpenClaw with zero AWS access",
       );
-      openclawEnv = scopedCreds.buildOpenClawEnv({
+      scopedEnvironment = scopedCreds.buildOpenClawEnv({
         credDir: null,
         baseEnv: process.env,
       });
-      openclawEnv.OPENCLAW_NO_AWS = "1";
     }
-    // Propagate INTERNAL_USER_ID so OpenClaw skills (e.g., eventbridge-cron)
-    // can resolve the container's authorized userId for DynamoDB writes.
-    openclawEnv.INTERNAL_USER_ID = userId;
+    const openclawEnv = runtimePolicy.buildOpenClawChildEnv({
+      scopedEnv: scopedEnvironment,
+      workspacePrefix: namespace,
+    });
     openclawProcess = spawn(
       "openclaw",
       ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
@@ -1073,11 +691,6 @@ async function init(userId, actorId, channel) {
       );
     });
 
-    // Start browser session in background (non-blocking, fire-and-forget)
-    initBrowserSession(userId).catch((err) => {
-      console.error(`[browser] Init error (non-fatal): ${err.message}`);
-    });
-
     console.log(
       "[contract] Init complete — proxy ready, lightweight agent active",
     );
@@ -1098,8 +711,7 @@ async function init(userId, actorId, channel) {
  * Extract plain text from message content — handles string, array of content
  * blocks, JSON-serialized array of content blocks, or object with text/content.
  *
- * Recursively unwraps nested content blocks (common with subagent responses
- * where each layer wraps the previous one in content block JSON).
+ * Recursively unwraps nested content blocks.
  */
 function extractTextFromContent(content) {
   if (!content) return "";
@@ -1184,114 +796,6 @@ function extractTextFromContent(content) {
     }
   }
   return "";
-}
-
-// ---------------------------------------------------------------------------
-// Telegram progressive streaming helpers
-// ---------------------------------------------------------------------------
-
-const https = require("https");
-
-/**
- * Call the Telegram Bot API. Returns parsed JSON response.
- */
-function telegramApiCall(method, body) {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
-    const req = https.request(
-      {
-        hostname: "api.telegram.org",
-        path: `/bot${TELEGRAM_BOT_TOKEN}/${method}`,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-        timeout: 10000,
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(data));
-          } catch {
-            resolve({ ok: false, description: data });
-          }
-        });
-      },
-    );
-    req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("Telegram API timeout"));
-    });
-    req.end(payload);
-  });
-}
-
-/**
- * Create a Telegram streamer that shows "typing..." indicator while working,
- * then sends ONE clean final message when done. No intermediate edits.
- *
- * onDelta(text): starts a typing indicator loop (sendChatAction every 5s).
- * finalize(text): stops the typing loop and sends a single sendMessage.
- */
-function createTelegramStreamer(chatId) {
-  let typingInterval = null;
-  let typingStarted = false;
-
-  const sendTyping = async () => {
-    try {
-      await telegramApiCall("sendChatAction", {
-        chat_id: chatId,
-        action: "typing",
-      });
-    } catch (err) {
-      console.warn(`[telegram-stream] Typing indicator error: ${err.message}`);
-    }
-  };
-
-  const startTypingLoop = () => {
-    if (typingStarted) return;
-    typingStarted = true;
-    sendTyping();
-    typingInterval = setInterval(sendTyping, 5000);
-    console.log(`[telegram-stream] Typing indicator started for chat_id=${chatId}`);
-  };
-
-  const stopTypingLoop = () => {
-    if (typingInterval) {
-      clearInterval(typingInterval);
-      typingInterval = null;
-    }
-  };
-
-  const onDelta = (text) => {
-    if (!text || text.length < 60) return;
-    startTypingLoop();
-  };
-
-  const finalize = async (text) => {
-    stopTypingLoop();
-    if (!text) return { messageId: null };
-    try {
-      const resp = await telegramApiCall("sendMessage", {
-        chat_id: chatId,
-        text,
-      });
-      const messageId = resp.ok ? resp.result?.message_id : null;
-      if (messageId) {
-        console.log(`[telegram-stream] Final message sent: msg_id=${messageId}`);
-      }
-      return { messageId };
-    } catch (err) {
-      console.warn(`[telegram-stream] Final send error: ${err.message}`);
-      return { messageId: null };
-    }
-  };
-
-  return { onDelta, finalize };
 }
 
 /**
@@ -1664,7 +1168,6 @@ const server = http.createServer(async (req, res) => {
             openclawPid: openclawProcess?.pid || null,
             openclawLogs: openclawLogs.slice(-20),
             totalRequestCount: proxyHealth?.total_requests ?? null,
-            subagentRequestCount: proxyHealth?.subagent_requests ?? null,
             activeTaskCount,
             pingStatus: activeTaskCount > 0 ? "HealthyBusy" : "Healthy",
           };
@@ -1690,99 +1193,6 @@ const server = http.createServer(async (req, res) => {
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "initializing" }));
-          return;
-        }
-
-        // Cron action — blocks until init completes, then bridges the message
-        if (action === "cron") {
-          const { userId, actorId, channel, message } = payload;
-          if (!userId || !actorId || !message) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({ error: "Missing userId, actorId, or message" }),
-            );
-            return;
-          }
-
-          // Update shared identity file so proxy picks up cross-channel changes
-          updateIdentityFile(actorId, channel || "unknown");
-
-          // Block until init completes (unlike chat which returns immediately)
-          if (!openclawReady || !proxyReady) {
-            try {
-              if (!initInProgress) {
-                await init(userId, actorId, channel || "unknown");
-              } else {
-                await initPromise;
-              }
-            } catch (err) {
-              console.error(`[contract] Cron init failed: ${err.message}`);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(
-                JSON.stringify({
-                  response: "Agent initialization failed for scheduled task.",
-                  status: "error",
-                }),
-              );
-              return;
-            }
-          }
-
-          if (!openclawReady || !proxyReady) {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({
-                response: "Agent not ready after initialization.",
-                status: "error",
-              }),
-            );
-            return;
-          }
-
-          // Track active task to prevent idle termination during cron processing
-          lastActivityTime = Math.floor(Date.now() / 1000);
-          activeTaskCount++;
-          let responseText;
-          try {
-            // Enqueue message (serialized with chat messages to prevent WebSocket races)
-            try {
-              responseText = await enqueueMessage(message);
-            } catch (bridgeErr) {
-              responseText = "";
-              console.error(
-                `[contract] Cron bridge error: ${bridgeErr.message}`,
-              );
-            }
-            // Belt-and-suspenders: strip any remaining content-block JSON wrappers
-            if (responseText) responseText = extractTextFromContent(responseText);
-
-            // If bridge returned empty, fall back to lightweight agent
-            if (!responseText || !responseText.trim()) {
-              console.warn(
-                "[contract] Cron bridge returned empty — falling back to lightweight agent",
-              );
-              try {
-                responseText = await agent.chat(message, actorId, Date.now() + 30000);
-              } catch (agentErr) {
-                responseText =
-                  "I couldn't process this scheduled task. Please check the configuration.";
-                console.error(
-                  `[contract] Cron lightweight agent fallback error: ${agentErr.message}`,
-                );
-              }
-            }
-          } finally {
-            activeTaskCount = Math.max(0, activeTaskCount - 1);
-          }
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              response: responseText,
-              userId: currentUserId,
-              sessionId: payload.sessionId || null,
-            }),
-          );
           return;
         }
 
@@ -1842,26 +1252,6 @@ const server = http.createServer(async (req, res) => {
 
           const bridgeText = buildBridgeText(message);
 
-          // Set up progressive Telegram streaming if applicable
-          let telegramStreamer = null;
-          if (
-            TELEGRAM_BOT_TOKEN &&
-            channel === "telegram" &&
-            actorId
-          ) {
-            // actorId is "telegram:123456789" — extract numeric chat ID
-            const chatId = actorId.split(":")[1];
-            if (chatId) {
-              telegramStreamer = createTelegramStreamer(chatId);
-              console.log(
-                `[contract] Telegram streaming enabled for chat_id=${chatId}`,
-              );
-            }
-          }
-          const onDelta = telegramStreamer
-            ? telegramStreamer.onDelta
-            : undefined;
-
           // Track active task to prevent idle termination during chat processing
           lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
@@ -1871,7 +1261,7 @@ const server = http.createServer(async (req, res) => {
             if (openclawReady) {
               // Full OpenClaw path — WebSocket bridge
               try {
-                responseText = await enqueueMessage(bridgeText, onDelta);
+                responseText = await enqueueMessage(bridgeText);
               } catch (bridgeErr) {
                 console.error(
                   `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
@@ -1880,8 +1270,8 @@ const server = http.createServer(async (req, res) => {
               }
               // If bridge returned empty (OpenClaw sent no content), check whether
               // OpenClaw is mid-run before falling back to lightweight agent.
-              // A tool-call-only response or concurrent subagent task can produce
-              // an empty bridge response that is NOT a failure.
+              // A tool-call-only response can produce an empty bridge response
+              // that is not necessarily a failure.
               if (!responseText || !responseText.trim()) {
                 // Brief retry — transient empty responses resolve quickly
                 await new Promise((r) => setTimeout(r, 300));
@@ -1965,31 +1355,12 @@ const server = http.createServer(async (req, res) => {
           // Belt-and-suspenders: strip any remaining content-block JSON wrappers
           if (responseText) responseText = extractTextFromContent(responseText);
 
-          // Finalize Telegram streaming (final edit without "..." suffix)
-          let telegramStreamed = false;
-          if (telegramStreamer && responseText) {
-            try {
-              const result = await telegramStreamer.finalize(responseText);
-              if (result.messageId) {
-                telegramStreamed = true;
-                console.log(
-                  `[contract] Telegram streaming finalized: msg_id=${result.messageId}`,
-                );
-              }
-            } catch (err) {
-              console.warn(
-                `[contract] Telegram streaming finalize error: ${err.message}`,
-              );
-            }
-          }
-
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               response: responseText,
               userId: currentUserId,
               sessionId: payload.sessionId || null,
-              streamed: telegramStreamed || undefined,
             }),
           );
           return;
@@ -2032,10 +1403,6 @@ process.on("SIGTERM", async () => {
     clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = null;
   }
-  if (browserHeaderRefreshTimer) {
-    clearInterval(browserHeaderRefreshTimer);
-    browserHeaderRefreshTimer = null;
-  }
 
   // Save workspace to S3 (10s max)
   const saveTimeout = setTimeout(() => {
@@ -2047,13 +1414,6 @@ process.on("SIGTERM", async () => {
     await workspaceSync.cleanup(currentNamespace);
   } catch (err) {
     console.warn(`[contract] Workspace cleanup error: ${err.message}`);
-  }
-
-  // Stop browser sessions before exit
-  try {
-    await stopBrowserSessions();
-  } catch (err) {
-    console.warn(`[contract] Browser session cleanup error: ${err.message}`);
   }
 
   clearTimeout(saveTimeout);
@@ -2080,7 +1440,7 @@ server.listen(PORT, "0.0.0.0", () => {
     `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
   );
   console.log(
-    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron}",
+    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup}",
   );
 
   // Pre-fetch secrets in background (saves ~2-3s from first-message critical path)

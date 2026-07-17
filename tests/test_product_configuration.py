@@ -59,10 +59,62 @@ def test_bridge_runtime_versions_are_frozen() -> None:
     assert "npm install -g openclaw@" not in dockerfile
 
 
-def test_bridge_image_does_not_install_clawhub() -> None:
+def test_bridge_image_copies_only_the_reviewed_plugin() -> None:
     dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
 
     assert "clawhub" not in dockerfile.casefold()
+    assert "COPY plugins/personal-operator /app/plugins/personal-operator" in dockerfile
+    assert "COPY skills/" not in dockerfile
+    assert "/skills/" not in dockerfile
+    assert "ln -s /opt/openclaw /app/node_modules/openclaw" in dockerfile
+
+
+def test_legacy_executable_skill_trees_are_absent() -> None:
+    assert not (ROOT / "bridge/skills").exists()
+    assert not (ROOT / "bridge/agentcore-browser.test.js").exists()
+    assert not (ROOT / "bridge/browser-lifecycle.test.js").exists()
+
+
+def test_personal_operator_plugin_package_is_frozen() -> None:
+    package = _json("bridge/plugins/personal-operator/package.json")
+    manifest = _json("bridge/plugins/personal-operator/openclaw.plugin.json")
+
+    expected_tools = [
+        "po_file_list",
+        "po_file_read",
+        "po_file_write",
+        "po_file_delete",
+    ]
+    assert package["type"] == "module"
+    assert package["openclaw"]["extensions"] == ["./index.js"]
+    assert package["openclaw"]["compat"]["pluginApi"] == ">=2026.7.2"
+    assert manifest["id"] == "personal-operator"
+    assert manifest["contracts"]["tools"] == expected_tools
+    assert manifest["activation"]["onStartup"] is True
+
+
+def test_contract_has_no_channel_delivery_or_executable_tool_runtime() -> None:
+    contract = (ROOT / "bridge/agentcore-contract.js").read_text(encoding="utf-8")
+    lightweight = (ROOT / "bridge/lightweight-agent.js").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
+
+    assert "TELEGRAM_BOT_TOKEN" not in contract
+    assert "api.telegram.org" not in contract
+    assert "TELEGRAM_CHANNEL_SECRET_ID" not in contract
+    assert "createTelegramStreamer" not in contract
+    assert "eventbridge-cron" not in contract.casefold()
+    assert "clawhub" not in contract.casefold()
+    assert "api-keys" not in contract.casefold()
+    assert "agentcore-browser" not in contract.casefold()
+    assert 'require("./runtime-policy")' in contract
+    assert "buildOpenClawConfig" in contract
+    assert "createLocalGatewayToken" in contract
+    assert "GATEWAY_TOKEN_SECRET_ID" not in contract
+    assert "child_process" not in lightweight
+    assert "/skills/" not in lightweight
+    assert "playwright-core" not in _json("bridge/package.json")["dependencies"]
+    assert "@aws-sdk/client-scheduler" not in _json("bridge/package.json")["dependencies"]
+    assert "playwright-core" not in dockerfile
 
 
 def test_bridge_dependency_install_is_locked() -> None:
@@ -81,14 +133,14 @@ def test_bridge_dependency_install_is_locked() -> None:
     assert "npm install --omit=dev" not in dockerfile
 
 
-def test_readme_distinguishes_target_constraints_from_imported_behavior() -> None:
+def test_readme_records_the_enforced_runtime_boundary() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "## Current imported runtime behavior" in readme
-    assert "until Task 2" in readme
-    assert "`api-keys`" in readme
-    assert "`clawhub-manage`" in readme
-    assert "## Target product boundaries (not yet fully enforced)" in readme
+    assert "## Runtime boundary now enforced" in readme
+    assert "`po_file_list`" in readme
+    assert "`po_file_delete`" in readme
+    assert "arbitrary shell execution is disabled" in readme
+    assert "Telegram delivery remains outside the runtime" in readme
 
 
 def test_cdk_nag_guard_rejects_missing_reports(tmp_path: Path) -> None:

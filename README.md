@@ -21,32 +21,34 @@ foundation stage.
 
 ## Current state
 
-Task 1 establishes the frozen product configuration and a reproducible local
-baseline over the imported AWS sample. It does not deploy infrastructure, send
-messages, or claim that the inherited runtime is least-privilege. Known
-upstream test failures are recorded in [docs/BASELINE.md](docs/BASELINE.md).
+The foundation and first runtime-hardening gate are implemented locally. The
+runtime now has a frozen tool and plugin boundary, but session rebinding,
+least-privilege credential policy, and lossless workspace lifecycle remain
+separate hardening gates. Nothing in this repository has been deployed and no
+real credentials or messages were used.
 
 The implementation proceeds in reviewed tasks described by the approved
 [design](docs/superpowers/specs/2026-07-17-personal-operator-v0-design.md) and
 [plan](docs/superpowers/plans/2026-07-17-personal-operator-v0.md).
 
-## Current imported runtime behavior
+## Runtime boundary now enforced
 
-The foundation checkout still contains inherited behavior that is outside the
-target product boundary:
+- OpenClaw uses the `minimal` profile with exactly `session_status`,
+  `web_search`, `web_fetch`, `po_file_list`, `po_file_read`, `po_file_write`,
+  and `po_file_delete`.
+- The image loads only the repository-owned `personal-operator` plugin from an
+  explicit path. All inherited executable skill trees are removed.
+- Workspace tools accept only relative paths and bounded UTF-8 content. Their
+  S3 prefix comes only from the server environment, never a model argument.
+- In the runtime, arbitrary shell execution is disabled, along with generic filesystem,
+  process, scheduling, UI automation, cross-session, delegated-worker, MCP,
+  marketplace-plugin, and user credential capabilities.
+- The loopback gateway token is generated inside each runtime. Telegram delivery remains outside the runtime, which never fetches a Telegram token or
+  calls the Telegram API.
 
-- The `api-keys` skill is still copied into the bridge image, and its runtime
-  code and credential permissions remain. Its two known baseline test failures
-  are recorded in `docs/BASELINE.md`.
-- The `clawhub-manage` source and imported runtime references still exist,
-  although Task 1 no longer copies that skill or preinstalls community packages
-  in the bridge image.
-- The imported tool policy and credential surface have not yet received the
-  Task 2 least-privilege rewrite.
-
-These paths remain explicitly unaccepted until Task 2 removes them under its
-own test-first change. The configuration below must not be read as proof that
-the complete target security boundary is already enforced.
+This is not the complete security boundary. Immutable user binding and the
+exact S3-only session policy are Runtime Hardening Task 2; lossless
+restore/mount/synchronization is Task 3.
 
 ## Frozen runtime baseline
 
@@ -63,10 +65,9 @@ the complete target security boundary is already enforced.
 | AgentCore runtime identifiers | Empty until an explicit deployment |
 
 OpenClaw `2026.7.2` is not a published npm release. The bridge image fetches
-the audited immutable source commit, verifies the package version, and builds
-it with the source lockfile. Task 1 does not preinstall community marketplace
-packages; the remaining imported management paths are disclosed above and are
-Task 2 work. See [docs/UPSTREAM.md](docs/UPSTREAM.md) for the source ledger.
+the audited immutable source commit, verifies the package version, builds it
+with the source lockfile, and loads the reviewed plugin package directly. See
+[docs/UPSTREAM.md](docs/UPSTREAM.md) for the source ledger.
 
 ## Local validation
 
@@ -92,10 +93,11 @@ Run the complete local baseline:
 The local script runs Python unit tests, serialized Node tests with
 `AWS_REGION=eu-west-1`, JavaScript and Python syntax checks, and an offline CDK
 synthesis contract using a synthetic account number. It never deploys or
-requires cloud credentials. Until later tasks remove the imported defects, the
-aggregate command is expected to report them and exit non-zero.
+requires cloud credentials. Cloud-specific behavior remains provisional until
+a later credentialed staging gate; local tests do not constitute deployment
+evidence.
 
-## Target product boundaries (not yet fully enforced)
+## Remaining product boundaries
 
 - The completed v0 must remain invite-only with browser automation disabled.
 - The target runtime must not allow arbitrary marketplace skill, MCP server,

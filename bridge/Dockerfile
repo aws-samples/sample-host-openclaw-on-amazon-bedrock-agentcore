@@ -5,11 +5,8 @@ FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim AS b
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq git python3 python3-pip && \
+    apt-get install -y --no-install-recommends git python3 && \
     rm -rf /var/lib/apt/lists/*
-
-# Install AWS CLI (for Secrets Manager in entrypoint)
-RUN pip3 install --no-cache-dir --break-system-packages awscli
 
 # The approved 2026.7.2 runtime is an unreleased source snapshot. Fetch the
 # audited commit directly, verify its declared version, and build with its
@@ -35,9 +32,7 @@ RUN mkdir -p /app
 
 WORKDIR /app
 
-# Install the bridge's exact locked production dependency graph. Skip browser
-# binary download — only playwright-core is needed for CDP client connections.
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# Install the bridge's exact locked production dependency graph.
 COPY package.json package-lock.json /app/
 RUN npm ci --omit=dev
 
@@ -49,10 +44,8 @@ RUN mkdir -p /app/.compile-cache && \
       require('@aws-sdk/client-cognito-identity-provider'); \
       require('@aws-sdk/client-s3'); \
       require('@aws-sdk/client-secrets-manager'); \
-      require('@aws-sdk/client-scheduler'); \
-      require('@aws-sdk/client-dynamodb'); \
       require('@aws-sdk/client-sts'); \
-      require('@aws-sdk/lib-dynamodb'); \
+      require('typebox'); \
       require('ws'); \
       console.log('[build] V8 compile cache pre-warmed'); \
     "
@@ -64,13 +57,8 @@ FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim
 
 # Install only runtime system dependencies (no git, no pip, no build tools)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq python3 && \
+    apt-get install -y --no-install-recommends python3 && \
     rm -rf /var/lib/apt/lists/*
-
-# Copy AWS CLI from builder
-COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
-COPY --from=builder /usr/local/lib/python3.*/dist-packages /usr/local/lib/python3.11/dist-packages
-COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-packages
 
 # Copy the verified source build and expose its CLI without a mutable registry
 # install. Relative imports continue to resolve inside /opt/openclaw.
@@ -81,6 +69,7 @@ RUN ln -s /opt/openclaw/openclaw.mjs /usr/local/bin/openclaw
 COPY --from=builder /app/node_modules /app/node_modules
 COPY --from=builder /app/package.json /app/package.json
 COPY --from=builder /app/.compile-cache /app/.compile-cache
+RUN ln -s /opt/openclaw /app/node_modules/openclaw
 
 # Ensure skills can resolve npm packages from /app/node_modules
 ENV NODE_PATH=/app/node_modules
@@ -94,30 +83,15 @@ RUN mkdir -p /root/.openclaw
 COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
+COPY runtime-policy.js /app/runtime-policy.js
 COPY workspace-sync.js /app/workspace-sync.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
 
-# Copy custom per-user file storage skill
-# /skills/ — scanned via extraDirs config (skills also copied to home dir during user setup below)
-COPY skills/s3-user-files /skills/s3-user-files
-RUN chmod +x /skills/s3-user-files/*.js
-
-# Copy EventBridge cron scheduling skill
-COPY skills/eventbridge-cron /skills/eventbridge-cron
-RUN chmod +x /skills/eventbridge-cron/*.js
-
-# Copy API key management skill (dual-mode: native file + Secrets Manager)
-COPY skills/api-keys /skills/api-keys
-RUN chmod +x /skills/api-keys/*.js
-
-# Copy AgentCore browser skill (headless Chromium browsing)
-COPY skills/agentcore-browser /skills/agentcore-browser
-RUN chmod +x /skills/agentcore-browser/*.js
-
-# Copy project instructions (CLAUDE.md) so the agent knows about its skills
-COPY CLAUDE.md /app/CLAUDE.md
+# Copy the only reviewed OpenClaw plugin. No executable skill tree or mutable
+# marketplace content enters the image.
+COPY plugins/personal-operator /app/plugins/personal-operator
 
 # Copy entrypoint
 COPY entrypoint.sh /app/entrypoint.sh
