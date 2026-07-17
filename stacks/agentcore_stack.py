@@ -31,6 +31,16 @@ from constructs import Construct
 # Regions where AgentCore Browser (CfnBrowserCustom) is confirmed available.
 REQUIRED_REGION = "eu-west-1"
 BROWSER_SUPPORTED_REGIONS = {REQUIRED_REGION}
+BEDROCK_INFERENCE_PROFILE_ID = "eu.anthropic.claude-sonnet-4-6"
+BEDROCK_FOUNDATION_MODEL_ID = "anthropic.claude-sonnet-4-6"
+BEDROCK_DESTINATION_REGIONS = (
+    "eu-central-1",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
+    "eu-west-1",
+    "eu-west-3",
+)
 
 
 class AgentCoreStack(Stack):
@@ -89,19 +99,36 @@ class AgentCoreStack(Stack):
             ),
         )
 
-        # Bedrock model invocation
+        # The frozen EU inference profile can route to any of these six EU
+        # Regions. Grant its exact source ARN separately, then bind every
+        # destination model permission to invocations through that profile.
+        inference_profile_arn = (
+            f"arn:aws:bedrock:{region}:{account}:inference-profile/"
+            f"{BEDROCK_INFERENCE_PROFILE_ID}"
+        )
+        bedrock_invocation_actions = [
+            "bedrock:InvokeModel",
+            "bedrock:InvokeModelWithResponseStream",
+        ]
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
-                actions=[
-                    "bedrock:InvokeModel",
-                    "bedrock:InvokeModelWithResponseStream",
-                    "bedrock:Converse",
-                    "bedrock:ConverseStream",
-                ],
+                actions=bedrock_invocation_actions,
+                resources=[inference_profile_arn],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=bedrock_invocation_actions,
                 resources=[
-                    f"arn:aws:bedrock:{region}::foundation-model/*",
-                    f"arn:aws:bedrock:{region}:{account}:inference-profile/*",
+                    f"arn:aws:bedrock:{destination_region}::foundation-model/"
+                    f"{BEDROCK_FOUNDATION_MODEL_ID}"
+                    for destination_region in BEDROCK_DESTINATION_REGIONS
                 ],
+                conditions={
+                    "StringLike": {
+                        "bedrock:InferenceProfileArn": inference_profile_arn,
+                    }
+                },
             )
         )
 
@@ -342,12 +369,10 @@ class AgentCoreStack(Stack):
             [
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
-                    reason="Bedrock model IDs, log streams, ECR repositories, and "
-                    "telemetry APIs require bounded wildcard resources or do not "
-                    "support resource-level permissions.",
+                    reason="Log streams, ECR repositories, and telemetry APIs require "
+                    "bounded wildcard resources or do not support resource-level "
+                    "permissions.",
                     applies_to=[
-                        f"Resource::arn:aws:bedrock:{region}::foundation-model/*",
-                        f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",
                         "Resource::*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*:*",

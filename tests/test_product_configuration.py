@@ -413,6 +413,80 @@ def test_synthesized_execution_role_has_only_exact_workspace_assume_authority() 
     ]
 
 
+def test_synthesized_execution_role_invokes_only_frozen_eu_sonnet_profile() -> None:
+    template = _synth_agentcore_template()
+    _, statements = _role_and_statements(
+        template, "openclaw-agentcore-execution-role-eu-west-1"
+    )
+    invocation_actions = {
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+    }
+    invocation_statements = [
+        statement
+        for statement in statements
+        if invocation_actions
+        & set(
+            statement["Action"]
+            if isinstance(statement["Action"], list)
+            else [statement["Action"]]
+        )
+    ]
+
+    profile_arn = (
+        "arn:aws:bedrock:eu-west-1:123456789012:inference-profile/"
+        "eu.anthropic.claude-sonnet-4-6"
+    )
+    destination_regions = {
+        "eu-central-1",
+        "eu-north-1",
+        "eu-south-1",
+        "eu-south-2",
+        "eu-west-1",
+        "eu-west-3",
+    }
+    foundation_model_arns = {
+        f"arn:aws:bedrock:{region}::foundation-model/anthropic.claude-sonnet-4-6"
+        for region in destination_regions
+    }
+
+    assert len(invocation_statements) == 2
+    profile_statement = next(
+        statement
+        for statement in invocation_statements
+        if statement["Resource"] == profile_arn
+    )
+    model_statement = next(
+        statement
+        for statement in invocation_statements
+        if isinstance(statement["Resource"], list)
+    )
+
+    assert set(profile_statement["Action"]) == invocation_actions
+    assert "Condition" not in profile_statement
+    assert set(model_statement["Action"]) == invocation_actions
+    assert set(model_statement["Resource"]) == foundation_model_arns
+    assert model_statement["Condition"] == {
+        "StringLike": {"bedrock:InferenceProfileArn": profile_arn}
+    }
+
+    invocation_resources = [
+        resource
+        for statement in invocation_statements
+        for resource in (
+            statement["Resource"]
+            if isinstance(statement["Resource"], list)
+            else [statement["Resource"]]
+        )
+    ]
+    assert all("*" not in resource for resource in invocation_resources)
+    assert all("global." not in resource for resource in invocation_resources)
+    assert all(
+        not resource.startswith("arn:aws:bedrock:::")
+        for resource in invocation_resources
+    )
+
+
 def test_agentcore_stack_rejects_wrong_region() -> None:
     try:
         _synth_agentcore_template("us-west-2")
