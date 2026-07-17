@@ -477,13 +477,17 @@ describe("WorkspaceLifecycle", () => {
     });
     await Promise.resolve();
     assert.equal(settled, false);
-    assert.equal(lifecycle.status().activeTurns, 0);
+    assert.equal(
+      lifecycle.status().activeTurns,
+      1,
+      "the turn remains exclusive until its durable commit settles",
+    );
     commit.resolve(committedHead());
     await persisted;
     assert.equal(settled, true);
   });
 
-  it("serializes post-turn and periodic commits through one promise tail", async () => {
+  it("does not admit a turn until an already-running periodic commit finishes", async () => {
     const { WorkspaceLifecycle } = await loadLifecycle();
     const gates = [deferred(), deferred()];
     let active = 0;
@@ -506,18 +510,88 @@ describe("WorkspaceLifecycle", () => {
     });
     const lifecycle = new WorkspaceLifecycle(current.options);
     await lifecycle.initialize();
-    const turn = lifecycle.beginTurn();
-    const first = lifecycle.commitAfterTurn(turn);
-    const second = lifecycle.requestPeriodicCommit();
+    const first = lifecycle.requestPeriodicCommit();
     await Promise.resolve();
     assert.deepEqual(order, ["start-0"]);
+    let admitted = false;
+    const turnPromise = lifecycle.acquireTurn().then((turn) => {
+      admitted = true;
+      return turn;
+    });
+    await Promise.resolve();
+    assert.equal(admitted, false);
     gates[0].resolve();
     await first;
+    const turn = await turnPromise;
+    const second = lifecycle.commitAfterTurn(turn);
     await Promise.resolve();
     assert.deepEqual(order, ["start-0", "end-0", "start-1"]);
     gates[1].resolve();
     await second;
     assert.equal(maximum, 1);
+  });
+
+  it("holds one exclusive turn through its durable commit before admitting the next", async () => {
+    const { WorkspaceLifecycle } = await loadLifecycle();
+    const firstCommit = deferred();
+    let commits = 0;
+    const current = lifecycleFixture({
+      snapshotStore: {
+        commit: async () => {
+          commits += 1;
+          if (commits === 1) await firstCommit.promise;
+          return committedHead();
+        },
+      },
+    });
+    const lifecycle = new WorkspaceLifecycle(current.options);
+    await lifecycle.initialize();
+
+    const firstTurn = await lifecycle.acquireTurn();
+    let secondAdmitted = false;
+    const secondTurnPromise = lifecycle.acquireTurn().then((turn) => {
+      secondAdmitted = true;
+      return turn;
+    });
+    const firstPersisted = lifecycle.commitAfterTurn(firstTurn);
+    await Promise.resolve();
+    assert.equal(secondAdmitted, false);
+    assert.equal(lifecycle.status().activeTurns, 1);
+
+    firstCommit.resolve();
+    await firstPersisted;
+    const secondTurn = await secondTurnPromise;
+    assert.equal(secondAdmitted, true);
+    assert.equal(lifecycle.status().activeTurns, 1);
+    await lifecycle.commitAfterTurn(secondTurn);
+    assert.equal(commits, 2);
+  });
+
+  it("never runs a periodic snapshot while a turn is active or queued", async () => {
+    const { WorkspaceLifecycle } = await loadLifecycle();
+    let commits = 0;
+    const current = lifecycleFixture({
+      snapshotStore: {
+        commit: async () => {
+          commits += 1;
+          return committedHead();
+        },
+      },
+    });
+    const lifecycle = new WorkspaceLifecycle(current.options);
+    await lifecycle.initialize();
+
+    const first = await lifecycle.acquireTurn();
+    const queued = lifecycle.acquireTurn();
+    const skipped = await lifecycle.requestPeriodicCommit();
+    assert.equal(commits, 0);
+    assert.equal(skipped.generation, committedHead().generation);
+
+    await lifecycle.commitAfterTurn(first);
+    const second = await queued;
+    assert.equal(commits, 1);
+    await lifecycle.commitAfterTurn(second);
+    assert.equal(commits, 2);
   });
 
   it("coalesces overlapping periodic requests into one bounded commit", async () => {
@@ -610,6 +684,38 @@ describe("WorkspaceLifecycle", () => {
     await assert.rejects(lifecycle.shutdown(), /final snapshot unavailable/);
     assert.equal(commitCount, 1);
     assert.deepEqual(current.calls, ["prepare", "stop-openclaw", "stop-support"]);
+    assert.equal(lifecycle.status().state, "FAILED");
+  });
+
+  it("bounds every shutdown phase and still attempts child cleanup", async () => {
+    const { WorkspaceLifecycle } = await loadLifecycle();
+    const never = new Promise(() => {});
+    const current = lifecycleFixture({
+      snapshotStore: {
+        commit: async () => never,
+      },
+      options: { shutdownTimeoutMs: 5 },
+    });
+    const lifecycle = new WorkspaceLifecycle(current.options);
+    await lifecycle.initialize();
+
+    const outcome = await Promise.race([
+      lifecycle.shutdown().then(
+        () => ({ status: "fulfilled" }),
+        (error) => ({ status: "rejected", error }),
+      ),
+      new Promise((resolve) =>
+        setTimeout(() => resolve({ status: "hung" }), 100),
+      ),
+    ]);
+
+    assert.equal(outcome.status, "rejected");
+    assert.match(outcome.error.message, /timed out/i);
+    assert.deepEqual(current.calls, [
+      "prepare",
+      "stop-openclaw",
+      "stop-support",
+    ]);
     assert.equal(lifecycle.status().state, "FAILED");
   });
 

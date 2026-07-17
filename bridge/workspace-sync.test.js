@@ -21,7 +21,6 @@ const {
 } = require("./workspace-manifest");
 const { WorkspacePathPolicy } = require("./workspace-path-policy");
 const {
-  WorkspaceConflictError,
   WorkspaceIntegrityError,
   WorkspaceQuarantinedError,
   WorkspaceSnapshotStore,
@@ -390,7 +389,7 @@ describe("CAS reconciliation and failure boundaries", () => {
 
     assert.equal(settled.filter(({ status }) => status === "fulfilled").length, 1);
     const rejected = settled.find(({ status }) => status === "rejected").reason;
-    assertCode(rejected, WorkspaceConflictError, "WORKSPACE_CONFLICT");
+    assertCode(rejected, WorkspaceQuarantinedError, "WORKSPACE_QUARANTINED");
     assert.equal(s3.calls.filter(({ name }) => name === "DeleteObjectCommand").length, 0);
     assert.ok(s3.objects.has(manifestKey("user_A", G1)));
     assert.ok(s3.objects.has(manifestKey("user_A", G2)));
@@ -419,8 +418,25 @@ describe("CAS reconciliation and failure boundaries", () => {
 
     await assert.rejects(
       writerA.commit({ liveDir: treeA, assertWritable: async () => {} }),
-      (error) => assertCode(error, WorkspaceConflictError, "WORKSPACE_CONFLICT"),
+      (error) =>
+        assertCode(
+          error,
+          WorkspaceQuarantinedError,
+          "WORKSPACE_QUARANTINED",
+        ),
     );
+
+    const callsAfterConflict = s3.calls.length;
+    await assert.rejects(
+      writerA.commit({ liveDir: treeA, assertWritable: async () => {} }),
+      (error) =>
+        assertCode(
+          error,
+          WorkspaceQuarantinedError,
+          "WORKSPACE_QUARANTINED",
+        ),
+    );
+    assert.equal(s3.calls.length, callsAfterConflict);
 
     const current = parsePointer(currentBytes(s3));
     assert.equal(current.generation, committedB.generation);
@@ -750,7 +766,12 @@ describe("restore and logical deletion", () => {
     write(targetDir, "workspace/welcome.md", "personalized");
     await assert.rejects(
       store.commit({ liveDir: targetDir, assertWritable: async () => {} }),
-      (error) => assertCode(error, WorkspaceConflictError, "WORKSPACE_CONFLICT"),
+      (error) =>
+        assertCode(
+          error,
+          WorkspaceQuarantinedError,
+          "WORKSPACE_QUARANTINED",
+        ),
     );
 
     const pointerPut = s3.calls.filter(

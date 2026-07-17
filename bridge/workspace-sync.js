@@ -954,13 +954,10 @@ class WorkspaceSnapshotStore {
     ) {
       return current.etag;
     }
-    if (ambiguous) {
-      this._quarantine("ambiguous pointer write exposed a different state", originalError);
-    }
-    throw new WorkspaceConflictError(
-      "WORKSPACE_CONFLICT",
-      "current pointer compare-and-swap lost a race",
-      {},
+    this._quarantine(
+      ambiguous
+        ? "ambiguous pointer write exposed a different state"
+        : "current pointer compare-and-swap exposed a conflicting writer",
       originalError,
     );
   }

@@ -71,10 +71,10 @@ describe("AgentCore workspace lifecycle production coupling", () => {
   });
 
   it("holds every successful chat response until post-turn persistence commits", () => {
-    assert.match(contract, /workspaceLifecycle\.beginTurn\(\)/);
+    assert.match(contract, /await workspaceLifecycle\.acquireTurn\(\)/);
     assert.match(contract, /await workspaceLifecycle\.commitAfterTurn\(/);
     assert.match(contract, /WORKSPACE_PERSISTENCE_FAILED/);
-    const begin = contract.indexOf("workspaceLifecycle.beginTurn()");
+    const begin = contract.indexOf("await workspaceLifecycle.acquireTurn()");
     const execute = contract.indexOf("gatewayRuntimeBoundary.invoke", begin);
     const commit = contract.indexOf(
       "await workspaceLifecycle.commitAfterTurn(",
@@ -82,6 +82,27 @@ describe("AgentCore workspace lifecycle production coupling", () => {
     );
     const response = contract.indexOf("res.end(JSON.stringify", commit);
     assert.ok(begin >= 0 && execute > begin && commit > execute && response > commit);
+  });
+
+  it("keeps health busy through persistence and forbids full in-place reinitialization", () => {
+    const begin = contract.indexOf("await workspaceLifecycle.acquireTurn()");
+    const tracked = contract.indexOf("await activeTaskTracker.run", begin);
+    const commit = contract.indexOf(
+      "await workspaceLifecycle.commitAfterTurn(",
+      tracked,
+    );
+    const trackedEnd = contract.indexOf("});", commit);
+    assert.ok(tracked > begin && commit > tracked && trackedEnd > commit);
+    assert.doesNotMatch(contract, /activeTaskCount\+\+|activeTaskCount\s*=/);
+
+    const init = functionBody(contract, "init", "/**\n * Extract plain text");
+    const claim = init.indexOf("runtimeInitializationGuard.claim()");
+    const lifecycle = init.indexOf("new WorkspaceLifecycle", claim);
+    const proxy = init.indexOf('spawn("node", ["/app/agentcore-proxy.js"]', claim);
+    assert.ok(claim >= 0 && lifecycle > claim && proxy > claim);
+    assert.match(init, /createUnexpectedChildExitHandler/);
+    assert.match(init, /BEDROCK_PROXY_EXITED/);
+    assert.match(init, /proxyProcess\.on\("error"/);
   });
 
   it("delegates ordered draining to the lifecycle and exits nonzero on failure", () => {

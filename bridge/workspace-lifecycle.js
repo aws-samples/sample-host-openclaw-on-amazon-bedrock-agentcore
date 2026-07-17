@@ -344,6 +344,9 @@ class WorkspaceLifecycle {
     this.head = null;
     this.quarantine = null;
     this.activeTurns = new Set();
+    this.turnReleaseByToken = new Map();
+    this.pendingTurnAdmissions = 0;
+    this.turnAdmissionTail = Promise.resolve();
     this.nextTurnId = 1;
     this.activeDrained = null;
     this.commitTail = Promise.resolve();
@@ -358,6 +361,7 @@ class WorkspaceLifecycle {
       state: this.state,
       namespace: this.namespace,
       activeTurns: this.activeTurns.size,
+      pendingTurns: this.pendingTurnAdmissions,
       generation: this.head?.generation || null,
       manifestSha256: this.head?.manifestSha256 || null,
       quarantine: this.quarantine ? { ...this.quarantine } : null,
@@ -417,7 +421,7 @@ class WorkspaceLifecycle {
     return this.initializePromise;
   }
 
-  beginTurn() {
+  _assertTurnAdmissionAllowed() {
     if (this.state !== "READY") {
       const label = this.state === "QUARANTINED" ? "quarantined" : "not ready";
       throw lifecycleError(
@@ -426,10 +430,71 @@ class WorkspaceLifecycle {
         { retryable: this.state !== "QUARANTINED" },
       );
     }
+  }
+
+  _activateTurn(release = null) {
     if (this.activeTurns.size === 0) this.activeDrained = deferredPromise();
     const token = Object.freeze({ id: this.nextTurnId++ });
     this.activeTurns.add(token);
+    if (release) this.turnReleaseByToken.set(token, release);
     return token;
+  }
+
+  beginTurn() {
+    this._assertTurnAdmissionAllowed();
+    if (this.activeTurns.size > 0 || this.pendingTurnAdmissions > 0) {
+      throw lifecycleError(
+        "WORKSPACE_TURN_BUSY",
+        "Another workspace turn already owns the durable state",
+        { retryable: true },
+      );
+    }
+    return this._activateTurn();
+  }
+
+  acquireTurn() {
+    try {
+      this._assertTurnAdmissionAllowed();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    this.pendingTurnAdmissions += 1;
+    const predecessor = this.turnAdmissionTail;
+    let releaseSlot;
+    const slot = new Promise((resolve) => {
+      releaseSlot = resolve;
+    });
+    this.turnAdmissionTail = predecessor.then(
+      () => slot,
+      () => slot,
+    );
+
+    return (async () => {
+      let activated = false;
+      try {
+        await predecessor;
+        // A periodic snapshot that won admission first must finish before the
+        // next mutating turn begins. The retained commit tail never rejects.
+        await this.commitTail;
+        this._assertTurnAdmissionAllowed();
+        if (this.activeTurns.size !== 0) {
+          throw lifecycleError(
+            "WORKSPACE_TURN_INVARIANT",
+            "Workspace turn admission lost exclusivity",
+          );
+        }
+        const token = this._activateTurn(releaseSlot);
+        activated = true;
+        return token;
+      } finally {
+        this.pendingTurnAdmissions = Math.max(
+          0,
+          this.pendingTurnAdmissions - 1,
+        );
+        if (!activated) releaseSlot();
+      }
+    })();
   }
 
   _finishTurn(token) {
@@ -443,6 +508,9 @@ class WorkspaceLifecycle {
       this.activeDrained.resolve();
       this.activeDrained = null;
     }
+    const release = this.turnReleaseByToken.get(token);
+    this.turnReleaseByToken.delete(token);
+    release?.();
   }
 
   _enqueueCommit(reason) {
@@ -472,7 +540,12 @@ class WorkspaceLifecycle {
         `Workspace is ${this.state.toLowerCase()} and cannot persist a turn`,
       );
     }
-    this._finishTurn(token);
+    if (!this.activeTurns.has(token)) {
+      throw lifecycleError(
+        "WORKSPACE_TURN_INVALID",
+        "Workspace turn token is not active",
+      );
+    }
     try {
       return await this._enqueueCommit("post-turn");
     } catch (cause) {
@@ -486,6 +559,8 @@ class WorkspaceLifecycle {
         "Completed work was not acknowledged because persistence failed",
         { retryable: true, cause },
       );
+    } finally {
+      this._finishTurn(token);
     }
   }
 
@@ -495,6 +570,12 @@ class WorkspaceLifecycle {
         "WORKSPACE_PERIODIC_REJECTED",
         `Workspace is ${this.state.toLowerCase()} and cannot run a periodic commit`,
       );
+    }
+    // Every successful turn already commits before acknowledgement. Skipping
+    // a timer tick while a turn is active or queued prevents a snapshot from
+    // observing unacknowledged mutations without weakening durability.
+    if (this.activeTurns.size > 0 || this.pendingTurnAdmissions > 0) {
+      return this.head;
     }
     if (this.periodicCommit) return this.periodicCommit;
     const operation = this._enqueueCommit("periodic");
@@ -541,22 +622,50 @@ class WorkspaceLifecycle {
         this.periodicTimer = null;
       }
       let failure = null;
+      const phase = (operation, label) =>
+        withTimeout(
+          Promise.resolve().then(operation),
+          this.shutdownTimeoutMs,
+          `Timed out ${label}`,
+        );
       try {
         if (this.activeTurns.size > 0 && this.activeDrained) {
-          await withTimeout(
-            this.activeDrained.promise,
-            this.shutdownTimeoutMs,
-            "Timed out draining active workspace turns",
+          await phase(
+            () => this.activeDrained.promise,
+            "draining active workspace turns",
           );
         }
-        await this.commitTail;
-        await this.stopOpenClaw();
-        await this._enqueueCommit("shutdown");
+        await phase(
+          () => this.turnAdmissionTail,
+          "rejecting queued workspace turns",
+        );
+        await phase(
+          () => this.commitTail,
+          "waiting for workspace persistence",
+        );
       } catch (error) {
         failure = error;
       }
       try {
-        await this.stopSupportProcesses();
+        await phase(() => this.stopOpenClaw(), "stopping OpenClaw");
+      } catch (error) {
+        if (!failure) failure = error;
+      }
+      if (!failure) {
+        try {
+          await phase(
+            () => this._enqueueCommit("shutdown"),
+            "persisting the final workspace snapshot",
+          );
+        } catch (error) {
+          failure = error;
+        }
+      }
+      try {
+        await phase(
+          () => this.stopSupportProcesses(),
+          "stopping workspace support processes",
+        );
       } catch (error) {
         if (!failure) failure = error;
       }

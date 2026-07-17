@@ -81,6 +81,8 @@ let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
 let workspaceLifecycle = null;
+const runtimeInitializationGuard = createRuntimeInitializationGuard();
+const activeTaskTracker = createActiveTaskTracker();
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
 
@@ -108,8 +110,6 @@ let openclawRestartCount = 0;
 const OPENCLAW_MAX_RESTARTS = 3;
 const OPENCLAW_RESTART_DELAY_MS = 5000;
 
-// Active task tracking — HealthyBusy prevents AgentCore from terminating during long tasks
-let activeTaskCount = 0;
 // Last activity timestamp (epoch seconds) — reported in /ping so AgentCore can track idle time.
 // Initialized to startup time; updated on each chat/warmup invocation.
 let lastActivityTime = Math.floor(Date.now() / 1000);
@@ -123,6 +123,71 @@ function createRuntimeInvocationAdmission({
   },
 } = {}) {
   return createInvocationHandler({ sessionBinding, handlers });
+}
+
+function createRuntimeInitializationGuard() {
+  let attempted = false;
+  return Object.freeze({
+    get attempted() {
+      return attempted;
+    },
+    claim() {
+      if (attempted) {
+        const error = new Error(
+          "A runtime process cannot replace an initialized workspace in place",
+        );
+        error.code = "RUNTIME_REINITIALIZATION_FORBIDDEN";
+        throw error;
+      }
+      attempted = true;
+    },
+  });
+}
+
+function createUnexpectedChildExitHandler({
+  label,
+  code,
+  isExpected,
+  markUnavailable,
+  quarantine,
+} = {}) {
+  if (
+    typeof label !== "string" ||
+    typeof code !== "string" ||
+    typeof isExpected !== "function" ||
+    typeof markUnavailable !== "function" ||
+    typeof quarantine !== "function"
+  ) {
+    throw new TypeError("Unexpected child exit handler requires exact callbacks");
+  }
+  return (exitCode, signal) => {
+    markUnavailable();
+    if (isExpected()) return;
+    const error = new Error(
+      `${label} exited unexpectedly (code=${exitCode ?? "none"}, signal=${signal ?? "none"})`,
+    );
+    quarantine(error, code);
+  };
+}
+
+function createActiveTaskTracker() {
+  let count = 0;
+  return Object.freeze({
+    get count() {
+      return count;
+    },
+    async run(task) {
+      if (typeof task !== "function") {
+        throw new TypeError("Active task tracker requires a task callback");
+      }
+      count += 1;
+      try {
+        return await task();
+      } finally {
+        count = Math.max(0, count - 1);
+      }
+    },
+  });
 }
 
 function hashBoundInvocation({ identity, delivery, request } = {}) {
@@ -511,6 +576,7 @@ async function stopSupportProcesses() {
 async function init(internalUserId, namespace) {
   if (proxyReady) return; // Already initialized
   if (initInProgress) return initPromise;
+  runtimeInitializationGuard.claim();
   initInProgress = true;
 
   initPromise = (async () => {
@@ -594,9 +660,26 @@ async function init(internalUserId, namespace) {
     proxyProcess.stderr.on("data", (d) => {
       d.toString().split("\n").filter(Boolean).forEach(line => console.error(`[proxy:err] ${line}`));
     });
-    proxyProcess.on("exit", (code) => {
-      console.log(`[contract] Proxy exited with code ${code}`);
+    const handleProxyExit = createUnexpectedChildExitHandler({
+      label: "Bedrock proxy",
+      code: "BEDROCK_PROXY_EXITED",
+      isExpected: () => shuttingDown || Boolean(gatewayQuarantined),
+      markUnavailable: () => {
+        proxyReady = false;
+      },
+      quarantine: quarantineRuntime,
+    });
+    proxyProcess.on("exit", (code, signal) => {
+      console.log(
+        `[contract] Proxy exited with code ${code} signal ${signal || "none"}`,
+      );
+      handleProxyExit(code, signal);
+    });
+    proxyProcess.on("error", (error) => {
       proxyReady = false;
+      if (!shuttingDown && !gatewayQuarantined) {
+        quarantineRuntime(error, "BEDROCK_PROXY_PROCESS_ERROR");
+      }
     });
 
     console.log("[contract] Starting OpenClaw gateway (headless)...");
@@ -634,6 +717,12 @@ async function init(internalUserId, namespace) {
       openclawExitCode = code;
       openclawReady = false;
       scheduleOpenClawRestart(currentNamespace);
+    });
+    openclawProcess.on("error", (error) => {
+      openclawReady = false;
+      if (!shuttingDown && !gatewayQuarantined) {
+        quarantineRuntime(error, "OPENCLAW_PROCESS_ERROR");
+      }
     });
 
     // 2. Wait only for proxy readiness (~5s)
@@ -826,17 +915,17 @@ const server = http.createServer(async (req, res) => {
     const uptimeSec = Math.floor((now - startTime) / 1000);
     // HealthyBusy prevents AgentCore from terminating during active tasks.
     // Healthy allows natural idle termination when no tasks are running.
-    const status = activeTaskCount > 0 ? "HealthyBusy" : "Healthy";
+    const status = activeTaskTracker.count > 0 ? "HealthyBusy" : "Healthy";
     const responseBody = {
       status,
       time_of_last_update: lastActivityTime,
-      active_tasks: activeTaskCount,
+      active_tasks: activeTaskTracker.count,
     };
 
     // Log every ping for the first 5 minutes, then every 60s
     if (uptimeSec < 300 || now - lastPingLogTime >= PING_LOG_INTERVAL_MS) {
       console.log(
-        `[contract] /ping #${pingCount} uptime=${uptimeSec}s status=${responseBody.status} openclawReady=${openclawReady} proxyReady=${proxyReady} activeTasks=${activeTaskCount}`,
+        `[contract] /ping #${pingCount} uptime=${uptimeSec}s status=${responseBody.status} openclawReady=${openclawReady} proxyReady=${proxyReady} activeTasks=${activeTaskTracker.count}`,
       );
       lastPingLogTime = now;
     }
@@ -901,8 +990,9 @@ const server = http.createServer(async (req, res) => {
             openclawPid: openclawProcess?.pid || null,
             openclawLogs: openclawLogs.slice(-20),
             totalRequestCount: proxyHealth?.total_requests ?? null,
-            activeTaskCount,
-            pingStatus: activeTaskCount > 0 ? "HealthyBusy" : "Healthy",
+            activeTaskCount: activeTaskTracker.count,
+            pingStatus:
+              activeTaskTracker.count > 0 ? "HealthyBusy" : "Healthy",
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));
@@ -1018,7 +1108,7 @@ const server = http.createServer(async (req, res) => {
                 const bridgeText = buildBridgeText(message);
                 let workspaceTurn;
                 try {
-                  workspaceTurn = workspaceLifecycle.beginTurn();
+                  workspaceTurn = await workspaceLifecycle.acquireTurn();
                 } catch (workspaceError) {
                   gatewayQuarantined =
                     workspaceLifecycle?.status().quarantine ||
@@ -1035,92 +1125,88 @@ const server = http.createServer(async (req, res) => {
                   };
                 }
                 lastActivityTime = Math.floor(Date.now() / 1000);
-                activeTaskCount++;
                 let executionText;
                 let executionStatus;
                 let executionErrorCode;
                 let unexpectedExecutionError;
-                try {
-                  if (openclawReady) {
-                    try {
-                      const gatewayOutcome =
-                        await gatewayRuntimeBoundary.invoke({
-                          invokePrimary: () =>
-                            enqueueMessage(bridgeText, gatewayRunId),
-                          invokeFallback: () =>
-                            agent.chat(
-                              bridgeText,
-                              Date.now() + 30000,
-                            ),
-                        });
-                      executionText = gatewayOutcome.text;
-                    } catch (bridgeErr) {
-                      gatewayQuarantined =
-                        gatewayRuntimeBoundary.getQuarantine();
-                      if (gatewayQuarantined) openclawReady = false;
-                      console.error(
-                        `[contract] Committed gateway invocation failed: ${bridgeErr.code || "UNKNOWN"} ${bridgeErr.message}`,
-                      );
-                      executionErrorCode =
-                        bridgeErr.code || "GATEWAY_INVOCATION_FAILED";
-                      if (bridgeErr.code === "UNCERTAIN_AGENT_RUN") {
-                        executionStatus = "uncertain";
-                        executionText =
-                          "I couldn't confirm whether that request stopped, so I won't run it again. Check its status before retrying.";
-                      } else {
-                        executionStatus = "failed";
-                        executionText =
-                          "The request failed without a committed response and was not run again.";
+                await activeTaskTracker.run(async () => {
+                  try {
+                    if (openclawReady) {
+                      try {
+                        const gatewayOutcome =
+                          await gatewayRuntimeBoundary.invoke({
+                            invokePrimary: () =>
+                              enqueueMessage(bridgeText, gatewayRunId),
+                            invokeFallback: () =>
+                              agent.chat(bridgeText, Date.now() + 30000),
+                          });
+                        executionText = gatewayOutcome.text;
+                      } catch (bridgeErr) {
+                        gatewayQuarantined =
+                          gatewayRuntimeBoundary.getQuarantine();
+                        if (gatewayQuarantined) openclawReady = false;
+                        console.error(
+                          `[contract] Committed gateway invocation failed: ${bridgeErr.code || "UNKNOWN"} ${bridgeErr.message}`,
+                        );
+                        executionErrorCode =
+                          bridgeErr.code || "GATEWAY_INVOCATION_FAILED";
+                        if (bridgeErr.code === "UNCERTAIN_AGENT_RUN") {
+                          executionStatus = "uncertain";
+                          executionText =
+                            "I couldn't confirm whether that request stopped, so I won't run it again. Check its status before retrying.";
+                        } else {
+                          executionStatus = "failed";
+                          executionText =
+                            "The request failed without a committed response and was not run again.";
+                        }
                       }
-                    }
-                  } else if (proxyReady) {
-                    console.log(
-                      "[contract] Routing via lightweight agent (warm-up)",
-                    );
-                    try {
-                      executionText = await agent.chat(
-                        bridgeText,
-                        Date.now() + 620000,
+                    } else if (proxyReady) {
+                      console.log(
+                        "[contract] Routing via lightweight agent (warm-up)",
                       );
-                    } catch (agentErr) {
+                      try {
+                        executionText = await agent.chat(
+                          bridgeText,
+                          Date.now() + 620000,
+                        );
+                      } catch (agentErr) {
+                        executionText =
+                          "I'm having trouble right now. Please try again in a moment.";
+                        executionStatus = "failed";
+                        executionErrorCode = "LIGHTWEIGHT_AGENT_FAILED";
+                        console.error(
+                          `[contract] Lightweight agent error: ${agentErr.message}`,
+                        );
+                      }
+                    } else {
                       executionText =
-                        "I'm having trouble right now. Please try again in a moment.";
+                        "I'm starting up — please try again in a moment.";
                       executionStatus = "failed";
-                      executionErrorCode = "LIGHTWEIGHT_AGENT_FAILED";
-                      console.error(
-                        `[contract] Lightweight agent error: ${agentErr.message}`,
-                      );
+                      executionErrorCode = "RUNTIME_NOT_READY";
                     }
-                  } else {
-                    executionText =
-                      "I'm starting up — please try again in a moment.";
-                    executionStatus = "failed";
-                    executionErrorCode = "RUNTIME_NOT_READY";
+                  } catch (executionError) {
+                    unexpectedExecutionError = executionError;
                   }
-                } catch (executionError) {
-                  unexpectedExecutionError = executionError;
-                } finally {
-                  activeTaskCount = Math.max(0, activeTaskCount - 1);
-                }
 
-                try {
-                  await workspaceLifecycle.commitAfterTurn(workspaceTurn);
-                } catch (workspaceError) {
-                  gatewayQuarantined =
-                    workspaceLifecycle.status().quarantine ||
-                    Object.freeze({
-                      code: "WORKSPACE_PERSISTENCE_FAILED",
-                      message: "Workspace persistence failed",
+                  try {
+                    await workspaceLifecycle.commitAfterTurn(workspaceTurn);
+                  } catch (workspaceError) {
+                    gatewayQuarantined =
+                      workspaceLifecycle.status().quarantine ||
+                      Object.freeze({
+                        code: "WORKSPACE_PERSISTENCE_FAILED",
+                        message: "Workspace persistence failed",
+                      });
+                    openclawReady = false;
+                    void stopOpenClawForSnapshot().catch((stopError) => {
+                      console.error(
+                        `[contract] OpenClaw quarantine stop failed: ${stopError.message}`,
+                      );
                     });
-                  openclawReady = false;
-                  void stopOpenClawForSnapshot().catch((stopError) => {
-                    console.error(
-                      `[contract] OpenClaw quarantine stop failed: ${stopError.message}`,
-                    );
-                  });
-                  throw workspaceError;
-                }
-                if (unexpectedExecutionError) throw unexpectedExecutionError;
+                    throw workspaceError;
+                  }
+                  if (unexpectedExecutionError) throw unexpectedExecutionError;
+                });
 
                 if (executionText) {
                   executionText = extractTextFromContent(executionText);
@@ -1239,7 +1325,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  createActiveTaskTracker,
   createRuntimeInvocationAdmission,
+  createRuntimeInitializationGuard,
+  createUnexpectedChildExitHandler,
   hashBoundInvocation,
   startContractServer,
 };
