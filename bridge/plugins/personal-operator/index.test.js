@@ -123,7 +123,7 @@ describe("workspace namespace boundary", () => {
     assert.equal(result, "safe");
     assert.deepEqual(s3.calls[0].input, {
       Bucket: "personal-operator-files",
-      Key: "user_alpha123/notes/today.md",
+      Key: "user_alpha123/files/notes/today.md",
     });
   });
 
@@ -147,7 +147,7 @@ describe("workspace namespace boundary", () => {
       prefix: "victim",
     });
 
-    assert.equal(s3.calls[0].input.Key, "user_alpha123/notes.md");
+    assert.equal(s3.calls[0].input.Key, "user_alpha123/files/notes.md");
   });
 
   it("fails closed when required server namespace configuration is missing", async () => {
@@ -193,10 +193,29 @@ describe("strict path and UTF-8 validation", () => {
     }
   });
 
+  it("rejects reserved internal top-level namespaces before S3 access", async () => {
+    const module = await loadPlugin();
+    const s3 = new FakeS3Client(() => ({}));
+    const store = module.createWorkspaceStore({
+      s3Client: s3,
+      env: env(),
+    });
+
+    for (const filePath of [
+      ".openclaw/openclaw.json",
+      "_uploads/image.png",
+      "_internal/state.json",
+      "internal/state.json",
+    ]) {
+      await assert.rejects(() => store.read(filePath), /reserved/i, filePath);
+    }
+    assert.equal(s3.calls.length, 0);
+  });
+
   it("accepts nested Unicode relative paths", async () => {
     const module = await loadPlugin();
     const s3 = new FakeS3Client((command) => {
-      assert.equal(command.input.Key, "user_alpha123/märkmed/tere-世界.txt");
+      assert.equal(command.input.Key, "user_alpha123/files/märkmed/tere-世界.txt");
       return { ContentLength: 5, Body: Readable.from([Buffer.from("hello")]) };
     });
     const store = module.createWorkspaceStore({ s3Client: s3, env: env() });
@@ -293,21 +312,21 @@ describe("bounded S3 workspace operations", () => {
     const s3 = new FakeS3Client((command, callNumber) => {
       assert.equal(command.constructor.name, "ListObjectsV2Command");
       assert.equal(command.input.Bucket, "personal-operator-files");
-      assert.equal(command.input.Prefix, "user_alpha123/");
+      assert.equal(command.input.Prefix, "user_alpha123/files/");
       if (callNumber === 1) {
         assert.equal(command.input.ContinuationToken, undefined);
         return {
           Contents: [
-            { Key: "user_alpha123/z.txt", Size: 3 },
-            { Key: "user_alpha123/folder/", Size: 0 },
-            { Key: "user_alpha123/é.txt", Size: 2 },
+            { Key: "user_alpha123/files/z.txt", Size: 3 },
+            { Key: "user_alpha123/files/folder/", Size: 0 },
+            { Key: "user_alpha123/files/é.txt", Size: 2 },
           ],
           NextContinuationToken: "next-page",
         };
       }
       assert.equal(command.input.ContinuationToken, "next-page");
       return {
-        Contents: [{ Key: "user_alpha123/a.txt", Size: 1 }],
+        Contents: [{ Key: "user_alpha123/files/a.txt", Size: 1 }],
       };
     });
     const store = module.createWorkspaceStore({ s3Client: s3, env: env() });
@@ -324,7 +343,7 @@ describe("bounded S3 workspace operations", () => {
     const store = module.createWorkspaceStore({
       s3Client: new FakeS3Client(() => ({
         Contents: [
-          { Key: "user_alpha123/ok.txt", Size: 1 },
+          { Key: "user_alpha123/files/ok.txt", Size: 1 },
           { Key: "user_alpha1234/collision.txt", Size: 2 },
         ],
       })),
@@ -339,7 +358,7 @@ describe("bounded S3 workspace operations", () => {
     const store = module.createWorkspaceStore({
       s3Client: new FakeS3Client(() => ({
         Contents: Array.from({ length: 1001 }, (_, index) => ({
-          Key: `user_alpha123/file-${String(index).padStart(4, "0")}.txt`,
+          Key: `user_alpha123/files/file-${String(index).padStart(4, "0")}.txt`,
           Size: 1,
         })),
       })),
@@ -366,7 +385,7 @@ describe("bounded S3 workspace operations", () => {
     const s3 = new FakeS3Client((command) => {
       assert.equal(command.constructor.name, "PutObjectCommand");
       assert.equal(command.input.Bucket, "personal-operator-files");
-      assert.equal(command.input.Key, "user_alpha123/notes.txt");
+      assert.equal(command.input.Key, "user_alpha123/files/notes.txt");
       assert.deepEqual(command.input.Body, Buffer.from("Tere 🌍", "utf8"));
       assert.equal(command.input.ContentType, "text/plain; charset=utf-8");
       assert.deepEqual(command.input.Metadata, {
@@ -388,7 +407,7 @@ describe("bounded S3 workspace operations", () => {
       assert.equal(command.constructor.name, "DeleteObjectCommand");
       assert.deepEqual(command.input, {
         Bucket: "personal-operator-files",
-        Key: "user_alpha123/old.txt",
+        Key: "user_alpha123/files/old.txt",
       });
       return {};
     });

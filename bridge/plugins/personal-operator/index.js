@@ -16,6 +16,12 @@ const WORKSPACE_PREFIX_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{1,64}$/;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
 const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/;
 const SYMLINK_LIKE_SEGMENT = /(?:^|\.)symlink$/i;
+const RESERVED_TOP_LEVEL_SEGMENTS = new Set([
+  ".openclaw",
+  "_uploads",
+  "_internal",
+  "internal",
+]);
 
 function assertWellFormed(value, label) {
   if (typeof value !== "string" || !value.isWellFormed()) {
@@ -51,6 +57,9 @@ export function validateRelativePath(value) {
   ) {
     throw new Error("File path contains a directory, traversal, or symlink-like segment");
   }
+  if (RESERVED_TOP_LEVEL_SEGMENTS.has(segments[0].toLowerCase())) {
+    throw new Error("File path uses a reserved internal top-level namespace");
+  }
   return value;
 }
 
@@ -69,7 +78,7 @@ function resolveConfiguration(runtimeEnv) {
   return {
     bucket,
     workspacePrefix,
-    objectPrefix: `${workspacePrefix}/`,
+    objectPrefix: `${workspacePrefix}/files/`,
     region: runtimeEnv.AWS_REGION || "eu-west-1",
   };
 }

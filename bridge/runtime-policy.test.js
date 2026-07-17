@@ -1,5 +1,7 @@
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -12,7 +14,6 @@ try {
 
 const APPROVED_TOOLS = [
   "session_status",
-  "web_search",
   "web_fetch",
   "po_file_list",
   "po_file_read",
@@ -39,6 +40,8 @@ const FORBIDDEN_TOOL_FAMILIES = [
   "canvas",
 ];
 
+const GATEWAY_CLIENT_SCOPES = ["operator.read", "operator.write"];
+
 describe("frozen runtime policy", () => {
   it("exports the runtime policy module", () => {
     assert.ok(policyModule, "runtime-policy.js must exist");
@@ -62,9 +65,12 @@ describe("frozen runtime policy", () => {
       enabled: true,
       allow: ["personal-operator"],
       load: { paths: ["/app/plugins/personal-operator"] },
-      entries: { "personal-operator": { enabled: true } },
+      entries: {
+        "personal-operator": { enabled: true },
+      },
       slots: { memory: "none" },
     });
+    assert.equal("web" in policy.tools, false);
   });
 
   it("does not expose any forbidden tool family", () => {
@@ -101,15 +107,34 @@ describe("generated OpenClaw configuration", () => {
     ]);
     assert.equal(config.gateway.auth.token, "a".repeat(43));
     assert.deepEqual(config.gateway.controlUi, { enabled: false });
-    assert.equal("skills" in config, false);
+    assert.deepEqual(config.agents.defaults.skills, []);
+    assert.deepEqual(config.skills, { allowBundled: [] });
+    assert.deepEqual(config.commands, { text: false });
     assert.equal("subagents" in config.agents.defaults, false);
     assert.equal("exec" in config.tools, false);
 
     const serialized = JSON.stringify(config);
+    assert.doesNotMatch(serialized, /web_search|duckduckgo/i);
     assert.doesNotMatch(serialized, /dangerously/i);
     assert.doesNotMatch(serialized, /allowInsecureAuth/i);
     assert.doesNotMatch(serialized, /allowedOrigins/i);
     assert.doesNotMatch(serialized, /\/skills/);
+  });
+
+  it("uses only read/write gateway scopes and gives the client no config authority", () => {
+    assert.deepEqual(policyModule.GATEWAY_CLIENT_SCOPES, GATEWAY_CLIENT_SCOPES);
+    assert.equal(policyModule.GATEWAY_CLIENT_SCOPES.includes("operator.admin"), false);
+
+    const contractSource = fs.readFileSync(
+      path.join(__dirname, "agentcore-contract.js"),
+      "utf8",
+    );
+    assert.match(contractSource, /scopes:\s*runtimePolicy\.GATEWAY_CLIENT_SCOPES/);
+    assert.doesNotMatch(contractSource, /operator\.admin/);
+    assert.match(contractSource, /minProtocol:\s*4/);
+    assert.match(contractSource, /maxProtocol:\s*4/);
+    assert.match(contractSource, /id:\s*"gateway-client"/);
+    assert.doesNotMatch(contractSource, /id:\s*"openclaw-control-ui"/);
   });
 
   it("rejects a missing local gateway token", () => {

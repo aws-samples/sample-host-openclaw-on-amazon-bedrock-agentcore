@@ -4,7 +4,6 @@ const { randomBytes } = require("node:crypto");
 
 const APPROVED_TOOLS = Object.freeze([
   "session_status",
-  "web_search",
   "web_fetch",
   "po_file_list",
   "po_file_read",
@@ -21,6 +20,10 @@ const PROFILE_ADDITIONS = Object.freeze(
 
 const PLUGIN_ID = "personal-operator";
 const PLUGIN_PATH = "/app/plugins/personal-operator";
+const GATEWAY_CLIENT_SCOPES = Object.freeze([
+  "operator.read",
+  "operator.write",
+]);
 
 const CHILD_ENV_ALLOWLIST = Object.freeze([
   "PATH",
@@ -43,7 +46,9 @@ function buildRuntimePolicy() {
       enabled: true,
       allow: [PLUGIN_ID],
       load: { paths: [PLUGIN_PATH] },
-      entries: { [PLUGIN_ID]: { enabled: true } },
+      entries: {
+        [PLUGIN_ID]: { enabled: true },
+      },
       slots: { memory: "none" },
     },
   };
@@ -73,8 +78,11 @@ function buildOpenClawConfig({
     agents: {
       defaults: {
         model: { primary: "agentcore/bedrock-agentcore" },
+        skills: [],
       },
     },
+    skills: { allowBundled: [] },
+    commands: { text: false },
     tools: policy.tools,
     plugins: policy.plugins,
     gateway: {
@@ -113,6 +121,7 @@ module.exports = {
   PROFILE_ADDITIONS,
   PLUGIN_ID,
   PLUGIN_PATH,
+  GATEWAY_CLIENT_SCOPES,
   CHILD_ENV_ALLOWLIST,
   buildRuntimePolicy,
   buildOpenClawConfig,

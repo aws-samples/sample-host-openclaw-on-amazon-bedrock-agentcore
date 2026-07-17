@@ -6,7 +6,6 @@ its tool surface as a frozen security contract, not an extensibility point.
 OpenClaw runs with the `minimal` profile and exactly these allowed tools:
 
 - `session_status`
-- `web_search`
 - `web_fetch`
 - `po_file_list`
 - `po_file_read`

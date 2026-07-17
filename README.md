@@ -34,12 +34,19 @@ The implementation proceeds in reviewed tasks described by the approved
 ## Runtime boundary now enforced
 
 - OpenClaw uses the `minimal` profile with exactly `session_status`,
-  `web_search`, `web_fetch`, `po_file_list`, `po_file_read`, `po_file_write`,
-  and `po_file_delete`.
+  `web_fetch`, `po_file_list`, `po_file_read`, `po_file_write`, and
+  `po_file_delete`. A live pinned-gateway invocation verified `web_fetch`;
+  `web_search` is deliberately deferred because the reviewed key-free
+  DuckDuckGo provider returned a bot-detection challenge.
 - The image loads only the repository-owned `personal-operator` plugin from an
-  explicit path. All inherited executable skill trees are removed.
+  explicit path. All inherited executable skill trees are removed, bundled
+  skills are disabled, and the agent's effective skill inventory is empty.
 - Workspace tools accept only relative paths and bounded UTF-8 content. Their
-  S3 prefix comes only from the server environment, never a model argument.
+  S3 keys are confined to `<server workspace prefix>/files/`; root runtime
+  state, `.openclaw`, `_uploads`, and internal namespaces are unreachable.
+- Text commands are disabled. The gateway bridge requests only
+  `operator.read` and `operator.write`; a live pinned-gateway proof rejected
+  `config.patch` for missing `operator.admin` and left the config byte-identical.
 - In the runtime, arbitrary shell execution is disabled, along with generic filesystem,
   process, scheduling, UI automation, cross-session, delegated-worker, MCP,
   marketplace-plugin, and user credential capabilities.
