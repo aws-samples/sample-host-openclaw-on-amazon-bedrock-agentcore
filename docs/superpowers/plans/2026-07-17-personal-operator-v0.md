@@ -50,6 +50,8 @@
 
 ### Task 2: Curated and least-privilege OpenClaw runtime
 
+> **Execution amendment:** This security boundary is implemented and reviewed through the three smaller gates in `docs/superpowers/plans/2026-07-17-runtime-hardening.md`. That plan supersedes the file list and checklist below where they differ; Task 3 must not begin until its Runtime Hardening Exit Gate passes.
+
 **Files:**
 - Create: `bridge/runtime-policy.js`
 - Create: `bridge/runtime-policy.test.js`
