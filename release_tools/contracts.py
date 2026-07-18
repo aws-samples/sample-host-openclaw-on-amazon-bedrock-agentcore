@@ -403,6 +403,170 @@ class RuntimeConfigurationV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ProductionObservationConfigV1:
+    """Reviewed, credential-free inputs for authoritative release observation."""
+
+    SCHEMA: ClassVar[str] = "personal-operator.production-observation-config.v1"
+    FIELDS: ClassVar[set[str]] = {
+        "schema",
+        "sourceCommit",
+        "sourceTree",
+        "account",
+        "region",
+        "buildContext",
+        "builderId",
+        "builderInputs",
+        "runtimeSubnetIds",
+        "runtimeSecurityGroupIds",
+        "runtimeEnvironmentVariables",
+        "runtimeIdleSessionTimeout",
+        "runtimeMaxLifetime",
+    }
+
+    source_commit: str
+    source_tree: str
+    account: str
+    region: str
+    build_context: str
+    builder_id: str
+    builder_inputs: tuple[str, ...]
+    runtime_subnet_ids: tuple[str, ...]
+    runtime_security_group_ids: tuple[str, ...]
+    runtime_environment_variables: tuple[tuple[str, str], ...]
+    runtime_idle_session_timeout: int
+    runtime_max_lifetime: int
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: Mapping[str, Any],
+    ) -> "ProductionObservationConfigV1":
+        value = _exact_object(
+            raw,
+            cls.FIELDS,
+            label="production observation config",
+        )
+        if value["schema"] != cls.SCHEMA:
+            raise ContractError("production observation config schema is invalid")
+        commit = _text(
+            value["sourceCommit"],
+            field="source commit",
+            pattern=_SHA_40,
+        )
+        tree = _text(
+            value["sourceTree"],
+            field="source tree",
+            pattern=_SHA_40,
+        )
+        account = _account(value["account"])
+        region = _region(value["region"])
+        build_context = _safe_path(value["buildContext"], field="build context")
+        if build_context == "." or len(build_context) > 256:
+            raise ContractError("build context is invalid")
+        builder_id = _text(value["builderId"], field="builder ID")
+        if (
+            len(builder_id) > 512
+            or re.fullmatch(r"https://[^\s]+", builder_id) is None
+        ):
+            raise ContractError("builder ID is invalid")
+
+        raw_builder_inputs = value["builderInputs"]
+        if (
+            not isinstance(raw_builder_inputs, list)
+            or not raw_builder_inputs
+            or len(raw_builder_inputs) > 64
+            or any(
+                not isinstance(item, str) or _DIGEST.fullmatch(item) is None
+                for item in raw_builder_inputs
+            )
+            or raw_builder_inputs != sorted(raw_builder_inputs)
+            or len(set(raw_builder_inputs)) != len(raw_builder_inputs)
+        ):
+            raise ContractError(
+                "builder input inventory is not exact and canonical"
+            )
+
+        runtime_image_uri = (
+            f"{account}.dkr.ecr.{region}.amazonaws.com/"
+            f"{RUNTIME_REPOSITORY}@sha256:{'0' * 64}"
+        )
+        runtime = RuntimeConfigurationV1.from_mapping(
+            {
+                "agentRuntimeArtifact": {
+                    "containerConfiguration": {"containerUri": runtime_image_uri}
+                },
+                "environmentVariables": value["runtimeEnvironmentVariables"],
+                "filesystemConfigurations": [
+                    {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+                ],
+                "lifecycleConfiguration": {
+                    "idleRuntimeSessionTimeout": value[
+                        "runtimeIdleSessionTimeout"
+                    ],
+                    "maxLifetime": value["runtimeMaxLifetime"],
+                },
+                "networkConfiguration": {
+                    "networkMode": "VPC",
+                    "networkModeConfig": {
+                        "securityGroups": value["runtimeSecurityGroupIds"],
+                        "subnets": value["runtimeSubnetIds"],
+                    },
+                },
+                "protocolConfiguration": {"serverProtocol": "HTTP"},
+            },
+            runtime_image_uri=runtime_image_uri,
+            region=region,
+        )
+        return cls(
+            source_commit=commit,
+            source_tree=tree,
+            account=account,
+            region=region,
+            build_context=build_context,
+            builder_id=builder_id,
+            builder_inputs=tuple(raw_builder_inputs),
+            runtime_subnet_ids=runtime.subnet_ids,
+            runtime_security_group_ids=runtime.security_group_ids,
+            runtime_environment_variables=runtime.environment_variables,
+            runtime_idle_session_timeout=runtime.idle_runtime_session_timeout,
+            runtime_max_lifetime=runtime.max_lifetime,
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "ProductionObservationConfigV1":
+        return cls.from_mapping(parse_canonical_object(payload))
+
+    @property
+    def execution_role_arn(self) -> str:
+        return expected_execution_role_arn(self.account, self.region)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "sourceCommit": self.source_commit,
+            "sourceTree": self.source_tree,
+            "account": self.account,
+            "region": self.region,
+            "buildContext": self.build_context,
+            "builderId": self.builder_id,
+            "builderInputs": list(self.builder_inputs),
+            "runtimeSubnetIds": list(self.runtime_subnet_ids),
+            "runtimeSecurityGroupIds": list(self.runtime_security_group_ids),
+            "runtimeEnvironmentVariables": dict(
+                self.runtime_environment_variables
+            ),
+            "runtimeIdleSessionTimeout": self.runtime_idle_session_timeout,
+            "runtimeMaxLifetime": self.runtime_max_lifetime,
+        }
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_mapping())
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeContextV3:
     SCHEMA: ClassVar[str] = "personal-operator.runtime-context.v3"
     FIELDS: ClassVar[set[str]] = {
@@ -1133,7 +1297,8 @@ class StagingTransactionV1:
 
 
 ReleaseContract = (
-    RuntimeContextV3
+    ProductionObservationConfigV1
+    | RuntimeContextV3
     | RuntimeImageEvidence
     | TrustedLambdaAssetV2
     | StagingTransactionV1
@@ -1146,6 +1311,9 @@ def parse_release_contract(payload: bytes) -> ReleaseContract:
     value = parse_canonical_object(payload)
     schema = value.get("schema")
     parsers = {
+        ProductionObservationConfigV1.SCHEMA: (
+            ProductionObservationConfigV1.from_mapping
+        ),
         RuntimeContextV3.SCHEMA: RuntimeContextV3.from_mapping,
         RuntimeImageEvidence.SCHEMA: RuntimeImageEvidence.from_mapping,
         TrustedLambdaAssetV2.SCHEMA: TrustedLambdaAssetV2.from_mapping,

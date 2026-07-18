@@ -9,12 +9,14 @@ import pytest
 
 from release_tools.contracts import (
     ContractError,
+    ProductionObservationConfigV1,
     RuntimeContextV3,
     RuntimeImageEvidence,
     StagingTransactionV1,
     TrustedLambdaAssetV2,
     canonical_json_bytes,
     parse_canonical_object,
+    parse_release_contract,
     write_new_contract,
 )
 
@@ -49,6 +51,25 @@ RUNTIME_ENVIRONMENT = {
     "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": "workspace-credential-broker",
     "WORKSPACE_SYNC_INTERVAL_MS": "300000",
 }
+BUILDER_INPUTS = ("sha256:" + "d" * 64, "sha256:" + "e" * 64)
+
+
+def _production_observation_config() -> dict[str, object]:
+    return {
+        "schema": "personal-operator.production-observation-config.v1",
+        "sourceCommit": COMMIT,
+        "sourceTree": TREE,
+        "account": ACCOUNT,
+        "region": REGION,
+        "buildContext": "bridge",
+        "builderId": "https://personal-operator.invalid/builders/bridge-v1",
+        "builderInputs": list(BUILDER_INPUTS),
+        "runtimeSubnetIds": list(SUBNET_IDS),
+        "runtimeSecurityGroupIds": list(SECURITY_GROUP_IDS),
+        "runtimeEnvironmentVariables": dict(RUNTIME_ENVIRONMENT),
+        "runtimeIdleSessionTimeout": 1800,
+        "runtimeMaxLifetime": 28800,
+    }
 
 
 def _runtime_configuration() -> dict[str, object]:
@@ -239,6 +260,82 @@ def test_runtime_context_v3_is_exact_canonical_and_immutable() -> None:
     assert parsed.to_mapping() == expected
     with pytest.raises(FrozenInstanceError):
         parsed.region = "us-east-1"  # type: ignore[misc]
+
+
+def test_production_observation_config_is_canonical_digest_bound_and_derives_role() -> None:
+    expected = _production_observation_config()
+    payload = canonical_json_bytes(expected)
+
+    parsed = ProductionObservationConfigV1.from_bytes(payload)
+
+    assert parsed.to_mapping() == expected
+    assert parsed.to_bytes() == payload
+    assert parsed.digest() == hashlib.sha256(payload).hexdigest()
+    assert parsed.execution_role_arn == ROLE_ARN
+    assert "executionRoleArn" not in parsed.to_mapping()
+    assert parse_release_contract(payload) == parsed
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda value: value.update(extra="x"), "fields"),
+        (lambda value: value.update(sourceCommit="A" * 40), "commit"),
+        (lambda value: value.update(sourceTree="b" * 39), "tree"),
+        (lambda value: value.update(account="000000000000"), "account"),
+        (lambda value: value.update(region="us-east-1"), "region"),
+        (lambda value: value.update(buildContext="../bridge"), "build context"),
+        (lambda value: value.update(builderId="not-https"), "builder"),
+        (lambda value: value.update(builderInputs=[]), "builder input"),
+        (
+            lambda value: value.update(builderInputs=list(reversed(BUILDER_INPUTS))),
+            "builder input",
+        ),
+        (
+            lambda value: value.update(builderInputs=[BUILDER_INPUTS[0]] * 2),
+            "builder input",
+        ),
+        (
+            lambda value: value.update(runtimeSubnetIds=list(reversed(SUBNET_IDS))),
+            "subnet",
+        ),
+        (
+            lambda value: value.update(
+                runtimeSecurityGroupIds=[SECURITY_GROUP_IDS[0]] * 2
+            ),
+            "security group",
+        ),
+        (
+            lambda value: value["runtimeEnvironmentVariables"].update(  # type: ignore[index]
+                AWS_SECRET_ACCESS_KEY="not-a-real-secret"
+            ),
+            "environment",
+        ),
+        (
+            lambda value: value["runtimeEnvironmentVariables"].update(  # type: ignore[index]
+                AWS_REGION="us-east-1"
+            ),
+            "environment",
+        ),
+        (
+            lambda value: value.update(runtimeMaxLifetime=1799),
+            "lifecycle",
+        ),
+        (
+            lambda value: value.update(executionRoleArn=ROLE_ARN),
+            "fields",
+        ),
+    ],
+)
+def test_production_observation_config_rejects_identity_or_configuration_drift(
+    mutate,
+    match: str,
+) -> None:
+    value = _production_observation_config()
+    mutate(value)
+
+    with pytest.raises(ContractError, match=match):
+        ProductionObservationConfigV1.from_mapping(value)
 
 
 @pytest.mark.parametrize(
