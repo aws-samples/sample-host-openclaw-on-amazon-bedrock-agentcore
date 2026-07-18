@@ -6,7 +6,9 @@ import json
 import math
 import os
 import re
+import stat
 import uuid
+import fcntl
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Mapping, Protocol, TypeVar
@@ -164,6 +166,21 @@ def _image_uri(account: str, region: str, digest: str, value: Any) -> str:
             raise ContractError("runtime image URI must be immutable")
         raise ContractError("runtime image URI crosses its account, region, or repository")
     return image_uri
+
+
+def _rollback_reference(
+    value: Any, *, account: str, region: str, commit: str
+) -> str:
+    reference = _text(value, field="rollback reference")
+    if not reference:
+        return reference
+    expected = re.compile(
+        rf"rollback:v1:{re.escape(account)}:{re.escape(region)}:"
+        rf"{re.escape(commit)}:sha256:[0-9a-f]{{64}}"
+    )
+    if expected.fullmatch(reference) is None:
+        raise ContractError("rollback reference is not exact for this release")
+    return reference
 
 
 class CanonicalContract(Protocol):
@@ -697,7 +714,9 @@ class StagingTransactionV1:
         context_digest = _text(value["runtimeContextSha256"], field="runtime context digest")
         if context_digest and _SHA_64.fullmatch(context_digest) is None:
             raise ContractError("runtime context digest is invalid")
-        rollback = _text(value["rollbackReference"], field="rollback reference")
+        rollback = _rollback_reference(
+            value["rollbackReference"], account=account, region=region, commit=commit
+        )
         uncertain_phase = _text(value["uncertainPhase"], field="uncertain phase")
         if state == "NEW":
             if stable != "NEW" or revision != 0 or any(
@@ -707,10 +726,38 @@ class StagingTransactionV1:
         elif state == "UNCERTAIN":
             if not uncertain_phase or revision < 1:
                 raise ContractError("UNCERTAIN staging transaction lacks its phase")
+            stable_index = LINEAR_TRANSACTION_STATES.index(stable)
+            expected_phase = (
+                LINEAR_TRANSACTION_STATES[stable_index + 1]
+                if stable_index + 1 < len(LINEAR_TRANSACTION_STATES)
+                else None
+            )
+            if uncertain_phase != expected_phase:
+                raise ContractError("UNCERTAIN phase is not the legal next state")
         elif uncertain_phase:
             raise ContractError("uncertain phase is set outside UNCERTAIN")
         if state in LINEAR_TRANSACTION_STATES and state != stable:
             raise ContractError("linear transaction state and last stable state differ")
+        evidence_state = stable if state in {"UNCERTAIN", "ROLLED_BACK"} else state
+        evidence_index = LINEAR_TRANSACTION_STATES.index(evidence_state)
+        image_index = LINEAR_TRANSACTION_STATES.index("IMAGE_PUBLISHED")
+        runtime_index = LINEAR_TRANSACTION_STATES.index("RUNTIME_READY")
+        context_index = LINEAR_TRANSACTION_STATES.index("CONTEXT_WRITTEN")
+        if evidence_index >= image_index and not image_digest:
+            raise ContractError("runtime image evidence is missing")
+        if evidence_index < image_index and image_digest:
+            raise ContractError("runtime image evidence appears before publication")
+        if evidence_index >= runtime_index and not (runtime_id and runtime_version):
+            raise ContractError("runtime identity evidence is missing")
+        if evidence_index < runtime_index and (runtime_id or runtime_version):
+            raise ContractError("runtime identity appears before runtime readiness")
+        if evidence_index >= context_index and not context_digest:
+            raise ContractError("runtime context evidence is missing")
+        if evidence_index < context_index and context_digest:
+            raise ContractError("runtime context evidence appears before context publication")
+        foundation_index = LINEAR_TRANSACTION_STATES.index("FOUNDATION_READY")
+        if (evidence_index >= foundation_index or state in {"UNCERTAIN", "ROLLED_BACK"}) and not rollback:
+            raise ContractError("exact rollback reference is missing")
         return cls(
             transaction_id,
             commit,
@@ -799,6 +846,34 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def read_regular_bytes(path: Path) -> bytes:
+    """Read one bounded regular file without following a final symlink."""
+
+    target = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as error:
+        raise ContractError(f"release artifact is not a regular file: {target}") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ContractError(f"release artifact is not a regular file: {target}")
+        chunks: list[bytes] = []
+        remaining = MAX_CONTRACT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > MAX_CONTRACT_BYTES:
+            raise ContractError("release artifact exceeds the byte limit")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
 def write_new_contract(path: Path, contract: CanonicalContract) -> None:
     """Atomically create one canonical artifact, refusing any existing target."""
 
@@ -823,3 +898,41 @@ def write_new_contract(path: Path, contract: CanonicalContract) -> None:
         _fsync_directory(target.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def atomic_replace_contract(
+    path: Path,
+    expected_payload: bytes,
+    contract: CanonicalContract,
+) -> None:
+    """Durably compare-and-swap one canonical artifact under a file lock."""
+
+    target = Path(path)
+    payload = contract.to_bytes()
+    parse_release_contract(payload)
+    lock_path = target.parent / f".{target.name}.lock"
+    lock_descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    temporary: Path | None = None
+    try:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        if read_regular_bytes(target) != expected_payload:
+            raise ContractError("release artifact changed concurrently")
+        temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        try:
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, target)
+        temporary = None
+        _fsync_directory(target.parent)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_descriptor)
