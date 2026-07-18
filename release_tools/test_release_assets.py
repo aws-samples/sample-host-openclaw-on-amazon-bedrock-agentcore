@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
-from release_tools.contracts import ContractError, RuntimeContextV3
+from release_tools.contracts import (
+    ContractError,
+    RuntimeContextV3,
+    canonical_json_bytes,
+)
 from release_tools.release_assets import build_cdk_context
 
 
@@ -16,6 +21,55 @@ IMAGE = (
     f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/"
     "personal-operator/bridge@sha256:" + "b" * 64
 )
+ROLE_ARN = (
+    f"arn:aws:iam::{ACCOUNT}:role/"
+    f"openclaw-agentcore-execution-role-{REGION}"
+)
+SUBNET_IDS = ("subnet-00000000000000001", "subnet-00000000000000002")
+SECURITY_GROUP_IDS = ("sg-00000000000000001",)
+RUNTIME_ENVIRONMENT = {
+    "AWS_DEFAULT_REGION": REGION,
+    "AWS_REGION": REGION,
+    "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+    "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
+    "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": "workspace-credential-broker",
+    "WORKSPACE_SYNC_INTERVAL_MS": "300000",
+}
+
+
+def _runtime_configuration() -> dict[str, object]:
+    return {
+        "agentRuntimeArtifact": {
+            "containerConfiguration": {"containerUri": IMAGE}
+        },
+        "environmentVariables": dict(RUNTIME_ENVIRONMENT),
+        "filesystemConfigurations": [
+            {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+        ],
+        "lifecycleConfiguration": {
+            "idleRuntimeSessionTimeout": 1800,
+            "maxLifetime": 28800,
+        },
+        "networkConfiguration": {
+            "networkMode": "VPC",
+            "networkModeConfig": {
+                "securityGroups": list(SECURITY_GROUP_IDS),
+                "subnets": list(SUBNET_IDS),
+            },
+        },
+        "protocolConfiguration": {"serverProtocol": "HTTP"},
+    }
+
+
+def _runtime_configuration_sha256() -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "executionRoleArn": ROLE_ARN,
+                "runtimeConfiguration": _runtime_configuration(),
+            }
+        )
+    ).hexdigest()
 
 
 def _context() -> RuntimeContextV3:
@@ -34,6 +88,9 @@ def _context() -> RuntimeContextV3:
             ),
             "runtimeVersion": "7",
             "runtimeImageUri": IMAGE,
+            "executionRoleArn": ROLE_ARN,
+            "runtimeConfiguration": _runtime_configuration(),
+            "runtimeConfigurationSha256": _runtime_configuration_sha256(),
         }
     )
 

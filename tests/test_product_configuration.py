@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+from release_tools.contracts import canonical_json_bytes
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +57,47 @@ def _create_e2e_script_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Pa
     )
     build = project / "build"
     build.mkdir()
+    image = (
+        "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
+        "personal-operator/bridge@sha256:" + "a" * 64
+    )
+    role_arn = (
+        "arn:aws:iam::123456789012:role/"
+        "openclaw-agentcore-execution-role-eu-west-1"
+    )
+    runtime_configuration = {
+        "agentRuntimeArtifact": {
+            "containerConfiguration": {"containerUri": image}
+        },
+        "environmentVariables": {
+            "AWS_DEFAULT_REGION": "eu-west-1",
+            "AWS_REGION": "eu-west-1",
+            "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+            "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
+            "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
+                "workspace-credential-broker"
+            ),
+            "WORKSPACE_SYNC_INTERVAL_MS": "300000",
+        },
+        "filesystemConfigurations": [
+            {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+        ],
+        "lifecycleConfiguration": {
+            "idleRuntimeSessionTimeout": 1800,
+            "maxLifetime": 28800,
+        },
+        "networkConfiguration": {
+            "networkMode": "VPC",
+            "networkModeConfig": {
+                "securityGroups": ["sg-00000000000000001"],
+                "subnets": [
+                    "subnet-00000000000000001",
+                    "subnet-00000000000000002",
+                ],
+            },
+        },
+        "protocolConfiguration": {"serverProtocol": "HTTP"},
+    }
     (build / "runtime-context.json").write_text(
         json.dumps(
             {
@@ -69,10 +113,17 @@ def _create_e2e_script_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Pa
                     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
                     "agent/12345678-1234-1234-1234-123456789abc:1"
                 ),
-                "runtimeImageUri": (
-                    "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
-                    "personal-operator/bridge@sha256:" + "a" * 64
-                ),
+                "runtimeImageUri": image,
+                "executionRoleArn": role_arn,
+                "runtimeConfiguration": runtime_configuration,
+                "runtimeConfigurationSha256": hashlib.sha256(
+                    canonical_json_bytes(
+                        {
+                            "executionRoleArn": role_arn,
+                            "runtimeConfiguration": runtime_configuration,
+                        }
+                    )
+                ).hexdigest(),
             }
         ),
         encoding="utf-8",
@@ -412,7 +463,10 @@ def test_runtime_metadata_validation_is_not_embedded_in_the_shell_shim() -> None
     assert "validate_runtime_metadata" not in deploy
     assert "json.loads" not in deploy
     assert "AgentCoreEvidenceAdapter" in adapter
-    assert "runtime artifact differs from the immutable release image" in adapter
+    assert (
+        "live runtime configuration differs from reviewed release configuration"
+        in adapter
+    )
     assert "endpoint was retargeted away from the release version" in adapter
     assert "returned unknown status" in adapter
 

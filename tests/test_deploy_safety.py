@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
-import json
 import shutil
 import subprocess
 import sys
+
+from release_tools.contracts import canonical_json_bytes
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,6 +162,43 @@ if observed:
         f"{account}.dkr.ecr.{region}.amazonaws.com/"
         f"personal-operator/bridge@sha256:{'4' * 64}"
     )
+    role_arn = (
+        f"arn:aws:iam::{account}:role/"
+        f"openclaw-agentcore-execution-role-{region}"
+    )
+    runtime_configuration = {
+        "agentRuntimeArtifact": {
+            "containerConfiguration": {"containerUri": image}
+        },
+        "environmentVariables": {
+            "AWS_DEFAULT_REGION": region,
+            "AWS_REGION": region,
+            "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+            "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
+            "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
+                "workspace-credential-broker"
+            ),
+            "WORKSPACE_SYNC_INTERVAL_MS": "300000",
+        },
+        "filesystemConfigurations": [
+            {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+        ],
+        "lifecycleConfiguration": {
+            "idleRuntimeSessionTimeout": 1800,
+            "maxLifetime": 28800,
+        },
+        "networkConfiguration": {
+            "networkMode": "VPC",
+            "networkModeConfig": {
+                "securityGroups": ["sg-00000000000000001"],
+                "subnets": [
+                    "subnet-00000000000000001",
+                    "subnet-00000000000000002",
+                ],
+            },
+        },
+        "protocolConfiguration": {"serverProtocol": "HTTP"},
+    }
     runtime_context = {
         "schema": "personal-operator.runtime-context.v3",
         "sourceCommit": commit,
@@ -173,6 +213,16 @@ if observed:
         ),
         "runtimeVersion": "7",
         "runtimeImageUri": image,
+        "executionRoleArn": role_arn,
+        "runtimeConfiguration": runtime_configuration,
+        "runtimeConfigurationSha256": hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "executionRoleArn": role_arn,
+                    "runtimeConfiguration": runtime_configuration,
+                }
+            )
+        ).hexdigest(),
     }
     runtime_path = repo / "build" / "runtime-context.json"
     runtime_path.parent.mkdir(parents=True)
