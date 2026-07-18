@@ -331,6 +331,32 @@ function deriveCallId(call) {
   return `call_${digest.digest("hex")}`;
 }
 
+function deriveTenantBinding(grant) {
+  return sha256(
+    canonicalJsonBytes({
+      sub: grant.sub,
+      sessionId: grant.sessionId,
+      runtimeArn: grant.runtimeArn,
+      runtimeQualifier: grant.runtimeQualifier,
+      releaseCommit: grant.releaseCommit,
+      catalogDigest: grant.catalogDigest,
+    }),
+  );
+}
+
+function deriveLogicalCallKey(grant, call) {
+  return sha256(
+    canonicalJsonBytes({
+      tenantBinding: deriveTenantBinding(grant),
+      invocationId: call.invocationId,
+      catalogDigest: call.catalogDigest,
+      operationId: call.operationId,
+      toolName: call.toolName,
+      argsHash: call.argsHash,
+    }),
+  );
+}
+
 function operationForTool(toolName) {
   return Object.values(GATEWAY_OPERATION_REGISTRY).find(
     (operation) => operation.toolName === toolName,
@@ -478,6 +504,26 @@ function validateResult(input, call, operation, sensitiveValues) {
   return deepFreeze(result);
 }
 
+function localFailureResult(call, { status, errorCode, retryPolicy }) {
+  return {
+    schema: RESULT_SCHEMA,
+    callId: call.callId,
+    invocationId: call.invocationId,
+    toolUseId: call.toolUseId,
+    catalogDigest: call.catalogDigest,
+    operationId: call.operationId,
+    toolName: call.toolName,
+    argsHash: call.argsHash,
+    status,
+    data: {},
+    provenanceRefs: [],
+    proposalRef: null,
+    receiptRef: null,
+    errorCode,
+    retryPolicy,
+  };
+}
+
 function emitSafe(logger, event) {
   try {
     logger(Object.freeze(event));
@@ -491,6 +537,7 @@ class CapabilityRelay {
   #calls = new Map();
   #gatewayTransport;
   #inflight = 0;
+  #logicalCalls = new Map();
   #logger;
   #maxInflight;
   #now;
@@ -526,6 +573,7 @@ class CapabilityRelay {
     }
     this.#grant = validateGrant(grant);
     this.#calls = new Map();
+    this.#logicalCalls = new Map();
     this.#sensitiveValues = [
       this.#grant.nonce,
       ...this.#grant.targetGrantHashes,
@@ -538,6 +586,7 @@ class CapabilityRelay {
     }
     this.#grant = null;
     this.#calls = new Map();
+    this.#logicalCalls = new Map();
     this.#sensitiveValues = [];
   }
 
@@ -560,7 +609,55 @@ class CapabilityRelay {
           "One tool-use identity cannot be rebound to different arguments",
         );
       }
-      return existing.promise;
+      if (!existing.result) return existing.promise;
+      if (
+        existing.result.status === "FAILED_RETRYABLE" &&
+        existing.operation.retryPolicy.mode === "READ_ONLY"
+      ) {
+        if (existing.attempts >= 2) {
+          existing.result = validateResult(
+            localFailureResult(existing.call, {
+              status: "DENIED",
+              errorCode: "CAPABILITY_READ_RETRY_EXHAUSTED",
+              retryPolicy: "NONE",
+            }),
+            existing.call,
+            existing.operation,
+            this.#sensitiveValues,
+          );
+          return existing.result;
+        }
+        return this.#dispatch(existing);
+      }
+      return existing.result;
+    }
+
+    const logicalKey = deriveLogicalCallKey(grant, call);
+    const priorToolUseId = this.#logicalCalls.get(logicalKey);
+    if (priorToolUseId !== undefined && priorToolUseId !== toolUseId) {
+      const prior = this.#calls.get(priorToolUseId);
+      if (operation.retryPolicy.mode !== "READ_ONLY") {
+        return validateResult(
+          localFailureResult(call, {
+            status: "UNCERTAIN",
+            errorCode: "CAPABILITY_LOGICAL_EFFECT_UNCERTAIN",
+            retryPolicy: "RECONCILE_ONLY",
+          }),
+          call,
+          operation,
+          this.#sensitiveValues,
+        );
+      }
+      if (
+        !prior ||
+        !prior.result ||
+        prior.result.status === "FAILED_RETRYABLE"
+      ) {
+        fail(
+          "CAPABILITY_READ_RETRY_REQUIRES_SAME_CALL",
+          "A retryable read must retain its exact tool-use identity",
+        );
+      }
     }
     if (this.#calls.size >= grant.maxCalls) {
       fail(
@@ -576,34 +673,55 @@ class CapabilityRelay {
       grant,
       call,
     });
-    const entry = { call, promise: null };
+    const entry = {
+      attempts: 0,
+      call,
+      envelope,
+      logicalKey,
+      operation,
+      promise: null,
+      result: null,
+    };
+    this.#calls.set(toolUseId, entry);
+    this.#logicalCalls.set(logicalKey, toolUseId);
+    return this.#dispatch(entry);
+  }
+
+  #dispatch(entry) {
+    if (this.#inflight >= this.#maxInflight) {
+      fail("CAPABILITY_RELAY_BUSY", "Capability relay concurrency is exhausted");
+    }
+    entry.attempts += 1;
     const promise = (async () => {
       this.#inflight += 1;
       emitSafe(this.#logger, {
         event: "capability_call_started",
-        callId: call.callId,
-        operationId: call.operationId,
+        callId: entry.call.callId,
+        operationId: entry.call.operationId,
       });
       try {
         let rawResult;
         try {
-          rawResult = await this.#gatewayTransport(envelope);
+          rawResult = await this.#gatewayTransport(entry.envelope);
         } catch (error) {
           if (error instanceof CapabilityRelayError) throw error;
-          fail(
-            "CAPABILITY_GATEWAY_UNAVAILABLE",
-            "Capability gateway transport is unavailable",
-          );
+          const isRead = entry.operation.retryPolicy.mode === "READ_ONLY";
+          rawResult = localFailureResult(entry.call, {
+            status: isRead ? "FAILED_RETRYABLE" : "UNCERTAIN",
+            errorCode: "CAPABILITY_GATEWAY_RESPONSE_UNAVAILABLE",
+            retryPolicy: isRead ? "SAFE_RETRY" : "RECONCILE_ONLY",
+          });
         }
         const result = validateResult(
           rawResult,
-          call,
-          operation,
+          entry.call,
+          entry.operation,
           this.#sensitiveValues,
         );
+        entry.result = result;
         emitSafe(this.#logger, {
           event: "capability_call_finished",
-          callId: call.callId,
+          callId: entry.call.callId,
           status: result.status,
         });
         return result;
@@ -612,7 +730,6 @@ class CapabilityRelay {
       }
     })();
     entry.promise = promise;
-    this.#calls.set(toolUseId, entry);
     return promise;
   }
 }

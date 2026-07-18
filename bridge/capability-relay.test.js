@@ -70,6 +70,33 @@ function succeededResult(call, overrides = {}) {
   };
 }
 
+function failedResult(
+  call,
+  {
+    status = "FAILED_RETRYABLE",
+    errorCode = "SYNTHETIC_READ_UNAVAILABLE",
+    retryPolicy = "SAFE_RETRY",
+  } = {},
+) {
+  return {
+    schema: "personal-operator.capability-result.v1",
+    callId: call.callId,
+    invocationId: call.invocationId,
+    toolUseId: call.toolUseId,
+    catalogDigest: call.catalogDigest,
+    operationId: call.operationId,
+    toolName: call.toolName,
+    argsHash: call.argsHash,
+    status,
+    data: {},
+    provenanceRefs: [],
+    proposalRef: null,
+    receiptRef: null,
+    errorCode,
+    retryPolicy,
+  };
+}
+
 describe("trusted capability relay", () => {
   it("exists with the frozen public interface", () => {
     const relayModule = loadRelay();
@@ -162,6 +189,157 @@ describe("trusted capability relay", () => {
       () => expired.call("tooluse_12345678", "po_web_read", args),
       (error) => error.code === "CAPABILITY_GRANT_EXPIRED",
     );
+  });
+
+  it("maps lost mutation delivery to typed uncertainty and fences a fresh tool-use ID", async () => {
+    const relayModule = loadRelay();
+    let transportCalls = 0;
+    const relay = new relayModule.CapabilityRelay({
+      now: () => 1_800_000_100,
+      gatewayTransport: async () => {
+        transportCalls += 1;
+        throw new Error("synthetic post-send response loss");
+      },
+    });
+    relay.bind_turn(
+      grant({
+        allowedPackIds: ["workspace.file-write"],
+        allowedOperationIds: ["workspace.file.write"],
+        targetGrantHashes: [],
+      }),
+    );
+    const args = { path: "notes/a.md", content: "hello" };
+
+    const ambiguous = await relay.call(
+      "tooluse_11111111",
+      "po_file_write",
+      args,
+    );
+    const fenced = await relay.call(
+      "tooluse_22222222",
+      "po_file_write",
+      args,
+    );
+
+    assert.equal(ambiguous.status, "UNCERTAIN");
+    assert.equal(ambiguous.errorCode, "CAPABILITY_GATEWAY_RESPONSE_UNAVAILABLE");
+    assert.equal(ambiguous.retryPolicy, "RECONCILE_ONLY");
+    assert.equal(fenced.status, "UNCERTAIN");
+    assert.equal(fenced.errorCode, "CAPABILITY_LOGICAL_EFFECT_UNCERTAIN");
+    assert.equal(fenced.toolUseId, "tooluse_22222222");
+    assert.equal(fenced.retryPolicy, "RECONCILE_ONLY");
+    assert.equal(transportCalls, 1);
+  });
+
+  it("retries only the same validated read envelope once without recharging the call budget", async () => {
+    const relayModule = loadRelay();
+    const envelopes = [];
+    const relay = new relayModule.CapabilityRelay({
+      now: () => 1_800_000_100,
+      gatewayTransport: async (envelope) => {
+        envelopes.push(envelope);
+        if (envelopes.length === 1) return failedResult(envelope.call);
+        return succeededResult(envelope.call);
+      },
+    });
+    relay.bind_turn(grant({ maxCalls: 1 }));
+    const args = { url: "https://example.com/exact" };
+
+    const retryable = await relay.call(
+      "tooluse_12345678",
+      "po_web_read",
+      args,
+    );
+    const succeeded = await relay.call(
+      "tooluse_12345678",
+      "po_web_read",
+      args,
+    );
+    const replay = await relay.call(
+      "tooluse_12345678",
+      "po_web_read",
+      args,
+    );
+
+    assert.equal(retryable.status, "FAILED_RETRYABLE");
+    assert.equal(succeeded.status, "SUCCEEDED");
+    assert.deepEqual(replay, succeeded);
+    assert.equal(envelopes.length, 2);
+    assert.strictEqual(envelopes[1], envelopes[0]);
+  });
+
+  it("turns a lost read response into a validated retryable result before exact retry", async () => {
+    const relayModule = loadRelay();
+    let transportCalls = 0;
+    const relay = new relayModule.CapabilityRelay({
+      now: () => 1_800_000_100,
+      gatewayTransport: async ({ call }) => {
+        transportCalls += 1;
+        if (transportCalls === 1) {
+          throw new Error("synthetic read response loss");
+        }
+        return succeededResult(call);
+      },
+    });
+    relay.bind_turn(grant({ maxCalls: 1 }));
+    const args = { url: "https://example.com/exact" };
+
+    const lost = await relay.call(
+      "tooluse_12345678",
+      "po_web_read",
+      args,
+    );
+    const retried = await relay.call(
+      "tooluse_12345678",
+      "po_web_read",
+      args,
+    );
+
+    assert.equal(lost.status, "FAILED_RETRYABLE");
+    assert.equal(lost.errorCode, "CAPABILITY_GATEWAY_RESPONSE_UNAVAILABLE");
+    assert.equal(lost.retryPolicy, "SAFE_RETRY");
+    assert.equal(retried.status, "SUCCEEDED");
+    assert.equal(transportCalls, 2);
+  });
+
+  it("caps read dispatch at two attempts and blocks fresh-tool retry bypass", async () => {
+    const relayModule = loadRelay();
+    let transportCalls = 0;
+    const relay = new relayModule.CapabilityRelay({
+      now: () => 1_800_000_100,
+      gatewayTransport: async ({ call }) => {
+        transportCalls += 1;
+        return failedResult(call);
+      },
+    });
+    relay.bind_turn(grant());
+    const args = { url: "https://example.com/exact" };
+
+    const first = await relay.call(
+      "tooluse_12345678",
+      "po_web_read",
+      args,
+    );
+    await assert.rejects(
+      () => relay.call("tooluse_87654321", "po_web_read", args),
+      (error) => error.code === "CAPABILITY_READ_RETRY_REQUIRES_SAME_CALL",
+    );
+    const second = await relay.call(
+      "tooluse_12345678",
+      "po_web_read",
+      args,
+    );
+    const exhausted = await relay.call(
+      "tooluse_12345678",
+      "po_web_read",
+      args,
+    );
+
+    assert.equal(first.status, "FAILED_RETRYABLE");
+    assert.equal(second.status, "FAILED_RETRYABLE");
+    assert.equal(exhausted.status, "DENIED");
+    assert.equal(exhausted.errorCode, "CAPABILITY_READ_RETRY_EXHAUSTED");
+    assert.equal(transportCalls, 2);
   });
 
   it("rejects noncanonical grants, arguments, and mismatched or authority-leaking results", async () => {
