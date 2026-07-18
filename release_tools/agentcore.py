@@ -1,0 +1,253 @@
+"""Injected AgentCore evidence adapter for one immutable runtime release."""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Protocol
+
+from release_tools.contracts import ContractError, RuntimeContextV3
+
+
+REQUIRED_REGION = "eu-west-1"
+RUNTIME_NAME = "personal_operator_bridge"
+
+_COMMIT = re.compile(r"[0-9a-f]{40}")
+_ACCOUNT = re.compile(r"[0-9]{12}")
+_RUNTIME_ID = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}")
+_VERSION = re.compile(r"[1-9][0-9]{0,4}")
+_ROLE_ARN = re.compile(r"arn:aws:iam::([0-9]{12}):role/[A-Za-z0-9_+=,.@/-]+")
+
+_PENDING = {"CREATING", "UPDATING"}
+_FAILED = {"CREATE_FAILED", "UPDATE_FAILED", "DELETING"}
+_KNOWN = _PENDING | _FAILED | {"READY"}
+
+
+class AgentCoreClient(Protocol):
+    def get_agent_runtime(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def list_agent_runtime_endpoints(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def get_agent_runtime_endpoint(self, **kwargs: Any) -> dict[str, Any]: ...
+
+
+class AgentCoreEvidenceError(RuntimeError):
+    """Live AgentCore state disproves the release contract."""
+
+
+class AgentCoreEvidenceIncomplete(AgentCoreEvidenceError):
+    """A known asynchronous AgentCore operation has not completed."""
+
+
+class AgentCoreEvidenceAmbiguous(AgentCoreEvidenceError):
+    """Live state cannot prove one exact runtime or endpoint."""
+
+
+def _object(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AgentCoreEvidenceError(f"{label} response is malformed")
+    return value
+
+
+def _list(value: Any, *, label: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise AgentCoreEvidenceError(f"{label} response is malformed")
+    return value
+
+
+def _identity(
+    *,
+    source_commit: str,
+    account: str,
+    region: str,
+    runtime_id: str | None = None,
+    runtime_version: str | None = None,
+) -> None:
+    if _COMMIT.fullmatch(source_commit) is None:
+        raise AgentCoreEvidenceError("source commit is not canonical")
+    if _ACCOUNT.fullmatch(account) is None or account == "000000000000":
+        raise AgentCoreEvidenceError("release account is not canonical")
+    if region != REQUIRED_REGION:
+        raise AgentCoreEvidenceError(
+            f"release region must be exactly {REQUIRED_REGION}"
+        )
+    if runtime_id is not None and _RUNTIME_ID.fullmatch(runtime_id) is None:
+        raise AgentCoreEvidenceError("runtime ID is not canonical")
+    if (
+        runtime_version is not None
+        and _VERSION.fullmatch(runtime_version) is None
+    ):
+        raise AgentCoreEvidenceError("runtime version is not canonical")
+
+
+def _ready(status: Any, *, subject: str) -> None:
+    if status not in _KNOWN:
+        raise AgentCoreEvidenceError(
+            f"{subject} returned unknown status {status!r}"
+        )
+    if status in _PENDING:
+        raise AgentCoreEvidenceIncomplete(
+            f"{subject} status {status} is not ready"
+        )
+    if status in _FAILED:
+        raise AgentCoreEvidenceError(
+            f"{subject} entered failed status {status}"
+        )
+
+
+class AgentCoreEvidenceAdapter:
+    """Validate AgentCore using only a caller-supplied compatible client."""
+
+    def __init__(self, client: AgentCoreClient) -> None:
+        self._client = client
+
+    def _call(self, method_name: str, **arguments: Any) -> dict[str, Any]:
+        method = getattr(self._client, method_name, None)
+        if method is None or not callable(method):
+            raise AgentCoreEvidenceError(
+                f"injected AgentCore adapter lacks {method_name}"
+            )
+        try:
+            return _object(method(**arguments), label=method_name)
+        except (TimeoutError, ConnectionError) as error:
+            raise AgentCoreEvidenceAmbiguous(
+                f"{method_name} ended without authoritative evidence"
+            ) from error
+
+    def assert_endpoint_name_available(
+        self,
+        *,
+        runtime_id: str,
+        source_commit: str,
+        account: str,
+        region: str,
+    ) -> None:
+        """Refuse to create or retarget an already allocated release name."""
+
+        _identity(
+            source_commit=source_commit,
+            account=account,
+            region=region,
+            runtime_id=runtime_id,
+        )
+        endpoint_name = f"release_{source_commit}"
+        response = self._call(
+            "list_agent_runtime_endpoints",
+            agentRuntimeId=runtime_id,
+            maxResults=100,
+        )
+        if response.get("nextToken"):
+            raise AgentCoreEvidenceAmbiguous(
+                "endpoint lookup was paginated"
+            )
+        endpoints = _list(
+            response.get("runtimeEndpoints"), label="runtime endpoints"
+        )
+        matching: list[dict[str, Any]] = []
+        for item in endpoints:
+            endpoint = _object(item, label="runtime endpoint")
+            if endpoint.get("name") == endpoint_name:
+                matching.append(endpoint)
+        if len(matching) > 1:
+            raise AgentCoreEvidenceAmbiguous(
+                "duplicate release endpoint names were returned"
+            )
+        if matching:
+            raise AgentCoreEvidenceError(
+                f"release endpoint name collision: {endpoint_name}"
+            )
+
+    def collect_context(
+        self,
+        *,
+        source_commit: str,
+        account: str,
+        region: str,
+        runtime_id: str,
+        runtime_version: str,
+        expected_role_arn: str,
+        runtime_image_uri: str,
+    ) -> RuntimeContextV3:
+        """Collect the canonical v3 context only from exact READY resources."""
+
+        _identity(
+            source_commit=source_commit,
+            account=account,
+            region=region,
+            runtime_id=runtime_id,
+            runtime_version=runtime_version,
+        )
+        role_match = _ROLE_ARN.fullmatch(expected_role_arn)
+        if role_match is None or role_match.group(1) != account:
+            raise AgentCoreEvidenceError(
+                "execution role ARN crosses the release account"
+            )
+        expected_endpoint_name = f"release_{source_commit}"
+        runtime = self._call(
+            "get_agent_runtime",
+            agentRuntimeId=runtime_id,
+            agentRuntimeVersion=runtime_version,
+        )
+        _ready(runtime.get("status"), subject="runtime")
+        if runtime.get("agentRuntimeId") != runtime_id:
+            raise AgentCoreEvidenceError("runtime ID differs from the request")
+        if runtime.get("agentRuntimeName") != RUNTIME_NAME:
+            raise AgentCoreEvidenceError("runtime name is not stable")
+        if runtime.get("agentRuntimeVersion") != runtime_version:
+            raise AgentCoreEvidenceError("runtime version differs from the request")
+        runtime_arn = runtime.get("agentRuntimeArn")
+        if runtime.get("roleArn") != expected_role_arn:
+            raise AgentCoreEvidenceError("runtime role differs from the release role")
+        if runtime.get("agentRuntimeArtifact") != {
+            "containerConfiguration": {"containerUri": runtime_image_uri}
+        }:
+            raise AgentCoreEvidenceError(
+                "runtime artifact differs from the immutable release image"
+            )
+        if runtime.get("networkConfiguration", {}).get("networkMode") != "VPC":
+            raise AgentCoreEvidenceError("runtime network mode is not VPC")
+        if runtime.get("filesystemConfigurations") != [
+            {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+        ]:
+            raise AgentCoreEvidenceError(
+                "runtime filesystem configuration is not canonical"
+            )
+        if runtime.get("protocolConfiguration") != {"serverProtocol": "HTTP"}:
+            raise AgentCoreEvidenceError("runtime protocol is not HTTP")
+
+        endpoint = self._call(
+            "get_agent_runtime_endpoint",
+            agentRuntimeId=runtime_id,
+            endpointName=expected_endpoint_name,
+        )
+        _ready(endpoint.get("status"), subject="endpoint")
+        if endpoint.get("name") != expected_endpoint_name:
+            raise AgentCoreEvidenceError("endpoint name differs from the release")
+        if (
+            endpoint.get("liveVersion") != runtime_version
+            or endpoint.get("targetVersion") != runtime_version
+        ):
+            raise AgentCoreEvidenceError(
+                "endpoint was retargeted away from the release version"
+            )
+        if endpoint.get("agentRuntimeArn") != runtime_arn:
+            raise AgentCoreEvidenceError("endpoint runtime ARN differs")
+
+        try:
+            return RuntimeContextV3.from_mapping(
+                {
+                    "schema": RuntimeContextV3.SCHEMA,
+                    "sourceCommit": source_commit,
+                    "account": account,
+                    "region": region,
+                    "runtimeId": runtime_id,
+                    "runtimeEndpointId": endpoint.get("id"),
+                    "runtimeEndpointName": expected_endpoint_name,
+                    "runtimeArn": runtime_arn,
+                    "runtimeVersion": runtime_version,
+                    "runtimeImageUri": runtime_image_uri,
+                }
+            )
+        except ContractError as error:
+            raise AgentCoreEvidenceError(
+                "AgentCore evidence cannot form a canonical runtime context"
+            ) from error

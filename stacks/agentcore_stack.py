@@ -472,10 +472,11 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # --- Reviewed runtime release identity (read via context) -------------
-        # Runtime provisioning is deliberately outside this stack. Dependent
-        # stacks are wired only after the release gate supplies one atomic,
-        # commit-bound runtime version, immutable image, and dedicated endpoint.
+        # --- Immutable AgentCore release resources ---------------------------
+        # A foundation synth supplies no runtime values and therefore owns no
+        # Runtime/Endpoint. A release synth must supply the exact source commit
+        # and canonical digest URI together. Post-deployment consumer synths may
+        # additionally carry the complete, independently verified v3 context.
         runtime_source_commit = str(
             self.node.try_get_context("runtime_source_commit") or ""
         )
@@ -491,19 +492,18 @@ class AgentCoreStack(Stack):
         runtime_image_uri = str(
             self.node.try_get_context("runtime_image_uri") or ""
         )
-        runtime_values = (
-            runtime_source_commit,
+        release_inputs = (runtime_source_commit, runtime_image_uri)
+        persisted_runtime_values = (
             runtime_id,
             runtime_endpoint_id,
             runtime_endpoint_name,
             runtime_version,
             runtime_arn,
-            runtime_image_uri,
         )
-        if not any(runtime_values):
-            # Offline/foundation synthesis happens before Starter Toolkit has
-            # created a runtime. Dependent stacks are not deployable until the
-            # external release gate replaces every placeholder atomically.
+        if not any(release_inputs) and not any(persisted_runtime_values):
+            # Foundation stacks are synthesizable before any image mutation.
+            # Consumer placeholders are intentionally undeployable release
+            # identities; the staging transaction never deploys those stacks.
             self.runtime_source_commit = "PLACEHOLDER"
             self.runtime_id = "PLACEHOLDER"
             self.runtime_endpoint_id = "PLACEHOLDER"
@@ -512,12 +512,12 @@ class AgentCoreStack(Stack):
             self.runtime_arn = "PLACEHOLDER"
             self.runtime_image_uri = "PLACEHOLDER"
             self.runtime_iam_arn = "PLACEHOLDER"
+            self.runtime = None
+            self.runtime_endpoint = None
         else:
-            if not all(runtime_values):
+            if not all(release_inputs):
                 raise ValueError(
-                    "runtime_source_commit, runtime_id, runtime_endpoint_id, "
-                    "runtime_endpoint_name, runtime_version, runtime_arn, and "
-                    "runtime_image_uri must be set together"
+                    "runtime_source_commit and runtime_image_uri must be set together"
                 )
             source_commit_pattern = r"[0-9a-f]{40}"
             runtime_version_pattern = r"[1-9][0-9]{0,4}"
@@ -531,55 +531,175 @@ class AgentCoreStack(Stack):
             runtime_image_uri_pattern = (
                 rf"{re.escape(account)}\.dkr\.ecr\."
                 rf"{re.escape(region)}\.amazonaws\.com/"
-                r"[a-z0-9]+(?:[._/-][a-z0-9]+)*"
+                r"personal-operator/bridge"
                 r"@sha256:[0-9a-f]{64}"
             )
             if re.fullmatch(source_commit_pattern, runtime_source_commit) is None:
                 raise ValueError("runtime_source_commit must be an exact git commit")
-            if re.fullmatch(runtime_version_pattern, runtime_version) is None:
-                raise ValueError("runtime_version is not canonical")
-            if re.fullmatch(runtime_id_pattern, runtime_id) is None:
-                raise ValueError(f"runtime_id is not canonical: {runtime_id}")
-            if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
-                raise ValueError(
-                    f"runtime_endpoint_id is not canonical: {runtime_endpoint_id}"
-                )
-            expected_endpoint_name = f"release_{runtime_source_commit}"
-            if runtime_endpoint_name != expected_endpoint_name:
-                raise ValueError(
-                    "runtime_endpoint_name must be derived from the exact "
-                    "runtime_source_commit"
-                )
-            if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
-                raise ValueError(
-                    "runtime_arn must be the exact AgentCore ARN returned for "
-                    f"account {account} in {region}"
-                )
-            if runtime_arn.rsplit(":", 1)[-1] != runtime_version:
-                raise ValueError(
-                    "runtime_version must equal the exact runtime ARN version"
-                )
             if re.fullmatch(runtime_image_uri_pattern, runtime_image_uri) is None:
                 raise ValueError(
-                    "runtime_image_uri must be an immutable ECR sha256 digest "
-                    f"in account {account} and region {region}"
+                    "runtime_image_uri must be the immutable personal-operator/bridge "
+                    f"ECR digest in account {account} and region {region}"
                 )
-            self.runtime_source_commit = runtime_source_commit
-            self.runtime_id = runtime_id
-            self.runtime_endpoint_id = runtime_endpoint_id
-            self.runtime_endpoint_name = runtime_endpoint_name
-            self.runtime_version = runtime_version
-            self.runtime_arn = runtime_arn
-            self.runtime_image_uri = runtime_image_uri
-            # AgentCore has two distinct ARN namespaces. GetAgentRuntime's
-            # agent/<uuid>:<version> ARN is the invocation identity above;
-            # IAM authorization uses the documented runtime/<runtime-id>
-            # resource grammar. Derive the latter only after validating the
-            # canonical runtime ID, account, and region.
-            self.runtime_iam_arn = (
-                f"arn:aws:bedrock-agentcore:{region}:{account}:"
-                f"runtime/{runtime_id}"
+
+            has_persisted_context = any(persisted_runtime_values)
+            if has_persisted_context and not all(persisted_runtime_values):
+                raise ValueError(
+                    "runtime_id, runtime_endpoint_id, runtime_endpoint_name, "
+                    "runtime_version, and runtime_arn must be set together"
+                )
+            expected_endpoint_name = f"release_{runtime_source_commit}"
+            if has_persisted_context:
+                if re.fullmatch(runtime_version_pattern, runtime_version) is None:
+                    raise ValueError("runtime_version is not canonical")
+                if re.fullmatch(runtime_id_pattern, runtime_id) is None:
+                    raise ValueError(f"runtime_id is not canonical: {runtime_id}")
+                if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
+                    raise ValueError(
+                        f"runtime_endpoint_id is not canonical: {runtime_endpoint_id}"
+                    )
+                if runtime_endpoint_name != expected_endpoint_name:
+                    raise ValueError(
+                        "runtime_endpoint_name must be derived from the exact "
+                        "runtime_source_commit"
+                    )
+                if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
+                    raise ValueError(
+                        "runtime_arn must be the exact AgentCore ARN returned for "
+                        f"account {account} in {region}"
+                    )
+                if runtime_arn.rsplit(":", 1)[-1] != runtime_version:
+                    raise ValueError(
+                        "runtime_version must equal the exact runtime ARN version"
+                    )
+
+            idle_timeout = int(
+                self.node.try_get_context("session_idle_timeout") or "1800"
             )
+            max_lifetime = int(
+                self.node.try_get_context("session_max_lifetime") or "28800"
+            )
+            workspace_sync_seconds = int(
+                self.node.try_get_context("workspace_sync_interval_seconds")
+                or "300"
+            )
+            runtime_environment = {
+                "AWS_REGION": region,
+                "AWS_DEFAULT_REGION": region,
+                "BEDROCK_MODEL_ID": str(
+                    self.node.try_get_context("default_model_id")
+                    or BEDROCK_INFERENCE_PROFILE_ID
+                ),
+                "S3_USER_FILES_BUCKET": self.user_files_bucket.bucket_name,
+                "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
+                    workspace_broker_function_name
+                ),
+                "WORKSPACE_SYNC_INTERVAL_MS": str(workspace_sync_seconds * 1000),
+            }
+            subagent_model_id = str(
+                self.node.try_get_context("subagent_model_id") or ""
+            )
+            if subagent_model_id:
+                runtime_environment["SUBAGENT_BEDROCK_MODEL_ID"] = (
+                    subagent_model_id
+                )
+            if guardrail_id:
+                runtime_environment.update(
+                    {
+                        "BEDROCK_GUARDRAIL_ID": guardrail_id,
+                        "BEDROCK_GUARDRAIL_VERSION": "DRAFT",
+                    }
+                )
+
+            self.runtime = agentcore.CfnRuntime(
+                self,
+                "BridgeRuntime",
+                agent_runtime_artifact=(
+                    agentcore.CfnRuntime.AgentRuntimeArtifactProperty(
+                        container_configuration=(
+                            agentcore.CfnRuntime.ContainerConfigurationProperty(
+                                container_uri=runtime_image_uri
+                            )
+                        )
+                    )
+                ),
+                agent_runtime_name="personal_operator_bridge",
+                network_configuration=(
+                    agentcore.CfnRuntime.NetworkConfigurationProperty(
+                        network_mode="VPC",
+                        network_mode_config=(
+                            agentcore.CfnRuntime.VpcConfigProperty(
+                                subnets=private_subnet_ids,
+                                security_groups=[self.agent_sg.security_group_id],
+                            )
+                        ),
+                    )
+                ),
+                role_arn=self.execution_role.role_arn,
+                environment_variables=runtime_environment,
+                filesystem_configurations=[
+                    agentcore.CfnRuntime.FilesystemConfigurationProperty(
+                        session_storage=(
+                            agentcore.CfnRuntime.SessionStorageConfigurationProperty(
+                                mount_path="/mnt/workspace"
+                            )
+                        )
+                    )
+                ],
+                lifecycle_configuration=(
+                    agentcore.CfnRuntime.LifecycleConfigurationProperty(
+                        idle_runtime_session_timeout=idle_timeout,
+                        max_lifetime=max_lifetime,
+                    )
+                ),
+                protocol_configuration="HTTP",
+                description=(
+                    "Personal Operator immutable bridge runtime at commit "
+                    f"{runtime_source_commit}"
+                ),
+                tags={"SourceCommit": runtime_source_commit},
+            )
+            self.runtime.add_dependency(self.bridge_repository)
+            self.runtime.apply_removal_policy(
+                RemovalPolicy.RETAIN,
+                apply_to_update_replace_policy=True,
+            )
+            self.runtime_endpoint = agentcore.CfnRuntimeEndpoint(
+                self,
+                "BridgeRuntimeEndpoint",
+                agent_runtime_id=self.runtime.attr_agent_runtime_id,
+                agent_runtime_version=self.runtime.attr_agent_runtime_version,
+                name=expected_endpoint_name,
+            )
+            self.runtime_endpoint.apply_removal_policy(
+                RemovalPolicy.RETAIN,
+                apply_to_update_replace_policy=True,
+            )
+
+            self.runtime_source_commit = runtime_source_commit
+            self.runtime_image_uri = runtime_image_uri
+            if has_persisted_context:
+                self.runtime_id = runtime_id
+                self.runtime_endpoint_id = runtime_endpoint_id
+                self.runtime_endpoint_name = runtime_endpoint_name
+                self.runtime_version = runtime_version
+                self.runtime_arn = runtime_arn
+                self.runtime_iam_arn = (
+                    f"arn:aws:bedrock-agentcore:{region}:{account}:"
+                    f"runtime/{runtime_id}"
+                )
+            else:
+                self.runtime_id = self.runtime.attr_agent_runtime_id
+                self.runtime_endpoint_id = self.runtime_endpoint.attr_id
+                self.runtime_endpoint_name = expected_endpoint_name
+                self.runtime_version = self.runtime.attr_agent_runtime_version
+                self.runtime_arn = self.runtime.attr_agent_runtime_arn
+                # AgentCore invocation and IAM use distinct ARN namespaces.
+                self.runtime_iam_arn = Stack.of(self).format_arn(
+                    service="bedrock-agentcore",
+                    resource="runtime",
+                    resource_name=self.runtime_id,
+                )
 
         # --- AgentCore Browser (optional) -------------------------------------
         enable_browser = str(self.node.try_get_context("enable_browser") or "false").lower() == "true"
@@ -652,6 +772,38 @@ class AgentCoreStack(Stack):
             "PrivateSubnetIds",
             value=",".join(private_subnet_ids),
         )
+        if self.runtime is not None:
+            CfnOutput(self, "RuntimeId", value=self.runtime.attr_agent_runtime_id)
+            CfnOutput(
+                self,
+                "RuntimeVersion",
+                value=self.runtime.attr_agent_runtime_version,
+            )
+            CfnOutput(
+                self,
+                "RuntimeArn",
+                value=self.runtime.attr_agent_runtime_arn,
+            )
+            CfnOutput(
+                self,
+                "RuntimeEndpointId",
+                value=self.runtime_endpoint.attr_id,
+            )
+            CfnOutput(
+                self,
+                "RuntimeEndpointName",
+                value=self.runtime_endpoint_name,
+            )
+            CfnOutput(
+                self,
+                "RuntimeImageUri",
+                value=self.runtime_image_uri,
+            )
+            CfnOutput(
+                self,
+                "RuntimeSourceCommit",
+                value=self.runtime_source_commit,
+            )
         if self.browser:
             CfnOutput(
                 self,

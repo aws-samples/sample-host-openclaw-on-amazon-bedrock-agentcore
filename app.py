@@ -6,10 +6,9 @@ channel ingestion via Router Lambda. No keepalive needed — sessions
 idle-terminate naturally.
 
 Deployment model:
-  Phase 1 (CDK): VPC, Security, AgentCore-base (Role/SG/S3), Observability
-  External gate: directly provision one reviewed runtime version and its
-  release-specific endpoint (not implemented in this repository)
-  Phase 3 (CDK): Router, web control surface, and Cron tombstone
+  Foundation (CDK): VPC, security, retained image boundary, observability
+  Release (CDK): exact digest-bound Runtime and commit-specific Endpoint
+  Consumers (CDK): Router, web control surface, and Cron tombstone
 """
 
 import os
@@ -75,9 +74,10 @@ guardrails_stack = GuardrailsStack(
     env=env,
 )
 
-# --- AgentCore base resources (Role, SG, S3) ---
-# Runtime/endpoint provisioning is deliberately external. Phase 3 accepts only
-# one atomic commit-bound runtime context supplied as explicit CDK arguments.
+# --- AgentCore foundation and optional immutable release resources -----------
+# Empty runtime context produces a foundation-only template. Supplying one
+# exact commit and image digest adds direct CloudFormation Runtime/Endpoint L1s;
+# a complete verified context then binds consumer stacks to that exact version.
 agentcore_stack = AgentCoreStack(
     app,
     "OpenClawAgentCore",

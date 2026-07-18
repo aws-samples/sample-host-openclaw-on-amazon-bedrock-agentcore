@@ -11,26 +11,38 @@ from stacks.agentcore_stack import AgentCoreStack
 ACCOUNT = "123456789012"
 REGION = "eu-west-1"
 REPOSITORY_NAME = "personal-operator/bridge"
+SOURCE_COMMIT = "a" * 40
+IMAGE_URI = (
+    f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/{REPOSITORY_NAME}"
+    "@sha256:" + "b" * 64
+)
 
 
-def _foundation_template() -> dict:
+def _stack(context_overrides: dict[str, str] | None = None) -> AgentCoreStack:
+    context = {
+        "runtime_source_commit": "",
+        "runtime_id": "",
+        "runtime_endpoint_id": "",
+        "runtime_endpoint_name": "",
+        "runtime_version": "",
+        "runtime_arn": "",
+        "runtime_image_uri": "",
+        "user_files_ttl_days": "30",
+        "session_idle_timeout": "1800",
+        "session_max_lifetime": "28800",
+        "workspace_sync_interval_seconds": "300",
+        "default_model_id": "eu.anthropic.claude-sonnet-4-6",
+        "subagent_model_id": "",
+        "enable_browser": "false",
+    }
+    context.update(context_overrides or {})
     app = App(
-        context={
-            "runtime_source_commit": "",
-            "runtime_id": "",
-            "runtime_endpoint_id": "",
-            "runtime_endpoint_name": "",
-            "runtime_version": "",
-            "runtime_arn": "",
-            "runtime_image_uri": "",
-            "user_files_ttl_days": "30",
-            "enable_browser": "false",
-        }
+        context=context
     )
     env = Environment(account=ACCOUNT, region=REGION)
     network = Stack(app, "Network", env=env)
     vpc = ec2.Vpc(network, "Vpc", max_azs=2, nat_gateways=0)
-    stack = AgentCoreStack(
+    return AgentCoreStack(
         app,
         "AgentCore",
         cmk_arn=f"arn:aws:kms:{REGION}:{ACCOUNT}:key/test-key",
@@ -40,6 +52,20 @@ def _foundation_template() -> dict:
             "personal-operator/workspace-capability"
         ),
         env=env,
+    )
+
+
+def _foundation_template() -> dict:
+    stack = _stack()
+    return Template.from_stack(stack).to_json()
+
+
+def _release_template() -> dict:
+    stack = _stack(
+        {
+            "runtime_source_commit": SOURCE_COMMIT,
+            "runtime_image_uri": IMAGE_URI,
+        }
     )
     return Template.from_stack(stack).to_json()
 
@@ -168,3 +194,122 @@ def test_runtime_pull_role_is_scoped_to_the_exact_release_repository() -> None:
     assert "openclaw-bridge*" not in serialized
     assert "openclaw_agent*" not in serialized
     assert "bedrock-agentcore-*" not in serialized
+
+
+def test_foundation_synth_omits_runtime_and_endpoint_resources() -> None:
+    template = _foundation_template()
+    types = [resource["Type"] for resource in template["Resources"].values()]
+
+    assert "AWS::BedrockAgentCore::Runtime" not in types
+    assert "AWS::BedrockAgentCore::RuntimeEndpoint" not in types
+
+
+def test_release_synth_owns_digest_bound_runtime_and_retained_endpoint() -> None:
+    template = _release_template()
+    runtimes = {
+        logical_id: resource
+        for logical_id, resource in template["Resources"].items()
+        if resource["Type"] == "AWS::BedrockAgentCore::Runtime"
+    }
+    endpoints = {
+        logical_id: resource
+        for logical_id, resource in template["Resources"].items()
+        if resource["Type"] == "AWS::BedrockAgentCore::RuntimeEndpoint"
+    }
+
+    assert len(runtimes) == 1
+    assert len(endpoints) == 1
+    runtime_id, runtime = next(iter(runtimes.items()))
+    endpoint = next(iter(endpoints.values()))
+    security_group_id = next(
+        logical_id
+        for logical_id, resource in template["Resources"].items()
+        if resource["Type"] == "AWS::EC2::SecurityGroup"
+    )
+    properties = runtime["Properties"]
+    assert properties["AgentRuntimeArtifact"] == {
+        "ContainerConfiguration": {"ContainerUri": IMAGE_URI}
+    }
+    assert properties["AgentRuntimeName"] == "personal_operator_bridge"
+    assert properties["NetworkConfiguration"] == {
+        "NetworkMode": "VPC",
+        "NetworkModeConfig": {
+            "SecurityGroups": [
+                {
+                    "Fn::GetAtt": [
+                        security_group_id,
+                        "GroupId",
+                    ]
+                }
+            ],
+            "Subnets": ["subnet-00000000000000001"],
+        },
+    }
+    assert properties["FilesystemConfigurations"] == [
+        {"SessionStorage": {"MountPath": "/mnt/workspace"}}
+    ]
+    assert properties["LifecycleConfiguration"] == {
+        "IdleRuntimeSessionTimeout": 1800,
+        "MaxLifetime": 28800,
+    }
+    assert properties["ProtocolConfiguration"] == "HTTP"
+    assert properties["EnvironmentVariables"] == {
+        "AWS_DEFAULT_REGION": REGION,
+        "AWS_REGION": REGION,
+        "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-6",
+        "S3_USER_FILES_BUCKET": {
+            "Ref": "UserFilesBucketCFDFD8C0"
+        },
+        "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
+            "personal-operator-workspace-credential-broker"
+        ),
+        "WORKSPACE_SYNC_INTERVAL_MS": "300000",
+    }
+
+    assert endpoint["Properties"] == {
+        "AgentRuntimeId": {"Fn::GetAtt": [runtime_id, "AgentRuntimeId"]},
+        "AgentRuntimeVersion": {
+            "Fn::GetAtt": [runtime_id, "AgentRuntimeVersion"]
+        },
+        "Name": f"release_{SOURCE_COMMIT}",
+    }
+    assert endpoint["DeletionPolicy"] == "Retain"
+    assert endpoint["UpdateReplacePolicy"] == "Retain"
+
+
+def test_release_stack_rejects_partial_or_mutable_runtime_inputs() -> None:
+    invalid = [
+        {"runtime_source_commit": SOURCE_COMMIT},
+        {"runtime_image_uri": IMAGE_URI},
+        {
+            "runtime_source_commit": SOURCE_COMMIT,
+            "runtime_image_uri": IMAGE_URI.replace("@sha256:", ":latest-"),
+        },
+        {
+            "runtime_source_commit": SOURCE_COMMIT,
+            "runtime_image_uri": IMAGE_URI.replace(
+                REPOSITORY_NAME, "personal-operator/other"
+            ),
+        },
+        {
+            "runtime_source_commit": SOURCE_COMMIT,
+            "runtime_image_uri": IMAGE_URI.replace(ACCOUNT, "999999999999"),
+        },
+        {
+            "runtime_source_commit": SOURCE_COMMIT,
+            "runtime_image_uri": IMAGE_URI.replace(REGION, "us-east-1"),
+        },
+        {
+            "runtime_source_commit": SOURCE_COMMIT,
+            "runtime_image_uri": IMAGE_URI,
+            "runtime_endpoint_name": "release_" + "c" * 40,
+        },
+    ]
+
+    for context in invalid:
+        try:
+            _stack(context)
+        except ValueError as error:
+            assert "runtime" in str(error).casefold()
+        else:
+            raise AssertionError(f"release stack accepted invalid inputs: {context}")
