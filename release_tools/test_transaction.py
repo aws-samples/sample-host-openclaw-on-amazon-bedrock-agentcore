@@ -261,12 +261,24 @@ def test_resume_and_rollback_are_bound_to_the_exact_recorded_reference(
         "CONSUMER_CHANGESETS_READY",
         rollback_reference=ROLLBACK,
         operation_sha256=OPERATION,
-        operation=lambda: {},
+        operation=lambda: {"consumer_changesets_sha256": "2" * 64},
     )
     journal.run_mutation(
-        "CONSUMERS_APPLIED", rollback_reference=ROLLBACK, operation_sha256=OPERATION, operation=lambda: {}
+        "CONSUMERS_APPLIED",
+        rollback_reference=ROLLBACK,
+        operation_sha256=OPERATION,
+        operation=lambda: {"consumer_application_sha256": "3" * 64},
     )
-    journal.run_mutation("VERIFIED", rollback_reference=ROLLBACK, operation_sha256=OPERATION, operation=lambda: {})
+    journal.run_mutation(
+        "VERIFIED",
+        rollback_reference=ROLLBACK,
+        operation_sha256=OPERATION,
+        operation=lambda: {"verification_sha256": "4" * 64},
+    )
+
+    assert journal.current.consumer_changesets_sha256 == "2" * 64
+    assert journal.current.consumer_application_sha256 == "3" * 64
+    assert journal.current.verification_sha256 == "4" * 64
 
     with pytest.raises(TransactionError, match="does not match"):
         journal.begin_rollback(ROLLBACK[:-1] + "e", operation_sha256=OPERATION)

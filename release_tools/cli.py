@@ -8,6 +8,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -126,7 +127,7 @@ def _check_requested_identity(
 
 
 @contextmanager
-def _driver(args: argparse.Namespace) -> Iterator[tuple[Path, str]]:
+def _driver(args: argparse.Namespace) -> Iterator[tuple[bytes, str]]:
     if args.driver is None:
         raise ReleaseCliError(
             "--driver is required at an explicitly confirmed mutation boundary"
@@ -163,35 +164,37 @@ def _driver(args: argparse.Namespace) -> Iterator[tuple[Path, str]]:
     if not payload or len(payload) > 16 * 1024 * 1024:
         raise ReleaseCliError("release phase driver bytes are invalid")
     digest = "sha256:" + hashlib.sha256(payload).hexdigest()
-    with tempfile.TemporaryDirectory(prefix="personal-operator-release-") as root:
-        retained = Path(root) / "reviewed-operation"
-        descriptor = os.open(
-            retained,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o700,
-        )
-        try:
-            with os.fdopen(descriptor, "wb", closefd=True) as output:
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
-        except Exception:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-            raise
-        yield retained, digest
+    yield payload, digest
 
 
-def _sanitized_environment(region: str) -> dict[str, str]:
+_FORWARDED_AWS_CREDENTIALS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+)
+
+
+def _sanitized_environment(account: str, region: str) -> dict[str, str]:
     _validate_region(region)
-    return {
-        **os.environ,
+    environment = {
+        name: os.environ[name]
+        for name in _FORWARDED_AWS_CREDENTIALS
+        if os.environ.get(name)
+    }
+    environment.update({
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "AWS_CONFIG_FILE": "/dev/null",
+        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "CDK_DEFAULT_ACCOUNT": account,
         "CDK_DEFAULT_REGION": region,
         "AWS_REGION": region,
         "AWS_DEFAULT_REGION": region,
-    }
+    })
+    return environment
 
 
 def _discover_account(
@@ -202,10 +205,13 @@ def _discover_account(
 ) -> None:
     """Touch credentials only after durable intent and immediately pre-dispatch."""
 
+    executable = shutil.which("aws")
+    if executable is None:
+        raise ReleaseCliError("AWS credential discovery is unavailable")
     try:
         completed = subprocess.run(
             [
-                "aws",
+                executable,
                 "sts",
                 "get-caller-identity",
                 "--query",
@@ -230,7 +236,7 @@ def _discover_account(
 
 
 def _invoke_driver(
-    driver: Path,
+    driver: bytes,
     *,
     mode: str,
     phase: str,
@@ -239,32 +245,72 @@ def _invoke_driver(
     environment: Mapping[str, str],
 ) -> dict[str, Any]:
     current = journal.current
-    completed = subprocess.run(
-        [
-            str(driver),
-            "--mode",
-            mode,
-            "--phase",
-            phase,
-            "--journal",
-            str(journal.path),
-            "--transaction-id",
-            current.transaction_id,
-            "--source-commit",
-            current.source_commit,
-            "--source-tree",
-            current.source_tree,
-            "--account",
-            current.account,
-            "--region",
-            current.region,
-            "--operation-sha256",
-            operation_sha256,
-        ],
-        check=False,
-        capture_output=True,
-        env=dict(environment),
-    )
+    expected_digest = "sha256:" + hashlib.sha256(driver).hexdigest()
+    if expected_digest != operation_sha256:
+        raise ReleaseCliError("release operation bytes differ from the journal digest")
+    with tempfile.TemporaryDirectory(
+        prefix="personal-operator-operation-"
+    ) as temporary_root:
+        root = Path(temporary_root)
+        retained = root / "reviewed-operation"
+        descriptor = os.open(
+            retained,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o700,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as output:
+                output.write(driver)
+                output.flush()
+                os.fsync(output.fileno())
+        except Exception:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        if retained.read_bytes() != driver:
+            raise ReleaseCliError("release operation bytes changed before invocation")
+        child_environment = dict(environment)
+        child_environment["HOME"] = str(root)
+        child_environment["TMPDIR"] = str(root)
+        completed = subprocess.run(
+            [
+                str(retained),
+                "--mode",
+                mode,
+                "--phase",
+                phase,
+                "--journal",
+                str(journal.path),
+                "--transaction-id",
+                current.transaction_id,
+                "--source-commit",
+                current.source_commit,
+                "--source-tree",
+                current.source_tree,
+                "--account",
+                current.account,
+                "--region",
+                current.region,
+                "--operation-sha256",
+                operation_sha256,
+            ],
+            check=False,
+            capture_output=True,
+            cwd=root,
+            env=child_environment,
+        )
+        try:
+            after = retained.read_bytes()
+        except OSError as error:
+            raise ReleaseCliError(
+                "release operation bytes changed during invocation"
+            ) from error
+        if after != driver:
+            raise ReleaseCliError(
+                "release operation bytes changed during invocation"
+            )
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         raise ReleaseCliError(
@@ -439,7 +485,7 @@ def _observe_and_reconcile(
     journal: TransactionJournal,
     *,
     phase: str,
-    driver: Path,
+    driver: bytes,
     operation_sha256: str,
     environment: Mapping[str, str],
 ) -> StagingTransactionV1:
@@ -516,7 +562,10 @@ def _run_phase(
             rollback_reference=rollback_reference,
             operation_sha256=operation_sha256,
         )
-        environment = _sanitized_environment(journal.current.region)
+        environment = _sanitized_environment(
+            journal.current.account,
+            journal.current.region,
+        )
         _discover_account(
             journal.current.account,
             journal.current.region,
@@ -595,7 +644,10 @@ def _resume(args: argparse.Namespace) -> StagingTransactionV1:
                     "reconciliation confirmation must be exactly "
                     f"{expected_confirmation}"
                 )
-            environment = _sanitized_environment(journal.current.region)
+            environment = _sanitized_environment(
+                journal.current.account,
+                journal.current.region,
+            )
             return _observe_and_reconcile(
                 journal,
                 phase=phase,
@@ -635,7 +687,10 @@ def _rollback(args: argparse.Namespace) -> StagingTransactionV1:
             reference,
             operation_sha256=operation_sha256,
         )
-        environment = _sanitized_environment(journal.current.region)
+        environment = _sanitized_environment(
+            journal.current.account,
+            journal.current.region,
+        )
         _discover_account(
             journal.current.account,
             journal.current.region,

@@ -23,9 +23,9 @@ _PHASE_EVIDENCE_FIELDS = {
     "RUNTIME_READY": frozenset({"runtime_id", "runtime_version"}),
     "ENDPOINT_READY": frozenset(),
     "CONTEXT_WRITTEN": frozenset({"runtime_context_sha256"}),
-    "CONSUMER_CHANGESETS_READY": frozenset(),
-    "CONSUMERS_APPLIED": frozenset(),
-    "VERIFIED": frozenset(),
+    "CONSUMER_CHANGESETS_READY": frozenset({"consumer_changesets_sha256"}),
+    "CONSUMERS_APPLIED": frozenset({"consumer_application_sha256"}),
+    "VERIFIED": frozenset({"verification_sha256"}),
 }
 _LOCAL_STATES = {"PREFLIGHTED"}
 
@@ -73,6 +73,9 @@ class TransactionJournal:
                 "runtimeVersion": "",
                 "runtimeEndpointName": f"release_{source_commit}",
                 "runtimeContextSha256": "",
+                "consumerChangesetsSha256": "",
+                "consumerApplicationSha256": "",
+                "verificationSha256": "",
                 "rollbackReference": "",
                 "uncertainPhase": "",
                 "uncertainOperationSha256": "",
@@ -220,6 +223,9 @@ class TransactionJournal:
             "runtime_id": "runtimeId",
             "runtime_version": "runtimeVersion",
             "runtime_context_sha256": "runtimeContextSha256",
+            "consumer_changesets_sha256": "consumerChangesetsSha256",
+            "consumer_application_sha256": "consumerApplicationSha256",
+            "verification_sha256": "verificationSha256",
         }
         for name, value in supplied.items():
             mapping[aliases[name]] = value

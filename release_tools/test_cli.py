@@ -58,20 +58,26 @@ def _fixture(tmp_path: Path) -> dict[str, object]:
     tree = subprocess.check_output(
         ["git", "rev-parse", "HEAD^{tree}"], cwd=repository, text=True
     ).strip()
+    rollback = (
+        f"rollback:v1:{ACCOUNT}:{REGION}:{commit}:sha256:" + "9" * 64
+    )
 
     call_log = tmp_path / "calls.log"
     fake_bin = tmp_path / "bin"
     _write_executable(
         fake_bin / "aws",
-        """#!/bin/bash
-set -eu
-printf 'aws <%s>\n' "$*" >> "$RELEASE_CALL_LOG"
-if [[ "$*" == "sts get-caller-identity --query Account --output text --region eu-west-1" ]]; then
-  printf '%s\n' "$RELEASE_TEST_ACCOUNT"
-else
-  printf 'unexpected aws command: %s\n' "$*" >&2
-  exit 97
-fi
+        f"""#!{sys.executable}
+from pathlib import Path
+import sys
+
+arguments = " ".join(sys.argv[1:])
+with Path({str(call_log)!r}).open("a", encoding="utf-8") as log:
+    log.write(f"aws <{{arguments}}>\\n")
+if arguments == "sts get-caller-identity --query Account --output text --region eu-west-1":
+    print({ACCOUNT!r})
+else:
+    print(f"unexpected aws command: {{arguments}}", file=sys.stderr)
+    raise SystemExit(97)
 """,
     )
     driver = tmp_path / "phase-driver"
@@ -96,7 +102,9 @@ parser.add_argument("--account", required=True)
 parser.add_argument("--region", required=True)
 parser.add_argument("--operation-sha256", required=True)
 args = parser.parse_args()
-with pathlib.Path(os.environ["RELEASE_CALL_LOG"]).open("a", encoding="utf-8") as log:
+control_path = pathlib.Path(args.journal + ".driver-control.json")
+control = json.loads(control_path.read_text(encoding="utf-8"))
+with pathlib.Path({str(call_log)!r}).open("a", encoding="utf-8") as log:
     log.write(
         f"driver {{args.mode}} <{{args.phase}}> region="
         f"<{{os.environ.get('CDK_DEFAULT_REGION', '')}}>"
@@ -104,16 +112,16 @@ with pathlib.Path(os.environ["RELEASE_CALL_LOG"]).open("a", encoding="utf-8") as
         f"/<{{os.environ.get('AWS_DEFAULT_REGION', '')}}>\\n"
     )
 if args.mode == "mutate":
-    if os.environ.get("RELEASE_FAIL_PHASE") == args.phase:
+    if control.get("RELEASE_FAIL_PHASE") == args.phase:
         raise SystemExit(75)
-    value = {{}} if os.environ.get("RELEASE_BAD_ACK_PHASE") == args.phase else {{"dispatched": True}}
+    value = {{}} if control.get("RELEASE_BAD_ACK_PHASE") == args.phase else {{"dispatched": True}}
     print(json.dumps(value, separators=(",", ":"), sort_keys=True))
     raise SystemExit(0)
 if args.mode != "observe":
     raise SystemExit(76)
-if os.environ.get("RELEASE_FAIL_OBSERVE_PHASE") == args.phase:
+if control.get("RELEASE_FAIL_OBSERVE_PHASE") == args.phase:
     raise SystemExit(77)
-outcome = os.environ.get("RELEASE_OBSERVE_OUTCOME", "PERSISTED")
+outcome = control.get("RELEASE_OBSERVE_OUTCOME", "PERSISTED")
 evidence = {{}}
 digest = "sha256:" + "0" * 64
 image_uri = (
@@ -137,7 +145,7 @@ context = {{
 }}
 if outcome == "PERSISTED":
     if args.phase == "image":
-        if os.environ.get("RELEASE_LEGACY_IMAGE") == "1":
+        if control.get("RELEASE_LEGACY_IMAGE") == "1":
             evidence = {{"runtime_image_digest": digest}}
         else:
             evidence = {{"runtime_image_evidence": {{
@@ -165,7 +173,7 @@ if outcome == "PERSISTED":
     elif args.phase == "runtime":
         evidence = {{"runtime_id": "Runtime-ABCDEFGHIJ", "runtime_version": "7"}}
     elif args.phase in {{"endpoint", "context"}}:
-        if args.phase == "endpoint" and os.environ.get("RELEASE_EMPTY_ENDPOINT") == "1":
+        if args.phase == "endpoint" and control.get("RELEASE_EMPTY_ENDPOINT") == "1":
             evidence = {{}}
         else:
             evidence = {{"runtime_context": context}}
@@ -173,7 +181,7 @@ if outcome == "PERSISTED":
                 payload = (json.dumps(context, separators=(",", ":"), sort_keys=True) + "\\n").encode()
                 evidence["runtime_context_sha256"] = hashlib.sha256(payload).hexdigest()
     elif args.phase == "rollback":
-        evidence = {{"rollback_reference": os.environ["RELEASE_ROLLBACK_REFERENCE"]}}
+        evidence = {{"rollback_reference": {rollback!r}}}
 observation = {{
     "account": args.account,
     "evidence": evidence,
@@ -190,16 +198,10 @@ print(json.dumps(observation, separators=(",", ":"), sort_keys=True))
 """,
     )
     journal = tmp_path / "journal.json"
-    rollback = (
-        f"rollback:v1:{ACCOUNT}:{REGION}:{commit}:sha256:" + "9" * 64
-    )
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "PYTHONPATH": str(ROOT),
-        "RELEASE_CALL_LOG": str(call_log),
-        "RELEASE_TEST_ACCOUNT": ACCOUNT,
-        "RELEASE_ROLLBACK_REFERENCE": rollback,
         "AWS_ACCESS_KEY_ID": "poison",
         "AWS_SECRET_ACCESS_KEY": "poison",
         "AWS_SESSION_TOKEN": "poison",
@@ -224,7 +226,21 @@ def _run(
     *arguments: str,
     **environment: str,
 ) -> subprocess.CompletedProcess[str]:
-    env = {**fixture["env"], **environment}
+    controls = {
+        name: value
+        for name, value in environment.items()
+        if name.startswith("RELEASE_")
+    }
+    control_path = Path(str(fixture["journal"]) + ".driver-control.json")
+    control_path.write_text(json.dumps(controls, sort_keys=True), encoding="utf-8")
+    env = {
+        **fixture["env"],
+        **{
+            name: value
+            for name, value in environment.items()
+            if not name.startswith("RELEASE_")
+        },
+    }
     return subprocess.run(
         [
             sys.executable,
@@ -370,6 +386,155 @@ def test_mutation_rejects_a_symlinked_driver_before_write_ahead_or_credentials(
     assert "symlink" in completed.stderr.casefold()
     assert not fixture["log"].exists()
     assert TransactionJournal.load(fixture["journal"]).current.state == "PREFLIGHTED"
+
+
+def test_driver_self_modification_stays_uncertain_under_recorded_digest(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _write_executable(
+        fixture["driver"],
+        f"""#!{sys.executable}
+import json
+import pathlib
+import sys
+
+mode = sys.argv[sys.argv.index("--mode") + 1]
+if mode == "mutate":
+    path = pathlib.Path(sys.argv[0])
+    path.write_text("#!{sys.executable}\\nprint('changed')\\n", encoding="utf-8")
+    path.chmod(0o700)
+    print(json.dumps({{"dispatched": True}}, separators=(",", ":"), sort_keys=True))
+else:
+    print("changed")
+""",
+    )
+    assert _preflight(fixture).returncode == 0
+
+    completed = _phase(fixture, "foundation")
+
+    assert completed.returncode != 0
+    assert "operation bytes changed" in completed.stderr.casefold()
+    current = TransactionJournal.load(fixture["journal"]).current
+    assert current.state == "UNCERTAIN"
+    assert current.uncertain_operation_sha256 == _sha256(fixture["driver"])
+
+
+def test_driver_cannot_import_mutable_operator_helper_from_pythonpath(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    helper_root = tmp_path / "unreviewed-helper"
+    helper_root.mkdir()
+    marker = tmp_path / "helper-imported"
+    (helper_root / "phase_helper.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('imported')\n",
+        encoding="utf-8",
+    )
+    _write_executable(
+        fixture["driver"],
+        f"""#!{sys.executable}
+import argparse
+import json
+import phase_helper
+
+parser = argparse.ArgumentParser()
+for name in ("mode", "phase", "journal", "transaction-id", "source-commit", "source-tree", "account", "region", "operation-sha256"):
+    parser.add_argument("--" + name, required=True)
+args = parser.parse_args()
+if args.mode == "mutate":
+    value = {{"dispatched": True}}
+else:
+    value = {{
+        "account": args.account,
+        "evidence": {{}},
+        "operationSha256": args.operation_sha256,
+        "outcome": "PERSISTED",
+        "phase": args.phase,
+        "region": args.region,
+        "schema": "personal-operator.phase-observation.v1",
+        "sourceCommit": args.source_commit,
+        "sourceTree": args.source_tree,
+        "transactionId": getattr(args, "transaction_id"),
+    }}
+print(json.dumps(value, separators=(",", ":"), sort_keys=True))
+""",
+    )
+    assert _preflight(fixture).returncode == 0
+
+    completed = _phase(
+        fixture,
+        "foundation",
+        PYTHONPATH=str(helper_root),
+    )
+
+    assert completed.returncode != 0
+    assert not marker.exists()
+    assert TransactionJournal.load(fixture["journal"]).current.state == "UNCERTAIN"
+
+
+def test_driver_environment_is_account_pinned_and_code_loading_closed(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    environment_log = tmp_path / "driver-environment.json"
+    _write_executable(
+        fixture["driver"],
+        f"""#!{sys.executable}
+import argparse
+import json
+import os
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+for name in ("mode", "phase", "journal", "transaction-id", "source-commit", "source-tree", "account", "region", "operation-sha256"):
+    parser.add_argument("--" + name, required=True)
+args = parser.parse_args()
+Path({str(environment_log)!r}).write_text(
+    json.dumps(dict(os.environ), sort_keys=True), encoding="utf-8"
+)
+if args.mode == "mutate":
+    value = {{"dispatched": True}}
+else:
+    value = {{
+        "account": args.account,
+        "evidence": {{}},
+        "operationSha256": args.operation_sha256,
+        "outcome": "PERSISTED",
+        "phase": args.phase,
+        "region": args.region,
+        "schema": "personal-operator.phase-observation.v1",
+        "sourceCommit": args.source_commit,
+        "sourceTree": args.source_tree,
+        "transactionId": getattr(args, "transaction_id"),
+    }}
+print(json.dumps(value, separators=(",", ":"), sort_keys=True))
+""",
+    )
+    assert _preflight(fixture).returncode == 0
+
+    completed = _phase(
+        fixture,
+        "foundation",
+        CDK_DEFAULT_ACCOUNT="999999999999",
+        AWS_ENDPOINT_URL="http://127.0.0.1:9",
+        PYTHONPATH="/tmp/unreviewed",
+        HTTP_PROXY="http://127.0.0.1:8",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    observed = json.loads(environment_log.read_text(encoding="utf-8"))
+    assert observed["CDK_DEFAULT_ACCOUNT"] == ACCOUNT
+    assert observed["AWS_REGION"] == REGION
+    assert observed["AWS_DEFAULT_REGION"] == REGION
+    assert observed["CDK_DEFAULT_REGION"] == REGION
+    for name in (
+        "AWS_ENDPOINT_URL",
+        "PYTHONPATH",
+        "HTTP_PROXY",
+    ):
+        assert name not in observed
 
 
 def test_confirmed_phase_discovers_exact_account_immediately_before_driver(
@@ -625,6 +790,9 @@ def test_verified_rollback_is_write_ahead_and_never_exposes_endpoint_retarget(
             "runtimeVersion": "7",
             "runtimeEndpointName": f"release_{fixture['commit']}",
             "runtimeContextSha256": "1" * 64,
+            "consumerChangesetsSha256": "2" * 64,
+            "consumerApplicationSha256": "3" * 64,
+            "verificationSha256": "4" * 64,
             "rollbackReference": fixture["rollback"],
             "uncertainPhase": "",
             "uncertainOperationSha256": "",
