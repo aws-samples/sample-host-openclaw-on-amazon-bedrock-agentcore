@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:browser-action-output:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"accepted":{"type":"boolean"}},"required":["accepted"],"title":"Browser action output","type":"object"}

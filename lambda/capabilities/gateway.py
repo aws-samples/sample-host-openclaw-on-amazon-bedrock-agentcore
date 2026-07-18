@@ -268,6 +268,52 @@ class CapabilityGateway:
         )
 
 
+class ConnectorPlaneRegistry:
+    """Disabled-by-default registry for the curated connector plane.
+
+    The connector plane is deliberately SEPARATE from the frozen 10-op
+    model-facing catalog: its adapters are keyed by connector operationId and it
+    is empty in production composition. This registry keeps connectors behind
+    the same caller-pinned trusted boundary WITHOUT polluting the catalog and
+    proves runtime-unawareness: a connector operationId that collides with any
+    model-facing catalog operationId is refused at construction, so no connector
+    tool can ever be surfaced to the runtime as a model tool.
+    """
+
+    def __init__(
+        self,
+        *,
+        catalog: CapabilityCatalogV1,
+        adapters: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(catalog, CapabilityCatalogV1):
+            raise TypeError("connector registry requires a validated catalog")
+        self._model_operation_ids = _catalog_operation_ids(catalog)
+        configured = dict(adapters or {})
+        colliding = set(configured) & self._model_operation_ids
+        if colliding:
+            raise ValueError(
+                "connector operationId collides with a model-facing catalog tool"
+            )
+        # Every connector adapter must implement the Task 3 effect surface so an
+        # effect can only flow through the kernel's reload+fence discipline.
+        for adapter in configured.values():
+            if not callable(getattr(adapter, "dispatch", None)) or not callable(
+                getattr(adapter, "prepare", None)
+            ):
+                raise TypeError("connector adapters must implement the Task 3 surface")
+        self._adapters = configured
+
+    def is_disabled(self) -> bool:
+        return not self._adapters
+
+    def enabled_connector_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._adapters))
+
+    def get(self, operation_id: str) -> Any | None:
+        return self._adapters.get(operation_id)
+
+
 def lambda_handler(event: Any, _context: Any) -> dict[str, Any]:
     """Invoke the cold-start verified, durable, disabled-adapter composition."""
 
@@ -294,5 +340,6 @@ __all__ = [
     "AdapterOutcome",
     "CapabilityAdapter",
     "CapabilityGateway",
+    "ConnectorPlaneRegistry",
     "lambda_handler",
 ]

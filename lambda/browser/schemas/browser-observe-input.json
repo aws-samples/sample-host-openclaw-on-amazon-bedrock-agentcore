@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:browser-observe-input:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"target":{"maxLength":2048,"minLength":1,"type":"string"}},"required":["target"],"title":"Browser observe input","type":"object"}

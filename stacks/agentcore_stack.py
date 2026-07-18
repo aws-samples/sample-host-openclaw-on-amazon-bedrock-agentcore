@@ -720,8 +720,11 @@ class AgentCoreStack(Stack):
         # --- Browser authority is forbidden in the runtime -------------------
         # The conversational runtime never owns a browser. Curated browsing is
         # provided outside AgentCore by the separate trusted Browser Gateway
-        # introduced by Task 10, disabled by default. A runtime-owned browser
-        # escape hatch is rejected at synth time.
+        # introduced by Task 10 (see ``stacks/browser_stack.py``), disabled by
+        # default and owning ALL browser IAM in its own role. That browser role
+        # is NEVER this execution role and is never passed into AgentCoreStack,
+        # so no browser IAM statement is ever added to the runtime role here. A
+        # runtime-owned browser escape hatch is rejected at synth time.
         enable_browser = str(
             self.node.try_get_context("enable_browser") or "false"
         ).casefold()
