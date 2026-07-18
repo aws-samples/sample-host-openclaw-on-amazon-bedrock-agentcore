@@ -64,6 +64,21 @@ def _documents(contracts):
     definition_hash = contracts.canonical_sha256(definition)
     proposal_arguments = {"taskType": "REMINDER", "definition": definition}
     proposal_args_hash = contracts.canonical_sha256(proposal_arguments)
+    connector_manifest_body = {
+        "schema": "personal-operator.connector-manifest.v1",
+        "connectorId": "google.gmail",
+        "version": "1.0.0",
+        "operations": [
+            {
+                "operationId": "gmail.read",
+                "mode": "READ",
+                "inputSchemaDigest": SHA_A,
+                "outputSchemaDigest": SHA_B,
+            }
+        ],
+        "credentialBoundary": "TRUSTED_ADAPTER",
+    }
+    connector_manifest_digest = contracts.canonical_sha256(connector_manifest_body)
     return {
         "personal-operator.capability-installation.v1": {
             "schema": "personal-operator.capability-installation.v1",
@@ -142,6 +157,7 @@ def _documents(contracts):
             "proposalId": "proposal_12345678",
             "userId": "user_alpha",
             "catalogDigest": SHA_A,
+            "connectorSchemaDigest": None,
             "operationId": "schedule.propose",
             "toolName": "po_schedule_propose",
             "capabilityId": "schedule.propose",
@@ -210,19 +226,8 @@ def _documents(contracts):
             "errorCode": None,
         },
         "personal-operator.connector-manifest.v1": {
-            "schema": "personal-operator.connector-manifest.v1",
-            "connectorId": "google.gmail",
-            "version": "1.0.0",
-            "schemaDigest": SHA_A,
-            "operations": [
-                {
-                    "operationId": "gmail.read",
-                    "mode": "READ",
-                    "inputSchemaDigest": SHA_A,
-                    "outputSchemaDigest": SHA_B,
-                }
-            ],
-            "credentialBoundary": "TRUSTED_ADAPTER",
+            **connector_manifest_body,
+            "schemaDigest": connector_manifest_digest,
         },
         "personal-operator.connector-connection.v1": {
             "schema": "personal-operator.connector-connection.v1",
@@ -498,22 +503,41 @@ def test_direct_catalog_parser_rejects_rehashed_frozen_matrix_mutation():
         contracts.parse_canonical_json(_canonical(document), document["schema"])
 
 
-def test_schema_byte_change_changes_catalog_digest(tmp_path):
-    _, catalog_module = _load_modules()
+@pytest.mark.parametrize("mutation", ["change", "swap"])
+def test_direct_catalog_parser_binds_exact_schema_digest_placement(mutation):
+    contracts, catalog_module = _load_modules()
+    _, catalog = catalog_module.compile_catalog(RELEASE_COMMIT, SCHEMA_DIR)
+    document = catalog.to_mapping()
+    operations = [pack["operations"][0] for pack in document["packs"]]
+    if mutation == "change":
+        operations[0]["inputSchemaDigest"] = SHA_A
+    else:
+        operations[0]["inputSchemaDigest"], operations[1]["inputSchemaDigest"] = (
+            operations[1]["inputSchemaDigest"],
+            operations[0]["inputSchemaDigest"],
+        )
+    without_digest = {
+        key: value for key, value in document.items() if key != "catalogDigest"
+    }
+    document["catalogDigest"] = hashlib.sha256(_canonical(without_digest)).hexdigest()
+    with pytest.raises(contracts.ContractValidationError):
+        contracts.parse_canonical_json(_canonical(document), document["schema"])
+
+
+def test_schema_byte_change_is_rejected_by_reviewed_digest_lock(tmp_path):
+    contracts, catalog_module = _load_modules()
     copied_root = tmp_path / "capabilities"
     shutil.copytree(SCHEMA_DIR.parent, copied_root)
     copied_schema_dir = copied_root / "schemas"
-    original_bytes, original = catalog_module.compile_catalog(
-        RELEASE_COMMIT, copied_schema_dir
-    )
+    catalog_module.compile_catalog(RELEASE_COMMIT, copied_schema_dir)
     schema_path = copied_schema_dir / "po-web-read-output.json"
     raw = schema_path.read_bytes()
-    schema_path.write_bytes(raw.replace(b'"maxLength":32768', b'"maxLength":32767', 1))
-    changed_bytes, changed = catalog_module.compile_catalog(
-        RELEASE_COMMIT, copied_schema_dir
-    )
-    assert original_bytes != changed_bytes
-    assert original.catalog_digest != changed.catalog_digest
+    changed = raw.replace(b'"maxLength":32768', b'"maxLength":32767', 1)
+    assert changed != raw
+    assert hashlib.sha256(changed).digest() != hashlib.sha256(raw).digest()
+    schema_path.write_bytes(changed)
+    with pytest.raises(contracts.ContractValidationError):
+        catalog_module.compile_catalog(RELEASE_COMMIT, copied_schema_dir)
 
 
 @pytest.mark.parametrize(
@@ -589,6 +613,67 @@ def _operation_call(contracts, operation_id, tool_name, arguments, index=1):
     return document
 
 
+def _successful_result_for_call(call, data, *, provenance_refs=None, receipt_ref=None):
+    return {
+        "schema": "personal-operator.capability-result.v1",
+        "callId": call["callId"],
+        "invocationId": call["invocationId"],
+        "toolUseId": call["toolUseId"],
+        "catalogDigest": call["catalogDigest"],
+        "operationId": call["operationId"],
+        "toolName": call["toolName"],
+        "argsHash": call["argsHash"],
+        "status": "SUCCEEDED",
+        "data": data,
+        "provenanceRefs": [] if provenance_refs is None else provenance_refs,
+        "proposalRef": None,
+        "receiptRef": receipt_ref,
+        "errorCode": None,
+        "retryPolicy": "NONE",
+    }
+
+
+def _connector_manifest_document(
+    contracts, *, connector_id="google.gmail", mode="PREPARE"
+):
+    body = {
+        "schema": "personal-operator.connector-manifest.v1",
+        "connectorId": connector_id,
+        "version": "1.0.0",
+        "operations": [
+            {
+                "operationId": "gmail.send",
+                "mode": mode,
+                "inputSchemaDigest": SHA_A,
+                "outputSchemaDigest": SHA_B,
+            }
+        ],
+        "credentialBoundary": "TRUSTED_ADAPTER",
+    }
+    return {**body, "schemaDigest": contracts.canonical_sha256(body)}
+
+
+def _connector_proposal_document(contracts, manifest, arguments):
+    return {
+        "schema": "personal-operator.action-proposal.v1",
+        "proposalId": "proposal_12345678",
+        "userId": "user_alpha",
+        "catalogDigest": None,
+        "connectorSchemaDigest": manifest.schema_digest,
+        "operationId": "gmail.send",
+        "toolName": None,
+        "capabilityId": "gmail.send",
+        "resource": "gmail:draft:draft_12345678",
+        "connectionRef": "connection_12345678",
+        "arguments": arguments,
+        "argsHash": contracts.canonical_sha256(arguments),
+        "revision": 1,
+        "originatingInvocationId": "invocation_12345678",
+        "approvalPolicy": "EXACT_ONE_TIME",
+        "expiresAt": 1_800_000_300,
+    }
+
+
 @pytest.mark.parametrize(
     "target",
     [
@@ -606,6 +691,10 @@ def _operation_call(contracts, operation_id, tool_name, arguments, index=1):
         "https://2130706433/",
         "https://0177.0.0.1/",
         "https://0x7f000001/",
+        "https://127.0.0.0x1/",
+        "https://127.0x0.0.1/",
+        "https://0x7f.0.0.1/",
+        "https://0177.0x0.0.01/",
         "https://example.com.:443/",
         "https://user@example.com/",
         "https://example.com/#fragment",
@@ -783,6 +872,92 @@ def test_cancel_proposal_binds_exact_schedule_resource_without_connection(mutati
         contracts.parse_canonical_json(_canonical(document), document["schema"])
 
 
+def test_connector_proposal_requires_manifest_and_connection_bound_context():
+    contracts, _ = _load_modules()
+    manifest = contracts.ConnectorManifestV1.from_mapping(
+        _connector_manifest_document(contracts)
+    )
+    connection = contracts.ConnectorConnectionV1.from_mapping(
+        _documents(contracts)["personal-operator.connector-connection.v1"]
+    )
+    normalized_arguments = {
+        "recipient": "synthetic@example.com",
+        "subject": "Synthetic draft",
+    }
+    proposal_document = _connector_proposal_document(
+        contracts, manifest, normalized_arguments
+    )
+    proposal = contracts.ActionProposalV1.from_connector_mapping(
+        proposal_document,
+        manifest=manifest,
+        connection=connection,
+        expected_resource="gmail:draft:draft_12345678",
+        normalized_arguments=normalized_arguments,
+    )
+    assert proposal.to_mapping() == proposal_document
+    with pytest.raises(contracts.ContractValidationError):
+        contracts.ActionProposalV1.from_mapping(proposal_document)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["manifest", "schema", "connection", "resource", "arguments", "read-operation"],
+)
+def test_connector_proposal_rejects_context_and_wysiwyis_substitution(mutation):
+    contracts, _ = _load_modules()
+    manifest_document = _connector_manifest_document(contracts)
+    if mutation == "read-operation":
+        manifest_document = _connector_manifest_document(contracts, mode="READ")
+    manifest = contracts.ConnectorManifestV1.from_mapping(manifest_document)
+    connection_document = _documents(contracts)[
+        "personal-operator.connector-connection.v1"
+    ]
+    connection = contracts.ConnectorConnectionV1.from_mapping(connection_document)
+    normalized_arguments = {
+        "recipient": "synthetic@example.com",
+        "subject": "Synthetic draft",
+    }
+    proposal_document = _connector_proposal_document(
+        contracts, manifest, normalized_arguments
+    )
+    expected_resource = "gmail:draft:draft_12345678"
+    if mutation == "manifest":
+        manifest = contracts.ConnectorManifestV1.from_mapping(
+            _connector_manifest_document(contracts, connector_id="other.gmail")
+        )
+    elif mutation == "schema":
+        proposal_document["connectorSchemaDigest"] = SHA_A
+        assert proposal_document["connectorSchemaDigest"] != manifest.schema_digest
+    elif mutation == "connection":
+        proposal_document["connectionRef"] = "connection_00000000"
+    elif mutation == "resource":
+        proposal_document["resource"] = "gmail:draft:draft_00000000"
+    elif mutation == "arguments":
+        proposal_document["arguments"] = {
+            **proposal_document["arguments"],
+            "sendImmediately": True,
+        }
+        proposal_document["argsHash"] = contracts.canonical_sha256(
+            proposal_document["arguments"]
+        )
+    with pytest.raises(contracts.ContractValidationError):
+        contracts.ActionProposalV1.from_connector_mapping(
+            proposal_document,
+            manifest=manifest,
+            connection=connection,
+            expected_resource=expected_resource,
+            normalized_arguments=normalized_arguments,
+        )
+
+
+def test_connector_manifest_digest_binds_operation_schema_metadata():
+    contracts, _ = _load_modules()
+    document = _connector_manifest_document(contracts)
+    document["operations"][0]["inputSchemaDigest"] = SHA_B
+    with pytest.raises(contracts.ContractValidationError):
+        contracts.ConnectorManifestV1.from_mapping(document)
+
+
 @pytest.mark.parametrize(
     "task_type,definition",
     [
@@ -819,11 +994,25 @@ def test_schedule_definition_is_exact_for_each_task_type(task_type, definition):
 def test_catalog_source_must_equal_the_frozen_ten_row_matrix():
     contracts, _ = _load_modules()
     source = json.loads(SOURCE_CATALOG.read_bytes())
-    assert source["packs"] == list(contracts.FROZEN_CATALOG_PACKS_V1)
+    assert contracts.canonical_json_bytes(
+        source["packs"]
+    ) == contracts.canonical_json_bytes(contracts.FROZEN_CATALOG_PACKS_V1)
     with pytest.raises(TypeError):
         contracts.FROZEN_CATALOG_PACKS_V1[0]["riskClass"] = "LOCAL_MUTATION"
-    with pytest.raises(TypeError):
+    with pytest.raises((AttributeError, TypeError)):
         contracts.FROZEN_CATALOG_PACKS_V1[0]["operations"].append({})
+
+
+def test_frozen_catalog_sequences_reject_base_list_mutator_bypass():
+    contracts, _ = _load_modules()
+    operations = contracts.FROZEN_CATALOG_PACKS_V1[0]["operations"]
+    original = operations[0]
+    try:
+        with pytest.raises(TypeError):
+            list.__setitem__(operations, 0, original)
+    finally:
+        if isinstance(operations, list):
+            list.__setitem__(operations, 0, original)
 
 
 @pytest.mark.parametrize("mutation", ["schema-swap", "policy-drift"])
@@ -962,6 +1151,17 @@ def test_schema_malformed_type_normalizes_to_contract_error(tmp_path, invalid_ty
         catalog_module.compile_catalog(RELEASE_COMMIT, schema_dir)
 
 
+def test_schema_mixed_required_members_normalize_to_contract_error(tmp_path):
+    contracts, catalog_module = _load_modules()
+    _, schema_dir = _copied_capability_tree(tmp_path)
+    schema_path = schema_dir / "po-web-read-input.json"
+    schema = json.loads(schema_path.read_bytes())
+    schema["required"] = ["url", 1]
+    _write_canonical(schema_path, schema)
+    with pytest.raises(contracts.ContractValidationError):
+        catalog_module.compile_catalog(RELEASE_COMMIT, schema_dir)
+
+
 @pytest.mark.parametrize(
     "mutation", ["schema-id", "path-escape", "duplicate-operation"]
 )
@@ -1047,6 +1247,163 @@ def test_result_rejects_cross_operation_substitution_for_a_real_call_id():
     )
     with pytest.raises(contracts.ContractValidationError):
         contracts.parse_canonical_json(_canonical(document), document["schema"])
+
+
+def test_result_has_a_strict_validation_path_against_originating_call():
+    contracts, _ = _load_modules()
+    call_document = _operation_call(
+        contracts, "workspace.file.read", "po_file_read", {"path": "notes/a.md"}
+    )
+    result_document = _successful_result_for_call(
+        call_document,
+        {"path": "notes/a.md", "content": "text"},
+        provenance_refs=["workspace:notes/a.md"],
+    )
+    call = contracts.CapabilityCallV1.from_mapping(call_document)
+    result = contracts.CapabilityResultV1.from_mapping(result_document)
+    assert result.validate_against_call(call) is result
+
+
+@pytest.mark.parametrize(
+    "operation_id,tool_name,arguments,data",
+    [
+        (
+            "workspace.file.read",
+            "po_file_read",
+            {"path": "notes/a.md"},
+            {"path": "notes/b.md", "content": "text"},
+        ),
+        (
+            "workspace.file.write",
+            "po_file_write",
+            {"path": "notes/a.md", "content": "text"},
+            {"path": "notes/b.md", "bytes": 4},
+        ),
+        (
+            "workspace.file.write",
+            "po_file_write",
+            {"path": "notes/a.md", "content": "text"},
+            {"path": "notes/a.md", "bytes": 3},
+        ),
+        (
+            "workspace.file.delete",
+            "po_file_delete",
+            {"path": "notes/a.md"},
+            {"path": "notes/b.md", "deleted": True},
+        ),
+        (
+            "web.exact.read",
+            "po_web_read",
+            {"url": "https://example.com/a"},
+            {
+                "canonicalUrl": "https://other.example.com/b",
+                "contentDigest": SHA_A,
+                "retrievedAt": 1_800_000_000,
+                "sourceRef": "public:https://other.example.com/b",
+                "text": "text",
+            },
+        ),
+        (
+            "compute.status",
+            "po_compute_status",
+            {"jobId": "job_00000001"},
+            {"jobId": "job_00000002", "outputs": [], "status": "RUNNING"},
+        ),
+    ],
+)
+def test_result_strict_path_rejects_unrelated_output_identity(
+    operation_id, tool_name, arguments, data
+):
+    contracts, _ = _load_modules()
+    call = contracts.CapabilityCallV1.from_mapping(
+        _operation_call(contracts, operation_id, tool_name, arguments)
+    )
+    result = contracts.CapabilityResultV1.from_mapping(
+        _successful_result_for_call(call.to_mapping(), data)
+    )
+    with pytest.raises(contracts.ContractValidationError):
+        result.validate_against_call(call)
+
+
+@pytest.mark.parametrize(
+    "operation_id,tool_name,arguments,data",
+    [
+        ("workspace.file.list", "po_file_list", {}, {"files": []}),
+        (
+            "workspace.file.read",
+            "po_file_read",
+            {"path": "notes/a.md"},
+            {"path": "notes/a.md", "content": "text"},
+        ),
+        (
+            "web.exact.read",
+            "po_web_read",
+            {"url": "https://example.com/a"},
+            {
+                "canonicalUrl": "https://example.com/a",
+                "contentDigest": SHA_A,
+                "retrievedAt": 1_800_000_000,
+                "sourceRef": "public:https://example.com/a",
+                "text": "text",
+            },
+        ),
+        ("schedule.list", "po_schedule_list", {}, {"schedules": []}),
+        (
+            "compute.status",
+            "po_compute_status",
+            {"jobId": "job_00000001"},
+            {"jobId": "job_00000001", "outputs": [], "status": "RUNNING"},
+        ),
+    ],
+)
+def test_read_list_and_status_results_cannot_invent_effect_receipts(
+    operation_id, tool_name, arguments, data
+):
+    contracts, _ = _load_modules()
+    call = _operation_call(contracts, operation_id, tool_name, arguments)
+    result = _successful_result_for_call(call, data, receipt_ref="receipt_00000001")
+    with pytest.raises(contracts.ContractValidationError):
+        contracts.parse_canonical_json(_canonical(result), result["schema"])
+
+
+@pytest.mark.parametrize(
+    "operation_id,tool_name,arguments,data",
+    [
+        (
+            "workspace.file.write",
+            "po_file_write",
+            {"path": "notes/a.md", "content": "text"},
+            {"path": "notes/a.md", "bytes": 4},
+        ),
+        (
+            "workspace.file.delete",
+            "po_file_delete",
+            {"path": "notes/a.md"},
+            {"path": "notes/a.md", "deleted": True},
+        ),
+        (
+            "compute.run",
+            "po_compute_run",
+            {
+                "command": {"mode": "SCRIPT", "value": "print('ok')"},
+                "inputPaths": [],
+                "network": "NONE",
+                "resourceProfile": "SMALL",
+            },
+            {"jobId": "job_00000001", "status": "QUEUED"},
+        ),
+    ],
+)
+def test_mutation_results_cannot_invent_read_provenance(
+    operation_id, tool_name, arguments, data
+):
+    contracts, _ = _load_modules()
+    call = _operation_call(contracts, operation_id, tool_name, arguments)
+    result = _successful_result_for_call(
+        call, data, provenance_refs=["workspace:notes/a.md"]
+    )
+    with pytest.raises(contracts.ContractValidationError):
+        contracts.parse_canonical_json(_canonical(result), result["schema"])
 
 
 def test_pending_result_proposal_hash_must_equal_the_call_arguments_hash():

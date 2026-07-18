@@ -17,11 +17,21 @@ Repository catalog/schema artifacts use that encoding plus one trailing LF.
 `catalogDigest` is non-self-referential: it is SHA-256 of the compiled canonical
 catalog with only `catalogDigest` omitted. Each input/output schema digest is
 SHA-256 over the exact canonical schema artifact bytes, including its single
-trailing LF. The compiled catalog binds one exact lowercase 40-character release
-commit. A release, catalog, schema, runtime, or gateway mismatch must fail closed.
+trailing LF, and direct catalog parsing requires every digest in its reviewed
+operation-specific position. The compiled catalog binds one exact lowercase
+40-character release commit. A release, catalog, schema, runtime, or gateway
+mismatch must fail closed.
 Capability calls bind the catalog digest, exact operation/tool pair, invocation,
 tool-use identity, and canonical argument hash into `callId`; operation-specific
-input, output, proposal, and schedule shapes reject all extra fields.
+input, output, proposal, and schedule shapes reject all extra fields. A result is
+accepted for use only after contextual validation against its originating call;
+that path binds the full call identity, operation-specific output identity, and
+the allowed receipt/provenance shape.
+
+Schedule proposals remain bound to the frozen catalog operation and tool.
+Connector proposals require a separate contextual constructor that binds a
+self-digesting connector manifest, one active unfenced connection, the exact
+PREPARE operation, trusted resource, and trusted normalized display arguments.
 
 Public URL grants accept only canonical HTTPS authorities. Non-global IP
 literals, IPv4-mapped IPv6, numeric and hostname aliases, userinfo, ports,

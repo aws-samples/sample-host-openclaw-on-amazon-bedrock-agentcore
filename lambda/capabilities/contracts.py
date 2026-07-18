@@ -59,6 +59,7 @@ _RUNTIME_ARN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
 )
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_LEGACY_IPV4_COMPONENT = re.compile(r"(?:[0-9]+|0x[0-9a-f]+)")
 _HEX_PAIR = re.compile(r"[0-9A-F]{2}")
 
 
@@ -175,39 +176,6 @@ def _freeze(value: Any) -> Any:
     return value
 
 
-class _FrozenList(list[Any]):
-    """List-shaped for exact JSON-matrix comparison, but non-mutable."""
-
-    __slots__ = ()
-
-    @staticmethod
-    def _immutable(*_args: Any, **_kwargs: Any) -> None:
-        raise TypeError("frozen catalog sequence cannot be mutated")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __iadd__ = _immutable
-    __imul__ = _immutable
-    append = _immutable
-    clear = _immutable
-    extend = _immutable
-    insert = _immutable
-    pop = _immutable
-    remove = _immutable
-    reverse = _immutable
-    sort = _immutable
-
-
-def _freeze_catalog_source(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {key: _freeze_catalog_source(nested) for key, nested in value.items()}
-        )
-    if isinstance(value, (tuple, list)):
-        return _FrozenList(_freeze_catalog_source(nested) for nested in value)
-    return value
-
-
 def _catalog_source_pack(
     pack_id: str,
     operation_id: str,
@@ -260,9 +228,8 @@ def _catalog_source_pack(
     }
 
 
-FROZEN_CATALOG_PACKS_V1 = tuple(
-    _freeze_catalog_source(pack)
-    for pack in (
+FROZEN_CATALOG_PACKS_V1 = _freeze(
+    (
         _catalog_source_pack(
             "workspace.file-list",
             "workspace.file.list",
@@ -444,6 +411,75 @@ FROZEN_CATALOG_PACKS_V1 = tuple(
             "FENCE_CANCEL_PURGE",
         ),
     )
+)
+
+# Reviewed exact-schema boundary for the v1 authority matrix.  These values bind
+# each operation to the repository-owned canonical input/output schema bytes;
+# callers cannot move a valid digest to another operation or substitute a
+# different, internally self-consistent schema.
+FROZEN_OPERATION_SCHEMA_DIGESTS_V1 = MappingProxyType(
+    {
+        "workspace.file.list": MappingProxyType(
+            {
+                "inputSchemaDigest": "35e141ebe098d3cbc73ef1655e93ed743520f76cab08a533574c1262330d344a",
+                "outputSchemaDigest": "6a6e9fe40d241f055d5509e7c337a1c279ba4e175fbddfed5bd9cc76ad09663f",
+            }
+        ),
+        "workspace.file.read": MappingProxyType(
+            {
+                "inputSchemaDigest": "adf79b35ad5da0e5ccfba630254e1b8cb6b0ee41db07cfe34d7d5004851bfb5f",
+                "outputSchemaDigest": "f6d5ec6a082465d3b66d4af47bdc41cc0fdcded0adfed706e14d18019188b34a",
+            }
+        ),
+        "workspace.file.write": MappingProxyType(
+            {
+                "inputSchemaDigest": "3c83b398c5709887c626fd70d36e251cce8a0c96c7b28080c530ff2c587d652d",
+                "outputSchemaDigest": "efacdca9b890b9ba2cb239a25488f487d00c4a6f070f532b2910d6cbd88e0052",
+            }
+        ),
+        "workspace.file.delete": MappingProxyType(
+            {
+                "inputSchemaDigest": "b731089b54f1c87185741f0045d04555a1e77fb05ded2c7a7e3ce4389759b224",
+                "outputSchemaDigest": "657d345a47d261692729a01ca96a6cd0d9b9b65c7bb862989503ee111cfd2d19",
+            }
+        ),
+        "web.exact.read": MappingProxyType(
+            {
+                "inputSchemaDigest": "3ce72f18e68a9c53329670e403dbf176c8fb5203d25d23438f29f5285defd80f",
+                "outputSchemaDigest": "c241a4bd2a4c986821f0aa71b4c6c883319c43598e3904e18e52ece8ad6e99e5",
+            }
+        ),
+        "schedule.list": MappingProxyType(
+            {
+                "inputSchemaDigest": "1ea525d11a67b6581efb9f064818e5da4782914ed8e7ef93c295ab3c93e3a710",
+                "outputSchemaDigest": "605a0da1316c22151b3e64d8be0a6fc5168353e7e9a99097ec35758f6c4986fa",
+            }
+        ),
+        "schedule.propose": MappingProxyType(
+            {
+                "inputSchemaDigest": "e3586bade20d0d184b65d5c79b41c22703c4feccd9fdbdb137fafc1006b3f12b",
+                "outputSchemaDigest": "8a82e3987b4f193e6c0edf8ca98245c950183883bf688f1d3690f7a05410198d",
+            }
+        ),
+        "schedule.cancel.propose": MappingProxyType(
+            {
+                "inputSchemaDigest": "fdee4f975779c5e83d216d20b1aabd68623c257903bd1d86ac3b776116383f15",
+                "outputSchemaDigest": "311792ffe90921e24eca03e043c21b5b790e32be1046a0dd533b148d0c98fa78",
+            }
+        ),
+        "compute.run": MappingProxyType(
+            {
+                "inputSchemaDigest": "01cf09ff29529611b51bbee73b86f32b99a6814f7319ba27b18bef5e579b2a1d",
+                "outputSchemaDigest": "ea26fc131f78e0377d5fbda50e8b1b9cf688d1c43f5a3a61dd3bd66953c08eb4",
+            }
+        ),
+        "compute.status": MappingProxyType(
+            {
+                "inputSchemaDigest": "54c5277b5f0b1da875e5c4321161cff110ab3ef9048409c9f1e7d7a70ab938d8",
+                "outputSchemaDigest": "144dd0d56b7897d0dfe225fdb20780e30225cddf7da19b7acbdbbd4ab1618c08",
+            }
+        ),
+    }
 )
 
 _OPERATION_METADATA_V1 = MappingProxyType(
@@ -705,7 +741,7 @@ def _public_https_url(value: Any) -> str:
                 "onion",
                 "test",
             }
-            or all(label.isdigit() for label in labels)
+            or all(_LEGACY_IPV4_COMPONENT.fullmatch(label) for label in labels)
             or host.startswith("0x")
         ):
             _fail("normalizedTarget hostname is not a canonical public name")
@@ -1076,6 +1112,13 @@ class CapabilityCatalogV1(ContractValue):
                 or actual_operations[0]["toolName"] != expected_operation["toolName"]
             ):
                 _fail("catalog authority metadata differs from the frozen v1 matrix")
+            operation_id = actual_operations[0]["operationId"]
+            reviewed_digests = FROZEN_OPERATION_SCHEMA_DIGESTS_V1.get(operation_id)
+            if reviewed_digests is None or any(
+                actual_operations[0][field] != reviewed_digests[field]
+                for field in ("inputSchemaDigest", "outputSchemaDigest")
+            ):
+                _fail("catalog schema digests differ from the reviewed v1 matrix")
         result["packs"] = normalized
         digest_input = {
             key: nested for key, nested in result.items() if key != "catalogDigest"
@@ -1330,6 +1373,28 @@ class CapabilityResultV1(ContractValue):
             )
             if result["proposalRef"] is not None or result["errorCode"] is not None:
                 _fail("successful result contains a forbidden proposal or error")
+            read_operations = {
+                "workspace.file.list",
+                "workspace.file.read",
+                "web.exact.read",
+                "schedule.list",
+                "compute.status",
+            }
+            mutation_operations = {
+                "workspace.file.write",
+                "workspace.file.delete",
+                "compute.run",
+            }
+            if (
+                result["operationId"] in read_operations
+                and result["receiptRef"] is not None
+            ):
+                _fail("read, list, and status results cannot claim effect receipts")
+            if (
+                result["operationId"] in mutation_operations
+                and result["provenanceRefs"]
+            ):
+                _fail("mutation results cannot claim read provenance")
         elif status == "PENDING_APPROVAL":
             if not proposal_operation:
                 _fail("only proposal operations can await approval")
@@ -1361,6 +1426,52 @@ class CapabilityResultV1(ContractValue):
             ):
                 _fail("read-only operations cannot return an uncertain effect outcome")
         return result
+
+    def validate_against_call(self, call: CapabilityCallV1) -> "CapabilityResultV1":
+        """Bind this result to one validated originating capability call."""
+
+        if not isinstance(call, CapabilityCallV1):
+            _fail("originating call must be a validated CapabilityCallV1")
+        for identity_field in (
+            "callId",
+            "invocationId",
+            "toolUseId",
+            "catalogDigest",
+            "operationId",
+            "toolName",
+            "argsHash",
+        ):
+            if self._data[identity_field] != call.data[identity_field]:
+                _fail(f"result {identity_field} does not match the originating call")
+
+        if self._data["status"] != "SUCCEEDED":
+            return self
+
+        operation_id = self._data["operationId"]
+        arguments = call.data["arguments"]
+        data = self._data["data"]
+        if (
+            operation_id
+            in {
+                "workspace.file.read",
+                "workspace.file.write",
+                "workspace.file.delete",
+            }
+            and data["path"] != arguments["path"]
+        ):
+            _fail("file result path does not match the originating call")
+        if operation_id == "workspace.file.write" and data["bytes"] != len(
+            arguments["content"].encode("utf-8")
+        ):
+            _fail("file write byte count does not match the originating content")
+        if operation_id == "web.exact.read":
+            requested_authority = urlsplit(arguments["url"]).netloc
+            result_authority = urlsplit(data["canonicalUrl"]).netloc
+            if result_authority != requested_authority:
+                _fail("web result authority does not match the originating call")
+        if operation_id == "compute.status" and data["jobId"] != arguments["jobId"]:
+            _fail("compute status job does not match the originating call")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -1411,6 +1522,7 @@ class ActionProposalV1(ContractValue):
         "proposalId",
         "userId",
         "catalogDigest",
+        "connectorSchemaDigest",
         "operationId",
         "toolName",
         "capabilityId",
@@ -1425,29 +1537,48 @@ class ActionProposalV1(ContractValue):
     )
 
     @classmethod
-    def _validate_mapping(cls, value: Mapping[str, Any]) -> dict[str, Any]:
+    def _validate_common(cls, value: Mapping[str, Any]) -> dict[str, Any]:
         result = cls._base(value)
         result["proposalId"] = _string(
             result["proposalId"], "proposalId", pattern=_OPAQUE_ID
         )
         result["userId"] = _string(result["userId"], "userId", pattern=_USER_ID)
-        result["catalogDigest"] = _sha256(result["catalogDigest"], "catalogDigest")
-        result["operationId"], result["toolName"] = _validate_tool_identity(
-            result["operationId"], result["toolName"]
-        )
-        if _operation_approval_mode(result["operationId"]) != "EXACT_ONE_TIME_PROPOSAL":
-            _fail("action proposal must name an approval-gated operation")
         result["capabilityId"] = _string(
             result["capabilityId"], "capabilityId", pattern=_OPERATION_ID
         )
-        if result["capabilityId"] != result["operationId"]:
-            _fail("capabilityId must equal operationId")
         result["resource"] = _string(result["resource"], "resource", maximum=1024)
         result["connectionRef"] = (
             None
             if result["connectionRef"] is None
             else _string(result["connectionRef"], "connectionRef", pattern=_OPAQUE_ID)
         )
+        result["arguments"] = _mapping(result["arguments"], "arguments")
+        result["argsHash"] = _sha256(result["argsHash"], "argsHash")
+        result["revision"] = _integer(result["revision"], "revision", minimum=1)
+        result["originatingInvocationId"] = _string(
+            result["originatingInvocationId"],
+            "originatingInvocationId",
+            pattern=_OPAQUE_ID,
+        )
+        result["approvalPolicy"] = _enum(
+            result["approvalPolicy"], "approvalPolicy", {"EXACT_ONE_TIME"}
+        )
+        result["expiresAt"] = _integer(result["expiresAt"], "expiresAt")
+        return result
+
+    @classmethod
+    def _validate_mapping(cls, value: Mapping[str, Any]) -> dict[str, Any]:
+        result = cls._validate_common(value)
+        result["catalogDigest"] = _sha256(result["catalogDigest"], "catalogDigest")
+        if result["connectorSchemaDigest"] is not None:
+            _fail("schedule proposals cannot carry a connector schema digest")
+        result["operationId"], result["toolName"] = _validate_tool_identity(
+            result["operationId"], result["toolName"]
+        )
+        if _operation_approval_mode(result["operationId"]) != "EXACT_ONE_TIME_PROPOSAL":
+            _fail("action proposal must name an approval-gated operation")
+        if result["capabilityId"] != result["operationId"]:
+            _fail("capabilityId must equal operationId")
         result["arguments"] = _validate_tool_input(
             result["operationId"], result["arguments"]
         )
@@ -1462,20 +1593,73 @@ class ActionProposalV1(ContractValue):
             _fail(
                 "schedule proposal resource does not match its exact operation target"
             )
-        result["argsHash"] = _sha256(result["argsHash"], "argsHash")
         if canonical_sha256(result["arguments"]) != result["argsHash"]:
             _fail("argsHash does not bind proposal arguments")
-        result["revision"] = _integer(result["revision"], "revision", minimum=1)
-        result["originatingInvocationId"] = _string(
-            result["originatingInvocationId"],
-            "originatingInvocationId",
-            pattern=_OPAQUE_ID,
-        )
-        result["approvalPolicy"] = _enum(
-            result["approvalPolicy"], "approvalPolicy", {"EXACT_ONE_TIME"}
-        )
-        result["expiresAt"] = _integer(result["expiresAt"], "expiresAt")
         return result
+
+    @classmethod
+    def from_connector_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        manifest: "ConnectorManifestV1",
+        connection: "ConnectorConnectionV1",
+        expected_resource: str,
+        normalized_arguments: Mapping[str, Any],
+    ) -> "ActionProposalV1":
+        """Validate a proposal against trusted connector and WYSIWYIS context."""
+
+        if not isinstance(manifest, ConnectorManifestV1):
+            _fail("manifest must be a validated ConnectorManifestV1")
+        if not isinstance(connection, ConnectorConnectionV1):
+            _fail("connection must be a validated ConnectorConnectionV1")
+        result = cls._validate_common(value)
+        if result["catalogDigest"] is not None:
+            _fail("connector proposals cannot carry a capability catalog digest")
+        result["connectorSchemaDigest"] = _sha256(
+            result["connectorSchemaDigest"], "connectorSchemaDigest"
+        )
+        if result["connectorSchemaDigest"] != manifest.schema_digest:
+            _fail("connector proposal does not bind the trusted manifest")
+        result["operationId"] = _string(
+            result["operationId"], "operationId", pattern=_OPERATION_ID
+        )
+        if result["toolName"] is not None:
+            _fail("connector proposals cannot name a local model tool")
+        if result["capabilityId"] != result["operationId"]:
+            _fail("capabilityId must equal operationId")
+        operations = [
+            operation
+            for operation in manifest.operations
+            if operation["operationId"] == result["operationId"]
+        ]
+        if len(operations) != 1 or operations[0]["mode"] != "PREPARE":
+            _fail("connector proposal must name one PREPARE manifest operation")
+        if (
+            connection.user_id != result["userId"]
+            or connection.connector_id != manifest.connector_id
+            or connection.connection_ref != result["connectionRef"]
+            or connection.state != "CONNECTED"
+            or connection.deletion_fence
+        ):
+            _fail("connector proposal does not bind an active trusted connection")
+        normalized_resource = _string(
+            expected_resource, "expected_resource", maximum=1024
+        )
+        if result["resource"] != normalized_resource:
+            _fail("connector proposal resource differs from trusted display context")
+        trusted_arguments = _mapping(normalized_arguments, "normalized_arguments")
+        if canonical_json_bytes(result["arguments"]) != canonical_json_bytes(
+            trusted_arguments
+        ):
+            _fail("connector proposal arguments differ from trusted display context")
+        if canonical_sha256(result["arguments"]) != result["argsHash"]:
+            _fail("argsHash does not bind proposal arguments")
+
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_data", _freeze(result))
+        object.__setattr__(instance, "_wire", canonical_json_bytes(result))
+        return instance
 
 
 @dataclass(frozen=True, slots=True)
@@ -1981,6 +2165,11 @@ class ConnectorManifestV1(ContractValue):
         result["credentialBoundary"] = _enum(
             result["credentialBoundary"], "credentialBoundary", {"TRUSTED_ADAPTER"}
         )
+        digest_input = {
+            key: nested for key, nested in result.items() if key != "schemaDigest"
+        }
+        if result["schemaDigest"] != canonical_sha256(digest_input):
+            _fail("schemaDigest does not bind the canonical connector manifest")
         return result
 
 
@@ -2265,6 +2454,7 @@ __all__ = [
     "ContractValidationError",
     "EffectReceiptV1",
     "FROZEN_CATALOG_PACKS_V1",
+    "FROZEN_OPERATION_SCHEMA_DIGESTS_V1",
     "ImportPlanV1",
     "ImportReceiptV1",
     "PortableStateManifestV2",

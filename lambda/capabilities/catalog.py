@@ -228,10 +228,12 @@ def _validate_schema_document(value: Any, filename: str) -> None:
                     _fail(f"tool schema property name is invalid: {filename}")
                 validate_node(child)
             required = item.get("required")
+            if not isinstance(required, list) or any(
+                not isinstance(name, str) for name in required
+            ):
+                _fail(f"tool schema required fields are invalid: {filename}")
             if (
-                not isinstance(required, list)
-                or required != sorted(required)
-                or any(not isinstance(name, str) for name in required)
+                required != sorted(required)
                 or len(set(required)) != len(required)
                 or set(required) != set(properties)
             ):
