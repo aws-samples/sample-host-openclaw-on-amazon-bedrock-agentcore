@@ -45,6 +45,7 @@ class MemoryInviteTable:
         self.calls = []
         self.lock = Lock()
         self.meta = type("Meta", (), {"client": self})()
+        self.raise_before_transaction = False
         self.raise_after_transaction = False
 
     @staticmethod
@@ -86,6 +87,9 @@ class MemoryInviteTable:
 
     def transact_write_items(self, **request):
         self.calls.append(("transact_write_items", deepcopy(request)))
+        if self.raise_before_transaction:
+            self.raise_before_transaction = False
+            raise TimeoutError("synthetic transaction outage")
         with self.lock:
             pending = deepcopy(self.items)
             for operation in request["TransactItems"]:
@@ -331,6 +335,24 @@ def test_ambiguous_transaction_reconciles_only_the_exact_actor_binding():
 
     assert result.created is True
     assert result.user_id.startswith("user_")
+
+
+def test_transaction_outage_before_commit_is_retryable_not_an_invite_rejection():
+    table = MemoryInviteTable()
+    invites = service(table=table)
+    token = invites.issue().token
+    table.raise_before_transaction = True
+
+    with pytest.raises(InviteStoreError, match="redemption"):
+        invites.redeem(
+            token,
+            channel="telegram",
+            channel_user_id="42",
+            display_name="Ada",
+        )
+
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    assert table.items[(f"PILOT_INVITE#{digest}", "INVITE")]["status"] == "ISSUED"
 
 
 def test_invalid_issue_randomness_and_collision_never_reissues_plaintext():
