@@ -268,6 +268,36 @@ class CapabilityGateway:
         )
 
 
+WEB_READ_OPERATION_ID = "web.exact.read"
+
+
+def build_web_read_adapter(
+    *,
+    resolver: Callable[[str], Any],
+    connect: Callable[..., Any],
+    clock: Callable[[], int],
+    max_redirects: int = 0,
+) -> "CapabilityAdapter":
+    """Build the gateway-mediated exact-target web reader adapter.
+
+    This is the single wiring point for the reader: it can only enter the
+    system as an ``adapters`` entry keyed by ``WEB_READ_OPERATION_ID`` on a
+    :class:`CapabilityGateway`, and it holds no network authority beyond the
+    explicit ``resolver``/``connect`` seams passed here. The production
+    composition never calls this, so ``web.exact.read`` stays a disabled
+    (fail-closed) adapter and the verifier remains offline and credential-free.
+    """
+
+    from .web_reader import build_web_read_adapter as _build
+
+    return _build(
+        resolver=resolver,
+        connect=connect,
+        clock=clock,
+        max_redirects=max_redirects,
+    )
+
+
 def lambda_handler(event: Any, _context: Any) -> dict[str, Any]:
     """Invoke the cold-start verified, durable, disabled-adapter composition."""
 
@@ -294,5 +324,7 @@ __all__ = [
     "AdapterOutcome",
     "CapabilityAdapter",
     "CapabilityGateway",
+    "WEB_READ_OPERATION_ID",
+    "build_web_read_adapter",
     "lambda_handler",
 ]

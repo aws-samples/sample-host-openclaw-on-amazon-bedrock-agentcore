@@ -679,6 +679,58 @@ def _safe_path(value: Any, label: str = "path") -> str:
     return path
 
 
+def _ip_is_globally_routable(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    """Return True only for a globally routable public IP literal.
+
+    This is the single authoritative IP classification predicate shared by the
+    URL gate (``_public_https_url``) and the pinned web-reader adapter so that
+    DNS-resolved addresses are held to the exact same public-only bar. Private,
+    loopback, link-local, metadata (169.254.169.254), reserved, multicast,
+    unspecified, site-local, and IPv4-mapped IPv6 addresses are rejected.
+    """
+
+    if not isinstance(address, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return False
+    if (
+        not address.is_global
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_private
+        or getattr(address, "is_site_local", False)
+        or (
+            isinstance(address, ipaddress.IPv6Address)
+            and address.ipv4_mapped is not None
+        )
+    ):
+        return False
+    return True
+
+
+def public_ip_or_none(
+    value: Any,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse ``value`` as an IP literal and return it only when public.
+
+    Returns ``None`` for anything that is not a syntactically valid IP address
+    or that fails the shared globally-routable predicate. Used by the web
+    reader to classify every DNS answer with the exact same rules the URL gate
+    applies to IP-literal hosts. Performs no network I/O.
+    """
+
+    if not isinstance(value, str):
+        return None
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return address if _ip_is_globally_routable(address) else None
+
+
 def _public_https_url(value: Any) -> str:
     target = _string(value, "normalizedTarget", maximum=2048)
     try:
@@ -747,20 +799,7 @@ def _public_https_url(value: Any) -> str:
             _fail("normalizedTarget hostname is not a canonical public name")
         canonical_authority = host
     else:
-        if (
-            not address.is_global
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_private
-            or getattr(address, "is_site_local", False)
-            or (
-                isinstance(address, ipaddress.IPv6Address)
-                and address.ipv4_mapped is not None
-            )
-        ):
+        if not _ip_is_globally_routable(address):
             _fail("normalizedTarget IP literal is not globally routable")
         if isinstance(address, ipaddress.IPv6Address):
             canonical_authority = f"[{address.compressed}]"
@@ -2470,4 +2509,5 @@ __all__ = [
     "derive_occurrence_id",
     "derive_target_hash",
     "parse_canonical_json",
+    "public_ip_or_none",
 ]
