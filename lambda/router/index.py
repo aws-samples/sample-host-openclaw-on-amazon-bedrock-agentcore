@@ -27,18 +27,13 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from event_identity import derive_event_trace
-from runtime_driver import AgentCoreAdapter, RuntimeDriver
-from runtime_state import RuntimeStateRepository
 from telegram_ingress import TelegramWebhookIngress
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # --- Configuration ---
-AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
-AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
-RUNTIME_STATE_TABLE_NAME = os.environ.get("RUNTIME_STATE_TABLE_NAME", "")
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
@@ -62,20 +57,14 @@ def _require_region():
 
 AWS_REGION = _require_region()
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
-LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
 # --- Clients (lazy init on cold start) ---
-dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
-identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
-agentcore_client = boto3.client(
-    "bedrock-agentcore",
+dynamodb = boto3.resource(
+    "dynamodb",
     region_name=AWS_REGION,
-    config=Config(
-        read_timeout=max(LAMBDA_TIMEOUT_SECONDS - 15, 60),
-        connect_timeout=10,
-        retries={"max_attempts": 0},
-    ),
+    config=Config(retries={"max_attempts": 0, "mode": "standard"}),
 )
+identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
@@ -85,32 +74,12 @@ sqs_client = boto3.client(
     config=Config(retries={"max_attempts": 0}),
 )
 
-_runtime_driver_cache = None
 _telegram_ingress_cache = None
 
 
 def _get_runtime_driver():
-    """Build the trusted driver lazily so import-only webhook tests stay offline."""
-    global _runtime_driver_cache
-    if _runtime_driver_cache is not None:
-        return _runtime_driver_cache
-    if not RUNTIME_STATE_TABLE_NAME:
-        raise RuntimeError("RUNTIME_STATE_TABLE_NAME is required")
-    lease_ms = int(os.environ.get("RUNTIME_LEASE_MS", "120000"))
-    if lease_ms < 30_000 or lease_ms > 600_000:
-        raise RuntimeError("RUNTIME_LEASE_MS must be between 30000 and 600000")
-    state_table = dynamodb.Table(RUNTIME_STATE_TABLE_NAME)
-    _runtime_driver_cache = RuntimeDriver(
-        repository=RuntimeStateRepository(state_table),
-        adapter=AgentCoreAdapter(
-            agentcore_client,
-            runtime_arn=AGENTCORE_RUNTIME_ARN,
-            qualifier=AGENTCORE_QUALIFIER,
-            region=AWS_REGION,
-        ),
-        lease_ms=lease_ms,
-    )
-    return _runtime_driver_cache
+    """Reject legacy in-process execution; only the ordered worker may run it."""
+    raise RuntimeError("runtime execution authority belongs to the ordered worker")
 
 USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
 

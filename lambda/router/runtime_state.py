@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 import uuid
@@ -10,6 +11,12 @@ from enum import Enum
 
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{32,255}")
+_RUNTIME_ARN = re.compile(
+    r"arn:aws:bedrock-agentcore:(?P<region>[a-z]{2}-[a-z]+-[1-9]):"
+    r"(?P<account>[0-9]{12}):agent/"
+    r"(?P<agent>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}):(?P<version>[1-9][0-9]{0,4})"
+)
 
 
 class RuntimeState(str, Enum):
@@ -52,10 +59,18 @@ class StaleLease(RuntimeStateError):
         self.record = record
 
 
+class DuplicateTraceUncertain(RuntimeStateError):
+    def __init__(self, record: "RuntimeRecord") -> None:
+        super().__init__(f"duplicate invocation trace for {record.user_id}")
+        self.record = record
+
+
 @dataclass(frozen=True)
 class RuntimeRecord:
     user_id: str
     session_id: str | None
+    runtime_arn: str
+    runtime_qualifier: str
     state: RuntimeState
     revision: int
     lease_owner: str | None
@@ -68,11 +83,15 @@ class RuntimeRecord:
     created_at: int
     updated_at: int
     tombstoned_at: int | None
+    last_mutation_id: str | None
+    stop_operation_id: str | None
 
     def public(self) -> dict:
         return {
             "userId": self.user_id,
             "sessionId": self.session_id,
+            "runtimeArn": self.runtime_arn,
+            "runtimeQualifier": self.runtime_qualifier,
             "state": self.state.value,
             "revision": self.revision,
             "leaseEpoch": self.lease_epoch,
@@ -108,6 +127,35 @@ def generate_session_id() -> str:
     return canonical_session_id(f"ses_{uuid.uuid4().hex}")
 
 
+def canonical_runtime_arn(runtime_arn: str) -> str:
+    value = str(runtime_arn or "")
+    match = _RUNTIME_ARN.fullmatch(value)
+    if match is None or match.group("region") != "eu-west-1":
+        raise ValueError("invalid exact AgentCore runtime ARN")
+    return value
+
+
+def runtime_lineage(runtime_arn: str) -> tuple[str, str, str]:
+    value = canonical_runtime_arn(runtime_arn)
+    match = _RUNTIME_ARN.fullmatch(value)
+    assert match is not None
+    return match.group("region"), match.group("account"), match.group("agent")
+
+
+def canonical_runtime_qualifier(qualifier: str) -> str:
+    value = str(qualifier or "")
+    if value != "DEFAULT":
+        raise ValueError("runtime qualifier must be exactly DEFAULT")
+    return value
+
+
+def deterministic_id(prefix: str, operation: str, *parts: object) -> str:
+    if prefix not in {"mut", "op"} or not operation:
+        raise ValueError("invalid deterministic identity kind")
+    canonical = "\0".join(["personal-operator-runtime-v1", operation, *map(str, parts)])
+    return f"{prefix}_{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
 def _is_conditional(error: BaseException) -> bool:
     response = getattr(error, "response", None)
     return bool(
@@ -117,16 +165,51 @@ def _is_conditional(error: BaseException) -> bool:
     )
 
 
+def _is_ambiguous(error: BaseException) -> bool:
+    if isinstance(error, (TimeoutError, ConnectionError, OSError)):
+        return True
+    response = getattr(error, "response", None)
+    code = (
+        response.get("Error", {}).get("Code")
+        if isinstance(response, dict)
+        else None
+    )
+    if code in {
+        "InternalServerError",
+        "ServiceUnavailable",
+        "RequestTimeout",
+        "RequestTimeoutException",
+        "ThrottlingException",
+        "ProvisionedThroughputExceededException",
+    }:
+        return True
+    return type(error).__name__ in {
+        "EndpointConnectionError",
+        "ConnectionClosedError",
+        "ReadTimeoutError",
+        "ConnectTimeoutError",
+    }
+
+
 class RuntimeStateRepository:
     """Stores tombstone, session mapping, and fenced lease in one DynamoDB item."""
 
-    def __init__(self, table, *, clock_ms=None, session_id_factory=None) -> None:
+    def __init__(
+        self,
+        table,
+        *,
+        runtime_arn: str,
+        runtime_qualifier: str,
+        clock_ms=None,
+        session_id_factory=None,
+    ) -> None:
         self.table = table
+        self.runtime_arn = canonical_runtime_arn(runtime_arn)
+        self.runtime_qualifier = canonical_runtime_qualifier(runtime_qualifier)
         self.clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self.session_id_factory = session_id_factory or generate_session_id
 
-    @staticmethod
-    def _record(item: dict) -> RuntimeRecord:
+    def _record(self, item: dict) -> RuntimeRecord:
         try:
             return RuntimeRecord(
                 user_id=canonical_user_id(item["userId"]),
@@ -134,6 +217,10 @@ class RuntimeStateRepository:
                     canonical_session_id(item["sessionId"])
                     if item.get("sessionId") is not None
                     else None
+                ),
+                runtime_arn=canonical_runtime_arn(item["runtimeArn"]),
+                runtime_qualifier=canonical_runtime_qualifier(
+                    item["runtimeQualifier"]
                 ),
                 state=RuntimeState(item["state"]),
                 revision=int(item.get("revision", 0)),
@@ -157,6 +244,8 @@ class RuntimeStateRepository:
                     if item.get("tombstonedAt") is not None
                     else None
                 ),
+                last_mutation_id=item.get("lastMutationId"),
+                stop_operation_id=item.get("stopOperationId"),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeStateError("corrupt runtime-state record") from error
@@ -168,6 +257,57 @@ class RuntimeStateRepository:
         )
         item = response.get("Item")
         return self._record(item) if item else None
+
+    def binding_matches(self, record: RuntimeRecord) -> bool:
+        return (
+            record.runtime_arn == self.runtime_arn
+            and record.runtime_qualifier == self.runtime_qualifier
+        )
+
+    def _reconcile(
+        self,
+        user_id: str,
+        mutation_id: str,
+        expected,
+    ) -> RuntimeRecord | None:
+        current = self.get(user_id)
+        if (
+            current is not None
+            and current.last_mutation_id == mutation_id
+            and expected(current)
+        ):
+            return current
+        return None
+
+    def _conditional_update(
+        self,
+        operation: str,
+        *,
+        user_id: str,
+        mutation_id: str,
+        expected,
+        **kwargs,
+    ) -> RuntimeRecord:
+        try:
+            response = self.table.update_item(ReturnValues="ALL_NEW", **kwargs)
+            return self._record(response["Attributes"])
+        except Exception as error:
+            if _is_conditional(error) or _is_ambiguous(error):
+                try:
+                    reconciled = self._reconcile(
+                        user_id, mutation_id, expected
+                    )
+                except Exception:
+                    reconciled = None
+                if reconciled is not None:
+                    return reconciled
+            if _is_conditional(error):
+                raise LeaseLost(operation) from error
+            if _is_ambiguous(error):
+                raise RuntimeStateError(
+                    f"runtime {operation} update outcome is uncertain"
+                ) from error
+            raise RuntimeStateError(f"runtime {operation} update failed") from error
 
     @staticmethod
     def _assert_available(record: RuntimeRecord) -> None:
@@ -184,6 +324,8 @@ class RuntimeStateRepository:
         candidate = RuntimeRecord(
             user_id=user_id,
             session_id=canonical_session_id(self.session_id_factory()),
+            runtime_arn=self.runtime_arn,
+            runtime_qualifier=self.runtime_qualifier,
             state=RuntimeState.COLD,
             revision=1,
             lease_owner=None,
@@ -196,15 +338,31 @@ class RuntimeStateRepository:
             created_at=now,
             updated_at=now,
             tombstoned_at=None,
+            last_mutation_id=None,
+            stop_operation_id=None,
+        )
+        mutation_id = deterministic_id(
+            "mut",
+            "ensure",
+            candidate.user_id,
+            candidate.session_id,
+            candidate.runtime_arn,
+            candidate.runtime_qualifier,
+        )
+        candidate = RuntimeRecord(
+            **{**candidate.__dict__, "last_mutation_id": mutation_id}
         )
         item = {
             "userId": candidate.user_id,
             "sessionId": candidate.session_id,
+            "runtimeArn": candidate.runtime_arn,
+            "runtimeQualifier": candidate.runtime_qualifier,
             "state": candidate.state.value,
             "revision": candidate.revision,
             "leaseEpoch": candidate.lease_epoch,
             "createdAt": now,
             "updatedAt": now,
+            "lastMutationId": mutation_id,
         }
         try:
             self.table.put_item(
@@ -213,12 +371,22 @@ class RuntimeStateRepository:
             )
             return candidate
         except Exception as error:
-            if not _is_conditional(error):
+            if not (_is_conditional(error) or _is_ambiguous(error)):
                 raise RuntimeStateError("runtime-state creation failed") from error
-        winner = self.get(user_id)
+        try:
+            winner = self.get(user_id)
+        except Exception as read_error:
+            raise RuntimeStateError(
+                "runtime-state creation outcome is uncertain"
+            ) from read_error
         if winner is None:
+            if _is_ambiguous(error):
+                raise RuntimeStateError(
+                    "runtime-state creation outcome is uncertain"
+                ) from error
             raise RuntimeStateError("runtime-state race had no winner")
-        self._assert_available(winner)
+        if winner.tombstoned_at is not None or winner.state is RuntimeState.DELETING:
+            raise TombstonedUser(winner.user_id)
         return winner
 
     def acquire(
@@ -232,70 +400,87 @@ class RuntimeStateRepository:
         user_id = canonical_user_id(user_id)
         if not owner or not trace_id or lease_ms <= 0:
             raise ValueError("lease owner, trace, and duration are required")
-        for attempt in range(2):
-            now = int(self.clock_ms())
-            try:
-                response = self.table.update_item(
-                    Key={"userId": user_id},
-                    UpdateExpression=(
-                        "SET leaseOwner=:owner, leaseExpiresAt=:until, "
-                        "lastTraceId=:trace, #state=:busy, updatedAt=:now, "
-                        "leaseEpoch=if_not_exists(leaseEpoch,:zero)+:one, "
-                        "revision=if_not_exists(revision,:zero)+:one"
-                    ),
-                    ConditionExpression=(
-                        "attribute_exists(userId) AND "
-                        "attribute_not_exists(tombstonedAt) AND "
-                        "#state <> :deleting AND #state <> :quarantined AND "
-                        "#state <> :unhealthy AND "
-                        "(attribute_not_exists(leaseExpiresAt) OR leaseOwner = :owner)"
-                    ),
-                    ExpressionAttributeNames={"#state": "state"},
-                    ExpressionAttributeValues={
-                        ":owner": owner,
-                        ":until": now + lease_ms,
-                        ":trace": trace_id,
-                        ":busy": RuntimeState.BUSY.value,
-                        ":deleting": RuntimeState.DELETING.value,
-                        ":quarantined": RuntimeState.QUARANTINED.value,
-                        ":unhealthy": RuntimeState.UNHEALTHY.value,
-                        ":now": now,
-                        ":zero": 0,
-                        ":one": 1,
-                    },
-                    ReturnValues="ALL_NEW",
+        now = int(self.clock_ms())
+        mutation_id = deterministic_id(
+            "mut", "acquire", user_id, owner, trace_id, self.runtime_arn
+        )
+        try:
+            response = self.table.update_item(
+                Key={"userId": user_id},
+                UpdateExpression=(
+                    "SET leaseOwner=:owner, leaseExpiresAt=:until, "
+                    "lastTraceId=:trace, #state=:busy, updatedAt=:now, "
+                    "lastMutationId=:mutation, "
+                    "leaseEpoch=if_not_exists(leaseEpoch,:zero)+:one, "
+                    "revision=if_not_exists(revision,:zero)+:one"
+                ),
+                ConditionExpression=(
+                    "attribute_exists(userId) AND "
+                    "attribute_not_exists(tombstonedAt) AND "
+                    "runtimeArn=:runtimeArn AND "
+                    "runtimeQualifier=:runtimeQualifier AND "
+                    "#state <> :deleting AND #state <> :quarantined AND "
+                    "#state <> :unhealthy AND "
+                    "(attribute_not_exists(lastTraceId) OR lastTraceId <> :trace) AND "
+                    "(attribute_not_exists(leaseExpiresAt) OR leaseOwner = :owner)"
+                ),
+                ExpressionAttributeNames={"#state": "state"},
+                ExpressionAttributeValues={
+                    ":owner": owner,
+                    ":until": now + lease_ms,
+                    ":trace": trace_id,
+                    ":busy": RuntimeState.BUSY.value,
+                    ":deleting": RuntimeState.DELETING.value,
+                    ":quarantined": RuntimeState.QUARANTINED.value,
+                    ":unhealthy": RuntimeState.UNHEALTHY.value,
+                    ":runtimeArn": self.runtime_arn,
+                    ":runtimeQualifier": self.runtime_qualifier,
+                    ":mutation": mutation_id,
+                    ":now": now,
+                    ":zero": 0,
+                    ":one": 1,
+                },
+                ReturnValues="ALL_NEW",
+            )
+            return self._record(response["Attributes"])
+        except Exception as error:
+            if _is_ambiguous(error):
+                reconciled = self._reconcile(
+                    user_id,
+                    mutation_id,
+                    lambda value: value.state is RuntimeState.BUSY
+                    and value.lease_owner == owner
+                    and value.last_trace_id == trace_id,
                 )
-                return self._record(response["Attributes"])
-            except Exception as error:
-                if not _is_conditional(error):
-                    raise RuntimeStateError("runtime lease acquisition failed") from error
-            current = self.get(user_id)
-            if current is None:
-                raise RuntimeStateError("runtime state disappeared during acquisition")
-            self._assert_available(current)
-            if current.lease_owner and current.lease_expires_at is not None:
-                if current.lease_expires_at < now:
-                    raise StaleLease(current)
-                raise LeaseBusy(user_id)
-            if attempt == 1:
-                raise LeaseBusy(user_id)
-        raise AssertionError("unreachable")
+                if reconciled is not None:
+                    return reconciled
+                raise RuntimeStateError(
+                    "runtime lease acquisition outcome is uncertain"
+                ) from error
+            if not _is_conditional(error):
+                raise RuntimeStateError("runtime lease acquisition failed") from error
+        current = self.get(user_id)
+        if current is None:
+            raise RuntimeStateError("runtime state disappeared during acquisition")
+        if current.last_trace_id == trace_id:
+            raise DuplicateTraceUncertain(current)
+        self._assert_available(current)
+        if not self.binding_matches(current):
+            raise RuntimeUnavailable("runtime binding requires fenced recovery")
+        if current.lease_owner and current.lease_expires_at is not None:
+            if current.lease_expires_at < now:
+                raise StaleLease(current)
+            raise LeaseBusy(user_id)
+        raise LeaseBusy(user_id)
 
     @staticmethod
     def _lease_condition() -> str:
         return (
             "leaseOwner=:owner AND leaseEpoch=:epoch AND "
-            "leaseExpiresAt >= :now AND attribute_not_exists(tombstonedAt)"
+            "leaseExpiresAt >= :now AND attribute_not_exists(tombstonedAt) AND "
+            "sessionId=:oldSession AND runtimeArn=:runtimeArn AND "
+            "runtimeQualifier=:runtimeQualifier"
         )
-
-    def _conditional_update(self, operation: str, **kwargs) -> RuntimeRecord:
-        try:
-            response = self.table.update_item(ReturnValues="ALL_NEW", **kwargs)
-            return self._record(response["Attributes"])
-        except Exception as error:
-            if _is_conditional(error):
-                raise LeaseLost(operation) from error
-            raise RuntimeStateError(f"runtime {operation} update failed") from error
 
     def fence_stale(
         self,
@@ -306,23 +491,45 @@ class RuntimeStateRepository:
         lease_ms: int,
     ) -> RuntimeRecord:
         now = int(self.clock_ms())
-        return self._conditional_update(
+        new_epoch = stale.lease_epoch + 1
+        stop_operation_id = deterministic_id(
+            "op",
+            "stale-stop",
             stale.user_id,
+            stale.session_id,
+            stale.runtime_arn,
+            stale.runtime_qualifier,
+            new_epoch,
+        )
+        mutation_id = deterministic_id(
+            "mut", "stale-fence", stop_operation_id, owner, trace_id
+        )
+        return self._conditional_update(
+            "stale-fence",
+            user_id=stale.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.state is RuntimeState.UNHEALTHY
+            and value.lease_owner == owner
+            and value.lease_epoch == new_epoch
+            and value.stop_operation_id == stop_operation_id,
             Key={"userId": stale.user_id},
             UpdateExpression=(
                 "SET leaseOwner=:newOwner, leaseEpoch=:newEpoch, "
                 "leaseExpiresAt=:until, lastTraceId=:trace, #state=:unhealthy, "
+                "stopOperationId=:stopOperation, lastMutationId=:mutation, "
                 "updatedAt=:now, revision=if_not_exists(revision,:zero)+:one"
             ),
             ConditionExpression=(
                 "leaseOwner=:oldOwner AND leaseEpoch=:oldEpoch AND "
                 "leaseExpiresAt < :now AND attribute_not_exists(tombstonedAt) AND "
-                "#state <> :deleting AND #state <> :quarantined"
+                "#state <> :deleting AND #state <> :quarantined AND "
+                "sessionId=:oldSession AND runtimeArn=:runtimeArn AND "
+                "runtimeQualifier=:runtimeQualifier"
             ),
             ExpressionAttributeNames={"#state": "state"},
             ExpressionAttributeValues={
                 ":newOwner": owner,
-                ":newEpoch": stale.lease_epoch + 1,
+                ":newEpoch": new_epoch,
                 ":until": now + lease_ms,
                 ":trace": trace_id,
                 ":unhealthy": RuntimeState.UNHEALTHY.value,
@@ -333,6 +540,11 @@ class RuntimeStateRepository:
                 ":oldEpoch": stale.lease_epoch,
                 ":deleting": RuntimeState.DELETING.value,
                 ":quarantined": RuntimeState.QUARANTINED.value,
+                ":oldSession": stale.session_id,
+                ":runtimeArn": stale.runtime_arn,
+                ":runtimeQualifier": stale.runtime_qualifier,
+                ":stopOperation": stop_operation_id,
+                ":mutation": mutation_id,
             },
         )
 
@@ -342,16 +554,32 @@ class RuntimeStateRepository:
         if lease_ms <= 0:
             raise ValueError("lease duration must be positive")
         now = int(self.clock_ms())
+        until = now + lease_ms
+        mutation_id = deterministic_id(
+            "mut", "heartbeat", lease.user_id, lease.lease_epoch, until
+        )
         return self._conditional_update(
-            lease.user_id,
+            "heartbeat",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.lease_owner == lease.lease_owner
+            and value.lease_epoch == lease.lease_epoch
+            and value.lease_expires_at == until,
             Key={"userId": lease.user_id},
-            UpdateExpression="SET leaseExpiresAt=:until, updatedAt=:now",
+            UpdateExpression=(
+                "SET leaseExpiresAt=:until, updatedAt=:now, "
+                "lastMutationId=:mutation"
+            ),
             ConditionExpression=self._lease_condition(),
             ExpressionAttributeValues={
-                ":until": now + lease_ms,
+                ":until": until,
                 ":now": now,
                 ":owner": lease.lease_owner,
                 ":epoch": lease.lease_epoch,
+                ":oldSession": lease.session_id,
+                ":runtimeArn": lease.runtime_arn,
+                ":runtimeQualifier": lease.runtime_qualifier,
+                ":mutation": mutation_id,
             },
         )
 
@@ -359,19 +587,39 @@ class RuntimeStateRepository:
         self, lease: RuntimeRecord, *, session_id: str, lease_ms: int
     ) -> RuntimeRecord:
         now = int(self.clock_ms())
-        return self._conditional_update(
+        session_id = canonical_session_id(session_id)
+        mutation_id = deterministic_id(
+            "mut",
+            "rotate-after-fence",
             lease.user_id,
+            lease.lease_epoch,
+            lease.session_id,
+            session_id,
+            self.runtime_arn,
+        )
+        return self._conditional_update(
+            "rotate-after-fence",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.session_id == session_id
+            and value.state is RuntimeState.BUSY
+            and value.lease_owner == lease.lease_owner
+            and value.lease_epoch == lease.lease_epoch
+            and self.binding_matches(value),
             Key={"userId": lease.user_id},
             UpdateExpression=(
                 "SET sessionId=:session, #state=:busy, leaseExpiresAt=:until, "
-                "updatedAt=:now, revision=if_not_exists(revision,:zero)+:one"
+                "runtimeArn=:newRuntimeArn, runtimeQualifier=:newRuntimeQualifier, "
+                "lastMutationId=:mutation, updatedAt=:now, "
+                "revision=if_not_exists(revision,:zero)+:one "
+                "REMOVE stopOperationId"
             ),
             ConditionExpression=(
                 self._lease_condition() + " AND #state=:unhealthy"
             ),
             ExpressionAttributeNames={"#state": "state"},
             ExpressionAttributeValues={
-                ":session": canonical_session_id(session_id),
+                ":session": session_id,
                 ":busy": RuntimeState.BUSY.value,
                 ":until": now + lease_ms,
                 ":now": now,
@@ -380,6 +628,12 @@ class RuntimeStateRepository:
                 ":owner": lease.lease_owner,
                 ":epoch": lease.lease_epoch,
                 ":unhealthy": RuntimeState.UNHEALTHY.value,
+                ":oldSession": lease.session_id,
+                ":runtimeArn": lease.runtime_arn,
+                ":runtimeQualifier": lease.runtime_qualifier,
+                ":newRuntimeArn": self.runtime_arn,
+                ":newRuntimeQualifier": self.runtime_qualifier,
+                ":mutation": mutation_id,
             },
         )
 
@@ -387,13 +641,30 @@ class RuntimeStateRepository:
         self, lease: RuntimeRecord, *, invocation_id: str, receipt: dict
     ) -> RuntimeRecord:
         now = int(self.clock_ms())
-        return self._conditional_update(
+        mutation_id = deterministic_id(
+            "mut",
+            "finalize-success",
             lease.user_id,
+            lease.lease_epoch,
+            invocation_id,
+            receipt["generation"],
+            receipt["manifestSha256"],
+        )
+        return self._conditional_update(
+            "finalize-success",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.state is RuntimeState.IDLE
+            and value.last_invocation_id == invocation_id
+            and value.last_workspace_generation == receipt["generation"]
+            and value.last_workspace_manifest_sha256
+            == receipt["manifestSha256"],
             Key={"userId": lease.user_id},
             UpdateExpression=(
                 "SET #state=:idle, updatedAt=:now, lastInvocationId=:invocation, "
                 "lastWorkspaceGeneration=:generation, "
                 "lastWorkspaceManifestSha256=:sha, "
+                "lastMutationId=:mutation, "
                 "revision=if_not_exists(revision,:zero)+:one "
                 "REMOVE leaseOwner, leaseExpiresAt"
             ),
@@ -409,6 +680,63 @@ class RuntimeStateRepository:
                 ":one": 1,
                 ":owner": lease.lease_owner,
                 ":epoch": lease.lease_epoch,
+                ":oldSession": lease.session_id,
+                ":runtimeArn": lease.runtime_arn,
+                ":runtimeQualifier": lease.runtime_qualifier,
+                ":mutation": mutation_id,
+            },
+        )
+
+    def quarantine(self, lease: RuntimeRecord) -> RuntimeRecord:
+        now = int(self.clock_ms())
+        mutation_id = deterministic_id(
+            "mut",
+            "quarantine",
+            lease.user_id,
+            lease.session_id,
+            lease.runtime_arn,
+            lease.runtime_qualifier,
+            lease.lease_owner,
+            lease.lease_epoch,
+        )
+        if lease.lease_owner is None:
+            owner_condition = "attribute_not_exists(leaseOwner)"
+            owner_values = {}
+        else:
+            owner_condition = "leaseOwner=:owner"
+            owner_values = {":owner": lease.lease_owner}
+        return self._conditional_update(
+            "quarantine",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.state is RuntimeState.QUARANTINED
+            and value.lease_owner is None,
+            Key={"userId": lease.user_id},
+            UpdateExpression=(
+                "SET #state=:quarantined, updatedAt=:now, "
+                "lastMutationId=:mutation, "
+                "revision=if_not_exists(revision,:zero)+:one "
+                "REMOVE leaseOwner, leaseExpiresAt"
+            ),
+            ConditionExpression=(
+                f"{owner_condition} AND leaseEpoch=:epoch AND "
+                "attribute_not_exists(tombstonedAt) AND "
+                "sessionId=:oldSession AND runtimeArn=:runtimeArn AND "
+                "runtimeQualifier=:runtimeQualifier AND #state <> :deleting"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                **owner_values,
+                ":epoch": lease.lease_epoch,
+                ":oldSession": lease.session_id,
+                ":runtimeArn": lease.runtime_arn,
+                ":runtimeQualifier": lease.runtime_qualifier,
+                ":quarantined": RuntimeState.QUARANTINED.value,
+                ":deleting": RuntimeState.DELETING.value,
+                ":now": now,
+                ":mutation": mutation_id,
+                ":zero": 0,
+                ":one": 1,
             },
         )
 
@@ -417,12 +745,21 @@ class RuntimeStateRepository:
     ) -> RuntimeRecord:
         if state not in {RuntimeState.UNHEALTHY, RuntimeState.QUARANTINED}:
             raise ValueError("failure state must be UNHEALTHY or QUARANTINED")
+        if state is RuntimeState.QUARANTINED:
+            return self.quarantine(lease)
         now = int(self.clock_ms())
+        mutation_id = deterministic_id(
+            "mut", "finalize-unhealthy", lease.user_id, lease.lease_epoch
+        )
         return self._conditional_update(
-            lease.user_id,
+            "finalize-unhealthy",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.state is RuntimeState.UNHEALTHY
+            and value.lease_owner is None,
             Key={"userId": lease.user_id},
             UpdateExpression=(
-                "SET #state=:state, updatedAt=:now, "
+                "SET #state=:state, updatedAt=:now, lastMutationId=:mutation, "
                 "revision=if_not_exists(revision,:zero)+:one "
                 "REMOVE leaseOwner, leaseExpiresAt"
             ),
@@ -435,6 +772,195 @@ class RuntimeStateRepository:
                 ":one": 1,
                 ":owner": lease.lease_owner,
                 ":epoch": lease.lease_epoch,
+                ":oldSession": lease.session_id,
+                ":runtimeArn": lease.runtime_arn,
+                ":runtimeQualifier": lease.runtime_qualifier,
+                ":mutation": mutation_id,
+            },
+        )
+
+    def fence_binding_mismatch(
+        self,
+        stale: RuntimeRecord,
+        *,
+        owner: str,
+        trace_id: str,
+        lease_ms: int,
+    ) -> RuntimeRecord:
+        if self.binding_matches(stale):
+            raise ValueError("runtime binding already matches")
+        now = int(self.clock_ms())
+        new_epoch = stale.lease_epoch + 1
+        stop_operation_id = deterministic_id(
+            "op",
+            "binding-stop",
+            stale.user_id,
+            stale.session_id,
+            stale.runtime_arn,
+            stale.runtime_qualifier,
+            new_epoch,
+        )
+        mutation_id = deterministic_id(
+            "mut", "binding-fence", stop_operation_id, owner, trace_id
+        )
+        return self._conditional_update(
+            "binding-fence",
+            user_id=stale.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.state is RuntimeState.UNHEALTHY
+            and value.lease_owner == owner
+            and value.lease_epoch == new_epoch
+            and value.stop_operation_id == stop_operation_id,
+            Key={"userId": stale.user_id},
+            UpdateExpression=(
+                "SET leaseOwner=:owner, leaseEpoch=:newEpoch, "
+                "leaseExpiresAt=:until, lastTraceId=:trace, #state=:unhealthy, "
+                "stopOperationId=:stopOperation, lastMutationId=:mutation, "
+                "updatedAt=:now, revision=if_not_exists(revision,:zero)+:one"
+            ),
+            ConditionExpression=(
+                "attribute_not_exists(tombstonedAt) AND #state <> :deleting AND "
+                "sessionId=:oldSession AND runtimeArn=:oldRuntimeArn AND "
+                "runtimeQualifier=:oldRuntimeQualifier AND leaseEpoch=:oldEpoch AND "
+                "(attribute_not_exists(leaseExpiresAt) OR leaseExpiresAt < :now)"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":owner": owner,
+                ":newEpoch": new_epoch,
+                ":oldEpoch": stale.lease_epoch,
+                ":until": now + lease_ms,
+                ":trace": trace_id,
+                ":unhealthy": RuntimeState.UNHEALTHY.value,
+                ":deleting": RuntimeState.DELETING.value,
+                ":oldSession": stale.session_id,
+                ":oldRuntimeArn": stale.runtime_arn,
+                ":oldRuntimeQualifier": stale.runtime_qualifier,
+                ":stopOperation": stop_operation_id,
+                ":mutation": mutation_id,
+                ":now": now,
+                ":zero": 0,
+                ":one": 1,
+            },
+        )
+
+    def rotate_binding(
+        self, lease: RuntimeRecord, *, session_id: str
+    ) -> RuntimeRecord:
+        session_id = canonical_session_id(session_id)
+        now = int(self.clock_ms())
+        mutation_id = deterministic_id(
+            "mut",
+            "rotate-binding",
+            lease.user_id,
+            lease.lease_epoch,
+            lease.runtime_arn,
+            self.runtime_arn,
+            session_id,
+        )
+        return self._conditional_update(
+            "rotate-binding",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.session_id == session_id
+            and value.state is RuntimeState.COLD
+            and self.binding_matches(value)
+            and value.lease_owner is None,
+            Key={"userId": lease.user_id},
+            UpdateExpression=(
+                "SET sessionId=:newSession, runtimeArn=:newRuntimeArn, "
+                "runtimeQualifier=:newRuntimeQualifier, #state=:cold, "
+                "updatedAt=:now, lastMutationId=:mutation, "
+                "revision=if_not_exists(revision,:zero)+:one "
+                "REMOVE leaseOwner, leaseExpiresAt, stopOperationId"
+            ),
+            ConditionExpression=(
+                "leaseOwner=:owner AND leaseEpoch=:epoch AND "
+                "attribute_not_exists(tombstonedAt) AND #state=:unhealthy AND "
+                "sessionId=:oldSession AND runtimeArn=:oldRuntimeArn AND "
+                "runtimeQualifier=:oldRuntimeQualifier"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":owner": lease.lease_owner,
+                ":epoch": lease.lease_epoch,
+                ":oldSession": lease.session_id,
+                ":oldRuntimeArn": lease.runtime_arn,
+                ":oldRuntimeQualifier": lease.runtime_qualifier,
+                ":newSession": session_id,
+                ":newRuntimeArn": self.runtime_arn,
+                ":newRuntimeQualifier": self.runtime_qualifier,
+                ":unhealthy": RuntimeState.UNHEALTHY.value,
+                ":cold": RuntimeState.COLD.value,
+                ":now": now,
+                ":mutation": mutation_id,
+                ":zero": 0,
+                ":one": 1,
+            },
+        )
+
+    def begin_stop(
+        self,
+        current: RuntimeRecord,
+        *,
+        owner: str,
+        trace_id: str,
+        lease_ms: int,
+    ) -> RuntimeRecord:
+        if current.tombstoned_at is not None or current.state is RuntimeState.DELETING:
+            raise TombstonedUser(current.user_id)
+        now = int(self.clock_ms())
+        new_epoch = current.lease_epoch + 1
+        stop_operation_id = deterministic_id(
+            "op",
+            "explicit-stop",
+            current.user_id,
+            current.session_id,
+            current.runtime_arn,
+            current.runtime_qualifier,
+            new_epoch,
+        )
+        mutation_id = deterministic_id(
+            "mut", "begin-stop", stop_operation_id, owner, trace_id
+        )
+        return self._conditional_update(
+            "begin-stop",
+            user_id=current.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.state is RuntimeState.UNHEALTHY
+            and value.lease_owner == owner
+            and value.lease_epoch == new_epoch
+            and value.stop_operation_id == stop_operation_id,
+            Key={"userId": current.user_id},
+            UpdateExpression=(
+                "SET leaseOwner=:owner, leaseEpoch=:newEpoch, "
+                "leaseExpiresAt=:until, lastTraceId=:trace, #state=:unhealthy, "
+                "stopOperationId=:stopOperation, lastMutationId=:mutation, "
+                "updatedAt=:now, revision=if_not_exists(revision,:zero)+:one"
+            ),
+            ConditionExpression=(
+                "attribute_not_exists(tombstonedAt) AND #state <> :deleting AND "
+                "sessionId=:oldSession AND runtimeArn=:runtimeArn AND "
+                "runtimeQualifier=:runtimeQualifier AND leaseEpoch=:oldEpoch AND "
+                "(attribute_not_exists(leaseExpiresAt) OR leaseExpiresAt < :now)"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":owner": owner,
+                ":newEpoch": new_epoch,
+                ":oldEpoch": current.lease_epoch,
+                ":until": now + lease_ms,
+                ":trace": trace_id,
+                ":unhealthy": RuntimeState.UNHEALTHY.value,
+                ":deleting": RuntimeState.DELETING.value,
+                ":oldSession": current.session_id,
+                ":runtimeArn": current.runtime_arn,
+                ":runtimeQualifier": current.runtime_qualifier,
+                ":stopOperation": stop_operation_id,
+                ":mutation": mutation_id,
+                ":now": now,
+                ":zero": 0,
+                ":one": 1,
             },
         )
 
@@ -442,24 +968,53 @@ class RuntimeStateRepository:
         self, lease: RuntimeRecord, *, session_id: str
     ) -> RuntimeRecord:
         now = int(self.clock_ms())
-        return self._conditional_update(
+        session_id = canonical_session_id(session_id)
+        mutation_id = deterministic_id(
+            "mut",
+            "rotate-after-stop",
             lease.user_id,
+            lease.lease_epoch,
+            lease.session_id,
+            session_id,
+            self.runtime_arn,
+        )
+        return self._conditional_update(
+            "rotate-after-stop",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.session_id == session_id
+            and value.state is RuntimeState.COLD
+            and value.lease_owner is None
+            and self.binding_matches(value),
             Key={"userId": lease.user_id},
             UpdateExpression=(
-                "SET sessionId=:session, #state=:cold, updatedAt=:now, "
+                "SET sessionId=:session, #state=:cold, runtimeArn=:newRuntimeArn, "
+                "runtimeQualifier=:newRuntimeQualifier, updatedAt=:now, "
+                "lastMutationId=:mutation, "
                 "revision=if_not_exists(revision,:zero)+:one "
-                "REMOVE leaseOwner, leaseExpiresAt"
+                "REMOVE leaseOwner, leaseExpiresAt, stopOperationId"
             ),
-            ConditionExpression=self._lease_condition(),
+            ConditionExpression=(
+                "leaseOwner=:owner AND leaseEpoch=:epoch AND "
+                "attribute_not_exists(tombstonedAt) AND "
+                "sessionId=:oldSession AND runtimeArn=:runtimeArn AND "
+                "runtimeQualifier=:runtimeQualifier"
+            ),
             ExpressionAttributeNames={"#state": "state"},
             ExpressionAttributeValues={
-                ":session": canonical_session_id(session_id),
+                ":session": session_id,
                 ":cold": RuntimeState.COLD.value,
                 ":now": now,
                 ":zero": 0,
                 ":one": 1,
                 ":owner": lease.lease_owner,
                 ":epoch": lease.lease_epoch,
+                ":oldSession": lease.session_id,
+                ":runtimeArn": lease.runtime_arn,
+                ":runtimeQualifier": lease.runtime_qualifier,
+                ":newRuntimeArn": self.runtime_arn,
+                ":newRuntimeQualifier": self.runtime_qualifier,
+                ":mutation": mutation_id,
             },
         )
 
@@ -470,19 +1025,27 @@ class RuntimeStateRepository:
         if lease_ms <= 0:
             raise ValueError("lease duration must be positive")
         now = int(self.clock_ms())
+        candidate_operation_id = deterministic_id(
+            "op", "purge", user_id, owner
+        )
+        mutation_id = deterministic_id(
+            "mut", "begin-purge", user_id, owner, now
+        )
         try:
             response = self.table.update_item(
                 Key={"userId": user_id},
                 UpdateExpression=(
-                    "SET tombstonedAt=:now, #state=:deleting, leaseOwner=:owner, "
-                    "leaseExpiresAt=:until, "
+                    "SET tombstonedAt=if_not_exists(tombstonedAt,:now), "
+                    "#state=:deleting, leaseOwner=:owner, leaseExpiresAt=:until, "
                     "leaseEpoch=if_not_exists(leaseEpoch,:zero)+:one, "
+                    "runtimeArn=if_not_exists(runtimeArn,:runtimeArn), "
+                    "runtimeQualifier=if_not_exists(runtimeQualifier,:runtimeQualifier), "
+                    "stopOperationId=if_not_exists(stopOperationId,:operation), "
                     "createdAt=if_not_exists(createdAt,:now), updatedAt=:now, "
+                    "lastMutationId=:mutation, "
                     "revision=if_not_exists(revision,:zero)+:one"
                 ),
                 ConditionExpression=(
-                    "attribute_not_exists(tombstonedAt) AND "
-                    "(attribute_not_exists(#state) OR #state <> :deleting) AND "
                     "(attribute_not_exists(leaseExpiresAt) OR leaseExpiresAt < :now)"
                 ),
                 ExpressionAttributeNames={"#state": "state"},
@@ -491,6 +1054,10 @@ class RuntimeStateRepository:
                     ":until": now + lease_ms,
                     ":deleting": RuntimeState.DELETING.value,
                     ":owner": owner,
+                    ":runtimeArn": self.runtime_arn,
+                    ":runtimeQualifier": self.runtime_qualifier,
+                    ":operation": candidate_operation_id,
+                    ":mutation": mutation_id,
                     ":zero": 0,
                     ":one": 1,
                 },
@@ -498,36 +1065,90 @@ class RuntimeStateRepository:
             )
             return self._record(response["Attributes"])
         except Exception as error:
+            if _is_conditional(error) or _is_ambiguous(error):
+                try:
+                    reconciled = self._reconcile(
+                        user_id,
+                        mutation_id,
+                        lambda value: value.state is RuntimeState.DELETING
+                        and value.tombstoned_at is not None
+                        and value.lease_owner == owner,
+                    )
+                except Exception:
+                    reconciled = None
+                if reconciled is not None:
+                    return reconciled
             if not _is_conditional(error):
+                if _is_ambiguous(error):
+                    raise RuntimeStateError(
+                        "runtime purge fencing outcome is uncertain"
+                    ) from error
                 raise RuntimeStateError("runtime purge fencing failed") from error
         current = self.get(user_id)
         if current is None:
             raise RuntimeUnavailable("runtime does not exist")
-        if current.tombstoned_at is not None:
-            raise TombstonedUser(user_id)
+        if (
+            current.tombstoned_at is not None
+            and current.state is RuntimeState.DELETING
+            and current.session_id is None
+            and current.lease_owner is None
+        ):
+            return current
         raise LeaseBusy(user_id)
 
     def finish_purge(self, lease: RuntimeRecord) -> RuntimeRecord:
         now = int(self.clock_ms())
-        return self._conditional_update(
+        mutation_id = deterministic_id(
+            "mut",
+            "finish-purge",
             lease.user_id,
+            lease.lease_epoch,
+            lease.stop_operation_id,
+        )
+        if lease.session_id is None and lease.lease_owner is None:
+            return lease
+        session_condition = (
+            "sessionId=:oldSession"
+            if lease.session_id is not None
+            else "attribute_not_exists(sessionId)"
+        )
+        session_values = (
+            {":oldSession": lease.session_id}
+            if lease.session_id is not None
+            else {}
+        )
+        return self._conditional_update(
+            "finish-purge",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.tombstoned_at is not None
+            and value.state is RuntimeState.DELETING
+            and value.session_id is None
+            and value.lease_owner is None,
             Key={"userId": lease.user_id},
             UpdateExpression=(
-                "SET updatedAt=:now, revision=if_not_exists(revision,:zero)+:one "
+                "SET updatedAt=:now, lastMutationId=:mutation, "
+                "revision=if_not_exists(revision,:zero)+:one "
                 "REMOVE sessionId, leaseOwner, leaseExpiresAt, lastTraceId, "
                 "lastInvocationId, lastWorkspaceGeneration, "
                 "lastWorkspaceManifestSha256"
             ),
             ConditionExpression=(
                 "leaseOwner=:owner AND leaseEpoch=:epoch AND "
-                "attribute_exists(tombstonedAt) AND #state=:deleting"
+                "attribute_exists(tombstonedAt) AND #state=:deleting AND "
+                f"{session_condition} AND runtimeArn=:runtimeArn AND "
+                "runtimeQualifier=:runtimeQualifier"
             ),
             ExpressionAttributeNames={"#state": "state"},
             ExpressionAttributeValues={
                 ":owner": lease.lease_owner,
                 ":epoch": lease.lease_epoch,
                 ":deleting": RuntimeState.DELETING.value,
+                **session_values,
+                ":runtimeArn": lease.runtime_arn,
+                ":runtimeQualifier": lease.runtime_qualifier,
                 ":now": now,
+                ":mutation": mutation_id,
                 ":zero": 0,
                 ":one": 1,
             },
@@ -535,24 +1156,52 @@ class RuntimeStateRepository:
 
     def mark_purge_uncertain(self, lease: RuntimeRecord) -> RuntimeRecord:
         now = int(self.clock_ms())
-        return self._conditional_update(
+        mutation_id = deterministic_id(
+            "mut",
+            "purge-uncertain",
             lease.user_id,
+            lease.lease_epoch,
+            lease.stop_operation_id,
+        )
+        session_condition = (
+            "sessionId=:oldSession"
+            if lease.session_id is not None
+            else "attribute_not_exists(sessionId)"
+        )
+        session_values = (
+            {":oldSession": lease.session_id}
+            if lease.session_id is not None
+            else {}
+        )
+        return self._conditional_update(
+            "purge-uncertain",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.state is RuntimeState.DELETING
+            and value.tombstoned_at is not None
+            and value.lease_owner is None,
             Key={"userId": lease.user_id},
             UpdateExpression=(
-                "SET #state=:quarantined, updatedAt=:now, "
+                "SET #state=:deleting, updatedAt=:now, lastMutationId=:mutation, "
                 "revision=if_not_exists(revision,:zero)+:one "
                 "REMOVE leaseOwner, leaseExpiresAt"
             ),
             ConditionExpression=(
                 "leaseOwner=:owner AND leaseEpoch=:epoch AND "
-                "attribute_exists(tombstonedAt)"
+                "attribute_exists(tombstonedAt) AND "
+                f"{session_condition} AND runtimeArn=:runtimeArn AND "
+                "runtimeQualifier=:runtimeQualifier"
             ),
             ExpressionAttributeNames={"#state": "state"},
             ExpressionAttributeValues={
                 ":owner": lease.lease_owner,
                 ":epoch": lease.lease_epoch,
-                ":quarantined": RuntimeState.QUARANTINED.value,
+                ":deleting": RuntimeState.DELETING.value,
+                **session_values,
+                ":runtimeArn": lease.runtime_arn,
+                ":runtimeQualifier": lease.runtime_qualifier,
                 ":now": now,
+                ":mutation": mutation_id,
                 ":zero": 0,
                 ":one": 1,
             },

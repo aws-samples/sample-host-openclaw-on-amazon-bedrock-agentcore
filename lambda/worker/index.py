@@ -338,6 +338,8 @@ def _build_production_dependencies() -> WorkerDependencies:
             "AGENTCORE_QUALIFIER",
             "RUNTIME_STATE_TABLE_NAME",
             "MESSAGE_LEDGER_TABLE_NAME",
+            "RUNTIME_LEASE_MS",
+            "LAMBDA_TIMEOUT_SECONDS",
             "TELEGRAM_TOKEN_SECRET_ID",
         )
     }
@@ -397,11 +399,19 @@ def _build_production_dependencies() -> WorkerDependencies:
         token_cache.append(token)
         return token
 
-    lease_ms = int(os.environ.get("RUNTIME_LEASE_MS", "600000"))
+    try:
+        lease_ms = int(required["RUNTIME_LEASE_MS"])
+        maximum_execution_ms = int(required["LAMBDA_TIMEOUT_SECONDS"]) * 1_000
+    except ValueError as error:
+        raise RuntimeError("worker runtime authority must be integral") from error
+    if maximum_execution_ms <= 0 or lease_ms <= maximum_execution_ms:
+        raise RuntimeError("worker lease must outlive Lambda execution authority")
     _production_dependencies = WorkerDependencies(
         runtime_driver=RuntimeDriver(
             repository=RuntimeStateRepository(
-                dynamodb.Table(required["RUNTIME_STATE_TABLE_NAME"])
+                dynamodb.Table(required["RUNTIME_STATE_TABLE_NAME"]),
+                runtime_arn=required["AGENTCORE_RUNTIME_ARN"],
+                runtime_qualifier=required["AGENTCORE_QUALIFIER"],
             ),
             adapter=AgentCoreAdapter(
                 agentcore,
@@ -410,6 +420,7 @@ def _build_production_dependencies() -> WorkerDependencies:
                 region=region,
             ),
             lease_ms=lease_ms,
+            max_execution_ms=maximum_execution_ms,
         ),
         command_handler=DeterministicProductCommandHandler(),
         telegram_delivery=TelegramDeliveryAdapter(token_provider=telegram_token),

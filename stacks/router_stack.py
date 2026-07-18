@@ -244,6 +244,7 @@ class RouterStack(Stack):
                 "RUNTIME_STATE_TABLE_NAME": self.runtime_state_table.table_name,
                 "MESSAGE_LEDGER_TABLE_NAME": self.message_ledger_table.table_name,
                 "RUNTIME_LEASE_MS": str(runtime_lease_ms),
+                "LAMBDA_TIMEOUT_SECONDS": str(worker_timeout),
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
             },
             log_group=worker_log_group,
