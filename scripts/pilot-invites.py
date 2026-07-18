@@ -57,7 +57,6 @@ def main(
     stdout=None,
     now=None,
     random_bytes=None,
-    conditional_failure_types=(),
 ) -> int:
     args = _parser().parse_args(argv)
     output = stdout or sys.stdout
@@ -67,7 +66,6 @@ def main(
         table,
         now=now,
         random_bytes=random_bytes,
-        conditional_failure_types=conditional_failure_types,
     )
     if args.command == "issue":
         # Stdout is the intentional one-time bearer handoff. The token is not

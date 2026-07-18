@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "lambda"))
 from control.index import ControlApplication
 from control.invites import DynamoPilotInvites
 from control.telegram_cards import CardActionRejected
-from control.test_invites import ConditionalFailure, MemoryInviteTable
+from control.test_invites import MemoryInviteTable
 from router.event_identity import derive_event_trace
 from router.telegram_ingress import TelegramWebhookIngress
 from web.auth import OpaqueSessionManager, SignedConnectTickets
@@ -535,7 +535,6 @@ def test_three_isolated_pilots_complete_provider_free_read_only_journey() -> Non
         invite_table,
         now=lambda: NOW_SECONDS,
         random_bytes=random,
-        conditional_failure_types=(ConditionalFailure,),
     )
     queue = SyntheticQueue()
     ingress = TelegramWebhookIngress(

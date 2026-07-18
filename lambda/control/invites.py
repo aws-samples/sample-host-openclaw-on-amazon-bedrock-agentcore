@@ -100,6 +100,31 @@ def _value(value: str | int) -> dict[str, str]:
     raise TypeError("unsupported DynamoDB value")
 
 
+def _conditional_failure(error: BaseException) -> bool:
+    """Recognize only proven DynamoDB conditional rejection semantics."""
+
+    response = getattr(error, "response", None)
+    error_record = response.get("Error") if isinstance(response, Mapping) else None
+    code = error_record.get("Code") if isinstance(error_record, Mapping) else None
+    if code == "ConditionalCheckFailedException":
+        return True
+    if code != "TransactionCanceledException":
+        return False
+    reasons = response.get("CancellationReasons")
+    if not isinstance(reasons, list) or not reasons:
+        return False
+    reason_codes: list[str] = []
+    for reason in reasons:
+        reason_code = reason.get("Code") if isinstance(reason, Mapping) else None
+        if not isinstance(reason_code, str):
+            return False
+        reason_codes.append(reason_code)
+    return (
+        "ConditionalCheckFailed" in reason_codes
+        and set(reason_codes).issubset({"None", "ConditionalCheckFailed"})
+    )
+
+
 class DynamoPilotInvites:
     """Issue, revoke, and atomically redeem pilot invitations."""
 
@@ -109,7 +134,6 @@ class DynamoPilotInvites:
         *,
         now: Callable[[], int] | None = None,
         random_bytes: Callable[[int], bytes] | None = None,
-        conditional_failure_types: tuple[type[BaseException], ...] = (),
     ) -> None:
         table_name = getattr(table, "name", None)
         client = getattr(getattr(table, "meta", None), "client", None)
@@ -122,17 +146,11 @@ class DynamoPilotInvites:
             or not callable(getattr(client, "transact_write_items", None))
         ):
             raise TypeError("invite table is invalid")
-        if not isinstance(conditional_failure_types, tuple) or any(
-            not isinstance(value, type) or not issubclass(value, BaseException)
-            for value in conditional_failure_types
-        ):
-            raise TypeError("conditional failure types are invalid")
         self._table = table
         self._table_name = table_name
         self._client = client
         self._now = now or (lambda: int(time.time()))
         self._random = random_bytes or os.urandom
-        self._conditional_failures = conditional_failure_types
 
     def _read(self, token: str) -> Mapping[str, object] | None:
         try:
@@ -194,7 +212,7 @@ class DynamoPilotInvites:
                 existing = self._read(token)
             except InviteStoreError:
                 existing = None
-            if existing is not None or isinstance(error, self._conditional_failures):
+            if existing is not None or _conditional_failure(error):
                 raise InviteStoreError("pilot invitation token collision") from None
             raise InviteStoreError("pilot invitation issue is uncertain") from None
         return IssuedInvite(token=token, expires_at=expires_at)
@@ -420,7 +438,8 @@ class DynamoPilotInvites:
         except InviteStoreError:
             raise
         except Exception as error:
-            created = not isinstance(error, self._conditional_failures)
+            conditional = _conditional_failure(error)
+            created = not conditional
             result = self._reconciled(
                 token=token,
                 channel_key=channel_key,
@@ -431,7 +450,7 @@ class DynamoPilotInvites:
             )
             if result is not None:
                 return result
-            if isinstance(error, self._conditional_failures):
+            if conditional:
                 raise InviteRejected("pilot invitation is unavailable") from None
             raise InviteStoreError(
                 "pilot invitation redemption is unavailable"
