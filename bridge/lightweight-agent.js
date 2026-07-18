@@ -11,6 +11,10 @@ const http = require("node:http");
 const https = require("node:https");
 const net = require("node:net");
 const { PROFILE_ADDITIONS } = require("./runtime-policy");
+const {
+  CAPABILITY_TOOL_NAMES,
+  TOOL_DEFINITIONS,
+} = require("./capability-catalog");
 const { isBlockedIp } = require("./web-network-policy");
 
 // The container exposes the exact pinned OpenClaw build at this public export.
@@ -37,52 +41,18 @@ const SYSTEM_PROMPT =
   "Use only the provided tools. Never claim a capability that is not present. " +
   "Format responses for chat with short paragraphs or bullets, not tables.";
 
-function parameters(properties, required = []) {
-  return {
-    type: "object",
-    properties,
-    required,
-    additionalProperties: false,
-  };
-}
-
-const TOOLS = Object.freeze([
-  {
-    type: "function",
-    function: {
-      name: "po_file_list",
-      description: "List files in the user's persistent workspace.",
-      parameters: parameters({}),
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "po_file_read",
-      description: "Read one bounded UTF-8 workspace file.",
-      parameters: parameters({ path: { type: "string" } }, ["path"]),
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "po_file_write",
-      description: "Create or replace one bounded UTF-8 workspace file.",
-      parameters: parameters(
-        { path: { type: "string" }, content: { type: "string" } },
-        ["path", "content"],
-      ),
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "po_file_delete",
-      description: "Delete one exact workspace file.",
-      parameters: parameters({ path: { type: "string" } }, ["path"]),
-    },
-  },
-]);
+const TOOLS = Object.freeze(
+  PROFILE_ADDITIONS.map((toolName) =>
+    Object.freeze({
+      type: "function",
+      function: Object.freeze({
+        name: toolName,
+        description: TOOL_DEFINITIONS[toolName].description,
+        parameters: TOOL_DEFINITIONS[toolName].parameters,
+      }),
+    }),
+  ),
+);
 
 const LIGHTWEIGHT_TOOL_NAMES = PROFILE_ADDITIONS;
 const declaredToolNames = TOOLS.map((tool) => tool.function.name);
@@ -440,6 +410,7 @@ async function executeWebFetch(url) {
 
 function createToolExecutor({
   workspaceStore,
+  capabilityAdapters = {},
 }) {
   return async (toolName, args = {}) => {
     try {
@@ -461,6 +432,18 @@ function createToolExecutor({
           return `Deleted ${result.path}.`;
         }
         default:
+          if (CAPABILITY_TOOL_NAMES.includes(toolName)) {
+            const adapter =
+              capabilityAdapters instanceof Map
+                ? capabilityAdapters.get(toolName)
+                : Object.hasOwn(capabilityAdapters, toolName)
+                  ? capabilityAdapters[toolName]
+                  : undefined;
+            if (typeof adapter !== "function") {
+              return `Error: Capability tool '${toolName}' is disabled`;
+            }
+            return adapter(toolName, args);
+          }
           return `Error: Unknown tool '${toolName}'`;
       }
     } catch (error) {
@@ -472,6 +455,7 @@ function createToolExecutor({
 let defaultToolExecutorPromise = null;
 async function configureWorkspaceRuntime({
   env,
+  capabilityAdapters = {},
   loadPlugin = () => import("./plugins/personal-operator/index.js"),
 } = {}) {
   if (!env || typeof env !== "object") {
@@ -479,7 +463,7 @@ async function configureWorkspaceRuntime({
   }
   const workspacePlugin = await loadPlugin();
   const workspaceStore = workspacePlugin.createWorkspaceStore({ env });
-  const executor = createToolExecutor({ workspaceStore });
+  const executor = createToolExecutor({ workspaceStore, capabilityAdapters });
   defaultToolExecutorPromise = Promise.resolve(executor);
   return executor;
 }

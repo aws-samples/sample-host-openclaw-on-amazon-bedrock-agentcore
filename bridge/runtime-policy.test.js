@@ -17,6 +17,12 @@ const APPROVED_TOOLS = [
   "po_file_read",
   "po_file_write",
   "po_file_delete",
+  "po_web_read",
+  "po_schedule_list",
+  "po_schedule_propose",
+  "po_schedule_cancel_propose",
+  "po_compute_run",
+  "po_compute_status",
 ];
 const PROFILE_ADDITIONS = APPROVED_TOOLS;
 const APPROVED_MODEL = "agentcore/bedrock-agentcore";
@@ -91,15 +97,15 @@ describe("frozen runtime policy", () => {
     }
   });
 
-  it("exposes no model-callable network egress tool", () => {
+  it("exposes only the exact governed web reader and no legacy network tool", () => {
     const serialized = JSON.stringify(policyModule.buildOpenClawConfig({
       gatewayToken: "a".repeat(43),
     }));
 
     assert.doesNotMatch(serialized, /web_fetch|web_search|browser|http_request/i);
-    assert.equal(
-      policyModule.APPROVED_TOOLS.some((tool) => /^web(?:_|\.)/.test(tool)),
-      false,
+    assert.deepEqual(
+      policyModule.APPROVED_TOOLS.filter((tool) => /web/.test(tool)),
+      ["po_web_read"],
     );
   });
 });

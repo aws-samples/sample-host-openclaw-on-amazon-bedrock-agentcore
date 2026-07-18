@@ -87,6 +87,9 @@ COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY runtime-policy.js /app/runtime-policy.js
+COPY capability-catalog.js /app/capability-catalog.js
+COPY capabilities/catalog-v1.json /app/capabilities/catalog-v1.json
+COPY capabilities/schemas /app/capabilities/schemas
 COPY gateway-invocation.js /app/gateway-invocation.js
 COPY session-binding.js /app/session-binding.js
 COPY invocation-handler.js /app/invocation-handler.js

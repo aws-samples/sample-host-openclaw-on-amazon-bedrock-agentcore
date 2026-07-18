@@ -219,6 +219,40 @@ def test_bridge_image_copies_only_the_reviewed_plugin() -> None:
     assert "COPY gateway-invocation.js /app/gateway-invocation.js" in dockerfile
 
 
+def test_bridge_image_contains_only_exact_reviewed_capability_artifacts() -> None:
+    dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
+    canonical_root = ROOT / "specs/capabilities"
+    image_root = ROOT / "bridge/capabilities"
+
+    expected = sorted(
+        path.relative_to(canonical_root)
+        for path in canonical_root.rglob("*")
+        if path.is_file()
+    )
+    actual = (
+        sorted(
+            path.relative_to(image_root)
+            for path in image_root.rglob("*")
+            if path.is_file()
+        )
+        if image_root.is_dir()
+        else []
+    )
+
+    assert actual == expected
+    for relative in expected:
+        assert (image_root / relative).read_bytes() == (
+            canonical_root / relative
+        ).read_bytes()
+
+    assert "COPY capability-catalog.js /app/capability-catalog.js" in dockerfile
+    assert (
+        "COPY capabilities/catalog-v1.json /app/capabilities/catalog-v1.json"
+        in dockerfile
+    )
+    assert "COPY capabilities/schemas /app/capabilities/schemas" in dockerfile
+
+
 def test_legacy_executable_skill_trees_are_absent() -> None:
     assert not (ROOT / "bridge/skills").exists()
     assert not (ROOT / "bridge/agentcore-browser.test.js").exists()
@@ -234,6 +268,12 @@ def test_personal_operator_plugin_package_is_frozen() -> None:
         "po_file_read",
         "po_file_write",
         "po_file_delete",
+        "po_web_read",
+        "po_schedule_list",
+        "po_schedule_propose",
+        "po_schedule_cancel_propose",
+        "po_compute_run",
+        "po_compute_status",
     ]
     assert package["type"] == "module"
     assert package["openclaw"]["extensions"] == ["./index.js"]

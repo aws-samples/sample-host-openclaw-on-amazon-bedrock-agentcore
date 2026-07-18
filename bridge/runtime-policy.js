@@ -1,18 +1,14 @@
 "use strict";
 
 const { randomBytes } = require("node:crypto");
+const { TOOL_NAMES } = require("./capability-catalog");
 const { canonicalNamespace } = require("./session-binding");
 const {
   requireExactRegion,
   FIXED_CHILD_ENV,
 } = require("./scoped-credentials");
 
-const APPROVED_TOOLS = Object.freeze([
-  "po_file_list",
-  "po_file_read",
-  "po_file_write",
-  "po_file_delete",
-]);
+const APPROVED_TOOLS = TOOL_NAMES;
 
 // OpenClaw's pinned minimal profile contributes the mutable session_status
 // tool. Keep the reviewed plugin tools additive, then deny that built-in so the

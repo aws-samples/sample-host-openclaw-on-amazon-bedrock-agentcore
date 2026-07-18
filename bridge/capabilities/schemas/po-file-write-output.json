@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:po-file-write-output:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"bytes":{"maximum":262144,"minimum":0,"type":"integer"},"path":{"maxLength":512,"minLength":1,"type":"string"}},"required":["bytes","path"],"title":"Workspace file write output","type":"object"}

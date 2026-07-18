@@ -5,8 +5,14 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
-import { Type } from "typebox";
+import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
+
+const require = createRequire(import.meta.url);
+const {
+  CAPABILITY_TOOL_NAMES,
+  TOOL_DEFINITIONS,
+} = require("../../capability-catalog.js");
 
 export const MAX_PATH_BYTES = 512;
 export const MAX_FILE_BYTES = 256 * 1024;
@@ -287,29 +293,34 @@ export function createWorkspaceStore({
   });
 }
 
-const EmptyParameters = Type.Object({}, { additionalProperties: false });
-const PathParameters = Type.Object(
-  { path: Type.String({ minLength: 1, maxLength: MAX_PATH_BYTES }) },
-  { additionalProperties: false },
-);
-const WriteParameters = Type.Object(
-  {
-    path: Type.String({ minLength: 1, maxLength: MAX_PATH_BYTES }),
-    content: Type.String({ maxLength: MAX_FILE_BYTES }),
-  },
-  { additionalProperties: false },
-);
-
 function textResult(text, details) {
   return { content: [{ type: "text", text }], details };
+}
+
+function capabilityAdapter(adapters, toolName) {
+  if (adapters instanceof Map) return adapters.get(toolName);
+  if (
+    adapters &&
+    typeof adapters === "object" &&
+    Object.hasOwn(adapters, toolName)
+  ) {
+    return adapters[toolName];
+  }
+  return undefined;
+}
+
+function disabledCapabilityError(toolName) {
+  const error = new Error(`Capability tool '${toolName}' is disabled`);
+  error.code = "CAPABILITY_ADAPTER_DISABLED";
+  return error;
 }
 
 export function registerPersonalOperatorPlugin(api, options = {}) {
   const store = createWorkspaceStore(options);
   api.registerTool({
     name: "po_file_list",
-    description: "List UTF-8 files in this user's persistent workspace.",
-    parameters: EmptyParameters,
+    description: TOOL_DEFINITIONS.po_file_list.description,
+    parameters: TOOL_DEFINITIONS.po_file_list.parameters,
     async execute() {
       const files = await store.list();
       const text =
@@ -321,8 +332,8 @@ export function registerPersonalOperatorPlugin(api, options = {}) {
   });
   api.registerTool({
     name: "po_file_read",
-    description: "Read one bounded UTF-8 file from this user's workspace.",
-    parameters: PathParameters,
+    description: TOOL_DEFINITIONS.po_file_read.description,
+    parameters: TOOL_DEFINITIONS.po_file_read.parameters,
     async execute(_id, params) {
       const content = await store.read(params.path);
       return textResult(content, { path: params.path, content });
@@ -330,8 +341,8 @@ export function registerPersonalOperatorPlugin(api, options = {}) {
   });
   api.registerTool({
     name: "po_file_write",
-    description: "Create or replace one bounded UTF-8 workspace file.",
-    parameters: WriteParameters,
+    description: TOOL_DEFINITIONS.po_file_write.description,
+    parameters: TOOL_DEFINITIONS.po_file_write.parameters,
     async execute(_id, params) {
       const result = await store.write(params.path, params.content);
       return textResult(`Wrote ${result.path} (${result.bytes} bytes).`, result);
@@ -339,13 +350,28 @@ export function registerPersonalOperatorPlugin(api, options = {}) {
   });
   api.registerTool({
     name: "po_file_delete",
-    description: "Delete one exact file from this user's workspace.",
-    parameters: PathParameters,
+    description: TOOL_DEFINITIONS.po_file_delete.description,
+    parameters: TOOL_DEFINITIONS.po_file_delete.parameters,
     async execute(_id, params) {
       const result = await store.delete(params.path);
       return textResult(`Deleted ${result.path}.`, result);
     },
   });
+  for (const toolName of CAPABILITY_TOOL_NAMES) {
+    const definition = TOOL_DEFINITIONS[toolName];
+    api.registerTool({
+      name: toolName,
+      description: definition.description,
+      parameters: definition.parameters,
+      async execute(toolUseId, params) {
+        const adapter = capabilityAdapter(options.capabilityAdapters, toolName);
+        if (typeof adapter !== "function") {
+          throw disabledCapabilityError(toolName);
+        }
+        return adapter(toolUseId, params);
+      },
+    });
+  }
 }
 
 const plugin = {
