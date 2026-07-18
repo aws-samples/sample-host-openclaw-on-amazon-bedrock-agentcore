@@ -182,6 +182,22 @@ record. A `PERSISTED` record contains only the evidence owned by that phase; an
 `ABSENT` record contains none. The CLI then performs the matching journal
 transition.
 
+The image phase cannot stabilize from a driver-provided digest alone. Its
+observation contains a complete strict `RuntimeImageEvidence`, including the
+exact commit/tree, immutable image subject, authenticated SBOM and provenance,
+scan, and signature evidence. Endpoint and context observations contain a
+complete strict `RuntimeContextV3`; an endpoint can never stabilize on `{}`.
+The context phase additionally supplies the SHA-256 of those exact canonical
+context bytes. All three artifacts are cross-checked against the journal before
+its phase-owned fields are derived.
+
+Reviewed observation implementations use
+`release_tools.production_observation.compose_production_evidence`. It wires
+the exact ECR and AgentCore validators from already-authorized injected clients
+without constructing a session or touching credentials at import or
+construction time. A release operation must not replace that composition with
+self-asserted cloud outcomes.
+
 After a crash or ambiguous result, use the same exact operation bytes and the
 confirmation
 `reconcile:release_<40-sha>:<phase>:sha256:<operation-hex>`. There is no
@@ -217,6 +233,9 @@ The shared trusted ZIP is consumed by five unique handler modules across six Lam
 `web.index.lambda_handler` is intentionally used by both the
 web and maintenance functions. The Docker-backed gate must import all five
 handlers from the exact Python 3.13/ARM64 ZIP with networking disabled.
+After container verification, publication is a same-filesystem atomic rename
+to an absent destination. The builder refuses to delete or replace an existing
+verified asset, so a failed rebuild cannot erase the prior release artifact.
 
 ### External staging gates — all open
 

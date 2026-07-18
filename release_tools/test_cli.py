@@ -77,65 +77,116 @@ fi
     driver = tmp_path / "phase-driver"
     _write_executable(
         driver,
-        """#!/bin/bash
-set -eu
-mode=""
-phase=""
-transaction_id=""
-source_commit=""
-source_tree=""
-account=""
-region=""
-operation_sha256=""
-while (($#)); do
-  case "$1" in
-    --mode) mode="$2"; shift 2 ;;
-    --phase) phase="$2"; shift 2 ;;
-    --transaction-id) transaction_id="$2"; shift 2 ;;
-    --source-commit) source_commit="$2"; shift 2 ;;
-    --source-tree) source_tree="$2"; shift 2 ;;
-    --account) account="$2"; shift 2 ;;
-    --region) region="$2"; shift 2 ;;
-    --operation-sha256) operation_sha256="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-printf 'driver %s <%s> region=<%s>/<%s>/<%s>\n' \
-  "$mode" "$phase" "${CDK_DEFAULT_REGION:-}" "${AWS_REGION:-}" \
-  "${AWS_DEFAULT_REGION:-}" >> "$RELEASE_CALL_LOG"
-if [[ "$mode" == "mutate" && "${RELEASE_FAIL_PHASE:-}" == "$phase" ]]; then
-  exit 75
-fi
-if [[ "$mode" == "mutate" ]]; then
-  if [[ "${RELEASE_BAD_ACK_PHASE:-}" == "$phase" ]]; then
-    printf '{}\n'
-    exit 0
-  fi
-  printf '{"dispatched":true}\n'
-  exit 0
-fi
-if [[ "$mode" != "observe" ]]; then
-  exit 76
-fi
-if [[ "${RELEASE_FAIL_OBSERVE_PHASE:-}" == "$phase" ]]; then
-  exit 77
-fi
-outcome="${RELEASE_OBSERVE_OUTCOME:-PERSISTED}"
-evidence='{}'
-if [[ "$outcome" == "PERSISTED" ]]; then
-  case "$phase" in
-    image) evidence='{"runtime_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}' ;;
-    runtime) evidence='{"runtime_id":"Runtime-ABCDEFGHIJ","runtime_version":"7"}' ;;
-    context) evidence='{"runtime_context_sha256":"1111111111111111111111111111111111111111111111111111111111111111"}' ;;
-    rollback) printf -v evidence '{"rollback_reference":"%s"}' \
-      "$RELEASE_ROLLBACK_REFERENCE" ;;
-  esac
-fi
-case "$phase" in
-  *) printf '{"account":"%s","evidence":%s,"operationSha256":"%s","outcome":"%s","phase":"%s","region":"%s","schema":"personal-operator.phase-observation.v1","sourceCommit":"%s","sourceTree":"%s","transactionId":"%s"}\n' \
-    "$account" "$evidence" "$operation_sha256" "$outcome" "$phase" \
-    "$region" "$source_commit" "$source_tree" "$transaction_id" ;;
-esac
+        f"""#!{sys.executable}
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--mode", required=True)
+parser.add_argument("--phase", required=True)
+parser.add_argument("--journal", required=True)
+parser.add_argument("--transaction-id", required=True)
+parser.add_argument("--source-commit", required=True)
+parser.add_argument("--source-tree", required=True)
+parser.add_argument("--account", required=True)
+parser.add_argument("--region", required=True)
+parser.add_argument("--operation-sha256", required=True)
+args = parser.parse_args()
+with pathlib.Path(os.environ["RELEASE_CALL_LOG"]).open("a", encoding="utf-8") as log:
+    log.write(
+        f"driver {{args.mode}} <{{args.phase}}> region="
+        f"<{{os.environ.get('CDK_DEFAULT_REGION', '')}}>"
+        f"/<{{os.environ.get('AWS_REGION', '')}}>"
+        f"/<{{os.environ.get('AWS_DEFAULT_REGION', '')}}>\\n"
+    )
+if args.mode == "mutate":
+    if os.environ.get("RELEASE_FAIL_PHASE") == args.phase:
+        raise SystemExit(75)
+    value = {{}} if os.environ.get("RELEASE_BAD_ACK_PHASE") == args.phase else {{"dispatched": True}}
+    print(json.dumps(value, separators=(",", ":"), sort_keys=True))
+    raise SystemExit(0)
+if args.mode != "observe":
+    raise SystemExit(76)
+if os.environ.get("RELEASE_FAIL_OBSERVE_PHASE") == args.phase:
+    raise SystemExit(77)
+outcome = os.environ.get("RELEASE_OBSERVE_OUTCOME", "PERSISTED")
+evidence = {{}}
+digest = "sha256:" + "0" * 64
+image_uri = (
+    f"{{args.account}}.dkr.ecr.{{args.region}}.amazonaws.com/"
+    f"personal-operator/bridge@{{digest}}"
+)
+context = {{
+    "account": args.account,
+    "region": args.region,
+    "runtimeArn": (
+        f"arn:aws:bedrock-agentcore:{{args.region}}:{{args.account}}:"
+        "agent/12345678-1234-1234-1234-123456789abc:7"
+    ),
+    "runtimeEndpointId": "ReleaseEndpoint-ABCDEFGHIJ",
+    "runtimeEndpointName": f"release_{{args.source_commit}}",
+    "runtimeId": "Runtime-ABCDEFGHIJ",
+    "runtimeImageUri": image_uri,
+    "runtimeVersion": "7",
+    "schema": "personal-operator.runtime-context.v3",
+    "sourceCommit": args.source_commit,
+}}
+if outcome == "PERSISTED":
+    if args.phase == "image":
+        if os.environ.get("RELEASE_LEGACY_IMAGE") == "1":
+            evidence = {{"runtime_image_digest": digest}}
+        else:
+            evidence = {{"runtime_image_evidence": {{
+                "account": args.account,
+                "commitTag": f"commit-{{args.source_commit}}",
+                "criticalFindings": 0,
+                "highFindings": 0,
+                "imageDigest": digest,
+                "imageSizeBytes": 1,
+                "imageUri": image_uri,
+                "provenanceSha256": "2" * 64,
+                "region": args.region,
+                "repositoryName": "personal-operator/bridge",
+                "sbomSha256": "1" * 64,
+                "scanStatus": "COMPLETE",
+                "schema": "personal-operator.runtime-image-evidence.v1",
+                "signatureStatus": "SIGNED",
+                "signingProfileArn": (
+                    f"arn:aws:signer:{{args.region}}:{{args.account}}:/"
+                    "signing-profiles/personal_operator_bridge"
+                ),
+                "sourceCommit": args.source_commit,
+                "sourceTree": args.source_tree,
+            }}}}
+    elif args.phase == "runtime":
+        evidence = {{"runtime_id": "Runtime-ABCDEFGHIJ", "runtime_version": "7"}}
+    elif args.phase in {{"endpoint", "context"}}:
+        if args.phase == "endpoint" and os.environ.get("RELEASE_EMPTY_ENDPOINT") == "1":
+            evidence = {{}}
+        else:
+            evidence = {{"runtime_context": context}}
+            if args.phase == "context":
+                payload = (json.dumps(context, separators=(",", ":"), sort_keys=True) + "\\n").encode()
+                evidence["runtime_context_sha256"] = hashlib.sha256(payload).hexdigest()
+    elif args.phase == "rollback":
+        evidence = {{"rollback_reference": os.environ["RELEASE_ROLLBACK_REFERENCE"]}}
+observation = {{
+    "account": args.account,
+    "evidence": evidence,
+    "operationSha256": args.operation_sha256,
+    "outcome": outcome,
+    "phase": args.phase,
+    "region": args.region,
+    "schema": "personal-operator.phase-observation.v1",
+    "sourceCommit": args.source_commit,
+    "sourceTree": args.source_tree,
+    "transactionId": args.transaction_id,
+}}
+print(json.dumps(observation, separators=(",", ":"), sort_keys=True))
 """,
     )
     journal = tmp_path / "journal.json"
@@ -414,6 +465,40 @@ def test_post_dispatch_failure_stays_uncertain_and_blocks_later_phases(
         "driver mutate <image> region=<eu-west-1>/<eu-west-1>/<eu-west-1>"
     ) == 1
     assert "<runtime>" not in fixture["log"].read_text(encoding="utf-8")
+
+
+def test_image_cannot_stabilize_on_a_bare_driver_asserted_digest(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+    assert _phase(fixture, "foundation").returncode == 0
+
+    completed = _phase(fixture, "image", RELEASE_LEGACY_IMAGE="1")
+
+    assert completed.returncode != 0
+    assert "RuntimeImageEvidence" in completed.stderr
+    current = TransactionJournal.load(fixture["journal"]).current
+    assert current.state == "UNCERTAIN"
+    assert current.last_stable_state == "FOUNDATION_READY"
+
+
+def test_endpoint_cannot_stabilize_without_a_typed_live_runtime_context(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+    assert _phase(fixture, "foundation").returncode == 0
+    assert _phase(fixture, "image").returncode == 0
+    assert _phase(fixture, "runtime").returncode == 0
+
+    completed = _phase(fixture, "endpoint", RELEASE_EMPTY_ENDPOINT="1")
+
+    assert completed.returncode != 0
+    assert "RuntimeContextV3" in completed.stderr
+    current = TransactionJournal.load(fixture["journal"]).current
+    assert current.state == "UNCERTAIN"
+    assert current.last_stable_state == "RUNTIME_READY"
 
 
 def test_explicit_absent_reconciliation_allows_safe_resume(

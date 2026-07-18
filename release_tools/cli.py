@@ -16,6 +16,8 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from release_tools.contracts import (
     ContractError,
+    RuntimeContextV3,
+    RuntimeImageEvidence,
     StagingTransactionV1,
     parse_canonical_object,
 )
@@ -36,10 +38,7 @@ PHASE_TO_STATE = {
 STATE_TO_PHASE = {state: phase for phase, state in PHASE_TO_STATE.items()}
 PHASE_EVIDENCE_FIELDS = {
     "foundation": set(),
-    "image": {"runtime_image_digest"},
     "runtime": {"runtime_id", "runtime_version"},
-    "endpoint": set(),
-    "context": {"runtime_context_sha256"},
     "consumer-changesets": set(),
     "consumers": set(),
     "verify": set(),
@@ -281,7 +280,91 @@ def _invoke_driver(
     return evidence
 
 
-def _phase_evidence(phase: str, raw: Mapping[str, Any]) -> dict[str, str]:
+def _runtime_image_evidence(
+    raw: Mapping[str, Any], *, journal: TransactionJournal
+) -> dict[str, str]:
+    if set(raw) != {"runtime_image_evidence"} or not isinstance(
+        raw.get("runtime_image_evidence"), Mapping
+    ):
+        raise ReleaseCliError(
+            "image observation must contain one exact RuntimeImageEvidence"
+        )
+    try:
+        evidence = RuntimeImageEvidence.from_mapping(raw["runtime_image_evidence"])
+    except ContractError as error:
+        raise ReleaseCliError(
+            "image observation contains invalid RuntimeImageEvidence"
+        ) from error
+    current = journal.current
+    if (
+        evidence.source_commit != current.source_commit
+        or evidence.source_tree != current.source_tree
+        or evidence.account != current.account
+        or evidence.region != current.region
+    ):
+        raise ReleaseCliError(
+            "RuntimeImageEvidence differs from the release identity"
+        )
+    return {"runtime_image_digest": evidence.image_digest}
+
+
+def _runtime_context_evidence(
+    phase: str,
+    raw: Mapping[str, Any],
+    *,
+    journal: TransactionJournal,
+) -> dict[str, str]:
+    expected_fields = (
+        {"runtime_context"}
+        if phase == "endpoint"
+        else {"runtime_context", "runtime_context_sha256"}
+    )
+    if set(raw) != expected_fields or not isinstance(
+        raw.get("runtime_context"), Mapping
+    ):
+        raise ReleaseCliError(
+            f"{phase} observation must contain one exact RuntimeContextV3"
+        )
+    try:
+        context = RuntimeContextV3.from_mapping(raw["runtime_context"])
+    except ContractError as error:
+        raise ReleaseCliError(
+            f"{phase} observation contains invalid RuntimeContextV3"
+        ) from error
+    current = journal.current
+    expected_image_uri = (
+        f"{current.account}.dkr.ecr.{current.region}.amazonaws.com/"
+        f"personal-operator/bridge@{current.runtime_image_digest}"
+    )
+    if (
+        context.source_commit != current.source_commit
+        or context.account != current.account
+        or context.region != current.region
+        or context.runtime_id != current.runtime_id
+        or context.runtime_version != current.runtime_version
+        or context.runtime_endpoint_name != current.runtime_endpoint_name
+        or context.runtime_image_uri != expected_image_uri
+    ):
+        raise ReleaseCliError("RuntimeContextV3 differs from the release journal")
+    if phase == "endpoint":
+        return {}
+    digest = raw.get("runtime_context_sha256")
+    expected_digest = hashlib.sha256(context.to_bytes()).hexdigest()
+    if digest != expected_digest:
+        raise ReleaseCliError("RuntimeContextV3 digest differs from its exact bytes")
+    return {"runtime_context_sha256": expected_digest}
+
+
+def _phase_evidence(
+    phase: str,
+    raw: Mapping[str, Any],
+    *,
+    journal: TransactionJournal,
+) -> dict[str, str]:
+    if phase == "image":
+        return _runtime_image_evidence(raw, journal=journal)
+    if phase in {"endpoint", "context"}:
+        return _runtime_context_evidence(phase, raw, journal=journal)
     expected = PHASE_EVIDENCE_FIELDS[phase]
     if set(raw) != expected:
         raise ReleaseCliError(
@@ -349,7 +432,7 @@ def _observation(
                 "rollback observation differs from the journal"
             )
         return True, {}
-    return True, _phase_evidence(phase, evidence)
+    return True, _phase_evidence(phase, evidence, journal=journal)
 
 
 def _observe_and_reconcile(

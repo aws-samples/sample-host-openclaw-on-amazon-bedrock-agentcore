@@ -83,10 +83,12 @@ The suite includes the following hostile cases:
   literal AWS, GitHub, Slack, OpenAI, Google, Telegram, or private-key secret;
 - active observability templates do not enable model payload logging;
 - staging transaction failures are write-ahead `UNCERTAIN`, cannot skip a
-  phase, require explicit reconciliation, and cannot retarget a retained
-  release endpoint;
+  phase, require explicit reconciliation, reject digest-only image claims and
+  empty endpoint claims, and cannot retarget a retained release endpoint;
 - the shared trusted asset covers five unique handler modules across six Lambda functions;
-  the web handler intentionally serves both web and maintenance.
+  the web handler intentionally serves both web and maintenance. Fake-container
+  subprocess tests inspect the executed boundary, and failed republication
+  preserves the prior artifact rather than deleting it.
 
 ## Dependency and license inventory
 
