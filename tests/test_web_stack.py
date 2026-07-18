@@ -351,7 +351,7 @@ def test_synthesis_reads_the_explicit_web_asset_root_not_an_untracked_build() ->
     assert 'Path("web/dist/index.html")' not in source
 
 
-def test_http_api_exposes_only_the_eleven_trusted_control_routes() -> None:
+def test_http_api_exposes_only_the_fifteen_trusted_control_routes() -> None:
     template = _synth_web_template()
     routes = {
         route["Properties"]["RouteKey"]
@@ -360,6 +360,7 @@ def test_http_api_exposes_only_the_eleven_trusted_control_routes() -> None:
 
     assert routes == {
         "POST /api/session/connect",
+        "POST /api/session/logout",
         "GET /oauth/google/start",
         "GET /oauth/google/callback",
         "GET /approve/{token}",
@@ -368,8 +369,11 @@ def test_http_api_exposes_only_the_eleven_trusted_control_routes() -> None:
         "GET /api/gmail",
         "POST /api/gmail/drafts/{action}",
         "GET /api/workspace",
+        "GET /api/overview",
         "GET /api/export",
         "POST /api/delete",
+        "POST /api/connections/google-gmail-readonly/disconnect",
+        "POST /api/scans/{scan}/feedback",
     }
     assert not any("openclaw" in route.casefold() for route in routes)
     assert not any("agentcore" in route.casefold() for route in routes)

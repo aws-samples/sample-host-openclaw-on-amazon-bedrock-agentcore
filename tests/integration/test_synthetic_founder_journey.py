@@ -327,6 +327,17 @@ class UnusedRetention:
         raise AssertionError("synthetic journey does not run retention")
 
 
+class UnusedPilotPorts:
+    def get(self, _user_id):
+        raise AssertionError("founder journey does not request the pilot overview")
+
+    def disconnect(self, _user_id):
+        raise AssertionError("founder journey does not disconnect Gmail")
+
+    def feedback(self, _user_id, _scan_id, *, response):
+        raise AssertionError(f"founder journey does not record {response} feedback")
+
+
 class DeletionDependency:
     def __init__(self, name: str, events: list[str]) -> None:
         self.name = name
@@ -473,6 +484,9 @@ def test_complete_synthetic_founder_connect_approve_receipt_export_delete_journe
         exporter=UserExporter(ExportSource(repository)),
         deletion=deletion,
         retention=UnusedRetention(),
+        overview=UnusedPilotPorts(),
+        connections=UnusedPilotPorts(),
+        scans=UnusedPilotPorts(),
         web_origin=ORIGIN,
         google_redirect_uri=f"{ORIGIN}/oauth/google/callback",
     )

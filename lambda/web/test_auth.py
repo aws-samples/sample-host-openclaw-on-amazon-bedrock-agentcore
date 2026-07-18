@@ -68,10 +68,16 @@ def test_connect_ticket_is_signed_user_bound_short_lived_and_one_time():
         random_bytes=DeterministicRandom(),
     )
 
-    token = tickets.issue(user_id="user_founder", ttl_seconds=300)
+    token = tickets.issue(
+        user_id="user_founder",
+        return_path="/workspace",
+        ttl_seconds=300,
+    )
 
-    assert token.startswith("poct1.")
-    assert tickets.consume(token) == "user_founder"
+    assert token.startswith("poct2.")
+    redemption = tickets.consume(token)
+    assert redemption.user_id == "user_founder"
+    assert redemption.return_path == "/workspace"
     with pytest.raises(ConnectTicketError, match="used"):
         tickets.consume(token)
 
@@ -85,21 +91,111 @@ def test_connect_ticket_rejects_tamper_expiry_and_wrong_stored_binding():
         now=clock,
         random_bytes=DeterministicRandom(),
     )
-    token = tickets.issue(user_id="user_founder", ttl_seconds=60)
+    token = tickets.issue(
+        user_id="user_founder", return_path="/connections", ttl_seconds=300
+    )
     with pytest.raises(ConnectTicketError, match="signature"):
         tickets.consume(token[:-1] + ("A" if token[-1] != "A" else "B"))
 
-    token = tickets.issue(user_id="user_founder", ttl_seconds=60)
-    clock.value += 61
+    token = tickets.issue(
+        user_id="user_founder", return_path="/connections", ttl_seconds=300
+    )
+    clock.value += 301
     with pytest.raises(ConnectTicketError, match="expired"):
         tickets.consume(token)
 
-    clock.value -= 61
-    token = tickets.issue(user_id="user_founder", ttl_seconds=60)
+    clock.value -= 301
+    token = tickets.issue(
+        user_id="user_founder", return_path="/connections", ttl_seconds=300
+    )
     only = next(reversed(store.items.values()))
     only["userId"] = "user_attacker"
     with pytest.raises(ConnectTicketError, match="binding"):
         tickets.consume(token)
+
+
+@pytest.mark.parametrize(
+    "return_path",
+    [
+        "/",
+        "/connections",
+        "/workspace",
+        "/export",
+        "/delete",
+        "/workspace?draft=draft_action_12345678",
+    ],
+)
+def test_connect_ticket_v2_accepts_only_exact_pilot_return_paths(return_path):
+    tickets = SignedConnectTickets(
+        secret=b"t" * 32,
+        store=OneTimeStore(),
+        now=Clock(),
+        random_bytes=DeterministicRandom(),
+    )
+
+    redemption = tickets.consume(
+        tickets.issue(user_id="user_founder", return_path=return_path)
+    )
+
+    assert redemption.return_path == return_path
+
+
+@pytest.mark.parametrize(
+    "return_path",
+    [
+        "",
+        "connections",
+        "//attacker.example",
+        "/../workspace",
+        "/connections?next=https://attacker.example",
+        "/workspace?draft=bad!draft",
+        "/workspace?draft=draft_action_12345678&next=/delete",
+        "/approve/signed-token",
+    ],
+)
+def test_connect_ticket_v2_rejects_open_redirects_and_unallowlisted_paths(return_path):
+    tickets = SignedConnectTickets(
+        secret=b"t" * 32,
+        store=OneTimeStore(),
+        now=Clock(),
+        random_bytes=DeterministicRandom(),
+    )
+
+    with pytest.raises(ValueError, match="return path"):
+        tickets.issue(user_id="user_founder", return_path=return_path)
+
+
+def test_connect_ticket_v2_cross_user_attempt_does_not_consume_ticket():
+    tickets = SignedConnectTickets(
+        secret=b"t" * 32,
+        store=OneTimeStore(),
+        now=Clock(),
+        random_bytes=DeterministicRandom(),
+    )
+    token = tickets.issue(user_id="user_founder", return_path="/export")
+
+    with pytest.raises(ConnectTicketError, match="identity"):
+        tickets.consume(token, expected_user_id="user_attacker")
+
+    redemption = tickets.consume(token, expected_user_id="user_founder")
+    assert redemption.user_id == "user_founder"
+    assert redemption.return_path == "/export"
+
+
+def test_legacy_v1_ticket_drain_can_return_only_to_connections():
+    tickets = SignedConnectTickets(
+        secret=b"t" * 32,
+        store=OneTimeStore(),
+        now=Clock(),
+        random_bytes=DeterministicRandom(),
+    )
+
+    token = tickets.issue_legacy_v1(user_id="user_founder")
+    redemption = tickets.consume(token)
+
+    assert token.startswith("poct1.")
+    assert redemption.user_id == "user_founder"
+    assert redemption.return_path == "/connections"
 
 
 def test_session_cookie_is_opaque_host_only_secure_and_stores_only_digests():

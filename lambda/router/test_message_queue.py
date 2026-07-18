@@ -152,13 +152,14 @@ def test_payload_shape_must_match_kind():
     assert command.payload["command"] == "/status"
 
 
-def test_callback_envelope_accepts_only_one_bounded_opaque_card_action():
+def test_callback_envelope_carries_bounded_query_id_and_drains_legacy_payloads():
     callback = envelope(
         kind="callback",
         payload={
             "chatId": "7",
             "actorId": "telegram:7",
             "callbackData": "poc1:prepare:ABCDEFGHIJKLMNOPQRSTUV",
+            "callbackQueryId": "telegram_callback_query_123",
         },
     )
 
@@ -166,7 +167,17 @@ def test_callback_envelope_accepts_only_one_bounded_opaque_card_action():
         "chatId": "7",
         "actorId": "telegram:7",
         "callbackData": "poc1:prepare:ABCDEFGHIJKLMNOPQRSTUV",
+        "callbackQueryId": "telegram_callback_query_123",
     }
+    legacy = envelope(
+        kind="callback",
+        payload={
+            "chatId": "7",
+            "actorId": "telegram:7",
+            "callbackData": "poc1:why:ABCDEFGHIJKLMNOPQRSTUV",
+        },
+    )
+    assert "callbackQueryId" not in legacy.payload
 
     for data in (
         "prepare:gmail:trusted:thread",
@@ -181,6 +192,18 @@ def test_callback_envelope_accepts_only_one_bounded_opaque_card_action():
                     "chatId": "7",
                     "actorId": "telegram:7",
                     "callbackData": data,
+                },
+            )
+
+    for callback_query_id in ("", "contains space", "x" * 257):
+        with pytest.raises(EnvelopeValidationError):
+            envelope(
+                kind="callback",
+                payload={
+                    "chatId": "7",
+                    "actorId": "telegram:7",
+                    "callbackData": "poc1:why:ABCDEFGHIJKLMNOPQRSTUV",
+                    "callbackQueryId": callback_query_id,
                 },
             )
 

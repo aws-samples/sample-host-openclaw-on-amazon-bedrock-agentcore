@@ -51,6 +51,49 @@ class Vault:
         self.saved.append((user_id, provider, token))
 
 
+class ConnectionFence:
+    def __init__(self, generation=0, status="DISCONNECTED"):
+        self.generation = generation
+        self.status = status
+        self.calls = []
+
+    def oauth_generation(self, user_id):
+        self.calls.append(("start", user_id, self.generation))
+        return self.generation
+
+    def assert_generation(self, user_id, generation, *, require_connected=False):
+        self.calls.append(("assert", user_id, generation, require_connected))
+        if generation != self.generation or (
+            require_connected and self.status != "CONNECTED"
+        ):
+            raise oauth.ConnectionFenceError("connection generation changed")
+
+    def activate_connection(self, user_id, generation):
+        self.assert_generation(user_id, generation, require_connected=False)
+        self.status = "CONNECTED"
+
+
+class FencedVault(Vault):
+    def save(
+        self,
+        *,
+        user_id,
+        provider,
+        token,
+        expected_generation=None,
+        allow_disconnected=False,
+    ):
+        self.saved.append(
+            (
+                user_id,
+                provider,
+                token,
+                expected_generation,
+                allow_disconnected,
+            )
+        )
+
+
 def test_oauth_start_uses_pkce_and_callback_is_one_time_user_bound():
     state_store = StateStore()
     token_client = TokenClient(
@@ -178,6 +221,79 @@ def test_oauth_rejects_unregistered_redirect_and_missing_initial_refresh_token()
     with pytest.raises(oauth.OAuthScopeError):
         flow.complete(user_id="user-1", state=request.state, code="code")
     assert vault.saved == []
+
+
+def test_oauth_callback_is_fenced_before_provider_exchange_after_local_disconnect():
+    fence = ConnectionFence(generation=7, status="CONNECTED")
+    tokens = TokenClient(
+        {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "scope": oauth.GMAIL_READONLY_SCOPE,
+        }
+    )
+    vault = FencedVault()
+    flow = oauth.GoogleReadonlyOAuthFlow(
+        state_store=StateStore(),
+        token_client=tokens,
+        token_vault=vault,
+        connection_fence=fence,
+        client_id="client-id",
+        authorization_endpoint=oauth.GOOGLE_AUTHORIZATION_ENDPOINT,
+        allowed_redirect_uris={"https://app.example/oauth/google/callback"},
+        now=lambda: NOW,
+    )
+    request = flow.start(
+        user_id="user-1",
+        redirect_uri="https://app.example/oauth/google/callback",
+    )
+
+    fence.generation = 8
+    fence.status = "DISCONNECTED"
+
+    with pytest.raises(oauth.ConnectionFenceError):
+        flow.complete(user_id="user-1", state=request.state, code="stale-code")
+    assert tokens.calls == []
+    assert vault.saved == []
+
+
+def test_oauth_activation_is_bound_to_the_generation_captured_at_start():
+    fence = ConnectionFence(generation=3, status="DISCONNECTED")
+    tokens = TokenClient(
+        {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "scope": oauth.GMAIL_READONLY_SCOPE,
+        }
+    )
+    vault = FencedVault()
+    flow = oauth.GoogleReadonlyOAuthFlow(
+        state_store=StateStore(),
+        token_client=tokens,
+        token_vault=vault,
+        connection_fence=fence,
+        client_id="client-id",
+        authorization_endpoint=oauth.GOOGLE_AUTHORIZATION_ENDPOINT,
+        allowed_redirect_uris={"https://app.example/oauth/google/callback"},
+        now=lambda: NOW,
+    )
+    request = flow.start(
+        user_id="user-1",
+        redirect_uri="https://app.example/oauth/google/callback",
+    )
+
+    flow.complete(user_id="user-1", state=request.state, code="fresh-code")
+
+    assert vault.saved == [
+        (
+            "user-1",
+            "google-gmail-readonly",
+            tokens.token,
+            3,
+            True,
+        )
+    ]
+    assert fence.status == "CONNECTED"
 
 
 class FakeHttpResponse:

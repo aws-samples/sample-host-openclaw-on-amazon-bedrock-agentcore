@@ -519,6 +519,7 @@ class WebStack(Stack):
         )
         route_contract = (
             ("/api/session/connect", apigwv2.HttpMethod.POST),
+            ("/api/session/logout", apigwv2.HttpMethod.POST),
             ("/oauth/google/start", apigwv2.HttpMethod.GET),
             ("/oauth/google/callback", apigwv2.HttpMethod.GET),
             ("/approve/{token}", apigwv2.HttpMethod.GET),
@@ -527,8 +528,14 @@ class WebStack(Stack):
             ("/api/gmail", apigwv2.HttpMethod.GET),
             ("/api/gmail/drafts/{action}", apigwv2.HttpMethod.POST),
             ("/api/workspace", apigwv2.HttpMethod.GET),
+            ("/api/overview", apigwv2.HttpMethod.GET),
             ("/api/export", apigwv2.HttpMethod.GET),
             ("/api/delete", apigwv2.HttpMethod.POST),
+            (
+                "/api/connections/google-gmail-readonly/disconnect",
+                apigwv2.HttpMethod.POST,
+            ),
+            ("/api/scans/{scan}/feedback", apigwv2.HttpMethod.POST),
         )
         for route_path, method in route_contract:
             self.http_api.add_routes(

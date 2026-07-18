@@ -324,6 +324,17 @@ class DynamoExpirySweeper:
                     and _DIGEST.fullmatch(pk[len(marker) :]) is not None
                 )
                 break
+        if pk.startswith("SCANUSER#"):
+            digest = pk[len("SCANUSER#") :]
+            allowed = (
+                _DIGEST.fullmatch(digest) is not None
+                and re.fullmatch(
+                    r"SCAN#[0-9]{20}#[A-Za-z0-9_-]{32}", sk
+                )
+                is not None
+                and item.get("recordType") == "PILOT_SCAN_MEASUREMENT_V1"
+                and item.get("userId") is None
+            )
         if pk.startswith("USER#"):
             user_id = pk[5:]
             if _USER_ID.fullmatch(user_id) is None:

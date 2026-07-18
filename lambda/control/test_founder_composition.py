@@ -23,6 +23,26 @@ class Producer:
         return "prepared"
 
 
+class LazyTable:
+    def __init__(self, name):
+        self.name = name
+
+    def put_item(self, **_kwargs):
+        raise AssertionError("lazy control store was unexpectedly called")
+
+    def update_item(self, **_kwargs):
+        raise AssertionError("lazy control store was unexpectedly called")
+
+    def query(self, **_kwargs):
+        raise AssertionError("lazy control store was unexpectedly called")
+
+    def get_item(self, **_kwargs):
+        raise AssertionError("lazy control store was unexpectedly called")
+
+    def delete_item(self, **_kwargs):
+        raise AssertionError("lazy control store was unexpectedly called")
+
+
 def test_google_read_transport_has_one_attempt_and_a_bounded_socket_timeout():
     calls = []
     raw_http = object()
@@ -141,7 +161,7 @@ def test_production_without_founder_binding_keeps_all_pilots_read_only(
     class Dynamo:
         @staticmethod
         def Table(name):
-            return {"name": name}
+            return LazyTable(name)
 
     class Secrets:
         def __init__(self):
@@ -185,6 +205,10 @@ def test_production_without_founder_binding_keeps_all_pilots_read_only(
     assert application._approval_producer is None
     assert isinstance(application._card_actions, DynamoTelegramCardActions)
     assert isinstance(application._draft_preparer, ReadOnlyGmailDraftPreparer)
+    assert (
+        application._card_actions._connection_fence
+        is application._draft_preparer._repository
+    )
     assert secrets.reads == ["web-auth"]
 
 
@@ -194,7 +218,7 @@ def test_production_composition_wires_the_lazy_producer_without_a_send_secret(
     class Dynamo:
         @staticmethod
         def Table(name):
-            return {"name": name}
+            return LazyTable(name)
 
     class Secrets:
         def __init__(self):

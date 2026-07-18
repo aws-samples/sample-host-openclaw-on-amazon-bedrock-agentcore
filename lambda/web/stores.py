@@ -11,6 +11,10 @@ from typing import Mapping
 
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
+_DRAFT_RETURN = re.compile(r"/workspace\?draft=[A-Za-z0-9_-]{8,128}")
+_STATIC_RETURN_PATHS = frozenset(
+    {"/", "/connections", "/workspace", "/export", "/delete"}
+)
 
 
 class WebStoreError(RuntimeError):
@@ -280,16 +284,30 @@ class DynamoWebStore:
 
     def put_once(self, key: str, record: Mapping, *, expires_at: int) -> None:
         key = _digest(key)
-        if not isinstance(record, Mapping) or set(record) != {"userId", "nonce", "issuedAt"}:
+        fields = set(record) if isinstance(record, Mapping) else set()
+        if fields not in (
+            {"userId", "nonce", "issuedAt"},
+            {"userId", "nonce", "issuedAt", "returnPath"},
+        ):
             raise ValueError("connect record is invalid")
         user_id = _user(record["userId"])
         nonce = record["nonce"]
         issued = record["issuedAt"]
+        return_path = record.get("returnPath")
         if not isinstance(nonce, str) or not 32 <= len(nonce) <= 256:
             raise ValueError("connect nonce is invalid")
         if isinstance(issued, bool) or not isinstance(issued, int) or issued <= 0:
             raise ValueError("connect issue time is invalid")
+        if return_path is not None and (
+            not isinstance(return_path, str)
+            or (
+                return_path not in _STATIC_RETURN_PATHS
+                and _DRAFT_RETURN.fullmatch(return_path) is None
+            )
+        ):
+            raise ValueError("connect record return path is invalid")
         expiry = _ttl(expires_at)
+        optional = {"returnPath": return_path} if return_path is not None else {}
         self._table.put_item(
             Item={
                 "PK": f"CONNECT#{key}",
@@ -297,6 +315,7 @@ class DynamoWebStore:
                 "userId": user_id,
                 "nonce": nonce,
                 "issuedAt": issued,
+                **optional,
                 "expiresAt": expiry,
                 "ttl": expiry,
             },
@@ -314,12 +333,15 @@ class DynamoWebStore:
             return None
         if item.get("PK") != f"CONNECT#{key}" or item.get("SK") != "CONNECT":
             raise WebStoreError("connect record binding is corrupt")
-        return {
+        result = {
             "userId": item.get("userId"),
             "nonce": item.get("nonce"),
             "issuedAt": item.get("issuedAt"),
             "expiresAt": item.get("expiresAt"),
         }
+        if "returnPath" in item:
+            result["returnPath"] = item.get("returnPath")
+        return result
 
     def create(self, key: str, record: Mapping, *, expires_at: int) -> None:
         key = _digest(key)
@@ -381,12 +403,21 @@ class DynamoWebStore:
         item = self._session(key)
         if item is None:
             return
-        self._table.update_item(
-            Key={"PK": item["PK"], "SK": item["SK"]},
-            UpdateExpression="SET revoked=:true",
-            ConditionExpression="sessionKey=:key",
-            ExpressionAttributeValues={":true": True, ":key": _digest(key)},
-        )
+        try:
+            self._table.update_item(
+                Key={"PK": item["PK"], "SK": item["SK"]},
+                UpdateExpression="SET revoked=:true",
+                ConditionExpression="sessionKey=:key",
+                ExpressionAttributeValues={":true": True, ":key": _digest(key)},
+            )
+        except Exception:
+            # The write may have committed before its response was lost. Logout
+            # must not strand a private session: reconcile with a strongly
+            # consistent read and accept success only when the exact session is
+            # proven revoked. Otherwise re-raise so the caller can retry.
+            reconciled = self._session(key)
+            if not (isinstance(reconciled, Mapping) and reconciled.get("revoked") is True):
+                raise
 
     def revoke_all(self, user_id: str) -> None:
         user_id = _user(user_id)
@@ -413,7 +444,10 @@ class DynamoOAuthStateStore:
     @staticmethod
     def _record(record: object, expires_at: int) -> dict[str, object]:
         required = {"user_id", "redirect_uri", "code_verifier", "expires_at"}
-        if not isinstance(record, Mapping) or set(record) != required:
+        if not isinstance(record, Mapping) or set(record) not in {
+            frozenset(required),
+            frozenset({*required, "connection_generation"}),
+        }:
             raise ValueError("OAuth state record is invalid")
         user_id = _user(record["user_id"])
         redirect_uri = record["redirect_uri"]
@@ -438,13 +472,23 @@ class DynamoOAuthStateStore:
             expires_at
         ):
             raise ValueError("OAuth state expiry is invalid")
-        return {
+        result = {
             "userId": user_id,
             "redirectUri": redirect_uri,
             "codeVerifier": verifier,
             "expiresAt": expiry_text,
             "ttl": expires_at,
         }
+        if "connection_generation" in record:
+            generation = record["connection_generation"]
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 0
+            ):
+                raise ValueError("OAuth state generation is invalid")
+            result["connectionGeneration"] = generation
+        return result
 
     def put_once(self, key: str, record: Mapping, *, expires_at: int) -> None:
         key = _digest(key)
@@ -469,9 +513,12 @@ class DynamoOAuthStateStore:
             or item.get("SK") != "OAUTHSTATE"
         ):
             raise WebStoreError("OAuth state binding is corrupt")
-        return {
+        result = {
             "user_id": item.get("userId"),
             "redirect_uri": item.get("redirectUri"),
             "code_verifier": item.get("codeVerifier"),
             "expires_at": item.get("expiresAt"),
         }
+        if "connectionGeneration" in item:
+            result["connection_generation"] = item.get("connectionGeneration")
+        return result

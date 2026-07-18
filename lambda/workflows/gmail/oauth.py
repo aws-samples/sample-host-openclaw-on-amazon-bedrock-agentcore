@@ -41,6 +41,10 @@ class OAuthTokenProviderError(RuntimeError):
     """A token endpoint failure with no provider or credential detail."""
 
 
+class ConnectionFenceError(RuntimeError):
+    """A local disconnect invalidated an OAuth generation."""
+
+
 def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
 
@@ -74,6 +78,7 @@ class GoogleReadonlyOAuthFlow:
         state_store,
         token_client,
         token_vault,
+        connection_fence=None,
         client_id: str,
         authorization_endpoint: str,
         allowed_redirect_uris: Iterable[str],
@@ -83,6 +88,16 @@ class GoogleReadonlyOAuthFlow:
         self._state_store = state_store
         self._token_client = token_client
         self._token_vault = token_vault
+        if connection_fence is not None and any(
+            not callable(getattr(connection_fence, method, None))
+            for method in (
+                "oauth_generation",
+                "assert_generation",
+                "activate_connection",
+            )
+        ):
+            raise TypeError("connection fence is invalid")
+        self._connection_fence = connection_fence
         self._client_id = _bounded_text(client_id, "client_id", 512)
         self._authorization_endpoint = _bounded_text(
             authorization_endpoint, "authorization_endpoint", 1_024
@@ -123,14 +138,24 @@ class GoogleReadonlyOAuthFlow:
         challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
         expires_at = self._now().astimezone(timezone.utc) + STATE_TTL
         state_key = hashlib.sha256(state.encode("ascii")).hexdigest()
+        generation = (
+            self._connection_fence.oauth_generation(user_id)
+            if self._connection_fence is not None
+            else None
+        )
+        state_record = {
+            "user_id": user_id,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+            "expires_at": expires_at.isoformat(),
+        }
+        if generation is not None:
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+                raise ConnectionFenceError("connection generation is invalid")
+            state_record["connection_generation"] = generation
         self._state_store.put_once(
             state_key,
-            {
-                "user_id": user_id,
-                "redirect_uri": redirect_uri,
-                "code_verifier": verifier,
-                "expires_at": expires_at.isoformat(),
-            },
+            state_record,
             expires_at=int(expires_at.timestamp()),
         )
         params = urlencode(
@@ -172,6 +197,19 @@ class GoogleReadonlyOAuthFlow:
             raise OAuthStateError("OAuth state expired")
         if not isinstance(bound_user, str) or not hmac.compare_digest(bound_user, user_id):
             raise OAuthStateError("OAuth state belongs to another user")
+        generation = record.get("connection_generation")
+        if self._connection_fence is not None:
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 0
+            ):
+                raise OAuthStateError("OAuth state has no connection generation")
+            self._connection_fence.assert_generation(
+                user_id,
+                generation,
+                require_connected=False,
+            )
         token = self._token_client.exchange_code(
             code=code,
             code_verifier=verifier,
@@ -196,11 +234,19 @@ class GoogleReadonlyOAuthFlow:
             or not 1 <= expires_in <= 86_400
         ):
             raise OAuthScopeError("Google returned an invalid token expiry")
-        self._token_vault.save(
-            user_id=user_id,
-            provider="google-gmail-readonly",
-            token=dict(token),
-        )
+        save = {
+            "user_id": user_id,
+            "provider": "google-gmail-readonly",
+            "token": dict(token),
+        }
+        if self._connection_fence is not None:
+            save.update(
+                expected_generation=generation,
+                allow_disconnected=True,
+            )
+        self._token_vault.save(**save)
+        if self._connection_fence is not None:
+            self._connection_fence.activate_connection(user_id, generation)
 
 
 class GoogleOAuthTokenClient:
@@ -340,7 +386,15 @@ class KmsEnvelopeTokenVault:
         self._store = record_store
         self._aead = aead
 
-    def save(self, *, user_id: str, provider: str, token: Mapping[str, object]) -> None:
+    def save(
+        self,
+        *,
+        user_id: str,
+        provider: str,
+        token: Mapping[str, object],
+        expected_generation: int | None = None,
+        allow_disconnected: bool = False,
+    ) -> None:
         context = _context(
             _bounded_text(user_id, "user_id", 128),
             _bounded_text(provider, "provider", 128),
@@ -378,7 +432,13 @@ class KmsEnvelopeTokenVault:
             "nonce": _b64url(nonce),
             "ciphertext": _b64url(ciphertext),
         }
-        self._store.put(user_id=user_id, provider=provider, record=record)
+        arguments = {"user_id": user_id, "provider": provider, "record": record}
+        if expected_generation is not None:
+            arguments.update(
+                expected_generation=expected_generation,
+                allow_disconnected=allow_disconnected,
+            )
+        self._store.put(**arguments)
 
     def load(self, *, user_id: str, provider: str) -> dict[str, object] | None:
         context = _context(

@@ -78,6 +78,26 @@ class LocalConnectionRevoker:
         self.events.append(("local", user_id))
 
 
+def test_account_record_deletion_includes_pseudonymous_scan_measurements():
+    events = []
+
+    class Deleter:
+        def __init__(self, name):
+            self.name = name
+
+        def delete_user_records(self, user_id):
+            events.append((self.name, user_id))
+
+    records = composition.CompositeUserRecordDeleter(
+        Deleter("records"),
+        Deleter("scan-measurements"),
+    )
+
+    records.delete_user_records("pilot-1")
+
+    assert events == [("records", "pilot-1"), ("scan-measurements", "pilot-1")]
+
+
 def live_send_secret():
     return {"Name": "google-send", "ARN": DeletionSecretClient.ARN}
 
@@ -698,6 +718,21 @@ class FakeTable:
     def __init__(self, name):
         self.name = name
 
+    def put_item(self, **_kwargs):
+        raise AssertionError("lazy production port was unexpectedly called")
+
+    def update_item(self, **_kwargs):
+        raise AssertionError("lazy production port was unexpectedly called")
+
+    def query(self, **_kwargs):
+        raise AssertionError("lazy production port was unexpectedly called")
+
+    def get_item(self, **_kwargs):
+        raise AssertionError("lazy production port was unexpectedly called")
+
+    def delete_item(self, **_kwargs):
+        raise AssertionError("lazy production port was unexpectedly called")
+
 
 class FakeDynamoResource:
     def __init__(self):
@@ -803,7 +838,14 @@ def test_production_builder_reads_only_web_auth_secret_and_defers_provider_paths
     )
     assert provider_revoker._secret_id == "google-send"
     assert provider_revoker._founder_user_id == "founder-1"
-    assert local_revoker is application._deletion._records
+    records, scans = application._deletion._records._deleters
+    assert local_revoker is records
+    assert scans is application._scans
+    assert (
+        application._connections._repository
+        is application._gmail_workspace._repository
+    )
+    assert application._gmail_workspace._enforce_connection_fence is True
     assert secrets.management_calls == []
     assert secrets.calls == ["web-auth"]
     with pytest.raises(

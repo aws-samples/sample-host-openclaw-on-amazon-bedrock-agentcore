@@ -27,6 +27,8 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from control.invites import DynamoPilotInvites, InviteRejected
+
 try:
     from .event_identity import derive_event_trace
     from .telegram_ingress import MAX_WEBHOOK_BYTES, TelegramWebhookIngress
@@ -80,6 +82,7 @@ sqs_client = boto3.client(
 )
 
 _telegram_ingress_cache = None
+_pilot_invites_cache = None
 
 
 def _get_runtime_driver():
@@ -153,10 +156,30 @@ def _get_telegram_ingress():
     _telegram_ingress_cache = TelegramWebhookIngress(
         secret_provider=_get_webhook_secret,
         resolve_user=resolve_user,
+        redeem_invite=_redeem_pilot_invite,
         sqs_client=sqs_client,
         queue_url=UPDATE_QUEUE_URL,
     )
     return _telegram_ingress_cache
+
+
+def _get_pilot_invites():
+    global _pilot_invites_cache
+    if _pilot_invites_cache is None:
+        _pilot_invites_cache = DynamoPilotInvites(identity_table)
+    return _pilot_invites_cache
+
+
+def _redeem_pilot_invite(token, channel, channel_user_id, display_name):
+    try:
+        return _get_pilot_invites().redeem(
+            token,
+            channel=channel,
+            channel_user_id=channel_user_id,
+            display_name=display_name,
+        ).user_id
+    except InviteRejected:
+        return None
 
 
 def _get_feishu_credentials():

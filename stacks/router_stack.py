@@ -132,6 +132,10 @@ class RouterStack(Stack):
         registration_open = str(
             self.node.try_get_context("registration_open") or "false"
         ).lower()
+        if registration_open != "false":
+            raise ValueError(
+                "external pilot registration must remain closed; use one-time invites"
+            )
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)

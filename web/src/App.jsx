@@ -1,18 +1,46 @@
-import { useEffect, useMemo, useState } from "react";
-import { api, rememberCsrf } from "./api";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { api, forgetCsrf, rememberCsrf } from "./api";
 
-function Shell({ eyebrow, title, children }) {
+const LogoutContext = createContext(null);
+
+function LogoutButton() {
+  const [state, setState] = useState("ready");
+  const onSignedOut = useContext(LogoutContext);
+  async function logout() {
+    setState("loading");
+    try {
+      await api("/api/session/logout", { method: "POST", body: {}, csrf: true });
+      forgetCsrf();
+      onSignedOut();
+    } catch {
+      setState("error");
+    }
+  }
+  return (
+    <button className="nav-action" disabled={state === "loading"} onClick={logout} type="button">
+      {state === "error" ? "Try sign out again" : "Sign out"}
+    </button>
+  );
+}
+
+function Shell({ eyebrow, title, children, authenticated = true }) {
   return (
     <main className="shell">
-      <nav aria-label="Primary">
-        <a className="brand" href="/">PO<span>.</span></a>
-        <div className="nav-links">
-          <a href="/connections">Connections</a>
-          <a href="/workspace">Workspace</a>
-          <a href="/export">Export</a>
-          <a href="/delete">Delete</a>
-        </div>
-      </nav>
+      {authenticated ? (
+        <nav aria-label="Primary">
+          <a className="brand" href="/">PO<span>.</span></a>
+          <div className="nav-links">
+            <a href="/">Overview</a>
+            <a href="/connections">Connections</a>
+            <a href="/workspace">Workspace</a>
+            <a href="/export">Export</a>
+            <a href="/delete">Delete</a>
+            <LogoutButton />
+          </div>
+        </nav>
+      ) : (
+        <div className="brand" aria-hidden="true">PO<span>.</span></div>
+      )}
       <section className="surface">
         <p className="eyebrow">{eyebrow}</p>
         <h1>{title}</h1>
@@ -29,16 +57,43 @@ function Status({ state, children }) {
   return children;
 }
 
-function ConnectPage() {
+const STATIC_RETURN_PATHS = new Set(["/", "/connections", "/workspace", "/export", "/delete"]);
+
+function validReturnPath(value) {
+  return typeof value === "string" && (
+    STATIC_RETURN_PATHS.has(value) || /^\/workspace\?draft=[A-Za-z0-9_-]{8,128}$/.test(value)
+  );
+}
+
+function assertReadOnlyOverview(payload) {
+  if (
+    !payload
+    || payload.version !== "personal-operator.pilot-overview.v1"
+    || payload.externalEffects !== false
+    || payload.capability?.externalEffects !== false
+    || payload.capability?.mode !== "READ_ONLY"
+    || payload.connection?.access !== "READ_ONLY"
+  ) {
+    throw new Error("The read-only boundary is unavailable.");
+  }
+  return payload;
+}
+
+function TicketBootstrap() {
   const ticket = useMemo(() => new URLSearchParams(location.search).get("ticket"), []);
   const [state, setState] = useState(ticket ? "loading" : "missing");
+  const [destination, setDestination] = useState("");
   const [error, setError] = useState("");
   useEffect(() => {
     if (!ticket) return;
     api("/api/session/connect", { method: "POST", body: { ticket } })
       .then(({ payload }) => {
+        if (!validReturnPath(payload.returnPath)) {
+          throw new Error("The secure session returned an invalid destination.");
+        }
         rememberCsrf(payload.csrfToken);
-        history.replaceState({}, "", "/connections");
+        history.replaceState({}, "", payload.returnPath);
+        setDestination(payload.returnPath);
         setState("ready");
       })
       .catch((failure) => {
@@ -46,32 +101,190 @@ function ConnectPage() {
         setState("error");
       });
   }, [ticket]);
+  if (state === "ready") return <Route path={destination.split("?")[0]} />;
   return (
-    <Shell eyebrow="Private control plane" title="Your operator, under your control.">
+    <Shell eyebrow="Private control plane" title="Your operator, under your control." authenticated={false}>
       <Status state={state}>
         {state === "missing" && <p>Open the one-time connection link from your Telegram conversation.</p>}
-        {state === "ready" && <ConnectionsContent />}
         {state === "error" && error}
       </Status>
     </Shell>
   );
 }
 
-function ConnectionsContent() {
+function OverviewPage() {
+  const [view, setView] = useState({ state: "loading" });
+  useEffect(() => {
+    api("/api/overview")
+      .then(({ payload }) => setView({ state: "ready", data: assertReadOnlyOverview(payload) }))
+      .catch((error) => setView({ state: "error", error: error.message }));
+  }, []);
+
+  async function recordFeedback(response) {
+    const scan = view.data.lastScan;
+    setView((current) => ({ ...current, feedbackState: "loading" }));
+    try {
+      await api(`/api/scans/${encodeURIComponent(scan.scanId)}/feedback`, {
+        method: "POST", body: { response }, csrf: true,
+      });
+      setView((current) => ({
+        ...current,
+        feedbackState: "done",
+        data: { ...current.data, lastScan: { ...current.data.lastScan, feedback: response } },
+      }));
+    } catch (error) {
+      setView((current) => ({ ...current, feedbackState: "error", feedbackError: error.message }));
+    }
+  }
+
+  return (
+    <Shell eyebrow="Read-only pilot" title="Your read-only operator.">
+      <Status state={view.state}>{view.error}</Status>
+      {view.state === "ready" && (
+        <div className="overview-grid">
+          <article className="summary-card safety-card">
+            <p className="card-kicker">Safety boundary</p>
+            <h2>External effects off</h2>
+            <p>Gmail access is read-only. This pilot can find, explain, and draft locally; it cannot send or request approval.</p>
+          </article>
+          <article className="summary-card">
+            <p className="card-kicker">Connection</p>
+            <h2>{connectionLabel(view.data.connection.status)}</h2>
+            <p>Google Gmail · read-only</p>
+            <a className="text-link" href="/connections">Manage connection</a>
+          </article>
+          <article className="summary-card">
+            <p className="card-kicker">Last scan</p>
+            <h2>{scanLabel(view.data.lastScan)}</h2>
+            {view.data.lastScan && (
+              <p>{view.data.lastScan.resultCount ?? 0} follow-ups · {view.data.lastScan.status.toLowerCase()}</p>
+            )}
+            {view.data.lastScan
+              && ["SUCCEEDED", "EMPTY"].includes(view.data.lastScan.status)
+              && !view.data.lastScan.feedback && (
+                <div className="feedback-actions" aria-label="Scan feedback">
+                  <button className="button quiet" disabled={view.feedbackState === "loading"} onClick={() => recordFeedback("USEFUL")}>Useful</button>
+                  <button className="button quiet" disabled={view.feedbackState === "loading"} onClick={() => recordFeedback("NOT_USEFUL")}>Not useful</button>
+                </div>
+              )}
+            {view.data.lastScan?.feedback && (
+              <p className="success compact" role="status">Feedback recorded: {view.data.lastScan.feedback === "USEFUL" ? "useful" : "not useful"}.</p>
+            )}
+            {view.feedbackState === "error" && <p className="error compact" role="alert">{view.feedbackError}</p>}
+          </article>
+          <article className="summary-card">
+            <p className="card-kicker">Workspace</p>
+            <h2>Runtime {view.data.workspace.runtimeState}</h2>
+            <p>{view.data.workspace.fileCount} files · {view.data.workspace.draftCount} local drafts</p>
+            {view.data.workspace.workspaceReceipt && (
+              <p className="receipt-chip">{view.data.workspace.workspaceReceipt.generation}</p>
+            )}
+            <a className="text-link" href="/workspace">Open workspace</a>
+          </article>
+          <article className="summary-card">
+            <p className="card-kicker">Portability</p>
+            <h2>Deterministic export</h2>
+            <p>Unencrypted ZIP · workspace, memory, schedules, and receipts</p>
+            <a className="text-link" href="/export">Review export</a>
+          </article>
+          <article className="summary-card">
+            <p className="card-kicker">Deletion</p>
+            <h2>Permanent account removal</h2>
+            <p>Two-pass deletion with a minimum {view.data.deletion.minimumReconciliationMinutes}-minute reconciliation window.</p>
+            <a className="text-link" href="/delete">Review deletion</a>
+          </article>
+        </div>
+      )}
+    </Shell>
+  );
+}
+
+function connectionLabel(status) {
+  return {
+    CONNECTED: "Gmail connected",
+    REAUTH_REQUIRED: "Gmail needs reconnection",
+    DISCONNECTED: "Gmail disconnected",
+  }[status] || "Connection unavailable";
+}
+
+function scanLabel(scan) {
+  if (!scan) return "No scan yet";
+  return {
+    RUNNING: "Scan in progress",
+    SUCCEEDED: "Scan complete",
+    EMPTY: "Nothing waiting",
+    FAILED: scan.failureCode === "AUTHORIZATION" ? "Reconnect Gmail to scan" : "Scan needs a retry",
+  }[scan.status] || "Scan unavailable";
+}
+
+function ConnectionsContent({ connection, onDisconnect, state }) {
+  const status = connection?.status;
   return (
     <div className="stack">
       <p className="lede">Connect data sources here. The trusted control plane holds access; the Linux workspace receives only bounded results.</p>
       <article className="connection-card">
         <div className="provider-mark" aria-hidden="true">G</div>
-        <div><h2>Gmail</h2><p>Read-only pilot · finds unanswered follow-ups</p></div>
-        <a className="button primary" href="/oauth/google/start">Connect safely</a>
+        <div>
+          <h2>Gmail</h2>
+          <p>Read-only pilot · {connectionLabel(status)}</p>
+        </div>
+        {status === "CONNECTED" ? (
+          <button className="button quiet" disabled={state === "loading" || state === "pending"} onClick={onDisconnect}>Disconnect Gmail</button>
+        ) : (
+          <a className="button primary" href="/oauth/google/start">
+            {status === "REAUTH_REQUIRED" ? "Reconnect Gmail" : "Connect read-only Gmail"}
+          </a>
+        )}
       </article>
     </div>
   );
 }
 
 function ConnectionsPage() {
-  return <Shell eyebrow="Connections" title="Bring your context. Keep your keys."><ConnectionsContent /></Shell>;
+  const [view, setView] = useState({ state: "loading" });
+  useEffect(() => {
+    api("/api/overview")
+      .then(({ payload }) => setView({ state: "ready", data: assertReadOnlyOverview(payload) }))
+      .catch((error) => setView({ state: "error", error: error.message }));
+  }, []);
+  async function disconnect() {
+    setView((current) => ({ ...current, actionState: "loading" }));
+    try {
+      // A bounded purge can need several passes. The server returns 202 with
+      // status DISCONNECTING until the authoritative fence is DISCONNECTED, so
+      // keep re-driving and never present the account as disconnected early.
+      for (let attempt = 0; attempt < 64; attempt += 1) {
+        const { payload, response } = await api(
+          "/api/connections/google-gmail-readonly/disconnect",
+          { method: "POST", body: {}, csrf: true },
+        );
+        if (response.status === 200 && payload.status === "DISCONNECTED") {
+          setView((current) => ({
+            ...current,
+            actionState: "done",
+            data: { ...current.data, connection: { ...current.data.connection, status: "DISCONNECTED" } },
+          }));
+          return;
+        }
+        setView((current) => ({ ...current, actionState: "pending" }));
+      }
+      throw new Error("Disconnect is still finishing. Please try again.");
+    } catch (error) {
+      setView((current) => ({ ...current, actionState: "error", actionError: error.message }));
+    }
+  }
+  return (
+    <Shell eyebrow="Connections" title="Bring your context. Keep your keys.">
+      <Status state={view.state}>{view.error}</Status>
+      {view.state === "ready" && (
+        <ConnectionsContent connection={view.data.connection} onDisconnect={disconnect} state={view.actionState} />
+      )}
+      {view.actionState === "pending" && (
+        <p className="status" role="status">Finishing disconnect…</p>
+      )}
+      {view.actionState === "error" && <p className="error" role="alert">{view.actionError}</p>}
+    </Shell>
+  );
 }
 
 function ApprovalPage({ token }) {
@@ -149,14 +362,21 @@ function WorkspacePage() {
           {view.gmail.opportunities.length > 0 && (
             <section aria-labelledby="opportunities-heading">
               <h2 id="opportunities-heading">Current follow-ups</h2>
-              <ul className="opportunity-list">
+              <div className="source-card-list">
                 {view.gmail.opportunities.map((opportunity) => (
-                  <li key={opportunity.id}>
-                    <a href={opportunity.sourceUrl} rel="noreferrer">{opportunity.title}</a>
+                  <article className="source-card" key={opportunity.id}>
+                    <p className="card-kicker">Source-backed follow-up</p>
+                    <h3>{opportunity.title}</h3>
                     <p>{opportunity.reason}</p>
-                  </li>
+                    <dl>
+                      <div><dt>Contact</dt><dd>{opportunity.correspondent}</dd></div>
+                      <div><dt>Subject</dt><dd>{opportunity.subject || "No subject"}</dd></div>
+                      <div><dt>Waiting since</dt><dd>{opportunity.waitingSince}</dd></div>
+                    </dl>
+                    <a className="button quiet" href={opportunity.sourceUrl} rel="noreferrer">Open source in Gmail</a>
+                  </article>
                 ))}
-              </ul>
+              </div>
             </section>
           )}
           <section aria-labelledby="files-heading">
@@ -254,8 +474,8 @@ function ExportPage() {
   }
   return (
     <Shell eyebrow="Portability" title="Take your operator with you.">
-      <p className="lede">Export your authored files, memory, schedules, and effect receipts. Credentials are never included.</p>
-      <button className="button primary" disabled={state === "loading"} onClick={download}>Create encrypted-ready ZIP</button>
+      <p className="lede">Create a deterministic, unencrypted ZIP containing your authored files, memory, schedules, and receipts. Credentials are never included; store the download securely.</p>
+      <button className="button primary" disabled={state === "loading"} onClick={download}>Create unencrypted ZIP</button>
       {state === "loading" && <p role="status">Building export…</p>}
       {state === "done" && <p className="success" role="status">Export created.</p>}
       {state === "error" && <p className="error" role="alert">Export could not be created.</p>}
@@ -279,8 +499,8 @@ function DeletePage() {
   }
   return (
     <Shell eyebrow="Danger zone" title="Delete your operator.">
-      <p className="lede">Your active application data is removed in two passes, at least 15 minutes apart. The first pass immediately blocks new work, revokes local connections, and stops your runtime.</p>
-      <p>Already queued Telegram updates, logs, and backups age out under their retention periods. Read-only Google records are removed. For the configured founder, the send credential is disabled and scheduled with a 7-day recovery window. Revoke the app separately in Google Account settings to end the provider grant.</p>
+      <p className="lede">Your active application data is removed in two passes with a minimum 30-minute reconciliation window. The first pass immediately blocks new work, revokes local connections, and stops your runtime.</p>
+      <p>Already queued Telegram updates, logs, and backups age out under their retention periods. Local read-only Google records and credentials are removed. Revoke the app separately in Google Account settings to end the provider grant.</p>
       <label htmlFor="confirmation">Type <strong>DELETE</strong> to continue</label>
       <input id="confirmation" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" />
       <button className="button danger" disabled={confirmation !== "DELETE" || state === "loading"} onClick={remove}>Start permanent deletion</button>
@@ -292,12 +512,34 @@ function DeletePage() {
   );
 }
 
-export default function App() {
-  const path = location.pathname;
+function Route({ path }) {
   if (path.startsWith("/approve/")) return <ApprovalPage token={decodeURIComponent(path.slice(9))} />;
   if (path === "/connections") return <ConnectionsPage />;
   if (path === "/workspace") return <WorkspacePage />;
   if (path === "/export") return <ExportPage />;
   if (path === "/delete") return <DeletePage />;
-  return <ConnectPage />;
+  return <OverviewPage />;
+}
+
+function SignedOutPage() {
+  return (
+    <Shell eyebrow="Private control plane" title="Signed out" authenticated={false}>
+      <p>This browser session is closed. Open a new one-time link from Telegram when you are ready to return.</p>
+    </Shell>
+  );
+}
+
+export default function App({ replaceDocument = (path) => location.replace(path) } = {}) {
+  const [signedOut, setSignedOut] = useState(location.pathname === "/signed-out");
+  function finishLogout() {
+    setSignedOut(true);
+    replaceDocument("/signed-out");
+  }
+  if (signedOut) return <SignedOutPage />;
+  const ticket = new URLSearchParams(location.search).get("ticket");
+  return (
+    <LogoutContext.Provider value={finishLogout}>
+      {ticket ? <TicketBootstrap /> : <Route path={location.pathname} />}
+    </LogoutContext.Provider>
+  );
 }

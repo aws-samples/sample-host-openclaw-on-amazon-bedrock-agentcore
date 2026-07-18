@@ -21,6 +21,7 @@ TELEGRAM_MAX_HTML_CHARS = 4_096
 _CHAT_ID = re.compile(r"-?[0-9]{1,20}")
 _TRACE_ID = re.compile(r"po1_[0-9a-f]{64}")
 _TOKEN = re.compile(r"[0-9]{3,20}:[A-Za-z0-9_-]{20,256}")
+_CALLBACK_QUERY_ID = re.compile(r"[A-Za-z0-9_-]{1,256}")
 
 
 class TelegramDeliveryValidationError(ValueError):
@@ -73,6 +74,51 @@ class TelegramDeliveryAdapter:
         self._token_provider = token_provider
         self._opener = opener or urllib_request.urlopen
         self._timeout = timeout_seconds
+
+    def acknowledge_callback(self, *, callback_query_id: str) -> None:
+        """Best-effort UI acknowledgement, separate from business delivery."""
+
+        if (
+            not isinstance(callback_query_id, str)
+            or _CALLBACK_QUERY_ID.fullmatch(callback_query_id) is None
+        ):
+            raise TelegramDeliveryValidationError(
+                "invalid Telegram callback query identity"
+            )
+        token = self._token_provider()
+        if not isinstance(token, str) or _TOKEN.fullmatch(token) is None:
+            raise TelegramDeliveryValidationError("Telegram bot token is unavailable")
+        payload = json.dumps(
+            {
+                "callback_query_id": callback_query_id,
+                "text": "Working...",
+                "show_alert": False,
+                "cache_time": 0,
+            },
+            separators=(",", ":"),
+        ).encode()
+        request = urllib_request.Request(
+            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with self._opener(request, timeout=self._timeout) as response:
+                raw = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise ValueError("Telegram response exceeded its bound")
+            decoded = json.loads(raw)
+            if (
+                not isinstance(decoded, dict)
+                or decoded.get("ok") is not True
+                or decoded.get("result") is not True
+            ):
+                raise ValueError("Telegram returned no callback acknowledgement")
+        except Exception as error:
+            raise TelegramDeliveryUncertain(
+                "Telegram callback acknowledgement outcome is uncertain"
+            ) from error
 
     def send_message(
         self,

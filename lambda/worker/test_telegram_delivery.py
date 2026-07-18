@@ -69,6 +69,63 @@ def test_one_exact_telegram_attempt_returns_provider_receipt_without_exposing_to
     assert TOKEN not in repr(receipt)
 
 
+def test_callback_query_acknowledgement_is_one_fixed_content_free_attempt():
+    requests = []
+    adapter = delivery_module.TelegramDeliveryAdapter(
+        token_provider=lambda: TOKEN,
+        opener=lambda request, timeout: (
+            requests.append((request, timeout))
+            or Response({"ok": True, "result": True})
+        ),
+        timeout_seconds=7,
+    )
+
+    adapter.acknowledge_callback(
+        callback_query_id="telegram_callback_query_123"
+    )
+
+    assert len(requests) == 1
+    request, timeout = requests[0]
+    assert timeout == 7
+    assert request.full_url.endswith("/answerCallbackQuery")
+    assert json.loads(request.data) == {
+        "callback_query_id": "telegram_callback_query_123",
+        "text": "Working...",
+        "show_alert": False,
+        "cache_time": 0,
+    }
+
+
+def test_callback_acknowledgement_validates_before_token_and_never_retries():
+    token_calls = []
+    attempts = []
+    adapter = delivery_module.TelegramDeliveryAdapter(
+        token_provider=lambda: token_calls.append(True) or TOKEN,
+        opener=lambda *args, **kwargs: (
+            attempts.append((args, kwargs))
+            and None
+        ),
+    )
+    for invalid in ("", "contains space", "x" * 257):
+        with pytest.raises(delivery_module.TelegramDeliveryValidationError):
+            adapter.acknowledge_callback(callback_query_id=invalid)
+    assert token_calls == []
+    assert attempts == []
+
+    failing = delivery_module.TelegramDeliveryAdapter(
+        token_provider=lambda: TOKEN,
+        opener=lambda *args, **kwargs: (
+            attempts.append((args, kwargs))
+            or (_ for _ in ()).throw(TimeoutError("lost"))
+        ),
+    )
+    with pytest.raises(delivery_module.TelegramDeliveryUncertain):
+        failing.acknowledge_callback(
+            callback_query_id="telegram_callback_query_123"
+        )
+    assert len(attempts) == 1
+
+
 def test_validated_opportunity_keyboard_is_included_in_the_same_provider_attempt():
     requests = []
     adapter = delivery_module.TelegramDeliveryAdapter(

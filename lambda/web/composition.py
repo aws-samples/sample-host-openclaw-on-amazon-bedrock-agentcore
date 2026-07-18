@@ -58,6 +58,8 @@ from .adapters import (
 from .auth import OpaqueSessionManager, SignedConnectTickets
 from .gmail_workspace import GmailWorkspaceService
 from .index import WebApplication
+from .measurements import DynamoScanMeasurements
+from .overview import DynamoConnectionLifecycle, PilotOverviewService
 from .retention import DeletionCoordinator, UserExporter
 from .services import ApprovalWebService, RetentionSweepService, WorkspaceService
 from .stores import DynamoOAuthStateStore, DynamoWebStore
@@ -300,6 +302,24 @@ class CompositeConnectionRevoker:
             raise ValueError("user identity is invalid")
         for revoker in self._revokers:
             revoker.revoke_all(user_id)
+
+
+class CompositeUserRecordDeleter:
+    """Remove raw-user and pseudonymous user partitions in fixed order."""
+
+    def __init__(self, *deleters) -> None:
+        if not deleters or any(
+            not callable(getattr(deleter, "delete_user_records", None))
+            for deleter in deleters
+        ):
+            raise ValueError("user record deleter is invalid")
+        self._deleters = tuple(deleters)
+
+    def delete_user_records(self, user_id: str) -> None:
+        if not isinstance(user_id, str) or _USER_ID.fullmatch(user_id) is None:
+            raise ValueError("user identity is invalid")
+        for deleter in self._deleters:
+            deleter.delete_user_records(user_id)
 
 
 class _LazyPort:
@@ -777,6 +797,7 @@ def build_production_application() -> WebApplication:
         s3, bucket_name=_required("USER_FILES_BUCKET_NAME")
     )
     record_store = DynamoUserDataStore(control_table)
+    gmail_repository = DynamoGmailRepository(control_table)
     action_repository = DynamoActionRepository(control_table)
     action_machine = ActionStateMachine(action_repository)
     send_secret_id = (
@@ -801,7 +822,6 @@ def build_production_application() -> WebApplication:
             required={"client_id", "client_secret"},
             optional={"bootstrap_nonce"},
         )
-        gmail_repository = DynamoGmailRepository(control_table)
         vault = KmsEnvelopeTokenVault(
             kms_client=kms,
             key_id=_required("OAUTH_KMS_KEY_ID"),
@@ -814,6 +834,7 @@ def build_production_application() -> WebApplication:
                 client_secret=google["client_secret"]
             ),
             token_vault=vault,
+            connection_fence=gmail_repository,
             client_id=google["client_id"],
             authorization_endpoint=GOOGLE_AUTHORIZATION_ENDPOINT,
             allowed_redirect_uris={redirect_uri},
@@ -856,6 +877,10 @@ def build_production_application() -> WebApplication:
         max_pages=20,
     )
 
+    scans = DynamoScanMeasurements(
+        control_table,
+        identity_key=web_secret,
+    )
     deletion = DeletionCoordinator(
         session_store=web_store,
         connection_store=CompositeConnectionRevoker(
@@ -868,23 +893,39 @@ def build_production_application() -> WebApplication:
         ),
         runtime_driver=runtime_driver,
         workspace_store=deletion_workspace_store,
-        record_store=record_store,
+        record_store=CompositeUserRecordDeleter(record_store, scans),
         footprint_store=DynamoUserFootprintStore(
             control_table=control_table,
             identity_table=identity_table,
             message_ledger_table=message_ledger_table,
         ),
     )
+    workspace = WorkspaceService(
+        workspace_store=authored_files_store,
+        runtime_driver=runtime_driver,
+    )
+    gmail_workspace = GmailWorkspaceService(
+        control_table,
+        repository=gmail_repository,
+        enforce_connection_fence=True,
+    )
+    connections = DynamoConnectionLifecycle(
+        control_table,
+        repository=gmail_repository,
+    )
+    overview = PilotOverviewService(
+        connections=connections,
+        workspace=workspace,
+        gmail_workspace=gmail_workspace,
+        scans=scans,
+    )
     return WebApplication(
         tickets=SignedConnectTickets(secret=web_secret, store=web_store),
         sessions=OpaqueSessionManager(secret=web_secret, store=web_store),
         oauth=LazyOAuthPort(oauth_factory),
         approvals=LazyApprovalPort(approvals_factory),
-        workspace=WorkspaceService(
-            workspace_store=authored_files_store,
-            runtime_driver=runtime_driver,
-        ),
-        gmail_workspace=GmailWorkspaceService(control_table),
+        workspace=workspace,
+        gmail_workspace=gmail_workspace,
         exporter=UserExporter(
             _ExportSource(records=record_store, workspace=authored_files_store)
         ),
@@ -895,6 +936,9 @@ def build_production_application() -> WebApplication:
             deletion=deletion,
             action_maintenance=action_maintenance,
         ),
+        overview=overview,
+        connections=connections,
+        scans=scans,
         web_origin=web_origin,
         google_redirect_uri=redirect_uri,
     )

@@ -13,6 +13,7 @@ from actions.state_machine import ActionStateMachine, ApprovalService, ApprovalT
 from .index import ControlApplication
 from .telegram_cards import DynamoTelegramCardActions, ReadOnlyGmailDraftPreparer
 from web.auth import SignedConnectTickets
+from web.measurements import DynamoScanMeasurements
 from web.stores import DynamoWebStore
 from workflows.founder_approval import FounderApprovalProducer
 from workflows.gmail.oauth import CryptographyAesGcm, GoogleOAuthTokenClient, KmsEnvelopeTokenVault
@@ -257,14 +258,23 @@ class ProductionGmailService:
         self._founder_account_email = founder_account_email
 
     def scan(self, *, user_id: str):
+        generation = self._repository.connected_generation(user_id)
         token = self._vault.load(user_id=user_id, provider=READONLY_PROVIDER)
+        self._repository.assert_generation(
+            user_id, generation, require_connected=True
+        )
         if not isinstance(token, Mapping) or not isinstance(token.get("refresh_token"), str):
             raise RuntimeError("Gmail read-only connection is not configured")
         refreshed = self._tokens.refresh(
             refresh_token=token["refresh_token"],
             client_id=self._client_id,
         )
-        self._vault.save(user_id=user_id, provider=READONLY_PROVIDER, token=refreshed)
+        self._vault.save(
+            user_id=user_id,
+            provider=READONLY_PROVIDER,
+            token=refreshed,
+            expected_generation=generation,
+        )
         try:
             from google.oauth2.credentials import Credentials
             from openai import OpenAI
@@ -297,7 +307,7 @@ class ProductionGmailService:
             scanner=scanner,
             ranker=ranker,
             repository=self._repository,
-        ).scan(user_id=user_id)
+        ).scan(user_id=user_id, expected_generation=generation)
 
 
 def build_production_application() -> ControlApplication:
@@ -408,6 +418,13 @@ def build_production_application() -> ControlApplication:
             if founder_user_id is not None
             else None
         ),
-        card_actions=DynamoTelegramCardActions(table),
+        card_actions=DynamoTelegramCardActions(
+            table,
+            connection_fence=repository,
+        ),
         draft_preparer=ReadOnlyGmailDraftPreparer(repository),
+        scan_measurements=DynamoScanMeasurements(
+            table,
+            identity_key=web_secret,
+        ),
     )
