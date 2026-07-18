@@ -841,6 +841,11 @@ def test_production_builder_reads_only_web_auth_secret_and_defers_provider_paths
     records, scans = application._deletion._records._deleters
     assert local_revoker is records
     assert scans is application._scans
+    assert (
+        application._connections._repository
+        is application._gmail_workspace._repository
+    )
+    assert application._gmail_workspace._enforce_connection_fence is True
     assert secrets.management_calls == []
     assert secrets.calls == ["web-auth"]
     with pytest.raises(

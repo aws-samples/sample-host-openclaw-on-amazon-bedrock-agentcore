@@ -337,6 +337,7 @@ def test_disconnect_is_csrf_bound_local_and_idempotent():
         assert json.loads(response["body"]) == {
             "provider": "google-gmail-readonly",
             "status": "DISCONNECTED",
+            "remoteGrantRevoked": False,
         }
     assert app._connections.calls == [USER, USER]
 

@@ -95,6 +95,18 @@ def _integer(value: object, *, label: str, maximum: int | None = None) -> int:
     return result
 
 
+def _generation(value: object) -> int:
+    if isinstance(value, bool):
+        raise GmailWorkspaceRecordError("stored connection generation is invalid")
+    if isinstance(value, Decimal):
+        if not value.is_finite() or value != value.to_integral_value():
+            raise GmailWorkspaceRecordError("stored connection generation is invalid")
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        raise GmailWorkspaceRecordError("stored connection generation is invalid")
+    return value
+
+
 def _request_revision(value: object) -> int:
     if (
         isinstance(value, bool)
@@ -164,8 +176,18 @@ def _opportunity_projection(record: object, *, user_id: str) -> dict[str, object
     }
 
 
-def _draft_projection(item: object, *, user_id: str, now_epoch: int) -> dict | None:
-    if not isinstance(item, Mapping) or set(item) != {"PK", "SK", "draft", "ttl"}:
+def _draft_projection(
+    item: object,
+    *,
+    user_id: str,
+    now_epoch: int,
+    expected_generation: int | None = None,
+) -> dict | None:
+    fields = {"PK", "SK", "draft", "ttl"}
+    if not isinstance(item, Mapping) or set(item) not in {
+        frozenset(fields),
+        frozenset({*fields, "connectionGeneration"}),
+    }:
         raise GmailWorkspaceRecordError("stored draft record fields are invalid")
     if item.get("PK") != f"USER#{user_id}":
         raise GmailWorkspaceRecordError("stored draft belongs to another user")
@@ -174,6 +196,10 @@ def _draft_projection(item: object, *, user_id: str, now_epoch: int) -> dict | N
     if match is None:
         raise GmailWorkspaceRecordError("stored draft key is invalid")
     ttl = _integer(item.get("ttl"), label="draft ttl")
+    if expected_generation is not None:
+        stored_generation = item.get("connectionGeneration")
+        if stored_generation is None or _generation(stored_generation) != expected_generation:
+            return None
     if ttl <= now_epoch:
         return None
     stored = item.get("draft")
@@ -211,10 +237,20 @@ def _draft_projection(item: object, *, user_id: str, now_epoch: int) -> dict | N
 class GmailWorkspaceService:
     """Read and revise session-bound, local Gmail pilot artifacts."""
 
-    def __init__(self, table, *, repository=None, now=None) -> None:
+    def __init__(
+        self,
+        table,
+        *,
+        repository=None,
+        enforce_connection_fence: bool = False,
+        now=None,
+    ) -> None:
         self._table = table
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._repository = repository or DynamoGmailRepository(table, now=self._now)
+        if not isinstance(enforce_connection_fence, bool):
+            raise TypeError("connection fence setting is invalid")
+        self._enforce_connection_fence = enforce_connection_fence
 
     def _now_utc(self) -> datetime:
         current = self._now()
@@ -222,7 +258,13 @@ class GmailWorkspaceService:
             raise GmailWorkspaceRecordError("Gmail workspace clock is invalid")
         return current.astimezone(timezone.utc)
 
-    def _opportunities(self, user_id: str, *, now_epoch: int) -> list[dict]:
+    def _opportunities(
+        self,
+        user_id: str,
+        *,
+        now_epoch: int,
+        expected_generation: int | None = None,
+    ) -> list[dict]:
         response = self._table.get_item(
             Key={"PK": f"USER#{user_id}", "SK": "GMAIL#OPPORTUNITIES"},
             ConsistentRead=True,
@@ -234,12 +276,25 @@ class GmailWorkspaceService:
             return []
         if (
             not isinstance(item, Mapping)
-            or set(item) != {"PK", "SK", "opportunities", "ttl"}
+            or set(item)
+            not in {
+                frozenset({"PK", "SK", "opportunities", "ttl"}),
+                frozenset(
+                    {"PK", "SK", "opportunities", "ttl", "connectionGeneration"}
+                ),
+            }
             or item.get("PK") != f"USER#{user_id}"
             or item.get("SK") != "GMAIL#OPPORTUNITIES"
         ):
             raise GmailWorkspaceRecordError("stored opportunity record is invalid")
         ttl = _integer(item.get("ttl"), label="opportunity ttl")
+        if expected_generation is not None:
+            stored_generation = item.get("connectionGeneration")
+            if (
+                stored_generation is None
+                or _generation(stored_generation) != expected_generation
+            ):
+                return []
         if ttl <= now_epoch:
             return []
         records = item.get("opportunities")
@@ -253,7 +308,13 @@ class GmailWorkspaceService:
             raise GmailWorkspaceRecordError("stored opportunity IDs are not unique")
         return projected
 
-    def _drafts(self, user_id: str, *, now_epoch: int) -> list[dict]:
+    def _drafts(
+        self,
+        user_id: str,
+        *,
+        now_epoch: int,
+        expected_generation: int | None = None,
+    ) -> list[dict]:
         latest: dict[str, dict] = {}
         start_key = None
         for page_number in range(MAX_DRAFT_PAGES):
@@ -275,7 +336,12 @@ class GmailWorkspaceService:
             ):
                 raise GmailWorkspaceRecordError("draft query returned an invalid result")
             for item in response.get("Items", []):
-                draft = _draft_projection(item, user_id=user_id, now_epoch=now_epoch)
+                draft = _draft_projection(
+                    item,
+                    user_id=user_id,
+                    now_epoch=now_epoch,
+                    expected_generation=expected_generation,
+                )
                 if draft is None:
                     continue
                 current = latest.get(draft["actionId"])
@@ -299,14 +365,42 @@ class GmailWorkspaceService:
     def get(self, user_id: str) -> dict[str, object]:
         user_id = _identifier(user_id, label="user_id", pattern=_USER_ID)
         now_epoch = int(self._now_utc().timestamp())
+        generation = None
+        if self._enforce_connection_fence:
+            try:
+                generation = self._repository.connected_generation(user_id)
+            except RuntimeError:
+                return {"userId": user_id, "opportunities": [], "drafts": []}
+        opportunities = self._opportunities(
+            user_id,
+            now_epoch=now_epoch,
+            expected_generation=generation,
+        )
+        drafts = self._drafts(
+            user_id,
+            now_epoch=now_epoch,
+            expected_generation=generation,
+        )
+        if generation is not None:
+            try:
+                self._repository.assert_generation(
+                    user_id, generation, require_connected=True
+                )
+            except RuntimeError:
+                return {"userId": user_id, "opportunities": [], "drafts": []}
         return {
             "userId": user_id,
-            "opportunities": self._opportunities(user_id, now_epoch=now_epoch),
-            "drafts": self._drafts(user_id, now_epoch=now_epoch),
+            "opportunities": opportunities,
+            "drafts": drafts,
         }
 
     def _latest_draft(
-        self, *, user_id: str, action_id: str, now_epoch: int
+        self,
+        *,
+        user_id: str,
+        action_id: str,
+        now_epoch: int,
+        expected_generation: int | None = None,
     ) -> dict | None:
         response = self._table.query(
             KeyConditionExpression="PK = :pk AND begins_with(SK, :sk)",
@@ -327,7 +421,12 @@ class GmailWorkspaceService:
             raise GmailWorkspaceRecordError("draft query exceeded its exact bound")
         if not items:
             return None
-        draft = _draft_projection(items[0], user_id=user_id, now_epoch=now_epoch)
+        draft = _draft_projection(
+            items[0],
+            user_id=user_id,
+            now_epoch=now_epoch,
+            expected_generation=expected_generation,
+        )
         if draft is not None and draft["actionId"] != action_id:
             raise GmailWorkspaceRecordError("draft query crossed an action boundary")
         return draft
@@ -357,10 +456,17 @@ class GmailWorkspaceService:
             raise ValueError(str(error)) from None
 
         now = self._now_utc()
+        generation = None
+        if self._enforce_connection_fence:
+            try:
+                generation = self._repository.connected_generation(user_id)
+            except RuntimeError:
+                raise DraftEditConflict("draft is not available") from None
         current = self._latest_draft(
             user_id=user_id,
             action_id=action_id,
             now_epoch=int(now.timestamp()),
+            expected_generation=generation,
         )
         if current is None:
             raise DraftEditConflict("draft is not available")
@@ -375,11 +481,14 @@ class GmailWorkspaceService:
         )
         expires_at = int((now + DERIVED_RECORD_TTL).timestamp())
         try:
-            self._repository.save_draft(
-                user_id=user_id,
-                draft=revised,
-                expires_at=expires_at,
-            )
+            arguments = {
+                "user_id": user_id,
+                "draft": revised,
+                "expires_at": expires_at,
+            }
+            if generation is not None:
+                arguments["expected_generation"] = generation
+            self._repository.save_draft(**arguments)
         except DraftRevisionConflictError:
             raise DraftEditConflict("draft current revision has changed") from None
         return {

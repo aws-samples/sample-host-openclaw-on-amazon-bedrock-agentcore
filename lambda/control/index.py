@@ -344,10 +344,11 @@ class ControlApplication:
         # the preparer has no provider client or send capability.
         if self._draft_preparer is None:
             raise ControlRequestError("read-only draft preparation is unavailable")
-        prepared_draft = self._draft_preparer.prepare(
-            user_id=user_id,
-            opportunity=opportunity,
-        )
+        prepare_arguments = {"user_id": user_id, "opportunity": opportunity}
+        connection_generation = getattr(consumed, "connection_generation", None)
+        if connection_generation is not None:
+            prepare_arguments["connection_generation"] = connection_generation
+        prepared_draft = self._draft_preparer.prepare(**prepare_arguments)
         draft_action_id, _ = self._validated_prepared(
             prepared_draft,
             label="draft preparer",

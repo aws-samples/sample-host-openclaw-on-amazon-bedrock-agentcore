@@ -136,6 +136,27 @@ def service(table):
     return GmailWorkspaceService(table, now=lambda: NOW)
 
 
+class ConnectionFence:
+    def __init__(self, *, generation=6, connected=True):
+        self.generation = generation
+        self.connected = connected
+        self.saved = []
+
+    def connected_generation(self, user_id):
+        assert user_id == USER
+        if not self.connected:
+            raise RuntimeError("disconnected")
+        return self.generation
+
+    def assert_generation(self, user_id, generation, *, require_connected=False):
+        assert user_id == USER
+        if generation != self.generation or (require_connected and not self.connected):
+            raise RuntimeError("stale")
+
+    def save_draft(self, **kwargs):
+        self.saved.append(kwargs)
+
+
 def test_get_returns_only_live_derived_opportunities_and_latest_draft_per_action():
     expired = int((NOW - timedelta(seconds=1)).timestamp())
     table = Table(
@@ -206,6 +227,25 @@ def test_get_hides_an_expired_opportunity_record():
     assert service(table).get(USER)["opportunities"] == []
 
 
+def test_disconnected_workspace_hides_all_gmail_derived_content():
+    table = Table([opportunity_item(), draft_item()])
+    fence = ConnectionFence(connected=False)
+    workspace = GmailWorkspaceService(
+        table,
+        repository=fence,
+        enforce_connection_fence=True,
+        now=lambda: NOW,
+    )
+
+    assert workspace.get(USER) == {
+        "userId": USER,
+        "opportunities": [],
+        "drafts": [],
+    }
+    assert table.get_calls == []
+    assert table.query_calls == []
+
+
 def test_edit_requires_current_revision_and_creates_immutable_recipient_revision():
     table = Table([draft_item()])
 
@@ -237,6 +277,29 @@ def test_edit_requires_current_revision_and_creates_immutable_recipient_revision
     ]
     assert stored["draft"]["to"] == "ada@example.com"
     assert stored["ttl"] == int((NOW + timedelta(days=14)).timestamp())
+
+
+def test_fenced_edit_forwards_the_generation_captured_before_reading():
+    item = draft_item()
+    item["connectionGeneration"] = 6
+    table = Table([item])
+    fence = ConnectionFence()
+    workspace = GmailWorkspaceService(
+        table,
+        repository=fence,
+        enforce_connection_fence=True,
+        now=lambda: NOW,
+    )
+
+    workspace.edit_draft(
+        user_id=USER,
+        action_id=ACTION,
+        revision=1,
+        subject="Updated subject",
+        body="Updated body",
+    )
+
+    assert fence.saved[0]["expected_generation"] == 6
 
 
 def test_edit_rejects_stale_or_missing_draft_without_writing():

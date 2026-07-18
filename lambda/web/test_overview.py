@@ -227,3 +227,84 @@ def test_connection_lifecycle_reads_presence_without_decrypting_and_disconnects_
     ]
     assert not hasattr(lifecycle, "kms")
     assert not hasattr(lifecycle, "provider_client")
+
+
+class DisconnectTable:
+    def __init__(self, items):
+        self.items = {
+            (item["PK"], item["SK"]): dict(item) for item in items
+        }
+
+    def get_item(self, **kwargs):
+        key = (kwargs["Key"]["PK"], kwargs["Key"]["SK"])
+        item = self.items.get(key)
+        return {"Item": dict(item)} if item is not None else {}
+
+    def put_item(self, **kwargs):
+        item = dict(kwargs["Item"])
+        key = (item["PK"], item["SK"])
+        if kwargs.get("ConditionExpression") and key in self.items:
+            raise RuntimeError("condition")
+        self.items[key] = item
+        return {}
+
+    def update_item(self, **kwargs):
+        key = (kwargs["Key"]["PK"], kwargs["Key"]["SK"])
+        item = self.items.get(key)
+        values = kwargs["ExpressionAttributeValues"]
+        if item is None or item.get("generation") != values[":expected"]:
+            raise RuntimeError("condition")
+        item["generation"] = values[":next"]
+        item["status"] = values[":status"]
+        item["updatedAt"] = values[":now"]
+        return {}
+
+    def query(self, **kwargs):
+        values = kwargs["ExpressionAttributeValues"]
+        pk = values[":pk"]
+        prefix = values[":prefix"]
+        matches = [
+            dict(item)
+            for (item_pk, item_sk), item in sorted(self.items.items())
+            if item_pk == pk and item_sk.startswith(prefix)
+        ]
+        return {"Items": matches[: kwargs["Limit"]]}
+
+    def delete_item(self, **kwargs):
+        key = (kwargs["Key"]["PK"], kwargs["Key"]["SK"])
+        self.items.pop(key, None)
+        return {}
+
+
+def test_disconnect_fences_writers_and_purges_all_gmail_derived_namespaces():
+    pk = f"USER#{USER}"
+    table = DisconnectTable(
+        [
+            {
+                "PK": pk,
+                "SK": f"CONNECTION#{PROVIDER}",
+                "envelope": {
+                    "format": "personal-operator.oauth-envelope.v1",
+                    "binding": "a" * 64,
+                    "wrappedKey": "wrapped",
+                    "nonce": "nonce",
+                    "ciphertext": "ciphertext",
+                },
+            },
+            {"PK": pk, "SK": "GMAIL#OPPORTUNITIES", "private": "address"},
+            {"PK": pk, "SK": "GMAIL#DRAFT#draft_12345678#0000000001", "private": "body"},
+            {"PK": pk, "SK": "TELEGRAM_CALLBACK#" + "a" * 64, "private": "source"},
+            {"PK": pk, "SK": "MEMORY#main", "private": "preserve"},
+        ]
+    )
+    lifecycle = DynamoConnectionLifecycle(table)
+
+    assert lifecycle.disconnect(USER) == "DISCONNECTED"
+
+    remaining = {sk: item for (item_pk, sk), item in table.items.items() if item_pk == pk}
+    assert set(remaining) == {"GMAIL#CONNECTION_FENCE", "MEMORY#main"}
+    assert remaining["GMAIL#CONNECTION_FENCE"]["status"] == "DISCONNECTED"
+    assert remaining["GMAIL#CONNECTION_FENCE"]["generation"] == 1
+    assert lifecycle.status(USER) == "DISCONNECTED"
+    assert lifecycle.disconnect(USER) == "DISCONNECTED"
+    assert remaining["MEMORY#main"]["private"] == "preserve"

@@ -172,10 +172,18 @@ class TelegramOpportunityCard:
 class ConsumedCardAction:
     action: str
     opportunity: Opportunity
+    connection_generation: int | None = None
 
     def __post_init__(self) -> None:
         if self.action not in CARD_ACTIONS or not isinstance(
             self.opportunity, Opportunity
+        ) or (
+            self.connection_generation is not None
+            and (
+                isinstance(self.connection_generation, bool)
+                or not isinstance(self.connection_generation, int)
+                or self.connection_generation < 0
+            )
         ):
             raise ValueError("consumed card action is invalid")
 
@@ -190,11 +198,22 @@ class DynamoTelegramCardActions:
         now: Callable[[], datetime] | None = None,
         token_factory: Callable[[], str] | None = None,
         conditional_failure_types: tuple[type[BaseException], ...] = (),
+        connection_fence=None,
     ) -> None:
         self._table = table
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._tokens = token_factory or (lambda: secrets.token_urlsafe(18))
         self._conditional_failures = conditional_failure_types
+        if connection_fence is not None and any(
+            not callable(getattr(connection_fence, method, None))
+            for method in (
+                "connected_generation",
+                "assert_generation",
+                "opportunities_match",
+            )
+        ):
+            raise TypeError("connection fence is invalid")
+        self._connection_fence = connection_fence
 
     def _read(self, user_id: str, callback_data: str) -> Mapping[str, object] | None:
         response = self._table.get_item(
@@ -222,6 +241,18 @@ class DynamoTelegramCardActions:
         ):
             raise ValueError("at most three opportunities may become cards")
         now = _clock(self._now())
+        generation = None
+        if self._connection_fence is not None:
+            try:
+                generation = self._connection_fence.connected_generation(user_id)
+                if not self._connection_fence.opportunities_match(
+                    user_id, generation, opportunities
+                ):
+                    raise CardActionRejected("scan opportunities are no longer current")
+            except CardActionRejected:
+                raise
+            except Exception:
+                raise CardActionRejected("Gmail connection is unavailable") from None
         created_at = int(now.timestamp())
         expiry = int((now + CARD_TTL).timestamp())
         cards: list[TelegramOpportunityCard] = []
@@ -246,6 +277,8 @@ class DynamoTelegramCardActions:
                     "createdAt": created_at,
                     "ttl": expiry,
                 }
+                if generation is not None:
+                    item["connectionGeneration"] = generation
                 try:
                     self._table.put_item(
                         Item=item,
@@ -259,6 +292,25 @@ class DynamoTelegramCardActions:
                         if isinstance(error, self._conditional_failures):
                             raise CardActionStoreError("card token collided") from None
                         raise CardActionStoreError("card issue is uncertain") from None
+                if generation is not None:
+                    try:
+                        self._connection_fence.assert_generation(
+                            user_id, generation, require_connected=True
+                        )
+                    except Exception:
+                        try:
+                            self._table.delete_item(
+                                Key=_callback_key(user_id, callback_data),
+                                ConditionExpression=(
+                                    "connectionGeneration=:generation"
+                                ),
+                                ExpressionAttributeValues={":generation": generation},
+                            )
+                        except Exception:
+                            pass
+                        raise CardActionRejected(
+                            "Gmail connection changed while issuing cards"
+                        ) from None
                 buttons.append((label, callback_data))
             cards.append(TelegramOpportunityCard(opportunity, tuple(buttons)))
         return cards
@@ -302,6 +354,22 @@ class DynamoTelegramCardActions:
             raise CardActionRejected("card action is invalid")
         action = match.group(1)
         now_epoch = int(_clock(self._now()).timestamp())
+        generation = None
+        if self._connection_fence is not None:
+            before = self._read(user_id, callback_data)
+            generation = _integer(
+                before.get("connectionGeneration")
+                if isinstance(before, Mapping)
+                else None
+            )
+            try:
+                if generation is None:
+                    raise RuntimeError("card has no generation")
+                self._connection_fence.assert_generation(
+                    user_id, generation, require_connected=True
+                )
+            except Exception:
+                raise CardActionRejected("card action is unavailable") from None
         try:
             response = self._table.update_item(
                 Key=_callback_key(user_id, callback_data),
@@ -352,9 +420,17 @@ class DynamoTelegramCardActions:
             now_epoch=now_epoch,
         ) or _integer(item.get("consumedAt")) != now_epoch:
             raise CardActionStoreError("consumed card record is invalid")
+        if generation is not None:
+            try:
+                self._connection_fence.assert_generation(
+                    user_id, generation, require_connected=True
+                )
+            except Exception:
+                raise CardActionRejected("card action is unavailable") from None
         return ConsumedCardAction(
             action=action,
             opportunity=_opportunity(item.get("opportunity"), user_id=user_id),
+            connection_generation=generation,
         )
 
 
@@ -365,7 +441,13 @@ class ReadOnlyGmailDraftPreparer:
         self._repository = repository
         self._now = now or (lambda: datetime.now(timezone.utc))
 
-    def prepare(self, *, user_id: str, opportunity: Opportunity):
+    def prepare(
+        self,
+        *,
+        user_id: str,
+        opportunity: Opportunity,
+        connection_generation: int | None = None,
+    ):
         user_id = _identity(user_id, _USER_ID, "user identity")
         if not isinstance(opportunity, Opportunity) or opportunity.user_id != user_id:
             raise TypeError("draft requires a user-bound Opportunity")
@@ -398,4 +480,5 @@ class ReadOnlyGmailDraftPreparer:
             to=opportunity.source.correspondent,
             subject=subject,
             body=body,
+            expected_generation=connection_generation,
         )

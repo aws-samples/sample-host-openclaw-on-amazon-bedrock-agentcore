@@ -797,6 +797,7 @@ def build_production_application() -> WebApplication:
         s3, bucket_name=_required("USER_FILES_BUCKET_NAME")
     )
     record_store = DynamoUserDataStore(control_table)
+    gmail_repository = DynamoGmailRepository(control_table)
     action_repository = DynamoActionRepository(control_table)
     action_machine = ActionStateMachine(action_repository)
     send_secret_id = (
@@ -821,7 +822,6 @@ def build_production_application() -> WebApplication:
             required={"client_id", "client_secret"},
             optional={"bootstrap_nonce"},
         )
-        gmail_repository = DynamoGmailRepository(control_table)
         vault = KmsEnvelopeTokenVault(
             kms_client=kms,
             key_id=_required("OAUTH_KMS_KEY_ID"),
@@ -834,6 +834,7 @@ def build_production_application() -> WebApplication:
                 client_secret=google["client_secret"]
             ),
             token_vault=vault,
+            connection_fence=gmail_repository,
             client_id=google["client_id"],
             authorization_endpoint=GOOGLE_AUTHORIZATION_ENDPOINT,
             allowed_redirect_uris={redirect_uri},
@@ -903,8 +904,15 @@ def build_production_application() -> WebApplication:
         workspace_store=authored_files_store,
         runtime_driver=runtime_driver,
     )
-    gmail_workspace = GmailWorkspaceService(control_table)
-    connections = DynamoConnectionLifecycle(control_table)
+    gmail_workspace = GmailWorkspaceService(
+        control_table,
+        repository=gmail_repository,
+        enforce_connection_fence=True,
+    )
+    connections = DynamoConnectionLifecycle(
+        control_table,
+        repository=gmail_repository,
+    )
     overview = PilotOverviewService(
         connections=connections,
         workspace=workspace,

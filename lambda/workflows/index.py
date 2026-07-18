@@ -56,13 +56,23 @@ class GmailPilotWorkflow:
             (self._now().astimezone(timezone.utc) + DERIVED_RECORD_TTL).timestamp()
         )
 
-    def scan(self, *, user_id: str) -> list[Opportunity]:
+    def scan(
+        self,
+        *,
+        user_id: str,
+        expected_generation: int | None = None,
+    ) -> list[Opportunity]:
         sources = self._scanner.scan()
         opportunities = self._ranker.rank(user_id=user_id, sources=sources)
+        arguments = {
+            "user_id": user_id,
+            "records": [_opportunity_record(item) for item in opportunities],
+            "expires_at": self._expires_at(),
+        }
+        if expected_generation is not None:
+            arguments["expected_generation"] = expected_generation
         self._repository.replace_opportunities(
-            user_id=user_id,
-            records=[_opportunity_record(item) for item in opportunities],
-            expires_at=self._expires_at(),
+            **arguments,
         )
         return opportunities
 
@@ -97,6 +107,7 @@ class GmailPilotWorkflow:
         to: str,
         subject: str,
         body: str,
+        expected_generation: int | None = None,
     ) -> DraftRevision:
         draft = DraftRevision.create(
             action_id=action_id,
@@ -105,9 +116,12 @@ class GmailPilotWorkflow:
             subject=subject,
             body=body,
         )
-        self._repository.save_draft(
-            user_id=user_id,
-            draft=draft,
-            expires_at=self._expires_at(),
-        )
+        arguments = {
+            "user_id": user_id,
+            "draft": draft,
+            "expires_at": self._expires_at(),
+        }
+        if expected_generation is not None:
+            arguments["expected_generation"] = expected_generation
+        self._repository.save_draft(**arguments)
         return draft

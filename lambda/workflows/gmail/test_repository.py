@@ -54,8 +54,27 @@ class FakeTable:
 
     def delete_item(self, **kwargs):
         self.calls.append(("delete_item", kwargs))
-        old = self.items.pop(self._key(kwargs["Key"]), None)
+        key = self._key(kwargs["Key"])
+        old = self.items.get(key)
+        expected = kwargs.get("ExpressionAttributeValues", {}).get(":generation")
+        if expected is not None and (
+            old is None or old.get("connectionGeneration") != expected
+        ):
+            raise ConditionalFailure("generation changed")
+        old = self.items.pop(key, None)
         return {"Attributes": old} if old is not None else {}
+
+    def update_item(self, **kwargs):
+        self.calls.append(("update_item", kwargs))
+        key = self._key(kwargs["Key"])
+        item = self.items.get(key)
+        values = kwargs["ExpressionAttributeValues"]
+        if item is None or item.get("generation") != values[":expected"]:
+            raise ConditionalFailure("generation changed")
+        item["generation"] = values[":next"]
+        item["status"] = values[":status"]
+        item["updatedAt"] = values[":now"]
+        return {}
 
     def get_item(self, **kwargs):
         self.calls.append(("get_item", kwargs))
@@ -183,6 +202,18 @@ def opportunity_record():
     }
 
 
+def fence_item(*, generation=1, status="CONNECTED"):
+    return {
+        "PK": "USER#user-1",
+        "SK": "GMAIL#CONNECTION_FENCE",
+        "recordType": "GMAIL_CONNECTION_FENCE",
+        "userId": "user-1",
+        "generation": generation,
+        "status": status,
+        "updatedAt": int(NOW.timestamp()),
+    }
+
+
 def test_derived_opportunities_and_drafts_have_exact_fourteen_day_ttl():
     repo, table = repository()
     repo.replace_opportunities(
@@ -222,6 +253,79 @@ def test_derived_opportunities_and_drafts_have_exact_fourteen_day_ttl():
     assert draft_put["ConditionExpression"] == (
         "attribute_not_exists(PK) AND attribute_not_exists(SK)"
     )
+
+
+def test_generation_guard_removes_a_derived_write_that_loses_to_disconnect():
+    class DisconnectDuringOpportunityWrite(FakeTable):
+        def put_item(self, **kwargs):
+            result = super().put_item(**kwargs)
+            if kwargs["Item"]["SK"] == "GMAIL#OPPORTUNITIES":
+                self.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
+                    "generation"
+                ] = 2
+                self.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
+                    "status"
+                ] = "DISCONNECTING"
+            return result
+
+    table = DisconnectDuringOpportunityWrite()
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item()
+    repo, _ = repository(table)
+
+    with pytest.raises(repository_module.ConnectionFenceError):
+        repo.replace_opportunities(
+            user_id="user-1",
+            records=[opportunity_record()],
+            expires_at=DERIVED_TTL,
+            expected_generation=1,
+        )
+
+    assert ("USER#user-1", "GMAIL#OPPORTUNITIES") not in table.items
+
+
+def test_connection_envelope_activation_and_refresh_are_generation_bound():
+    repo, table = repository()
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item(
+        generation=4,
+        status="DISCONNECTED",
+    )
+    envelope = {
+        "format": "personal-operator.oauth-envelope.v1",
+        "binding": "b" * 64,
+        "wrappedKey": "wrapped",
+        "nonce": "nonce",
+        "ciphertext": "ciphertext",
+    }
+
+    repo.put(
+        user_id="user-1",
+        provider="google-gmail-readonly",
+        record=envelope,
+        expected_generation=4,
+        allow_disconnected=True,
+    )
+    repo.activate_connection("user-1", 4)
+
+    connection = table.items[
+        ("USER#user-1", "CONNECTION#google-gmail-readonly")
+    ]
+    assert connection["connectionGeneration"] == 4
+    assert repo.connected_generation("user-1") == 4
+    assert table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
+        "status"
+    ] == "CONNECTED"
+
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")]["generation"] = 5
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
+        "status"
+    ] = "DISCONNECTED"
+    with pytest.raises(repository_module.ConnectionFenceError):
+        repo.put(
+            user_id="user-1",
+            provider="google-gmail-readonly",
+            record=envelope,
+            expected_generation=4,
+        )
 
 
 def test_draft_revision_is_immutable_but_exact_replay_is_idempotent():

@@ -15,6 +15,7 @@ from urllib.parse import unquote_to_bytes
 from workflows.gmail.repository import READONLY_PROVIDER
 
 from .auth import AuthenticationError, ConnectTicketError
+from .overview import ConnectionDisconnectPending
 from .retention import DeletionPending, ExportBoundaryError
 
 
@@ -384,12 +385,26 @@ class WebApplication:
                 identity = self._identity(headers, mutate=True)
                 if _json_body(event) != {}:
                     raise ValueError("disconnect request fields are invalid")
-                status = self._connections.disconnect(identity.user_id)
+                try:
+                    status = self._connections.disconnect(identity.user_id)
+                except ConnectionDisconnectPending:
+                    return self._response(
+                        202,
+                        {
+                            "provider": READONLY_PROVIDER,
+                            "status": "DISCONNECTED",
+                            "remoteGrantRevoked": False,
+                        },
+                    )
                 if status != "DISCONNECTED":
                     raise RuntimeError("connection disconnect returned invalid status")
                 return self._response(
                     200,
-                    {"provider": READONLY_PROVIDER, "status": status},
+                    {
+                        "provider": READONLY_PROVIDER,
+                        "status": status,
+                        "remoteGrantRevoked": False,
+                    },
                 )
 
             if method == "POST" and path == "/api/session/logout":

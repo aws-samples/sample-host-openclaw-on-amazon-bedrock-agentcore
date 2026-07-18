@@ -54,6 +54,17 @@ _OAUTH_STATE_FIELDS = {
     "code_verifier",
     "expires_at",
 }
+_FENCE_FIELDS = {
+    "PK",
+    "SK",
+    "recordType",
+    "userId",
+    "generation",
+    "status",
+    "updatedAt",
+}
+_FENCE_SK = "GMAIL#CONNECTION_FENCE"
+_FENCE_STATUSES = frozenset({"CONNECTED", "DISCONNECTING", "DISCONNECTED"})
 
 
 class RepositoryRecordError(ValueError):
@@ -66,6 +77,10 @@ class DuplicateOAuthStateError(RepositoryRecordError):
 
 class DraftRevisionConflictError(RepositoryRecordError):
     """An immutable action revision already contains another exact payload."""
+
+
+class ConnectionFenceError(RuntimeError):
+    """A Gmail writer lost to a local disconnect generation change."""
 
 
 def _identifier(value: str, label: str) -> str:
@@ -117,6 +132,18 @@ def _decimal_safe(value):
     return value
 
 
+def _generation(value: object) -> int:
+    if isinstance(value, bool):
+        raise RepositoryRecordError("connection generation is invalid")
+    if isinstance(value, Decimal):
+        if not value.is_finite() or value != value.to_integral_value():
+            raise RepositoryRecordError("connection generation is invalid")
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        raise RepositoryRecordError("connection generation is invalid")
+    return value
+
+
 def _is_conditional_failure(error: Exception) -> bool:
     response = getattr(error, "response", None)
     if not isinstance(response, Mapping):
@@ -128,17 +155,25 @@ def _is_conditional_failure(error: Exception) -> bool:
 
 
 def _validate_oauth_state(value: Mapping[str, object], expires_at: int) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _OAUTH_STATE_FIELDS:
+    if not isinstance(value, Mapping) or set(value) not in {
+        frozenset(_OAUTH_STATE_FIELDS),
+        frozenset({*_OAUTH_STATE_FIELDS, "connection_generation"}),
+    }:
         raise RepositoryRecordError("OAuth state record has invalid fields")
     state_expiry = _aware_iso(value["expires_at"], "expires_at")
     if int(datetime.fromisoformat(state_expiry).timestamp()) != expires_at:
         raise RepositoryRecordError("OAuth state TTL does not match its expiry")
-    return {
+    result = {
         "user_id": _identifier(value["user_id"], "user_id"),
         "redirect_uri": _text(value["redirect_uri"], "redirect_uri", 1_024),
         "code_verifier": _text(value["code_verifier"], "code_verifier", 256),
         "expires_at": state_expiry,
     }
+    if "connection_generation" in value:
+        result["connection_generation"] = _generation(
+            value["connection_generation"]
+        )
+    return result
 
 
 def _validate_envelope(record: Mapping[str, object]) -> dict[str, str]:
@@ -244,6 +279,283 @@ class DynamoGmailRepository:
             raise RepositoryRecordError("repository clock must be timezone-aware")
         return int(current.astimezone(timezone.utc).timestamp())
 
+    @staticmethod
+    def _connection_key(user_id: str) -> dict[str, str]:
+        return {
+            "PK": f"USER#{user_id}",
+            "SK": f"CONNECTION#{READONLY_PROVIDER}",
+        }
+
+    @staticmethod
+    def _fence_key(user_id: str) -> dict[str, str]:
+        return {"PK": f"USER#{user_id}", "SK": _FENCE_SK}
+
+    def _read_item(self, key: Mapping[str, str]) -> Mapping[str, object] | None:
+        response = self._table.get_item(Key=dict(key), ConsistentRead=True)
+        item = response.get("Item") if isinstance(response, Mapping) else None
+        return item if isinstance(item, Mapping) else None
+
+    def _fence(self, user_id: str) -> tuple[int, str] | None:
+        item = self._read_item(self._fence_key(user_id))
+        if item is None:
+            return None
+        if (
+            set(item) != _FENCE_FIELDS
+            or item.get("PK") != f"USER#{user_id}"
+            or item.get("SK") != _FENCE_SK
+            or item.get("recordType") != "GMAIL_CONNECTION_FENCE"
+            or item.get("userId") != user_id
+            or item.get("status") not in _FENCE_STATUSES
+        ):
+            raise RepositoryRecordError("stored connection fence is invalid")
+        generation = _generation(item.get("generation"))
+        _generation(item.get("updatedAt"))
+        return generation, str(item["status"])
+
+    def oauth_generation(self, user_id: str) -> int:
+        """Capture the generation for a new OAuth attempt.
+
+        A reconnect may begin while disconnected, but never while a bounded
+        disconnect purge is still in progress.
+        """
+
+        user_id = _identifier(user_id, "user_id")
+        fence = self._fence(user_id)
+        if fence is None:
+            return 0
+        generation, status = fence
+        if status == "DISCONNECTING":
+            raise ConnectionFenceError("connection disconnect is still pending")
+        return generation
+
+    def assert_generation(
+        self,
+        user_id: str,
+        expected_generation: int,
+        *,
+        require_connected: bool = False,
+    ) -> None:
+        user_id = _identifier(user_id, "user_id")
+        expected_generation = _generation(expected_generation)
+        fence = self._fence(user_id)
+        if fence is None:
+            generation = 0
+            connected = self._read_item(self._connection_key(user_id)) is not None
+        else:
+            generation, status = fence
+            connected = status == "CONNECTED"
+        if generation != expected_generation or (require_connected and not connected):
+            raise ConnectionFenceError("connection generation changed")
+
+    def connected_generation(self, user_id: str) -> int:
+        user_id = _identifier(user_id, "user_id")
+        fence = self._fence(user_id)
+        if fence is None:
+            if self._read_item(self._connection_key(user_id)) is None:
+                raise ConnectionFenceError("Gmail connection is not active")
+            return 0
+        generation, status = fence
+        if status != "CONNECTED":
+            raise ConnectionFenceError("Gmail connection is not active")
+        item = self._read_item(self._connection_key(user_id))
+        if item is None:
+            raise ConnectionFenceError("Gmail connection is not active")
+        stored_generation = item.get("connectionGeneration")
+        if stored_generation is not None and _generation(stored_generation) != generation:
+            raise ConnectionFenceError("connection generation changed")
+        if stored_generation is None and generation != 0:
+            raise ConnectionFenceError("legacy connection is outside the active generation")
+        return generation
+
+    def _fence_item(self, user_id: str, generation: int, status: str) -> dict[str, object]:
+        return {
+            **self._fence_key(user_id),
+            "recordType": "GMAIL_CONNECTION_FENCE",
+            "userId": user_id,
+            "generation": generation,
+            "status": status,
+            "updatedAt": self._now_epoch(),
+        }
+
+    def _set_existing_fence(
+        self,
+        user_id: str,
+        *,
+        expected_generation: int,
+        generation: int,
+        status: str,
+    ) -> None:
+        self._table.update_item(
+            Key=self._fence_key(user_id),
+            UpdateExpression="SET generation=:next, #status=:status, updatedAt=:now",
+            ConditionExpression="generation=:expected",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":expected": expected_generation,
+                ":next": generation,
+                ":status": status,
+                ":now": self._now_epoch(),
+            },
+        )
+
+    def activate_connection(self, user_id: str, expected_generation: int) -> None:
+        user_id = _identifier(user_id, "user_id")
+        expected_generation = _generation(expected_generation)
+        self.assert_generation(user_id, expected_generation)
+        fence = self._fence(user_id)
+        try:
+            if fence is None:
+                self._table.put_item(
+                    Item=self._fence_item(user_id, expected_generation, "CONNECTED"),
+                    ConditionExpression=(
+                        "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+                    ),
+                )
+            else:
+                self._set_existing_fence(
+                    user_id,
+                    expected_generation=expected_generation,
+                    generation=expected_generation,
+                    status="CONNECTED",
+                )
+        except Exception as error:
+            try:
+                self.assert_generation(
+                    user_id, expected_generation, require_connected=True
+                )
+            except Exception:
+                raise ConnectionFenceError("connection activation lost its generation") from error
+        self.assert_generation(user_id, expected_generation, require_connected=True)
+
+    def begin_disconnect(self, user_id: str) -> int:
+        user_id = _identifier(user_id, "user_id")
+        fence = self._fence(user_id)
+        if fence is not None and fence[1] == "DISCONNECTING":
+            return fence[0]
+        if (
+            fence is not None
+            and fence[1] == "DISCONNECTED"
+            and self._read_item(self._connection_key(user_id)) is None
+        ):
+            return fence[0]
+        current = 0 if fence is None else fence[0]
+        generation = current + 1
+        try:
+            if fence is None:
+                self._table.put_item(
+                    Item=self._fence_item(user_id, generation, "DISCONNECTING"),
+                    ConditionExpression=(
+                        "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+                    ),
+                )
+            else:
+                self._set_existing_fence(
+                    user_id,
+                    expected_generation=current,
+                    generation=generation,
+                    status="DISCONNECTING",
+                )
+        except Exception as error:
+            reconciled = self._fence(user_id)
+            if reconciled is None or reconciled[1] != "DISCONNECTING":
+                raise ConnectionFenceError("disconnect fence outcome is uncertain") from error
+            return reconciled[0]
+        self.assert_generation(user_id, generation)
+        return generation
+
+    def finish_disconnect(self, user_id: str, generation: int) -> None:
+        user_id = _identifier(user_id, "user_id")
+        generation = _generation(generation)
+        try:
+            self._set_existing_fence(
+                user_id,
+                expected_generation=generation,
+                generation=generation,
+                status="DISCONNECTED",
+            )
+        except Exception as error:
+            reconciled = self._fence(user_id)
+            if reconciled != (generation, "DISCONNECTED"):
+                raise ConnectionFenceError("disconnect completion is uncertain") from error
+
+    def connection_status(self, user_id: str) -> str:
+        user_id = _identifier(user_id, "user_id")
+        fence = self._fence(user_id)
+        if fence is not None and fence[1] != "CONNECTED":
+            return "DISCONNECTED"
+        return (
+            "CONNECTED"
+            if self._read_item(self._connection_key(user_id)) is not None
+            else "DISCONNECTED"
+        )
+
+    def opportunities_match(
+        self,
+        user_id: str,
+        generation: int,
+        opportunities: Sequence[object],
+    ) -> bool:
+        """Bind Telegram handles to the exact current derived opportunity set."""
+
+        user_id = _identifier(user_id, "user_id")
+        generation = _generation(generation)
+        self.assert_generation(user_id, generation, require_connected=True)
+        item = self._read_item(
+            {"PK": f"USER#{user_id}", "SK": "GMAIL#OPPORTUNITIES"}
+        )
+        if not isinstance(item, Mapping):
+            return False
+        stored_generation = item.get("connectionGeneration")
+        if stored_generation is None:
+            if generation != 0:
+                return False
+        elif _generation(stored_generation) != generation:
+            return False
+        records = item.get("opportunities")
+        if not isinstance(records, list) or len(records) != len(opportunities):
+            return False
+        for record, opportunity in zip(records, opportunities, strict=True):
+            source = record.get("source") if isinstance(record, Mapping) else None
+            if (
+                not isinstance(source, Mapping)
+                or record.get("id") != getattr(opportunity, "id", None)
+                or record.get("userId") != user_id
+                or source.get("sourceId")
+                != getattr(getattr(opportunity, "source", None), "source_id", None)
+            ):
+                return False
+        self.assert_generation(user_id, generation, require_connected=True)
+        return True
+
+    def _delete_generation(self, key: Mapping[str, str], generation: int) -> None:
+        try:
+            self._table.delete_item(
+                Key=dict(key),
+                ConditionExpression="connectionGeneration=:generation",
+                ExpressionAttributeValues={":generation": generation},
+            )
+        except Exception:
+            # A newer generation may already own the key. Never delete it.
+            return
+
+    def _post_write_guard(
+        self,
+        *,
+        user_id: str,
+        expected_generation: int,
+        key: Mapping[str, str],
+        require_connected: bool,
+    ) -> None:
+        try:
+            self.assert_generation(
+                user_id,
+                expected_generation,
+                require_connected=require_connected,
+            )
+        except Exception:
+            self._delete_generation(key, expected_generation)
+            raise ConnectionFenceError("connection write lost to disconnect") from None
+
     # GoogleReadonlyOAuthFlow state-store interface.
     def put_once(
         self,
@@ -303,32 +615,54 @@ class DynamoGmailRepository:
         user_id: str,
         provider: str,
         record: Mapping[str, object],
+        expected_generation: int | None = None,
+        allow_disconnected: bool = False,
     ) -> None:
         user_id = _identifier(user_id, "user_id")
         if provider != READONLY_PROVIDER:
             raise RepositoryRecordError("provider is not Gmail read-only")
-        self._table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": f"CONNECTION#{provider}",
-                "envelope": _validate_envelope(record),
-            }
-        )
+        item = {
+            "PK": f"USER#{user_id}",
+            "SK": f"CONNECTION#{provider}",
+            "envelope": _validate_envelope(record),
+        }
+        if expected_generation is not None:
+            expected_generation = _generation(expected_generation)
+            self.assert_generation(
+                user_id,
+                expected_generation,
+                require_connected=not allow_disconnected,
+            )
+            item["connectionGeneration"] = expected_generation
+        self._table.put_item(Item=item)
+        if expected_generation is not None:
+            self._post_write_guard(
+                user_id=user_id,
+                expected_generation=expected_generation,
+                key=self._connection_key(user_id),
+                require_connected=not allow_disconnected,
+            )
 
     def get(self, *, user_id: str, provider: str) -> Mapping[str, object] | None:
         user_id = _identifier(user_id, "user_id")
         if provider != READONLY_PROVIDER:
             raise RepositoryRecordError("provider is not Gmail read-only")
-        response = self._table.get_item(
-            Key={
-                "PK": f"USER#{user_id}",
-                "SK": f"CONNECTION#{provider}",
-            },
-            ConsistentRead=True,
-        )
-        item = response.get("Item") if isinstance(response, Mapping) else None
+        item = self._read_item(self._connection_key(user_id))
         if not isinstance(item, Mapping):
             return None
+        allowed = {"PK", "SK", "envelope", "connectionGeneration"}
+        if not set(item).issubset(allowed) or not {"PK", "SK", "envelope"}.issubset(item):
+            raise RepositoryRecordError("stored token envelope is invalid")
+        fence = self._fence(user_id)
+        stored_generation = item.get("connectionGeneration")
+        if fence is not None:
+            generation, status = fence
+            if status != "CONNECTED":
+                return None
+            if stored_generation is None and generation != 0:
+                return None
+            if stored_generation is not None and _generation(stored_generation) != generation:
+                return None
         envelope = item.get("envelope")
         if not isinstance(envelope, Mapping):
             raise RepositoryRecordError("stored token envelope is invalid")
@@ -341,6 +675,7 @@ class DynamoGmailRepository:
         user_id: str,
         records: Sequence[Mapping[str, object]],
         expires_at: int,
+        expected_generation: int | None = None,
     ) -> None:
         user_id = _identifier(user_id, "user_id")
         expires_at = self._derived_expiry(expires_at)
@@ -354,14 +689,24 @@ class DynamoGmailRepository:
         ids = [record["id"] for record in validated]
         if len(set(ids)) != len(ids):
             raise RepositoryRecordError("opportunity IDs must be unique")
-        self._table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": "GMAIL#OPPORTUNITIES",
-                "opportunities": _decimal_safe(validated),
-                "ttl": expires_at,
-            }
-        )
+        item = {
+            "PK": f"USER#{user_id}",
+            "SK": "GMAIL#OPPORTUNITIES",
+            "opportunities": _decimal_safe(validated),
+            "ttl": expires_at,
+        }
+        if expected_generation is not None:
+            expected_generation = _generation(expected_generation)
+            self.assert_generation(user_id, expected_generation, require_connected=True)
+            item["connectionGeneration"] = expected_generation
+        self._table.put_item(Item=item)
+        if expected_generation is not None:
+            self._post_write_guard(
+                user_id=user_id,
+                expected_generation=expected_generation,
+                key={"PK": f"USER#{user_id}", "SK": "GMAIL#OPPORTUNITIES"},
+                require_connected=True,
+            )
 
     def save_draft(
         self,
@@ -369,6 +714,7 @@ class DynamoGmailRepository:
         user_id: str,
         draft: DraftRevision,
         expires_at: int,
+        expected_generation: int | None = None,
     ) -> None:
         user_id = _identifier(user_id, "user_id")
         expires_at = self._derived_expiry(expires_at)
@@ -386,9 +732,15 @@ class DynamoGmailRepository:
             "body": draft.body,
             "payloadHash": draft.payload_hash,
         }
+        if expected_generation is not None:
+            expected_generation = _generation(expected_generation)
+            self.assert_generation(user_id, expected_generation, require_connected=True)
+        item = {**key, "draft": exact_draft, "ttl": expires_at}
+        if expected_generation is not None:
+            item["connectionGeneration"] = expected_generation
         try:
             self._table.put_item(
-                Item={**key, "draft": exact_draft, "ttl": expires_at},
+                Item=item,
                 ConditionExpression=(
                     "attribute_not_exists(PK) AND attribute_not_exists(SK)"
                 ),
@@ -400,7 +752,22 @@ class DynamoGmailRepository:
             response = self._table.get_item(Key=key, ConsistentRead=True)
             item = response.get("Item") if isinstance(response, Mapping) else None
             stored = item.get("draft") if isinstance(item, Mapping) else None
-            if isinstance(stored, Mapping) and dict(stored) == exact_draft:
+            stored_generation = item.get("connectionGeneration") if isinstance(item, Mapping) else None
+            if (
+                isinstance(stored, Mapping)
+                and dict(stored) == exact_draft
+                and (
+                    expected_generation is None
+                    or _generation(stored_generation) == expected_generation
+                )
+            ):
+                if expected_generation is not None:
+                    self._post_write_guard(
+                        user_id=user_id,
+                        expected_generation=expected_generation,
+                        key=key,
+                        require_connected=True,
+                    )
                 return
             if isinstance(stored, Mapping) or isinstance(
                 error, self._conditional_failure_types
@@ -409,3 +776,10 @@ class DynamoGmailRepository:
                     "draft revision already contains another payload"
                 ) from None
             raise
+        if expected_generation is not None:
+            self._post_write_guard(
+                user_id=user_id,
+                expected_generation=expected_generation,
+                key=key,
+                require_connected=True,
+            )

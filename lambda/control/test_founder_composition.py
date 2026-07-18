@@ -205,6 +205,10 @@ def test_production_without_founder_binding_keeps_all_pilots_read_only(
     assert application._approval_producer is None
     assert isinstance(application._card_actions, DynamoTelegramCardActions)
     assert isinstance(application._draft_preparer, ReadOnlyGmailDraftPreparer)
+    assert (
+        application._card_actions._connection_fence
+        is application._draft_preparer._repository
+    )
     assert secrets.reads == ["web-auth"]
 
 

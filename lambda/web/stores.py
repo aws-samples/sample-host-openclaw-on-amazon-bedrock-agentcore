@@ -435,7 +435,10 @@ class DynamoOAuthStateStore:
     @staticmethod
     def _record(record: object, expires_at: int) -> dict[str, object]:
         required = {"user_id", "redirect_uri", "code_verifier", "expires_at"}
-        if not isinstance(record, Mapping) or set(record) != required:
+        if not isinstance(record, Mapping) or set(record) not in {
+            frozenset(required),
+            frozenset({*required, "connection_generation"}),
+        }:
             raise ValueError("OAuth state record is invalid")
         user_id = _user(record["user_id"])
         redirect_uri = record["redirect_uri"]
@@ -460,13 +463,23 @@ class DynamoOAuthStateStore:
             expires_at
         ):
             raise ValueError("OAuth state expiry is invalid")
-        return {
+        result = {
             "userId": user_id,
             "redirectUri": redirect_uri,
             "codeVerifier": verifier,
             "expiresAt": expiry_text,
             "ttl": expires_at,
         }
+        if "connection_generation" in record:
+            generation = record["connection_generation"]
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 0
+            ):
+                raise ValueError("OAuth state generation is invalid")
+            result["connectionGeneration"] = generation
+        return result
 
     def put_once(self, key: str, record: Mapping, *, expires_at: int) -> None:
         key = _digest(key)
@@ -491,9 +504,12 @@ class DynamoOAuthStateStore:
             or item.get("SK") != "OAUTHSTATE"
         ):
             raise WebStoreError("OAuth state binding is corrupt")
-        return {
+        result = {
             "user_id": item.get("userId"),
             "redirect_uri": item.get("redirectUri"),
             "code_verifier": item.get("codeVerifier"),
             "expires_at": item.get("expiresAt"),
         }
+        if "connectionGeneration" in item:
+            result["connection_generation"] = item.get("connectionGeneration")
+        return result

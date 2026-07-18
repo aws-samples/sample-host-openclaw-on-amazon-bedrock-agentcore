@@ -39,6 +39,13 @@ _SCAN_STATES = frozenset({"RUNNING", "SUCCEEDED", "EMPTY", "FAILED"})
 _FAILURE_CODES = frozenset(
     {"AUTHORIZATION", "PROVIDER_UNAVAILABLE", "RANKING", "INTERNAL"}
 )
+_DISCONNECT_PREFIXES = ("GMAIL#DRAFT#", "TELEGRAM_CALLBACK#")
+_DISCONNECT_PAGE_SIZE = 25
+_DISCONNECT_MAX_PAGES = 40
+
+
+class ConnectionDisconnectPending(RuntimeError):
+    """A bounded disconnect purge made progress and requires another pass."""
 
 
 def _user_id(value: object) -> str:
@@ -120,14 +127,92 @@ class DynamoConnectionLifecycle:
 
     def status(self, user_id: str) -> str:
         user_id = _user_id(user_id)
+        connection_status = getattr(self._repository, "connection_status", None)
+        if callable(connection_status):
+            return connection_status(user_id)
         envelope = self._repository.get(
             user_id=user_id,
             provider=READONLY_PROVIDER,
         )
         return "DISCONNECTED" if envelope is None else "CONNECTED"
 
+    def _delete_exact(self, key: Mapping[str, str]) -> None:
+        try:
+            self._table.delete_item(Key=dict(key))
+        except Exception as error:
+            try:
+                response = self._table.get_item(Key=dict(key), ConsistentRead=True)
+            except Exception:
+                response = None
+            item = response.get("Item") if isinstance(response, Mapping) else None
+            if item is not None:
+                raise RuntimeError("connection purge outcome is uncertain") from error
+
+    def _purge_prefix(self, user_id: str, prefix: str) -> None:
+        start_key = None
+        for page_number in range(_DISCONNECT_MAX_PAGES):
+            request = {
+                "KeyConditionExpression": "PK = :pk AND begins_with(SK, :prefix)",
+                "ExpressionAttributeValues": {
+                    ":pk": f"USER#{user_id}",
+                    ":prefix": prefix,
+                },
+                "ConsistentRead": True,
+                "ScanIndexForward": True,
+                "Limit": _DISCONNECT_PAGE_SIZE,
+            }
+            if start_key is not None:
+                request["ExclusiveStartKey"] = start_key
+            response = self._table.query(**request)
+            items = response.get("Items") if isinstance(response, Mapping) else None
+            if not isinstance(items, list) or len(items) > _DISCONNECT_PAGE_SIZE:
+                raise RuntimeError("connection purge returned an invalid page")
+            for item in items:
+                if (
+                    not isinstance(item, Mapping)
+                    or item.get("PK") != f"USER#{user_id}"
+                    or not isinstance(item.get("SK"), str)
+                    or not item["SK"].startswith(prefix)
+                ):
+                    raise RuntimeError("connection purge crossed its namespace")
+                self._delete_exact({"PK": item["PK"], "SK": item["SK"]})
+            start_key = response.get("LastEvaluatedKey")
+            if start_key is None:
+                return
+            if (
+                not isinstance(start_key, Mapping)
+                or set(start_key) != {"PK", "SK"}
+                or start_key.get("PK") != f"USER#{user_id}"
+                or not isinstance(start_key.get("SK"), str)
+                or not start_key["SK"].startswith(prefix)
+            ):
+                raise RuntimeError("connection purge returned an invalid cursor")
+            if page_number == _DISCONNECT_MAX_PAGES - 1:
+                raise ConnectionDisconnectPending(
+                    "connection purge requires another bounded pass"
+                )
+
     def disconnect(self, user_id: str) -> str:
         user_id = _user_id(user_id)
+        begin_disconnect = getattr(self._repository, "begin_disconnect", None)
+        finish_disconnect = getattr(self._repository, "finish_disconnect", None)
+        if callable(begin_disconnect) and callable(finish_disconnect):
+            generation = begin_disconnect(user_id)
+            self._delete_exact(
+                {
+                    "PK": f"USER#{user_id}",
+                    "SK": f"CONNECTION#{READONLY_PROVIDER}",
+                }
+            )
+            self._delete_exact(
+                {"PK": f"USER#{user_id}", "SK": "GMAIL#OPPORTUNITIES"}
+            )
+            for prefix in _DISCONNECT_PREFIXES:
+                self._purge_prefix(user_id, prefix)
+            finish_disconnect(user_id, generation)
+            if self.status(user_id) != "DISCONNECTED":
+                raise RuntimeError("connection disconnect outcome is uncertain")
+            return "DISCONNECTED"
         key = {
             "PK": f"USER#{user_id}",
             "SK": f"CONNECTION#{READONLY_PROVIDER}",
