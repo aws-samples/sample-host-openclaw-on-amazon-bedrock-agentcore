@@ -151,6 +151,7 @@ required = {
     "schema", "sourceCommit", "account", "region", "runtimeId",
     "runtimeEndpointId", "runtimeEndpointName", "runtimeVersion",
     "runtimeArn", "runtimeImageUri",
+    "executionRoleArn", "runtimeConfiguration", "runtimeConfigurationSha256",
 }
 if not isinstance(value, dict) or set(value) != required:
     raise SystemExit("runtime context has the wrong fields")
