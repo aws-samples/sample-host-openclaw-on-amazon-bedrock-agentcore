@@ -164,6 +164,17 @@ class DraftRevision:
     def payload_hash(self) -> str:
         return canonical_args_hash(self.args)
 
+    # ActionProposalV1 (proposals.py): DraftRevision is the Gmail-send concrete
+    # instance of the connector-generic approvable-proposal contract. These are
+    # read-only views over the frozen stored shape; no persisted field changes.
+    @property
+    def capability(self) -> str:
+        return "gmail.send"
+
+    @property
+    def connection_ref(self) -> str:
+        return self.connection_id
+
 
 @dataclass(frozen=True, slots=True)
 class CapabilityGrant:
@@ -358,6 +369,31 @@ class EffectReceipt:
             "executedAt": self.executed_at.isoformat(),
             "labels": list(self.labels),
         }
+
+    # EffectReceiptV1 (receipts.py): EffectReceipt is the Gmail-send concrete
+    # instance of the connector-generic evidence contract. These are read-only
+    # views over the frozen stored shape; record()/from_record() are untouched.
+    @property
+    def capability(self) -> str:
+        return "gmail.send"
+
+    @property
+    def resource(self) -> str:
+        return gmail_resource(
+            connection_id=self.connection_id, account_email=self.account_email
+        )
+
+    @property
+    def connection_ref(self) -> str:
+        return self.connection_id
+
+    @property
+    def provider_effect_id(self) -> str:
+        return self.provider_message_id
+
+    @property
+    def evidence_labels(self) -> tuple[str, ...]:
+        return self.labels
 
 
 @dataclass(frozen=True, slots=True)

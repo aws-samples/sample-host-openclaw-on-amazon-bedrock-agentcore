@@ -30,6 +30,10 @@ class ReconciliationDeferred(RuntimeError):
 
 
 class GmailEffectReconciler:
+    # implements the reconcile surface of connectors.ConnectorAdapter (via
+    # connectors.GmailConnectorAdapter, which adapts the (action) shape to the
+    # reconcile(action_id=, user_id=) kwargs). Returns EffectReceipt | None,
+    # structurally satisfying receipts.EffectReceiptV1 | None.
     def __init__(
         self,
         *,

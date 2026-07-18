@@ -27,6 +27,7 @@ models = load("action_models", "models.py")
 machine_module = load("action_state_machine", "state_machine.py")
 send_module = load("action_gmail_send", "gmail_send.py")
 reconcile_module = load("action_reconcile", "reconcile.py")
+receipts_module = load("action_receipts", "receipts.py")
 NOW = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
 PROVIDER_TIME = NOW - timedelta(seconds=7)
 RESOURCE = "google:gmail:connection:google_conn_1234:account:founder@example.com"
@@ -219,6 +220,25 @@ def test_sends_exact_plain_text_once_and_receipt_uses_provider_execution_time():
 
     receipt = gateway.execute(record)
 
+    # The concrete receipt satisfies the connector-generic EffectReceiptV1 with
+    # no stored-shape change (record() keys are unchanged).
+    assert isinstance(receipt, receipts_module.EffectReceiptV1)
+    assert receipt.capability == "gmail.send"
+    assert receipt.connection_ref == "google_conn_1234"
+    assert receipt.provider_effect_id == receipt.provider_message_id
+    assert tuple(receipt.evidence_labels) == ("SENT",)
+    assert set(receipt.record()) == {
+        "providerMessageId",
+        "providerThreadId",
+        "messageId",
+        "connectionId",
+        "accountEmail",
+        "senderAddress",
+        "recipient",
+        "payloadHash",
+        "executedAt",
+        "labels",
+    }
     assert receipt.executed_at == PROVIDER_TIME
     assert receipt.labels == ("SENT",)
     assert len(provider.send_calls) == 1

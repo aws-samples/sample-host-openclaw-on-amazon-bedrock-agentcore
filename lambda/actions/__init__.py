@@ -23,6 +23,14 @@ from .repository import (
     TERMINAL_RETENTION_SECONDS,
 )
 from .state_machine import ApprovalService, ApprovalTokenCodec, ActionStateMachine
+from .proposals import ActionProposalV1, GenericActionProposalV1
+from .receipts import EffectReceiptV1
+from .connectors import (
+    ConnectorAdapter,
+    ConnectorContext,
+    GenericConnectorKernel,
+    GmailConnectorAdapter,
+)
 
 __all__ = [
     "ActionState",
@@ -47,4 +55,11 @@ __all__ = [
     "ActionMaintenanceRunner",
     "DynamoActionCursorStore",
     "DynamoActionPageSource",
+    "ActionProposalV1",
+    "GenericActionProposalV1",
+    "EffectReceiptV1",
+    "ConnectorAdapter",
+    "ConnectorContext",
+    "GenericConnectorKernel",
+    "GmailConnectorAdapter",
 ]

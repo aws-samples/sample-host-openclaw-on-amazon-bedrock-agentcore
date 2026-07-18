@@ -420,6 +420,9 @@ def _receipt_matches_action(receipt: EffectReceipt, action: Mapping[str, object]
 
 
 class GmailSendExecutor:
+    # implements the dispatch/reconcile surface of connectors.ConnectorAdapter
+    # (via connectors.GmailConnectorAdapter). execute() returns an
+    # EffectReceipt, which structurally satisfies receipts.EffectReceiptV1.
     def __init__(
         self,
         *,

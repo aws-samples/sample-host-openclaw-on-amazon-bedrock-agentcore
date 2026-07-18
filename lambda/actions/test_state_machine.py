@@ -24,7 +24,39 @@ def load(name, filename):
 models = load("action_models", "models.py")
 machine_module = load("action_state_machine", "state_machine.py")
 repository_module = load("action_repository", "repository.py")
+proposals_module = load("action_proposals", "proposals.py")
 NOW = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
+
+
+def test_draft_revision_satisfies_action_proposal_v1_without_stored_shape_change():
+    args = {"to": "a@example.net", "subject": "Hi", "body": "Exact"}
+    draft = models.DraftRevision(
+        action_id="action_12345678",
+        user_id="founder-1",
+        draft_revision=4,
+        connection_id="google_conn_1234",
+        account_email="founder@example.com",
+        sender_address="founder@example.com",
+        args=args,
+        created_at=NOW,
+    )
+    assert isinstance(draft, proposals_module.ActionProposalV1)
+    assert draft.capability == "gmail.send"
+    assert draft.connection_ref == "google_conn_1234"
+    assert draft.payload_hash == models.canonical_args_hash(args)
+    # The generic proposal computes the same canonical payload hash.
+    generic = proposals_module.GenericActionProposalV1(
+        action_id=draft.action_id,
+        user_id=draft.user_id,
+        draft_revision=draft.draft_revision,
+        capability="gmail.send",
+        resource=draft.resource,
+        connection_ref=draft.connection_ref,
+        args=args,
+        created_at=NOW,
+    )
+    assert isinstance(generic, proposals_module.ActionProposalV1)
+    assert generic.payload_hash == draft.payload_hash
 
 
 def test_canonical_payload_hash_is_order_independent_but_exact_value_sensitive():
