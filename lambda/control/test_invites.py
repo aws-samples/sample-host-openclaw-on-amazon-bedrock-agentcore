@@ -13,7 +13,7 @@ import sys
 from threading import Lock
 
 import pytest
-from botocore.exceptions import ClientError
+from tests.provider_test_support import ClientError
 
 from .invites import (
     DynamoPilotInvites,
@@ -32,6 +32,11 @@ def conditional_failure(operation: str) -> ClientError:
         },
         operation,
     )
+
+
+def test_invite_failures_use_the_real_botocore_client_error() -> None:
+    assert ClientError.__module__ == "botocore.exceptions"
+    assert issubclass(ClientError, Exception)
 
 
 def transaction_cancelled(

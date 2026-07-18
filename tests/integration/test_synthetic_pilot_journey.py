@@ -20,6 +20,8 @@ import zipfile
 
 import pytest
 
+from tests.provider_test_support import BaseClient, boto3
+
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "lambda"))
@@ -93,9 +95,7 @@ def external_call_sentinel(monkeypatch):
         sentinel.forbidden("https"),
     )
 
-    import boto3
     import requests
-    from botocore.client import BaseClient
     from control import composition as control_composition
     from router.runtime_driver import AgentCoreAdapter
     from web import composition as web_composition
