@@ -356,3 +356,30 @@ def test_browser_release_inputs_are_inside_the_literal_credential_scan(
     assert _scan_production_credentials(tmp_path) == [
         ("aws_access_key", "web/src/App.jsx", 1)
     ]
+
+
+def test_release_infrastructure_has_one_exact_immutable_runtime_subject() -> None:
+    stack = (ROOT / "stacks/agentcore_stack.py").read_text(encoding="utf-8")
+    deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+    release_cli = (ROOT / "release_tools/cli.py").read_text(encoding="utf-8")
+
+    assert stack.count("agentcore.CfnRuntime(") == 1
+    assert stack.count("agentcore.CfnRuntimeEndpoint(") == 1
+    assert 'repository_name="personal-operator/bridge"' in stack
+    assert 'image_tag_mutability="IMMUTABLE"' in stack
+    assert 'platform_id="Notation-OCI-SHA384-ECDSA"' in stack
+    assert 'name=expected_endpoint_name' in stack
+    assert "agentcore deploy" not in (deploy + release_cli).casefold()
+    assert "update-agent-runtime-endpoint" not in (deploy + release_cli)
+
+
+def test_shared_asset_declares_five_handlers_for_six_lambda_functions() -> None:
+    stack_sources = "\n".join(
+        (ROOT / relative).read_text(encoding="utf-8")
+        for relative in ("stacks/router_stack.py", "stacks/web_stack.py")
+    )
+    handlers = re.findall(r'handler="([a-z_]+\.index\.(?:handler|lambda_handler))"', stack_sources)
+
+    assert len(handlers) == 6
+    assert len(set(handlers)) == 5
+    assert handlers.count("web.index.lambda_handler") == 2

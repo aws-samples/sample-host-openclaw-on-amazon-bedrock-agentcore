@@ -1,9 +1,10 @@
-# Personal Operator v0 Release Evidence
+# Personal Operator v1 Release Evidence
 
 ## Verdict
 
-**NOT RELEASED / NOT DEPLOYABLE YET.** The repository now contains a locally
-verified **pre-production local
+**NOT RELEASED / NOT DEPLOYABLE YET.** Status:
+**staging deployment path implemented and locally verified; not deployed**.
+The repository remains a locally verified **pre-production local
 prototype**. This ledger records synthetic, credential-free development
 evidence from 2026-07-18. It is not evidence of an AWS deployment or of a real
 Telegram, Google, Gmail, OpenAI, or AgentCore interaction.
@@ -13,7 +14,6 @@ was connected. No Telegram or email message was sent.
 
 ## Verification identity
 
-- Branch: `codex/personal-operator-v0`
 - Evidence target: the clean Git commit containing this ledger. The immutable
   commit SHA is reported by the final handoff rather than embedded here, because
   a commit cannot contain its own hash.
@@ -43,13 +43,15 @@ Result on 2026-07-18: **passed**.
 | Gate | Result |
 |---|---|
 | Bridge and web lockfile installs with lifecycle scripts disabled | passed; zero reported npm vulnerabilities |
-| Python unit, security, and integration tests | 946 passed plus 10 subtests |
+| Python unit, security, and integration tests | 1,039 passed plus 10 subtests |
 | Local end-to-end session-control tests | 11 passed |
 | Serialized bridge/runtime Node tests | 313 passed |
 | Web UI tests | 5 passed |
 | Web production build | passed |
 | JavaScript syntax | passed |
 | Python compilation | passed |
+| Strict release contracts, ECR/AgentCore adapters, journal, and CLI tests | passed with injected fakes only |
+| Deterministic trusted Lambda ZIP double-build in pure Python | byte-identical; Docker import gate open |
 | Repository whitespace/diff contract | passed |
 | Hermetic offline CDK synthesis contract | passed |
 | CDK cdk-nag contract | passed with zero findings |
@@ -79,7 +81,12 @@ The suite includes the following hostile cases:
   one confirmed receipt, bounded export, and deletion without real providers;
 - production source and browser inputs contain no detected high-confidence
   literal AWS, GitHub, Slack, OpenAI, Google, Telegram, or private-key secret;
-- active observability templates do not enable model payload logging.
+- active observability templates do not enable model payload logging;
+- staging transaction failures are write-ahead `UNCERTAIN`, cannot skip a
+  phase, require explicit reconciliation, and cannot retarget a retained
+  release endpoint;
+- the shared trusted asset covers five unique handler modules across six Lambda functions;
+  the web handler intentionally serves both web and maintenance.
 
 ## Dependency and license inventory
 
@@ -97,53 +104,57 @@ absolute path.
 - Python records: 43
 - license `NOASSERTION`: 43, all Python records
 - `personal-operator.cdx.json` SHA-256:
-  `cf269119ede9e2efbd4335b4639ddada655376285e2ba1901515cd3da746d27a`
+  `d659119fba053a6e0bc2b433b097c66205f52dd419bc281feca190ec2644b621`
 - `dependency-licenses.csv` SHA-256:
-  `74225f6590d5a7aac1b7e8c14d0420890502efbb201a7d0fb86ca824d10bc632`
+  `2fa2efb09245e447cf2145d74011422109e6dc5fd54293039b3a3390f494b656`
 
-This is a source/lock inventory, not a final image SBOM. It covers the
-hash-locked Lambda Python dependency tree and npm lock records. It does not
-prove the built Lambda asset, base-image packages, or the OpenClaw pnpm graph.
+This is a source/lock inventory, not a final runtime-image SBOM. It covers the
+hash-locked Lambda Python dependency tree and npm lock records. The separate v2
+Lambda manifest locally binds deterministic ZIP bytes to commit/tree, builder
+digest and ID, requirements, platform, inventories, byte counts, and archive
+SHA-256. Docker-backed Python 3.13/ARM64 import proof and runtime base-image/
+OpenClaw pnpm attestation remain open.
 
-## Release blockers
+## Release blockers and external gates
 
-1. **Runtime provisioning is intentionally absent.** `scripts/deploy.sh --full`
-   and `--runtime-only` fail before credentials or cloud calls. An immutable
-   AgentCore runtime/version/endpoint must be provisioned by a reviewed,
-   reproducible path before the CDK stack can bind it.
-2. **No Lambda deployment bundle proof.** The trusted Python 3.13/ARM64 asset
-   must be built with the reviewed digest-pinned Lambda image and its provider
-   imports verified with networking disabled. Docker is not installed on this
-   host, so the release-asset gate could not run.
-3. **No image build, scan, SBOM, signature, push, or immutable ECR digest.** The
-   bridge Dockerfile and pins are locally tested, but no container artifact has
-   been produced or attested.
-4. **No exact runtime-context v3 artifact.** The release gate correctly rejects
-   placeholder runtime ARN, version, release endpoint, image digest, account,
-   or commit bindings.
-5. **No cloud staging evidence.** AWS CLI and CDK CLI are absent, and no account
-   was authorized. Synthesized IAM, AgentCore, S3/KMS, DynamoDB, SQS,
-   CloudFront, API Gateway, WAF, alarms, retention, backup, and recovery
-   behavior remain unverified in AWS.
-6. **No provider evidence.** Telegram, Google OAuth/Gmail, and OpenAI credentials
-   were intentionally absent. Provider scopes, callbacks, receipts,
-   idempotency, and reconciliation are proven only against injected fakes.
-7. **No deployed lifecycle SLA.** Local tests cover 14/30/90-day lifecycle
-   semantics, permanent identity anti-recreation markers, hourly reconciliation,
-   and the 30-minute deletion drain, but do not prove a deployed schedule or a
-   completion time.
-8. **No performance or usefulness acceptance.** Cold start, runtime replacement,
-   concurrent-user behavior, cost, and moderated-pilot usefulness have not been
-   measured in staging.
-9. **No real-effect authorization.** A founder identity, exact provider account,
-   allowlisted recipient, payload hash, fresh approval, and separate human gate
-   are required before any Gmail effect.
+Every external gate remains open. “Implemented” below refers only to reviewed
+code and local fake/offline evidence.
+
+| Gate | State | Evidence still required |
+|---|---|---|
+| OPEN — runtime image push | open | exact commit-tagged digest in retained `personal-operator/bridge` |
+| OPEN — managed signing | open | one completed Notation OCI signature from the retained profile |
+| OPEN — authoritative image scan | open | completed scan with zero unreviewed high/critical findings plus SBOM and provenance referrers |
+| OPEN — CloudFormation change-set execution | open | separately reviewed exact-account changesets and human execution record |
+| OPEN — AgentCore runtime readiness | open | exact READY runtime/version/image/role/storage evidence |
+| OPEN — consumer application | open | reviewed consumer changesets applied to the exact RuntimeContextV3 |
+| OPEN — moderated pilot | open | synthetic staging journey, performance/cost results, then separate pilot authorization |
+
+Additional blockers:
+
+1. Docker was unavailable on this host. The exact Lambda Python 3.13/ARM64
+   double-build and network-disabled imports for five unique handlers remain
+   unproven, even though independent pure-Python ZIP builds were byte-identical.
+2. No runtime image, final image SBOM/provenance, signature, scan result, or
+   immutable ECR digest exists. No image was pushed.
+3. No authoritative runtime-context v3 artifact exists. Local tests only prove
+   strict rejection and injected READY evidence behavior.
+4. No AWS account was authorized and no CloudFormation change set was created
+   or executed. IAM, storage, alarms, retention, backup, and recovery behavior
+   remain template evidence only.
+5. Telegram, Google OAuth/Gmail, and OpenAI credentials were absent. Provider
+   scopes, callbacks, receipts, idempotency, and reconciliation use fakes.
+6. Local tests cover lifecycle semantics and deletion drains but establish no
+   deployed completion SLA.
+7. A founder identity, exact provider account, allowlisted recipient, payload
+   hash, fresh approval, and separate human gate remain mandatory before any
+   Gmail effect.
 
 ## What the local result means
 
 The local result establishes that the repository's deterministic contracts,
 state machines, privacy boundaries, static infrastructure, synthetic flows,
-and failure behavior agree with the v0 plan on this host. It does not establish
+and failure behavior agree with the approved plan on this host. It does not establish
 that AWS or any external provider behaves as the fakes and templates predict.
 
 The next authorized milestone is a dedicated non-production staging audit using

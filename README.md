@@ -35,12 +35,13 @@ Active observability uses aggregate AWS service metrics and alarms only. It
 does not enable model invocation text or image payload logging, and the
 archived legacy token-monitoring stack is not active.
 
-This is not deployment evidence. The Lambda dependency image and OpenClaw
-runtime image have not been built or scanned on this machine, no AWS stack has
-been deployed, and no Telegram, Google, OpenAI, or Gmail credential or real
-message was used. Direct immutable AgentCore runtime provisioning is not yet
-implemented, so `scripts/deploy.sh --full` and `--runtime-only` deliberately
-fail before any cloud call. The remaining gates are recorded in
+This is not deployment evidence. The deterministic release contracts, retained
+ECR/signing template, direct immutable AgentCore Runtime/Endpoint L1s, and
+write-ahead phase CLI are implemented and locally verified only. The Docker
+Lambda import gate and every AWS image, signing, scan, change-set, readiness,
+consumer, and pilot gate remain open. No AWS stack has been deployed, and no
+Telegram, Google, OpenAI, or Gmail credential or real message was used. The
+remaining gates are recorded in
 [docs/RELEASE-EVIDENCE.md](docs/RELEASE-EVIDENCE.md).
 
 The implementation proceeds in reviewed tasks described by the approved
@@ -139,10 +140,10 @@ Run the complete local baseline:
 ./scripts/test-local.sh
 ```
 
-The local script runs the Python unit, security, integration, replay, and
-synthetic-journey suites; serialized runtime Node tests; web tests and a
-production build; JavaScript/Python syntax checks; repository whitespace
-checks; and offline CDK/cdk-nag synthesis using a synthetic account number. It
+The local script runs the Python unit, release-foundation, security,
+integration, replay, and synthetic-journey suites; serialized runtime Node
+tests; web tests and a production build; JavaScript/Python syntax checks;
+repository whitespace checks; and offline CDK/cdk-nag synthesis using a synthetic account number. It
 never deploys or requires cloud credentials. Cloud-specific behavior remains
 provisional until a later credentialed staging gate.
 
@@ -196,6 +197,7 @@ lambda/actions/         Approval, effect, and reconciliation state machines
 lambda/web/             Browser auth, approval, export, retention, deletion
 web/                    React/Vite consumer control surface
 stacks/                 CDK infrastructure and exact IAM boundaries
+release_tools/          Strict artifacts, evidence adapters, journal, and CLI
 tests/                  Unit, security, replay, and synthetic journey contracts
 scripts/test-local.sh   Credential-free aggregate local gate
 scripts/test-release-assets.sh

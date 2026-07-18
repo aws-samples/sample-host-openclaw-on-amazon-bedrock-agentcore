@@ -471,6 +471,9 @@ def test_app_and_deploy_path_require_the_trusted_asset_for_real_stacks() -> None
     )
     web_source = (ROOT / "stacks" / "web_stack.py").read_text(encoding="utf-8")
     deploy_source = (ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    release_gate_source = (ROOT / "scripts" / "test-release-assets.sh").read_text(
+        encoding="utf-8"
+    )
 
     assert "resolve_trusted_lambda_asset_metadata(" in app_source
     assert app_source.count("trusted_code_asset_root=trusted_lambda_asset.path") == 2
@@ -479,10 +482,11 @@ def test_app_and_deploy_path_require_the_trusted_asset_for_real_stacks() -> None
     for source in (router_source, web_source):
         assert "asset_hash=trusted_code_asset_hash" in source
         assert "asset_hash_type=AssetHashType.CUSTOM" in source
-    build = '"$PROJECT_DIR/scripts/build-trusted-lambda-asset.sh" build'
-    verify = '"$PROJECT_DIR/scripts/build-trusted-lambda-asset.sh" verify'
-    deploy = "cdk deploy"
-    assert build in deploy_source and verify in deploy_source
-    assert deploy_source.index(build) < deploy_source.index(deploy)
-    assert deploy_source.index(verify) < deploy_source.index(deploy)
-    assert "PersonalOperatorWeb" in deploy_source
+    build = '"${REPO_ROOT}/scripts/build-trusted-lambda-asset.sh" build'
+    verify = '"${REPO_ROOT}/scripts/build-trusted-lambda-asset.sh" verify'
+    assert build in release_gate_source and verify in release_gate_source
+    assert release_gate_source.index(build) < release_gate_source.index("app.py")
+    assert release_gate_source.index(verify) < release_gate_source.index("app.py")
+    assert "cdk deploy" not in release_gate_source
+    assert '"${SCRIPT_DIR}/staging-release.py" "$@"' in deploy_source
+    assert "PersonalOperatorWeb" in app_source

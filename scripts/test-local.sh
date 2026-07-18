@@ -47,6 +47,7 @@ run_check "Python unit tests" \
   PYTHONPATH="$ROOT_DIR/lambda/router:$ROOT_DIR/lambda" \
   "$PYTHON" -m pytest lambda/router lambda/worker lambda/workflows \
   lambda/actions lambda/control lambda/web lambda/cron lambda/workspace_broker \
+  release_tools \
   tests/test_product_configuration.py \
   tests/test_telegram_queue_infrastructure.py \
   tests/test_deploy_safety.py \
@@ -73,7 +74,7 @@ run_check "JavaScript syntax" \
   bash -c 'while IFS= read -r file; do node --check "$file" || exit 1; done < <(find bridge -type f -name "*.js" -not -path "*/node_modules/*" | sort)'
 
 run_check "Python syntax" \
-  "$PYTHON" -m compileall -q app.py stacks lambda scripts tests
+  "$PYTHON" -m compileall -q app.py stacks lambda release_tools scripts tests
 
 run_check "Repository whitespace contract" \
   git diff --check
