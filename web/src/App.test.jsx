@@ -1,6 +1,9 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+
+const styles = readFileSync("src/styles.css", "utf8");
 
 function response(payload, { status = 200, contentType = "application/json" } = {}) {
   return Promise.resolve({
@@ -12,17 +15,72 @@ function response(payload, { status = 200, contentType = "application/json" } = 
   });
 }
 
+function overview(overrides = {}) {
+  return {
+    version: "personal-operator.pilot-overview.v1",
+    externalEffects: false,
+    connection: {
+      provider: "google-gmail-readonly",
+      status: "CONNECTED",
+      access: "READ_ONLY",
+    },
+    lastScan: {
+      scanId: `scan_00000000001700000000_${"s".repeat(32)}`,
+      status: "SUCCEEDED",
+      startedAt: 1700000000,
+      completedAt: 1700000012,
+      resultCount: 2,
+      failureCode: null,
+      feedback: null,
+    },
+    workspace: {
+      runtimeState: "IDLE",
+      workspaceReceipt: {
+        generation: "gen_1234567890abcdef",
+        manifestSha256: "a".repeat(64),
+      },
+      fileCount: 2,
+      opportunityCount: 2,
+      draftCount: 1,
+    },
+    capability: {
+      provider: "google-gmail-readonly",
+      mode: "READ_ONLY",
+      externalEffects: false,
+    },
+    export: {
+      format: "ZIP",
+      encrypted: false,
+      deterministic: true,
+      includes: ["memory", "receipts", "schedules", "workspace"],
+    },
+    deletion: { status: "AVAILABLE", minimumReconciliationMinutes: 30 },
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   sessionStorage.clear();
   vi.stubGlobal("fetch", vi.fn());
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe("consumer control surface", () => {
   it("bootstraps a one-time Telegram ticket and keeps CSRF only in session storage", async () => {
     history.replaceState({}, "", "/?ticket=one-time-ticket");
-    fetch.mockReturnValue(response({ csrfToken: "x".repeat(43), expiresAt: 123 }));
+    fetch
+      .mockReturnValueOnce(response({
+        csrfToken: "x".repeat(43), expiresAt: 123, returnPath: "/connections",
+      }))
+      .mockReturnValueOnce(response(overview({
+        connection: {
+          provider: "google-gmail-readonly", status: "DISCONNECTED", access: "READ_ONLY",
+        },
+      })));
     render(<App />);
     expect(screen.getByRole("status")).toHaveTextContent("Loading");
     await screen.findByRole("heading", { name: "Gmail" });
@@ -32,6 +90,79 @@ describe("consumer control surface", () => {
     );
     expect(sessionStorage.getItem("personal-operator.csrf")).toBe("x".repeat(43));
     expect(localStorage.length).toBe(0);
+    expect(location.pathname).toBe("/connections");
+  });
+
+  it("renders the read-only overview, runtime receipt, mobile navigation, and feedback", async () => {
+    history.replaceState({}, "", "/");
+    sessionStorage.setItem("personal-operator.csrf", "c".repeat(43));
+    fetch
+      .mockReturnValueOnce(response(overview()))
+      .mockReturnValueOnce(response({
+        scanId: `scan_00000000001700000000_${"s".repeat(32)}`,
+        feedback: "USEFUL",
+      }));
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: /read-only operator/i })).toBeInTheDocument();
+    expect(screen.getByText(/External effects off/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 follow-ups/i)).toBeInTheDocument();
+    expect(screen.getByText(/Runtime IDLE/i)).toBeInTheDocument();
+    expect(screen.getByText(/gen_1234567890abcdef/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /send|approve/i })).not.toBeInTheDocument();
+    const navigation = screen.getByRole("navigation", { name: "Primary" });
+    for (const name of ["Overview", "Connections", "Workspace", "Export", "Delete"]) {
+      expect(navigation).toHaveTextContent(name);
+    }
+
+    fireEvent.click(screen.getByRole("button", { name: "Useful" }));
+    await screen.findByText(/Feedback recorded: useful/i);
+    expect(fetch.mock.calls[1][0]).toContain("/api/scans/scan_");
+    expect(JSON.parse(fetch.mock.calls[1][1].body)).toEqual({ response: "USEFUL" });
+    expect(fetch.mock.calls[1][1].headers["X-PO-CSRF"]).toBe("c".repeat(43));
+  });
+
+  it("keeps primary navigation reachable at the mobile breakpoint", () => {
+    expect(styles).not.toContain(".nav-links { display: none; }");
+    expect(styles).toContain("overflow-x: auto");
+    expect(styles).toContain(".overview-grid { grid-template-columns: 1fr; }");
+  });
+
+  it("shows reconnect state and disconnects a connected account without provider content", async () => {
+    history.replaceState({}, "", "/connections");
+    sessionStorage.setItem("personal-operator.csrf", "c".repeat(43));
+    fetch.mockReturnValueOnce(response(overview({
+      connection: {
+        provider: "google-gmail-readonly", status: "REAUTH_REQUIRED", access: "READ_ONLY",
+      },
+    })));
+    const first = render(<App />);
+    expect(await screen.findByRole("link", { name: /Reconnect Gmail/i })).toBeInTheDocument();
+    first.unmount();
+
+    fetch
+      .mockReturnValueOnce(response(overview()))
+      .mockReturnValueOnce(response({
+        provider: "google-gmail-readonly", status: "DISCONNECTED",
+      }));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Disconnect Gmail/i }));
+    await screen.findByRole("link", { name: /Connect read-only Gmail/i });
+    expect(fetch.mock.calls.at(-1)[0]).toBe(
+      "/api/connections/google-gmail-readonly/disconnect",
+    );
+    expect(fetch.mock.calls.at(-1)[1].headers["X-PO-CSRF"]).toBe("c".repeat(43));
+  });
+
+  it("fails closed if the pilot overview ever enables external effects", async () => {
+    history.replaceState({}, "", "/");
+    fetch.mockReturnValue(response(overview({ externalEffects: true })));
+
+    render(<App />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/read-only boundary/i);
+    expect(screen.queryByRole("button", { name: /send|approve/i })).not.toBeInTheDocument();
   });
 
   it("renders exact approval data and sends a CSRF-protected decision only on click", async () => {
@@ -112,7 +243,10 @@ describe("consumer control surface", () => {
     render(<App />);
 
     expect(await screen.findByDisplayValue("Following up")).toBeInTheDocument();
-    expect(screen.getByText("ada@example.com")).toBeInTheDocument();
+    expect(screen.getAllByText("ada@example.com")).toHaveLength(2);
+    expect(screen.getByRole("link", { name: /Open source in Gmail/i })).toHaveAttribute(
+      "href", "https://mail.google.com/mail/u/0/#inbox/thread-1",
+    );
     expect(screen.queryByRole("button", { name: /send/i })).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Subject"), { target: { value: "Updated subject" } });
     fireEvent.change(screen.getByLabelText("Body"), { target: { value: "Updated body" } });
@@ -132,7 +266,7 @@ describe("consumer control surface", () => {
     history.replaceState({}, "", "/delete");
     render(<App />);
     expect(screen.getByText(/active application data is removed in two passes/i)).toBeInTheDocument();
-    expect(screen.getByText(/7-day recovery window/i)).toBeInTheDocument();
+    expect(screen.getByText(/minimum 30-minute reconciliation/i)).toBeInTheDocument();
     expect(screen.getByText(/Google Account settings/i)).toBeInTheDocument();
     const button = screen.getByRole("button", { name: "Start permanent deletion" });
     expect(button).toBeDisabled();
@@ -141,5 +275,32 @@ describe("consumer control surface", () => {
     fetch.mockReturnValue(response({ error: "not now" }, { status: 409 }));
     fireEvent.click(button);
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+  });
+
+  it("describes the deterministic export truthfully as an unencrypted ZIP", () => {
+    history.replaceState({}, "", "/export");
+
+    render(<App />);
+
+    expect(screen.getByText(/deterministic, unencrypted ZIP/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Create unencrypted ZIP/i })).toBeInTheDocument();
+    expect(screen.queryByText(/encrypted-ready/i)).not.toBeInTheDocument();
+  });
+
+  it("logs out only the current browser session and clears the in-memory CSRF handle", async () => {
+    history.replaceState({}, "", "/");
+    sessionStorage.setItem("personal-operator.csrf", "c".repeat(43));
+    fetch
+      .mockReturnValueOnce(response(overview()))
+      .mockReturnValueOnce(response({}, { status: 204 }));
+    render(<App />);
+    await screen.findByRole("heading", { name: /read-only operator/i });
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    await screen.findByText("Signed out");
+    expect(sessionStorage.getItem("personal-operator.csrf")).toBeNull();
+    expect(fetch.mock.calls.at(-1)[0]).toBe("/api/session/logout");
+    expect(fetch.mock.calls.at(-1)[1].headers["X-PO-CSRF"]).toBe("c".repeat(43));
   });
 });

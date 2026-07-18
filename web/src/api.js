@@ -11,6 +11,10 @@ export function rememberCsrf(value) {
   sessionStorage.setItem(CSRF_KEY, value);
 }
 
+export function forgetCsrf() {
+  sessionStorage.removeItem(CSRF_KEY);
+}
+
 export async function api(path, { method = "GET", body, csrf = false } = {}) {
   const headers = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
