@@ -291,11 +291,15 @@ class WebApplication:
                 body = _json_body(event)
                 if set(body) != {"ticket"}:
                     raise ValueError("connect request fields are invalid")
-                existing = (
-                    self._identity(headers)
-                    if headers.get("cookie") is not None
-                    else None
-                )
+                existing = None
+                if headers.get("cookie") is not None:
+                    try:
+                        existing = self._identity(headers)
+                    except AuthenticationError:
+                        # A dead incumbent cookie must not strand a valid
+                        # one-time Telegram ticket. Storage failures are not
+                        # AuthenticationError and remain retryable failures.
+                        existing = None
                 redemption = self._tickets.consume(
                     body["ticket"],
                     expected_user_id=(

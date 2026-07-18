@@ -4,6 +4,8 @@ import base64
 import json
 from urllib.parse import urlencode
 
+import pytest
+
 from .auth import OpaqueSessionManager, SignedConnectTickets
 from .index import WebApplication
 from .test_auth import Clock, DeterministicRandom, OneTimeStore, SessionStore
@@ -257,6 +259,61 @@ def test_connect_ticket_cannot_replace_a_different_users_live_session():
     )
     assert retried["statusCode"] == 201
     assert json.loads(retried["body"])["returnPath"] == "/delete"
+
+
+@pytest.mark.parametrize("stale_kind", ["expired", "revoked"])
+def test_connect_ticket_recovers_from_an_expired_or_revoked_cookie(stale_kind):
+    app, tickets, *_ = setup_app()
+    stale_cookie, _ = bootstrap(app, tickets)
+    if stale_kind == "expired":
+        app._sessions._now.value += 86_401
+    else:
+        app._sessions.revoke(cookie_header=stale_cookie)
+    token = tickets.issue(user_id="user_recovered", return_path="/workspace")
+
+    response = app.handle(
+        event(
+            "POST",
+            "/api/session/connect",
+            body={"ticket": token},
+            cookie=stale_cookie,
+        )
+    )
+
+    assert response["statusCode"] == 201
+    replacement = response["headers"]["Set-Cookie"]
+    assert replacement != stale_cookie
+    assert json.loads(response["body"])["returnPath"] == "/workspace"
+    assert app._sessions.authenticate(cookie_header=replacement).user_id == (
+        "user_recovered"
+    )
+
+
+def test_connect_ticket_preserves_store_outages_and_is_not_consumed():
+    app, tickets, *_ = setup_app()
+    incumbent_cookie, _ = bootstrap(app, tickets)
+    token = tickets.issue(user_id=USER, return_path="/export")
+    original_get = app._sessions._store.get
+    app._sessions._store.get = lambda _key: (_ for _ in ()).throw(
+        RuntimeError("store unavailable")
+    )
+
+    failed = app.handle(
+        event(
+            "POST",
+            "/api/session/connect",
+            body={"ticket": token},
+            cookie=incumbent_cookie,
+        )
+    )
+
+    assert failed["statusCode"] == 409
+    app._sessions._store.get = original_get
+    retried = app.handle(
+        event("POST", "/api/session/connect", body={"ticket": token})
+    )
+    assert retried["statusCode"] == 201
+    assert json.loads(retried["body"])["returnPath"] == "/export"
 
 
 def test_legacy_v1_connect_ticket_drain_returns_only_to_connections():
