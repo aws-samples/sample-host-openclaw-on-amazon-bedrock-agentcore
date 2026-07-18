@@ -9,7 +9,12 @@ import re
 from copy import deepcopy
 from typing import Any, Mapping
 
-from product_commands import parse_product_command
+try:
+    from .event_identity import assert_event_trace
+    from .product_commands import parse_product_command
+except ImportError:  # direct Lambda asset and focused tests
+    from event_identity import assert_event_trace
+    from product_commands import parse_product_command
 
 
 MAX_ENVELOPE_BYTES = 128 * 1024
@@ -20,7 +25,6 @@ MAX_JSON_COLLECTION_ITEMS = 64
 _WIRE_KEYS = ("userId", "channel", "updateId", "traceId", "kind", "payload")
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
 _UPDATE_ID = re.compile(r"[0-9]{1,20}")
-_TRACE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}")
 _CHAT_ID = re.compile(r"-?[0-9]{1,20}")
 _ACTOR_ID = re.compile(r"telegram:[0-9]{1,20}")
 _S3_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_/-]{1,1023}(?:\.[A-Za-z0-9]{1,16})?")
@@ -156,6 +160,7 @@ class QueueEnvelope:
         "kind",
         "_json",
         "_dedupe_id",
+        "_request_sha256",
         "_sealed",
     )
 
@@ -175,7 +180,15 @@ class QueueEnvelope:
             raise EnvelopeValidationError("unsupported queue channel")
         self.channel = channel
         self.update_id = _require_string("update ID", update_id, _UPDATE_ID)
-        self.trace_id = _require_string("trace ID", trace_id, _TRACE_ID)
+        try:
+            self.trace_id = assert_event_trace(
+                trace_id,
+                channel=self.channel,
+                user_id=self.user_id,
+                platform_event_id=self.update_id,
+            )
+        except ValueError as error:
+            raise EnvelopeValidationError(str(error)) from error
         if kind not in {"command", "message"}:
             raise EnvelopeValidationError("unsupported message kind")
         self.kind = kind
@@ -210,8 +223,10 @@ class QueueEnvelope:
             sort_keys=True,
             allow_nan=False,
         )
-        self._dedupe_id = hashlib.sha256(
-            b"personal-operator-telegram-content-v1\0" + stable_content.encode("utf-8")
+        self._dedupe_id = self.trace_id
+        self._request_sha256 = hashlib.sha256(
+            b"personal-operator-telegram-envelope-v1\0"
+            + stable_content.encode("utf-8")
         ).hexdigest()
         object.__setattr__(self, "_sealed", True)
 
@@ -231,6 +246,12 @@ class QueueEnvelope:
     @property
     def message_deduplication_id(self) -> str:
         return self._dedupe_id
+
+    @property
+    def request_sha256(self) -> str:
+        """Digest used by the ledger to reject same-event content collisions."""
+
+        return self._request_sha256
 
     def to_wire(self) -> dict[str, Any]:
         return json.loads(self._json)

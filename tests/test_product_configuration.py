@@ -799,14 +799,15 @@ def _synth_router_template(
     return Template.from_stack(stack).to_json()
 
 
-def test_router_separates_invocation_arn_from_iam_runtime_resource() -> None:
+def test_worker_separates_invocation_arn_from_iam_runtime_resource() -> None:
     template = _synth_router_template()
     resources = template["Resources"].values()
-    router = next(
+    worker = next(
         resource
         for resource in resources
         if resource["Type"] == "AWS::Lambda::Function"
-        and resource["Properties"].get("FunctionName") == "openclaw-router"
+        and resource["Properties"].get("FunctionName")
+        == "personal-operator-telegram-worker"
     )
     policies = [
         statement
@@ -825,10 +826,10 @@ def test_router_separates_invocation_arn_from_iam_runtime_resource() -> None:
         )
     )
 
-    assert router["Properties"]["Environment"]["Variables"][
+    assert worker["Properties"]["Environment"]["Variables"][
         "AGENTCORE_RUNTIME_ARN"
     ] == TEST_RUNTIME_ARN
-    assert router["Properties"]["Environment"]["Variables"][
+    assert worker["Properties"]["Environment"]["Variables"][
         "AGENTCORE_QUALIFIER"
     ] == TEST_RUNTIME_ENDPOINT_NAME
     assert invocation["Resource"] == [

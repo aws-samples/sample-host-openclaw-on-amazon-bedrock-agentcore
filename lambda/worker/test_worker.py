@@ -18,7 +18,9 @@ worker = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = worker
 spec.loader.exec_module(worker)
 
-from message_queue import QueueEnvelope  # noqa: E402
+from event_identity import derive_event_trace  # noqa: E402
+
+QueueEnvelope = worker.QueueEnvelope
 
 
 class FakeRuntimeDriver:
@@ -55,29 +57,70 @@ class FakeDelivery:
 
 @dataclass
 class Record:
+    request_sha256: str
+    state: str = "PROCESSING"
     result: str | None = None
-    delivered: bool = False
+
+
+@dataclass
+class Claim:
+    key: str
+    state: str
+    result: str | None = None
 
 
 class FakeLedger:
     def __init__(self):
         self.records = {}
+        self.fail_complete = False
+        self.fail_confirm = False
 
-    def get_result(self, key):
-        return self.records.get(key, Record()).result
+    def claim_processing(self, envelope, *, owner):
+        del owner
+        key = envelope.message_deduplication_id
+        record = self.records.get(key)
+        if record is None:
+            record = Record(request_sha256=envelope.request_sha256)
+            self.records[key] = record
+            return Claim(key, "CLAIMED")
+        if record.request_sha256 != envelope.request_sha256:
+            raise worker.WorkerContractError("same event identity has different content")
+        return Claim(key, record.state, record.result)
 
-    def put_result_if_absent(self, key, result):
-        record = self.records.setdefault(key, Record())
-        if record.result is None:
-            record.result = result
-        return record.result
+    def complete_result(self, claim, result):
+        if self.fail_complete:
+            raise RuntimeError("synthetic result persistence ambiguity")
+        record = self.records[claim.key]
+        assert record.state == "PROCESSING"
+        record.state = "RESULT_READY"
+        record.result = result
+        return Claim(claim.key, "RESULT_READY", result)
 
-    def is_delivered(self, key):
-        return self.records.get(key, Record()).delivered
+    def mark_processing_uncertain(self, claim, *, error_type):
+        del error_type
+        record = self.records[claim.key]
+        if record.state == "PROCESSING":
+            record.state = "PROCESSING_UNCERTAIN"
 
-    def mark_delivered(self, key, receipt):
+    def begin_delivery(self, claim, *, owner):
+        del owner
+        record = self.records[claim.key]
+        if record.state == "RESULT_READY":
+            record.state = "DELIVERY_IN_FLIGHT"
+            return Claim(claim.key, "DELIVERY_CLAIMED", record.result)
+        return Claim(claim.key, record.state, record.result)
+
+    def confirm_delivery(self, claim, receipt):
         assert receipt["providerMessageId"].startswith("tg-")
-        self.records.setdefault(key, Record()).delivered = True
+        if self.fail_confirm:
+            raise RuntimeError("synthetic delivery receipt persistence ambiguity")
+        self.records[claim.key].state = "DELIVERED"
+
+    def mark_delivery_uncertain(self, claim, *, error_type):
+        del error_type
+        record = self.records[claim.key]
+        if record.state == "DELIVERY_IN_FLIGHT":
+            record.state = "DELIVERY_UNCERTAIN"
 
 
 def dependencies(*, runtime=None, commands=None, delivery=None, ledger=None):
@@ -89,7 +132,13 @@ def dependencies(*, runtime=None, commands=None, delivery=None, ledger=None):
     )
 
 
-def make_envelope(*, update_id="100", trace_id="trace_100", kind="message", payload=None):
+def make_envelope(
+    *,
+    update_id="100",
+    trace_id=None,
+    kind="message",
+    payload=None,
+):
     if payload is None:
         payload = {
             "chatId": "9001",
@@ -100,7 +149,7 @@ def make_envelope(*, update_id="100", trace_id="trace_100", kind="message", payl
         user_id="user_a1",
         channel="telegram",
         update_id=update_id,
-        trace_id=trace_id,
+        trace_id=trace_id or derive_event_trace("telegram", "user_a1", update_id),
         kind=kind,
         payload=payload,
     )
@@ -135,9 +184,8 @@ def test_free_form_input_invokes_runtime_with_minimal_secret_free_request():
     assert len(runtime.calls) == 1
     user_id, request, trace_id = runtime.calls[0]
     assert user_id == "user_a1"
-    assert trace_id == "trace_100"
-    assert set(request) == {"channel", "actorId", "message", "invocationId"}
-    assert request["invocationId"] == item.message_deduplication_id
+    assert trace_id == derive_event_trace("telegram", "user_a1", "100")
+    assert set(request) == {"channel", "actorId", "message"}
     serialized = json.dumps(request).lower()
     assert "token" not in serialized
     assert "credential" not in serialized
@@ -181,7 +229,7 @@ def test_successful_duplicate_replay_does_not_repeat_runtime_or_delivery():
     assert len(delivery.calls) == 1
 
 
-def test_delivery_retry_uses_cached_runtime_result_instead_of_reinvoking():
+def test_ambiguous_delivery_is_never_sent_again_on_retry():
     runtime = FakeRuntimeDriver()
     delivery = FakeDelivery(fail_times=1)
     ledger = FakeLedger()
@@ -195,10 +243,51 @@ def test_delivery_retry_uses_cached_runtime_result_instead_of_reinvoking():
     else:
         raise AssertionError("first delivery must fail")
 
-    worker.process_envelope(item, deps)
+    try:
+        worker.process_envelope(item, deps)
+    except worker.WorkerContractError as error:
+        assert "uncertain" in str(error).lower()
+    else:
+        raise AssertionError("ambiguous delivery replay must remain failed")
+
+    assert len(runtime.calls) == 1
+    assert len(delivery.calls) == 0
+
+
+def test_runtime_success_then_result_persistence_failure_never_reexecutes():
+    runtime = FakeRuntimeDriver()
+    ledger = FakeLedger()
+    ledger.fail_complete = True
+    deps = dependencies(runtime=runtime, ledger=ledger)
+    item = make_envelope()
+
+    for _ in range(2):
+        try:
+            worker.process_envelope(item, deps)
+        except RuntimeError:
+            pass
+
+    assert len(runtime.calls) == 1
+    assert ledger.records[item.message_deduplication_id].state == "PROCESSING_UNCERTAIN"
+
+
+def test_send_success_then_receipt_persistence_failure_never_resends():
+    runtime = FakeRuntimeDriver()
+    delivery = FakeDelivery()
+    ledger = FakeLedger()
+    ledger.fail_confirm = True
+    deps = dependencies(runtime=runtime, delivery=delivery, ledger=ledger)
+    item = make_envelope()
+
+    for _ in range(2):
+        try:
+            worker.process_envelope(item, deps)
+        except RuntimeError:
+            pass
 
     assert len(runtime.calls) == 1
     assert len(delivery.calls) == 1
+    assert ledger.records[item.message_deduplication_id].state == "DELIVERY_UNCERTAIN"
 
 
 def test_fifo_batch_returns_partial_failures_and_stops_after_first_failure():
@@ -268,4 +357,3 @@ def test_runtime_cannot_claim_it_streamed_directly_to_telegram():
         assert "stream" in str(error).lower()
     else:
         raise AssertionError("untrusted runtime streaming claim must be rejected")
-

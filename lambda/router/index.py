@@ -26,8 +26,10 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from event_identity import derive_event_trace
 from runtime_driver import AgentCoreAdapter, RuntimeDriver
 from runtime_state import RuntimeStateRepository
+from telegram_ingress import TelegramWebhookIngress
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -42,6 +44,7 @@ SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
+UPDATE_QUEUE_URL = os.environ.get("UPDATE_QUEUE_URL", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 REQUIRED_REGION = "eu-west-1"
 
@@ -76,8 +79,14 @@ agentcore_client = boto3.client(
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
+sqs_client = boto3.client(
+    "sqs",
+    region_name=AWS_REGION,
+    config=Config(retries={"max_attempts": 0}),
+)
 
 _runtime_driver_cache = None
+_telegram_ingress_cache = None
 
 
 def _get_runtime_driver():
@@ -149,6 +158,22 @@ def _get_slack_tokens():
 
 def _get_webhook_secret():
     return _get_secret(WEBHOOK_SECRET_ID)
+
+
+def _get_telegram_ingress():
+    """Build the Telegram-to-FIFO boundary without initializing a runtime."""
+    global _telegram_ingress_cache
+    if _telegram_ingress_cache is not None:
+        return _telegram_ingress_cache
+    if not UPDATE_QUEUE_URL:
+        raise RuntimeError("UPDATE_QUEUE_URL is required")
+    _telegram_ingress_cache = TelegramWebhookIngress(
+        secret_provider=_get_webhook_secret,
+        resolve_user=resolve_user,
+        sqs_client=sqs_client,
+        queue_url=UPDATE_QUEUE_URL,
+    )
+    return _telegram_ingress_cache
 
 
 def _get_feishu_credentials():
@@ -628,14 +653,7 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 
 def _build_runtime_invocation_id(channel, platform_event_id, internal_user_id):
     """Build the fixed trusted retry identity without using message content."""
-    if channel not in {"telegram", "slack", "feishu"}:
-        raise ValueError("unsupported invocation channel")
-    event_id = str(platform_event_id or "").strip()
-    user_id = _canonical_namespace(internal_user_id)
-    if not event_id or len(event_id) > 512:
-        raise ValueError("missing immutable platform event or internal user identity")
-    canonical = f"personal-operator-invocation-v1\0{channel}\0{user_id}\0{event_id}"
-    return "po1_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return derive_event_trace(channel, internal_user_id, platform_event_id)
 
 
 def _canonical_namespace(internal_user_id):
@@ -1937,14 +1955,17 @@ def handler(event, context):
 
     # Determine channel from path
     if path.endswith("/webhook/telegram"):
-        # Validate webhook secret before processing
-        if not validate_telegram_webhook(headers):
-            logger.warning("Telegram webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
-
-        # Self-invoke async and return immediately
-        _self_invoke_async("telegram", body, headers)
-        return {"statusCode": 200, "body": "ok"}
+        # Authentication, bounded parsing, identity resolution, and durable
+        # FIFO acceptance form one synchronous boundary. A 200 is returned
+        # only after SQS provides an exact acceptance receipt.
+        try:
+            return _get_telegram_ingress().handle(body, headers)
+        except Exception as error:
+            logger.warning(
+                "Telegram ingress unavailable: error_type=%s",
+                type(error).__name__,
+            )
+            return {"statusCode": 503, "body": "queue unavailable"}
 
     elif path.endswith("/webhook/slack"):
         # Slack url_verification — only allowed during initial setup

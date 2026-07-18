@@ -13,6 +13,7 @@ import pytest
 ROUTER_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROUTER_DIR))
 
+from event_identity import derive_event_trace  # noqa: E402
 from message_queue import (  # noqa: E402
     EnvelopeValidationError,
     QueueEnvelope,
@@ -25,7 +26,7 @@ def envelope(**overrides):
         "user_id": "user_ab12",
         "channel": "telegram",
         "update_id": "42001",
-        "trace_id": "trace_42001",
+        "trace_id": derive_event_trace("telegram", "user_ab12", "42001"),
         "kind": "message",
         "payload": {
             "chatId": "991",
@@ -34,6 +35,15 @@ def envelope(**overrides):
         },
     }
     values.update(overrides)
+    if not any(key in overrides for key in ("trace_id",)) and any(
+        key in overrides for key in ("channel", "user_id", "update_id")
+    ):
+        try:
+            values["trace_id"] = derive_event_trace(
+                values["channel"], values["user_id"], values["update_id"]
+            )
+        except ValueError:
+            pass
     return QueueEnvelope(**values)
 
 
@@ -46,28 +56,33 @@ def test_wire_envelope_has_exact_typed_shape_and_canonical_json():
     assert QueueEnvelope.from_json(item.to_json()) == item
 
 
-def test_fifo_group_is_user_and_dedupe_is_stable_for_receipt_replays():
-    first = envelope(trace_id="receipt_a")
-    replay = envelope(trace_id="receipt_b")
+def test_fifo_group_and_dedupe_are_the_immutable_bound_event_identity():
+    first = envelope()
+    replay = envelope()
     mutated_receipt = envelope(
-        trace_id="receipt_c",
         payload={"chatId": "991", "actorId": "telegram:77", "message": "mutated retry body"},
     )
 
     assert first.message_group_id == "user_ab12"
     assert first.message_deduplication_id == replay.message_deduplication_id
-    assert first.message_deduplication_id != mutated_receipt.message_deduplication_id
-    assert len(first.message_deduplication_id) == 64
+    assert first.message_deduplication_id == mutated_receipt.message_deduplication_id
+    assert first.request_sha256 == replay.request_sha256
+    assert first.request_sha256 != mutated_receipt.request_sha256
+    assert first.message_deduplication_id.startswith("po1_")
     assert envelope(update_id="42002").message_deduplication_id != first.message_deduplication_id
     assert envelope(user_id="user_other").message_deduplication_id != first.message_deduplication_id
 
 
 def test_one_hundred_replayed_updates_have_one_fifo_identity():
     dedupe_ids = {
-        envelope(trace_id=f"receipt_{index}").message_deduplication_id
-        for index in range(100)
+        envelope().message_deduplication_id for _ in range(100)
     }
     assert len(dedupe_ids) == 1
+
+
+def test_trace_must_be_derived_from_channel_user_and_update_id():
+    with pytest.raises(EnvelopeValidationError, match="bound"):
+        envelope(trace_id="po1_" + "f" * 64)
 
 
 def test_fifo_request_contains_explicit_group_and_deduplication_ids():
