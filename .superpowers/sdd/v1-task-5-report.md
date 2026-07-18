@@ -173,3 +173,62 @@ authority.
 19. `f35a505e8bc6ef0947eabaac8b1e9af32723de54` - uncertain deletes
 20. `359c84982c894f0fa021e3e2beafd8c5e48ee50b` - atomic writes
 21. `4c707ae679c76ca98312009672add3d12260f0b8` - monotonic disconnect fence
+
+## Final-review remediation (three Important findings)
+
+The independent final review (`.superpowers/sdd/v1-task-5-final-review-report.md`)
+returned NEEDS FIXES with three reproduced Important defects. All three are now
+resolved with RED-before-GREEN tests on branch `codex/po-v1-experience`.
+
+- Remediation commit: `f832602ceffbabed6ee4bf7b7eadff34bff9f1c5`
+- Remediation tree: `9205ad33fe198f9da2d0a67b29e594bac576db7b`
+- Base for whitespace check: `4eed676..HEAD` (`git diff --check` clean)
+
+### Finding 1 - same-generation slow disconnect deletes a reconnect
+`DynamoGmailRepository.delete_under_disconnecting_fence` issues a DynamoDB
+transaction that ConditionChecks the connection fence is exactly
+`(generation, DISCONNECTING)` and Deletes the exact target key in the same
+atomic unit. `DynamoConnectionLifecycle.disconnect` now routes every
+destructive step (connection envelope, opportunities, draft and callback
+prefixes) through it, carrying the generation returned by `begin_disconnect`.
+Once a reconnect advances the fence to CONNECTED, a resumed stale runner's
+fenced deletes fail closed (`ConnectionFenceError`) instead of destroying the
+new records. A genuinely ambiguous transport failure under the still-pending
+generation stays retryable and reports "uncertain".
+Tests: `test_fenced_delete_removes_a_target_only_under_the_exact_disconnecting_fence`,
+`test_fenced_delete_cannot_destroy_a_reconnect_after_a_stale_runner_resumes`
+(test_repository.py); `test_slow_disconnect_runner_cannot_delete_a_newly_reconnected_envelope`,
+`test_disconnect_keeps_fence_pending_when_delete_and_confirmation_read_fail`
+(test_overview.py).
+
+### Finding 2 - bounded purge stranded while UI reports disconnected
+On `ConnectionDisconnectPending` the HTTP layer now returns 202 with the
+truthful `status: "DISCONNECTING"` (never DISCONNECTED). The web client
+re-drives the idempotent disconnect (which reuses the DISCONNECTING
+generation and resumes the bounded purge) until the server returns 200
+`DISCONNECTED`, and keeps the disconnect control pending/disabled meanwhile.
+DISCONNECTED is never reported until the authoritative fence is exactly
+DISCONNECTED.
+Tests: `test_bounded_disconnect_reports_pending_truthfully_and_completes_on_retry`
+(test_index.py); `keeps disconnect pending on 202 DISCONNECTING and completes
+it on retry` (App.test.jsx).
+
+### Finding 3 - applied-but-response-lost logout strands private DOM
+`DynamoWebStore.revoke` now reconciles an ambiguous update by strongly reading
+the exact session and accepting success only when it is proven revoked, so the
+logout endpoint still returns its 204 cookie-clearing response and the SPA
+unmounts private DOM. If revocation cannot be proven, revoke re-raises.
+Tests: `test_revoke_reconciles_an_applied_but_response_lost_update`,
+`test_revoke_reraises_when_revocation_cannot_be_proven` (test_stores.py);
+`test_logout_still_clears_cookie_after_applied_but_response_lost_revocation`
+(test_index.py).
+
+### Evidence
+- Focused Python gate: 87 passed
+  (test_overview, test_stores, test_auth, test_index, test_repository,
+  test_synthetic_pilot_journey).
+- Broader affected suites: 307 passed (lambda/web, lambda/workflows/gmail,
+  tests/integration).
+- UI gate: 12 passed (web/src/App.test.jsx).
+- Full aggregate `scripts/test-local.sh`: see recorded run at HEAD `f832602`.
+- No AWS/network/Docker/provider call was made; public/synthetic data only.
