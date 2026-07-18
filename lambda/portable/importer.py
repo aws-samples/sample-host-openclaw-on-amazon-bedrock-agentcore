@@ -40,6 +40,13 @@ from .manifest import (
 
 MAX_BUNDLE_BYTES = 50 * 1024 * 1024
 MAX_ENTRIES = 1_000
+# The compressed bundle is bounded above, but a small bundle can inflate to
+# gigabytes. Bound each entry and the cumulative decompressed size using the
+# declared ZipInfo.file_size BEFORE reading any entry, matching the exporter's
+# per-entry (5 MiB) and total (50 MiB) limits, so a decompression bomb is
+# rejected without ever materializing its payload in memory.
+MAX_ENTRY_UNCOMPRESSED_BYTES = 5 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 
 # Record states that prove a still-open or uncertain effect.  A portable bundle
 # may only carry immutable, terminal, non-replayable history.
@@ -110,9 +117,33 @@ class PortableImporter:
                 raise BundleIntegrityError("portable bundle has too many entries")
             if len(names) != len(set(names)):
                 raise BundleIntegrityError("portable bundle has duplicate entries")
+            # Bound decompressed size on declared ZipInfo.file_size BEFORE the
+            # manifest lookup or any read, so a decompression bomb is rejected
+            # without materializing a payload.
+            total_uncompressed = 0
+            for info in archive.infolist():
+                if info.file_size > MAX_ENTRY_UNCOMPRESSED_BYTES:
+                    raise BundleIntegrityError(
+                        "portable bundle entry exceeds its uncompressed size limit"
+                    )
+                total_uncompressed += info.file_size
+                if total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES:
+                    raise BundleIntegrityError(
+                        "portable bundle exceeds its total uncompressed size limit"
+                    )
             if "manifest.json" not in names:
                 raise BundleIntegrityError("portable bundle has no manifest")
-            payloads = {name: archive.read(name) for name in names}
+            # Read each entry under a hard ceiling so a lying ZipInfo.file_size
+            # cannot inflate past the per-entry bound during decompression.
+            payloads = {}
+            for name in names:
+                with archive.open(name) as stream:
+                    payload = stream.read(MAX_ENTRY_UNCOMPRESSED_BYTES + 1)
+                if len(payload) > MAX_ENTRY_UNCOMPRESSED_BYTES:
+                    raise BundleIntegrityError(
+                        "portable bundle entry exceeds its uncompressed size limit"
+                    )
+                payloads[name] = payload
 
         manifest_bytes = payloads["manifest.json"]
         try:

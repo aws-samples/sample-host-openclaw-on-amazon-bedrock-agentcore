@@ -141,6 +141,36 @@ def test_size_mismatch_rejected():
         PortableImporter(staging=StagingStore()).build_plan(_rezip(entries))
 
 
+def test_decompression_bomb_rejected_before_reading_entries():
+    # A bundle that is small compressed but inflates past the uncompressed
+    # ceiling must be rejected on ZipInfo.file_size, before any entry is read
+    # into memory — otherwise a ~1.5 MiB bundle can OOM the import Lambda.
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for index in range(60):
+            info = zipfile.ZipInfo(
+                f"workspace/zero_{index:03d}.bin", date_time=(1980, 1, 1, 0, 0, 0)
+            )
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o600 << 16
+            archive.writestr(info, b"\x00" * (5 * 1024 * 1024))
+    bomb = output.getvalue()
+    assert len(bomb) < 8 * 1024 * 1024  # under the HTTP-boundary cap
+    with pytest.raises(BundleIntegrityError, match="uncompressed|size"):
+        PortableImporter(staging=StagingStore()).build_plan(bomb)
+
+
+def test_single_oversize_entry_rejected_on_declared_size():
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        info = zipfile.ZipInfo("workspace/big.bin", date_time=(1980, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.external_attr = 0o600 << 16
+        archive.writestr(info, b"\x00" * (6 * 1024 * 1024))
+    with pytest.raises(BundleIntegrityError, match="uncompressed|size"):
+        PortableImporter(staging=StagingStore()).build_plan(output.getvalue())
+
+
 def test_noncanonical_manifest_rejected():
     entries = _entries(_bundle_bytes())
     import json
