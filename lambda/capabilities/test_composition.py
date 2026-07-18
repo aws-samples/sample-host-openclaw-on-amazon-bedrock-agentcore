@@ -3,9 +3,27 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import importlib
 import json
 from pathlib import Path
 import shutil
+import sys
+from types import ModuleType
+
+# Some router tests replace ``sys.modules["boto3"]`` with a bare MagicMock at
+# collection time. Restore the installed package before importing DynamoDB's
+# serializers so this test remains order-independent in the aggregate suite.
+if any(
+    (loaded_module := sys.modules.get(package_name)) is not None
+    and not isinstance(loaded_module, ModuleType)
+    for package_name in ("boto3", "botocore")
+):
+    for module_name in tuple(sys.modules):
+        if module_name in {"boto3", "botocore"} or module_name.startswith(
+            ("boto3.", "botocore.")
+        ):
+            sys.modules.pop(module_name, None)
+    importlib.invalidate_caches()
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
