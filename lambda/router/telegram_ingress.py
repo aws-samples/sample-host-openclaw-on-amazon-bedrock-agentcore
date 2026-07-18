@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 from typing import Mapping
 
 try:
@@ -21,6 +22,10 @@ except ImportError:
 
 
 MAX_WEBHOOK_BYTES = 128 * 1024
+_INVITE_START = re.compile(
+    r"/start(?:@[A-Za-z0-9_]{5,32})? (poi1_[A-Za-z0-9_-]{32})"
+)
+_START_WITH_PAYLOAD = re.compile(r"/start(?:@[A-Za-z0-9_]{5,32})?\s+.*", re.DOTALL)
 
 
 class TelegramWebhookIngress:
@@ -29,13 +34,19 @@ class TelegramWebhookIngress:
         *,
         secret_provider,
         resolve_user,
+        redeem_invite,
         sqs_client,
         queue_url: str,
     ) -> None:
-        if not callable(secret_provider) or not callable(resolve_user):
+        if (
+            not callable(secret_provider)
+            or not callable(resolve_user)
+            or not callable(redeem_invite)
+        ):
             raise TypeError("ingress dependencies must be callable")
         self._secret_provider = secret_provider
         self._resolve_user = resolve_user
+        self._redeem_invite = redeem_invite
         self._sqs = sqs_client
         self._queue_url = queue_url
 
@@ -124,16 +135,47 @@ class TelegramWebhookIngress:
         display_name = actor.get("first_name") or actor.get("username") or ""
         if not isinstance(display_name, str):
             display_name = ""
-        try:
-            user_id, _ = self._resolve_user("telegram", actor_id, display_name[:128])
-        except Exception:
-            return {"statusCode": 503, "body": "identity unavailable"}
+        canonical_invite_start = False
+        invite_match = (
+            _INVITE_START.fullmatch(text)
+            if callback_data is None and isinstance(text, str)
+            else None
+        )
+        if callback_data is None and isinstance(text, str) and _START_WITH_PAYLOAD.fullmatch(text):
+            # A /start payload is an authorization bearer lane, never ordinary
+            # chat content. Malformed payloads are discarded before identity
+            # resolution so they cannot register or cross the FIFO boundary.
+            if invite_match is None:
+                return {"statusCode": 200, "body": "ok"}
+            try:
+                user_id = self._redeem_invite(
+                    invite_match.group(1),
+                    "telegram",
+                    actor_id,
+                    display_name[:128],
+                )
+            except Exception:
+                return {"statusCode": 503, "body": "identity unavailable"}
+            if user_id is None:
+                return {"statusCode": 200, "body": "ok"}
+            canonical_invite_start = True
+        else:
+            try:
+                user_id, _ = self._resolve_user(
+                    "telegram", actor_id, display_name[:128]
+                )
+            except Exception:
+                return {"statusCode": 503, "body": "identity unavailable"}
         if user_id is None:
             return {"statusCode": 200, "body": "ok"}
         event_id = str(update_id)
         try:
             trace_id = derive_event_trace("telegram", user_id, event_id)
-            command = parse_product_command(text) if callback_data is None else None
+            command = (
+                parse_product_command("/start" if canonical_invite_start else text)
+                if callback_data is None
+                else None
+            )
             if callback_data is not None:
                 kind = "callback"
                 work = {"callbackData": callback_data}

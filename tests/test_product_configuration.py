@@ -872,6 +872,7 @@ def _synth_router_template(
     runtime_arn: str = TEST_RUNTIME_ARN,
     runtime_iam_arn: str = TEST_RUNTIME_IAM_ARN,
     runtime_endpoint_name: str = TEST_RUNTIME_ENDPOINT_NAME,
+    registration_open: str = "false",
 ) -> dict:
     from aws_cdk import App, Environment
     from aws_cdk.assertions import Template
@@ -879,7 +880,7 @@ def _synth_router_template(
     from stacks.router_stack import RouterStack
 
     account = "123456789012"
-    app = App(context={"registration_open": "false"})
+    app = App(context={"registration_open": registration_open})
     stack = RouterStack(
         app,
         "Router",
@@ -913,6 +914,16 @@ def _synth_router_template(
         env=Environment(account=account, region="eu-west-1"),
     )
     return Template.from_stack(stack).to_json()
+
+
+def test_external_pilot_router_rejects_open_registration():
+    try:
+        _synth_router_template(registration_open="true")
+    except ValueError as error:
+        assert "registration" in str(error).casefold()
+        assert "closed" in str(error).casefold()
+    else:
+        raise AssertionError("external pilot accepted open registration")
 
 
 def test_worker_separates_invocation_arn_from_iam_runtime_resource() -> None:

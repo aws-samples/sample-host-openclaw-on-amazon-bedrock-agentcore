@@ -28,6 +28,19 @@ class Resolver:
         return self.result
 
 
+class Redeemer:
+    def __init__(self, result="user_invited", error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def __call__(self, token, channel, actor, display_name):
+        self.calls.append((token, channel, actor, display_name))
+        if self.error:
+            raise self.error
+        return self.result
+
+
 class Queue:
     def __init__(self, error=None):
         self.calls = []
@@ -74,10 +87,11 @@ def callback_update(
     }
 
 
-def router(*, resolver=None, queue=None):
+def router(*, resolver=None, redeemer=None, queue=None):
     return ingress_module.TelegramWebhookIngress(
         secret_provider=lambda: SECRET,
         resolve_user=resolver or Resolver(),
+        redeem_invite=redeemer or Redeemer(),
         sqs_client=queue or Queue(),
         queue_url="https://sqs.eu-west-1.amazonaws.com/1/personal-operator.fifo",
     )
@@ -248,4 +262,85 @@ def test_uninvited_invalid_and_non_text_updates_are_safe_noops_or_rejections():
         "{bad-json",
         {"x-telegram-bot-api-secret-token": SECRET},
     )["statusCode"] == 400
+    assert queue.calls == []
+
+
+def test_valid_deep_link_redeems_before_identity_and_queues_only_canonical_start():
+    token = "poi1_" + "A" * 32
+    resolver = Resolver((None, False))
+    redeemer = Redeemer("user_invited")
+    queue = Queue()
+    ingress = router(resolver=resolver, redeemer=redeemer, queue=queue)
+
+    result = ingress.handle(
+        json.dumps(update(text=f"/start {token}")),
+        {"x-telegram-bot-api-secret-token": SECRET},
+    )
+
+    assert result == {"statusCode": 200, "body": "ok"}
+    assert redeemer.calls == [(token, "telegram", "42", "Ada")]
+    assert resolver.calls == []
+    assert len(queue.calls) == 1
+    wire = json.loads(queue.calls[0]["MessageBody"])
+    assert wire["kind"] == "command"
+    assert wire["payload"] == {
+        "chatId": "42",
+        "actorId": "telegram:42",
+        "command": "/start",
+    }
+    assert token not in repr(queue.calls)
+
+
+def test_invite_replay_for_same_actor_can_retry_queue_but_bearer_never_crosses_fifo():
+    token = "poi1_" + "B" * 32
+    redeemer = Redeemer("user_invited")
+    queue = Queue()
+    ingress = router(redeemer=redeemer, queue=queue)
+    body = json.dumps(update(update_id=700, text=f"/start {token}"))
+    headers = {"x-telegram-bot-api-secret-token": SECRET}
+
+    for _ in range(2):
+        assert ingress.handle(body, headers) == {"statusCode": 200, "body": "ok"}
+
+    assert len(redeemer.calls) == 2
+    assert len(queue.calls) == 2
+    assert len({call["MessageDeduplicationId"] for call in queue.calls}) == 1
+    assert token not in repr(queue.calls)
+
+
+def test_invalid_used_or_cross_actor_invite_is_a_safe_noop_without_registration():
+    token = "poi1_" + "C" * 32
+    resolver = Resolver(("user_should_not_resolve", False))
+    redeemer = Redeemer(None)
+    queue = Queue()
+    ingress = router(resolver=resolver, redeemer=redeemer, queue=queue)
+
+    for text in (f"/start {token}", "/start poi1_short", "/start arbitrary"):
+        assert ingress.handle(
+            json.dumps(update(text=text)),
+            {"x-telegram-bot-api-secret-token": SECRET},
+        ) == {"statusCode": 200, "body": "ok"}
+
+    assert redeemer.calls == [(token, "telegram", "42", "Ada")]
+    assert resolver.calls == []
+    assert queue.calls == []
+
+
+def test_invite_store_unavailability_is_retryable_without_ordinary_resolution():
+    token = "poi1_" + "D" * 32
+    resolver = Resolver()
+    redeemer = Redeemer(error=TimeoutError("synthetic identity outage"))
+    queue = Queue()
+
+    result = router(
+        resolver=resolver,
+        redeemer=redeemer,
+        queue=queue,
+    ).handle(
+        json.dumps(update(text=f"/start {token}")),
+        {"x-telegram-bot-api-secret-token": SECRET},
+    )
+
+    assert result == {"statusCode": 503, "body": "identity unavailable"}
+    assert resolver.calls == []
     assert queue.calls == []
