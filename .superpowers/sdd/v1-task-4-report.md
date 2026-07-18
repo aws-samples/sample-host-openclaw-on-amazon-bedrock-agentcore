@@ -230,3 +230,35 @@ PASS
 
 All clients and blob reads were injected. No ambient SDK construction, AWS
 call, network request, image operation, deploy, or push occurred.
+
+### Digest-bound dispatch and authoritative reconciliation
+
+RED probes reproduced three remaining transaction-boundary failures: a
+mutation driver was not bound to the journal, `{}` could be accepted as a
+successful dispatch, and an operator could choose `persisted|absent` during
+reconciliation. Additional probes showed inherited region variables reaching
+later phases and rollback without revalidation.
+
+GREEN at `057dc9e5fb8bfc0d505136e5dd065e1435411934`: each reviewed operation is
+read once through a regular-file descriptor, hashed, copied to a private exact
+executable, and named in both the confirmation and the durable `UNCERTAIN`
+journal record. Mutation accepts only `{"dispatched":true}` and never treats
+that acknowledgement as persistence proof. The same retained bytes must then
+produce an exact identity-bound, phase-owned read-only observation; recovery
+cannot accept an operator outcome or a changed operation. Every dispatch and
+observation reauthenticates the exact account and pins all AWS region variables
+to `eu-west-1`. Rollback uses the same write-ahead and live-observation path.
+
+Fresh local evidence:
+
+```text
+.venv/bin/python -m pytest -q release_tools
+103 passed in 16.93s
+.venv/bin/python -m py_compile release_tools/cli.py release_tools/contracts.py release_tools/transaction.py
+git diff --check
+PASS
+```
+
+The focused subprocess suite used a fake `aws` executable and fake operation
+driver. It made no AWS, network, deploy, image, signing, or credentialed call.
+Behavioral container-boundary tests and final independent review remain open.
