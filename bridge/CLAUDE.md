@@ -27,6 +27,14 @@ provide code execution.
 Channel delivery also stays outside this runtime. The contract returns response
 text to its caller; it never fetches a channel token or calls a channel API.
 
+`POST /invocations` accepts only `status`, `warmup`, `chat`, and `snapshot`
+after binding the exact internal identity and namespace. A chat that reaches
+the workspace commit returns a frozen `workspaceReceipt` containing only its
+committed `generation` and `manifestSha256`; the same trusted invocation replay
+returns the same receipt. Failed persistence returns no receipt and quarantines
+the workspace. `snapshot` performs one fair, exclusive manual commit and
+returns the same receipt shape without executing model work.
+
 For every behavior change, add a failing Node test first and run the bridge test
 suite serially under Node 24:
 

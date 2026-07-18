@@ -72,12 +72,12 @@ describe("AgentCore workspace lifecycle production coupling", () => {
 
   it("holds every successful chat response until post-turn persistence commits", () => {
     assert.match(contract, /await workspaceLifecycle\.acquireTurn\(\)/);
-    assert.match(contract, /await workspaceLifecycle\.commitAfterTurn\(/);
+    assert.match(contract, /await persistWorkspaceOutcome\(\{/);
     assert.match(contract, /WORKSPACE_PERSISTENCE_FAILED/);
     const begin = contract.indexOf("await workspaceLifecycle.acquireTurn()");
     const execute = contract.indexOf("gatewayRuntimeBoundary.invoke", begin);
     const commit = contract.indexOf(
-      "await workspaceLifecycle.commitAfterTurn(",
+      "await persistWorkspaceOutcome({",
       execute,
     );
     const response = contract.indexOf("res.end(JSON.stringify", commit);
@@ -86,9 +86,9 @@ describe("AgentCore workspace lifecycle production coupling", () => {
 
   it("keeps health busy through persistence and forbids full in-place reinitialization", () => {
     const begin = contract.indexOf("await workspaceLifecycle.acquireTurn()");
-    const tracked = contract.indexOf("await activeTaskTracker.run", begin);
+    const tracked = contract.indexOf("return activeTaskTracker.run", begin);
     const commit = contract.indexOf(
-      "await workspaceLifecycle.commitAfterTurn(",
+      "await persistWorkspaceOutcome({",
       tracked,
     );
     const trackedEnd = contract.indexOf("});", commit);

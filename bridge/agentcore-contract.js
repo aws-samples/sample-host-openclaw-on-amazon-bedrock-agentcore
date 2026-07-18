@@ -3,7 +3,7 @@
  *
  * Implements the required HTTP protocol contract for AgentCore Runtime:
  *   - GET  /ping         -> Health check (Healthy — allows idle termination)
- *   - POST /invocations  -> Chat handler with hybrid init
+ *   - POST /invocations  -> status, warmup, chat, or durable snapshot action
  *
  * Each AgentCore session is dedicated to a single user. On first invocation:
  *   1. Bind the exact internal identity and mint scoped workspace credentials
@@ -85,6 +85,9 @@ const runtimeInitializationGuard = createRuntimeInitializationGuard();
 const activeTaskTracker = createActiveTaskTracker();
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
+const WORKSPACE_GENERATION_PATTERN =
+  /^g-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
 const OPENCLAW_LOG_LIMIT = 50;
@@ -120,9 +123,63 @@ function createRuntimeInvocationAdmission({
     status: (context) => context,
     warmup: (context) => context,
     chat: (context) => context,
+    snapshot: (context) => context,
   },
 } = {}) {
   return createInvocationHandler({ sessionBinding, handlers });
+}
+
+function createWorkspaceReceipt(head) {
+  if (!head || !WORKSPACE_GENERATION_PATTERN.test(head.generation || "")) {
+    throw new TypeError("Workspace receipt requires a canonical generation");
+  }
+  if (!SHA256_PATTERN.test(head.manifestSha256 || "")) {
+    throw new TypeError("Workspace receipt requires a canonical manifest digest");
+  }
+  return Object.freeze({
+    generation: head.generation,
+    manifestSha256: head.manifestSha256,
+  });
+}
+
+async function persistWorkspaceOutcome({
+  workspaceLifecycle: lifecycle,
+  workspaceTurn,
+  outcome,
+} = {}) {
+  if (!lifecycle || typeof lifecycle.commitAfterTurn !== "function") {
+    throw new TypeError("Workspace outcome persistence requires a lifecycle");
+  }
+  if (!outcome || typeof outcome !== "object" || Array.isArray(outcome)) {
+    throw new TypeError("Workspace outcome must be an object");
+  }
+  const head = await lifecycle.commitAfterTurn(workspaceTurn);
+  return Object.freeze({
+    ...outcome,
+    workspaceReceipt: createWorkspaceReceipt(head),
+  });
+}
+
+async function executeSnapshotAction({
+  initialize,
+  getWorkspaceLifecycle,
+} = {}) {
+  if (
+    typeof initialize !== "function" ||
+    typeof getWorkspaceLifecycle !== "function"
+  ) {
+    throw new TypeError("Snapshot action requires trusted runtime callbacks");
+  }
+  await initialize();
+  const lifecycle = getWorkspaceLifecycle();
+  if (!lifecycle || typeof lifecycle.requestManualSnapshot !== "function") {
+    throw new Error("Durable workspace lifecycle is unavailable");
+  }
+  const head = await lifecycle.requestManualSnapshot();
+  return Object.freeze({
+    status: "snapshotted",
+    workspaceReceipt: createWorkspaceReceipt(head),
+  });
 }
 
 function createRuntimeInitializationGuard() {
@@ -573,7 +630,7 @@ async function stopSupportProcesses() {
   await cwLogger.shutdown();
 }
 
-async function init(internalUserId, namespace) {
+async function init(internalUserId, namespace, { warmModel = true } = {}) {
   if (proxyReady) return; // Already initialized
   if (initInProgress) return initPromise;
   runtimeInitializationGuard.claim();
@@ -733,7 +790,9 @@ async function init(internalUserId, namespace) {
 
     // 2b. Warm proxy JIT — send a lightweight request to trigger V8 compilation
     // of the request handling path, so the first real user message is faster.
-    warmProxyJit().catch(() => {}); // non-blocking, fire-and-forget
+    if (warmModel) {
+      warmProxyJit().catch(() => {}); // non-blocking, fire-and-forget
+    }
 
     // 3. Poll for OpenClaw readiness in the background (don't block)
     pollOpenClawReadiness(namespace).catch((err) => {
@@ -936,7 +995,7 @@ const server = http.createServer(async (req, res) => {
   }
 
 
-  // POST /invocations — Chat handler
+  // POST /invocations — trusted runtime actions
   if (req.method === "POST" && req.url === "/invocations") {
     let body = "";
     let bodySize = 0;
@@ -1029,6 +1088,68 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
+        // Snapshot action — initialize the bound workspace if necessary, then
+        // take one fair, exclusive snapshot without executing model work.
+        if (action === "snapshot") {
+          if (gatewayQuarantined) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                status: "quarantined",
+                errorCode: "AGENT_RUNTIME_QUARANTINED",
+              }),
+            );
+            return;
+          }
+
+          lastActivityTime = Math.floor(Date.now() / 1000);
+          try {
+            const snapshotOutcome = await activeTaskTracker.run(() =>
+              executeSnapshotAction({
+                initialize: () =>
+                  init(identity.internalUserId, identity.namespace, {
+                    warmModel: false,
+                  }),
+                getWorkspaceLifecycle: () => workspaceLifecycle,
+              }),
+            );
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                internalUserId: identity.internalUserId,
+                ...snapshotOutcome,
+              }),
+            );
+          } catch (snapshotError) {
+            const persistenceFailed =
+              snapshotError.code === "WORKSPACE_PERSISTENCE_FAILED";
+            if (persistenceFailed) {
+              gatewayQuarantined =
+                workspaceLifecycle?.status().quarantine ||
+                Object.freeze({
+                  code: "WORKSPACE_PERSISTENCE_FAILED",
+                  message: "Workspace persistence failed",
+                });
+              openclawReady = false;
+              void stopOpenClawForSnapshot().catch((stopError) => {
+                console.error(
+                  `[contract] OpenClaw quarantine stop failed: ${stopError.message}`,
+                );
+              });
+            }
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                internalUserId: identity.internalUserId,
+                status: persistenceFailed ? "retryable" : "failed",
+                errorCode:
+                  snapshotError.code || "WORKSPACE_SNAPSHOT_FAILED",
+              }),
+            );
+          }
+          return;
+        }
+
         // Chat action — lazy init and bridge
         if (action === "chat") {
           const { message, invocationId } = request;
@@ -1063,6 +1184,7 @@ const server = http.createServer(async (req, res) => {
           let responseText;
           let responseStatus;
           let responseErrorCode;
+          let responseWorkspaceReceipt;
           try {
             const outcome = await trustedInvocationRegistry.invoke({
               invocationId,
@@ -1128,8 +1250,7 @@ const server = http.createServer(async (req, res) => {
                 let executionText;
                 let executionStatus;
                 let executionErrorCode;
-                let unexpectedExecutionError;
-                await activeTaskTracker.run(async () => {
+                return activeTaskTracker.run(async () => {
                   try {
                     if (openclawReady) {
                       try {
@@ -1185,11 +1306,31 @@ const server = http.createServer(async (req, res) => {
                       executionErrorCode = "RUNTIME_NOT_READY";
                     }
                   } catch (executionError) {
-                    unexpectedExecutionError = executionError;
+                    console.error(
+                      `[contract] Unexpected agent execution failure: ${executionError.message}`,
+                    );
+                    executionText =
+                      "This request could not be executed safely.";
+                    executionStatus = "failed";
+                    executionErrorCode = "AGENT_EXECUTION_FAILED";
                   }
 
+                  if (executionText) {
+                    executionText = extractTextFromContent(executionText);
+                  }
+                  const executionOutcome = {
+                    responseText: executionText,
+                    ...(executionStatus ? { status: executionStatus } : {}),
+                    ...(executionErrorCode
+                      ? { errorCode: executionErrorCode }
+                      : {}),
+                  };
                   try {
-                    await workspaceLifecycle.commitAfterTurn(workspaceTurn);
+                    return await persistWorkspaceOutcome({
+                      workspaceLifecycle,
+                      workspaceTurn,
+                      outcome: executionOutcome,
+                    });
                   } catch (workspaceError) {
                     gatewayQuarantined =
                       workspaceLifecycle.status().quarantine ||
@@ -1205,24 +1346,13 @@ const server = http.createServer(async (req, res) => {
                     });
                     throw workspaceError;
                   }
-                  if (unexpectedExecutionError) throw unexpectedExecutionError;
                 });
-
-                if (executionText) {
-                  executionText = extractTextFromContent(executionText);
-                }
-                return {
-                  responseText: executionText,
-                  ...(executionStatus ? { status: executionStatus } : {}),
-                  ...(executionErrorCode
-                    ? { errorCode: executionErrorCode }
-                    : {}),
-                };
               },
             });
             responseText = outcome.responseText;
             responseStatus = outcome.status;
             responseErrorCode = outcome.errorCode;
+            responseWorkspaceReceipt = outcome.workspaceReceipt;
           } catch (invocationErr) {
             console.error(
               `[contract] Trusted invocation rejected: ${invocationErr.code || "UNKNOWN"} ${invocationErr.message}`,
@@ -1248,6 +1378,9 @@ const server = http.createServer(async (req, res) => {
               internalUserId: identity.internalUserId,
               ...(responseStatus ? { status: responseStatus } : {}),
               ...(responseErrorCode ? { errorCode: responseErrorCode } : {}),
+              ...(responseWorkspaceReceipt
+                ? { workspaceReceipt: responseWorkspaceReceipt }
+                : {}),
             }),
           );
           return;
@@ -1315,7 +1448,7 @@ function startContractServer() {
       `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
     );
     console.log(
-      "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup}",
+      "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|snapshot}",
     );
   });
 }
@@ -1329,6 +1462,9 @@ module.exports = {
   createRuntimeInvocationAdmission,
   createRuntimeInitializationGuard,
   createUnexpectedChildExitHandler,
+  createWorkspaceReceipt,
+  persistWorkspaceOutcome,
+  executeSnapshotAction,
   hashBoundInvocation,
   startContractServer,
 };

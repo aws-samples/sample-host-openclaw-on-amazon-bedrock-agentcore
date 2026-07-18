@@ -20,8 +20,8 @@ function payload(action, overrides = {}) {
 }
 
 describe("trusted invocation admission", () => {
-  it("binds synchronously before status, warmup, chat, or cron dispatch", () => {
-    for (const action of ["status", "warmup", "chat", "cron"]) {
+  it("binds synchronously before status, warmup, chat, snapshot, or cron dispatch", () => {
+    for (const action of ["status", "warmup", "chat", "snapshot", "cron"]) {
       const trace = [];
       const handler = createInvocationHandler({
         sessionBinding: new SessionBinding(),
@@ -327,12 +327,13 @@ describe("production contract admission boundary", () => {
             finishWarmup = resolve;
           }),
         chat: () => trace.push("chat"),
+        snapshot: () => trace.push("snapshot"),
       },
     });
 
     const pending = admission.handle(payload("warmup"));
     assert.deepEqual(trace, ["warmup-start"]);
-    for (const action of ["status", "warmup", "chat"]) {
+    for (const action of ["status", "warmup", "chat", "snapshot"]) {
       assert.throws(
         () =>
           admission.handle(

@@ -347,6 +347,8 @@ class WorkspaceLifecycle {
     this.turnReleaseByToken = new Map();
     this.pendingTurnAdmissions = 0;
     this.turnAdmissionTail = Promise.resolve();
+    this.pendingManualSnapshots = 0;
+    this.manualSnapshotActive = false;
     this.nextTurnId = 1;
     this.activeDrained = null;
     this.commitTail = Promise.resolve();
@@ -442,7 +444,12 @@ class WorkspaceLifecycle {
 
   beginTurn() {
     this._assertTurnAdmissionAllowed();
-    if (this.activeTurns.size > 0 || this.pendingTurnAdmissions > 0) {
+    if (
+      this.activeTurns.size > 0 ||
+      this.pendingTurnAdmissions > 0 ||
+      this.pendingManualSnapshots > 0 ||
+      this.manualSnapshotActive
+    ) {
       throw lifecycleError(
         "WORKSPACE_TURN_BUSY",
         "Another workspace turn already owns the durable state",
@@ -574,7 +581,12 @@ class WorkspaceLifecycle {
     // Every successful turn already commits before acknowledgement. Skipping
     // a timer tick while a turn is active or queued prevents a snapshot from
     // observing unacknowledged mutations without weakening durability.
-    if (this.activeTurns.size > 0 || this.pendingTurnAdmissions > 0) {
+    if (
+      this.activeTurns.size > 0 ||
+      this.pendingTurnAdmissions > 0 ||
+      this.pendingManualSnapshots > 0 ||
+      this.manualSnapshotActive
+    ) {
       return this.head;
     }
     if (this.periodicCommit) return this.periodicCommit;
@@ -596,6 +608,83 @@ class WorkspaceLifecycle {
     } finally {
       if (this.periodicCommit === operation) this.periodicCommit = null;
     }
+  }
+
+  requestManualSnapshot() {
+    if (this.state !== "READY") {
+      return Promise.reject(
+        lifecycleError(
+          "WORKSPACE_SNAPSHOT_REJECTED",
+          `Workspace is ${this.state.toLowerCase()} and cannot run a manual snapshot`,
+          { retryable: this.state !== "QUARANTINED" },
+        ),
+      );
+    }
+
+    this.pendingManualSnapshots += 1;
+    const predecessor = this.turnAdmissionTail;
+    let releaseSlot;
+    const slot = new Promise((resolve) => {
+      releaseSlot = resolve;
+    });
+    this.turnAdmissionTail = predecessor.then(
+      () => slot,
+      () => slot,
+    );
+
+    return (async () => {
+      let pending = true;
+      try {
+        await predecessor;
+        if (this.activeTurns.size > 0 && this.activeDrained) {
+          await this.activeDrained.promise;
+        }
+        await this.commitTail;
+        if (this.state !== "READY") {
+          throw lifecycleError(
+            "WORKSPACE_SNAPSHOT_REJECTED",
+            `Workspace is ${this.state.toLowerCase()} and cannot run a manual snapshot`,
+            { retryable: this.state !== "QUARANTINED" },
+          );
+        }
+        if (this.activeTurns.size !== 0 || this.manualSnapshotActive) {
+          throw lifecycleError(
+            "WORKSPACE_SNAPSHOT_INVARIANT",
+            "Manual workspace snapshot admission lost exclusivity",
+          );
+        }
+        this.manualSnapshotActive = true;
+        this.pendingManualSnapshots = Math.max(
+          0,
+          this.pendingManualSnapshots - 1,
+        );
+        pending = false;
+
+        try {
+          return await this._enqueueCommit("manual");
+        } catch (cause) {
+          this.quarantine = Object.freeze({
+            code: "WORKSPACE_PERSISTENCE_FAILED",
+            message: "Manual persistence failed",
+          });
+          this.state = "QUARANTINED";
+          throw lifecycleError(
+            "WORKSPACE_PERSISTENCE_FAILED",
+            "Manual workspace persistence failed",
+            { retryable: true, cause },
+          );
+        }
+      } finally {
+        if (pending) {
+          this.pendingManualSnapshots = Math.max(
+            0,
+            this.pendingManualSnapshots - 1,
+          );
+        }
+        this.manualSnapshotActive = false;
+        releaseSlot();
+      }
+    })();
   }
 
   startPeriodic(intervalMs) {

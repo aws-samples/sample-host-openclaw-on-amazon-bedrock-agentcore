@@ -621,6 +621,164 @@ describe("WorkspaceLifecycle", () => {
     assert.equal(commits, 1);
   });
 
+  it("serializes a manual snapshot fairly between already-queued workspace turns", async () => {
+    const { WorkspaceLifecycle } = await loadLifecycle();
+    const gates = [deferred(), deferred(), deferred()];
+    const started = [deferred(), deferred(), deferred()];
+    const order = [];
+    let commitIndex = 0;
+    const current = lifecycleFixture({
+      snapshotStore: {
+        commit: async ({ reason }) => {
+          const index = commitIndex++;
+          order.push(`start-${reason}-${index}`);
+          started[index].resolve();
+          await gates[index].promise;
+          order.push(`end-${reason}-${index}`);
+          return committedHead();
+        },
+      },
+    });
+    const lifecycle = new WorkspaceLifecycle(current.options);
+    await lifecycle.initialize();
+
+    const firstTurn = await lifecycle.acquireTurn();
+    const manualSnapshot = lifecycle.requestManualSnapshot();
+    let secondAdmitted = false;
+    const secondTurnPromise = lifecycle.acquireTurn().then((turn) => {
+      secondAdmitted = true;
+      return turn;
+    });
+    const firstPersisted = lifecycle.commitAfterTurn(firstTurn);
+    await started[0].promise;
+    assert.deepEqual(order, ["start-post-turn-0"]);
+    assert.equal(secondAdmitted, false);
+
+    gates[0].resolve();
+    await firstPersisted;
+    await started[1].promise;
+    assert.deepEqual(order, [
+      "start-post-turn-0",
+      "end-post-turn-0",
+      "start-manual-1",
+    ]);
+    assert.equal(secondAdmitted, false);
+
+    gates[1].resolve();
+    assert.deepEqual(await manualSnapshot, committedHead());
+    const secondTurn = await secondTurnPromise;
+    assert.equal(secondAdmitted, true);
+
+    const secondPersisted = lifecycle.commitAfterTurn(secondTurn);
+    await started[2].promise;
+    assert.deepEqual(order, [
+      "start-post-turn-0",
+      "end-post-turn-0",
+      "start-manual-1",
+      "end-manual-1",
+      "start-post-turn-2",
+    ]);
+    gates[2].resolve();
+    await secondPersisted;
+  });
+
+  it("waits for a legacy active turn instead of racing its manual snapshot", async () => {
+    const { WorkspaceLifecycle } = await loadLifecycle();
+    const firstCommit = deferred();
+    const manualCommit = deferred();
+    const started = [deferred(), deferred()];
+    let commitIndex = 0;
+    const current = lifecycleFixture({
+      snapshotStore: {
+        commit: async ({ reason }) => {
+          const index = commitIndex++;
+          started[index].resolve(reason);
+          await [firstCommit, manualCommit][index].promise;
+          return committedHead();
+        },
+      },
+    });
+    const lifecycle = new WorkspaceLifecycle(current.options);
+    await lifecycle.initialize();
+
+    const turn = lifecycle.beginTurn();
+    const snapshot = lifecycle.requestManualSnapshot();
+    let snapshotSettled = false;
+    void snapshot.then(
+      () => {
+        snapshotSettled = true;
+      },
+      () => {
+        snapshotSettled = true;
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(snapshotSettled, false);
+    const persisted = lifecycle.commitAfterTurn(turn);
+    assert.equal(await started[0].promise, "post-turn");
+    assert.equal(commitIndex, 1);
+
+    firstCommit.resolve();
+    await persisted;
+    assert.equal(await started[1].promise, "manual");
+    manualCommit.resolve();
+    await snapshot;
+    assert.equal(commitIndex, 2);
+  });
+
+  it("skips periodic work while an exclusive manual snapshot is pending", async () => {
+    const { WorkspaceLifecycle } = await loadLifecycle();
+    const gate = deferred();
+    const started = deferred();
+    let commits = 0;
+    const current = lifecycleFixture({
+      snapshotStore: {
+        commit: async () => {
+          commits += 1;
+          started.resolve();
+          await gate.promise;
+          return committedHead();
+        },
+      },
+    });
+    const lifecycle = new WorkspaceLifecycle(current.options);
+    await lifecycle.initialize();
+
+    const manualSnapshot = lifecycle.requestManualSnapshot();
+    const periodic = await lifecycle.requestPeriodicCommit();
+    await started.promise;
+    assert.equal(commits, 1);
+    assert.deepEqual(periodic, committedHead());
+
+    gate.resolve();
+    await manualSnapshot;
+    assert.equal(commits, 1);
+  });
+
+  it("quarantines after a manual snapshot persistence failure", async () => {
+    const { WorkspaceLifecycle } = await loadLifecycle();
+    const current = lifecycleFixture({
+      snapshotStore: {
+        commit: async () => {
+          throw new Error("manual S3 CAS failed");
+        },
+      },
+    });
+    const lifecycle = new WorkspaceLifecycle(current.options);
+    await lifecycle.initialize();
+
+    await assert.rejects(
+      lifecycle.requestManualSnapshot(),
+      (error) =>
+        error.code === "WORKSPACE_PERSISTENCE_FAILED" && error.retryable === true,
+    );
+    assert.equal(lifecycle.status().state, "QUARANTINED");
+    assert.equal(
+      lifecycle.status().quarantine.code,
+      "WORKSPACE_PERSISTENCE_FAILED",
+    );
+  });
+
   it("quarantines after a post-turn persistence failure", async () => {
     const { WorkspaceLifecycle } = await loadLifecycle();
     const current = lifecycleFixture({
