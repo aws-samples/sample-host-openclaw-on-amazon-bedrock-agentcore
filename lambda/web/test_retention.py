@@ -153,6 +153,12 @@ def test_scheduled_sweep_conditionally_deletes_only_allowlisted_expired_records(
                         "userId": "user_founder",
                         "ttl": 952,
                     },
+                    {
+                        "PK": "SCANUSER#" + "c" * 64,
+                        "SK": "SCAN#00000000001700000000#" + "d" * 32,
+                        "recordType": "PILOT_SCAN_MEASUREMENT_V1",
+                        "ttl": 953,
+                    },
                 ]
             }
 
@@ -163,8 +169,8 @@ def test_scheduled_sweep_conditionally_deletes_only_allowlisted_expired_records(
     table = Table()
     result = DynamoExpirySweeper(table, now=lambda: 1_000).sweep()
 
-    assert result == {"status": "ok", "expired": 4}
-    assert len(table.deleted) == 4
+    assert result == {"status": "ok", "expired": 5}
+    assert len(table.deleted) == 5
     assert all(
         call["ConditionExpression"] == "#ttl=:ttl"
         for call in table.deleted

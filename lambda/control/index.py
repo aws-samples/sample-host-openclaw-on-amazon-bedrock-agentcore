@@ -74,6 +74,7 @@ class ControlApplication:
         approval_producer=None,
         card_actions=None,
         draft_preparer=None,
+        scan_measurements=None,
     ) -> None:
         if not isinstance(web_origin, str) or not web_origin.startswith("https://"):
             raise ValueError("web origin must use HTTPS")
@@ -96,6 +97,12 @@ class ControlApplication:
             raise TypeError("draft preparer is invalid")
         self._card_actions = card_actions
         self._draft_preparer = draft_preparer
+        if scan_measurements is not None and any(
+            not callable(getattr(scan_measurements, method, None))
+            for method in ("start", "complete", "fail")
+        ):
+            raise TypeError("scan measurement store is invalid")
+        self._scan_measurements = scan_measurements
 
     def _ticket_url(self, *, user_id: str, return_path: str) -> str:
         ticket = self._tickets.issue(user_id=user_id, return_path=return_path)
@@ -179,7 +186,29 @@ class ControlApplication:
         chat_id: str | None,
         actor_id: str | None,
     ) -> tuple[str, dict[str, object] | None]:
-        opportunities = self._gmail.scan(user_id=user_id)
+        scan_id = (
+            self._scan_measurements.start(user_id)
+            if self._scan_measurements is not None
+            else None
+        )
+        try:
+            opportunities = self._gmail.scan(user_id=user_id)
+            if not isinstance(opportunities, list) or len(opportunities) > 3:
+                raise ControlRequestError("workflow returned invalid opportunities")
+        except Exception as error:
+            if self._scan_measurements is not None:
+                self._scan_measurements.fail(
+                    user_id,
+                    scan_id,
+                    failure_code=self._scan_failure_code(error),
+                )
+            raise
+        if self._scan_measurements is not None:
+            self._scan_measurements.complete(
+                user_id,
+                scan_id,
+                result_count=len(opportunities),
+            )
         if not opportunities:
             return "No unanswered follow-ups were found in the 3–30 day window.", None
         lines = ["I found these unanswered follow-ups:"]
@@ -227,6 +256,22 @@ class ControlApplication:
                 ]
             )
         return "\n".join(lines), telegram
+
+    @staticmethod
+    def _scan_failure_code(error: BaseException) -> str:
+        name = type(error).__name__.casefold()
+        if isinstance(error, PermissionError) or any(
+            marker in name
+            for marker in ("oauth", "credential", "authorization", "tokenenvelope")
+        ):
+            return "AUTHORIZATION"
+        if "ranker" in name:
+            return "RANKING"
+        if isinstance(error, (TimeoutError, ConnectionError, OSError)) or (
+            "provider" in name
+        ):
+            return "PROVIDER_UNAVAILABLE"
+        return "INTERNAL"
 
     @staticmethod
     def _validated_prepared(

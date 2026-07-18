@@ -106,6 +106,45 @@ class Retention:
         return {"status": "ok", "expired": 3}
 
 
+class Overview:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, user_id):
+        self.calls.append(user_id)
+        return {
+            "version": "personal-operator.pilot-overview.v1",
+            "externalEffects": False,
+            "connection": {
+                "provider": "google-gmail-readonly",
+                "status": "CONNECTED",
+                "access": "READ_ONLY",
+            },
+        }
+
+
+class Connections:
+    def __init__(self):
+        self.calls = []
+
+    def disconnect(self, user_id):
+        self.calls.append(user_id)
+        return "DISCONNECTED"
+
+
+class Scans:
+    def __init__(self):
+        self.calls = []
+
+    def feedback(self, user_id, scan_id, *, response):
+        self.calls.append((user_id, scan_id, response))
+        return {
+            "scanId": scan_id,
+            "status": "SUCCEEDED",
+            "feedback": response,
+        }
+
+
 def event(method, path, *, body=None, cookie=None, csrf=None, query=None, origin=ORIGIN):
     headers = {"origin": origin} if origin is not None else {}
     if cookie:
@@ -145,6 +184,9 @@ def setup_app():
     deletion = Deletion()
     retention = Retention()
     gmail_workspace = GmailWorkspace()
+    overview = Overview()
+    connections = Connections()
+    scans = Scans()
     app = WebApplication(
         tickets=tickets,
         sessions=sessions,
@@ -155,6 +197,9 @@ def setup_app():
         exporter=Exporter(),
         deletion=deletion,
         retention=retention,
+        overview=overview,
+        connections=connections,
+        scans=scans,
         web_origin=ORIGIN,
         google_redirect_uri=f"{ORIGIN}/oauth/google/callback",
     )
@@ -248,6 +293,107 @@ def test_oauth_pkce_flow_is_bound_to_authenticated_browser_session():
     assert completed["statusCode"] == 302
     assert completed["headers"]["Location"] == f"{ORIGIN}/connections?google=connected"
     assert oauth.calls[-1] == ("complete", USER, "state-1", "code-1")
+
+
+def test_overview_is_authenticated_and_external_effects_are_always_false():
+    app, tickets, *_ = setup_app()
+    assert app.handle(event("GET", "/api/overview"))["statusCode"] == 401
+    cookie, _ = bootstrap(app, tickets)
+
+    response = app.handle(event("GET", "/api/overview", cookie=cookie))
+
+    assert response["statusCode"] == 200
+    payload = json.loads(response["body"])
+    assert payload["externalEffects"] is False
+    assert payload["connection"]["access"] == "READ_ONLY"
+    assert app._overview.calls == [USER]
+
+
+def test_disconnect_is_csrf_bound_local_and_idempotent():
+    app, tickets, *_ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+
+    missing_csrf = app.handle(
+        event(
+            "POST",
+            "/api/connections/google-gmail-readonly/disconnect",
+            body={},
+            cookie=cookie,
+        )
+    )
+    assert missing_csrf["statusCode"] == 401
+
+    for _ in range(2):
+        response = app.handle(
+            event(
+                "POST",
+                "/api/connections/google-gmail-readonly/disconnect",
+                body={},
+                cookie=cookie,
+                csrf=csrf,
+            )
+        )
+        assert response["statusCode"] == 200
+        assert json.loads(response["body"]) == {
+            "provider": "google-gmail-readonly",
+            "status": "DISCONNECTED",
+        }
+    assert app._connections.calls == [USER, USER]
+
+
+def test_logout_revokes_only_the_current_session_and_clears_cookie():
+    app, tickets, *_ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+
+    response = app.handle(
+        event(
+            "POST",
+            "/api/session/logout",
+            body={},
+            cookie=cookie,
+            csrf=csrf,
+        )
+    )
+
+    assert response["statusCode"] == 204
+    assert response["headers"]["Set-Cookie"] == (
+        "__Host-po_session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+    )
+    assert app.handle(event("GET", "/api/overview", cookie=cookie))["statusCode"] == 401
+
+
+def test_scan_feedback_is_csrf_bound_and_accepts_only_one_bounded_bit():
+    app, tickets, *_ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+    scan_id = "scan_00000000001700000000_" + "s" * 32
+
+    rejected = app.handle(
+        event(
+            "POST",
+            f"/api/scans/{scan_id}/feedback",
+            body={"response": "Ada was useful"},
+            cookie=cookie,
+            csrf=csrf,
+        )
+    )
+    assert rejected["statusCode"] == 400
+
+    response = app.handle(
+        event(
+            "POST",
+            f"/api/scans/{scan_id}/feedback",
+            body={"response": "USEFUL"},
+            cookie=cookie,
+            csrf=csrf,
+        )
+    )
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {
+        "scanId": scan_id,
+        "feedback": "USEFUL",
+    }
+    assert app._scans.calls == [(USER, scan_id, "USEFUL")]
 
 
 def test_oauth_callback_rejects_duplicate_or_malformed_raw_query_before_oauth():

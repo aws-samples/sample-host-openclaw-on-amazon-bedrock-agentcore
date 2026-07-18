@@ -143,6 +143,21 @@ class Drafts:
         )()
 
 
+class ScanMeasurements:
+    def __init__(self):
+        self.calls = []
+
+    def start(self, user_id):
+        self.calls.append(("start", user_id))
+        return "scan_00000000001700000000_" + "s" * 32
+
+    def complete(self, user_id, scan_id, *, result_count):
+        self.calls.append(("complete", user_id, scan_id, result_count))
+
+    def fail(self, user_id, scan_id, *, failure_code):
+        self.calls.append(("fail", user_id, scan_id, failure_code))
+
+
 def app():
     return ControlApplication(
         tickets=Tickets(),
@@ -299,6 +314,60 @@ def test_scan_returns_source_backed_bounded_opportunities():
         for row in result["telegram"]["inlineKeyboard"]
         for button in row
     )
+
+
+def test_scan_records_only_typed_start_and_success_measurements():
+    scans = ScanMeasurements()
+    application = ControlApplication(
+        tickets=Tickets(),
+        gmail=Gmail(),
+        tasks=Tasks(),
+        deletion_intents=DeletionIntents(),
+        web_origin="https://app.personal-operator.example",
+        card_actions=CardActions(),
+        draft_preparer=Drafts(),
+        scan_measurements=scans,
+    )
+
+    application.handle(request("/scan"))
+
+    scan_id = "scan_00000000001700000000_" + "s" * 32
+    assert scans.calls == [
+        ("start", USER),
+        ("complete", USER, scan_id, 2),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (PermissionError("credential details"), "AUTHORIZATION"),
+        (TimeoutError("provider details"), "PROVIDER_UNAVAILABLE"),
+        (RuntimeError("model details"), "INTERNAL"),
+    ],
+)
+def test_scan_failure_measurement_is_bounded_and_never_contains_error_text(error, code):
+    class FailingGmail:
+        def scan(self, *, user_id):
+            raise error
+
+    scans = ScanMeasurements()
+    application = ControlApplication(
+        tickets=Tickets(),
+        gmail=FailingGmail(),
+        tasks=Tasks(),
+        deletion_intents=DeletionIntents(),
+        web_origin="https://app.personal-operator.example",
+        card_actions=CardActions(),
+        draft_preparer=Drafts(),
+        scan_measurements=scans,
+    )
+
+    with pytest.raises(type(error)):
+        application.handle(request("/scan"))
+
+    assert scans.calls[-1][-1] == code
+    assert "details" not in repr(scans.calls)
 
 
 def test_three_worst_case_cards_still_fit_one_escaped_telegram_message():

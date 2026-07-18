@@ -13,6 +13,7 @@ from actions.state_machine import ActionStateMachine, ApprovalService, ApprovalT
 from .index import ControlApplication
 from .telegram_cards import DynamoTelegramCardActions, ReadOnlyGmailDraftPreparer
 from web.auth import SignedConnectTickets
+from web.measurements import DynamoScanMeasurements
 from web.stores import DynamoWebStore
 from workflows.founder_approval import FounderApprovalProducer
 from workflows.gmail.oauth import CryptographyAesGcm, GoogleOAuthTokenClient, KmsEnvelopeTokenVault
@@ -410,4 +411,8 @@ def build_production_application() -> ControlApplication:
         ),
         card_actions=DynamoTelegramCardActions(table),
         draft_preparer=ReadOnlyGmailDraftPreparer(repository),
+        scan_measurements=DynamoScanMeasurements(
+            table,
+            identity_key=web_secret,
+        ),
     )

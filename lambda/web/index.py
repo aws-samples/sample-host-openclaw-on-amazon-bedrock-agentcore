@@ -12,6 +12,8 @@ import time
 from typing import Callable, Mapping
 from urllib.parse import unquote_to_bytes
 
+from workflows.gmail.repository import READONLY_PROVIDER
+
 from .auth import AuthenticationError, ConnectTicketError
 from .retention import DeletionPending, ExportBoundaryError
 
@@ -24,6 +26,9 @@ _ACTION_ROUTE = re.compile(
 )
 _GMAIL_DRAFT_ROUTE = re.compile(
     r"/api/gmail/drafts/(?P<action>[A-Za-z0-9_-]{8,128})"
+)
+_SCAN_FEEDBACK_ROUTE = re.compile(
+    r"/api/scans/(?P<scan>scan_[0-9]{20}_[A-Za-z0-9_-]{32})/feedback"
 )
 _APPROVAL_PREVIEW = re.compile(r"/approve/(?P<token>[A-Za-z0-9_.-]{1,4096})")
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
@@ -196,6 +201,9 @@ class WebApplication:
         exporter,
         deletion,
         retention,
+        overview,
+        connections,
+        scans,
         web_origin: str,
         google_redirect_uri: str,
     ) -> None:
@@ -212,6 +220,15 @@ class WebApplication:
         self._exporter = exporter
         self._deletion = deletion
         self._retention = retention
+        if not callable(getattr(overview, "get", None)):
+            raise TypeError("overview service is invalid")
+        if not callable(getattr(connections, "disconnect", None)):
+            raise TypeError("connection lifecycle is invalid")
+        if not callable(getattr(scans, "feedback", None)):
+            raise TypeError("scan measurement store is invalid")
+        self._overview = overview
+        self._connections = connections
+        self._scans = scans
         self._origin = web_origin.rstrip("/")
         self._redirect = google_redirect_uri
 
@@ -355,6 +372,67 @@ class WebApplication:
                 identity = self._identity(headers)
                 return self._response(200, self._workspace.get(identity.user_id))
 
+            if method == "GET" and path == "/api/overview":
+                identity = self._identity(headers)
+                return self._response(200, self._overview.get(identity.user_id))
+
+            if (
+                method == "POST"
+                and path
+                == f"/api/connections/{READONLY_PROVIDER}/disconnect"
+            ):
+                identity = self._identity(headers, mutate=True)
+                if _json_body(event) != {}:
+                    raise ValueError("disconnect request fields are invalid")
+                status = self._connections.disconnect(identity.user_id)
+                if status != "DISCONNECTED":
+                    raise RuntimeError("connection disconnect returned invalid status")
+                return self._response(
+                    200,
+                    {"provider": READONLY_PROVIDER, "status": status},
+                )
+
+            if method == "POST" and path == "/api/session/logout":
+                self._identity(headers, mutate=True)
+                if _json_body(event) != {}:
+                    raise ValueError("logout request fields are invalid")
+                self._sessions.revoke(cookie_header=headers.get("cookie"))
+                return self._response(
+                    204,
+                    headers={
+                        "Set-Cookie": (
+                            "__Host-po_session=; Path=/; Secure; HttpOnly; "
+                            "SameSite=Lax; Max-Age=0"
+                        )
+                    },
+                )
+
+            scan_feedback = _SCAN_FEEDBACK_ROUTE.fullmatch(path or "")
+            if method == "POST" and scan_feedback:
+                identity = self._identity(headers, mutate=True)
+                body = _json_body(event)
+                if set(body) != {"response"} or body.get("response") not in {
+                    "USEFUL",
+                    "NOT_USEFUL",
+                }:
+                    raise ValueError("scan feedback is invalid")
+                scan_id = scan_feedback.group("scan")
+                result = self._scans.feedback(
+                    identity.user_id,
+                    scan_id,
+                    response=body["response"],
+                )
+                if (
+                    not isinstance(result, Mapping)
+                    or result.get("scanId") != scan_id
+                    or result.get("feedback") != body["response"]
+                ):
+                    raise RuntimeError("scan feedback result is invalid")
+                return self._response(
+                    200,
+                    {"scanId": scan_id, "feedback": body["response"]},
+                )
+
             if method == "GET" and path == "/api/gmail":
                 identity = self._identity(headers)
                 return self._response(
@@ -402,11 +480,14 @@ class WebApplication:
                 "/oauth/google/start",
                 "/oauth/google/callback",
                 "/api/workspace",
+                "/api/overview",
                 "/api/gmail",
                 "/api/export",
                 "/api/delete",
+                f"/api/connections/{READONLY_PROVIDER}/disconnect",
+                "/api/session/logout",
             }
-            if path in known_paths or action or preview or gmail_draft:
+            if path in known_paths or action or preview or gmail_draft or scan_feedback:
                 return self._response(405, {"error": "method not allowed"})
             return self._response(404, {"error": "not found"})
         except (AuthenticationError,) as error:
