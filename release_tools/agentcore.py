@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
-from release_tools.contracts import ContractError, RuntimeContextV3
+from release_tools.contracts import (
+    ContractError,
+    RuntimeConfigurationV1,
+    RuntimeContextV3,
+    expected_execution_role_arn,
+)
 
 
 REQUIRED_REGION = "eu-west-1"
@@ -15,8 +20,6 @@ _COMMIT = re.compile(r"[0-9a-f]{40}")
 _ACCOUNT = re.compile(r"[0-9]{12}")
 _RUNTIME_ID = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}")
 _VERSION = re.compile(r"[1-9][0-9]{0,4}")
-_ROLE_ARN = re.compile(r"arn:aws:iam::([0-9]{12}):role/[A-Za-z0-9_+=,.@/-]+")
-
 _PENDING = {"CREATING", "UPDATING"}
 _FAILED = {"CREATE_FAILED", "UPDATE_FAILED", "DELETING"}
 _KNOWN = _PENDING | _FAILED | {"READY"}
@@ -94,6 +97,30 @@ def _ready(status: Any, *, subject: str) -> None:
         )
 
 
+def _sorted_runtime_configuration(runtime: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy and canonicalize only the order-insensitive VPC identifier sets."""
+
+    configuration = {
+        field: runtime.get(field) for field in RuntimeConfigurationV1.FIELDS
+    }
+    network = configuration.get("networkConfiguration")
+    if not isinstance(network, Mapping):
+        return configuration
+    network_copy = dict(network)
+    vpc = network_copy.get("networkModeConfig")
+    if isinstance(vpc, Mapping):
+        vpc_copy = dict(vpc)
+        for field in ("securityGroups", "subnets"):
+            identifiers = vpc_copy.get(field)
+            if isinstance(identifiers, list) and all(
+                isinstance(value, str) for value in identifiers
+            ):
+                vpc_copy[field] = sorted(identifiers)
+        network_copy["networkModeConfig"] = vpc_copy
+    configuration["networkConfiguration"] = network_copy
+    return configuration
+
+
 class AgentCoreEvidenceAdapter:
     """Validate AgentCore using only a caller-supplied compatible client."""
 
@@ -164,8 +191,12 @@ class AgentCoreEvidenceAdapter:
         region: str,
         runtime_id: str,
         runtime_version: str,
-        expected_role_arn: str,
         runtime_image_uri: str,
+        expected_subnet_ids: Sequence[str],
+        expected_security_group_ids: Sequence[str],
+        expected_environment_variables: Mapping[str, str],
+        expected_idle_runtime_session_timeout: int,
+        expected_max_lifetime: int,
     ) -> RuntimeContextV3:
         """Collect the canonical v3 context only from exact READY resources."""
 
@@ -176,11 +207,41 @@ class AgentCoreEvidenceAdapter:
             runtime_id=runtime_id,
             runtime_version=runtime_version,
         )
-        role_match = _ROLE_ARN.fullmatch(expected_role_arn)
-        if role_match is None or role_match.group(1) != account:
-            raise AgentCoreEvidenceError(
-                "execution role ARN crosses the release account"
+        execution_role_arn = expected_execution_role_arn(account, region)
+        try:
+            expected_configuration = RuntimeConfigurationV1.from_mapping(
+                {
+                    "agentRuntimeArtifact": {
+                        "containerConfiguration": {
+                            "containerUri": runtime_image_uri
+                        }
+                    },
+                    "environmentVariables": expected_environment_variables,
+                    "filesystemConfigurations": [
+                        {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+                    ],
+                    "lifecycleConfiguration": {
+                        "idleRuntimeSessionTimeout": (
+                            expected_idle_runtime_session_timeout
+                        ),
+                        "maxLifetime": expected_max_lifetime,
+                    },
+                    "networkConfiguration": {
+                        "networkMode": "VPC",
+                        "networkModeConfig": {
+                            "securityGroups": sorted(expected_security_group_ids),
+                            "subnets": sorted(expected_subnet_ids),
+                        },
+                    },
+                    "protocolConfiguration": {"serverProtocol": "HTTP"},
+                },
+                runtime_image_uri=runtime_image_uri,
+                region=region,
             )
+        except (ContractError, TypeError) as error:
+            raise AgentCoreEvidenceError(
+                f"expected runtime configuration is invalid: {error}"
+            ) from error
         expected_endpoint_name = f"release_{source_commit}"
         runtime = self._call(
             "get_agent_runtime",
@@ -195,24 +256,22 @@ class AgentCoreEvidenceAdapter:
         if runtime.get("agentRuntimeVersion") != runtime_version:
             raise AgentCoreEvidenceError("runtime version differs from the request")
         runtime_arn = runtime.get("agentRuntimeArn")
-        if runtime.get("roleArn") != expected_role_arn:
+        if runtime.get("roleArn") != execution_role_arn:
             raise AgentCoreEvidenceError("runtime role differs from the release role")
-        if runtime.get("agentRuntimeArtifact") != {
-            "containerConfiguration": {"containerUri": runtime_image_uri}
-        }:
-            raise AgentCoreEvidenceError(
-                "runtime artifact differs from the immutable release image"
+        try:
+            live_configuration = RuntimeConfigurationV1.from_mapping(
+                _sorted_runtime_configuration(runtime),
+                runtime_image_uri=runtime_image_uri,
+                region=region,
             )
-        if runtime.get("networkConfiguration", {}).get("networkMode") != "VPC":
-            raise AgentCoreEvidenceError("runtime network mode is not VPC")
-        if runtime.get("filesystemConfigurations") != [
-            {"sessionStorage": {"mountPath": "/mnt/workspace"}}
-        ]:
+        except ContractError as error:
             raise AgentCoreEvidenceError(
-                "runtime filesystem configuration is not canonical"
+                f"live runtime configuration is invalid: {error}"
+            ) from error
+        if live_configuration != expected_configuration:
+            raise AgentCoreEvidenceError(
+                "live runtime configuration differs from reviewed release configuration"
             )
-        if runtime.get("protocolConfiguration") != {"serverProtocol": "HTTP"}:
-            raise AgentCoreEvidenceError("runtime protocol is not HTTP")
 
         endpoint = self._call(
             "get_agent_runtime_endpoint",
@@ -245,6 +304,11 @@ class AgentCoreEvidenceAdapter:
                     "runtimeArn": runtime_arn,
                     "runtimeVersion": runtime_version,
                     "runtimeImageUri": runtime_image_uri,
+                    "executionRoleArn": execution_role_arn,
+                    "runtimeConfiguration": live_configuration.to_mapping(),
+                    "runtimeConfigurationSha256": (
+                        live_configuration.digest_for_role(execution_role_arn)
+                    ),
                 }
             )
         except ContractError as error:

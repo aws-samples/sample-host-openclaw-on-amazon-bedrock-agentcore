@@ -42,8 +42,68 @@ def _json(value: object) -> bytes:
 SBOM_BLOB = _json(
     {
         "SPDXID": "SPDXRef-DOCUMENT",
+        "creationInfo": {
+            "created": "2026-07-18T00:00:00Z",
+            "creators": ["Tool: personal-operator-release-builder-1.0"],
+        },
         "dataLicense": "CC0-1.0",
+        "documentNamespace": (
+            "https://personal-operator.invalid/spdx/"
+            + DIGEST.removeprefix("sha256:")
+        ),
+        "files": [
+            {
+                "SPDXID": "SPDXRef-File-agentcore-contract",
+                "checksums": [
+                    {"algorithm": "SHA256", "checksumValue": "d" * 64}
+                ],
+                "copyrightText": "NOASSERTION",
+                "fileName": "/opt/app/bridge/agentcore-contract.js",
+                "licenseConcluded": "NOASSERTION",
+            }
+        ],
         "name": "personal-operator-bridge",
+        "packages": [
+            {
+                "SPDXID": "SPDXRef-Package-runtime-image",
+                "checksums": [
+                    {
+                        "algorithm": "SHA256",
+                        "checksumValue": DIGEST.removeprefix("sha256:"),
+                    }
+                ],
+                "copyrightText": "NOASSERTION",
+                "downloadLocation": "NOASSERTION",
+                "externalRefs": [
+                    {
+                        "referenceCategory": "PACKAGE-MANAGER",
+                        "referenceLocator": (
+                            "pkg:oci/personal-operator/bridge@" + DIGEST
+                        ),
+                        "referenceType": "purl",
+                    }
+                ],
+                "filesAnalyzed": True,
+                "licenseConcluded": "NOASSERTION",
+                "licenseDeclared": "NOASSERTION",
+                "name": "personal-operator/bridge",
+                "packageVerificationCode": {
+                    "packageVerificationCodeValue": "e" * 40
+                },
+            }
+        ],
+        "relationships": [
+            {
+                "relatedSpdxElement": "SPDXRef-Package-runtime-image",
+                "relationshipType": "DESCRIBES",
+                "spdxElementId": "SPDXRef-DOCUMENT",
+            },
+            {
+                "relatedSpdxElement": "SPDXRef-File-agentcore-contract",
+                "relationshipType": "CONTAINS",
+                "spdxElementId": "SPDXRef-Package-runtime-image",
+            },
+        ],
         "spdxVersion": "SPDX-2.3",
     }
 )
@@ -340,6 +400,50 @@ def _replace_provenance(
     )
 
 
+def _replace_sbom(
+    responses: dict[str, object],
+    blob: bytes,
+) -> FakeBlobReader:
+    manifest = _artifact_manifest(SBOM_ARTIFACT_TYPE, blob)
+    manifest_digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
+    layer_digest = "sha256:" + hashlib.sha256(blob).hexdigest()
+    referrers = responses["list_image_referrers"]["referrers"]  # type: ignore[index]
+    item = next(
+        value
+        for value in referrers
+        if value["artifactType"] == SBOM_ARTIFACT_TYPE
+    )
+    item["digest"] = manifest_digest
+    item["size"] = len(manifest)
+    responses["batch_get_image"] = {  # type: ignore[index]
+        **responses["batch_get_image"],  # type: ignore[index]
+        manifest_digest: {
+            "failures": [],
+            "images": [
+                {
+                    "imageId": {"imageDigest": manifest_digest},
+                    "imageManifest": manifest.decode("utf-8"),
+                    "imageManifestMediaType": (
+                        "application/vnd.oci.image.manifest.v1+json"
+                    ),
+                    "registryId": ACCOUNT,
+                    "repositoryName": "personal-operator/bridge",
+                }
+            ],
+        },
+    }
+    responses["get_download_url_for_layer"] = {  # type: ignore[index]
+        **responses["get_download_url_for_layer"],  # type: ignore[index]
+        layer_digest: {
+            "downloadUrl": "memory://sbom",
+            "layerDigest": layer_digest,
+        },
+    }
+    return FakeBlobReader(
+        {"memory://sbom": blob, "memory://provenance": PROVENANCE_BLOB}
+    )
+
+
 def test_adapter_collects_exact_immutable_image_evidence_through_fake() -> None:
     fake = FakeEcr()
 
@@ -451,6 +555,45 @@ def test_attestation_manifest_must_hash_and_name_the_exact_image_subject() -> No
 
     with pytest.raises(EcrEvidenceError, match="manifest digest"):
         _collect(FakeEcr(responses))
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda value: value.clear()
+            or value.update(
+                {
+                    "SPDXID": "SPDXRef-DOCUMENT",
+                    "dataLicense": "CC0-1.0",
+                    "name": "empty-runtime-image",
+                    "spdxVersion": "SPDX-2.3",
+                }
+            ),
+            "SPDX",
+        ),
+        (lambda value: value.update(files=[]), "inventory"),
+        (
+            lambda value: value["packages"][0]["checksums"][0].update(
+                checksumValue="0" * 64
+            ),
+            "subject",
+        ),
+        (lambda value: value.update(relationships=[]), "relationship"),
+    ],
+)
+def test_sbom_requires_subject_bound_inventory_and_relationship_coverage(
+    mutate,
+    message: str,
+) -> None:
+    sbom = json.loads(SBOM_BLOB)
+    mutate(sbom)
+    blob = _json(sbom)
+    responses = _responses()
+    reader = _replace_sbom(responses, blob)
+
+    with pytest.raises(EcrEvidenceError, match=message):
+        _collect(FakeEcr(responses), reader)
 
 
 @pytest.mark.parametrize(

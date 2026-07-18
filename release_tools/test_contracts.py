@@ -35,6 +35,55 @@ RUNTIME_ARN = (
     f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:agent/"
     "12345678-1234-1234-1234-123456789abc:7"
 )
+ROLE_ARN = (
+    f"arn:aws:iam::{ACCOUNT}:role/"
+    f"openclaw-agentcore-execution-role-{REGION}"
+)
+SUBNET_IDS = ("subnet-00000000000000001", "subnet-00000000000000002")
+SECURITY_GROUP_IDS = ("sg-00000000000000001",)
+RUNTIME_ENVIRONMENT = {
+    "AWS_DEFAULT_REGION": REGION,
+    "AWS_REGION": REGION,
+    "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+    "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
+    "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": "workspace-credential-broker",
+    "WORKSPACE_SYNC_INTERVAL_MS": "300000",
+}
+
+
+def _runtime_configuration() -> dict[str, object]:
+    return {
+        "agentRuntimeArtifact": {
+            "containerConfiguration": {"containerUri": IMAGE_URI}
+        },
+        "environmentVariables": dict(RUNTIME_ENVIRONMENT),
+        "filesystemConfigurations": [
+            {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+        ],
+        "lifecycleConfiguration": {
+            "idleRuntimeSessionTimeout": 1800,
+            "maxLifetime": 28800,
+        },
+        "networkConfiguration": {
+            "networkMode": "VPC",
+            "networkModeConfig": {
+                "securityGroups": list(SECURITY_GROUP_IDS),
+                "subnets": list(SUBNET_IDS),
+            },
+        },
+        "protocolConfiguration": {"serverProtocol": "HTTP"},
+    }
+
+
+def _runtime_configuration_sha256() -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "executionRoleArn": ROLE_ARN,
+                "runtimeConfiguration": _runtime_configuration(),
+            }
+        )
+    ).hexdigest()
 
 
 def _runtime_context() -> dict[str, object]:
@@ -49,6 +98,9 @@ def _runtime_context() -> dict[str, object]:
         "runtimeArn": RUNTIME_ARN,
         "runtimeVersion": "7",
         "runtimeImageUri": IMAGE_URI,
+        "executionRoleArn": ROLE_ARN,
+        "runtimeConfiguration": _runtime_configuration(),
+        "runtimeConfigurationSha256": _runtime_configuration_sha256(),
     }
 
 
@@ -128,10 +180,53 @@ def _transaction() -> dict[str, object]:
         "runtimeVersion": "",
         "runtimeEndpointName": f"release_{COMMIT}",
         "runtimeContextSha256": "",
+        "consumerChangesetsSha256": "",
+        "consumerApplicationSha256": "",
+        "verificationSha256": "",
         "rollbackReference": "",
         "uncertainPhase": "",
         "uncertainOperationSha256": "",
     }
+
+
+def _transaction_at(state: str) -> dict[str, object]:
+    states = (
+        "NEW",
+        "PREFLIGHTED",
+        "FOUNDATION_READY",
+        "IMAGE_PUBLISHED",
+        "RUNTIME_READY",
+        "ENDPOINT_READY",
+        "CONTEXT_WRITTEN",
+        "CONSUMER_CHANGESETS_READY",
+        "CONSUMERS_APPLIED",
+        "VERIFIED",
+    )
+    index = states.index(state)
+    value = {
+        **_transaction(),
+        "state": state,
+        "lastStableState": state,
+        "revision": index,
+    }
+    if index >= states.index("FOUNDATION_READY"):
+        value["rollbackReference"] = (
+            f"rollback:v1:{ACCOUNT}:{REGION}:{COMMIT}:sha256:" + "9" * 64
+        )
+    if index >= states.index("IMAGE_PUBLISHED"):
+        value["runtimeImageDigest"] = DIGEST
+    if index >= states.index("RUNTIME_READY"):
+        value["runtimeId"] = RUNTIME_ID
+        value["runtimeVersion"] = "7"
+    if index >= states.index("CONTEXT_WRITTEN"):
+        value["runtimeContextSha256"] = "5" * 64
+    if index >= states.index("CONSUMER_CHANGESETS_READY"):
+        value["consumerChangesetsSha256"] = "6" * 64
+    if index >= states.index("CONSUMERS_APPLIED"):
+        value["consumerApplicationSha256"] = "7" * 64
+    if index >= states.index("VERIFIED"):
+        value["verificationSha256"] = "8" * 64
+    return value
 
 
 def test_runtime_context_v3_is_exact_canonical_and_immutable() -> None:
@@ -165,6 +260,51 @@ def test_runtime_context_v3_is_exact_canonical_and_immutable() -> None:
     ],
 )
 def test_runtime_context_rejects_extra_cross_boundary_or_mutable_values(
+    mutate, match: str
+) -> None:
+    value = _runtime_context()
+    mutate(value)
+
+    with pytest.raises(ContractError, match=match):
+        RuntimeContextV3.from_mapping(value)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (
+            lambda value: value.update(
+                executionRoleArn=(
+                    f"arn:aws:iam::{ACCOUNT}:role/caller-selected-same-account-role"
+                )
+            ),
+            "execution role",
+        ),
+        (
+            lambda value: value["runtimeConfiguration"][  # type: ignore[index]
+                "environmentVariables"
+            ].update(AWS_SECRET_ACCESS_KEY="not-a-real-secret"),
+            "environment",
+        ),
+        (
+            lambda value: value["runtimeConfiguration"][  # type: ignore[index]
+                "environmentVariables"
+            ].update(AWS_REGION="us-east-1"),
+            "environment",
+        ),
+        (
+            lambda value: value["runtimeConfiguration"][  # type: ignore[index]
+                "networkConfiguration"
+            ]["networkModeConfig"].update(subnets=["subnet-99999999999999999"]),
+            "configuration digest",
+        ),
+        (
+            lambda value: value.update(runtimeConfigurationSha256="0" * 64),
+            "configuration digest",
+        ),
+    ],
+)
+def test_runtime_context_binds_deterministic_role_and_complete_configuration(
     mutate, match: str
 ) -> None:
     value = _runtime_context()
@@ -288,6 +428,59 @@ def test_uncertain_transaction_is_bound_to_one_exact_operation_digest() -> None:
     with pytest.raises(ContractError, match="operation"):
         StagingTransactionV1.from_mapping(
             {**_transaction(), "uncertainOperationSha256": OPERATION}
+        )
+
+
+def test_rolled_back_transaction_requires_verified_last_stable_state() -> None:
+    rolled_back = {
+        **_transaction(),
+        "state": "ROLLED_BACK",
+        "lastStableState": "FOUNDATION_READY",
+        "revision": 2,
+        "rollbackReference": (
+            f"rollback:v1:{ACCOUNT}:{REGION}:{COMMIT}:sha256:" + "9" * 64
+        ),
+    }
+
+    with pytest.raises(ContractError, match="ROLLED_BACK.*VERIFIED"):
+        StagingTransactionV1.from_mapping(rolled_back)
+
+
+@pytest.mark.parametrize(
+    ("field", "owned_state", "prior_state"),
+    [
+        (
+            "consumerChangesetsSha256",
+            "CONSUMER_CHANGESETS_READY",
+            "CONTEXT_WRITTEN",
+        ),
+        (
+            "consumerApplicationSha256",
+            "CONSUMERS_APPLIED",
+            "CONSUMER_CHANGESETS_READY",
+        ),
+        ("verificationSha256", "VERIFIED", "CONSUMERS_APPLIED"),
+    ],
+)
+def test_transaction_phase_evidence_is_exact_and_appears_only_at_owned_state(
+    field: str,
+    owned_state: str,
+    prior_state: str,
+) -> None:
+    owned = _transaction_at(owned_state)
+
+    parsed = StagingTransactionV1.from_mapping(owned)
+
+    assert parsed.to_mapping() == owned
+    with pytest.raises(ContractError, match="evidence is missing"):
+        StagingTransactionV1.from_mapping({**owned, field: ""})
+    with pytest.raises(ContractError, match="evidence appears before"):
+        StagingTransactionV1.from_mapping(
+            {**_transaction_at(prior_state), field: "f" * 64}
+        )
+    with pytest.raises(ContractError, match="digest"):
+        StagingTransactionV1.from_mapping(
+            {**owned, field: "sha256:" + "f" * 64}
         )
 
 

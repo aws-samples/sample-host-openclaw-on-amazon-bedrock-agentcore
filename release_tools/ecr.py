@@ -25,6 +25,10 @@ MAX_ATTESTATION_BLOB_BYTES = 16 * 1024 * 1024
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _ACCOUNT = re.compile(r"[0-9]{12}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_SPDX_ID = re.compile(r"SPDXRef-[A-Za-z0-9.-]+")
+_SPDX_CREATED = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+)
 
 
 class EcrClient(Protocol):
@@ -356,7 +360,7 @@ class EcrEvidenceAdapter:
         return manifest_digest.removeprefix("sha256:"), blob
 
     @staticmethod
-    def _validate_sbom(payload: bytes) -> None:
+    def _validate_sbom(payload: bytes, *, subject_digest: str) -> None:
         value = _strict_json(payload, label="SBOM")
         if (
             value.get("spdxVersion") != "SPDX-2.3"
@@ -364,8 +368,235 @@ class EcrEvidenceAdapter:
             or value.get("dataLicense") != "CC0-1.0"
             or not isinstance(value.get("name"), str)
             or not value.get("name")
+            or not isinstance(value.get("documentNamespace"), str)
+            or re.fullmatch(r"https://[^\s]+", value["documentNamespace"]) is None
+            or not isinstance(value.get("creationInfo"), dict)
         ):
             raise EcrEvidenceError("SBOM content is not a complete SPDX document")
+
+        creation = value["creationInfo"]
+        creators = creation.get("creators")
+        created = creation.get("created")
+        if (
+            not isinstance(creators, list)
+            or not creators
+            or any(
+                not isinstance(creator, str)
+                or re.fullmatch(r"(?:Tool|Organization|Person): .+", creator) is None
+                for creator in creators
+            )
+            or not isinstance(created, str)
+            or _SPDX_CREATED.fullmatch(created) is None
+        ):
+            raise EcrEvidenceError("SBOM SPDX creation information is incomplete")
+
+        packages = _list(value.get("packages"), label="SBOM package inventory")
+        files = _list(value.get("files"), label="SBOM file inventory")
+        if not packages:
+            raise EcrEvidenceError("SBOM inventory has no subject package")
+
+        element_ids = {"SPDXRef-DOCUMENT"}
+        package_ids: set[str] = set()
+        subject_ids: list[str] = []
+        subject_sha256 = subject_digest.removeprefix("sha256:")
+        subject_purl = f"pkg:oci/{REPOSITORY_NAME}@{subject_digest}"
+        package_required = {
+            "SPDXID",
+            "copyrightText",
+            "downloadLocation",
+            "filesAnalyzed",
+            "licenseConcluded",
+            "licenseDeclared",
+            "name",
+        }
+        for raw in packages:
+            package = _object(raw, label="SBOM package inventory")
+            package_id = package.get("SPDXID")
+            if (
+                not package_required.issubset(package)
+                or not isinstance(package_id, str)
+                or _SPDX_ID.fullmatch(package_id) is None
+                or package_id in element_ids
+                or not isinstance(package.get("name"), str)
+                or not package.get("name")
+                or not isinstance(package.get("downloadLocation"), str)
+                or not package.get("downloadLocation")
+                or not isinstance(package.get("filesAnalyzed"), bool)
+                or not isinstance(package.get("licenseConcluded"), str)
+                or not package.get("licenseConcluded")
+                or not isinstance(package.get("licenseDeclared"), str)
+                or not package.get("licenseDeclared")
+                or not isinstance(package.get("copyrightText"), str)
+                or not package.get("copyrightText")
+            ):
+                raise EcrEvidenceError("SBOM package inventory is malformed")
+            element_ids.add(package_id)
+            package_ids.add(package_id)
+
+            if package["filesAnalyzed"] is True:
+                verification = package.get("packageVerificationCode")
+                if (
+                    not isinstance(verification, dict)
+                    or set(verification) != {"packageVerificationCodeValue"}
+                    or not isinstance(
+                        verification.get("packageVerificationCodeValue"), str
+                    )
+                    or re.fullmatch(
+                        r"[0-9a-f]{40}",
+                        verification["packageVerificationCodeValue"],
+                    )
+                    is None
+                ):
+                    raise EcrEvidenceError(
+                        "SBOM package verification code is malformed"
+                    )
+
+            checksums = package.get("checksums")
+            package_sha256 = EcrEvidenceAdapter._spdx_sha256(
+                checksums,
+                label="SBOM package",
+                required=False,
+            )
+            external_refs = package.get("externalRefs", [])
+            if not isinstance(external_refs, list):
+                raise EcrEvidenceError("SBOM package external references are malformed")
+            purls: set[str] = set()
+            for raw_ref in external_refs:
+                reference = _object(raw_ref, label="SBOM package external reference")
+                if set(reference) != {
+                    "referenceCategory",
+                    "referenceLocator",
+                    "referenceType",
+                }:
+                    raise EcrEvidenceError(
+                        "SBOM package external reference is malformed"
+                    )
+                if (
+                    reference["referenceCategory"] == "PACKAGE-MANAGER"
+                    and reference["referenceType"] == "purl"
+                    and isinstance(reference["referenceLocator"], str)
+                ):
+                    purls.add(reference["referenceLocator"])
+            if (
+                package["name"] == REPOSITORY_NAME
+                and package_sha256 == subject_sha256
+                and subject_purl in purls
+            ):
+                subject_ids.append(package_id)
+
+        file_ids: set[str] = set()
+        file_required = {
+            "SPDXID",
+            "checksums",
+            "copyrightText",
+            "fileName",
+            "licenseConcluded",
+        }
+        for raw in files:
+            file = _object(raw, label="SBOM file inventory")
+            file_id = file.get("SPDXID")
+            if (
+                not file_required.issubset(file)
+                or not isinstance(file_id, str)
+                or _SPDX_ID.fullmatch(file_id) is None
+                or file_id in element_ids
+                or not isinstance(file.get("fileName"), str)
+                or not file.get("fileName")
+                or not isinstance(file.get("licenseConcluded"), str)
+                or not file.get("licenseConcluded")
+                or not isinstance(file.get("copyrightText"), str)
+                or not file.get("copyrightText")
+            ):
+                raise EcrEvidenceError("SBOM file inventory is malformed")
+            EcrEvidenceAdapter._spdx_sha256(
+                file["checksums"],
+                label="SBOM file",
+                required=True,
+            )
+            element_ids.add(file_id)
+            file_ids.add(file_id)
+
+        if len(subject_ids) != 1:
+            raise EcrEvidenceError(
+                "SBOM subject package does not bind the exact runtime image"
+            )
+        subject_id = subject_ids[0]
+        inventory_ids = (package_ids - {subject_id}) | file_ids
+        if not inventory_ids:
+            raise EcrEvidenceError("SBOM inventory contains no runtime contents")
+
+        relationships = _list(
+            value.get("relationships"),
+            label="SBOM relationship inventory",
+        )
+        if not relationships:
+            raise EcrEvidenceError("SBOM relationship inventory is empty")
+        relationship_set: set[tuple[str, str, str]] = set()
+        for raw in relationships:
+            relationship = _object(raw, label="SBOM relationship")
+            required = {
+                "relatedSpdxElement",
+                "relationshipType",
+                "spdxElementId",
+            }
+            if not required.issubset(relationship) or set(relationship) - (
+                required | {"comment"}
+            ):
+                raise EcrEvidenceError("SBOM relationship is malformed")
+            triple = (
+                relationship["spdxElementId"],
+                relationship["relationshipType"],
+                relationship["relatedSpdxElement"],
+            )
+            if (
+                any(not isinstance(item, str) or not item for item in triple)
+                or triple[0] not in element_ids
+                or triple[2] not in element_ids
+                or triple in relationship_set
+            ):
+                raise EcrEvidenceError("SBOM relationship is ambiguous or dangling")
+            relationship_set.add(triple)
+        if (
+            "SPDXRef-DOCUMENT",
+            "DESCRIBES",
+            subject_id,
+        ) not in relationship_set:
+            raise EcrEvidenceError("SBOM relationship does not describe the image")
+        uncovered = {
+            item
+            for item in inventory_ids
+            if (subject_id, "CONTAINS", item) not in relationship_set
+        }
+        if uncovered:
+            raise EcrEvidenceError(
+                "SBOM relationship coverage omits runtime inventory"
+            )
+
+    @staticmethod
+    def _spdx_sha256(
+        raw: Any,
+        *,
+        label: str,
+        required: bool,
+    ) -> str | None:
+        if raw is None and not required:
+            return None
+        checksums = _list(raw, label=f"{label} checksum")
+        observed: list[str] = []
+        for raw_checksum in checksums:
+            checksum = _object(raw_checksum, label=f"{label} checksum")
+            value = checksum.get("checksumValue")
+            if (
+                set(checksum) != {"algorithm", "checksumValue"}
+                or checksum.get("algorithm") != "SHA256"
+                or not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            ):
+                raise EcrEvidenceError(f"{label} checksum is malformed")
+            observed.append(value)
+        if len(observed) > 1 or (required and len(observed) != 1):
+            raise EcrEvidenceError(f"{label} checksum is ambiguous or missing")
+        return observed[0] if observed else None
 
     @staticmethod
     def _validate_provenance(
@@ -495,7 +726,7 @@ class EcrEvidenceAdapter:
             artifact_type=PROVENANCE_ARTIFACT_TYPE,
             referrer=by_type[PROVENANCE_ARTIFACT_TYPE][0],
         )
-        self._validate_sbom(sbom_blob)
+        self._validate_sbom(sbom_blob, subject_digest=digest)
         self._validate_provenance(
             provenance_blob,
             subject_digest=digest,

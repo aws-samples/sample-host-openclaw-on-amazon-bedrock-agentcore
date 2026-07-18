@@ -31,6 +31,18 @@ IMAGE_URI = (
     f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/"
     "personal-operator/bridge@sha256:" + "b" * 64
 )
+SUBNET_IDS = ("subnet-00000000000000001", "subnet-00000000000000002")
+SECURITY_GROUP_IDS = ("sg-00000000000000001",)
+ENVIRONMENT = {
+    "AWS_DEFAULT_REGION": REGION,
+    "AWS_REGION": REGION,
+    "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+    "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
+    "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": "workspace-credential-broker",
+    "WORKSPACE_SYNC_INTERVAL_MS": "300000",
+}
+IDLE_TIMEOUT = 1800
+MAX_LIFETIME = 28800
 
 
 def _runtime(**overrides):
@@ -44,11 +56,22 @@ def _runtime(**overrides):
         "agentRuntimeArtifact": {
             "containerConfiguration": {"containerUri": IMAGE_URI}
         },
-        "networkConfiguration": {"networkMode": "VPC"},
+        "networkConfiguration": {
+            "networkMode": "VPC",
+            "networkModeConfig": {
+                "securityGroups": list(SECURITY_GROUP_IDS),
+                "subnets": list(SUBNET_IDS),
+            },
+        },
+        "environmentVariables": dict(ENVIRONMENT),
         "filesystemConfigurations": [
             {"sessionStorage": {"mountPath": "/mnt/workspace"}}
         ],
         "protocolConfiguration": {"serverProtocol": "HTTP"},
+        "lifecycleConfiguration": {
+            "idleRuntimeSessionTimeout": IDLE_TIMEOUT,
+            "maxLifetime": MAX_LIFETIME,
+        },
     }
     value.update(overrides)
     return value
@@ -102,8 +125,12 @@ def _collect(adapter: AgentCoreEvidenceAdapter):
         region=REGION,
         runtime_id=RUNTIME_ID,
         runtime_version=VERSION,
-        expected_role_arn=ROLE_ARN,
         runtime_image_uri=IMAGE_URI,
+        expected_subnet_ids=SUBNET_IDS,
+        expected_security_group_ids=SECURITY_GROUP_IDS,
+        expected_environment_variables=ENVIRONMENT,
+        expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
+        expected_max_lifetime=MAX_LIFETIME,
     )
 
 
@@ -119,6 +146,10 @@ def test_collects_one_ready_digest_bound_runtime_context() -> None:
     assert context.runtime_version == VERSION
     assert context.runtime_arn == RUNTIME_ARN
     assert context.runtime_image_uri == IMAGE_URI
+    assert context.execution_role_arn == ROLE_ARN
+    assert context.runtime_configuration.subnet_ids == SUBNET_IDS
+    assert context.runtime_configuration.security_group_ids == SECURITY_GROUP_IDS
+    assert len(context.runtime_configuration_sha256) == 64
     assert fake.calls == [
         (
             "get_agent_runtime",
@@ -189,7 +220,58 @@ def test_unknown_pending_and_failed_states_are_not_release_evidence(
     ("subject", "replacement"),
     [
         ("runtime", {"agentRuntimeArtifact": {"containerConfiguration": {"containerUri": IMAGE_URI.replace("b", "c")}}}),
-        ("runtime", {"roleArn": ROLE_ARN.replace(ACCOUNT, "999999999999")}),
+        ("runtime", {"roleArn": f"arn:aws:iam::{ACCOUNT}:role/caller-selected"}),
+        (
+            "runtime",
+            {
+                "networkConfiguration": {
+                    "networkMode": "VPC",
+                    "networkModeConfig": {
+                        "securityGroups": list(SECURITY_GROUP_IDS),
+                        "subnets": ["subnet-99999999999999999"],
+                    },
+                }
+            },
+        ),
+        (
+            "runtime",
+            {
+                "networkConfiguration": {
+                    "networkMode": "VPC",
+                    "networkModeConfig": {
+                        "securityGroups": ["sg-99999999999999999"],
+                        "subnets": list(SUBNET_IDS),
+                    },
+                }
+            },
+        ),
+        (
+            "runtime",
+            {
+                "environmentVariables": {
+                    **ENVIRONMENT,
+                    "AWS_SECRET_ACCESS_KEY": "not-a-real-secret",
+                }
+            },
+        ),
+        (
+            "runtime",
+            {
+                "environmentVariables": {
+                    **ENVIRONMENT,
+                    "AWS_DEFAULT_REGION": "us-east-1",
+                }
+            },
+        ),
+        (
+            "runtime",
+            {
+                "lifecycleConfiguration": {
+                    "idleRuntimeSessionTimeout": IDLE_TIMEOUT,
+                    "maxLifetime": MAX_LIFETIME + 1,
+                }
+            },
+        ),
         ("runtime", {"filesystemConfigurations": []}),
         ("runtime", {"protocolConfiguration": {"serverProtocol": "HTTPS"}}),
         ("endpoint", {"liveVersion": "6"}),
@@ -218,6 +300,31 @@ def test_timeout_after_dispatch_is_ambiguous() -> None:
 
     with pytest.raises(AgentCoreEvidenceAmbiguous, match="authoritative"):
         _collect(AgentCoreEvidenceAdapter(fake))
+
+
+def test_unreviewed_expected_environment_is_rejected_before_live_calls() -> None:
+    fake = FakeAgentCore()
+    adapter = AgentCoreEvidenceAdapter(fake)
+
+    with pytest.raises(AgentCoreEvidenceError, match="environment"):
+        adapter.collect_context(
+            source_commit=COMMIT,
+            account=ACCOUNT,
+            region=REGION,
+            runtime_id=RUNTIME_ID,
+            runtime_version=VERSION,
+            runtime_image_uri=IMAGE_URI,
+            expected_subnet_ids=SUBNET_IDS,
+            expected_security_group_ids=SECURITY_GROUP_IDS,
+            expected_environment_variables={
+                **ENVIRONMENT,
+                "AWS_ACCESS_KEY_ID": "not-a-real-key",
+            },
+            expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
+            expected_max_lifetime=MAX_LIFETIME,
+        )
+
+    assert fake.calls == []
 
 
 def test_paginated_or_duplicate_endpoint_lookup_is_ambiguous() -> None:

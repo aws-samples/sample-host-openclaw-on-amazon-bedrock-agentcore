@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -29,6 +30,26 @@ _BUILDER_IMAGE = re.compile(
 )
 _BUILDER_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _SIGNING_PROFILE_NAME = "personal_operator_bridge"
+_SUBNET_ID = re.compile(r"subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})")
+_SECURITY_GROUP_ID = re.compile(r"sg-(?:[0-9a-f]{8}|[0-9a-f]{17})")
+
+_REQUIRED_RUNTIME_ENVIRONMENT = frozenset(
+    {
+        "AWS_DEFAULT_REGION",
+        "AWS_REGION",
+        "BEDROCK_MODEL_ID",
+        "S3_USER_FILES_BUCKET",
+        "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME",
+        "WORKSPACE_SYNC_INTERVAL_MS",
+    }
+)
+_OPTIONAL_RUNTIME_ENVIRONMENT = frozenset(
+    {
+        "BEDROCK_GUARDRAIL_ID",
+        "BEDROCK_GUARDRAIL_VERSION",
+        "SUBAGENT_BEDROCK_MODEL_ID",
+    }
+)
 
 
 class ContractError(ValueError):
@@ -187,6 +208,200 @@ class CanonicalContract(Protocol):
     def to_bytes(self) -> bytes: ...
 
 
+def expected_execution_role_arn(account: str, region: str) -> str:
+    """Return the only execution role that can satisfy this release contract."""
+
+    return (
+        f"arn:aws:iam::{account}:role/"
+        f"openclaw-agentcore-execution-role-{region}"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeConfigurationV1:
+    """Immutable canonical subset of every trust-bearing AgentCore setting."""
+
+    FIELDS: ClassVar[set[str]] = {
+        "agentRuntimeArtifact",
+        "environmentVariables",
+        "filesystemConfigurations",
+        "lifecycleConfiguration",
+        "networkConfiguration",
+        "protocolConfiguration",
+    }
+
+    runtime_image_uri: str
+    subnet_ids: tuple[str, ...]
+    security_group_ids: tuple[str, ...]
+    environment_variables: tuple[tuple[str, str], ...]
+    idle_runtime_session_timeout: int
+    max_lifetime: int
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: Mapping[str, Any],
+        *,
+        runtime_image_uri: str,
+        region: str,
+    ) -> "RuntimeConfigurationV1":
+        value = _exact_object(raw, cls.FIELDS, label="runtime configuration")
+
+        artifact = _exact_object(
+            value["agentRuntimeArtifact"],
+            {"containerConfiguration"},
+            label="runtime artifact",
+        )
+        container = _exact_object(
+            artifact["containerConfiguration"],
+            {"containerUri"},
+            label="runtime container configuration",
+        )
+        if container["containerUri"] != runtime_image_uri:
+            raise ContractError("runtime configuration image differs")
+
+        network = _exact_object(
+            value["networkConfiguration"],
+            {"networkMode", "networkModeConfig"},
+            label="runtime network configuration",
+        )
+        if network["networkMode"] != "VPC":
+            raise ContractError("runtime network configuration is not VPC")
+        vpc = _exact_object(
+            network["networkModeConfig"],
+            {"securityGroups", "subnets"},
+            label="runtime VPC configuration",
+        )
+        subnet_ids = cls._identifiers(
+            vpc["subnets"], pattern=_SUBNET_ID, label="runtime subnet"
+        )
+        security_group_ids = cls._identifiers(
+            vpc["securityGroups"],
+            pattern=_SECURITY_GROUP_ID,
+            label="runtime security group",
+        )
+
+        environment = value["environmentVariables"]
+        if not isinstance(environment, Mapping):
+            raise ContractError("runtime environment is malformed")
+        keys = set(environment)
+        allowed = _REQUIRED_RUNTIME_ENVIRONMENT | _OPTIONAL_RUNTIME_ENVIRONMENT
+        if not _REQUIRED_RUNTIME_ENVIRONMENT.issubset(keys) or not keys <= allowed:
+            raise ContractError("runtime environment contains missing or unreviewed fields")
+        if any(
+            not isinstance(key, str)
+            or not isinstance(item, str)
+            or not item
+            for key, item in environment.items()
+        ):
+            raise ContractError("runtime environment contains an invalid value")
+        if (
+            environment["AWS_REGION"] != region
+            or environment["AWS_DEFAULT_REGION"] != region
+        ):
+            raise ContractError("runtime environment region is not release-bound")
+        if re.fullmatch(r"[1-9][0-9]*", environment["WORKSPACE_SYNC_INTERVAL_MS"]) is None:
+            raise ContractError("runtime environment sync interval is invalid")
+        guardrail_fields = {
+            "BEDROCK_GUARDRAIL_ID",
+            "BEDROCK_GUARDRAIL_VERSION",
+        }
+        if keys & guardrail_fields and not guardrail_fields <= keys:
+            raise ContractError("runtime environment guardrail fields are incomplete")
+        if (
+            "BEDROCK_GUARDRAIL_VERSION" in environment
+            and environment["BEDROCK_GUARDRAIL_VERSION"] != "DRAFT"
+        ):
+            raise ContractError("runtime environment guardrail version is invalid")
+
+        if value["filesystemConfigurations"] != [
+            {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+        ]:
+            raise ContractError("runtime filesystem configuration is not canonical")
+        if value["protocolConfiguration"] != {"serverProtocol": "HTTP"}:
+            raise ContractError("runtime protocol configuration is not HTTP")
+
+        lifecycle = _exact_object(
+            value["lifecycleConfiguration"],
+            {"idleRuntimeSessionTimeout", "maxLifetime"},
+            label="runtime lifecycle configuration",
+        )
+        idle_timeout = _count(
+            lifecycle["idleRuntimeSessionTimeout"],
+            field="runtime idle timeout",
+            minimum=1,
+        )
+        max_lifetime = _count(
+            lifecycle["maxLifetime"],
+            field="runtime maximum lifetime",
+            minimum=1,
+        )
+        if max_lifetime < idle_timeout:
+            raise ContractError("runtime lifecycle maximum is below its idle timeout")
+
+        return cls(
+            runtime_image_uri=runtime_image_uri,
+            subnet_ids=subnet_ids,
+            security_group_ids=security_group_ids,
+            environment_variables=tuple(sorted(environment.items())),
+            idle_runtime_session_timeout=idle_timeout,
+            max_lifetime=max_lifetime,
+        )
+
+    @staticmethod
+    def _identifiers(
+        raw: Any,
+        *,
+        pattern: re.Pattern[str],
+        label: str,
+    ) -> tuple[str, ...]:
+        if (
+            not isinstance(raw, list)
+            or not raw
+            or any(
+                not isinstance(value, str) or pattern.fullmatch(value) is None
+                for value in raw
+            )
+            or raw != sorted(raw)
+            or len(set(raw)) != len(raw)
+        ):
+            raise ContractError(f"{label} inventory is not exact and canonical")
+        return tuple(raw)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "agentRuntimeArtifact": {
+                "containerConfiguration": {"containerUri": self.runtime_image_uri}
+            },
+            "environmentVariables": dict(self.environment_variables),
+            "filesystemConfigurations": [
+                {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+            ],
+            "lifecycleConfiguration": {
+                "idleRuntimeSessionTimeout": self.idle_runtime_session_timeout,
+                "maxLifetime": self.max_lifetime,
+            },
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": {
+                    "securityGroups": list(self.security_group_ids),
+                    "subnets": list(self.subnet_ids),
+                },
+            },
+            "protocolConfiguration": {"serverProtocol": "HTTP"},
+        }
+
+    def digest_for_role(self, execution_role_arn: str) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "executionRoleArn": execution_role_arn,
+                    "runtimeConfiguration": self.to_mapping(),
+                }
+            )
+        ).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeContextV3:
     SCHEMA: ClassVar[str] = "personal-operator.runtime-context.v3"
@@ -201,6 +416,9 @@ class RuntimeContextV3:
         "runtimeArn",
         "runtimeVersion",
         "runtimeImageUri",
+        "executionRoleArn",
+        "runtimeConfiguration",
+        "runtimeConfigurationSha256",
     }
 
     source_commit: str
@@ -212,6 +430,9 @@ class RuntimeContextV3:
     runtime_arn: str
     runtime_version: str
     runtime_image_uri: str
+    execution_role_arn: str
+    runtime_configuration: RuntimeConfigurationV1
+    runtime_configuration_sha256: str
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "RuntimeContextV3":
@@ -245,6 +466,21 @@ class RuntimeContextV3:
         if digest_match is None:
             raise ContractError("runtime image URI must be immutable")
         image_uri = _image_uri(account, region, digest_match.group(1), value["runtimeImageUri"])
+        role_arn = _text(value["executionRoleArn"], field="execution role ARN")
+        if role_arn != expected_execution_role_arn(account, region):
+            raise ContractError("execution role ARN is not deterministic for the release")
+        configuration = RuntimeConfigurationV1.from_mapping(
+            value["runtimeConfiguration"],
+            runtime_image_uri=image_uri,
+            region=region,
+        )
+        configuration_sha256 = _text(
+            value["runtimeConfigurationSha256"],
+            field="runtime configuration digest",
+            pattern=_SHA_64,
+        )
+        if configuration_sha256 != configuration.digest_for_role(role_arn):
+            raise ContractError("runtime configuration digest differs from exact bytes")
         return cls(
             source_commit=commit,
             account=account,
@@ -255,6 +491,9 @@ class RuntimeContextV3:
             runtime_arn=runtime_arn,
             runtime_version=version,
             runtime_image_uri=image_uri,
+            execution_role_arn=role_arn,
+            runtime_configuration=configuration,
+            runtime_configuration_sha256=configuration_sha256,
         )
 
     @classmethod
@@ -273,6 +512,9 @@ class RuntimeContextV3:
             "runtimeArn": self.runtime_arn,
             "runtimeVersion": self.runtime_version,
             "runtimeImageUri": self.runtime_image_uri,
+            "executionRoleArn": self.execution_role_arn,
+            "runtimeConfiguration": self.runtime_configuration.to_mapping(),
+            "runtimeConfigurationSha256": self.runtime_configuration_sha256,
         }
 
     def to_bytes(self) -> bytes:
@@ -660,6 +902,9 @@ class StagingTransactionV1:
         "runtimeVersion",
         "runtimeEndpointName",
         "runtimeContextSha256",
+        "consumerChangesetsSha256",
+        "consumerApplicationSha256",
+        "verificationSha256",
         "rollbackReference",
         "uncertainPhase",
         "uncertainOperationSha256",
@@ -678,6 +923,9 @@ class StagingTransactionV1:
     runtime_version: str
     runtime_endpoint_name: str
     runtime_context_sha256: str
+    consumer_changesets_sha256: str
+    consumer_application_sha256: str
+    verification_sha256: str
     rollback_reference: str
     uncertain_phase: str
     uncertain_operation_sha256: str
@@ -700,6 +948,10 @@ class StagingTransactionV1:
         stable = _text(value["lastStableState"], field="last stable state")
         if stable not in LINEAR_TRANSACTION_STATES:
             raise ContractError("staging transaction last stable state is unknown")
+        if state == "ROLLED_BACK" and stable != "VERIFIED":
+            raise ContractError(
+                "ROLLED_BACK staging transaction requires VERIFIED last stable state"
+            )
         revision = _count(value["revision"], field="revision")
         image_digest = _text(value["runtimeImageDigest"], field="runtime image digest")
         if image_digest and _DIGEST.fullmatch(image_digest) is None:
@@ -716,6 +968,24 @@ class StagingTransactionV1:
         context_digest = _text(value["runtimeContextSha256"], field="runtime context digest")
         if context_digest and _SHA_64.fullmatch(context_digest) is None:
             raise ContractError("runtime context digest is invalid")
+        changesets_digest = _text(
+            value["consumerChangesetsSha256"],
+            field="consumer changesets digest",
+        )
+        if changesets_digest and _SHA_64.fullmatch(changesets_digest) is None:
+            raise ContractError("consumer changesets digest is invalid")
+        application_digest = _text(
+            value["consumerApplicationSha256"],
+            field="consumer application digest",
+        )
+        if application_digest and _SHA_64.fullmatch(application_digest) is None:
+            raise ContractError("consumer application digest is invalid")
+        verification_digest = _text(
+            value["verificationSha256"],
+            field="verification digest",
+        )
+        if verification_digest and _SHA_64.fullmatch(verification_digest) is None:
+            raise ContractError("verification digest is invalid")
         rollback = _rollback_reference(
             value["rollbackReference"], account=account, region=region, commit=commit
         )
@@ -735,6 +1005,9 @@ class StagingTransactionV1:
                     runtime_id,
                     runtime_version,
                     context_digest,
+                    changesets_digest,
+                    application_digest,
+                    verification_digest,
                     rollback,
                     uncertain_phase,
                     operation_digest,
@@ -783,6 +1056,25 @@ class StagingTransactionV1:
             raise ContractError("runtime context evidence is missing")
         if evidence_index < context_index and context_digest:
             raise ContractError("runtime context evidence appears before context publication")
+        phase_evidence = (
+            (
+                changesets_digest,
+                "CONSUMER_CHANGESETS_READY",
+                "consumer changesets",
+            ),
+            (
+                application_digest,
+                "CONSUMERS_APPLIED",
+                "consumer application",
+            ),
+            (verification_digest, "VERIFIED", "verification"),
+        )
+        for digest, owner_state, label in phase_evidence:
+            owner_index = LINEAR_TRANSACTION_STATES.index(owner_state)
+            if evidence_index >= owner_index and not digest:
+                raise ContractError(f"{label} evidence is missing")
+            if evidence_index < owner_index and digest:
+                raise ContractError(f"{label} evidence appears before its owned phase")
         foundation_index = LINEAR_TRANSACTION_STATES.index("FOUNDATION_READY")
         if (evidence_index >= foundation_index or state in {"UNCERTAIN", "ROLLED_BACK"}) and not rollback:
             raise ContractError("exact rollback reference is missing")
@@ -800,6 +1092,9 @@ class StagingTransactionV1:
             runtime_version,
             endpoint_name,
             context_digest,
+            changesets_digest,
+            application_digest,
+            verification_digest,
             rollback,
             uncertain_phase,
             operation_digest,
@@ -825,6 +1120,9 @@ class StagingTransactionV1:
             "runtimeVersion": self.runtime_version,
             "runtimeEndpointName": self.runtime_endpoint_name,
             "runtimeContextSha256": self.runtime_context_sha256,
+            "consumerChangesetsSha256": self.consumer_changesets_sha256,
+            "consumerApplicationSha256": self.consumer_application_sha256,
+            "verificationSha256": self.verification_sha256,
             "rollbackReference": self.rollback_reference,
             "uncertainPhase": self.uncertain_phase,
             "uncertainOperationSha256": self.uncertain_operation_sha256,
