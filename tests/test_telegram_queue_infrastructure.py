@@ -86,6 +86,7 @@ def test_router_and_worker_have_split_exact_authority() -> None:
     assert "s3:PutObject" not in router_actions
 
     assert "bedrock-agentcore:InvokeAgentRuntime" in worker_actions
+    assert "bedrock-agentcore:InvokeAgentRuntimeForUser" in worker_actions
     assert "bedrock-agentcore:StopRuntimeSession" in worker_actions
     assert "secretsmanager:GetSecretValue" in worker_actions
     assert "sqs:SendMessage" not in worker_actions

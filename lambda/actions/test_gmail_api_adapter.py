@@ -45,6 +45,8 @@ class Messages:
         self.send_calls = []
         self.list_calls = []
         self.get_calls = []
+        self.profile_result = {"emailAddress": "founder@example.com"}
+        self.profile_calls = []
 
     def send(self, **kwargs):
         self.send_calls.append(kwargs)
@@ -65,6 +67,10 @@ class Users:
 
     def messages(self):
         return self._messages
+
+    def getProfile(self, **kwargs):
+        self._messages.profile_calls.append(kwargs)
+        return Request(self._messages.profile_result)
 
 
 class GmailService:
@@ -132,6 +138,7 @@ def test_send_returns_only_exact_sent_evidence_with_provider_execution_time():
         "labels": ["SENT"],
     }
     assert messages.get_calls == [{"userId": "me", "id": "gmail-1", "format": "raw"}]
+    assert messages.profile_calls == [{"userId": "me"}]
     assert base64.urlsafe_b64decode(messages.send_calls[0]["body"]["raw"]) == raw
 
 
@@ -219,3 +226,20 @@ def test_history_none_is_proven_no_match_and_duplicates_are_ambiguous():
     messages.list_result = {"messages": [{"id": "one"}, {"id": "two"}]}
     with pytest.raises(send_module.ProviderEvidenceAmbiguous):
         adapter(messages).find_by_message_id(**kwargs)
+
+
+def test_provider_account_profile_must_match_exact_approved_google_account():
+    messages = Messages()
+    messages.profile_result = {"emailAddress": "other@example.com"}
+    message_id = "<po-aaaaaaaaaaaaaaaaaaaaaaaa@personal-operator.invalid>"
+    raw = raw_message(message_id)
+    with pytest.raises(send_module.ProviderEvidenceAmbiguous):
+        adapter(messages).send_raw(
+            raw=raw,
+            message_id=message_id,
+            idempotency_key=message_id,
+            payload_hash=models.canonical_args_hash(
+                {"to": "person@example.net", "subject": "Hi", "body": "Hello"}
+            ),
+        )
+    assert messages.send_calls == []

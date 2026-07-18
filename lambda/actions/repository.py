@@ -388,6 +388,7 @@ class DynamoActionRepository:
                 "accountEmail": draft.account_email,
                 "senderAddress": draft.sender_address,
                 "draftRevision": draft.draft_revision,
+                "draftCreatedAt": draft.created_at.isoformat(),
                 "payloadHash": payload_hash,
                 "resource": resource,
                 "userId": user_id,
@@ -401,6 +402,7 @@ class DynamoActionRepository:
             "state": ActionState.PREPARED.value,
             "revision": 1,
             "draftRevision": draft.draft_revision,
+            "draftCreatedAt": draft.created_at.isoformat(),
             "connectionId": draft.connection_id,
             "accountEmail": draft.account_email,
             "senderAddress": draft.sender_address,
@@ -427,6 +429,7 @@ class DynamoActionRepository:
                 and current.get("creationId") == creation_id
                 and current.get("payloadHash") == payload_hash
                 and current.get("draftRevision") == draft.draft_revision
+                and current.get("draftCreatedAt") == draft.created_at.isoformat()
                 and current.get("connectionId") == draft.connection_id
                 and current.get("accountEmail") == draft.account_email
                 and current.get("senderAddress") == draft.sender_address
@@ -511,6 +514,36 @@ class DynamoActionRepository:
             names["#draftRevision"] = "draftRevision"
             values[":expectedDraftRevision"] = draft_fence
             conditions.append("#draftRevision=:expectedDraftRevision")
+        if (
+            expected_state is ActionState.APPROVAL_PENDING
+            and target_state is ActionState.APPROVED
+        ):
+            names.update(
+                {
+                    "#pendingApprovalId": "approvalId",
+                    "#pendingApprovalActionId": "approvalActionId",
+                    "#pendingApprovalDraftRevision": "approvalDraftRevision",
+                    "#pendingApprovalArgsHash": "approvalArgsHash",
+                }
+            )
+            values.update(
+                {
+                    ":pendingApprovalId": exact_updates["approvalId"],
+                    ":pendingApprovalActionId": exact_updates["approvedActionId"],
+                    ":pendingApprovalDraftRevision": exact_updates[
+                        "approvedDraftRevision"
+                    ],
+                    ":pendingApprovalArgsHash": exact_updates["approvedArgsHash"],
+                }
+            )
+            conditions.extend(
+                [
+                    "#pendingApprovalId=:pendingApprovalId",
+                    "#pendingApprovalActionId=:pendingApprovalActionId",
+                    "#pendingApprovalDraftRevision=:pendingApprovalDraftRevision",
+                    "#pendingApprovalArgsHash=:pendingApprovalArgsHash",
+                ]
+            )
         assignments = [
             "#state=:targetState",
             "#revision=:nextRevision",

@@ -364,6 +364,7 @@ class RouterStack(Stack):
             iam.PolicyStatement(
                 actions=[
                     "bedrock-agentcore:InvokeAgentRuntime",
+                    "bedrock-agentcore:InvokeAgentRuntimeForUser",
                     "bedrock-agentcore:StopRuntimeSession",
                 ],
                 resources=[

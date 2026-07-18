@@ -1804,6 +1804,7 @@ def test_worker_stack_provisions_exact_runtime_state_boundary():
     )
     assert set(runtime_policy["Action"]) == {
         "bedrock-agentcore:InvokeAgentRuntime",
+        "bedrock-agentcore:InvokeAgentRuntimeForUser",
         "bedrock-agentcore:StopRuntimeSession",
     }
     assert runtime_policy["Resource"] == [
