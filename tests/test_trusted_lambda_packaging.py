@@ -10,6 +10,7 @@ import sys
 
 import pytest
 
+import release_tools.lambda_asset as lambda_asset
 from release_tools.contracts import ContractError
 from release_tools.lambda_asset import (
     build_trusted_lambda_artifacts,
@@ -117,6 +118,19 @@ def _packaging_subprocess_fixture(
     (repository / "lambda" / "requirements.txt").write_bytes(
         REQUIREMENTS.read_bytes()
     )
+    (repository / "lambda" / "requirements.in").write_text(
+        "# synthetic packaging subprocess fixture\n", encoding="utf-8"
+    )
+    for relative in (
+        "router/index.py",
+        "worker/index.py",
+        "web/index.py",
+        "control/index.py",
+        "workspace_broker/index.py",
+    ):
+        source = repository / "lambda" / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(f"# {relative}\n", encoding="utf-8")
     if existing_asset:
         asset = repository / "build" / "trusted-lambda"
         asset.mkdir(parents=True)
@@ -174,14 +188,59 @@ if args[:1] != ["run"]:
 if os.environ.get("FAKE_DOCKER_FAIL_VERIFY") == "1" and "lambda_asset verify" in stdin:
     raise SystemExit(93)
 if "lambda_asset build" in stdin:
+    workspace_mount = next(
+        value for value in args if value.endswith(":/workspace:ro")
+    )
+    workspace = pathlib.Path(workspace_mount.removesuffix(":/workspace:ro"))
     output_mount = next(
         value for value in args if value.endswith(":/output-parent:rw")
     )
     output_parent = pathlib.Path(output_mount.removesuffix(":/output-parent:rw"))
+    payload_mount = next(
+        value for value in args if value.endswith(":/payload:rw")
+    )
+    payload = pathlib.Path(payload_mount.removesuffix(":/payload:rw"))
     output = output_parent / args[-1]
-    output.mkdir()
-    for name in ("MANIFEST.json", "SHA256SUMS", "ASSET.sha256", "trusted-lambda.zip"):
-        (output / name).write_text(name + "\\n", encoding="utf-8")
+    source = workspace / "lambda"
+    for source_path in list(source.rglob("*.py")) + [source / "requirements.txt"]:
+        target = payload / source_path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source_path.read_bytes())
+        target.chmod(0o644)
+    for name in (
+        "boto3",
+        "cryptography",
+        "google-api-python-client",
+        "google-auth",
+        "openai",
+    ):
+        metadata = payload / (name.replace("-", "_") + "-1.0.dist-info") / "METADATA"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text(
+            "Metadata-Version: 2.1\\nName: " + name + "\\nVersion: 1.0\\n",
+            encoding="utf-8",
+        )
+        metadata.chmod(0o644)
+
+    def container_value(name):
+        prefix = name + "="
+        for index, value in enumerate(args[:-1]):
+            if value == "--env" and args[index + 1].startswith(prefix):
+                return args[index + 1][len(prefix):]
+        raise SystemExit(94)
+
+    sys.path.insert(0, str(workspace))
+    from release_tools.lambda_asset import build_trusted_lambda_artifacts
+
+    build_trusted_lambda_artifacts(
+        payload,
+        source,
+        output,
+        source_commit=container_value("SOURCE_COMMIT"),
+        source_tree=container_value("SOURCE_TREE"),
+        builder_image=container_value("BUILDER_IMAGE"),
+        builder_image_id=container_value("BUILDER_IMAGE_ID"),
+    )
 raise SystemExit(0)
 """,
     )
@@ -547,19 +606,145 @@ def test_cdk_asset_resolution_rejects_missing_or_unauthenticated_build(tmp_path)
         )
 
 
-def _write_valid_asset(repository_root: pathlib.Path) -> pathlib.Path:
+def _write_valid_artifact(
+    repository_root: pathlib.Path, output: pathlib.Path
+) -> pathlib.Path:
     source, payload = _write_source_and_payload(repository_root)
-    asset = repository_root / "build" / "trusted-lambda"
     build_trusted_lambda_artifacts(
         payload,
         source,
-        asset,
+        output,
         source_commit="a" * 40,
         source_tree="b" * 40,
         builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
         builder_image_id="sha256:" + "3" * 64,
     )
+    return output
+
+
+def _write_valid_asset(repository_root: pathlib.Path) -> pathlib.Path:
+    asset = repository_root / "build" / "trusted-lambda"
+    _write_valid_artifact(repository_root, asset)
     return asset
+
+
+def test_publication_atomically_refuses_a_destination_created_after_verification(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging = _write_valid_artifact(tmp_path, tmp_path / "staging")
+    destination = tmp_path / "published"
+    real_durable_verify = getattr(
+        lambda_asset, "_durably_verify_staging", lambda _staging: None
+    )
+    racer_inode: int | None = None
+
+    def race_after_verification(*args, **kwargs):
+        nonlocal racer_inode
+        result = real_durable_verify(*args, **kwargs)
+        destination.mkdir()
+        racer_inode = destination.stat().st_ino
+        return result
+
+    monkeypatch.setattr(
+        lambda_asset,
+        "_durably_verify_staging",
+        race_after_verification,
+        raising=False,
+    )
+
+    with pytest.raises(ContractError, match="already exists"):
+        lambda_asset.publish_trusted_lambda_artifact(staging, destination)
+
+    assert racer_inode is not None
+    assert destination.stat().st_ino == racer_inode
+    assert list(destination.iterdir()) == []
+    assert (staging / "MANIFEST.json").is_file()
+
+
+def test_publication_fails_closed_without_a_supported_no_replace_primitive(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging = _write_valid_artifact(tmp_path, tmp_path / "staging")
+    destination = tmp_path / "published"
+    monkeypatch.setattr(lambda_asset.sys, "platform", "unsupported-test-platform")
+
+    with pytest.raises(ContractError, match="no-replace primitive is unavailable"):
+        lambda_asset.publish_trusted_lambda_artifact(staging, destination)
+
+    assert staging.is_dir()
+    assert not destination.exists()
+
+
+def test_publication_detects_staging_mutation_during_durable_verification(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging = _write_valid_artifact(tmp_path, tmp_path / "staging")
+    destination = tmp_path / "published"
+    real_fsync = lambda_asset.os.fsync
+    mutated = False
+
+    def mutate_after_fsync(descriptor: int) -> None:
+        nonlocal mutated
+        real_fsync(descriptor)
+        if not mutated and staging.exists():
+            mutated = True
+            (staging / "ASSET.sha256").write_text(
+                "f" * 64 + "\n", encoding="ascii"
+            )
+
+    monkeypatch.setattr(lambda_asset.os, "fsync", mutate_after_fsync)
+
+    with pytest.raises(ContractError, match="changed during durable verification"):
+        lambda_asset.publish_trusted_lambda_artifact(staging, destination)
+
+    assert mutated
+    assert staging.is_dir()
+    assert not destination.exists()
+
+
+def test_publication_reverifies_staged_artifact_bytes_before_visibility(
+    tmp_path: pathlib.Path,
+) -> None:
+    staging = _write_valid_artifact(tmp_path, tmp_path / "staging")
+    destination = tmp_path / "published"
+    archive = staging / "trusted-lambda.zip"
+    archive.write_bytes(archive.read_bytes() + b"corrupt")
+
+    with pytest.raises(ContractError, match="archive bytes changed"):
+        lambda_asset.publish_trusted_lambda_artifact(staging, destination)
+
+    assert staging.is_dir()
+    assert not destination.exists()
+
+
+def test_publication_reads_each_staged_file_to_eof_before_visibility(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging = _write_valid_artifact(tmp_path, tmp_path / "staging")
+    destination = tmp_path / "published"
+    real_read = lambda_asset.os.read
+
+    def short_read(descriptor: int, size: int) -> bytes:
+        return real_read(descriptor, min(size, 7))
+
+    monkeypatch.setattr(lambda_asset.os, "read", short_read)
+
+    lambda_asset.publish_trusted_lambda_artifact(staging, destination)
+
+    assert not staging.exists()
+    assert (destination / "MANIFEST.json").is_file()
+
+
+def test_current_runbooks_only_point_to_the_journaled_staging_release_path() -> None:
+    for relative in (
+        "docs/guardrails.md",
+        "docs/security.md",
+        "redteam/README.md",
+    ):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "--require-approval never" not in source
+        assert "OPERATIONS.md" in source
+        assert "journal" in source.casefold()
 
 
 def test_cdk_asset_resolution_accepts_fresh_authenticated_arm64_python313_build(tmp_path) -> None:

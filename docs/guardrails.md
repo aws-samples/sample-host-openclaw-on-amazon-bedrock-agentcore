@@ -1,5 +1,11 @@
 # Bedrock Guardrails — Operational Runbook
 
+> **Archived upstream operational reference.** Do not deploy or update stacks
+> from this document. Personal Operator infrastructure changes use the
+> exact-commit, write-ahead journal in [OPERATIONS.md](OPERATIONS.md) through
+> `scripts/staging-release.py` (or its `scripts/deploy.sh` compatibility shim).
+> Direct CDK deployment bypasses reviewed change sets and is prohibited.
+
 ## Overview
 
 OpenClaw deploys AWS Bedrock Guardrails via the `OpenClawGuardrails` CDK stack to provide content-level defense on every Bedrock Converse/ConverseStream API call. The proxy (`agentcore-proxy.js`) injects `guardrailConfig` into every request — Bedrock evaluates the guardrail server-side.
@@ -81,12 +87,12 @@ Set in `cdk.json`:
 }
 ```
 
-Then redeploy:
-
-```bash
-source .venv/bin/activate
-cdk deploy OpenClawGuardrails OpenClawAgentCore --require-approval never
-```
+The former upstream workflow deployed these stacks directly. That path is
+retired and must not be reconstructed from repository history. Treat a change
+to this setting as a new exact-commit release candidate: run the credential-free
+local gates, create the canonical staging journal, and follow the separately
+reviewed phase sequence in [OPERATIONS.md](OPERATIONS.md). No change is active
+until that journaled release closes its external gates.
 
 When disabled, the `GuardrailsStack` creates no resources. The proxy receives empty guardrail env vars and skips `guardrailConfig` injection.
 
@@ -95,13 +101,16 @@ When disabled, the `GuardrailsStack` creates no resources. The proxy receives em
 ## Updating Guardrail Policies
 
 1. Modify `stacks/guardrails_stack.py` (e.g., add a topic denial, change filter strength, add a PII type)
-2. Deploy the guardrails stack:
+2. Run the credential-free release checks against the exact clean commit:
    ```bash
-   source .venv/bin/activate
-   cdk deploy OpenClawGuardrails --require-approval never
+   ./scripts/test-local.sh
+   git diff --check
    ```
-3. A new `CfnGuardrailVersion` is created automatically. The container picks up the new version on the next session start (or after redeploying `OpenClawAgentCore`)
-4. Run the red team eval to verify the change didn't regress pass rates:
+3. Use the preflight and separately reviewed journaled phases documented in
+   [OPERATIONS.md](OPERATIONS.md). Do not invoke CDK directly.
+4. A successful journaled release creates a new `CfnGuardrailVersion`. The
+   container picks up the new version on the next session start.
+5. Run the red team eval to verify the change didn't regress pass rates:
    ```bash
    cd redteam && npx promptfoo@latest eval --config evalconfig.yaml
    ```
