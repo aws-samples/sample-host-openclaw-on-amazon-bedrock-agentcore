@@ -86,6 +86,20 @@ function snapshotRequest(payload) {
   return Object.freeze(request);
 }
 
+function snapshotTurnCapabilityGrant(value) {
+  if (value === undefined) return undefined;
+  const snapshot = cloneAndFreeze(value);
+  if (
+    !snapshot ||
+    typeof snapshot !== "object" ||
+    Array.isArray(snapshot) ||
+    Buffer.byteLength(JSON.stringify(snapshot), "utf8") > 64 * 1024
+  ) {
+    throw new TypeError("turn capability grant must be a bounded JSON object");
+  }
+  return snapshot;
+}
+
 function createInvocationHandler({ sessionBinding, handlers = {} } = {}) {
   if (!sessionBinding || typeof sessionBinding.bindOrAssert !== "function") {
     throw new TypeError("sessionBinding with bindOrAssert is required");
@@ -115,8 +129,12 @@ function createInvocationHandler({ sessionBinding, handlers = {} } = {}) {
         payload.workspaceCapability,
         { required: action !== "status" },
       );
+      const turnCapabilityGrant = snapshotTurnCapabilityGrant(
+        payload.turnCapabilityGrant,
+      );
       const authority = Object.freeze({
         ...(workspaceCapability === undefined ? {} : { workspaceCapability }),
+        ...(turnCapabilityGrant === undefined ? {} : { turnCapabilityGrant }),
       });
 
       const actorId = snapshotOptionalString(payload.actorId, "actorId");

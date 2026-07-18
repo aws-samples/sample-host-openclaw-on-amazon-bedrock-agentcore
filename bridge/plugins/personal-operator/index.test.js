@@ -15,6 +15,12 @@ const EXPECTED_TOOLS = [
   "po_file_read",
   "po_file_write",
   "po_file_delete",
+  "po_web_read",
+  "po_schedule_list",
+  "po_schedule_propose",
+  "po_schedule_cancel_propose",
+  "po_compute_run",
+  "po_compute_status",
 ];
 
 async function loadPlugin() {
@@ -71,7 +77,47 @@ describe("personal-operator plugin package", () => {
     assert.equal(typeof module.default.register, "function");
   });
 
-  it("registers exactly four strict workspace tools", async () => {
+  it("forwards new tools through the exact loopback client without authority", async () => {
+    const module = await loadPlugin();
+    const registered = [];
+    const calls = [];
+    module.registerPersonalOperatorPlugin(
+      { registerTool: (tool) => registered.push(tool) },
+      {
+        s3Client: { send: async () => ({ Contents: [] }) },
+        env: {
+          AWS_REGION: "eu-west-1",
+          S3_USER_FILES_BUCKET: "files",
+          PERSONAL_OPERATOR_WORKSPACE_PREFIX: "user_alpha",
+        },
+        loopbackRelayClient: {
+          call: async (...args) => {
+            calls.push(args);
+            return { status: "DENIED", errorCode: "PACK_DISABLED" };
+          },
+        },
+      },
+    );
+    const tool = registered.find((candidate) => candidate.name === "po_web_read");
+    const result = await tool.execute("tooluse_12345678", {
+        url: "https://example.com/exact",
+      });
+    assert.deepEqual(result, {
+      content: [{
+        type: "text",
+        text: '{"status":"DENIED","errorCode":"PACK_DISABLED"}',
+      }],
+      details: { status: "DENIED", errorCode: "PACK_DISABLED" },
+    });
+    assert.deepEqual(calls, [[
+      "tooluse_12345678",
+      "po_web_read",
+      { url: "https://example.com/exact" },
+    ]]);
+    assert.doesNotMatch(JSON.stringify(calls), /grant|nonce|token/i);
+  });
+
+  it("registers exactly ten strict catalog tools", async () => {
     const module = await loadPlugin();
     const registered = [];
     module.registerPersonalOperatorPlugin(
@@ -84,8 +130,11 @@ describe("personal-operator plugin package", () => {
       EXPECTED_TOOLS,
     );
     for (const tool of registered) {
-      assert.equal(tool.parameters.type, "object");
-      assert.equal(tool.parameters.additionalProperties, false);
+      const branches = tool.parameters.oneOf || [tool.parameters];
+      for (const branch of branches) {
+        assert.equal(branch.type, "object");
+        assert.equal(branch.additionalProperties, false);
+      }
       assert.equal(typeof tool.execute, "function");
     }
     assert.deepEqual(Object.keys(registered[0].parameters.properties), []);
@@ -93,12 +142,14 @@ describe("personal-operator plugin package", () => {
     assert.deepEqual(Object.keys(registered[2].parameters.properties), [
       "path",
       "content",
-    ]);
+    ].sort());
     assert.deepEqual(Object.keys(registered[3].parameters.properties), ["path"]);
     for (const tool of registered) {
-      assert.equal("userId" in tool.parameters.properties, false);
-      assert.equal("namespace" in tool.parameters.properties, false);
-      assert.equal("prefix" in tool.parameters.properties, false);
+      for (const branch of tool.parameters.oneOf || [tool.parameters]) {
+        assert.equal("userId" in branch.properties, false);
+        assert.equal("namespace" in branch.properties, false);
+        assert.equal("prefix" in branch.properties, false);
+      }
     }
   });
 });

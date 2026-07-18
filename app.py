@@ -14,6 +14,8 @@ Deployment model:
 
 import os
 from pathlib import Path
+import re
+import sys
 
 import aws_cdk as cdk
 import cdk_nag
@@ -21,6 +23,7 @@ import cdk_nag
 from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
+from stacks.capability_stack import CapabilityStack
 from stacks.router_stack import RouterStack
 from stacks.web_stack import WebStack
 from stacks.guardrails_stack import GuardrailsStack
@@ -29,7 +32,11 @@ from stacks.observability_stack import ObservabilityStack
 from stacks.trusted_lambda_asset import resolve_trusted_lambda_asset
 
 REQUIRED_REGION = "eu-west-1"
+RELEASE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
+repository_root = Path(__file__).resolve().parent
+sys.path.insert(0, str(repository_root / "lambda"))
+from capabilities.catalog import compile_catalog  # noqa: E402
 
 app = cdk.App()
 
@@ -50,7 +57,6 @@ env = cdk.Environment(
     region=REQUIRED_REGION,
 )
 
-repository_root = Path(__file__).resolve().parent
 configured_account = app.node.try_get_context("account") or os.environ.get(
     "CDK_DEFAULT_ACCOUNT"
 )
@@ -60,6 +66,17 @@ trusted_lambda_asset_root = resolve_trusted_lambda_asset(
     allow_synthetic_source=(
         os.environ.get("PERSONAL_OPERATOR_SYNTH_SOURCE_ASSET") == "1"
     ),
+)
+capability_release_commit = app.node.try_get_context("capability_release_commit") or ""
+if not capability_release_commit and configured_account == "000000000000":
+    capability_release_commit = "0" * 40
+if RELEASE_COMMIT_PATTERN.fullmatch(capability_release_commit) is None:
+    raise RuntimeError(
+        "capability_release_commit must bind the exact reviewed Git commit"
+    )
+_, capability_catalog = compile_catalog(
+    capability_release_commit,
+    repository_root / "specs" / "capabilities" / "schemas",
 )
 
 # --- Foundation ---
@@ -78,6 +95,16 @@ guardrails_stack = GuardrailsStack(
 # --- AgentCore base resources (Role, SG, S3) ---
 # Runtime/endpoint provisioning is deliberately external. Phase 3 accepts only
 # one atomic commit-bound runtime context supplied as explicit CDK arguments.
+capability_stack = CapabilityStack(
+    app,
+    "PersonalOperatorCapabilities",
+    trusted_code_asset_root=trusted_lambda_asset_root,
+    cmk_arn=security_stack.cmk.key_arn,
+    release_commit=capability_release_commit,
+    catalog_digest=capability_catalog.catalog_digest,
+    env=env,
+)
+
 agentcore_stack = AgentCoreStack(
     app,
     "OpenClawAgentCore",
@@ -87,8 +114,10 @@ agentcore_stack = AgentCoreStack(
     workspace_capability_secret_name=(
         security_stack.workspace_capability_secret.secret_name
     ),
+    capability_gateway_function_arn=capability_stack.gateway_function_arn,
     env=env,
 )
+agentcore_stack.add_dependency(capability_stack)
 
 # --- Router (Lambda + API Gateway HTTP API for Telegram/Slack webhooks) ---
 router_stack = RouterStack(

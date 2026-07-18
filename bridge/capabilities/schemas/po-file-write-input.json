@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:po-file-write-input:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"content":{"maxLength":262144,"type":"string"},"path":{"maxLength":512,"minLength":1,"type":"string"}},"required":["content","path"],"title":"Workspace file write input","type":"object"}

@@ -117,6 +117,12 @@ def test_runtime_has_exact_curated_surface_loopback_gateway_and_no_provider_secr
         "po_file_read",
         "po_file_write",
         "po_file_delete",
+        "po_web_read",
+        "po_schedule_list",
+        "po_schedule_propose",
+        "po_schedule_cancel_propose",
+        "po_compute_run",
+        "po_compute_status",
     ]
     assert result["runtimePolicy"] == {
         "tools": {
@@ -126,6 +132,12 @@ def test_runtime_has_exact_curated_surface_loopback_gateway_and_no_provider_secr
                 "po_file_read",
                 "po_file_write",
                 "po_file_delete",
+                "po_web_read",
+                "po_schedule_list",
+                "po_schedule_propose",
+                "po_schedule_cancel_propose",
+                "po_compute_run",
+                "po_compute_status",
             ],
             "deny": ["session_status"],
         },

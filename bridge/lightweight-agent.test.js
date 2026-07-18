@@ -18,6 +18,12 @@ const EXPECTED_LIGHTWEIGHT_TOOLS = [
   "po_file_read",
   "po_file_write",
   "po_file_delete",
+  "po_web_read",
+  "po_schedule_list",
+  "po_schedule_propose",
+  "po_schedule_cancel_propose",
+  "po_compute_run",
+  "po_compute_status",
 ];
 
 describe("lightweight tool boundary", () => {
@@ -25,7 +31,7 @@ describe("lightweight tool boundary", () => {
     assert.ok(agentModule);
   });
 
-  it("exposes only repository workspace capabilities", () => {
+  it("exposes the complete frozen repository capability catalog", () => {
     assert.deepEqual(agentModule.LIGHTWEIGHT_TOOL_NAMES, PROFILE_ADDITIONS);
     assert.deepEqual(
       agentModule.TOOLS.map((tool) => tool.function.name),
@@ -33,11 +39,15 @@ describe("lightweight tool boundary", () => {
     );
     for (const tool of agentModule.TOOLS) {
       assert.equal(tool.type, "function");
-      assert.equal(tool.function.parameters.additionalProperties, false);
-      const properties = tool.function.parameters.properties;
-      assert.equal("userId" in properties, false);
-      assert.equal("namespace" in properties, false);
-      assert.equal("prefix" in properties, false);
+      const branches = tool.function.parameters.oneOf || [tool.function.parameters];
+      for (const branch of branches) {
+        assert.equal(branch.type, "object");
+        assert.equal(branch.additionalProperties, false);
+        const properties = branch.properties;
+        assert.equal("userId" in properties, false);
+        assert.equal("namespace" in properties, false);
+        assert.equal("prefix" in properties, false);
+      }
     }
   });
 
@@ -63,10 +73,7 @@ describe("lightweight tool boundary", () => {
       agentModule.SYSTEM_PROMPT,
       /scheduling|cron|clawhub|skill management|api.?key|sub-?agents?|browser|shell|exec/i,
     );
-    assert.doesNotMatch(
-      agentModule.SYSTEM_PROMPT,
-      /web|URL|internet|network|browser/i,
-    );
+    assert.doesNotMatch(agentModule.SYSTEM_PROMPT, /clawhub|browser|shell|exec/i);
     assert.match(agentModule.SYSTEM_PROMPT, /persistent workspace/i);
   });
 });
@@ -287,6 +294,38 @@ describe("lightweight workspace execution", () => {
       "Error: Unknown tool 'web_fetch'",
     );
     assert.equal(networkCalls, 0);
+  });
+
+  it("fails every new capability closed until its exact adapter is registered", async () => {
+    const executeTool = agentModule.createToolExecutor({ workspaceStore: {} });
+    for (const toolName of EXPECTED_LIGHTWEIGHT_TOOLS.slice(4)) {
+      assert.match(await executeTool(toolName, {}), /disabled/i);
+    }
+  });
+
+  it("forwards the server tool-use identity to an exact capability adapter", async () => {
+    const calls = [];
+    const executeTool = agentModule.createToolExecutor({
+      workspaceStore: {},
+      capabilityAdapters: {
+        po_web_read: async (...args) => {
+          calls.push(args);
+          return { status: "DENIED", errorCode: "PACK_DISABLED" };
+        },
+      },
+    });
+    assert.equal(
+      await executeTool(
+        "po_web_read",
+        { url: "https://example.com/exact" },
+        "tooluse_12345678",
+      ),
+      '{"status":"DENIED","errorCode":"PACK_DISABLED"}',
+    );
+    assert.deepEqual(calls, [[
+      "tooluse_12345678",
+      { url: "https://example.com/exact" },
+    ]]);
   });
 });
 

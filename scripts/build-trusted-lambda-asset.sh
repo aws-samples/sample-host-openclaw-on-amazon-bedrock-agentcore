@@ -241,9 +241,16 @@ required_handlers = {
     "web/index.py",
     "control/index.py",
     "workspace_broker/index.py",
+    "capabilities/gateway.py",
+    "capabilities/composition.py",
+    "capabilities/durable.py",
+    "capabilities/artifacts/catalog-v1.json",
 }
 if not required_handlers.issubset(source_names):
     raise SystemExit("asset source inventory is missing a handler")
+schema_prefix = "capabilities/artifacts/schemas/"
+if len([name for name in source_names if str(name).startswith(schema_prefix)]) != 20:
+    raise SystemExit("asset source inventory is missing exact capability schemas")
 actual_by_path = {item["path"]: item for item in actual_files}
 for item in source_files:
     if not isinstance(item, dict) or set(item) != {"path", "sha256", "size"}:
@@ -296,6 +303,9 @@ import web.index  # noqa: F401,E402
 import web.composition  # noqa: F401,E402
 import worker.index  # noqa: F401,E402
 import workspace_broker.index  # noqa: F401,E402
+import capabilities.gateway  # noqa: F401,E402
+import capabilities.composition  # noqa: F401,E402
+import capabilities.durable  # noqa: F401,E402
 
 print(f'verified {len(actual_files)} files and {len(dependencies)} distributions')
 PY
@@ -357,7 +367,13 @@ cp -R /workspace/lambda/. /asset/
 find /asset -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
 find /asset -type f \( -name 'test_*.py' -o -name '*.pyc' -o -name '*.pyo' \) -delete
 rm -f /asset/requirements.in
-if find /asset -type f ! -name '*.py' ! -name requirements.txt -print -quit | grep -q .; then
+mkdir -p /asset/capabilities/artifacts
+cp /workspace/specs/capabilities/catalog-v1.json /asset/capabilities/artifacts/catalog-v1.json
+cp -R /workspace/specs/capabilities/schemas /asset/capabilities/artifacts/schemas
+test "$(find /asset/capabilities/artifacts/schemas -type f -name '*.json' | wc -l | tr -d ' ')" = "20"
+if find /asset -type f ! -name '*.py' ! -name requirements.txt \
+  ! -path '/asset/capabilities/artifacts/catalog-v1.json' \
+  ! -path '/asset/capabilities/artifacts/schemas/*.json' -print -quit | grep -q .; then
   echo "unsupported non-source file found under lambda/" >&2
   exit 1
 fi
@@ -424,19 +440,28 @@ dependencies = sorted(
     ),
     key=lambda item: (item["name"].lower(), item["version"]),
 )
-source_paths = sorted(
-    [
-        path
-        for path in pathlib.Path("/workspace/lambda").rglob("*.py")
+lambda_source = pathlib.Path("/workspace/lambda")
+capability_source = pathlib.Path("/workspace/specs/capabilities")
+source_inputs = [
+        (path, path.relative_to(lambda_source).as_posix())
+        for path in lambda_source.rglob("*.py")
         if not path.name.startswith("test_")
         and not any(part in {"__pycache__", ".pytest_cache"} for part in path.parts)
     ]
-    + [pathlib.Path("/workspace/lambda/requirements.txt")],
-    key=lambda path: path.relative_to("/workspace/lambda").as_posix(),
+source_inputs.append((lambda_source / "requirements.txt", "requirements.txt"))
+source_inputs.append(
+    (
+        capability_source / "catalog-v1.json",
+        "capabilities/artifacts/catalog-v1.json",
+    )
 )
+source_inputs.extend(
+    (path, f"capabilities/artifacts/schemas/{path.name}")
+    for path in sorted((capability_source / "schemas").glob("*.json"))
+)
+source_inputs.sort(key=lambda item: item[1])
 source_files = []
-for source_path in source_paths:
-    relative = source_path.relative_to("/workspace/lambda").as_posix()
+for source_path, relative in source_inputs:
     source_payload = source_path.read_bytes()
     asset_payload = (asset / relative).read_bytes()
     if asset_payload != source_payload:

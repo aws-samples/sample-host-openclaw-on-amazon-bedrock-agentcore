@@ -10,7 +10,13 @@
       "po_file_list",
       "po_file_read",
       "po_file_write",
-      "po_file_delete"
+      "po_file_delete",
+      "po_web_read",
+      "po_schedule_list",
+      "po_schedule_propose",
+      "po_schedule_cancel_propose",
+      "po_compute_run",
+      "po_compute_status"
     ]
   },
   "configSchema": {

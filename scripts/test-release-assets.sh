@@ -133,6 +133,7 @@ context = dict(context)
 context.update(
     {
         "runtime_source_commit": commit,
+        "capability_release_commit": commit,
         "runtime_id": runtime["runtimeId"],
         "runtime_endpoint_id": runtime["runtimeEndpointId"],
         "runtime_endpoint_name": runtime["runtimeEndpointName"],

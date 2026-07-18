@@ -10,21 +10,25 @@ import stat
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-
 SCHEMA = "personal-operator.trusted-lambda-asset.v1"
 SYNTHETIC_ACCOUNT = "000000000000"
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
-_BUILDER_IMAGE = re.compile(
-    r"public\.ecr\.aws/lambda/python@sha256:[0-9a-f]{64}"
-)
+_BUILDER_IMAGE = re.compile(r"public\.ecr\.aws/lambda/python@sha256:[0-9a-f]{64}")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _EXCLUDED_INVENTORY = {"ASSET.sha256", "MANIFEST.json", "SHA256SUMS"}
+_CAPABILITY_SOURCE = Path("specs/capabilities")
+_CAPABILITY_ASSET = PurePosixPath("capabilities/artifacts")
+_CAPABILITY_SCHEMA_PREFIX = f"{_CAPABILITY_ASSET.as_posix()}/schemas/"
 _REQUIRED_HANDLERS = {
     "router/index.py",
     "worker/index.py",
     "web/index.py",
     "control/index.py",
     "workspace_broker/index.py",
+    "capabilities/gateway.py",
+    "capabilities/composition.py",
+    "capabilities/durable.py",
+    "capabilities/artifacts/catalog-v1.json",
 }
 _REQUIRED_DEPENDENCIES = {
     "boto3",
@@ -59,7 +63,9 @@ def _safe_relative_path(value: Any) -> str:
 def _validate_file_inventory(value: Any, *, source: bool) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         label = "source" if source else "file"
-        raise TrustedLambdaAssetError(f"trusted Lambda asset {label} inventory is empty")
+        raise TrustedLambdaAssetError(
+            f"trusted Lambda asset {label} inventory is empty"
+        )
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
     expected_keys = {"path", "sha256", "size"} | (set() if source else {"mode"})
@@ -68,7 +74,9 @@ def _validate_file_inventory(value: Any, *, source: bool) -> list[dict[str, Any]
             raise TrustedLambdaAssetError("trusted Lambda asset inventory is malformed")
         relative = _safe_relative_path(raw.get("path"))
         if relative in seen or relative in _EXCLUDED_INVENTORY:
-            raise TrustedLambdaAssetError("trusted Lambda asset inventory has duplicates")
+            raise TrustedLambdaAssetError(
+                "trusted Lambda asset inventory has duplicates"
+            )
         seen.add(relative)
         digest = raw.get("sha256")
         size = raw.get("size")
@@ -88,22 +96,43 @@ def _validate_file_inventory(value: Any, *, source: bool) -> list[dict[str, Any]
     return result
 
 
-def _source_inventory(source: Path) -> list[dict[str, Any]]:
-    paths = [
-        path
-        for path in source.rglob("*.py")
+def _source_inputs(root: Path) -> list[tuple[Path, str]]:
+    lambda_source = root / "lambda"
+    inputs = [
+        (path, path.relative_to(lambda_source).as_posix())
+        for path in lambda_source.rglob("*.py")
         if not path.name.startswith("test_")
         and not any(part in {"__pycache__", ".pytest_cache"} for part in path.parts)
     ]
-    paths.append(source / "requirements.txt")
+    inputs.append((lambda_source / "requirements.txt", "requirements.txt"))
+    capability_source = root / _CAPABILITY_SOURCE
+    catalog = capability_source / "catalog-v1.json"
+    schemas = sorted((capability_source / "schemas").glob("*.json"))
+    if len(schemas) != 20:
+        raise TrustedLambdaAssetError(
+            "trusted Lambda capability schema inventory is not exact"
+        )
+    inputs.extend(
+        (
+            path,
+            (
+                _CAPABILITY_ASSET / path.relative_to(capability_source).as_posix()
+            ).as_posix(),
+        )
+        for path in [catalog, *schemas]
+    )
+    return sorted(inputs, key=lambda item: item[1])
+
+
+def _source_inventory(root: Path) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    for path in sorted(paths, key=lambda item: item.relative_to(source).as_posix()):
+    for path, relative in _source_inputs(root):
         if not path.is_file() or path.is_symlink():
             raise TrustedLambdaAssetError("trusted Lambda source boundary is invalid")
         payload = path.read_bytes()
         result.append(
             {
-                "path": path.relative_to(source).as_posix(),
+                "path": relative,
                 "sha256": _sha256(payload),
                 "size": len(payload),
             }
@@ -134,12 +163,16 @@ def _validate_hash_lock(path: Path) -> None:
             re.fullmatch(r"--hash=sha256:[0-9a-f]{64}", token) is None
             for token in tokens[1:]
         ):
-            raise TrustedLambdaAssetError("trusted Lambda requirements are not hash locked")
+            raise TrustedLambdaAssetError(
+                "trusted Lambda requirements are not hash locked"
+            )
 
 
 def _actual_asset_inventory(asset: Path) -> list[dict[str, Any]]:
     actual: list[dict[str, Any]] = []
-    for path in sorted(asset.rglob("*"), key=lambda item: item.relative_to(asset).as_posix()):
+    for path in sorted(
+        asset.rglob("*"), key=lambda item: item.relative_to(asset).as_posix()
+    ):
         if path.is_symlink():
             raise TrustedLambdaAssetError("trusted Lambda asset contains a symlink")
         if not path.is_file():
@@ -163,26 +196,37 @@ def _resolve_built_asset(root: Path, asset: Path) -> str | None:
     manifest_path = asset / "MANIFEST.json"
     sums_path = asset / "SHA256SUMS"
     digest_path = asset / "ASSET.sha256"
-    if not any(path.exists() or path.is_symlink() for path in (manifest_path, sums_path, digest_path)):
+    if not any(
+        path.exists() or path.is_symlink()
+        for path in (manifest_path, sums_path, digest_path)
+    ):
         return None
     try:
         if asset.is_symlink() or not asset.is_dir():
             raise TrustedLambdaAssetError("trusted Lambda asset contains a symlink")
         for path in (manifest_path, sums_path, digest_path):
             if path.is_symlink() or not path.is_file():
-                raise TrustedLambdaAssetError("trusted Lambda asset metadata is incomplete")
+                raise TrustedLambdaAssetError(
+                    "trusted Lambda asset metadata is incomplete"
+                )
         manifest_bytes = manifest_path.read_bytes()
         manifest = json.loads(manifest_bytes)
         recorded_digest = digest_path.read_text(encoding="ascii")
     except TrustedLambdaAssetError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise TrustedLambdaAssetError("trusted Lambda asset metadata is unreadable") from error
+        raise TrustedLambdaAssetError(
+            "trusted Lambda asset metadata is unreadable"
+        ) from error
 
     if recorded_digest != _sha256(manifest_bytes) + "\n":
-        raise TrustedLambdaAssetError("trusted Lambda asset manifest authentication failed")
+        raise TrustedLambdaAssetError(
+            "trusted Lambda asset manifest authentication failed"
+        )
     if not isinstance(manifest, dict):
-        raise TrustedLambdaAssetError("trusted Lambda asset manifest has the wrong contract")
+        raise TrustedLambdaAssetError(
+            "trusted Lambda asset manifest has the wrong contract"
+        )
     if (
         manifest.get("schema") != SCHEMA
         or manifest.get("platform") != "linux/arm64"
@@ -194,16 +238,16 @@ def _resolve_built_asset(root: Path, asset: Path) -> str | None:
         or not isinstance(manifest.get("builderImageId"), str)
         or _IMAGE_ID.fullmatch(manifest["builderImageId"]) is None
     ):
-        raise TrustedLambdaAssetError("trusted Lambda asset manifest has the wrong contract")
+        raise TrustedLambdaAssetError(
+            "trusted Lambda asset manifest has the wrong contract"
+        )
 
     files = _validate_file_inventory(manifest.get("files"), source=False)
     source_files = _validate_file_inventory(manifest.get("sourceFiles"), source=True)
     actual_files = _actual_asset_inventory(asset)
     if files != actual_files:
         raise TrustedLambdaAssetError("trusted Lambda asset file set or bytes changed")
-    expected_sums = "".join(
-        f'{item["sha256"]}  {item["path"]}\n' for item in files
-    )
+    expected_sums = "".join(f'{item["sha256"]}  {item["path"]}\n' for item in files)
     if sums_path.read_text(encoding="utf-8") != expected_sums:
         raise TrustedLambdaAssetError("trusted Lambda asset checksum inventory changed")
     if manifest.get("payloadBytes") != sum(item["size"] for item in files):
@@ -217,13 +261,40 @@ def _resolve_built_asset(root: Path, asset: Path) -> str | None:
     _validate_hash_lock(requirements)
     if manifest.get("requirementsSha256") != _sha256(requirements.read_bytes()):
         raise TrustedLambdaAssetError("trusted Lambda asset requirements are stale")
-    if manifest.get("requirementsInputSha256") != _sha256(requirements_input.read_bytes()):
-        raise TrustedLambdaAssetError("trusted Lambda asset requirements input is stale")
-    current_source = _source_inventory(source)
+    if manifest.get("requirementsInputSha256") != _sha256(
+        requirements_input.read_bytes()
+    ):
+        raise TrustedLambdaAssetError(
+            "trusted Lambda asset requirements input is stale"
+        )
+    current_source = _source_inventory(root)
     if source_files != current_source:
         raise TrustedLambdaAssetError("trusted Lambda asset source is stale")
-    if not _REQUIRED_HANDLERS.issubset({item["path"] for item in source_files}):
+    files_by_path = {item["path"]: item for item in files}
+    for source_item in source_files:
+        packaged = files_by_path.get(source_item["path"])
+        if packaged is None or any(
+            packaged[field] != source_item[field]
+            for field in ("path", "sha256", "size")
+        ):
+            raise TrustedLambdaAssetError(
+                "trusted Lambda asset source differs from packaged payload"
+            )
+    actual_paths = set(files_by_path)
+    if not _REQUIRED_HANDLERS.issubset(actual_paths):
         raise TrustedLambdaAssetError("trusted Lambda asset is missing a handler")
+    reviewed_schemas = {
+        item["path"]
+        for item in source_files
+        if item["path"].startswith(_CAPABILITY_SCHEMA_PREFIX)
+    }
+    actual_schemas = {
+        path for path in actual_paths if path.startswith(_CAPABILITY_SCHEMA_PREFIX)
+    }
+    if len(reviewed_schemas) != 20 or actual_schemas != reviewed_schemas:
+        raise TrustedLambdaAssetError(
+            "trusted Lambda asset source differs from packaged payload schemas"
+        )
 
     dependencies = manifest.get("dependencies")
     if not isinstance(dependencies, list) or not dependencies:
@@ -238,7 +309,9 @@ def _resolve_built_asset(root: Path, asset: Path) -> str | None:
             or not isinstance(dependency["version"], str)
             or not dependency["version"]
         ):
-            raise TrustedLambdaAssetError("trusted Lambda dependency inventory is malformed")
+            raise TrustedLambdaAssetError(
+                "trusted Lambda dependency inventory is malformed"
+            )
         normalized_names.add(re.sub(r"[-_.]+", "-", dependency["name"].casefold()))
     if not _REQUIRED_DEPENDENCIES.issubset(normalized_names):
         raise TrustedLambdaAssetError("trusted Lambda asset is missing a dependency")

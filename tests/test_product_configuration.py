@@ -219,6 +219,40 @@ def test_bridge_image_copies_only_the_reviewed_plugin() -> None:
     assert "COPY gateway-invocation.js /app/gateway-invocation.js" in dockerfile
 
 
+def test_bridge_image_contains_only_exact_reviewed_capability_artifacts() -> None:
+    dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
+    canonical_root = ROOT / "specs/capabilities"
+    image_root = ROOT / "bridge/capabilities"
+
+    expected = sorted(
+        path.relative_to(canonical_root)
+        for path in canonical_root.rglob("*")
+        if path.is_file()
+    )
+    actual = (
+        sorted(
+            path.relative_to(image_root)
+            for path in image_root.rglob("*")
+            if path.is_file()
+        )
+        if image_root.is_dir()
+        else []
+    )
+
+    assert actual == expected
+    for relative in expected:
+        assert (image_root / relative).read_bytes() == (
+            canonical_root / relative
+        ).read_bytes()
+
+    assert "COPY capability-catalog.js /app/capability-catalog.js" in dockerfile
+    assert (
+        "COPY capabilities/catalog-v1.json /app/capabilities/catalog-v1.json"
+        in dockerfile
+    )
+    assert "COPY capabilities/schemas /app/capabilities/schemas" in dockerfile
+
+
 def test_legacy_executable_skill_trees_are_absent() -> None:
     assert not (ROOT / "bridge/skills").exists()
     assert not (ROOT / "bridge/agentcore-browser.test.js").exists()
@@ -234,6 +268,12 @@ def test_personal_operator_plugin_package_is_frozen() -> None:
         "po_file_read",
         "po_file_write",
         "po_file_delete",
+        "po_web_read",
+        "po_schedule_list",
+        "po_schedule_propose",
+        "po_schedule_cancel_propose",
+        "po_compute_run",
+        "po_compute_status",
     ]
     assert package["type"] == "module"
     assert package["openclaw"]["extensions"] == ["./index.js"]
@@ -725,6 +765,10 @@ TEST_RUNTIME_IMAGE_URI = (
     "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
     "personal-operator/bridge@sha256:" + "a" * 64
 )
+TEST_CAPABILITY_GATEWAY_ARN = (
+    "arn:aws:lambda:eu-west-1:123456789012:function:"
+    "personal-operator-capability-gateway"
+)
 
 
 def _build_agentcore_stack(
@@ -761,6 +805,7 @@ def _build_agentcore_stack(
         workspace_capability_secret_name=(
             "personal-operator/workspace-capability"
         ),
+        capability_gateway_function_arn=TEST_CAPABILITY_GATEWAY_ARN,
         env=env,
     )
     return stack
@@ -1112,7 +1157,7 @@ def test_synthesized_workspace_role_trusts_only_the_credential_broker() -> None:
     }
 
 
-def test_synthesized_runtime_has_no_sts_and_invokes_only_the_credential_broker() -> None:
+def test_synthesized_runtime_invokes_only_exact_broker_and_capability_gateway() -> None:
     template = _synth_agentcore_template()
     _, statements = _role_and_statements(
         template, "openclaw-agentcore-execution-role-eu-west-1"
@@ -1138,8 +1183,33 @@ def test_synthesized_runtime_has_no_sts_and_invokes_only_the_credential_broker()
                 "arn:aws:lambda:eu-west-1:123456789012:function:"
                 "personal-operator-workspace-credential-broker"
             ),
-        }
+        },
+        {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": TEST_CAPABILITY_GATEWAY_ARN,
+        },
     ]
+
+
+def test_runtime_owned_browser_flag_is_rejected_and_never_synthesizes_iam() -> None:
+    try:
+        _build_agentcore_stack(context_overrides={"enable_browser": "true"})
+    except ValueError as error:
+        assert "trusted Browser Gateway" in str(error)
+    else:
+        raise AssertionError("runtime-owned browser authority was accepted")
+
+    template = _synth_agentcore_template()
+    _, statements = _role_and_statements(
+        template, "openclaw-agentcore-execution-role-eu-west-1"
+    )
+    actions = _flatten_statement_actions(statements)
+    assert not any("browser" in action.casefold() for action in actions)
+    assert not any(
+        resource["Type"] == "AWS::BedrockAgentCore::BrowserCustom"
+        for resource in template["Resources"].values()
+    )
 
 
 def test_synthesized_credential_broker_is_the_sole_workspace_role_assumer() -> None:

@@ -24,6 +24,15 @@ function functionBody(source, name, nextMarker) {
 }
 
 describe("AgentCore workspace lifecycle production coupling", () => {
+  it("owns the loopback relay and binds grants only around model execution", () => {
+    assert.match(contract, /require\("\.\/capability-relay"\)/);
+    assert.match(contract, /createCapabilityRelayServer/);
+    assert.match(contract, /host:\s*"127\.0\.0\.1"/);
+    assert.match(contract, /capabilityRelay\.bind_turn\(/);
+    assert.match(contract, /capabilityRelay\.clear_turn\(/);
+    assert.match(contract, /capabilityAdapters/);
+    assert.doesNotMatch(contract, /TURN_CAPABILITY_GRANT|CAPABILITY_RELAY_TOKEN/);
+  });
   it("uses the manifest store, SQLite snapshot, and lifecycle state machine", () => {
     assert.match(contract, /require\("\.\/workspace-sync"\)/);
     assert.match(contract, /WorkspaceSnapshotStore/);
@@ -103,13 +112,25 @@ describe("AgentCore workspace lifecycle production coupling", () => {
 
   it("keeps health busy through persistence and forbids full in-place reinitialization", () => {
     const begin = contract.indexOf("await workspaceLifecycle.acquireTurn()");
-    const tracked = contract.indexOf("return activeTaskTracker.run", begin);
+    const capabilityTurn = contract.indexOf(
+      "return capabilityTurnExecutor.submit",
+      begin,
+    );
+    const tracked = contract.indexOf(
+      "task: () => activeTaskTracker.run",
+      capabilityTurn,
+    );
     const commit = contract.indexOf(
       "await persistWorkspaceOutcome({",
       tracked,
     );
     const trackedEnd = contract.indexOf("});", commit);
-    assert.ok(tracked > begin && commit > tracked && trackedEnd > commit);
+    assert.ok(
+      capabilityTurn > begin &&
+        tracked > capabilityTurn &&
+        commit > tracked &&
+        trackedEnd > commit,
+    );
     assert.doesNotMatch(contract, /activeTaskCount\+\+|activeTaskCount\s*=/);
 
     const init = functionBody(contract, "init", "/**\n * Extract plain text");
@@ -151,6 +172,10 @@ describe("runtime image lifecycle contract", () => {
     assert.match(dockerfile, /\/opt\/personal-operator\/seed/);
     assert.match(dockerfile, /chmod -R a-w \/opt\/personal-operator\/seed/);
     assert.match(dockerfile, /\/run\/personal-operator/);
+    assert.match(
+      dockerfile,
+      /^COPY capability-relay\.js \/app\/capability-relay\.js$/m,
+    );
   });
 
   it("starts with strict shell failure handling and fixed runtime paths", () => {
