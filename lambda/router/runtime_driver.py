@@ -173,7 +173,7 @@ class AgentCoreAdapter:
         returned_session = response.get("runtimeSessionId")
         if returned_session != session_id:
             raise RuntimeInvocationUncertain("AgentCore returned another session identity")
-        if status < 200 or status >= 300:
+        if status != 200:
             raise RuntimeInvocationUncertain(
                 f"AgentCore invocation outcome was HTTP {status or 'unknown'}"
             )
@@ -219,7 +219,7 @@ class AgentCoreAdapter:
                 return {"stopped": True, "notFound": True}
             raise AgentCoreStopUncertain("AgentCore stop outcome is unknown") from error
         status = int(response.get("statusCode", 0))
-        if status < 200 or status >= 300:
+        if status != 200:
             raise AgentCoreStopUncertain(
                 f"AgentCore stop outcome was HTTP {status or 'unknown'}"
             )

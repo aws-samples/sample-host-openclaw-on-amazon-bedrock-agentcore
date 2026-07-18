@@ -1559,6 +1559,50 @@ def test_agentcore_adapter_rejects_duplicate_json_response_keys():
         )
 
 
+@pytest.mark.parametrize("status_code", [201, 202, 204])
+def test_agentcore_invoke_requires_exact_200_completion(status_code):
+    client = MagicMock()
+    client.meta.region_name = "eu-west-1"
+    client.invoke_agent_runtime.return_value = {
+        "statusCode": status_code,
+        "runtimeSessionId": SESSION,
+        "response": io.BytesIO(b"{}"),
+    }
+    adapter = AgentCoreAdapter(
+        client,
+        runtime_arn=RUNTIME_ARN_V1,
+        qualifier="DEFAULT",
+        region="eu-west-1",
+    )
+
+    with pytest.raises(RuntimeInvocationUncertain, match="HTTP"):
+        adapter.invoke(
+            session_id=SESSION,
+            user_id=USER,
+            payload={"action": "chat"},
+            trace_id=TRACE,
+        )
+
+
+@pytest.mark.parametrize("status_code", [201, 202, 204])
+def test_agentcore_stop_requires_exact_200_completion(status_code):
+    client = MagicMock()
+    client.meta.region_name = "eu-west-1"
+    client.stop_runtime_session.return_value = {
+        "statusCode": status_code,
+        "runtimeSessionId": SESSION,
+    }
+    adapter = AgentCoreAdapter(
+        client,
+        runtime_arn=RUNTIME_ARN_V1,
+        qualifier="DEFAULT",
+        region="eu-west-1",
+    )
+
+    with pytest.raises(AgentCoreStopUncertain, match="HTTP"):
+        adapter.stop(session_id=SESSION, operation_id="op_" + "a" * 64)
+
+
 def test_agentcore_stop_uses_deterministic_valid_token_and_accepts_not_found():
     client = MagicMock()
     client.meta.region_name = "eu-west-1"
