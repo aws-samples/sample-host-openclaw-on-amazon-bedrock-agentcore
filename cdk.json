@@ -28,6 +28,7 @@
     "enable_cloudtrail": false,
     "enable_browser": false,
     "runtime_source_commit": "",
+    "capability_release_commit": "",
     "runtime_id": "",
     "runtime_endpoint_id": "",
     "runtime_endpoint_name": "",

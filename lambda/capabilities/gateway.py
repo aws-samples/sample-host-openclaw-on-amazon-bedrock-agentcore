@@ -163,6 +163,8 @@ class CapabilityGateway:
             )
         except LedgerDenied as error:
             return _denied(validated_call, error.code)
+        except Exception:
+            return _denied(validated_call, "CAPABILITY_LEDGER_UNAVAILABLE")
 
         if claim.disposition is LedgerDisposition.CACHED:
             if claim.result is None:
@@ -267,12 +269,7 @@ class CapabilityGateway:
 
 
 def lambda_handler(event: Any, _context: Any) -> dict[str, Any]:
-    """Fail closed until a deployment composition injects durable live state.
-
-    CDK may package this handler before any adapter task closes. It deliberately
-    does not construct ambient DynamoDB, provider, browser, scheduler, secret,
-    or MCP clients.
-    """
+    """Invoke the cold-start verified, durable, disabled-adapter composition."""
 
     if (
         not isinstance(event, Mapping)
@@ -284,7 +281,13 @@ def lambda_handler(event: Any, _context: Any) -> dict[str, Any]:
         call = CapabilityCallV1.from_mapping(event["call"])
     except (ContractValidationError, TypeError, ValueError) as error:
         raise ValueError("capability relay call is invalid") from error
-    return _denied(call, "GATEWAY_NOT_CONFIGURED").to_mapping()
+    try:
+        from .composition import get_production_composition
+
+        composition = get_production_composition()
+    except Exception:
+        return _denied(call, "GATEWAY_CONFIGURATION_INVALID").to_mapping()
+    return composition.invoke(event).to_mapping()
 
 
 __all__ = [

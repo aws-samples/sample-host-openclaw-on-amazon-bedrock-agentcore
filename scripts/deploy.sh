@@ -305,6 +305,7 @@ phase1_cdk() {
     PersonalOperatorCapabilities \
     OpenClawAgentCore \
     OpenClawObservability \
+    -c "capability_release_commit=$PERSONAL_OPERATOR_DEPLOY_COMMIT" \
     --require-approval broadening
 
   echo "  Phase 1 complete."
@@ -579,6 +580,7 @@ PY
     PersonalOperatorWeb \
     OpenClawCron \
     -c "runtime_source_commit=$PERSONAL_OPERATOR_DEPLOY_COMMIT" \
+    -c "capability_release_commit=$PERSONAL_OPERATOR_DEPLOY_COMMIT" \
     -c "runtime_id=$RUNTIME_ID" \
     -c "runtime_endpoint_id=$RUNTIME_ENDPOINT_ID" \
     -c "runtime_endpoint_name=$RUNTIME_ENDPOINT_NAME" \

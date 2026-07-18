@@ -307,6 +307,14 @@ class FailFirstCompletionLedger:
         return self.delegate.complete(*args, **kwargs)
 
 
+class UnavailableLedger:
+    def begin(self, **_kwargs):
+        raise OSError("synthetic durable ledger outage")
+
+    def complete(self, **_kwargs):  # pragma: no cover - begin always fails
+        raise AssertionError("completion cannot follow a failed begin")
+
+
 def _iam(catalog, *, target_grant=None, grant_overrides=None):
     return {
         "callerArn": CALLER_ARN,
@@ -553,6 +561,34 @@ def test_cached_call_rejects_a_different_exact_grant_before_returning_result():
     assert len(adapter.calls) == 1
 
 
+def test_durable_ledger_outage_fails_closed_before_adapter_dispatch():
+    loaded = _load_gateway_modules()
+    assert loaded is not None
+    LiveTargetGrant, AdapterOutcome, CapabilityGateway, _ = loaded
+    catalog = _catalog()
+    repository = FakeRepository(catalog, LiveTargetGrant)
+    adapter = RecordingAdapter(
+        AdapterOutcome(status="SUCCEEDED", data={"schedules": []})
+    )
+    gateway = CapabilityGateway(
+        catalog=catalog,
+        repository=repository,
+        ledger=UnavailableLedger(),
+        adapters={"schedule.list": adapter},
+        allowed_caller_arn=CALLER_ARN,
+        clock=lambda: NOW,
+    )
+
+    result = gateway.invoke(
+        _call(catalog, "schedule.list", {}),
+        _iam(catalog),
+    )
+
+    assert result.status == "DENIED"
+    assert result.error_code == "CAPABILITY_LEDGER_UNAVAILABLE"
+    assert adapter.calls == []
+
+
 def test_lost_mutation_completion_is_uncertain_and_fences_fresh_tool_use():
     loaded = _load_gateway_modules()
     assert loaded is not None
@@ -786,7 +822,7 @@ def test_deletion_fence_race_after_admission_denies_at_last_point_without_adapte
     assert reads == 2
 
 
-def test_lambda_handler_is_exact_and_fails_closed_without_live_repository_configuration():
+def test_lambda_handler_is_exact_and_fails_closed_on_invalid_production_configuration():
     from capabilities.gateway import lambda_handler
 
     catalog = _catalog()
@@ -798,6 +834,6 @@ def test_lambda_handler_is_exact_and_fails_closed_without_live_repository_config
     }
     result = lambda_handler(event, None)
     assert result["status"] == "DENIED"
-    assert result["errorCode"] == "GATEWAY_NOT_CONFIGURED"
+    assert result["errorCode"] == "GATEWAY_CONFIGURATION_INVALID"
     assert "grant" not in result
     assert "nonce" not in str(result).lower()

@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+import re
+
 from aws_cdk import (
     CfnOutput,
     Duration,
     RemovalPolicy,
     Stack,
     aws_iam as iam,
+    aws_dynamodb as dynamodb,
+    aws_kms as kms,
     aws_lambda as _lambda,
     aws_logs as logs,
 )
 import cdk_nag
 from constructs import Construct
 
-
 REQUIRED_REGION = "eu-west-1"
 GATEWAY_FUNCTION_NAME = "personal-operator-capability-gateway"
+STATE_TABLE_NAME = "personal-operator-capability-state"
+_RELEASE_COMMIT = re.compile(r"[0-9a-f]{40}")
+_CATALOG_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class CapabilityStack(Stack):
@@ -28,6 +34,9 @@ class CapabilityStack(Stack):
         construct_id: str,
         *,
         trusted_code_asset_root: str,
+        cmk_arn: str,
+        release_commit: str,
+        catalog_digest: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -40,6 +49,47 @@ class CapabilityStack(Stack):
             )
         if not isinstance(trusted_code_asset_root, str) or not trusted_code_asset_root:
             raise ValueError("CapabilityStack requires the trusted Lambda asset")
+        if not isinstance(cmk_arn, str) or not cmk_arn:
+            raise ValueError("CapabilityStack requires one exact CMK ARN")
+        if (
+            not isinstance(release_commit, str)
+            or _RELEASE_COMMIT.fullmatch(release_commit) is None
+        ):
+            raise ValueError("CapabilityStack requires one exact release commit")
+        if (
+            not isinstance(catalog_digest, str)
+            or _CATALOG_DIGEST.fullmatch(catalog_digest) is None
+        ):
+            raise ValueError("CapabilityStack requires one exact catalog digest")
+
+        encryption_key = kms.Key.from_key_arn(
+            self,
+            "CapabilityStateEncryptionKey",
+            cmk_arn,
+        )
+        self.state_table = dynamodb.Table(
+            self,
+            "CapabilityStateTable",
+            table_name=STATE_TABLE_NAME,
+            partition_key=dynamodb.Attribute(
+                name="PK",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            sort_key=dynamodb.Attribute(
+                name="SK",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=encryption_key,
+            point_in_time_recovery_specification=(
+                dynamodb.PointInTimeRecoverySpecification(
+                    point_in_time_recovery_enabled=True
+                )
+            ),
+            deletion_protection=True,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
 
         log_group = logs.LogGroup(
             self,
@@ -54,7 +104,7 @@ class CapabilityStack(Stack):
             role_name=f"personal-operator-capability-gateway-{region}",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
             description=(
-                "Fail-closed capability admission gateway with log-only base authority"
+                "Fail-closed capability admission gateway with exact durable state authority"
             ),
         )
         execution_role.add_to_policy(
@@ -65,6 +115,39 @@ class CapabilityStack(Stack):
                     "/personal-operator/lambda/capability-gateway:*"
                 ],
             )
+        )
+        execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:TransactWriteItems",
+                ],
+                resources=[self.state_table.table_arn],
+            )
+        )
+        execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "kms:Decrypt",
+                    "kms:Encrypt",
+                    "kms:GenerateDataKey",
+                    "kms:DescribeKey",
+                ],
+                resources=[cmk_arn],
+                conditions={
+                    "StringEquals": {
+                        "kms:CallerAccount": account,
+                        "kms:ViaService": f"dynamodb.{region}.amazonaws.com",
+                    }
+                },
+            )
+        )
+
+        allowed_caller_arn = (
+            f"arn:aws:iam::{account}:role/"
+            f"openclaw-agentcore-execution-role-{region}"
         )
 
         self.gateway_function = _lambda.Function(
@@ -79,6 +162,12 @@ class CapabilityStack(Stack):
             timeout=Duration.seconds(15),
             memory_size=256,
             log_group=log_group,
+            environment={
+                "CAPABILITY_ALLOWED_CALLER_ARN": allowed_caller_arn,
+                "CAPABILITY_CATALOG_DIGEST": catalog_digest,
+                "CAPABILITY_RELEASE_COMMIT": release_commit,
+                "CAPABILITY_STATE_TABLE_NAME": STATE_TABLE_NAME,
+            },
         )
         self.gateway_function_arn = (
             f"arn:aws:lambda:{region}:{account}:function:{GATEWAY_FUNCTION_NAME}"
@@ -121,4 +210,4 @@ class CapabilityStack(Stack):
         )
 
 
-__all__ = ["CapabilityStack", "GATEWAY_FUNCTION_NAME"]
+__all__ = ["CapabilityStack", "GATEWAY_FUNCTION_NAME", "STATE_TABLE_NAME"]

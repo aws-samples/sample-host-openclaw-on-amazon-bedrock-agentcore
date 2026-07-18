@@ -16,7 +16,6 @@ from stacks.trusted_lambda_asset import (
     resolve_trusted_lambda_asset,
 )
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build-trusted-lambda-asset.sh"
 REQUIREMENTS = ROOT / "lambda" / "requirements.txt"
@@ -78,11 +77,12 @@ def test_deployment_requirements_are_transitively_sha256_locked() -> None:
         assert exact_pin.fullmatch(tokens[0]), line
         assert tokens[1:], line
         assert all(
-            re.fullmatch(r"--hash=sha256:[0-9a-f]{64}", token)
-            for token in tokens[1:]
+            re.fullmatch(r"--hash=sha256:[0-9a-f]{64}", token) for token in tokens[1:]
         ), line
 
-    locked_names = {shlex.split(line)[0].split("==", 1)[0].casefold() for line in requirement_lines}
+    locked_names = {
+        shlex.split(line)[0].split("==", 1)[0].casefold() for line in requirement_lines
+    }
     assert {
         "boto3",
         "cryptography",
@@ -95,14 +95,14 @@ def test_deployment_requirements_are_transitively_sha256_locked() -> None:
 def test_build_fails_closed_onto_lambda_python_313_arm64() -> None:
     script = _script_text()
     assert 'readonly PLATFORM="linux/arm64"' in script
-    assert 'TRUSTED_LAMBDA_BUILD_IMAGE' in script
-    assert 'public.ecr.aws/lambda/python@sha256:' in script
-    assert 'public.ecr.aws/lambda/python:3.13 |' not in script
+    assert "TRUSTED_LAMBDA_BUILD_IMAGE" in script
+    assert "public.ecr.aws/lambda/python@sha256:" in script
+    assert "public.ecr.aws/lambda/python:3.13 |" not in script
     assert 'docker pull --platform "${PLATFORM}"' in script
     assert '"$(id -u):$(id -g)"' in script
     assert "refusing a host-native build" in script
     assert 'platform.machine() in {"aarch64", "arm64"}' in script
-    assert 'sys.version_info[:2] == (3, 13)' in script
+    assert "sys.version_info[:2] == (3, 13)" in script
     assert '"ID=amzn" in os_release' in script
 
 
@@ -127,7 +127,7 @@ def test_container_boundary_does_not_forward_credentials_or_deploy() -> None:
 
 def test_build_is_atomic_normalized_and_inventory_backed() -> None:
     script = _script_text()
-    assert '.trusted-lambda.$$.tmp' in script
+    assert ".trusted-lambda.$$.tmp" in script
     assert 'verify_asset_in_container "${staging_dir}"' in script
     assert 'mv "${staging_dir}" "${ASSET_DIR}"' in script
     assert "SOURCE_DATE_EPOCH=0" in script
@@ -156,7 +156,7 @@ def test_verify_is_offline_and_checks_required_provider_imports() -> None:
     assert "import googleapiclient" in verify_body
     assert "import openai" in verify_body
     assert "-m pip check" in verify_body
-    assert "actual_files != manifest.get(\"files\")" in verify_body
+    assert 'actual_files != manifest.get("files")' in verify_body
     assert "import boto3" in verify_body
     assert "import router.index" in verify_body
     assert "import worker.index" in verify_body
@@ -172,9 +172,7 @@ def test_verify_is_offline_and_checks_required_provider_imports() -> None:
 
 def test_broker_and_capability_gateway_are_in_every_asset_gate() -> None:
     local_gate = (ROOT / "scripts" / "test-local.sh").read_text(encoding="utf-8")
-    resolver = (ROOT / "stacks" / "trusted_lambda_asset.py").read_text(
-        encoding="utf-8"
-    )
+    resolver = (ROOT / "stacks" / "trusted_lambda_asset.py").read_text(encoding="utf-8")
     packaging = _script_text()
 
     assert "lambda/workspace_broker" in local_gate
@@ -187,13 +185,29 @@ def test_broker_and_capability_gateway_are_in_every_asset_gate() -> None:
     assert "import capabilities.gateway" in packaging
 
 
+def test_capability_catalog_and_all_schemas_are_authenticated_asset_inputs() -> None:
+    resolver = (ROOT / "stacks" / "trusted_lambda_asset.py").read_text(encoding="utf-8")
+    packaging = _script_text()
+
+    assert "cp /workspace/specs/capabilities/catalog-v1.json" in packaging
+    assert "cp -R /workspace/specs/capabilities/schemas" in packaging
+    assert '"capabilities/artifacts/catalog-v1.json"' in packaging
+    assert '"capabilities/artifacts/schemas/"' in packaging
+    assert "import capabilities.composition" in packaging
+    assert "import capabilities.durable" in packaging
+    assert 'Path("specs/capabilities")' in resolver
+    assert 'PurePosixPath("capabilities/artifacts")' in resolver
+
+
 def test_cdk_hook_root_is_unambiguous() -> None:
     script = _script_text()
     assert 'readonly ASSET_DIR="${BUILD_DIR}/trusted-lambda"' in script
     assert "CDK code asset root: build/trusted-lambda" in script
 
 
-def test_cdk_asset_resolution_rejects_missing_or_unauthenticated_build(tmp_path) -> None:
+def test_cdk_asset_resolution_rejects_missing_or_unauthenticated_build(
+    tmp_path,
+) -> None:
     (tmp_path / "lambda").mkdir()
     with pytest.raises(TrustedLambdaAssetError, match="build/trusted-lambda"):
         resolve_trusted_lambda_asset(tmp_path, account="123456789012")
@@ -207,9 +221,7 @@ def test_cdk_asset_resolution_rejects_missing_or_unauthenticated_build(tmp_path)
         "files": [],
         "dependencies": [],
     }
-    (asset / "MANIFEST.json").write_text(
-        json.dumps(manifest) + "\n", encoding="utf-8"
-    )
+    (asset / "MANIFEST.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
     (asset / "SHA256SUMS").write_text("", encoding="utf-8")
     (asset / "ASSET.sha256").write_text("0" * 64 + "\n", encoding="ascii")
 
@@ -226,6 +238,8 @@ def _write_valid_asset(repository_root: pathlib.Path) -> pathlib.Path:
         "control/index.py",
         "workspace_broker/index.py",
         "capabilities/gateway.py",
+        "capabilities/composition.py",
+        "capabilities/durable.py",
     ):
         path = source / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -240,13 +254,33 @@ def _write_valid_asset(repository_root: pathlib.Path) -> pathlib.Path:
         "boto3==1.43.50 --hash=sha256:" + "1" * 64 + "\n",
         encoding="utf-8",
     )
+    capability_source = repository_root / "specs" / "capabilities"
+    for original in sorted((ROOT / "specs" / "capabilities").rglob("*.json")):
+        relative = original.relative_to(ROOT / "specs" / "capabilities")
+        target = capability_source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(original.read_bytes())
 
     asset = repository_root / "build" / "trusted-lambda"
     asset.mkdir(parents=True)
     source_files = []
     files = []
-    for path in sorted(source.rglob("*.py")) + [source / "requirements.txt"]:
-        relative = path.relative_to(source).as_posix()
+    source_inputs = [
+        (path, path.relative_to(source).as_posix())
+        for path in sorted(source.rglob("*.py"))
+    ]
+    source_inputs.append((source / "requirements.txt", "requirements.txt"))
+    source_inputs.extend(
+        (
+            path,
+            (
+                pathlib.PurePosixPath("capabilities/artifacts")
+                / path.relative_to(capability_source).as_posix()
+            ).as_posix(),
+        )
+        for path in sorted(capability_source.rglob("*.json"))
+    )
+    for path, relative in sorted(source_inputs, key=lambda item: item[1]):
         target = asset / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(path.read_bytes())
@@ -307,17 +341,19 @@ def _write_valid_asset(repository_root: pathlib.Path) -> pathlib.Path:
     return asset
 
 
-def test_cdk_asset_resolution_accepts_fresh_authenticated_arm64_python313_build(tmp_path) -> None:
+def test_cdk_asset_resolution_accepts_fresh_authenticated_arm64_python313_build(
+    tmp_path,
+) -> None:
     asset = _write_valid_asset(tmp_path)
 
-    assert resolve_trusted_lambda_asset(
-        tmp_path, account="123456789012"
-    ) == str(asset)
+    assert resolve_trusted_lambda_asset(tmp_path, account="123456789012") == str(asset)
 
 
 def test_cdk_asset_resolution_rejects_empty_stale_or_extra_assets(tmp_path) -> None:
     asset = _write_valid_asset(tmp_path)
-    (tmp_path / "lambda" / "web" / "index.py").write_text("# changed\n", encoding="utf-8")
+    (tmp_path / "lambda" / "web" / "index.py").write_text(
+        "# changed\n", encoding="utf-8"
+    )
     with pytest.raises(TrustedLambdaAssetError, match="source"):
         resolve_trusted_lambda_asset(tmp_path, account="123456789012")
 
@@ -335,7 +371,9 @@ def test_cdk_asset_resolution_rejects_symlinks(tmp_path) -> None:
         resolve_trusted_lambda_asset(tmp_path, account="123456789012")
 
 
-def test_source_only_synth_escape_is_limited_to_impossible_test_account(tmp_path) -> None:
+def test_source_only_synth_escape_is_limited_to_impossible_test_account(
+    tmp_path,
+) -> None:
     source = tmp_path / "lambda"
     source.mkdir()
 
@@ -354,9 +392,7 @@ def test_source_only_synth_escape_is_limited_to_impossible_test_account(tmp_path
 
 def test_app_and_deploy_path_require_the_trusted_asset_for_real_stacks() -> None:
     app_source = (ROOT / "app.py").read_text(encoding="utf-8")
-    router_source = (ROOT / "stacks" / "router_stack.py").read_text(
-        encoding="utf-8"
-    )
+    router_source = (ROOT / "stacks" / "router_stack.py").read_text(encoding="utf-8")
     web_source = (ROOT / "stacks" / "web_stack.py").read_text(encoding="utf-8")
     deploy_source = (ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
 
@@ -364,9 +400,7 @@ def test_app_and_deploy_path_require_the_trusted_asset_for_real_stacks() -> None
     assert app_source.count("trusted_code_asset_root=trusted_lambda_asset_root") == 3
     assert 'web_asset_root=str(repository_root / "web" / "dist")' in app_source
     assert "_lambda.Code.from_asset(trusted_code_asset_root)" in router_source
-    assert web_source.count(
-        "_lambda.Code.from_asset(trusted_code_asset_root)"
-    ) == 3
+    assert web_source.count("_lambda.Code.from_asset(trusted_code_asset_root)") == 3
     build = '"$PROJECT_DIR/scripts/build-trusted-lambda-asset.sh" build'
     verify = '"$PROJECT_DIR/scripts/build-trusted-lambda-asset.sh" verify'
     deploy = "cdk deploy"
