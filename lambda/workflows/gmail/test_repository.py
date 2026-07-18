@@ -73,7 +73,19 @@ class FakeTable:
         key = self._key(kwargs["Key"])
         item = self.items.get(key)
         values = kwargs["ExpressionAttributeValues"]
-        if item is None or item.get("generation") != values[":expected"]:
+        expected_statuses = {
+            value
+            for name, value in values.items()
+            if name.startswith(":expectedStatus")
+        }
+        if (
+            item is None
+            or item.get("generation") != values[":expected"]
+            or (
+                expected_statuses
+                and item.get("status") not in expected_statuses
+            )
+        ):
             raise ConditionalFailure("generation changed")
         item["generation"] = values[":next"]
         item["status"] = values[":status"]
@@ -476,6 +488,27 @@ def test_stale_guarded_writer_cannot_clobber_the_new_generation(target_sk):
     ] == 2
 
 
+def test_fresh_disconnect_advances_an_already_disconnected_generation():
+    repo, table = repository()
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item(
+        generation=4,
+        status="DISCONNECTED",
+    )
+
+    assert repo.begin_disconnect("user-1") == 5
+    assert table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
+        "status"
+    ] == "DISCONNECTING"
+    with pytest.raises(repository_module.ConnectionFenceError):
+        repo.oauth_generation("user-1")
+
+    repo.finish_disconnect("user-1", 5)
+    assert table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] == fence_item(
+        generation=5,
+        status="DISCONNECTED",
+    )
+
+
 def test_activation_cannot_revive_a_disconnecting_fence():
     repo, table = repository()
     table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item(
@@ -499,6 +532,21 @@ def test_activation_cannot_revive_a_disconnecting_fence():
 
     with pytest.raises(repository_module.ConnectionFenceError):
         repo.activate_connection("user-1", 4)
+
+
+def test_disconnect_completion_requires_the_disconnecting_status():
+    repo, table = repository()
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item(
+        generation=4,
+        status="CONNECTED",
+    )
+
+    with pytest.raises(repository_module.ConnectionFenceError):
+        repo.finish_disconnect("user-1", 4)
+
+    assert table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
+        "status"
+    ] == "CONNECTED"
 
 
 def test_activation_requires_the_exact_generation_connection_record():

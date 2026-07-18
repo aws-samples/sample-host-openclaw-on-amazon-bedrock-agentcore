@@ -847,7 +847,19 @@ class LocalDynamoTable:
         item = self.items.get(key)
         values = request["ExpressionAttributeValues"]
         if ":expected" in values:
-            if item is None or item.get("generation") != values[":expected"]:
+            expected_statuses = {
+                value
+                for name, value in values.items()
+                if name.startswith(":expectedStatus")
+            }
+            if (
+                item is None
+                or item.get("generation") != values[":expected"]
+                or (
+                    expected_statuses
+                    and item.get("status") not in expected_statuses
+                )
+            ):
                 raise LocalConditionalFailure("stale fence")
             item.update(
                 generation=values[":next"],
@@ -1194,6 +1206,34 @@ def test_real_local_gmail_adapters_purge_and_fence_disconnect(
             expires_at=int(now.timestamp()) + 14 * 24 * 60 * 60,
             expected_generation=0,
         )
+
+    repeated_disconnect_state = oauth.start(
+        user_id=user_id,
+        redirect_uri="https://operator.example/oauth/google/callback",
+    )
+    assert lifecycle.disconnect(user_id) == "DISCONNECTED"
+    fence = table.items[(f"USER#{user_id}", "GMAIL#CONNECTION_FENCE")]
+    assert fence["generation"] == 2
+    assert fence["status"] == "DISCONNECTED"
+    with pytest.raises(ConnectionFenceError):
+        oauth.complete(
+            user_id=user_id,
+            state=repeated_disconnect_state.state,
+            code="same-generation-race",
+        )
+    with pytest.raises(ConnectionFenceError):
+        repository.put(
+            user_id=user_id,
+            provider=READONLY_PROVIDER,
+            record=envelope,
+            expected_generation=1,
+            allow_disconnected=True,
+        )
+    assert {
+        sk
+        for (pk, sk) in table.items
+        if pk == f"USER#{user_id}"
+    } == {"GMAIL#CONNECTION_FENCE"}
 
     assert external_call_sentinel.calls == []
 

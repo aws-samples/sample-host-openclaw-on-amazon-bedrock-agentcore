@@ -417,20 +417,35 @@ class DynamoGmailRepository:
         user_id: str,
         *,
         expected_generation: int,
+        expected_statuses: tuple[str, ...] | None = None,
         generation: int,
         status: str,
     ) -> None:
+        condition = "generation=:expected"
+        values: dict[str, object] = {
+            ":expected": expected_generation,
+            ":next": generation,
+            ":status": status,
+            ":now": self._now_epoch(),
+        }
+        if expected_statuses is not None:
+            if not expected_statuses or any(
+                candidate not in _FENCE_STATUSES
+                for candidate in expected_statuses
+            ):
+                raise RepositoryRecordError("expected fence status is invalid")
+            status_terms = []
+            for index, candidate in enumerate(expected_statuses):
+                placeholder = f":expectedStatus{index}"
+                values[placeholder] = candidate
+                status_terms.append(placeholder)
+            condition += " AND #status IN (" + ", ".join(status_terms) + ")"
         self._table.update_item(
             Key=self._fence_key(user_id),
             UpdateExpression="SET generation=:next, #status=:status, updatedAt=:now",
-            ConditionExpression="generation=:expected",
+            ConditionExpression=condition,
             ExpressionAttributeNames={"#status": "status"},
-            ExpressionAttributeValues={
-                ":expected": expected_generation,
-                ":next": generation,
-                ":status": status,
-                ":now": self._now_epoch(),
-            },
+            ExpressionAttributeValues=values,
         )
 
     def _transact(self, operations: Sequence[Mapping[str, object]]) -> None:
@@ -643,12 +658,6 @@ class DynamoGmailRepository:
         fence = self._fence(user_id)
         if fence is not None and fence[1] == "DISCONNECTING":
             return fence[0]
-        if (
-            fence is not None
-            and fence[1] == "DISCONNECTED"
-            and self._read_item(self._connection_key(user_id)) is None
-        ):
-            return fence[0]
         current = 0 if fence is None else fence[0]
         generation = current + 1
         try:
@@ -663,6 +672,7 @@ class DynamoGmailRepository:
                 self._set_existing_fence(
                     user_id,
                     expected_generation=current,
+                    expected_statuses=("CONNECTED", "DISCONNECTED"),
                     generation=generation,
                     status="DISCONNECTING",
                 )
@@ -681,6 +691,7 @@ class DynamoGmailRepository:
             self._set_existing_fence(
                 user_id,
                 expected_generation=generation,
+                expected_statuses=("DISCONNECTING",),
                 generation=generation,
                 status="DISCONNECTED",
             )
