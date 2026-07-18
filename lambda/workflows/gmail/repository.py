@@ -22,6 +22,7 @@ except ImportError:  # direct file loading in Lambda/unit tests
 READONLY_PROVIDER = "google-gmail-readonly"
 DERIVED_RECORD_TTL = timedelta(days=14)
 _STATE_KEY = re.compile(r"^[0-9a-f]{64}$")
+_CALLBACK_SK = re.compile(r"^TELEGRAM_CALLBACK#[0-9a-f]{64}$")
 _SOURCE_ID = re.compile(r"^gmail:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_-]{1,128}$")
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
 _ENVELOPE_FIELDS = {
@@ -144,6 +145,36 @@ def _generation(value: object) -> int:
     return value
 
 
+def _dynamo_value(value: object) -> dict[str, object]:
+    """Serialize the repository's closed record types for low-level transactions."""
+
+    if isinstance(value, str):
+        return {"S": value}
+    if isinstance(value, bool):
+        return {"BOOL": value}
+    if isinstance(value, int):
+        return {"N": str(value)}
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise RepositoryRecordError("DynamoDB number is invalid")
+        return {"N": str(value)}
+    if value is None:
+        return {"NULL": True}
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise RepositoryRecordError("DynamoDB map key is invalid")
+        return {
+            "M": {key: _dynamo_value(field) for key, field in value.items()}
+        }
+    if isinstance(value, (list, tuple)):
+        return {"L": [_dynamo_value(field) for field in value]}
+    raise RepositoryRecordError("DynamoDB value is invalid")
+
+
+def _dynamo_item(value: Mapping[str, object]) -> dict[str, dict[str, object]]:
+    return {name: _dynamo_value(field) for name, field in value.items()}
+
+
 def _is_conditional_failure(error: Exception) -> bool:
     response = getattr(error, "response", None)
     if not isinstance(response, Mapping):
@@ -252,6 +283,10 @@ class DynamoGmailRepository:
         now=None,
     ) -> None:
         self._table = table
+        self._table_name = getattr(table, "name", None)
+        self._transaction_client = getattr(
+            getattr(table, "meta", None), "client", None
+        )
         self._conditional_failure_types = conditional_failure_types
         self._now = now or (lambda: datetime.now(timezone.utc))
 
@@ -398,34 +433,210 @@ class DynamoGmailRepository:
             },
         )
 
+    def _transact(self, operations: Sequence[Mapping[str, object]]) -> None:
+        transact = getattr(self._transaction_client, "transact_write_items", None)
+        if not isinstance(self._table_name, str) or not self._table_name or not callable(
+            transact
+        ):
+            raise RepositoryRecordError(
+                "repository table does not support atomic generation writes"
+            )
+        transact(TransactItems=list(operations))
+
+    @staticmethod
+    def _fence_allows(
+        fence: tuple[int, str] | None,
+        generation: int,
+        statuses: tuple[str, ...],
+    ) -> bool:
+        return (
+            fence is None
+            and generation == 0
+            or fence is not None
+            and fence[0] == generation
+            and fence[1] in statuses
+        )
+
+    def _guarded_put(
+        self,
+        *,
+        user_id: str,
+        expected_generation: int,
+        allowed_statuses: tuple[str, ...],
+        item: Mapping[str, object],
+        target_condition: str | None = None,
+        target_condition_names: Mapping[str, str] | None = None,
+        conflict_error: type[Exception] | None = None,
+    ) -> None:
+        """Atomically bind one Put to the exact current connection fence."""
+
+        fence = self._fence(user_id)
+        if not self._fence_allows(fence, expected_generation, allowed_statuses):
+            raise ConnectionFenceError("connection generation changed")
+        if fence is None and allowed_statuses == ("CONNECTED",):
+            connection = self._read_item(self._connection_key(user_id))
+            if connection is None:
+                raise ConnectionFenceError("Gmail connection is not active")
+
+        condition: dict[str, object] = {
+            "TableName": self._table_name,
+            "Key": _dynamo_item(self._fence_key(user_id)),
+        }
+        if fence is None:
+            condition["ConditionExpression"] = (
+                "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+            )
+        else:
+            condition["ConditionExpression"] = (
+                "generation=:generation AND #status IN ("
+                + ", ".join(
+                    f":status{index}" for index in range(len(allowed_statuses))
+                )
+                + ")"
+            )
+            condition["ExpressionAttributeNames"] = {"#status": "status"}
+            condition["ExpressionAttributeValues"] = {
+                ":generation": _dynamo_value(expected_generation),
+                **{
+                    f":status{index}": _dynamo_value(status)
+                    for index, status in enumerate(allowed_statuses)
+                },
+            }
+        put: dict[str, object] = {
+            "TableName": self._table_name,
+            "Item": _dynamo_item(item),
+        }
+        if target_condition is not None:
+            put["ConditionExpression"] = target_condition
+        if target_condition_names is not None:
+            put["ExpressionAttributeNames"] = dict(target_condition_names)
+        try:
+            self._transact([{"ConditionCheck": condition}, {"Put": put}])
+            return
+        except Exception as error:
+            try:
+                current_fence = self._fence(user_id)
+            except Exception:
+                raise ConnectionFenceError(
+                    "connection write outcome is uncertain"
+                ) from error
+            if not self._fence_allows(
+                current_fence, expected_generation, allowed_statuses
+            ):
+                raise ConnectionFenceError(
+                    "connection write lost to disconnect"
+                ) from None
+            try:
+                stored = self._read_item(
+                    {"PK": str(item["PK"]), "SK": str(item["SK"])}
+                )
+            except Exception:
+                raise ConnectionFenceError(
+                    "connection write outcome is uncertain"
+                ) from error
+            if isinstance(stored, Mapping) and dict(stored) == dict(item):
+                return
+            if conflict_error is not None and stored is not None:
+                raise conflict_error(
+                    "draft revision already contains another payload"
+                ) from None
+            raise
+
     def activate_connection(self, user_id: str, expected_generation: int) -> None:
         user_id = _identifier(user_id, "user_id")
         expected_generation = _generation(expected_generation)
-        self.assert_generation(user_id, expected_generation)
         fence = self._fence(user_id)
         try:
             if fence is None:
-                self._table.put_item(
-                    Item=self._fence_item(user_id, expected_generation, "CONNECTED"),
-                    ConditionExpression=(
-                        "attribute_not_exists(PK) AND attribute_not_exists(SK)"
-                    ),
+                if expected_generation != 0:
+                    raise ConnectionFenceError("connection generation changed")
+                self._transact(
+                    [
+                        {
+                            "ConditionCheck": {
+                                "TableName": self._table_name,
+                                "Key": _dynamo_item(
+                                    self._connection_key(user_id)
+                                ),
+                                "ConditionExpression": (
+                                    "connectionGeneration=:generation"
+                                ),
+                                "ExpressionAttributeValues": {
+                                    ":generation": _dynamo_value(0)
+                                },
+                            }
+                        },
+                        {
+                            "Put": {
+                                "TableName": self._table_name,
+                                "Item": _dynamo_item(
+                                    self._fence_item(
+                                        user_id, expected_generation, "CONNECTED"
+                                    )
+                                ),
+                                "ConditionExpression": (
+                                    "attribute_not_exists(PK) AND "
+                                    "attribute_not_exists(SK)"
+                                ),
+                            }
+                        },
+                    ]
                 )
             else:
-                self._set_existing_fence(
-                    user_id,
-                    expected_generation=expected_generation,
-                    generation=expected_generation,
-                    status="CONNECTED",
+                self._transact(
+                    [
+                        {
+                            "ConditionCheck": {
+                                "TableName": self._table_name,
+                                "Key": _dynamo_item(
+                                    self._connection_key(user_id)
+                                ),
+                                "ConditionExpression": (
+                                    "connectionGeneration=:generation"
+                                ),
+                                "ExpressionAttributeValues": {
+                                    ":generation": _dynamo_value(
+                                        expected_generation
+                                    )
+                                },
+                            }
+                        },
+                        {
+                            "Update": {
+                                "TableName": self._table_name,
+                                "Key": _dynamo_item(self._fence_key(user_id)),
+                                "UpdateExpression": (
+                                    "SET #status=:connected, updatedAt=:now"
+                                ),
+                                "ConditionExpression": (
+                                    "generation=:generation AND #status IN "
+                                    "(:disconnected, :connected)"
+                                ),
+                                "ExpressionAttributeNames": {
+                                    "#status": "status"
+                                },
+                                "ExpressionAttributeValues": {
+                                    ":generation": _dynamo_value(
+                                        expected_generation
+                                    ),
+                                    ":disconnected": _dynamo_value(
+                                        "DISCONNECTED"
+                                    ),
+                                    ":connected": _dynamo_value("CONNECTED"),
+                                    ":now": _dynamo_value(self._now_epoch()),
+                                },
+                            }
+                        },
+                    ]
                 )
         except Exception as error:
             try:
-                self.assert_generation(
-                    user_id, expected_generation, require_connected=True
-                )
+                if self.connected_generation(user_id) != expected_generation:
+                    raise ConnectionFenceError("connection generation changed")
             except Exception:
                 raise ConnectionFenceError("connection activation lost its generation") from error
-        self.assert_generation(user_id, expected_generation, require_connected=True)
+        if self.connected_generation(user_id) != expected_generation:
+            raise ConnectionFenceError("connection activation lost its generation")
 
     def begin_disconnect(self, user_id: str) -> int:
         user_id = _identifier(user_id, "user_id")
@@ -527,34 +738,34 @@ class DynamoGmailRepository:
         self.assert_generation(user_id, generation, require_connected=True)
         return True
 
-    def _delete_generation(self, key: Mapping[str, str], generation: int) -> None:
-        try:
-            self._table.delete_item(
-                Key=dict(key),
-                ConditionExpression="connectionGeneration=:generation",
-                ExpressionAttributeValues={":generation": generation},
-            )
-        except Exception:
-            # A newer generation may already own the key. Never delete it.
-            return
-
-    def _post_write_guard(
+    def put_connected_record_once(
         self,
         *,
         user_id: str,
-        expected_generation: int,
-        key: Mapping[str, str],
-        require_connected: bool,
+        generation: int,
+        item: Mapping[str, object],
     ) -> None:
-        try:
-            self.assert_generation(
-                user_id,
-                expected_generation,
-                require_connected=require_connected,
-            )
-        except Exception:
-            self._delete_generation(key, expected_generation)
-            raise ConnectionFenceError("connection write lost to disconnect") from None
+        """Atomically create one callback record under the connected fence."""
+
+        user_id = _identifier(user_id, "user_id")
+        generation = _generation(generation)
+        if (
+            not isinstance(item, Mapping)
+            or item.get("PK") != f"USER#{user_id}"
+            or not isinstance(item.get("SK"), str)
+            or _CALLBACK_SK.fullmatch(item["SK"]) is None
+            or item.get("connectionGeneration") != generation
+        ):
+            raise RepositoryRecordError("connected callback record is invalid")
+        self._guarded_put(
+            user_id=user_id,
+            expected_generation=generation,
+            allowed_statuses=("CONNECTED",),
+            item=dict(item),
+            target_condition=(
+                "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+            ),
+        )
 
     # GoogleReadonlyOAuthFlow state-store interface.
     def put_once(
@@ -628,20 +839,17 @@ class DynamoGmailRepository:
         }
         if expected_generation is not None:
             expected_generation = _generation(expected_generation)
-            self.assert_generation(
-                user_id,
-                expected_generation,
-                require_connected=not allow_disconnected,
-            )
             item["connectionGeneration"] = expected_generation
-        self._table.put_item(Item=item)
-        if expected_generation is not None:
-            self._post_write_guard(
+            self._guarded_put(
                 user_id=user_id,
                 expected_generation=expected_generation,
-                key=self._connection_key(user_id),
-                require_connected=not allow_disconnected,
+                allowed_statuses=("CONNECTED", "DISCONNECTED")
+                if allow_disconnected
+                else ("CONNECTED",),
+                item=item,
             )
+            return
+        self._table.put_item(Item=item)
 
     def get(self, *, user_id: str, provider: str) -> Mapping[str, object] | None:
         user_id = _identifier(user_id, "user_id")
@@ -697,16 +905,15 @@ class DynamoGmailRepository:
         }
         if expected_generation is not None:
             expected_generation = _generation(expected_generation)
-            self.assert_generation(user_id, expected_generation, require_connected=True)
             item["connectionGeneration"] = expected_generation
-        self._table.put_item(Item=item)
-        if expected_generation is not None:
-            self._post_write_guard(
+            self._guarded_put(
                 user_id=user_id,
                 expected_generation=expected_generation,
-                key={"PK": f"USER#{user_id}", "SK": "GMAIL#OPPORTUNITIES"},
-                require_connected=True,
+                allowed_statuses=("CONNECTED",),
+                item=item,
             )
+            return
+        self._table.put_item(Item=item)
 
     def save_draft(
         self,
@@ -732,12 +939,21 @@ class DynamoGmailRepository:
             "body": draft.body,
             "payloadHash": draft.payload_hash,
         }
-        if expected_generation is not None:
-            expected_generation = _generation(expected_generation)
-            self.assert_generation(user_id, expected_generation, require_connected=True)
         item = {**key, "draft": exact_draft, "ttl": expires_at}
         if expected_generation is not None:
+            expected_generation = _generation(expected_generation)
             item["connectionGeneration"] = expected_generation
+            self._guarded_put(
+                user_id=user_id,
+                expected_generation=expected_generation,
+                allowed_statuses=("CONNECTED",),
+                item=item,
+                target_condition=(
+                    "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+                ),
+                conflict_error=DraftRevisionConflictError,
+            )
+            return
         try:
             self._table.put_item(
                 Item=item,
@@ -761,13 +977,6 @@ class DynamoGmailRepository:
                     or _generation(stored_generation) == expected_generation
                 )
             ):
-                if expected_generation is not None:
-                    self._post_write_guard(
-                        user_id=user_id,
-                        expected_generation=expected_generation,
-                        key=key,
-                        require_connected=True,
-                    )
                 return
             if isinstance(stored, Mapping) or isinstance(
                 error, self._conditional_failure_types
@@ -776,10 +985,3 @@ class DynamoGmailRepository:
                     "draft revision already contains another payload"
                 ) from None
             raise
-        if expected_generation is not None:
-            self._post_write_guard(
-                user_id=user_id,
-                expected_generation=expected_generation,
-                key=key,
-                require_connected=True,
-            )

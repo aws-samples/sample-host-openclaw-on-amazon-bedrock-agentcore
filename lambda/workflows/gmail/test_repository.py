@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,9 +37,12 @@ class AmbiguousWrite(Exception):
 
 
 class FakeTable:
+    name = "gmail-table"
+
     def __init__(self):
         self.items = {}
         self.calls = []
+        self.meta = SimpleNamespace(client=self)
 
     @staticmethod
     def _key(item):
@@ -80,6 +84,102 @@ class FakeTable:
         self.calls.append(("get_item", kwargs))
         item = self.items.get(self._key(kwargs["Key"]))
         return {"Item": item} if item is not None else {}
+
+    @classmethod
+    def _decode_value(cls, value):
+        if "S" in value:
+            return value["S"]
+        if "N" in value:
+            number = Decimal(value["N"])
+            return int(number) if number == number.to_integral_value() else number
+        if "BOOL" in value:
+            return value["BOOL"]
+        if "NULL" in value:
+            return None
+        if "M" in value:
+            return {
+                name: cls._decode_value(field)
+                for name, field in value["M"].items()
+            }
+        if "L" in value:
+            return [cls._decode_value(field) for field in value["L"]]
+        raise AssertionError(f"unsupported Dynamo value: {value!r}")
+
+    @classmethod
+    def _decode_item(cls, item):
+        return {name: cls._decode_value(field) for name, field in item.items()}
+
+    def _before_transaction(self, _operations):
+        return None
+
+    def transact_write_items(self, **kwargs):
+        operations = kwargs["TransactItems"]
+        self.calls.append(("transact_write_items", kwargs))
+        self._before_transaction(operations)
+        pending = {key: dict(item) for key, item in self.items.items()}
+        for operation in operations:
+            if "ConditionCheck" in operation:
+                check = operation["ConditionCheck"]
+                key = self._key(self._decode_item(check["Key"]))
+                item = pending.get(key)
+                expression = check["ConditionExpression"]
+                values = {
+                    name: self._decode_value(value)
+                    for name, value in check.get(
+                        "ExpressionAttributeValues", {}
+                    ).items()
+                }
+                if expression.startswith("attribute_not_exists"):
+                    valid = item is None
+                elif expression == "connectionGeneration=:generation":
+                    valid = (
+                        item is not None
+                        and item.get("connectionGeneration")
+                        == values[":generation"]
+                    )
+                else:
+                    valid = (
+                        item is not None
+                        and item.get("generation") == values[":generation"]
+                        and item.get("status")
+                        in {
+                            value
+                            for name, value in values.items()
+                            if name.startswith(":status")
+                        }
+                    )
+                if not valid:
+                    raise ConditionalFailure("transaction condition rejected")
+            elif "Put" in operation:
+                put = operation["Put"]
+                item = self._decode_item(put["Item"])
+                key = self._key(item)
+                if put.get("ConditionExpression") and key in pending:
+                    raise ConditionalFailure("transaction put rejected")
+                pending[key] = item
+            elif "Update" in operation:
+                update = operation["Update"]
+                key = self._key(self._decode_item(update["Key"]))
+                item = pending.get(key)
+                values = {
+                    name: self._decode_value(value)
+                    for name, value in update[
+                        "ExpressionAttributeValues"
+                    ].items()
+                }
+                if (
+                    item is None
+                    or item.get("generation") != values[":generation"]
+                    or item.get("status")
+                    not in {values[":disconnected"], values[":connected"]}
+                ):
+                    raise ConditionalFailure("transaction update rejected")
+                item["status"] = values[":connected"]
+                item["updatedAt"] = values[":now"]
+            else:
+                raise AssertionError(f"unsupported transaction: {operation!r}")
+        self.items = pending
+        return {}
 
 
 def repository(table=None):
@@ -255,18 +355,21 @@ def test_derived_opportunities_and_drafts_have_exact_fourteen_day_ttl():
     )
 
 
-def test_generation_guard_removes_a_derived_write_that_loses_to_disconnect():
+def test_generation_guard_atomically_rejects_a_write_that_loses_to_disconnect():
     class DisconnectDuringOpportunityWrite(FakeTable):
-        def put_item(self, **kwargs):
-            result = super().put_item(**kwargs)
-            if kwargs["Item"]["SK"] == "GMAIL#OPPORTUNITIES":
+        def _before_transaction(self, operations):
+            if any(
+                "Put" in operation
+                and self._decode_item(operation["Put"]["Item"])["SK"]
+                == "GMAIL#OPPORTUNITIES"
+                for operation in operations
+            ):
                 self.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
                     "generation"
                 ] = 2
                 self.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
                     "status"
                 ] = "DISCONNECTING"
-            return result
 
     table = DisconnectDuringOpportunityWrite()
     table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item()
@@ -281,6 +384,132 @@ def test_generation_guard_removes_a_derived_write_that_loses_to_disconnect():
         )
 
     assert ("USER#user-1", "GMAIL#OPPORTUNITIES") not in table.items
+
+
+@pytest.mark.parametrize(
+    "target_sk",
+    ["CONNECTION#google-gmail-readonly", "GMAIL#OPPORTUNITIES"],
+)
+def test_stale_guarded_writer_cannot_clobber_the_new_generation(target_sk):
+    class NewGenerationWins(FakeTable):
+        def __init__(self):
+            super().__init__()
+            self.superseded = False
+
+        def put_item(self, **kwargs):
+            item = kwargs["Item"]
+            if item["SK"] == target_sk and not self.superseded:
+                self.superseded = True
+                self.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = (
+                    fence_item(generation=2, status="CONNECTED")
+                )
+                self.items[("USER#user-1", target_sk)] = {
+                    "PK": "USER#user-1",
+                    "SK": target_sk,
+                    "connectionGeneration": 2,
+                    "newGeneration": True,
+                }
+            return super().put_item(**kwargs)
+
+        def _before_transaction(self, operations):
+            target = next(
+                (
+                    self._decode_item(operation["Put"]["Item"])
+                    for operation in operations
+                    if "Put" in operation
+                    and self._decode_item(operation["Put"]["Item"])["SK"]
+                    == target_sk
+                ),
+                None,
+            )
+            if target is not None and not self.superseded:
+                self.superseded = True
+                self.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = (
+                    fence_item(generation=2, status="CONNECTED")
+                )
+                self.items[("USER#user-1", target_sk)] = {
+                    "PK": "USER#user-1",
+                    "SK": target_sk,
+                    "connectionGeneration": 2,
+                    "newGeneration": True,
+                }
+
+    table = NewGenerationWins()
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item()
+    table.items[("USER#user-1", target_sk)] = {
+        "PK": "USER#user-1",
+        "SK": target_sk,
+        "connectionGeneration": 1,
+    }
+    repo, _ = repository(table)
+
+    with pytest.raises(repository_module.ConnectionFenceError):
+        if target_sk.startswith("CONNECTION#"):
+            repo.put(
+                user_id="user-1",
+                provider="google-gmail-readonly",
+                record={
+                    "format": "personal-operator.oauth-envelope.v1",
+                    "binding": "b" * 64,
+                    "wrappedKey": "stale",
+                    "nonce": "nonce",
+                    "ciphertext": "ciphertext",
+                },
+                expected_generation=1,
+            )
+        else:
+            repo.replace_opportunities(
+                user_id="user-1",
+                records=[opportunity_record()],
+                expires_at=DERIVED_TTL,
+                expected_generation=1,
+            )
+
+    assert table.items[("USER#user-1", target_sk)] == {
+        "PK": "USER#user-1",
+        "SK": target_sk,
+        "connectionGeneration": 2,
+        "newGeneration": True,
+    }
+    assert table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
+        "generation"
+    ] == 2
+
+
+def test_activation_cannot_revive_a_disconnecting_fence():
+    repo, table = repository()
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item(
+        generation=4,
+        status="DISCONNECTING",
+    )
+    table.items[
+        ("USER#user-1", "CONNECTION#google-gmail-readonly")
+    ] = {
+        "PK": "USER#user-1",
+        "SK": "CONNECTION#google-gmail-readonly",
+        "connectionGeneration": 4,
+        "envelope": {
+            "format": "personal-operator.oauth-envelope.v1",
+            "binding": "b" * 64,
+            "wrappedKey": "wrapped",
+            "nonce": "nonce",
+            "ciphertext": "ciphertext",
+        },
+    }
+
+    with pytest.raises(repository_module.ConnectionFenceError):
+        repo.activate_connection("user-1", 4)
+
+
+def test_activation_requires_the_exact_generation_connection_record():
+    repo, table = repository()
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item(
+        generation=4,
+        status="CONNECTED",
+    )
+
+    with pytest.raises(repository_module.ConnectionFenceError):
+        repo.activate_connection("user-1", 4)
 
 
 def test_connection_envelope_activation_and_refresh_are_generation_bound():

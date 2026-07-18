@@ -84,9 +84,11 @@ class Table:
 
 
 class Fence:
-    def __init__(self, generation=1, connected=True):
+    def __init__(self, generation=1, connected=True, table=None):
         self.generation = generation
         self.connected = connected
+        self.table = table
+        self.atomic_puts = []
 
     def connected_generation(self, user_id):
         assert user_id == USER
@@ -104,6 +106,16 @@ class Fence:
         return self.connected and generation == self.generation and list(opportunities) == [
             opportunity()
         ]
+
+    def put_connected_record_once(self, *, user_id, generation, item):
+        self.assert_generation(user_id, generation, require_connected=True)
+        if self.table is None:
+            raise AssertionError("atomic card table is missing")
+        key = (item["PK"], item["SK"])
+        if key in self.table.items:
+            raise ConditionalFailure("duplicate")
+        self.atomic_puts.append(dict(item))
+        self.table.items[key] = dict(item)
 
 
 def opportunity() -> Opportunity:
@@ -210,7 +222,7 @@ def test_consumes_exact_user_chat_actor_action_once_and_reconstructs_source():
 
 def test_disconnect_generation_invalidates_issued_callback_and_blocks_draft_recreation():
     table = Table()
-    fence = Fence()
+    fence = Fence(table=table)
     tokens = iter(
         [
             "AAAAAAAAAAAAAAAAAAAAAA",
@@ -245,6 +257,43 @@ def test_disconnect_generation_invalidates_issued_callback_and_blocks_draft_recr
             actor_id=ACTOR,
             callback_data=prepare,
         )
+
+
+def test_fenced_card_issue_uses_the_atomic_connection_record_boundary():
+    class NoDirectPut(Table):
+        def put_item(self, **_kwargs):
+            raise AssertionError("fenced callback used a non-atomic put")
+
+    table = NoDirectPut()
+    fence = Fence(table=table)
+    tokens = iter(
+        [
+            "AAAAAAAAAAAAAAAAAAAAAA",
+            "BBBBBBBBBBBBBBBBBBBBBB",
+            "CCCCCCCCCCCCCCCCCCCCCC",
+            "DDDDDDDDDDDDDDDDDDDDDD",
+        ]
+    )
+    actions = DynamoTelegramCardActions(
+        table,
+        now=lambda: NOW,
+        token_factory=lambda: next(tokens),
+        conditional_failure_types=(ConditionalFailure,),
+        connection_fence=fence,
+    )
+
+    cards = actions.issue(
+        user_id=USER,
+        chat_id=CHAT,
+        actor_id=ACTOR,
+        opportunities=[opportunity()],
+    )
+
+    assert len(cards) == 1
+    assert len(fence.atomic_puts) == 4
+    assert all(
+        item["connectionGeneration"] == 1 for item in fence.atomic_puts
+    )
 
 
 def test_cross_tenant_chat_actor_and_forged_action_are_rejected_before_use():

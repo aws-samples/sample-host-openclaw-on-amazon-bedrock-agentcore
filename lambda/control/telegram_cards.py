@@ -210,6 +210,7 @@ class DynamoTelegramCardActions:
                 "connected_generation",
                 "assert_generation",
                 "opportunities_match",
+                "put_connected_record_once",
             )
         ):
             raise TypeError("connection fence is invalid")
@@ -280,37 +281,35 @@ class DynamoTelegramCardActions:
                 if generation is not None:
                     item["connectionGeneration"] = generation
                 try:
-                    self._table.put_item(
-                        Item=item,
-                        ConditionExpression=(
-                            "attribute_not_exists(PK) AND attribute_not_exists(SK)"
-                        ),
-                    )
+                    if generation is None:
+                        self._table.put_item(
+                            Item=item,
+                            ConditionExpression=(
+                                "attribute_not_exists(PK) AND "
+                                "attribute_not_exists(SK)"
+                            ),
+                        )
+                    else:
+                        self._connection_fence.put_connected_record_once(
+                            user_id=user_id,
+                            generation=generation,
+                            item=item,
+                        )
                 except Exception as error:
+                    if generation is not None:
+                        try:
+                            self._connection_fence.assert_generation(
+                                user_id, generation, require_connected=True
+                            )
+                        except Exception:
+                            raise CardActionRejected(
+                                "Gmail connection changed while issuing cards"
+                            ) from None
                     stored = self._read(user_id, callback_data)
                     if not isinstance(stored, Mapping) or dict(stored) != item:
                         if isinstance(error, self._conditional_failures):
                             raise CardActionStoreError("card token collided") from None
                         raise CardActionStoreError("card issue is uncertain") from None
-                if generation is not None:
-                    try:
-                        self._connection_fence.assert_generation(
-                            user_id, generation, require_connected=True
-                        )
-                    except Exception:
-                        try:
-                            self._table.delete_item(
-                                Key=_callback_key(user_id, callback_data),
-                                ConditionExpression=(
-                                    "connectionGeneration=:generation"
-                                ),
-                                ExpressionAttributeValues={":generation": generation},
-                            )
-                        except Exception:
-                            pass
-                        raise CardActionRejected(
-                            "Gmail connection changed while issuing cards"
-                        ) from None
                 buttons.append((label, callback_data))
             cards.append(TelegramOpportunityCard(opportunity, tuple(buttons)))
         return cards

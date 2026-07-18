@@ -4,6 +4,7 @@ import base64
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 import hashlib
 import html
 import http.client
@@ -808,8 +809,11 @@ class LocalConditionalFailure(Exception):
 class LocalDynamoTable:
     """Small Dynamo-compatible store for real Gmail local adapters only."""
 
+    name = "local-gmail-table"
+
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict] = {}
+        self.meta = SimpleNamespace(client=self)
 
     @staticmethod
     def _key(value):
@@ -904,6 +908,96 @@ class LocalDynamoTable:
                 "SK": page[-1]["SK"],
             }
         return response
+
+    @classmethod
+    def _decode_value(cls, value):
+        if "S" in value:
+            return value["S"]
+        if "N" in value:
+            number = Decimal(value["N"])
+            return int(number) if number == number.to_integral_value() else number
+        if "BOOL" in value:
+            return value["BOOL"]
+        if "NULL" in value:
+            return None
+        if "M" in value:
+            return {
+                name: cls._decode_value(field)
+                for name, field in value["M"].items()
+            }
+        if "L" in value:
+            return [cls._decode_value(field) for field in value["L"]]
+        raise AssertionError(f"unsupported local Dynamo value: {value!r}")
+
+    @classmethod
+    def _decode_item(cls, item):
+        return {name: cls._decode_value(field) for name, field in item.items()}
+
+    def transact_write_items(self, **request):
+        pending = deepcopy(self.items)
+        for operation in request["TransactItems"]:
+            if "ConditionCheck" in operation:
+                check = operation["ConditionCheck"]
+                key = self._key(self._decode_item(check["Key"]))
+                item = pending.get(key)
+                expression = check["ConditionExpression"]
+                values = {
+                    name: self._decode_value(value)
+                    for name, value in check.get(
+                        "ExpressionAttributeValues", {}
+                    ).items()
+                }
+                if expression.startswith("attribute_not_exists"):
+                    valid = item is None
+                elif expression == "connectionGeneration=:generation":
+                    valid = (
+                        item is not None
+                        and item.get("connectionGeneration")
+                        == values[":generation"]
+                    )
+                else:
+                    valid = (
+                        item is not None
+                        and item.get("generation") == values[":generation"]
+                        and item.get("status")
+                        in {
+                            value
+                            for name, value in values.items()
+                            if name.startswith(":status")
+                        }
+                    )
+                if not valid:
+                    raise LocalConditionalFailure("transaction condition")
+            elif "Put" in operation:
+                put = operation["Put"]
+                item = self._decode_item(put["Item"])
+                key = self._key(item)
+                if put.get("ConditionExpression") and key in pending:
+                    raise LocalConditionalFailure("transaction put")
+                pending[key] = item
+            elif "Update" in operation:
+                update = operation["Update"]
+                key = self._key(self._decode_item(update["Key"]))
+                item = pending.get(key)
+                values = {
+                    name: self._decode_value(value)
+                    for name, value in update[
+                        "ExpressionAttributeValues"
+                    ].items()
+                }
+                if (
+                    item is None
+                    or item.get("generation") != values[":generation"]
+                    or item.get("status")
+                    not in {values[":disconnected"], values[":connected"]}
+                ):
+                    raise LocalConditionalFailure("transaction update")
+                item["status"] = values[":connected"]
+                item["updatedAt"] = values[":now"]
+            else:
+                raise AssertionError(f"unsupported local transaction: {operation!r}")
+        self.items = pending
+        return {}
 
 
 def _web_event(method, path, *, cookie=None, csrf=None, body=None, query=None):
@@ -1100,6 +1194,7 @@ def test_real_local_gmail_adapters_purge_and_fence_disconnect(
             expires_at=int(now.timestamp()) + 14 * 24 * 60 * 60,
             expected_generation=0,
         )
+
     assert external_call_sentinel.calls == []
 
 
