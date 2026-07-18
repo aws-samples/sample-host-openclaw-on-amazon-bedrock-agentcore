@@ -15,8 +15,12 @@ TRACE = "po1_" + "a" * 64
 
 
 class Tickets:
-    def issue(self, *, user_id):
+    def __init__(self):
+        self.calls = []
+
+    def issue(self, *, user_id, return_path):
         assert user_id == USER
+        self.calls.append((user_id, return_path))
         return "signed-connect-ticket"
 
 
@@ -188,7 +192,17 @@ def deletion_fence_request():
 
 
 def test_connect_returns_one_time_secure_web_link_without_credentials():
-    result = app().handle(request("/connect"))
+    tickets = Tickets()
+    application = ControlApplication(
+        tickets=tickets,
+        gmail=Gmail(),
+        tasks=Tasks(),
+        deletion_intents=DeletionIntents(),
+        web_origin="https://app.personal-operator.example",
+        card_actions=CardActions(),
+        draft_preparer=Drafts(),
+    )
+    result = application.handle(request("/connect"))
     assert result == {
         "status": "ok",
         "userId": USER,
@@ -199,6 +213,43 @@ def test_connect_returns_one_time_secure_web_link_without_credentials():
             "This link is one-time and expires in five minutes."
         ),
     }
+    assert tickets.calls == [(USER, "/connections")]
+
+
+def test_every_protected_telegram_destination_uses_a_bound_one_time_ticket():
+    tickets = Tickets()
+    cards = CardActions()
+    application = ControlApplication(
+        tickets=tickets,
+        gmail=Gmail(),
+        tasks=Tasks(),
+        deletion_intents=DeletionIntents(),
+        web_origin="https://app.personal-operator.example",
+        card_actions=cards,
+        draft_preparer=Drafts(),
+    )
+
+    start = application.handle(request("/start"))["text"]
+    workspace = application.handle(request("/workspace"))["text"]
+    deletion = application.handle(request("/delete"))["text"]
+    status = application.handle(request("/status"))["text"]
+    scan = application.handle(request("/scan"))
+    draft = application.handle(
+        callback(scan["telegram"]["inlineKeyboard"][0][0]["callbackData"])
+    )["text"]
+
+    assert all(
+        "https://app.personal-operator.example/?ticket=signed-connect-ticket" in text
+        for text in (start, workspace, deletion, status, draft)
+    )
+    assert tickets.calls == [
+        (USER, "/connections"),
+        (USER, "/workspace"),
+        (USER, "/export"),
+        (USER, "/delete"),
+        (USER, "/"),
+        (USER, "/workspace?draft=draft_1234567890abcdef"),
+    ]
 
 
 def test_deletion_fence_is_a_strong_read_only_boolean_before_any_product_work():
@@ -307,7 +358,7 @@ def test_prepare_callback_surfaces_founder_approval_without_sending():
         in result["text"]
     )
     assert (
-        "https://app.personal-operator.example/workspace?draft=draft_1234567890abcdef"
+        "https://app.personal-operator.example/?ticket=signed-connect-ticket"
         in result["text"]
     )
     assert producer.calls[0][0] == USER
@@ -337,7 +388,7 @@ def test_external_prepare_callback_never_creates_an_approval_or_send_transition(
     )
     assert "/approve/" not in result["text"]
     assert "Nothing was sent" in result["text"]
-    assert "?draft=draft_1234567890abcdef" in result["text"]
+    assert "?ticket=signed-connect-ticket" in result["text"]
     assert len(producer.calls) == 1
     assert len(drafts.calls) == 1
 
@@ -362,7 +413,7 @@ def test_edit_skip_and_why_callbacks_are_source_bound_read_only_responses():
     why = application.handle(callback(buttons[3]["callbackData"]))["text"]
 
     assert (
-        "https://app.personal-operator.example/workspace?draft=draft_1234567890abcdef"
+        "https://app.personal-operator.example/?ticket=signed-connect-ticket"
         in edit
     )
     assert "Nothing was sent" in edit

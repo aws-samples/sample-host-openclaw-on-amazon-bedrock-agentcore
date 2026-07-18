@@ -11,6 +11,10 @@ from typing import Mapping
 
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
+_DRAFT_RETURN = re.compile(r"/workspace\?draft=[A-Za-z0-9_-]{8,128}")
+_STATIC_RETURN_PATHS = frozenset(
+    {"/", "/connections", "/workspace", "/export", "/delete"}
+)
 
 
 class WebStoreError(RuntimeError):
@@ -280,16 +284,30 @@ class DynamoWebStore:
 
     def put_once(self, key: str, record: Mapping, *, expires_at: int) -> None:
         key = _digest(key)
-        if not isinstance(record, Mapping) or set(record) != {"userId", "nonce", "issuedAt"}:
+        fields = set(record) if isinstance(record, Mapping) else set()
+        if fields not in (
+            {"userId", "nonce", "issuedAt"},
+            {"userId", "nonce", "issuedAt", "returnPath"},
+        ):
             raise ValueError("connect record is invalid")
         user_id = _user(record["userId"])
         nonce = record["nonce"]
         issued = record["issuedAt"]
+        return_path = record.get("returnPath")
         if not isinstance(nonce, str) or not 32 <= len(nonce) <= 256:
             raise ValueError("connect nonce is invalid")
         if isinstance(issued, bool) or not isinstance(issued, int) or issued <= 0:
             raise ValueError("connect issue time is invalid")
+        if return_path is not None and (
+            not isinstance(return_path, str)
+            or (
+                return_path not in _STATIC_RETURN_PATHS
+                and _DRAFT_RETURN.fullmatch(return_path) is None
+            )
+        ):
+            raise ValueError("connect record return path is invalid")
         expiry = _ttl(expires_at)
+        optional = {"returnPath": return_path} if return_path is not None else {}
         self._table.put_item(
             Item={
                 "PK": f"CONNECT#{key}",
@@ -297,6 +315,7 @@ class DynamoWebStore:
                 "userId": user_id,
                 "nonce": nonce,
                 "issuedAt": issued,
+                **optional,
                 "expiresAt": expiry,
                 "ttl": expiry,
             },
@@ -314,12 +333,15 @@ class DynamoWebStore:
             return None
         if item.get("PK") != f"CONNECT#{key}" or item.get("SK") != "CONNECT":
             raise WebStoreError("connect record binding is corrupt")
-        return {
+        result = {
             "userId": item.get("userId"),
             "nonce": item.get("nonce"),
             "issuedAt": item.get("issuedAt"),
             "expiresAt": item.get("expiresAt"),
         }
+        if "returnPath" in item:
+            result["returnPath"] = item.get("returnPath")
+        return result
 
     def create(self, key: str, record: Mapping, *, expires_at: int) -> None:
         key = _digest(key)

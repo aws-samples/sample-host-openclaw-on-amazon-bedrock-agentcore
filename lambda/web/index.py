@@ -273,11 +273,25 @@ class WebApplication:
                 body = _json_body(event)
                 if set(body) != {"ticket"}:
                     raise ValueError("connect request fields are invalid")
-                user_id = self._tickets.consume(body["ticket"])
-                issued = self._sessions.issue(user_id=user_id)
+                existing = (
+                    self._identity(headers)
+                    if headers.get("cookie") is not None
+                    else None
+                )
+                redemption = self._tickets.consume(
+                    body["ticket"],
+                    expected_user_id=(
+                        existing.user_id if existing is not None else None
+                    ),
+                )
+                issued = self._sessions.issue(user_id=redemption.user_id)
                 return self._response(
                     201,
-                    {"csrfToken": issued.csrf_token, "expiresAt": issued.expires_at},
+                    {
+                        "csrfToken": issued.csrf_token,
+                        "expiresAt": issued.expires_at,
+                        "returnPath": redemption.return_path,
+                    },
                     headers={"Set-Cookie": issued.cookie},
                 )
 

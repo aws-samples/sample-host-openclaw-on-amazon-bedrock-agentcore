@@ -97,6 +97,10 @@ class ControlApplication:
         self._card_actions = card_actions
         self._draft_preparer = draft_preparer
 
+    def _ticket_url(self, *, user_id: str, return_path: str) -> str:
+        ticket = self._tickets.issue(user_id=user_id, return_path=return_path)
+        return f"{self._web_origin}/?ticket={quote(ticket, safe='')}"
+
     @staticmethod
     def _binding(request: Mapping) -> tuple[str, str]:
         user_id = request.get("userId")
@@ -219,7 +223,7 @@ class ControlApplication:
                 [
                     "",
                     "Edit, prepare, skip, or ask why in your private control surface:",
-                    f"{self._web_origin}/workspace",
+                    self._ticket_url(user_id=user_id, return_path="/workspace"),
                 ]
             )
         return "\n".join(lines), telegram
@@ -304,9 +308,9 @@ class ControlApplication:
             label="draft preparer",
             require_local_revision=True,
         )
-        draft_url = (
-            f"{self._web_origin}/workspace?draft="
-            f"{quote(draft_action_id, safe='')}"
+        draft_url = self._ticket_url(
+            user_id=user_id,
+            return_path=f"/workspace?draft={draft_action_id}",
         )
         if action == "edit":
             return (
@@ -349,7 +353,10 @@ class ControlApplication:
             if not isinstance(task, Mapping):
                 raise ControlRequestError("task source returned invalid data")
             lines.append(f"• {str(task.get('title', 'Task'))[:120]} — {str(task.get('state', ''))[:40]}")
-        lines.append(f"Review them at {self._web_origin}/workspace")
+        lines.append(
+            "Review them at "
+            + self._ticket_url(user_id=user_id, return_path="/workspace")
+        )
         return "\n".join(lines)
 
     def handle(self, request: object) -> dict[str, object]:
@@ -386,10 +393,9 @@ class ControlApplication:
                 callback_data=callback_data,
             )
         elif command == "/connect":
-            ticket = self._tickets.issue(user_id=user_id)
             text = (
                 "Open your private control surface:\n"
-                f"{self._web_origin}/?ticket={quote(ticket, safe='')}\n\n"
+                f"{self._ticket_url(user_id=user_id, return_path='/connections')}\n\n"
                 "This link is one-time and expires in five minutes."
             )
         elif command == "/scan":
@@ -401,18 +407,30 @@ class ControlApplication:
         elif command == "/tasks":
             text = self._tasks_text(user_id)
         elif command == "/workspace":
-            text = f"Your portable workspace is at {self._web_origin}/workspace"
+            text = (
+                "Open your portable workspace:\n"
+                f"{self._ticket_url(user_id=user_id, return_path='/workspace')}\n\n"
+                "Export your portable workspace:\n"
+                f"{self._ticket_url(user_id=user_id, return_path='/export')}"
+            )
         elif command == "/status":
-            text = "The trusted command plane accepted this request. Use /workspace for durable state."
+            text = (
+                "The trusted command plane accepted this request. "
+                "Open your private status overview:\n"
+                f"{self._ticket_url(user_id=user_id, return_path='/')}"
+            )
         elif command == "/delete":
             text = (
-                f"Open {self._web_origin}/delete to review deletion. "
+                "Open "
+                f"{self._ticket_url(user_id=user_id, return_path='/delete')} "
+                "to review deletion. "
                 "This command itself does not delete anything."
             )
         else:
             text = (
-                "Personal Operator is ready. Use /connect for private connections, "
-                "/scan for follow-ups, or send a normal request to your workspace."
+                "Personal Operator is ready. Open your private connection setup:\n"
+                f"{self._ticket_url(user_id=user_id, return_path='/connections')}\n\n"
+                "Use /scan for follow-ups, or send a normal request to your workspace."
             )
         if not isinstance(text, str) or not 1 <= len(text) <= 3_500:
             raise ControlRequestError("control response exceeds its boundary")

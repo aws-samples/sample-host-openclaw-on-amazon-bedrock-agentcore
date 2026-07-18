@@ -16,6 +16,10 @@ from typing import Callable, Mapping
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
 _OPAQUE = re.compile(r"[A-Za-z0-9_-]{32,256}")
 _COOKIE_NAME = "__Host-po_session"
+_DRAFT_RETURN = re.compile(r"/workspace\?draft=[A-Za-z0-9_-]{8,128}")
+_STATIC_RETURN_PATHS = frozenset(
+    {"/", "/connections", "/workspace", "/export", "/delete"}
+)
 
 
 class ConnectTicketError(ValueError):
@@ -39,6 +43,16 @@ class SessionIdentity:
     user_id: str
     session_key: str
     expires_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectTicketRedemption:
+    user_id: str
+    return_path: str
+
+    def __post_init__(self) -> None:
+        _user_id(self.user_id)
+        _return_path(self.return_path)
 
 
 def _b64url(value: bytes) -> str:
@@ -68,6 +82,14 @@ def _secret(value: object) -> bytes:
     return value
 
 
+def _return_path(value: object) -> str:
+    if not isinstance(value, str) or (
+        value not in _STATIC_RETURN_PATHS and _DRAFT_RETURN.fullmatch(value) is None
+    ):
+        raise ValueError("connect ticket return path is invalid")
+    return value
+
+
 def _digest(secret: bytes, purpose: bytes, value: str) -> str:
     return hmac.new(secret, purpose + b"\0" + value.encode(), hashlib.sha256).hexdigest()
 
@@ -88,10 +110,35 @@ class SignedConnectTickets:
         self._now = now or (lambda: int(time.time()))
         self._random = random_bytes or os.urandom
 
-    def issue(self, *, user_id: str, ttl_seconds: int = 300) -> str:
+    def _issue(
+        self,
+        *,
+        user_id: str,
+        return_path: str | None,
+        ttl_seconds: int,
+        version: int,
+    ) -> str:
         user_id = _user_id(user_id)
-        if isinstance(ttl_seconds, bool) or not 60 <= ttl_seconds <= 600:
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, int)
+            or (
+                version == 2
+                and ttl_seconds != 300
+            )
+            or (
+                version == 1
+                and not 60 <= ttl_seconds <= 600
+            )
+        ):
             raise ValueError("connect ticket TTL must be between 60 and 600 seconds")
+        if version == 2:
+            return_path = _return_path(return_path)
+        elif version == 1:
+            if return_path is not None:
+                raise ValueError("legacy connect ticket has no return path")
+        else:
+            raise ValueError("connect ticket version is invalid")
         now = int(self._now())
         jti = _b64url(self._random(24))
         nonce = _b64url(self._random(24))
@@ -102,27 +149,64 @@ class SignedConnectTickets:
             "nonce": nonce,
             "typ": "connect",
             "uid": user_id,
-            "v": 1,
+            "v": version,
         }
+        if version == 2:
+            payload["ret"] = return_path
         encoded = _b64url(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         )
-        signed = f"poct1.{encoded}"
+        signed = f"poct{version}.{encoded}"
         signature = _b64url(hmac.new(self._secret, signed.encode(), hashlib.sha256).digest())
         token = f"{signed}.{signature}"
-        key = _digest(self._secret, b"connect-jti", jti)
+        purpose = b"connect-jti-v2" if version == 2 else b"connect-jti"
+        key = _digest(self._secret, purpose, jti)
+        record = {"userId": user_id, "nonce": nonce, "issuedAt": now}
+        if version == 2:
+            record["returnPath"] = return_path
         self._store.put_once(
             key,
-            {"userId": user_id, "nonce": nonce, "issuedAt": now},
+            record,
             expires_at=payload["exp"],
         )
         return token
 
-    def consume(self, token: object) -> str:
+    def issue(
+        self,
+        *,
+        user_id: str,
+        return_path: str,
+        ttl_seconds: int = 300,
+    ) -> str:
+        return self._issue(
+            user_id=user_id,
+            return_path=return_path,
+            ttl_seconds=ttl_seconds,
+            version=2,
+        )
+
+    def issue_legacy_v1(self, *, user_id: str, ttl_seconds: int = 300) -> str:
+        """Test/drain helper; production issuance uses v2 exclusively."""
+
+        return self._issue(
+            user_id=user_id,
+            return_path=None,
+            ttl_seconds=ttl_seconds,
+            version=1,
+        )
+
+    def consume(
+        self,
+        token: object,
+        *,
+        expected_user_id: str | None = None,
+    ) -> ConnectTicketRedemption:
         if not isinstance(token, str) or len(token) > 2_048:
             raise ConnectTicketError("connect ticket is invalid")
         parts = token.split(".")
-        if len(parts) != 3 or parts[0] != "poct1":
+        versions = {"poct1": 1, "poct2": 2}
+        version = versions.get(parts[0]) if len(parts) == 3 else None
+        if version is None:
             raise ConnectTicketError("connect ticket is invalid")
         expected = _b64url(
             hmac.new(
@@ -138,9 +222,11 @@ class SignedConnectTickets:
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise ConnectTicketError("connect ticket payload is invalid") from error
         required = {"exp", "iat", "jti", "nonce", "typ", "uid", "v"}
+        if version == 2:
+            required.add("ret")
         if not isinstance(payload, dict) or set(payload) != required:
             raise ConnectTicketError("connect ticket payload is invalid")
-        if payload.get("typ") != "connect" or payload.get("v") != 1:
+        if payload.get("typ") != "connect" or payload.get("v") != version:
             raise ConnectTicketError("connect ticket type is invalid")
         try:
             user_id = _user_id(payload["uid"])
@@ -154,14 +240,36 @@ class SignedConnectTickets:
             or not isinstance(payload["exp"], int)
             or payload["iat"] > now + 30
             or payload["exp"] <= now
-            or payload["exp"] - payload["iat"] > 600
+            or (
+                version == 1
+                and payload["exp"] - payload["iat"] > 600
+            )
+            or (
+                version == 2
+                and payload["exp"] - payload["iat"] != 300
+            )
             or not isinstance(payload["jti"], str)
             or _OPAQUE.fullmatch(payload["jti"]) is None
             or not isinstance(payload["nonce"], str)
             or _OPAQUE.fullmatch(payload["nonce"]) is None
         ):
             raise ConnectTicketError("connect ticket expired or is invalid")
-        key = _digest(self._secret, b"connect-jti", payload["jti"])
+        if version == 2:
+            try:
+                return_path = _return_path(payload["ret"])
+            except ValueError as error:
+                raise ConnectTicketError("connect ticket return path is invalid") from error
+        else:
+            return_path = "/connections"
+        if expected_user_id is not None:
+            try:
+                expected_user_id = _user_id(expected_user_id)
+            except ValueError as error:
+                raise ConnectTicketError("connect ticket identity is invalid") from error
+            if not hmac.compare_digest(user_id, expected_user_id):
+                raise ConnectTicketError("connect ticket identity does not match session")
+        purpose = b"connect-jti-v2" if version == 2 else b"connect-jti"
+        key = _digest(self._secret, purpose, payload["jti"])
         record = self._store.pop_once(key)
         if not isinstance(record, Mapping):
             raise ConnectTicketError("connect ticket was already used or revoked")
@@ -169,9 +277,20 @@ class SignedConnectTickets:
             record.get("userId") != user_id
             or record.get("nonce") != payload["nonce"]
             or int(record.get("expiresAt", 0)) != payload["exp"]
+            or (
+                version == 2
+                and record.get("returnPath") != return_path
+            )
+            or (
+                version == 1
+                and "returnPath" in record
+            )
         ):
             raise ConnectTicketError("connect ticket binding is invalid")
-        return user_id
+        return ConnectTicketRedemption(
+            user_id=user_id,
+            return_path=return_path,
+        )
 
 
 def _cookie_value(cookie_header: object) -> str:

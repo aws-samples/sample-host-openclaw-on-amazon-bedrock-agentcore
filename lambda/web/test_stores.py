@@ -92,6 +92,27 @@ def test_connect_records_are_conditional_bounded_and_atomically_consumed():
     assert store.pop_once("a" * 64) is None
 
 
+def test_v2_connect_record_immutably_binds_allowlisted_return_path():
+    table = Table()
+    store = DynamoWebStore(table)
+    record = {
+        "userId": "user_founder",
+        "nonce": "n" * 32,
+        "issuedAt": 100,
+        "returnPath": "/workspace?draft=draft_action_12345678",
+    }
+
+    store.put_once("b" * 64, record, expires_at=200)
+
+    assert store.pop_once("b" * 64) == {**record, "expiresAt": 200}
+    with pytest.raises(ValueError, match="connect record"):
+        store.put_once(
+            "c" * 64,
+            {**record, "next": "https://attacker.example"},
+            expires_at=200,
+        )
+
+
 def test_sessions_use_digest_gsi_and_can_be_revoked_individually_or_by_user():
     table = Table()
     store = DynamoWebStore(table)

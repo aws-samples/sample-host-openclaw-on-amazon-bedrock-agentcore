@@ -162,7 +162,7 @@ def setup_app():
 
 
 def bootstrap(app, tickets):
-    token = tickets.issue(user_id=USER)
+    token = tickets.issue(user_id=USER, return_path="/connections")
     response = app.handle(event("POST", "/api/session/connect", body={"ticket": token}))
     assert response["statusCode"] == 201
     payload = json.loads(response["body"])
@@ -171,16 +171,59 @@ def bootstrap(app, tickets):
 
 def test_connect_bootstrap_consumes_ticket_and_returns_secure_session_once():
     app, tickets, *_ = setup_app()
-    token = tickets.issue(user_id=USER)
+    token = tickets.issue(user_id=USER, return_path="/workspace")
 
     response = app.handle(event("POST", "/api/session/connect", body={"ticket": token}))
 
     assert response["statusCode"] == 201
     assert response["headers"]["Set-Cookie"].startswith("__Host-po_session=")
-    assert json.loads(response["body"])["csrfToken"]
+    payload = json.loads(response["body"])
+    assert payload["csrfToken"]
+    assert payload["returnPath"] == "/workspace"
     assert app.handle(
         event("POST", "/api/session/connect", body={"ticket": token})
     )["statusCode"] == 400
+
+
+def test_connect_ticket_cannot_replace_a_different_users_live_session():
+    app, tickets, *_ = setup_app()
+    founder_cookie, _ = bootstrap(app, tickets)
+    attacker_token = tickets.issue(
+        user_id="user_attacker",
+        return_path="/delete",
+    )
+
+    denied = app.handle(
+        event(
+            "POST",
+            "/api/session/connect",
+            body={"ticket": attacker_token},
+            cookie=founder_cookie,
+        )
+    )
+
+    assert denied["statusCode"] == 400
+    retried = app.handle(
+        event(
+            "POST",
+            "/api/session/connect",
+            body={"ticket": attacker_token},
+        )
+    )
+    assert retried["statusCode"] == 201
+    assert json.loads(retried["body"])["returnPath"] == "/delete"
+
+
+def test_legacy_v1_connect_ticket_drain_returns_only_to_connections():
+    app, tickets, *_ = setup_app()
+    token = tickets.issue_legacy_v1(user_id=USER)
+
+    response = app.handle(
+        event("POST", "/api/session/connect", body={"ticket": token})
+    )
+
+    assert response["statusCode"] == 201
+    assert json.loads(response["body"])["returnPath"] == "/connections"
 
 
 def test_oauth_pkce_flow_is_bound_to_authenticated_browser_session():
