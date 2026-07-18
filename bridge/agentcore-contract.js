@@ -25,10 +25,10 @@ const { spawn } = require("child_process");
 const WebSocket = require("ws");
 const workspaceSync = require("./workspace-sync");
 const cwLogger = require("./cloudwatch-logger");
-const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
 const runtimePolicy = require("./runtime-policy");
 const gatewayInvocation = require("./gateway-invocation");
+const capabilityCatalogModule = require("./capability-catalog");
 const capabilityRelayModule = require("./capability-relay");
 const { SessionBinding } = require("./session-binding");
 const { createInvocationHandler } = require("./invocation-handler");
@@ -85,6 +85,7 @@ let credentialRefreshTimer = null;
 let credentialRefreshInProgress = false;
 let currentWorkspaceCapability = null;
 let workspaceLifecycle = null;
+let agent = null;
 const runtimeInitializationGuard = createRuntimeInitializationGuard();
 const activeTaskTracker = createActiveTaskTracker();
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
@@ -139,6 +140,11 @@ const capabilityRelayServer =
     port: CAPABILITY_RELAY_PORT,
   });
 let capabilityRelayReady = null;
+const runtimeCapabilityStartup = createCapabilityStartupGate({
+  validateRelease: () =>
+    capabilityCatalogModule.loadRuntimeCapabilityRelease(),
+  constructRuntime: () => require("./lightweight-agent"),
+});
 
 // OpenClaw auto-restart on crash
 let openclawRestartCount = 0;
@@ -232,6 +238,38 @@ function createRuntimeInitializationGuard() {
         throw error;
       }
       attempted = true;
+    },
+  });
+}
+
+function createCapabilityStartupGate({
+  validateRelease,
+  constructRuntime,
+} = {}) {
+  if (
+    typeof validateRelease !== "function" ||
+    typeof constructRuntime !== "function"
+  ) {
+    throw new TypeError(
+      "Capability startup requires release validation and runtime construction",
+    );
+  }
+  let started = false;
+  let runtime = null;
+  return Object.freeze({
+    get started() {
+      return started;
+    },
+    start() {
+      if (started) return runtime;
+      const validatedRelease = validateRelease();
+      const candidate = constructRuntime(validatedRelease);
+      if (!candidate || typeof candidate !== "object") {
+        throw new TypeError("Capability runtime construction returned no runtime");
+      }
+      runtime = candidate;
+      started = true;
+      return runtime;
     },
   });
 }
@@ -1537,6 +1575,7 @@ async function shutdownRuntime() {
 }
 
 function startContractServer() {
+  agent = runtimeCapabilityStartup.start();
   process.once("SIGTERM", shutdownRuntime);
   ensureCapabilityRelayServer().catch((error) => {
     quarantineRuntime(error, "CAPABILITY_RELAY_START_FAILED");
@@ -1557,6 +1596,7 @@ if (require.main === module) {
 
 module.exports = {
   createActiveTaskTracker,
+  createCapabilityStartupGate,
   createRuntimeInvocationAdmission,
   createRuntimeInitializationGuard,
   createUnexpectedChildExitHandler,

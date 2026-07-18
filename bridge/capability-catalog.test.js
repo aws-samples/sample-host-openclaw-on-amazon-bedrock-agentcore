@@ -107,6 +107,94 @@ describe("immutable capability catalog", () => {
     }
   });
 
+  it("loads exact image-owned release metadata before exposing the catalog", () => {
+    const catalogModule = loadCatalogModule();
+    const { root, target } = copyArtifacts();
+    const releasePath = path.join(root, "release-v1.json");
+    try {
+      fs.writeFileSync(
+        releasePath,
+        JSON.stringify({
+          schema: "personal-operator.capability-release.v1",
+          releaseCommit: RELEASE_COMMIT,
+          catalogDigest: CATALOG_DIGEST,
+        }),
+      );
+
+      const loaded = catalogModule.loadRuntimeCapabilityRelease({
+        capabilityDir: target,
+        releasePath,
+      });
+
+      assert.equal(loaded.release.releaseCommit, RELEASE_COMMIT);
+      assert.equal(loaded.release.catalogDigest, CATALOG_DIGEST);
+      assert.equal(loaded.catalog.catalogDigest, CATALOG_DIGEST);
+      assert.equal(Object.isFrozen(loaded.release), true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects missing, extra, symlinked, and catalog-drifted release metadata", () => {
+    const catalogModule = loadCatalogModule();
+    const { root, target } = copyArtifacts();
+    const releasePath = path.join(root, "release-v1.json");
+    try {
+      for (const release of [
+        {
+          schema: "personal-operator.capability-release.v1",
+          releaseCommit: RELEASE_COMMIT,
+          catalogDigest: "f".repeat(64),
+        },
+        {
+          schema: "personal-operator.capability-release.v1",
+          releaseCommit: RELEASE_COMMIT,
+          catalogDigest: CATALOG_DIGEST,
+          unexpected: true,
+        },
+      ]) {
+        fs.writeFileSync(releasePath, JSON.stringify(release));
+        assert.throws(
+          () =>
+            catalogModule.loadRuntimeCapabilityRelease({
+              capabilityDir: target,
+              releasePath,
+            }),
+          /release|catalog|digest/i,
+        );
+      }
+      fs.unlinkSync(releasePath);
+      assert.throws(
+        () =>
+          catalogModule.loadRuntimeCapabilityRelease({
+            capabilityDir: target,
+            releasePath,
+          }),
+        /release/i,
+      );
+      const outside = path.join(root, "outside.json");
+      fs.writeFileSync(
+        outside,
+        JSON.stringify({
+          schema: "personal-operator.capability-release.v1",
+          releaseCommit: RELEASE_COMMIT,
+          catalogDigest: CATALOG_DIGEST,
+        }),
+      );
+      fs.symlinkSync(outside, releasePath);
+      assert.throws(
+        () =>
+          catalogModule.loadRuntimeCapabilityRelease({
+            capabilityDir: target,
+            releasePath,
+          }),
+        /release/i,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed on release, catalog, source, schema, and inventory drift", () => {
     const catalogModule = loadCatalogModule();
     assert.throws(

@@ -91,6 +91,18 @@ COPY capability-catalog.js /app/capability-catalog.js
 COPY capability-relay.js /app/capability-relay.js
 COPY capabilities/catalog-v1.json /app/capabilities/catalog-v1.json
 COPY capabilities/schemas /app/capabilities/schemas
+
+# Bind the image to the exact release/catalog pair before any runtime module or
+# child process can start. Both arguments are required release inputs; there is
+# no mutable environment fallback at runtime.
+ARG PERSONAL_OPERATOR_RELEASE_COMMIT
+ARG PERSONAL_OPERATOR_CATALOG_DIGEST
+RUN printf '%s' "$PERSONAL_OPERATOR_RELEASE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' && \
+    printf '%s' "$PERSONAL_OPERATOR_CATALOG_DIGEST" | grep -Eq '^[0-9a-f]{64}$' && \
+    printf '{"schema":"personal-operator.capability-release.v1","releaseCommit":"%s","catalogDigest":"%s"}\n' \
+      "$PERSONAL_OPERATOR_RELEASE_COMMIT" "$PERSONAL_OPERATOR_CATALOG_DIGEST" \
+      > /app/capabilities/release-v1.json && \
+    node -e 'require("./capability-catalog").loadRuntimeCapabilityRelease()'
 COPY gateway-invocation.js /app/gateway-invocation.js
 COPY session-binding.js /app/session-binding.js
 COPY invocation-handler.js /app/invocation-handler.js

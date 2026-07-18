@@ -8,10 +8,15 @@ const path = require("node:path");
 // the runtime image. Keeping the runtime lookup image-local avoids an implicit
 // dependency on the repository layout or any mutable mounted workspace.
 const DEFAULT_CAPABILITY_DIR = path.resolve(__dirname, "capabilities");
+const DEFAULT_RELEASE_PATH = path.join(
+  DEFAULT_CAPABILITY_DIR,
+  "release-v1.json",
+);
 const SOURCE_CATALOG_SHA256 =
   "b4385b54dfa5aaa7ecf2e916111e44248b647b15208432bb9d31883c26e87a26";
 const SOURCE_SCHEMA = "personal-operator.capability-catalog-source.v1";
 const CATALOG_SCHEMA = "personal-operator.capability-catalog.v1";
+const RELEASE_METADATA_SCHEMA = "personal-operator.capability-release.v1";
 const RELEASE_COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -233,6 +238,53 @@ function loadCapabilityCatalog({
   });
 }
 
+function loadRuntimeCapabilityRelease({
+  capabilityDir = DEFAULT_CAPABILITY_DIR,
+  releasePath = DEFAULT_RELEASE_PATH,
+} = {}) {
+  let raw;
+  try {
+    const metadata = fs.lstatSync(releasePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error("not a regular file");
+    }
+    raw = fs.readFileSync(releasePath);
+  } catch {
+    throw new Error("Capability release metadata is unavailable or unsafe");
+  }
+  let release;
+  try {
+    release = JSON.parse(raw.toString("utf8"));
+  } catch {
+    throw new Error("Capability release metadata is not valid JSON");
+  }
+  const expectedFields = ["schema", "releaseCommit", "catalogDigest"];
+  if (
+    !release ||
+    typeof release !== "object" ||
+    Array.isArray(release) ||
+    Object.getPrototypeOf(release) !== Object.prototype ||
+    Object.keys(release).length !== expectedFields.length ||
+    expectedFields.some((field) => !Object.hasOwn(release, field)) ||
+    release.schema !== RELEASE_METADATA_SCHEMA ||
+    typeof release.releaseCommit !== "string" ||
+    !RELEASE_COMMIT_PATTERN.test(release.releaseCommit) ||
+    typeof release.catalogDigest !== "string" ||
+    !SHA256_PATTERN.test(release.catalogDigest)
+  ) {
+    throw new Error("Capability release metadata violates its exact contract");
+  }
+  const loaded = loadCapabilityCatalog({
+    capabilityDir,
+    releaseCommit: release.releaseCommit,
+    expectedCatalogDigest: release.catalogDigest,
+  });
+  return deepFreeze({
+    release: { ...release },
+    ...loaded,
+  });
+}
+
 const PINNED_ARTIFACTS = loadPinnedArtifacts();
 const TOOL_NAMES = deepFreeze(Object.keys(PINNED_ARTIFACTS.toolDefinitions));
 const WORKSPACE_TOOL_NAMES = deepFreeze(TOOL_NAMES.slice(0, 4));
@@ -243,6 +295,7 @@ const GATEWAY_OPERATION_REGISTRY = PINNED_ARTIFACTS.operationRegistry;
 module.exports = {
   CAPABILITY_TOOL_NAMES,
   DEFAULT_CAPABILITY_DIR,
+  DEFAULT_RELEASE_PATH,
   GATEWAY_OPERATION_REGISTRY,
   SCHEMA_SHA256,
   SOURCE_CATALOG_SHA256,
@@ -250,4 +303,5 @@ module.exports = {
   TOOL_NAMES,
   WORKSPACE_TOOL_NAMES,
   loadCapabilityCatalog,
+  loadRuntimeCapabilityRelease,
 };
