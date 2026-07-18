@@ -1,4 +1,4 @@
-"""AgentCore Stack — IAM, S3, and Security Group for AgentCore Runtime.
+"""AgentCore release foundation and Runtime support resources.
 
 Creates the supporting resources that the AgentCore Runtime needs:
   - Execution Role (Bedrock/log/telemetry plus exact broker invocation)
@@ -7,13 +7,11 @@ Creates the supporting resources that the AgentCore Runtime needs:
   - Security Group (VPC networking for the container)
   - S3 Bucket (per-user file storage and workspace sync)
 
-The Runtime itself (container, endpoint) is deployed separately via the
-AgentCore Starter Toolkit (`agentcore deploy`), which handles ECR, Docker
-build (CodeBuild), and Runtime/Endpoint lifecycle. The deploy script
-passes the execution role ARN, subnet IDs, and security group ID from
-this stack to the toolkit.
+The stack owns the immutable ECR and signing boundary. Runtime resources are
+added only for an exact digest-bound release input.
 """
 
+import json
 import re
 
 from aws_cdk import (
@@ -25,9 +23,11 @@ from aws_cdk import (
     Token,
     aws_bedrockagentcore as agentcore,
     aws_ec2 as ec2,
+    aws_ecr as ecr,
     aws_iam as iam,
     aws_kms as kms,
     aws_s3 as s3,
+    aws_signer as signer,
 )
 import cdk_nag
 from constructs import Construct
@@ -296,7 +296,95 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # ECR pull (toolkit creates the repo, but the execution role needs pull access)
+        # --- Immutable runtime image repository and managed signing ----------
+        # This repository is an independently retained release boundary. The
+        # registry-wide signing configuration has one exact repository filter.
+        self.bridge_repository_key = kms.Key(
+            self,
+            "BridgeRepositoryKey",
+            description="KMS key for Personal Operator runtime images",
+            enable_key_rotation=True,
+            pending_window=Duration.days(30),
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        lifecycle_policy = json.dumps(
+            {
+                "rules": [
+                    {
+                        "rulePriority": 1,
+                        "description": "Expire untagged images after 30 days",
+                        "selection": {
+                            "tagStatus": "untagged",
+                            "countType": "sinceImagePushed",
+                            "countUnit": "days",
+                            "countNumber": 30,
+                        },
+                        "action": {"type": "expire"},
+                    }
+                ]
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.bridge_repository = ecr.CfnRepository(
+            self,
+            "BridgeRepository",
+            repository_name="personal-operator/bridge",
+            image_tag_mutability="IMMUTABLE",
+            image_scanning_configuration=(
+                ecr.CfnRepository.ImageScanningConfigurationProperty(
+                    scan_on_push=True
+                )
+            ),
+            encryption_configuration=(
+                ecr.CfnRepository.EncryptionConfigurationProperty(
+                    encryption_type="KMS",
+                    kms_key=self.bridge_repository_key.key_arn,
+                )
+            ),
+            lifecycle_policy=ecr.CfnRepository.LifecyclePolicyProperty(
+                lifecycle_policy_text=lifecycle_policy
+            ),
+        )
+        self.bridge_repository.apply_removal_policy(
+            RemovalPolicy.RETAIN,
+            apply_to_update_replace_policy=True,
+        )
+
+        self.bridge_signing_profile = signer.CfnSigningProfile(
+            self,
+            "BridgeSigningProfile",
+            platform_id="Notation-OCI-SHA384-ECDSA",
+            profile_name="personal_operator_bridge",
+            signature_validity_period=(
+                signer.CfnSigningProfile.SignatureValidityPeriodProperty(
+                    type="DAYS",
+                    value=3650,
+                )
+            ),
+        )
+        self.bridge_signing_profile.apply_removal_policy(
+            RemovalPolicy.RETAIN,
+            apply_to_update_replace_policy=True,
+        )
+        self.bridge_signing_configuration = ecr.CfnSigningConfiguration(
+            self,
+            "BridgeSigningConfiguration",
+            rules=[
+                ecr.CfnSigningConfiguration.RuleProperty(
+                    signing_profile_arn=self.bridge_signing_profile.attr_arn,
+                    repository_filters=[
+                        ecr.CfnSigningConfiguration.RepositoryFilterProperty(
+                            filter="personal-operator/bridge",
+                            filter_type="WILDCARD_MATCH",
+                        )
+                    ],
+                )
+            ],
+        )
+        self.bridge_signing_configuration.add_dependency(self.bridge_repository)
+
+        # AgentCore can pull only the exact retained release repository.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
@@ -305,9 +393,8 @@ class AgentCoreStack(Stack):
                     "ecr:BatchCheckLayerAvailability",
                 ],
                 resources=[
-                    f"arn:aws:ecr:{region}:{account}:repository/openclaw-bridge*",
-                    f"arn:aws:ecr:{region}:{account}:repository/openclaw_agent*",
-                    f"arn:aws:ecr:{region}:{account}:repository/bedrock-agentcore-*",
+                    f"arn:aws:ecr:{region}:{account}:"
+                    "repository/personal-operator/bridge"
                 ],
             )
         )
@@ -586,10 +673,6 @@ class AgentCoreStack(Stack):
                         "Resource::*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*:*",
-                        # ECR pull (toolkit-managed repos — Starter Toolkit uses bedrock-agentcore- prefix)
-                        f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw-bridge*",
-                        f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw_agent*",
-                        f"Resource::arn:aws:ecr:{region}:{account}:repository/bedrock-agentcore-*",
                         # Bedrock Guardrails (wildcard for guardrail version changes)
                         f"Resource::arn:aws:bedrock:{region}:{account}:guardrail/*",
                     ],
