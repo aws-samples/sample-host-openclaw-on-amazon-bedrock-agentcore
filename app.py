@@ -27,6 +27,7 @@ from stacks.router_stack import RouterStack
 from stacks.web_stack import WebStack
 from stacks.guardrails_stack import GuardrailsStack
 from stacks.cron_stack import CronStack
+from stacks.scheduler_stack import SchedulerStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.trusted_lambda_asset import resolve_trusted_lambda_asset_metadata
 
@@ -189,6 +190,23 @@ web_stack = WebStack(
 # Same-ID tombstone deployment removes any legacy Scheduler/Lambda/IAM
 # resources from an existing OpenClawCron CloudFormation stack.
 cron_stack = CronStack(app, "OpenClawCron", env=env)
+
+# --- Trusted read-only scheduler (Task 7) ---
+# Supersedes the CronStack tombstone: a governed control table + ingress Lambda
+# whose EventBridge Scheduler role can only invoke the ingress function and
+# whose ingress role can only strong-read control state and enqueue a read-only
+# occurrence into the existing per-user FIFO. No connector/browser/provider
+# authority exists on either role.
+scheduler_stack = SchedulerStack(
+    app,
+    "PersonalOperatorScheduler",
+    trusted_code_asset_root=trusted_lambda_asset.path,
+    cmk_arn=security_stack.cmk.key_arn,
+    update_queue_arn=router_stack.update_queue.queue_arn,
+    update_queue_url=router_stack.update_queue.queue_url,
+    env=env,
+)
+scheduler_stack.add_dependency(router_stack)
 
 # --- Observability (metadata-only dashboards + alarms; no model payloads) ---
 observability_stack = ObservabilityStack(

@@ -7,6 +7,7 @@ SQS FIFO partial-batch failure semantics without importing an AWS SDK.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -50,15 +51,205 @@ except ImportError:
     )
 
 
+try:
+    from capabilities.contracts import derive_occurrence_id
+except ImportError:  # focused tests add lambda/capabilities directly to sys.path
+    from contracts import derive_occurrence_id
+
+
 logger = logging.getLogger(__name__)
 
 MAX_RUNTIME_RESPONSE_CHARS = 3_500
 MAX_TELEGRAM_HTML_CHARS = TELEGRAM_MAX_HTML_CHARS
 MAX_SQS_BATCH_SIZE = 10
+MAX_OCCURRENCE_BODY_BYTES = 16 * 1024
+
+OCCURRENCE_BODY_SCHEMA = "personal-operator.schedule-occurrence-body.v1"
+_OCCURRENCE_FIELDS = frozenset(
+    {
+        "schema",
+        "occurrenceId",
+        "scheduleId",
+        "userId",
+        "generation",
+        "occurrenceTime",
+        "taskType",
+        "chatId",
+        "actorId",
+        "scheduled",
+        "externalEffects",
+    }
+)
+_OCCURRENCE_TASK_TYPES = frozenset({"REMINDER", "READ_ONLY_AGENT_TURN"})
+_OCCURRENCE_USER_ID = __import__("re").compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
+_OCCURRENCE_SCHEDULE_ID = __import__("re").compile(r"[A-Za-z0-9][A-Za-z0-9_-]{7,127}")
+_OCCURRENCE_ID = __import__("re").compile(r"occ_[0-9a-f]{64}")
+_OCCURRENCE_CHAT_ID = __import__("re").compile(r"[1-9][0-9]{0,19}")
+_OCCURRENCE_ACTOR_ID = __import__("re").compile(r"telegram:([1-9][0-9]{0,19})")
+_MAX_SAFE_INTEGER = 2**53 - 1
 
 
 class WorkerContractError(RuntimeError):
     """A dependency returned data that cannot cross the trusted boundary."""
+
+
+class ScheduledOccurrence:
+    """A distinguishable scheduler-enqueued occurrence parsed before QueueEnvelope.
+
+    It duck-types the ledger's envelope contract (user_id, channel, trace_id,
+    request_sha256, message_group_id, message_deduplication_id, payload) so the
+    at-most-once claim/result/delivery state machine is reused verbatim. Its
+    kind is ``occurrence`` and it carries the read-only markers scheduled=True /
+    externalEffects=False, so a scheduled READ_ONLY_AGENT_TURN can only read or
+    prepare a fresh proposal, never dispatch a connector/browser effect.
+    """
+
+    __slots__ = (
+        "user_id",
+        "channel",
+        "kind",
+        "schedule_id",
+        "occurrence_id",
+        "generation",
+        "occurrence_time",
+        "task_type",
+        "chat_id",
+        "actor_id",
+        "content",
+        "trace_id",
+        "_request_sha256",
+    )
+
+    def __init__(self, body: Mapping[str, Any]) -> None:
+        if not isinstance(body, Mapping):
+            raise WorkerContractError("scheduled occurrence body must be an object")
+        task_type = body.get("taskType")
+        if task_type not in _OCCURRENCE_TASK_TYPES:
+            raise WorkerContractError("scheduled occurrence task type is unsupported")
+        content_field = "message" if task_type == "REMINDER" else "prompt"
+        # Exactly the fixed envelope plus the single content field for the type;
+        # the opposite content field or any extra key is rejected.
+        expected = _OCCURRENCE_FIELDS | {content_field}
+        if set(body) != expected:
+            raise WorkerContractError("scheduled occurrence body is not exact")
+        if body.get("schema") != OCCURRENCE_BODY_SCHEMA:
+            raise WorkerContractError("scheduled occurrence schema is invalid")
+        if body.get("scheduled") is not True or body.get("externalEffects") is not False:
+            raise WorkerContractError("scheduled occurrence markers are invalid")
+        user_id = body.get("userId")
+        schedule_id = body.get("scheduleId")
+        occurrence_id = body.get("occurrenceId")
+        generation = body.get("generation")
+        occurrence_time = body.get("occurrenceTime")
+        chat_id = body.get("chatId")
+        actor_id = body.get("actorId")
+        content = body.get(content_field)
+        if (
+            not isinstance(user_id, str)
+            or _OCCURRENCE_USER_ID.fullmatch(user_id) is None
+            or not isinstance(schedule_id, str)
+            or _OCCURRENCE_SCHEDULE_ID.fullmatch(schedule_id) is None
+            or not isinstance(occurrence_id, str)
+            or _OCCURRENCE_ID.fullmatch(occurrence_id) is None
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or not 1 <= generation <= _MAX_SAFE_INTEGER
+            or isinstance(occurrence_time, bool)
+            or not isinstance(occurrence_time, int)
+            or not 0 <= occurrence_time <= _MAX_SAFE_INTEGER
+            or not isinstance(chat_id, str)
+            or _OCCURRENCE_CHAT_ID.fullmatch(chat_id) is None
+            or not isinstance(actor_id, str)
+            or _OCCURRENCE_ACTOR_ID.fullmatch(actor_id) is None
+            or not isinstance(content, str)
+            or not content
+            or len(content) > 4096
+        ):
+            raise WorkerContractError("scheduled occurrence body is invalid")
+        if chat_id != actor_id.removeprefix("telegram:"):
+            raise WorkerContractError("scheduled occurrence chat is not its actor")
+        # The occurrence id must bind schedule + generation + time exactly.
+        if occurrence_id != derive_occurrence_id(
+            schedule_id, generation, occurrence_time
+        ):
+            raise WorkerContractError(
+                "scheduled occurrence id does not bind its schedule generation and time"
+            )
+        self.user_id = user_id
+        self.channel = "telegram"
+        self.kind = "occurrence"
+        self.schedule_id = schedule_id
+        self.occurrence_id = occurrence_id
+        self.generation = generation
+        self.occurrence_time = occurrence_time
+        self.task_type = task_type
+        self.chat_id = chat_id
+        self.actor_id = actor_id
+        self.content = content
+        # The occurrence id is the durable event identity: deterministic across
+        # duplicate fires so the ledger collapses replays to at-most-once.
+        self.trace_id = occurrence_id
+        self._request_sha256 = hashlib.sha256(
+            b"personal-operator-schedule-occurrence-body-v1\0"
+            + occurrence_id.encode("utf-8")
+        ).hexdigest()
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return {"chatId": self.chat_id, "actorId": self.actor_id}
+
+    @property
+    def message_group_id(self) -> str:
+        return self.user_id
+
+    @property
+    def message_deduplication_id(self) -> str:
+        return self.occurrence_id
+
+    @property
+    def request_sha256(self) -> str:
+        return self._request_sha256
+
+    @classmethod
+    def from_json(cls, body: Any) -> "ScheduledOccurrence":
+        if (
+            not isinstance(body, str)
+            or not body
+            or len(body.encode("utf-8")) > MAX_OCCURRENCE_BODY_BYTES
+        ):
+            raise WorkerContractError("occurrence body must be bounded UTF-8 JSON text")
+
+        def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise WorkerContractError("duplicate JSON key")
+                result[key] = value
+            return result
+
+        try:
+            parsed = json.loads(
+                body,
+                object_pairs_hook=reject_duplicates,
+                parse_constant=lambda token: (_ for _ in ()).throw(
+                    WorkerContractError(token)
+                ),
+            )
+        except WorkerContractError:
+            raise
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise WorkerContractError("occurrence body is not valid JSON") from error
+        return cls(parsed)
+
+
+def _looks_like_occurrence_body(body: Any) -> bool:
+    if not isinstance(body, str) or f'"{OCCURRENCE_BODY_SCHEMA}"' not in body:
+        return False
+    try:
+        peeked = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return isinstance(peeked, Mapping) and peeked.get("schema") == OCCURRENCE_BODY_SCHEMA
 
 
 class RuntimeDriver(Protocol):
@@ -257,11 +448,42 @@ def _runtime_result(
     return _extract_runtime_text(result)
 
 
+def _occurrence_result(
+    occurrence: "ScheduledOccurrence",
+    dependencies: WorkerDependencies,
+) -> str:
+    """Compute the durable result text for one scheduled occurrence.
+
+    A REMINDER renders its fixed reminder text (a Telegram notification, not a
+    connector effect). A READ_ONLY_AGENT_TURN invokes the runtime with the
+    explicit read-only markers so the turn's capability grant can only read or
+    PREPARE a fresh proposal and can never dispatch an external effect.
+    """
+
+    if occurrence.task_type == "REMINDER":
+        return occurrence.content
+    if occurrence.task_type == "READ_ONLY_AGENT_TURN":
+        # No chatId, no provider secret, and an explicit read-only marker. The
+        # runtime's capability grant is thereby confined to read/propose.
+        request = {
+            "channel": occurrence.channel,
+            "actorId": occurrence.actor_id,
+            "prompt": occurrence.content,
+            "scheduled": True,
+            "externalEffects": False,
+        }
+        result = dependencies.runtime_driver.invoke(
+            occurrence.user_id, request, occurrence.trace_id
+        )
+        return _extract_runtime_text(result)
+    raise WorkerContractError("scheduled occurrence task type is unsupported")
+
+
 def process_envelope(envelope: QueueEnvelope, dependencies: WorkerDependencies) -> None:
     """Process one update with durable execution and at-most-one delivery attempt."""
 
-    if not isinstance(envelope, QueueEnvelope):
-        raise TypeError("envelope must be a QueueEnvelope")
+    if not isinstance(envelope, (QueueEnvelope, ScheduledOccurrence)):
+        raise TypeError("envelope must be a QueueEnvelope or ScheduledOccurrence")
     if not isinstance(dependencies, WorkerDependencies):
         raise TypeError("dependencies must be WorkerDependencies")
 
@@ -327,6 +549,8 @@ def process_envelope(envelope: QueueEnvelope, dependencies: WorkerDependencies) 
                 proposed_result = _callback_result(
                     envelope, envelope.message_deduplication_id, dependencies
                 )
+            elif envelope.kind == "occurrence":
+                proposed_result = _occurrence_result(envelope, dependencies)
             else:
                 raise WorkerContractError("unsupported worker message kind")
             claim = dependencies.ledger.complete_result(claim, proposed_result)
@@ -410,10 +634,17 @@ def _record_identifier(record: Any, fallback_index: int) -> str:
     return f"invalid-record-{fallback_index}"
 
 
-def _envelope_from_sqs_record(record: Any) -> QueueEnvelope:
+def _envelope_from_sqs_record(record: Any):
     if not isinstance(record, Mapping) or record.get("eventSource") != "aws:sqs":
         raise WorkerContractError("worker accepts only SQS event records")
-    envelope = QueueEnvelope.from_json(record.get("body"))
+    body = record.get("body")
+    # A scheduler-enqueued occurrence rides the same per-user FIFO as a
+    # distinguishable SQS body. Detect and parse it before QueueEnvelope so the
+    # message_queue contract need not change to carry a new envelope kind.
+    if _looks_like_occurrence_body(body):
+        envelope = ScheduledOccurrence.from_json(body)
+    else:
+        envelope = QueueEnvelope.from_json(body)
     attributes = record.get("attributes")
     if not isinstance(attributes, Mapping):
         raise WorkerContractError("SQS FIFO attributes are missing")

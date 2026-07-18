@@ -591,3 +591,115 @@ def test_runtime_cannot_claim_it_streamed_directly_to_telegram():
         assert "stream" in str(error).lower()
     else:
         raise AssertionError("untrusted runtime streaming claim must be rejected")
+
+
+# --- Task 7: scheduled read-only occurrences ---------------------------------
+
+import hashlib as _hashlib
+
+sys.path.insert(0, str(WORKER_DIR.parent / "capabilities"))
+from contracts import derive_occurrence_id as _derive_occurrence_id  # noqa: E402
+
+OCCURRENCE_BODY_SCHEMA = "personal-operator.schedule-occurrence-body.v1"
+SCHEDULE_ID = "sch_" + "a" * 64
+
+
+def occurrence_body(*, task_type="REMINDER", generation=1, occurrence_time=1_800_000_600, content=None):
+    occurrence_id = _derive_occurrence_id(SCHEDULE_ID, generation, occurrence_time)
+    content_field = "message" if task_type == "REMINDER" else "prompt"
+    if content is None:
+        content = "water the plants" if task_type == "REMINDER" else "read my inbox"
+    body = {
+        "schema": OCCURRENCE_BODY_SCHEMA,
+        "occurrenceId": occurrence_id,
+        "scheduleId": SCHEDULE_ID,
+        "userId": "user_a1",
+        "generation": generation,
+        "occurrenceTime": occurrence_time,
+        "taskType": task_type,
+        "chatId": "42",
+        "actorId": "telegram:42",
+        content_field: content,
+        "scheduled": True,
+        "externalEffects": False,
+    }
+    return json.dumps(body, ensure_ascii=True, separators=(",", ":"), sort_keys=True, allow_nan=False), occurrence_id
+
+
+def occurrence_sqs_record(body, occurrence_id, message_id="sqs-occ-1"):
+    return {
+        "messageId": message_id,
+        "receiptHandle": "synthetic",
+        "body": body,
+        "attributes": {
+            "MessageGroupId": "user_a1",
+            "MessageDeduplicationId": occurrence_id,
+        },
+        "messageAttributes": {},
+        "eventSource": "aws:sqs",
+    }
+
+
+def test_worker_processes_scheduled_occurrence_at_most_once_reusing_ledger_state_machine():
+    ledger = FakeLedger()
+    delivery = FakeDelivery()
+    deps = dependencies(ledger=ledger, delivery=delivery)
+    body, occurrence_id = occurrence_body(task_type="REMINDER")
+    record = occurrence_sqs_record(body, occurrence_id)
+
+    first = worker.process_sqs_event({"Records": [record]}, deps)
+    second = worker.process_sqs_event({"Records": [record]}, deps)
+
+    assert first == {"batchItemFailures": []}
+    assert second == {"batchItemFailures": []}
+    # At-most-once delivery despite a duplicate fire replay.
+    assert len(delivery.calls) == 1
+    # The occurrence reused the existing ledger state machine keyed by dedupe id.
+    assert list(ledger.records) == [occurrence_id]
+    assert ledger.records[occurrence_id].state == "DELIVERED"
+
+
+def test_scheduled_reminder_delivers_once_and_read_only_turn_invokes_runtime_with_external_effects_false():
+    # REMINDER: delivered as a notification, runtime is never invoked.
+    runtime = FakeRuntimeDriver()
+    delivery = FakeDelivery()
+    deps = dependencies(runtime=runtime, delivery=delivery)
+    body, occurrence_id = occurrence_body(task_type="REMINDER", content="**call mum**")
+    worker.process_sqs_event({"Records": [occurrence_sqs_record(body, occurrence_id)]}, deps)
+
+    assert runtime.calls == []
+    assert len(delivery.calls) == 1
+    assert delivery.calls[0]["chat_id"] == "42"
+    assert delivery.calls[0]["html"] == "<b>call mum</b>"
+
+    # READ_ONLY_AGENT_TURN: the runtime is invoked with the read-only markers.
+    runtime2 = FakeRuntimeDriver({"response": "here is your digest"})
+    delivery2 = FakeDelivery()
+    deps2 = dependencies(runtime=runtime2, delivery=delivery2)
+    body2, occ2 = occurrence_body(task_type="READ_ONLY_AGENT_TURN", content="read inbox")
+    worker.process_sqs_event({"Records": [occurrence_sqs_record(body2, occ2, message_id="sqs-occ-2")]}, deps2)
+
+    assert len(runtime2.calls) == 1
+    user_id, request, trace_id = runtime2.calls[0]
+    assert user_id == "user_a1"
+    assert request["scheduled"] is True
+    assert request["externalEffects"] is False
+    # The read-only turn's request carries no chatId or provider secret.
+    serialized = json.dumps(request).lower()
+    assert "chatid" not in serialized
+    assert "token" not in serialized
+    assert len(delivery2.calls) == 1
+    assert delivery2.calls[0]["html"] == "here is your digest"
+
+
+def test_scheduled_occurrence_body_with_forbidden_shape_is_rejected():
+    deps = dependencies()
+    # An occurrence that lies about its bound occurrenceId is rejected.
+    body, occurrence_id = occurrence_body(task_type="REMINDER")
+    tampered = json.loads(body)
+    tampered["occurrenceId"] = _derive_occurrence_id(SCHEDULE_ID, 9, 1_800_000_600)
+    record = occurrence_sqs_record(
+        json.dumps(tampered, separators=(",", ":"), sort_keys=True), occurrence_id
+    )
+    result = worker.process_sqs_event({"Records": [record]}, deps)
+    assert result == {"batchItemFailures": [{"itemIdentifier": "sqs-occ-1"}]}

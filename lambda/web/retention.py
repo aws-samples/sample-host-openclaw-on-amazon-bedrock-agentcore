@@ -458,6 +458,7 @@ class DeletionCoordinator:
         workspace_store,
         record_store,
         footprint_store,
+        schedule_store=None,
         clock_ms=None,
         finalization_grace_ms: int = FINALIZATION_GRACE_MS,
     ) -> None:
@@ -475,6 +476,14 @@ class DeletionCoordinator:
         if not callable(getattr(footprint_store, "delete_user_records", None)):
             raise TypeError("external user footprint store is invalid")
         self._footprint = footprint_store
+        # Optional trusted scheduler purge. When present it must delete every
+        # live EventBridge schedule and report the count still ENABLED, so the
+        # deletion path cannot complete while any live schedule remains.
+        if schedule_store is not None and not callable(
+            getattr(schedule_store, "purge_user_schedules", None)
+        ):
+            raise TypeError("schedule store is invalid")
+        self._schedules = schedule_store
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self._finalization_grace_ms = finalization_grace_ms
 
@@ -561,6 +570,13 @@ class DeletionCoordinator:
         try:
             self._sessions.revoke_all(user_id)
             self._connections.revoke_all(user_id)
+            # Delete live schedules before any completion can be claimed. This is
+            # idempotent/repeatable and must leave zero ENABLED schedules or the
+            # deletion stays pending.
+            if self._schedules is not None:
+                remaining = self._schedules.purge_user_schedules(user_id)
+                if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining != 0:
+                    raise RuntimeError("live schedules remain before deletion completion")
             runtime = self._runtime.purge(user_id)
             if (
                 not isinstance(runtime, Mapping)
