@@ -341,6 +341,41 @@ def _write_valid_asset(repository_root: pathlib.Path) -> pathlib.Path:
     return asset
 
 
+def _rebaseline_packaged_files_without_touching_reviewed_sources(
+    asset: pathlib.Path,
+) -> None:
+    excluded = {"ASSET.sha256", "MANIFEST.json", "SHA256SUMS"}
+    files = []
+    for path in sorted(
+        asset.rglob("*"), key=lambda item: item.relative_to(asset).as_posix()
+    ):
+        if not path.is_file() or path.name in excluded:
+            continue
+        payload = path.read_bytes()
+        files.append(
+            {
+                "path": path.relative_to(asset).as_posix(),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+                "mode": format(stat.S_IMODE(path.stat().st_mode), "04o"),
+            }
+        )
+    manifest_path = asset / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["files"] = files
+    manifest["payloadBytes"] = sum(item["size"] for item in files)
+    manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    manifest_path.write_bytes(manifest_bytes)
+    (asset / "SHA256SUMS").write_text(
+        "".join(f'{item["sha256"]}  {item["path"]}\n' for item in files),
+        encoding="utf-8",
+    )
+    (asset / "ASSET.sha256").write_text(
+        hashlib.sha256(manifest_bytes).hexdigest() + "\n",
+        encoding="ascii",
+    )
+
+
 def test_cdk_asset_resolution_accepts_fresh_authenticated_arm64_python313_build(
     tmp_path,
 ) -> None:
@@ -362,6 +397,27 @@ def test_cdk_asset_resolution_rejects_empty_stale_or_extra_assets(tmp_path) -> N
     (asset / "unexpected.py").write_text("pass\n", encoding="utf-8")
     with pytest.raises(TrustedLambdaAssetError, match="file set"):
         resolve_trusted_lambda_asset(second, account="123456789012")
+
+
+@pytest.mark.parametrize("hostile_change", ["gateway", "catalog", "schema"])
+def test_cdk_asset_resolution_cross_binds_every_reviewed_source_to_payload(
+    tmp_path,
+    hostile_change,
+) -> None:
+    asset = _write_valid_asset(tmp_path)
+    if hostile_change == "gateway":
+        (asset / "capabilities" / "gateway.py").write_text(
+            "# substituted after review\n",
+            encoding="utf-8",
+        )
+    elif hostile_change == "catalog":
+        (asset / "capabilities" / "artifacts" / "catalog-v1.json").unlink()
+    else:
+        next((asset / "capabilities" / "artifacts" / "schemas").glob("*.json")).unlink()
+    _rebaseline_packaged_files_without_touching_reviewed_sources(asset)
+
+    with pytest.raises(TrustedLambdaAssetError, match="source.*payload"):
+        resolve_trusted_lambda_asset(tmp_path, account="123456789012")
 
 
 def test_cdk_asset_resolution_rejects_symlinks(tmp_path) -> None:

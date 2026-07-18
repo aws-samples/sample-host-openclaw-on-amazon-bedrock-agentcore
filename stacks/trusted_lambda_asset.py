@@ -18,6 +18,7 @@ _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _EXCLUDED_INVENTORY = {"ASSET.sha256", "MANIFEST.json", "SHA256SUMS"}
 _CAPABILITY_SOURCE = Path("specs/capabilities")
 _CAPABILITY_ASSET = PurePosixPath("capabilities/artifacts")
+_CAPABILITY_SCHEMA_PREFIX = f"{_CAPABILITY_ASSET.as_posix()}/schemas/"
 _REQUIRED_HANDLERS = {
     "router/index.py",
     "worker/index.py",
@@ -269,8 +270,31 @@ def _resolve_built_asset(root: Path, asset: Path) -> str | None:
     current_source = _source_inventory(root)
     if source_files != current_source:
         raise TrustedLambdaAssetError("trusted Lambda asset source is stale")
-    if not _REQUIRED_HANDLERS.issubset({item["path"] for item in source_files}):
+    files_by_path = {item["path"]: item for item in files}
+    for source_item in source_files:
+        packaged = files_by_path.get(source_item["path"])
+        if packaged is None or any(
+            packaged[field] != source_item[field]
+            for field in ("path", "sha256", "size")
+        ):
+            raise TrustedLambdaAssetError(
+                "trusted Lambda asset source differs from packaged payload"
+            )
+    actual_paths = set(files_by_path)
+    if not _REQUIRED_HANDLERS.issubset(actual_paths):
         raise TrustedLambdaAssetError("trusted Lambda asset is missing a handler")
+    reviewed_schemas = {
+        item["path"]
+        for item in source_files
+        if item["path"].startswith(_CAPABILITY_SCHEMA_PREFIX)
+    }
+    actual_schemas = {
+        path for path in actual_paths if path.startswith(_CAPABILITY_SCHEMA_PREFIX)
+    }
+    if len(reviewed_schemas) != 20 or actual_schemas != reviewed_schemas:
+        raise TrustedLambdaAssetError(
+            "trusted Lambda asset source differs from packaged payload schemas"
+        )
 
     dependencies = manifest.get("dependencies")
     if not isinstance(dependencies, list) or not dependencies:
