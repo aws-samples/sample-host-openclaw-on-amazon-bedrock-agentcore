@@ -27,14 +27,10 @@ index = importlib.import_module("index")
 
 class TestCanonicalRuntimeIdentity(unittest.TestCase):
     def test_invoke_uses_internal_user_for_namespace_and_runtime_user(self):
-        response = MagicMock()
-        response.read.return_value = b'{"response":"ok"}'
-        with patch.object(index, "agentcore_client") as client:
-            client.invoke_agent_runtime.return_value = {
-                "statusCode": 200,
-                "response": response,
-            }
-
+        driver = MagicMock()
+        driver.ensure.return_value.session_id = "ses_123456789012345678901234567890"
+        driver.invoke.return_value = {"response": "ok"}
+        with patch.object(index, "_get_runtime_driver", return_value=driver):
             result = index.invoke_agent_runtime(
                 "ses_123456789012345678901234567890",
                 "user_internal_1",
@@ -45,26 +41,42 @@ class TestCanonicalRuntimeIdentity(unittest.TestCase):
             )
 
         self.assertEqual(result, {"response": "ok"})
-        call = client.invoke_agent_runtime.call_args.kwargs
-        self.assertEqual(call["runtimeUserId"], "user_internal_1")
-        payload = json.loads(call["payload"])
-        self.assertEqual(payload["internalUserId"], "user_internal_1")
-        self.assertEqual(payload["namespace"], "user_internal_1")
-        self.assertEqual(payload["actorId"], "telegram:attacker-controlled-actor")
-        self.assertNotIn("userId", payload)
+        driver.invoke.assert_called_once_with(
+            "user_internal_1",
+            {
+                "actorId": "telegram:attacker-controlled-actor",
+                "channel": "telegram",
+                "message": "hello",
+            },
+            f"po1_{'a' * 64}",
+        )
+
+    def test_legacy_router_wrapper_cannot_select_another_session(self):
+        driver = MagicMock()
+        driver.ensure.return_value.session_id = "ses_123456789012345678901234567890"
+        with (
+            patch.object(index, "_get_runtime_driver", return_value=driver),
+            self.assertRaisesRegex(RuntimeError, "session mapping"),
+        ):
+            index.invoke_agent_runtime(
+                "ses_attacker_controlled_12345678901234567890",
+                "user_internal_1",
+                "telegram:1",
+                "telegram",
+                "hello",
+                f"po1_{'f' * 64}",
+            )
+        driver.invoke.assert_not_called()
 
     def test_two_linked_channel_actors_share_runtime_and_upload_namespace(self):
         linked_user = "user_linked_42"
         actors = ["telegram:101", "slack:U202", "feishu:ou_303"]
         for actor in actors:
             with self.subTest(actor=actor):
-                response = MagicMock()
-                response.read.return_value = b'{"response":"ok"}'
-                with patch.object(index, "agentcore_client") as client:
-                    client.invoke_agent_runtime.return_value = {
-                        "statusCode": 200,
-                        "response": response,
-                    }
+                driver = MagicMock()
+                driver.ensure.return_value.session_id = "ses_123456789012345678901234567890"
+                driver.invoke.return_value = {"response": "ok"}
+                with patch.object(index, "_get_runtime_driver", return_value=driver):
                     index.invoke_agent_runtime(
                         "ses_123456789012345678901234567890",
                         linked_user,
@@ -74,7 +86,7 @@ class TestCanonicalRuntimeIdentity(unittest.TestCase):
                         f"po1_{'b' * 64}",
                     )
                 self.assertEqual(
-                    client.invoke_agent_runtime.call_args.kwargs["runtimeUserId"],
+                    driver.invoke.call_args.args[0],
                     linked_user,
                 )
 

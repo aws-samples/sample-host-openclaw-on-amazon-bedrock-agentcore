@@ -119,6 +119,25 @@ class RouterStack(Stack):
             encryption_key=identity_cmk,
         )
 
+        # Runtime state has a deliberately separate, single-item-per-user
+        # boundary. Session mapping, lease fencing, and deletion tombstone are
+        # atomically co-located; tombstones have no DynamoDB TTL.
+        self.runtime_state_table = dynamodb.Table(
+            self,
+            "RuntimeStateTable",
+            table_name="personal-operator-runtime-state",
+            partition_key=dynamodb.Attribute(
+                name="userId", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.RETAIN,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True,
+            ),
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=identity_cmk,
+        )
+
         # --- Log Group ---
         router_log_group = logs.LogGroup(
             self,
@@ -142,6 +161,8 @@ class RouterStack(Stack):
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,
                 "IDENTITY_TABLE_NAME": self.identity_table.table_name,
+                "RUNTIME_STATE_TABLE_NAME": self.runtime_state_table.table_name,
+                "RUNTIME_LEASE_MS": "120000",
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
                 "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
@@ -222,6 +243,7 @@ class RouterStack(Stack):
                 actions=[
                     "bedrock-agentcore:InvokeAgentRuntime",
                     "bedrock-agentcore:InvokeAgentRuntimeForUser",
+                    "bedrock-agentcore:StopRuntimeSession",
                 ],
                 resources=[
                     runtime_iam_arn,
@@ -232,6 +254,19 @@ class RouterStack(Stack):
 
         # DynamoDB read/write
         self.identity_table.grant_read_write_data(self.router_fn)
+
+        # Runtime state is narrower than the inherited identity/profile table:
+        # no DeleteItem, scans, queries, batches, or transactions are needed.
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                ],
+                resources=[self.runtime_state_table.table_arn],
+            )
+        )
 
         # Lambda self-invoke (for async dispatch)
         # Use constructed ARN to avoid circular dependency with Function URL
@@ -298,6 +333,11 @@ class RouterStack(Stack):
             self,
             "IdentityTableName",
             value=self.identity_table.table_name,
+        )
+        CfnOutput(
+            self,
+            "RuntimeStateTableName",
+            value=self.runtime_state_table.table_name,
         )
 
         # --- cdk-nag suppressions ---

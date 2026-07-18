@@ -26,6 +26,9 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from runtime_driver import AgentCoreAdapter, RuntimeDriver
+from runtime_state import RuntimeStateRepository
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -33,6 +36,7 @@ logger.setLevel(logging.INFO)
 AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
 AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
+RUNTIME_STATE_TABLE_NAME = os.environ.get("RUNTIME_STATE_TABLE_NAME", "")
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
@@ -72,6 +76,32 @@ agentcore_client = boto3.client(
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
+
+_runtime_driver_cache = None
+
+
+def _get_runtime_driver():
+    """Build the trusted driver lazily so import-only webhook tests stay offline."""
+    global _runtime_driver_cache
+    if _runtime_driver_cache is not None:
+        return _runtime_driver_cache
+    if not RUNTIME_STATE_TABLE_NAME:
+        raise RuntimeError("RUNTIME_STATE_TABLE_NAME is required")
+    lease_ms = int(os.environ.get("RUNTIME_LEASE_MS", "120000"))
+    if lease_ms < 30_000 or lease_ms > 600_000:
+        raise RuntimeError("RUNTIME_LEASE_MS must be between 30000 and 600000")
+    state_table = dynamodb.Table(RUNTIME_STATE_TABLE_NAME)
+    _runtime_driver_cache = RuntimeDriver(
+        repository=RuntimeStateRepository(state_table),
+        adapter=AgentCoreAdapter(
+            agentcore_client,
+            runtime_arn=AGENTCORE_RUNTIME_ARN,
+            qualifier=AGENTCORE_QUALIFIER,
+            region=AWS_REGION,
+        ),
+        lease_ms=lease_ms,
+    )
+    return _runtime_driver_cache
 
 USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
 
@@ -513,45 +543,9 @@ def resolve_user(channel, channel_user_id, display_name=""):
 
 
 def get_or_create_session(user_id):
-    """Get or create a session ID for the user. Session IDs must be >= 33 chars."""
+    """Return the driver's server-created session mapping for legacy handlers."""
     user_id = _canonical_namespace(user_id)
-    pk = f"USER#{user_id}"
-
-    try:
-        resp = identity_table.get_item(Key={"PK": pk, "SK": "SESSION"})
-        if "Item" in resp:
-            # Update last activity
-            identity_table.update_item(
-                Key={"PK": pk, "SK": "SESSION"},
-                UpdateExpression="SET lastActivity = :now",
-                ExpressionAttributeValues={":now": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-            )
-            return resp["Item"]["sessionId"]
-    except ClientError as e:
-        logger.error("DynamoDB session lookup failed: %s", e)
-
-    # Create new session (>= 33 chars required by AgentCore)
-    session_id = f"ses_{user_id}_{uuid.uuid4().hex[:12]}"
-    if len(session_id) < 33:
-        session_id += "_" + uuid.uuid4().hex[: 33 - len(session_id)]
-    logger.info("New session created: %s for user %s", session_id, user_id)
-    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    try:
-        identity_table.put_item(
-            Item={
-                "PK": pk,
-                "SK": "SESSION",
-                "sessionId": session_id,
-                "createdAt": now_iso,
-                "lastActivity": now_iso,
-            }
-        )
-    except ClientError as e:
-        logger.error("Failed to create session: %s", e)
-
-    logger.info("New session created: %s for %s", session_id, user_id)
-    return session_id
+    return _get_runtime_driver().ensure(user_id).session_id
 
 
 # ---------------------------------------------------------------------------
@@ -653,52 +647,22 @@ def _canonical_namespace(internal_user_id):
 
 
 def invoke_agent_runtime(session_id, user_id, actor_id, channel, message, invocation_id):
-    """Invoke the AgentCore Runtime with a per-user session.
-
-    Message can be a plain string or a structured dict with text + images.
-    """
+    """Compatibility wrapper that validates, but never selects, a session ID."""
     namespace = _canonical_namespace(user_id)
-    payload = json.dumps({
-        "action": "chat",
-        "internalUserId": namespace,
-        "namespace": namespace,
-        "actorId": actor_id,
-        "channel": channel,
-        "message": message,
-        "invocationId": invocation_id,
-    }).encode()
-
+    driver = _get_runtime_driver()
+    mapped_session = driver.ensure(namespace).session_id
+    if session_id != mapped_session:
+        raise RuntimeError("caller session does not match server session mapping")
     try:
-        logger.info("Invoking AgentCore: arn=%s qualifier=%s session=%s", AGENTCORE_RUNTIME_ARN, AGENTCORE_QUALIFIER, session_id)
-        resp = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
-            qualifier=AGENTCORE_QUALIFIER,
-            runtimeSessionId=session_id,
-            runtimeUserId=namespace,
-            payload=payload,
-            contentType="application/json",
-            accept="application/json",
+        return driver.invoke(
+            namespace,
+            {
+                "actorId": actor_id,
+                "channel": channel,
+                "message": message,
+            },
+            invocation_id,
         )
-        status_code = resp.get("statusCode")
-        logger.info("AgentCore response status: %s", status_code)
-        MAX_RESPONSE_BYTES = 500_000  # 500 KB — prevents OOM from large subagent responses
-        body = resp.get("response")
-        if body:
-            if hasattr(body, "read"):
-                body_bytes = body.read(MAX_RESPONSE_BYTES + 1)
-                body_text = body_bytes.decode("utf-8", errors="replace")
-                if len(body_bytes) > MAX_RESPONSE_BYTES:
-                    logger.warning("AgentCore response truncated at %d bytes", MAX_RESPONSE_BYTES)
-                    body_text = body_text[:MAX_RESPONSE_BYTES]
-            else:
-                body_text = str(body)[:MAX_RESPONSE_BYTES]
-            logger.info("AgentCore response (len=%d, first 200 chars): %s", len(body_text), body_text[:200])
-            try:
-                return json.loads(body_text)
-            except json.JSONDecodeError:
-                return {"response": body_text}
-        logger.warning("AgentCore returned no response body")
-        return {"response": "No response from agent."}
     except Exception as e:
         logger.error("AgentCore invocation failed: %s", e, exc_info=True)
         return {"response": f"Sorry, I'm having trouble right now. Please try again later."}
