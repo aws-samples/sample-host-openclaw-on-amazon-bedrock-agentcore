@@ -311,9 +311,10 @@ BUILD_CONTAINER
 
   verify_asset_in_container "${staging_dir}" "${immutable_image}" \
     "${source_commit}" "${source_tree}"
-  rm -rf "${ASSET_DIR}"
   rm -rf "${payload_dir}"
-  mv "${staging_dir}" "${ASSET_DIR}"
+  PYTHONPATH="${REPO_ROOT}" python3 -m release_tools.lambda_asset publish \
+    --staging "${staging_dir}" \
+    --destination "${ASSET_DIR}"
   trap - EXIT INT TERM
   printf 'trusted Lambda asset ready: %s/%s\n' "${ASSET_DIR}" "${ARCHIVE_NAME}"
   printf 'CDK code asset: build/trusted-lambda/trusted-lambda.zip\n'

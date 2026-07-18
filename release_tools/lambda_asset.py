@@ -330,6 +330,34 @@ def extract_verified_archive(
             output.chmod(int(item.mode, 8))
 
 
+def publish_trusted_lambda_artifact(
+    staging_root: Path,
+    destination_root: Path,
+) -> None:
+    """Publish one verified directory without deleting or replacing an asset."""
+
+    staging = Path(staging_root)
+    destination = Path(destination_root)
+    if staging.parent.resolve(strict=True) != destination.parent.resolve(strict=True):
+        raise ContractError("trusted Lambda publication must stay on one filesystem")
+    if not staging.is_dir() or staging.is_symlink():
+        raise ContractError("trusted Lambda staging directory is invalid")
+    if destination.exists() or destination.is_symlink():
+        raise ContractError(
+            "trusted Lambda destination already exists; refusing to replace it"
+        )
+    try:
+        os.rename(staging, destination)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(destination.parent, directory_flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise ContractError("trusted Lambda publication was not atomic") from error
+
+
 def _cli() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -347,6 +375,9 @@ def _cli() -> int:
     verify.add_argument("--expected-commit", required=True)
     verify.add_argument("--expected-tree", required=True)
     verify.add_argument("--extract", type=Path)
+    publish = subparsers.add_parser("publish")
+    publish.add_argument("--staging", type=Path, required=True)
+    publish.add_argument("--destination", type=Path, required=True)
     arguments = parser.parse_args()
     if arguments.command == "build":
         manifest = build_trusted_lambda_artifacts(
@@ -358,7 +389,7 @@ def _cli() -> int:
             builder_image=arguments.builder_image,
             builder_image_id=arguments.builder_image_id,
         )
-    else:
+    elif arguments.command == "verify":
         manifest = verify_trusted_lambda_artifact(
             arguments.artifact,
             arguments.source,
@@ -367,6 +398,10 @@ def _cli() -> int:
         )
         if arguments.extract is not None:
             extract_verified_archive(arguments.artifact, arguments.extract, manifest)
+    else:
+        publish_trusted_lambda_artifact(arguments.staging, arguments.destination)
+        print("published trusted Lambda artifact", file=sys.stderr)
+        return 0
     print(
         f"verified {len(manifest.files)} files and "
         f"{len(manifest.dependencies)} distributions",

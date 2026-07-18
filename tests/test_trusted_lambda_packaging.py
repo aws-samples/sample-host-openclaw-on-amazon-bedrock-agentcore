@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import shlex
 import subprocess
+import sys
 
 import pytest
 
-from release_tools.lambda_asset import build_trusted_lambda_artifacts
+from release_tools.contracts import ContractError
+from release_tools.lambda_asset import (
+    build_trusted_lambda_artifacts,
+    verify_trusted_lambda_artifact,
+)
 from stacks.trusted_lambda_asset import (
     SCHEMA,
     TrustedLambdaAssetError,
@@ -20,10 +26,6 @@ from stacks.trusted_lambda_asset import (
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build-trusted-lambda-asset.sh"
 REQUIREMENTS = ROOT / "lambda" / "requirements.txt"
-
-
-def _script_text() -> str:
-    return SCRIPT.read_text(encoding="utf-8")
 
 
 def test_packaging_script_is_valid_bash_and_help_needs_no_docker() -> None:
@@ -82,7 +84,10 @@ def test_deployment_requirements_are_transitively_sha256_locked() -> None:
             for token in tokens[1:]
         ), line
 
-    locked_names = {shlex.split(line)[0].split("==", 1)[0].casefold() for line in requirement_lines}
+    locked_names = {
+        shlex.split(line)[0].split("==", 1)[0].casefold()
+        for line in requirement_lines
+    }
     assert {
         "boto3",
         "cryptography",
@@ -92,129 +97,247 @@ def test_deployment_requirements_are_transitively_sha256_locked() -> None:
     }.issubset(locked_names)
 
 
-def test_build_fails_closed_onto_lambda_python_313_arm64() -> None:
-    script = _script_text()
-    assert 'readonly PLATFORM="linux/arm64"' in script
-    assert 'TRUSTED_LAMBDA_BUILD_IMAGE' in script
-    assert 'public.ecr.aws/lambda/python@sha256:' in script
-    assert 'public.ecr.aws/lambda/python:3.13 |' not in script
-    assert 'docker pull --platform "${PLATFORM}"' in script
-    assert '"$(id -u):$(id -g)"' in script
-    assert "refusing a host-native build" in script
-    assert 'platform.machine() in {"aarch64", "arm64"}' in script
-    assert 'sys.version_info[:2] == (3, 13)' in script
-    assert '"ID=amzn" in os_release' in script
+def _write_executable(path: pathlib.Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
 
 
-def test_container_boundary_does_not_forward_credentials_or_deploy() -> None:
-    script = _script_text()
-    assert '--volume "${HOME}/.aws' not in script
-    assert '--volume "${HOME}/.config' not in script
-    assert "${AWS_ACCESS_KEY_ID" not in script
-    assert "${AWS_SECRET_ACCESS_KEY" not in script
-    assert "${AWS_SESSION_TOKEN" not in script
-    assert "--env AWS_SESSION_TOKEN" not in script
-    assert "--env AWS_ACCESS_KEY_ID=packaging-placeholder" in script
-    assert "--env AWS_SECRET_ACCESS_KEY=packaging-placeholder" in script
-    assert "cdk deploy" not in script
-    assert "aws lambda" not in script
-    assert "--env-file" not in script
-    assert "AWS_EC2_METADATA_DISABLED=true" in script
-    assert "--cap-drop ALL" in script
-    assert "--security-opt no-new-privileges" in script
-    assert '"${REPO_ROOT}:/workspace:ro"' in script
+def _packaging_subprocess_fixture(
+    tmp_path: pathlib.Path, *, existing_asset: bool = False
+) -> tuple[pathlib.Path, dict[str, str], pathlib.Path]:
+    repository = tmp_path / "repository"
+    (repository / "scripts").mkdir(parents=True)
+    (repository / "lambda").mkdir()
+    (repository / "release_tools").mkdir()
+    (repository / "scripts" / SCRIPT.name).write_bytes(SCRIPT.read_bytes())
+    (repository / "scripts" / SCRIPT.name).chmod(0o755)
+    for name in ("__init__.py", "contracts.py", "lambda_asset.py"):
+        source = ROOT / "release_tools" / name
+        (repository / "release_tools" / name).write_bytes(source.read_bytes())
+    (repository / "lambda" / "requirements.txt").write_bytes(
+        REQUIREMENTS.read_bytes()
+    )
+    if existing_asset:
+        asset = repository / "build" / "trusted-lambda"
+        asset.mkdir(parents=True)
+        (asset / "existing-release").write_text("retain me\n", encoding="utf-8")
 
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Packaging Test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "packaging@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "fixture"], cwd=repository, check=True
+    )
 
-def test_build_is_atomic_normalized_and_inventory_backed() -> None:
-    script = _script_text()
-    implementation = "".join(
-        (
-            script,
-            (ROOT / "release_tools/lambda_asset.py").read_text(encoding="utf-8"),
-            (ROOT / "release_tools/contracts.py").read_text(encoding="utf-8"),
+    log = tmp_path / "docker.jsonl"
+    command_log = tmp_path / "forbidden-commands.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "docker",
+        f"""#!{sys.executable}
+import json
+import os
+import pathlib
+import sys
+
+args = sys.argv[1:]
+stdin = sys.stdin.read()
+with pathlib.Path(os.environ["FAKE_DOCKER_LOG"]).open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps({{"argv": args, "stdin": stdin}}, sort_keys=True) + "\\n")
+if args == ["version"]:
+    raise SystemExit(0)
+if args[:1] == ["pull"]:
+    raise SystemExit(0)
+if args[:2] == ["image", "inspect"]:
+    format_value = args[args.index("--format") + 1]
+    if format_value == "{{{{.Os}}}}/{{{{.Architecture}}}}":
+        print("linux/arm64")
+    elif ".RepoDigests" in format_value:
+        print(os.environ["TRUSTED_LAMBDA_BUILD_IMAGE"])
+    elif format_value == "{{{{.Id}}}}":
+        print("sha256:" + "7" * 64)
+    else:
+        raise SystemExit(91)
+    raise SystemExit(0)
+if args[:1] != ["run"]:
+    raise SystemExit(92)
+if os.environ.get("FAKE_DOCKER_FAIL_VERIFY") == "1" and "lambda_asset verify" in stdin:
+    raise SystemExit(93)
+if "lambda_asset build" in stdin:
+    output_mount = next(
+        value for value in args if value.endswith(":/output-parent:rw")
+    )
+    output_parent = pathlib.Path(output_mount.removesuffix(":/output-parent:rw"))
+    output = output_parent / args[-1]
+    output.mkdir()
+    for name in ("MANIFEST.json", "SHA256SUMS", "ASSET.sha256", "trusted-lambda.zip"):
+        (output / name).write_text(name + "\\n", encoding="utf-8")
+raise SystemExit(0)
+""",
+    )
+    for name in ("aws", "cdk"):
+        _write_executable(
+            fake_bin / name,
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$0 $*\" >> \"$FORBIDDEN_COMMAND_LOG\"\n"
+            "exit 97\n",
         )
-    )
-    assert '.trusted-lambda.$$.tmp' in script
-    assert 'verify_asset_in_container "${staging_dir}"' in script
-    assert 'mv "${staging_dir}" "${ASSET_DIR}"' in script
-    assert "SOURCE_DATE_EPOCH=0" in script
-    assert "--no-compile" in script
-    assert "--only-binary=:all:" in script
-    assert "--isolated" in script
-    assert "--index-url https://pypi.org/simple" in script
-    assert "--require-hashes" in script
-    assert "MANIFEST.json" in implementation
-    assert "SHA256SUMS" in implementation
-    assert "ASSET.sha256" in implementation
-    assert '"requirementsSha256"' in implementation
-    assert '"payloadBytes"' in implementation
-    assert "250 MiB unzipped limit" in implementation
-    assert '"dependencies"' in implementation
+    if existing_asset:
+        _write_executable(fake_bin / "mv", "#!/bin/sh\nexit 88\n")
+
+    python_bin = str(pathlib.Path(sys.executable).parent)
+    environment = {
+        **os.environ,
+        "PATH": os.pathsep.join(
+            (str(fake_bin), python_bin, "/usr/local/bin", "/usr/bin", "/bin")
+        ),
+        "FAKE_DOCKER_LOG": str(log),
+        "FORBIDDEN_COMMAND_LOG": str(command_log),
+        "TRUSTED_LAMBDA_BUILD_IMAGE": (
+            "public.ecr.aws/lambda/python@sha256:" + "6" * 64
+        ),
+        "AWS_ACCESS_KEY_ID": "host-access-must-not-cross",
+        "AWS_SECRET_ACCESS_KEY": "host-secret-must-not-cross",
+        "AWS_SESSION_TOKEN": "host-session-must-not-cross",
+        "HOME": str(tmp_path / "host-home"),
+    }
+    return repository, environment, log
 
 
-def test_builder_emits_external_v2_manifest_and_deterministic_zip() -> None:
-    script = _script_text()
-    implementation = "".join(
-        (
-            script,
-            (ROOT / "release_tools/lambda_asset.py").read_text(encoding="utf-8"),
-            (ROOT / "release_tools/contracts.py").read_text(encoding="utf-8"),
-        )
-    )
-
-    assert "personal-operator.trusted-lambda-asset.v2" in implementation
-    assert 'readonly ARCHIVE_NAME="trusted-lambda.zip"' in script
-    assert 'source_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD)"' in script
-    assert 'source_tree="$(git -C "${REPO_ROOT}" rev-parse "HEAD^{tree}")"' in script
-    assert "release_tools.lambda_asset build" in script
-    assert "release_tools.lambda_asset verify" in script
-    assert "MANIFEST.json is outside" in script
-
-
-def test_verify_is_offline_and_checks_required_provider_imports() -> None:
-    script = _script_text()
-    verify_body = script.split("verify_asset_in_container()", maxsplit=1)[1].split(
-        "build_asset()", maxsplit=1
-    )[0]
-    assert "--network none" in verify_body
-    assert '"${asset_dir}:/asset:ro"' in verify_body
-    assert "import cryptography" in verify_body
-    assert "import googleapiclient" in verify_body
-    assert "import openai" in verify_body
-    assert "-m pip check" in verify_body
-    assert "release_tools.lambda_asset verify" in verify_body
-    assert "import boto3" in verify_body
-    assert "import router.index" in verify_body
-    assert "import worker.index" in verify_body
-    assert "import web.index" in verify_body
-    assert "import control.index" in verify_body
-    assert "import control.composition" in verify_body
-    assert "import web.composition" in verify_body
-    assert "import workspace_broker.index" in verify_body
-    assert '"workspace_broker/index.py"' in verify_body
-
-
-def test_workspace_broker_is_in_every_local_and_release_asset_gate() -> None:
-    local_gate = (ROOT / "scripts" / "test-local.sh").read_text(encoding="utf-8")
-    resolver = (ROOT / "stacks" / "trusted_lambda_asset.py").read_text(
-        encoding="utf-8"
-    )
-    packaging = _script_text()
-    artifact_helper = (ROOT / "release_tools/lambda_asset.py").read_text(
-        encoding="utf-8"
+def _run_packaging_build(
+    repository: pathlib.Path, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/bin/bash", str(repository / "scripts" / SCRIPT.name), "build"],
+        cwd=repository,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
     )
 
-    assert "lambda/workspace_broker" in local_gate
-    assert '"workspace_broker/index.py"' in artifact_helper
-    assert "verify_trusted_lambda_artifact" in resolver
-    assert '"workspace_broker/index.py"' in packaging
-    assert "import workspace_broker.index" in packaging
+
+def _docker_records(path: pathlib.Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def test_cdk_hook_root_is_unambiguous() -> None:
-    script = _script_text()
-    assert 'readonly ASSET_DIR="${BUILD_DIR}/trusted-lambda"' in script
-    assert "CDK code asset: build/trusted-lambda/trusted-lambda.zip" in script
+def test_build_executes_only_the_immutable_lambda_313_arm64_boundary(
+    tmp_path: pathlib.Path,
+) -> None:
+    repository, environment, log = _packaging_subprocess_fixture(tmp_path)
+
+    completed = _run_packaging_build(repository, environment)
+
+    assert completed.returncode == 0, completed.stderr
+    records = _docker_records(log)
+    pull = next(record for record in records if record["argv"][:1] == ["pull"])
+    assert pull["argv"] == [
+        "pull",
+        "--platform",
+        "linux/arm64",
+        environment["TRUSTED_LAMBDA_BUILD_IMAGE"],
+    ]
+    platform_probe = next(
+        record
+        for record in records
+        if record["argv"][:1] == ["run"]
+        and '"ID=amzn"' in " ".join(str(value) for value in record["argv"])
+    )
+    assert "--platform" in platform_probe["argv"]
+    assert platform_probe["argv"][platform_probe["argv"].index("--platform") + 1] == (
+        "linux/arm64"
+    )
+    probe_program = " ".join(str(value) for value in platform_probe["argv"])
+    assert "sys.version_info[:2] == (3, 13)" in probe_program
+    assert '"ID=amzn"' in probe_program
+
+
+def test_container_commands_do_not_forward_credentials_or_invoke_deploy(
+    tmp_path: pathlib.Path,
+) -> None:
+    repository, environment, log = _packaging_subprocess_fixture(tmp_path)
+
+    completed = _run_packaging_build(repository, environment)
+
+    assert completed.returncode == 0, completed.stderr
+    records = _docker_records(log)
+    rendered = json.dumps(records, sort_keys=True)
+    for secret in (
+        environment["AWS_ACCESS_KEY_ID"],
+        environment["AWS_SECRET_ACCESS_KEY"],
+        environment["AWS_SESSION_TOKEN"],
+    ):
+        assert secret not in rendered
+    assert str(pathlib.Path(environment["HOME"]) / ".aws") not in rendered
+    assert str(pathlib.Path(environment["HOME"]) / ".config") not in rendered
+    assert "AWS_SESSION_TOKEN" not in rendered
+    assert not (tmp_path / "forbidden-commands.log").exists()
+    for record in (item for item in records if item["argv"][:1] == ["run"]):
+        argv = record["argv"]
+        assert "--cap-drop" in argv and argv[argv.index("--cap-drop") + 1] == "ALL"
+        assert "--security-opt" in argv
+        assert "no-new-privileges" in argv
+        assert "AWS_EC2_METADATA_DISABLED=true" in argv
+
+
+def test_verification_container_is_offline_and_executes_exact_import_gate(
+    tmp_path: pathlib.Path,
+) -> None:
+    repository, environment, log = _packaging_subprocess_fixture(tmp_path)
+
+    completed = _run_packaging_build(repository, environment)
+
+    assert completed.returncode == 0, completed.stderr
+    verify = next(
+        record
+        for record in _docker_records(log)
+        if record["argv"][:1] == ["run"]
+        and "release_tools.lambda_asset verify" in str(record["stdin"])
+    )
+    assert "--network" in verify["argv"]
+    assert verify["argv"][verify["argv"].index("--network") + 1] == "none"
+    assert any(str(value).endswith(":/asset:ro") for value in verify["argv"])
+    assert any(str(value).endswith(":/workspace:ro") for value in verify["argv"])
+    program = str(verify["stdin"])
+    for import_name in (
+        "boto3",
+        "cryptography",
+        "googleapiclient",
+        "openai",
+        "control.index",
+        "control.composition",
+        "router.index",
+        "web.index",
+        "web.composition",
+        "worker.index",
+        "workspace_broker.index",
+    ):
+        assert f"import {import_name}" in program
+    assert "-m pip check" in program
+
+
+def test_failed_republication_preserves_the_existing_verified_asset(
+    tmp_path: pathlib.Path,
+) -> None:
+    repository, environment, _ = _packaging_subprocess_fixture(
+        tmp_path, existing_asset=True
+    )
+    existing = repository / "build" / "trusted-lambda" / "existing-release"
+
+    completed = _run_packaging_build(repository, environment)
+
+    assert completed.returncode != 0
+    assert existing.read_text(encoding="utf-8") == "retain me\n"
 
 
 def _write_source_and_payload(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
@@ -286,10 +409,48 @@ def test_lambda_zip_is_byte_identical_across_independent_builds(
     assert (first / "MANIFEST.json").read_bytes() == (
         second / "MANIFEST.json"
     ).read_bytes()
+    assert first_manifest.SCHEMA == "personal-operator.trusted-lambda-asset.v2"
+    assert first_manifest.platform == "linux/arm64"
+    assert first_manifest.python == "3.13"
+    assert first_manifest.archive_name == "trusted-lambda.zip"
     with __import__("zipfile").ZipFile(first / "trusted-lambda.zip") as archive:
         names = archive.namelist()
     assert names == sorted(names)
     assert {"MANIFEST.json", "ASSET.sha256", "SHA256SUMS"}.isdisjoint(names)
+
+
+@pytest.mark.parametrize("missing", ["handler", "dependency"])
+def test_verifier_rejects_missing_required_runtime_inventory(
+    tmp_path: pathlib.Path,
+    missing: str,
+) -> None:
+    source, payload = _write_source_and_payload(tmp_path)
+    if missing == "handler":
+        for root in (source, payload):
+            (root / "workspace_broker" / "index.py").unlink()
+            (root / "workspace_broker").rmdir()
+    else:
+        metadata = payload / "openai-1.0.dist-info" / "METADATA"
+        metadata.unlink()
+        metadata.parent.rmdir()
+    output = tmp_path / "asset"
+    build_trusted_lambda_artifacts(
+        payload,
+        source,
+        output,
+        source_commit="a" * 40,
+        source_tree="b" * 40,
+        builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+        builder_image_id="sha256:" + "3" * 64,
+    )
+
+    with pytest.raises(ContractError, match="handler|dependency"):
+        verify_trusted_lambda_artifact(
+            output,
+            source,
+            expected_commit="a" * 40,
+            expected_tree="b" * 40,
+        )
 
 
 def test_cdk_resolves_authenticated_zip_and_exact_custom_hash(
