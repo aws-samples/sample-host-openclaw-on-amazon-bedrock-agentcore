@@ -392,11 +392,14 @@ class WebApplication:
                 try:
                     status = self._connections.disconnect(identity.user_id)
                 except ConnectionDisconnectPending:
+                    # The bounded purge made progress but is not finished. Report
+                    # the truthful pending state so the client keeps retrying;
+                    # never claim DISCONNECTED while the fence is DISCONNECTING.
                     return self._response(
                         202,
                         {
                             "provider": READONLY_PROVIDER,
-                            "status": "DISCONNECTED",
+                            "status": "DISCONNECTING",
                             "remoteGrantRevoked": False,
                         },
                     )

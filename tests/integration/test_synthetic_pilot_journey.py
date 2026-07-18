@@ -967,6 +967,12 @@ class LocalDynamoTable:
                         and item.get("connectionGeneration")
                         == values[":generation"]
                     )
+                elif expression == "generation=:generation AND #status=:status":
+                    valid = (
+                        item is not None
+                        and item.get("generation") == values[":generation"]
+                        and item.get("status") == values[":status"]
+                    )
                 else:
                     valid = (
                         item is not None
@@ -1006,6 +1012,9 @@ class LocalDynamoTable:
                     raise LocalConditionalFailure("transaction update")
                 item["status"] = values[":connected"]
                 item["updatedAt"] = values[":now"]
+            elif "Delete" in operation:
+                key = self._key(self._decode_item(operation["Delete"]["Key"]))
+                pending.pop(key, None)
             else:
                 raise AssertionError(f"unsupported local transaction: {operation!r}")
         self.items = pending

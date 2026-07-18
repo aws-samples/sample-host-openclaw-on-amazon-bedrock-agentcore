@@ -420,6 +420,123 @@ def test_logout_revokes_only_the_current_session_and_clears_cookie():
     assert app.handle(event("GET", "/api/overview", cookie=cookie))["statusCode"] == 401
 
 
+def test_bounded_disconnect_reports_pending_truthfully_and_completes_on_retry():
+    from .overview import ConnectionDisconnectPending
+
+    class BoundedConnections:
+        def __init__(self):
+            self.calls = 0
+
+        def disconnect(self, user_id):
+            assert user_id == USER
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionDisconnectPending("another bounded pass required")
+            return "DISCONNECTED"
+
+    app, tickets, *_ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+    app._connections = BoundedConnections()
+
+    pending = app.handle(
+        event(
+            "POST",
+            "/api/connections/google-gmail-readonly/disconnect",
+            body={},
+            cookie=cookie,
+            csrf=csrf,
+        )
+    )
+    assert pending["statusCode"] == 202
+    # The purge is incomplete: the response must not claim the account is
+    # disconnected, or the UI would drop the retry path and strand the fence.
+    assert json.loads(pending["body"]) == {
+        "provider": "google-gmail-readonly",
+        "status": "DISCONNECTING",
+        "remoteGrantRevoked": False,
+    }
+
+    done = app.handle(
+        event(
+            "POST",
+            "/api/connections/google-gmail-readonly/disconnect",
+            body={},
+            cookie=cookie,
+            csrf=csrf,
+        )
+    )
+    assert done["statusCode"] == 200
+    assert json.loads(done["body"]) == {
+        "provider": "google-gmail-readonly",
+        "status": "DISCONNECTED",
+        "remoteGrantRevoked": False,
+    }
+
+
+def test_logout_still_clears_cookie_after_applied_but_response_lost_revocation():
+    from .stores import DynamoWebStore
+    from .test_stores import Table
+
+    class ResponseLostTable(Table):
+        def __init__(self):
+            super().__init__()
+            self.lost_once = True
+
+        def update_item(self, **kwargs):
+            result = super().update_item(**kwargs)
+            if (
+                self.items[(kwargs["Key"]["PK"], kwargs["Key"]["SK"])]["SK"]
+                == "SESSION"
+                and self.lost_once
+            ):
+                self.lost_once = False
+                raise TimeoutError("session revocation response was lost")
+            return result
+
+    clock = Clock()
+    random = DeterministicRandom()
+    store = DynamoWebStore(ResponseLostTable())
+    tickets = SignedConnectTickets(
+        secret=b"t" * 32, store=store, now=clock, random_bytes=random
+    )
+    sessions = OpaqueSessionManager(
+        secret=b"s" * 32, store=store, now=clock, random_bytes=random
+    )
+    app = WebApplication(
+        tickets=tickets,
+        sessions=sessions,
+        oauth=OAuth(),
+        approvals=Approvals(),
+        workspace=Workspace(),
+        gmail_workspace=GmailWorkspace(),
+        exporter=Exporter(),
+        deletion=Deletion(),
+        retention=Retention(),
+        overview=Overview(),
+        connections=Connections(),
+        scans=Scans(),
+        web_origin=ORIGIN,
+        google_redirect_uri=f"{ORIGIN}/oauth/google/callback",
+    )
+    token = tickets.issue(user_id=USER, return_path="/connections")
+    connect = app.handle(event("POST", "/api/session/connect", body={"ticket": token}))
+    cookie = connect["headers"]["Set-Cookie"]
+    csrf = json.loads(connect["body"])["csrfToken"]
+
+    response = app.handle(
+        event("POST", "/api/session/logout", body={}, cookie=cookie, csrf=csrf)
+    )
+
+    # The revocation write committed even though its response was lost, so the
+    # endpoint still returns the cookie-clearing response and the now-revoked
+    # session cannot be reused.
+    assert response["statusCode"] == 204
+    assert response["headers"]["Set-Cookie"] == (
+        "__Host-po_session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+    )
+    assert app.handle(event("GET", "/api/overview", cookie=cookie))["statusCode"] == 401
+
+
 def test_scan_feedback_is_csrf_bound_and_accepts_only_one_bounded_bit():
     app, tickets, *_ = setup_app()
     cookie, csrf = bootstrap(app, tickets)

@@ -246,6 +246,64 @@ def test_account_deletion_intent_is_durable_queryable_and_revokes_session_before
     assert all(request["ConsistentRead"] is True for request in deletion_reads)
 
 
+def test_revoke_reconciles_an_applied_but_response_lost_update():
+    class ResponseLostTable(Table):
+        def __init__(self):
+            super().__init__()
+            self.lost_once = True
+
+        def update_item(self, **kwargs):
+            result = super().update_item(**kwargs)
+            if (
+                self.items[(kwargs["Key"]["PK"], kwargs["Key"]["SK"])]["SK"]
+                == "SESSION"
+                and self.lost_once
+            ):
+                self.lost_once = False
+                raise TimeoutError("session revocation response was lost")
+            return result
+
+    table = ResponseLostTable()
+    store = DynamoWebStore(table)
+    base = {
+        "userId": "user_founder",
+        "csrfDigest": "c" * 64,
+        "createdAt": 100,
+        "revoked": False,
+    }
+    store.create("a" * 64, base, expires_at=200)
+
+    # The DynamoDB write commits but its response is lost. revoke() must not
+    # strand logout: it reconciles with a strong read and returns normally
+    # because the exact session is proven revoked.
+    store.revoke("a" * 64)
+
+    assert store.get("a" * 64)["revoked"] is True
+
+
+def test_revoke_reraises_when_revocation_cannot_be_proven():
+    class NeverAppliesTable(Table):
+        def update_item(self, **kwargs):
+            if self.items[(kwargs["Key"]["PK"], kwargs["Key"]["SK"])]["SK"] == (
+                "SESSION"
+            ):
+                raise TimeoutError("session revocation outcome is unknown")
+            return super().update_item(**kwargs)
+
+    table = NeverAppliesTable()
+    store = DynamoWebStore(table)
+    base = {
+        "userId": "user_founder",
+        "csrfDigest": "c" * 64,
+        "createdAt": 100,
+        "revoked": False,
+    }
+    store.create("a" * 64, base, expires_at=200)
+
+    with pytest.raises(TimeoutError):
+        store.revoke("a" * 64)
+
+
 def test_oauth_state_has_a_separate_exact_one_time_schema():
     table = Table()
     store = DynamoOAuthStateStore(table)

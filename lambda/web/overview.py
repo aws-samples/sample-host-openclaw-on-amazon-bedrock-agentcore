@@ -150,7 +150,14 @@ class DynamoConnectionLifecycle:
             if not isinstance(response, Mapping) or item is not None:
                 raise RuntimeError("connection purge outcome is uncertain") from error
 
-    def _purge_prefix(self, user_id: str, prefix: str) -> None:
+    def _fenced_delete(self, user_id: str, generation: int, key: Mapping[str, str]) -> None:
+        self._repository.delete_under_disconnecting_fence(
+            user_id, generation, {"PK": key["PK"], "SK": key["SK"]}
+        )
+
+    def _purge_prefix(
+        self, user_id: str, prefix: str, generation: int | None = None
+    ) -> None:
         start_key = None
         for page_number in range(_DISCONNECT_MAX_PAGES):
             request = {
@@ -177,7 +184,12 @@ class DynamoConnectionLifecycle:
                     or not item["SK"].startswith(prefix)
                 ):
                     raise RuntimeError("connection purge crossed its namespace")
-                self._delete_exact({"PK": item["PK"], "SK": item["SK"]})
+                if generation is None:
+                    self._delete_exact({"PK": item["PK"], "SK": item["SK"]})
+                else:
+                    self._fenced_delete(
+                        user_id, generation, {"PK": item["PK"], "SK": item["SK"]}
+                    )
             start_key = response.get("LastEvaluatedKey")
             if start_key is None:
                 return
@@ -198,19 +210,33 @@ class DynamoConnectionLifecycle:
         user_id = _user_id(user_id)
         begin_disconnect = getattr(self._repository, "begin_disconnect", None)
         finish_disconnect = getattr(self._repository, "finish_disconnect", None)
-        if callable(begin_disconnect) and callable(finish_disconnect):
+        fenced_delete = getattr(
+            self._repository, "delete_under_disconnecting_fence", None
+        )
+        if (
+            callable(begin_disconnect)
+            and callable(finish_disconnect)
+            and callable(fenced_delete)
+        ):
             generation = begin_disconnect(user_id)
-            self._delete_exact(
+            # Every destructive step is bound to this exact DISCONNECTING
+            # generation, so a slow runner resuming after a reconnect fails
+            # closed instead of deleting the newly reconnected records.
+            self._fenced_delete(
+                user_id,
+                generation,
                 {
                     "PK": f"USER#{user_id}",
                     "SK": f"CONNECTION#{READONLY_PROVIDER}",
-                }
+                },
             )
-            self._delete_exact(
-                {"PK": f"USER#{user_id}", "SK": "GMAIL#OPPORTUNITIES"}
+            self._fenced_delete(
+                user_id,
+                generation,
+                {"PK": f"USER#{user_id}", "SK": "GMAIL#OPPORTUNITIES"},
             )
             for prefix in _DISCONNECT_PREFIXES:
-                self._purge_prefix(user_id, prefix)
+                self._purge_prefix(user_id, prefix, generation)
             finish_disconnect(user_id, generation)
             if self.status(user_id) != "DISCONNECTED":
                 raise RuntimeError("connection disconnect outcome is uncertain")

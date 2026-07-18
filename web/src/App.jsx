@@ -229,7 +229,7 @@ function ConnectionsContent({ connection, onDisconnect, state }) {
           <p>Read-only pilot · {connectionLabel(status)}</p>
         </div>
         {status === "CONNECTED" ? (
-          <button className="button quiet" disabled={state === "loading"} onClick={onDisconnect}>Disconnect Gmail</button>
+          <button className="button quiet" disabled={state === "loading" || state === "pending"} onClick={onDisconnect}>Disconnect Gmail</button>
         ) : (
           <a className="button primary" href="/oauth/google/start">
             {status === "REAUTH_REQUIRED" ? "Reconnect Gmail" : "Connect read-only Gmail"}
@@ -250,14 +250,25 @@ function ConnectionsPage() {
   async function disconnect() {
     setView((current) => ({ ...current, actionState: "loading" }));
     try {
-      await api("/api/connections/google-gmail-readonly/disconnect", {
-        method: "POST", body: {}, csrf: true,
-      });
-      setView((current) => ({
-        ...current,
-        actionState: "done",
-        data: { ...current.data, connection: { ...current.data.connection, status: "DISCONNECTED" } },
-      }));
+      // A bounded purge can need several passes. The server returns 202 with
+      // status DISCONNECTING until the authoritative fence is DISCONNECTED, so
+      // keep re-driving and never present the account as disconnected early.
+      for (let attempt = 0; attempt < 64; attempt += 1) {
+        const { payload, response } = await api(
+          "/api/connections/google-gmail-readonly/disconnect",
+          { method: "POST", body: {}, csrf: true },
+        );
+        if (response.status === 200 && payload.status === "DISCONNECTED") {
+          setView((current) => ({
+            ...current,
+            actionState: "done",
+            data: { ...current.data, connection: { ...current.data.connection, status: "DISCONNECTED" } },
+          }));
+          return;
+        }
+        setView((current) => ({ ...current, actionState: "pending" }));
+      }
+      throw new Error("Disconnect is still finishing. Please try again.");
     } catch (error) {
       setView((current) => ({ ...current, actionState: "error", actionError: error.message }));
     }
@@ -267,6 +278,9 @@ function ConnectionsPage() {
       <Status state={view.state}>{view.error}</Status>
       {view.state === "ready" && (
         <ConnectionsContent connection={view.data.connection} onDisconnect={disconnect} state={view.actionState} />
+      )}
+      {view.actionState === "pending" && (
+        <p className="status" role="status">Finishing disconnect…</p>
       )}
       {view.actionState === "error" && <p className="error" role="alert">{view.actionError}</p>}
     </Shell>

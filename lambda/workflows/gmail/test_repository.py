@@ -149,6 +149,12 @@ class FakeTable:
                         and item.get("connectionGeneration")
                         == values[":generation"]
                     )
+                elif expression == "generation=:generation AND #status=:status":
+                    valid = (
+                        item is not None
+                        and item.get("generation") == values[":generation"]
+                        and item.get("status") == values[":status"]
+                    )
                 else:
                     valid = (
                         item is not None
@@ -188,6 +194,10 @@ class FakeTable:
                     raise ConditionalFailure("transaction update rejected")
                 item["status"] = values[":connected"]
                 item["updatedAt"] = values[":now"]
+            elif "Delete" in operation:
+                delete = operation["Delete"]
+                key = self._key(self._decode_item(delete["Key"]))
+                pending.pop(key, None)
             else:
                 raise AssertionError(f"unsupported transaction: {operation!r}")
         self.items = pending
@@ -486,6 +496,63 @@ def test_stale_guarded_writer_cannot_clobber_the_new_generation(target_sk):
     assert table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")][
         "generation"
     ] == 2
+
+
+def test_fenced_delete_removes_a_target_only_under_the_exact_disconnecting_fence():
+    repo, table = repository()
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item(
+        generation=3, status="DISCONNECTING"
+    )
+    table.items[("USER#user-1", "CONNECTION#google-gmail-readonly")] = {
+        "PK": "USER#user-1",
+        "SK": "CONNECTION#google-gmail-readonly",
+        "connectionGeneration": 3,
+        "envelope": {"format": "personal-operator.oauth-envelope.v1"},
+    }
+
+    repo.delete_under_disconnecting_fence(
+        "user-1",
+        3,
+        {"PK": "USER#user-1", "SK": "CONNECTION#google-gmail-readonly"},
+    )
+
+    assert (
+        "USER#user-1",
+        "CONNECTION#google-gmail-readonly",
+    ) not in table.items
+
+
+def test_fenced_delete_cannot_destroy_a_reconnect_after_a_stale_runner_resumes():
+    # A slow same-generation runner captured generation 3 while DISCONNECTING.
+    # A faster runner finished the disconnect; the user reconnected, advancing
+    # the fence to a CONNECTED generation with a fresh envelope. The stale
+    # runner must NOT be able to delete that new envelope.
+    repo, table = repository()
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = fence_item(
+        generation=4, status="CONNECTED"
+    )
+    reconnected = {
+        "PK": "USER#user-1",
+        "SK": "CONNECTION#google-gmail-readonly",
+        "connectionGeneration": 4,
+        "envelope": {"format": "personal-operator.oauth-envelope.v1", "new": True},
+    }
+    table.items[("USER#user-1", "CONNECTION#google-gmail-readonly")] = dict(
+        reconnected
+    )
+
+    with pytest.raises(repository_module.ConnectionFenceError):
+        repo.delete_under_disconnecting_fence(
+            "user-1",
+            3,
+            {"PK": "USER#user-1", "SK": "CONNECTION#google-gmail-readonly"},
+        )
+
+    assert (
+        table.items[("USER#user-1", "CONNECTION#google-gmail-readonly")]
+        == reconnected
+    )
+    assert repo.connection_status("user-1") == "CONNECTED"
 
 
 def test_fresh_disconnect_advances_an_already_disconnected_generation():

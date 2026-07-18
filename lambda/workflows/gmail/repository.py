@@ -700,6 +700,73 @@ class DynamoGmailRepository:
             if reconciled != (generation, "DISCONNECTED"):
                 raise ConnectionFenceError("disconnect completion is uncertain") from error
 
+    def delete_under_disconnecting_fence(
+        self,
+        user_id: str,
+        generation: int,
+        key: Mapping[str, str],
+    ) -> None:
+        """Delete one derived record only while this exact disconnect owns it.
+
+        A disconnect purge reuses one ``DISCONNECTING`` generation, so a slow
+        runner can resume after a faster runner completed and a reconnect
+        activated a new generation. Every destructive step is therefore bound
+        by transaction to the exact ``(generation, DISCONNECTING)`` fence: once
+        the fence advances or flips to ``CONNECTED``, the delete fails closed
+        and cannot touch the reconnected records.
+        """
+
+        user_id = _identifier(user_id, "user_id")
+        generation = _generation(generation)
+        if (
+            not isinstance(key, Mapping)
+            or set(key) != {"PK", "SK"}
+            or key.get("PK") != f"USER#{user_id}"
+            or not isinstance(key.get("SK"), str)
+        ):
+            raise RepositoryRecordError("fenced delete key is invalid")
+        condition = {
+            "TableName": self._table_name,
+            "Key": _dynamo_item(self._fence_key(user_id)),
+            "ConditionExpression": "generation=:generation AND #status=:status",
+            "ExpressionAttributeNames": {"#status": "status"},
+            "ExpressionAttributeValues": {
+                ":generation": _dynamo_value(generation),
+                ":status": _dynamo_value("DISCONNECTING"),
+            },
+        }
+        delete = {
+            "TableName": self._table_name,
+            "Key": _dynamo_item({"PK": key["PK"], "SK": key["SK"]}),
+        }
+        try:
+            self._transact([{"ConditionCheck": condition}, {"Delete": delete}])
+        except Exception as error:
+            try:
+                fence = self._fence(user_id)
+                still_present = (
+                    self._read_item({"PK": key["PK"], "SK": key["SK"]}) is not None
+                )
+            except Exception as read_error:
+                raise RuntimeError(
+                    "connection purge outcome is uncertain"
+                ) from read_error
+            if fence == (generation, "DISCONNECTING"):
+                # The fence still belongs to this exact attempt. Either the
+                # write silently applied (target gone) or its outcome is
+                # genuinely ambiguous and stays retryable under this pending
+                # generation.
+                if not still_present:
+                    return
+                raise RuntimeError(
+                    "connection purge outcome is uncertain"
+                ) from error
+            # The fence advanced or flipped to CONNECTED: a reconnect or newer
+            # disconnect now owns the record, so fail closed without deleting.
+            raise ConnectionFenceError(
+                "fenced delete lost to a disconnect generation change"
+            ) from error
+
     def connection_status(self, user_id: str) -> str:
         user_id = _identifier(user_id, "user_id")
         fence = self._fence(user_id)

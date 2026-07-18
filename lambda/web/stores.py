@@ -403,12 +403,21 @@ class DynamoWebStore:
         item = self._session(key)
         if item is None:
             return
-        self._table.update_item(
-            Key={"PK": item["PK"], "SK": item["SK"]},
-            UpdateExpression="SET revoked=:true",
-            ConditionExpression="sessionKey=:key",
-            ExpressionAttributeValues={":true": True, ":key": _digest(key)},
-        )
+        try:
+            self._table.update_item(
+                Key={"PK": item["PK"], "SK": item["SK"]},
+                UpdateExpression="SET revoked=:true",
+                ConditionExpression="sessionKey=:key",
+                ExpressionAttributeValues={":true": True, ":key": _digest(key)},
+            )
+        except Exception:
+            # The write may have committed before its response was lost. Logout
+            # must not strand a private session: reconcile with a strongly
+            # consistent read and accept success only when the exact session is
+            # proven revoked. Otherwise re-raise so the caller can retry.
+            reconciled = self._session(key)
+            if not (isinstance(reconciled, Mapping) and reconciled.get("revoked") is True):
+                raise
 
     def revoke_all(self, user_id: str) -> None:
         user_id = _user(user_id)

@@ -155,6 +155,31 @@ describe("consumer control surface", () => {
     expect(fetch.mock.calls.at(-1)[1].headers["X-PO-CSRF"]).toBe("c".repeat(43));
   });
 
+  it("keeps disconnect pending on 202 DISCONNECTING and completes it on retry", async () => {
+    history.replaceState({}, "", "/connections");
+    sessionStorage.setItem("personal-operator.csrf", "c".repeat(43));
+    fetch
+      .mockReturnValueOnce(response(overview()))
+      .mockReturnValueOnce(response(
+        { provider: "google-gmail-readonly", status: "DISCONNECTING", remoteGrantRevoked: false },
+        { status: 202 },
+      ))
+      .mockReturnValueOnce(response(
+        { provider: "google-gmail-readonly", status: "DISCONNECTED", remoteGrantRevoked: false },
+        { status: 200 },
+      ));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Disconnect Gmail/i }));
+
+    // The bounded purge needed two passes; the UI must not present the account
+    // as disconnected until the server confirms DISCONNECTED.
+    await screen.findByRole("link", { name: /Connect read-only Gmail/i });
+    const disconnectCalls = fetch.mock.calls.filter(
+      ([path]) => path === "/api/connections/google-gmail-readonly/disconnect",
+    );
+    expect(disconnectCalls).toHaveLength(2);
+  });
+
   it("fails closed if the pilot overview ever enables external effects", async () => {
     history.replaceState({}, "", "/");
     fetch.mockReturnValue(response(overview({ externalEffects: true })));
