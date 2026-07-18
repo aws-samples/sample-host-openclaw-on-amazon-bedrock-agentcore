@@ -270,3 +270,116 @@ were clean.
 
 No deployment, provider invocation, browser action, real message, AWS call,
 push, or cloud mutation was performed during review remediation.
+
+## Independent remediation-review closure
+
+The independent review of `eef24e5` found three Important blockers and one
+CMK-permission minor. The follow-up remained inside Task 2 and is implemented
+by:
+
+- `7fdba8e docs(plan): close task 2 independent review`
+- `617388f fix(capabilities): admit claimed target replay`
+- `16e4102 fix(relay): type all lambda delivery ambiguity`
+- `480c333 fix(packaging): bind reviewed source to payload`
+- `50e29e6 fix(iam): complete constrained dynamodb cmk actions`
+
+### Durable target replay and retry
+
+Three production-composition regressions failed before the change. With a
+real `DynamoAdmissionRepository`, real `DynamoCapabilityLedger`, and
+`maxUses=1`, the first read succeeded but exact cached replay and the one
+allowed same-call retry were denied as `TARGET_GRANT_EXHAUSTED`.
+
+`LiveTargetGrant` now carries a canonical sorted tuple of exact
+`call_<64 lowercase hex>` identities, requires that its use count equal that
+inventory, and rejects use counts beyond the grant. The Dynamo repository
+preserves the validated `claimedCallIds`. Admission exempts only the exact
+already-claimed call from aggregate exhaustion, allowing the ledger to return
+its cached result or one same-call read retry. Fresh calls remain denied. The
+hostile durable tests also prove one target use, one turn/pack budget charge,
+two adapter calls at most, retry exhaustion, and rejection under a different
+exact grant binding.
+
+RED: `3 failed, 4 passed`. Focused GREEN with the gateway suite:
+`35 passed`.
+
+### Typed Lambda ambiguity
+
+Three real-transport tests initially failed because Lambda `FunctionError`,
+missing payload, and malformed payload errors escaped as
+`CapabilityRelayError`. A second RED (`2 failed, 13 passed`) proved that a
+schema-invalid or sensitive post-dispatch response could also escape.
+
+The relay now treats every exception after invoking the gateway transport,
+including result-contract validation failure, as delivery-ambiguous. Reads
+receive a validated `FAILED_RETRYABLE/SAFE_RETRY` result; mutations receive a
+validated `UNCERTAIN/RECONCILE_ONLY` result. Constructor, grant, argument,
+quota, and local-admission errors remain outside that boundary and still fail
+before transport. Node 24 focused GREEN: `15/15` relay tests.
+
+### Reviewed source to packaged payload binding
+
+Three hostile packaging tests initially rebaselined `files`, `SHA256SUMS`,
+`MANIFEST.json`, and `ASSET.sha256` while leaving `sourceFiles` unchanged. The
+old resolver accepted a substituted `capabilities/gateway.py`, a removed
+catalog, and a removed schema (`3 failed, 15 passed`).
+
+The CDK resolver now requires every reviewed source path, digest, and size to
+equal its actual packaged row. Required handlers are checked against the
+actual payload, and the actual capability inventory must contain the reviewed
+catalog plus exactly the same 20 schema paths. Focused GREEN: `18/18`.
+
+### DynamoDB CMK action evidence
+
+The local CDK `Table.grant_read_write_data()` reference synthesis proved the
+exact cryptographic data-plane set includes `kms:GenerateDataKey*` and
+`kms:ReEncrypt*`; the initial comparison failed `1/7`. AWS's DynamoDB
+documentation likewise lists `Encrypt`, `Decrypt`, both re-encrypt directions,
+both data-key variants, and `DescribeKey` among the required customer-managed
+key permissions. `CreateGrant` is used by the identity selecting/configuring
+the table key and was not added to the Lambda runtime role. Sources:
+[DynamoDB encryption usage notes](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/encryption.usagenotes.html),
+[KMS permissions reference](https://docs.aws.amazon.com/kms/latest/developerguide/kms-api-permissions-reference.html),
+and the
+[AWS CDK DynamoDB table source](https://github.com/aws/aws-cdk/blob/main/packages/aws-cdk-lib/aws-dynamodb/lib/table.ts).
+
+The gateway role now has `kms:GenerateDataKey*` and `kms:ReEncrypt*` under the
+same exact CMK resource, caller account, regional DynamoDB `ViaService`, and no
+`CreateGrant`. The first nag run correctly reported two IAM5 action-wildcard
+findings; evidence-scoped suppressions for only those two action families
+reduced the isolated report to `NONCOMPLIANT=0`. Focused CDK GREEN: `7/7`.
+
+### Final code-candidate evidence
+
+The reviewed implementation candidate was
+`50e29e66b1bbc09d125c11b3b58a7b5a4215fada`, tree
+`654a914d31394585752426169a7dc83324c82439`. Fresh gates at that code head:
+
+```text
+capabilities + capability stack + trusted packaging
+204 passed in 28.07s
+
+focused Node 24 capability/runtime boundary
+105 passed; 0 failed
+
+release boundaries
+13 passed
+
+session-control E2E
+11 passed
+
+complete Node 24 aggregate
+343 passed; 58 suites; 0 failed; duration_ms 69867.842542
+
+complete Python aggregate
+1138 passed, 10 subtests passed in 88.95s
+
+isolated AwsSolutionsChecks
+NONCOMPLIANT=0
+```
+
+Targeted Ruff and Black, `bash -n`, `compileall`, `git diff --check`, and the
+direct credential scan were clean. No deployment, push, AWS call, provider
+invocation, product-browser action, real message, credential access, or cloud
+mutation was performed. The only external read was the approved lookup of the
+three primary AWS/CDK documentation sources cited above.
