@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import pathlib
 import re
 import shlex
-import stat
 import subprocess
 
 import pytest
 
+from release_tools.lambda_asset import build_trusted_lambda_artifacts
 from stacks.trusted_lambda_asset import (
     SCHEMA,
     TrustedLambdaAssetError,
     resolve_trusted_lambda_asset,
+    resolve_trusted_lambda_asset_metadata,
 )
 
 
@@ -127,6 +127,13 @@ def test_container_boundary_does_not_forward_credentials_or_deploy() -> None:
 
 def test_build_is_atomic_normalized_and_inventory_backed() -> None:
     script = _script_text()
+    implementation = "".join(
+        (
+            script,
+            (ROOT / "release_tools/lambda_asset.py").read_text(encoding="utf-8"),
+            (ROOT / "release_tools/contracts.py").read_text(encoding="utf-8"),
+        )
+    )
     assert '.trusted-lambda.$$.tmp' in script
     assert 'verify_asset_in_container "${staging_dir}"' in script
     assert 'mv "${staging_dir}" "${ASSET_DIR}"' in script
@@ -136,13 +143,32 @@ def test_build_is_atomic_normalized_and_inventory_backed() -> None:
     assert "--isolated" in script
     assert "--index-url https://pypi.org/simple" in script
     assert "--require-hashes" in script
-    assert "MANIFEST.json" in script
-    assert "SHA256SUMS" in script
-    assert "ASSET.sha256" in script
-    assert '"requirementsSha256"' in script
-    assert '"payloadBytes"' in script
-    assert "250 MiB unzipped limit" in script
-    assert '"dependencies"' in script
+    assert "MANIFEST.json" in implementation
+    assert "SHA256SUMS" in implementation
+    assert "ASSET.sha256" in implementation
+    assert '"requirementsSha256"' in implementation
+    assert '"payloadBytes"' in implementation
+    assert "250 MiB unzipped limit" in implementation
+    assert '"dependencies"' in implementation
+
+
+def test_builder_emits_external_v2_manifest_and_deterministic_zip() -> None:
+    script = _script_text()
+    implementation = "".join(
+        (
+            script,
+            (ROOT / "release_tools/lambda_asset.py").read_text(encoding="utf-8"),
+            (ROOT / "release_tools/contracts.py").read_text(encoding="utf-8"),
+        )
+    )
+
+    assert "personal-operator.trusted-lambda-asset.v2" in implementation
+    assert 'readonly ARCHIVE_NAME="trusted-lambda.zip"' in script
+    assert 'source_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD)"' in script
+    assert 'source_tree="$(git -C "${REPO_ROOT}" rev-parse "HEAD^{tree}")"' in script
+    assert "release_tools.lambda_asset build" in script
+    assert "release_tools.lambda_asset verify" in script
+    assert "MANIFEST.json is outside" in script
 
 
 def test_verify_is_offline_and_checks_required_provider_imports() -> None:
@@ -156,7 +182,7 @@ def test_verify_is_offline_and_checks_required_provider_imports() -> None:
     assert "import googleapiclient" in verify_body
     assert "import openai" in verify_body
     assert "-m pip check" in verify_body
-    assert "actual_files != manifest.get(\"files\")" in verify_body
+    assert "release_tools.lambda_asset verify" in verify_body
     assert "import boto3" in verify_body
     assert "import router.index" in verify_body
     assert "import worker.index" in verify_body
@@ -174,9 +200,13 @@ def test_workspace_broker_is_in_every_local_and_release_asset_gate() -> None:
         encoding="utf-8"
     )
     packaging = _script_text()
+    artifact_helper = (ROOT / "release_tools/lambda_asset.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "lambda/workspace_broker" in local_gate
-    assert '"workspace_broker/index.py"' in resolver
+    assert '"workspace_broker/index.py"' in artifact_helper
+    assert "verify_trusted_lambda_artifact" in resolver
     assert '"workspace_broker/index.py"' in packaging
     assert "import workspace_broker.index" in packaging
 
@@ -184,7 +214,146 @@ def test_workspace_broker_is_in_every_local_and_release_asset_gate() -> None:
 def test_cdk_hook_root_is_unambiguous() -> None:
     script = _script_text()
     assert 'readonly ASSET_DIR="${BUILD_DIR}/trusted-lambda"' in script
-    assert "CDK code asset root: build/trusted-lambda" in script
+    assert "CDK code asset: build/trusted-lambda/trusted-lambda.zip" in script
+
+
+def _write_source_and_payload(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    source = root / "lambda"
+    payload = root / "payload"
+    for relative in (
+        "router/index.py",
+        "worker/index.py",
+        "web/index.py",
+        "control/index.py",
+        "workspace_broker/index.py",
+    ):
+        source_path = source / relative
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(f"# {relative}\n", encoding="utf-8")
+        payload_path = payload / relative
+        payload_path.parent.mkdir(parents=True, exist_ok=True)
+        payload_path.write_bytes(source_path.read_bytes())
+        payload_path.chmod(0o644)
+    (source / "requirements.in").write_text(
+        "boto3==1.0\ncryptography==1.0\ngoogle-api-python-client==1.0\n"
+        "google-auth==1.0\nopenai==1.0\n",
+        encoding="utf-8",
+    )
+    (source / "requirements.txt").write_text(
+        "boto3==1.0 --hash=sha256:" + "1" * 64 + "\n",
+        encoding="utf-8",
+    )
+    (payload / "requirements.txt").write_bytes(
+        (source / "requirements.txt").read_bytes()
+    )
+    for name in (
+        "boto3",
+        "cryptography",
+        "google-api-python-client",
+        "google-auth",
+        "openai",
+    ):
+        metadata = payload / f"{name.replace('-', '_')}-1.0.dist-info" / "METADATA"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n",
+            encoding="utf-8",
+        )
+        metadata.chmod(0o644)
+    return source, payload
+
+
+def test_lambda_zip_is_byte_identical_across_independent_builds(
+    tmp_path: pathlib.Path,
+) -> None:
+    source, payload = _write_source_and_payload(tmp_path)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    kwargs = {
+        "source_commit": "a" * 40,
+        "source_tree": "b" * 40,
+        "builder_image": "public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+        "builder_image_id": "sha256:" + "3" * 64,
+    }
+
+    first_manifest = build_trusted_lambda_artifacts(payload, source, first, **kwargs)
+    second_manifest = build_trusted_lambda_artifacts(payload, source, second, **kwargs)
+
+    assert first_manifest == second_manifest
+    assert (first / "trusted-lambda.zip").read_bytes() == (
+        second / "trusted-lambda.zip"
+    ).read_bytes()
+    assert (first / "MANIFEST.json").read_bytes() == (
+        second / "MANIFEST.json"
+    ).read_bytes()
+    with __import__("zipfile").ZipFile(first / "trusted-lambda.zip") as archive:
+        names = archive.namelist()
+    assert names == sorted(names)
+    assert {"MANIFEST.json", "ASSET.sha256", "SHA256SUMS"}.isdisjoint(names)
+
+
+def test_cdk_resolves_authenticated_zip_and_exact_custom_hash(
+    tmp_path: pathlib.Path,
+) -> None:
+    source, payload = _write_source_and_payload(tmp_path)
+    output = tmp_path / "build" / "trusted-lambda"
+    manifest = build_trusted_lambda_artifacts(
+        payload,
+        source,
+        output,
+        source_commit="a" * 40,
+        source_tree="b" * 40,
+        builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+        builder_image_id="sha256:" + "3" * 64,
+    )
+
+    resolved = resolve_trusted_lambda_asset_metadata(
+        tmp_path,
+        account="123456789012",
+        expected_commit="a" * 40,
+        expected_tree="b" * 40,
+    )
+
+    assert resolved.path == str(output / "trusted-lambda.zip")
+    assert resolved.asset_hash == manifest.archive_sha256
+    assert resolve_trusted_lambda_asset(
+        tmp_path,
+        account="123456789012",
+        expected_commit="a" * 40,
+        expected_tree="b" * 40,
+    ) == str(output / "trusted-lambda.zip")
+
+
+def test_cdk_rejects_zip_or_release_identity_mutation(tmp_path: pathlib.Path) -> None:
+    source, payload = _write_source_and_payload(tmp_path)
+    output = tmp_path / "build" / "trusted-lambda"
+    build_trusted_lambda_artifacts(
+        payload,
+        source,
+        output,
+        source_commit="a" * 40,
+        source_tree="b" * 40,
+        builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+        builder_image_id="sha256:" + "3" * 64,
+    )
+
+    with pytest.raises(TrustedLambdaAssetError, match="commit"):
+        resolve_trusted_lambda_asset_metadata(
+            tmp_path,
+            account="123456789012",
+            expected_commit="f" * 40,
+            expected_tree="b" * 40,
+        )
+
+    archive = output / "trusted-lambda.zip"
+    archive.write_bytes(archive.read_bytes() + b"changed")
+    with pytest.raises(TrustedLambdaAssetError, match="archive"):
+        resolve_trusted_lambda_asset_metadata(
+            tmp_path,
+            account="123456789012",
+            expected_commit="a" * 40,
+            expected_tree="b" * 40,
+        )
 
 
 def test_cdk_asset_resolution_rejects_missing_or_unauthenticated_build(tmp_path) -> None:
@@ -207,95 +376,27 @@ def test_cdk_asset_resolution_rejects_missing_or_unauthenticated_build(tmp_path)
     (asset / "SHA256SUMS").write_text("", encoding="utf-8")
     (asset / "ASSET.sha256").write_text("0" * 64 + "\n", encoding="ascii")
 
-    with pytest.raises(TrustedLambdaAssetError, match="authentication"):
-        resolve_trusted_lambda_asset(tmp_path, account="123456789012")
+    (asset / "trusted-lambda.zip").write_bytes(b"not-a-zip")
+    with pytest.raises(TrustedLambdaAssetError, match="fields|manifest|archive|artifact"):
+        resolve_trusted_lambda_asset(
+            tmp_path,
+            account="123456789012",
+            expected_commit="a" * 40,
+            expected_tree="b" * 40,
+        )
 
 
 def _write_valid_asset(repository_root: pathlib.Path) -> pathlib.Path:
-    source = repository_root / "lambda"
-    for relative in (
-        "router/index.py",
-        "worker/index.py",
-        "web/index.py",
-        "control/index.py",
-        "workspace_broker/index.py",
-    ):
-        path = source / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"# {relative}\n", encoding="utf-8")
-    (source / "requirements.in").write_text(
-        "boto3==1.43.50\ncryptography==49.0.0\n"
-        "google-api-python-client==2.198.0\ngoogle-auth==2.56.0\n"
-        "openai==2.46.0\n",
-        encoding="utf-8",
-    )
-    (source / "requirements.txt").write_text(
-        "boto3==1.43.50 --hash=sha256:" + "1" * 64 + "\n",
-        encoding="utf-8",
-    )
-
+    source, payload = _write_source_and_payload(repository_root)
     asset = repository_root / "build" / "trusted-lambda"
-    asset.mkdir(parents=True)
-    source_files = []
-    files = []
-    for path in sorted(source.rglob("*.py")) + [source / "requirements.txt"]:
-        relative = path.relative_to(source).as_posix()
-        target = asset / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(path.read_bytes())
-        target.chmod(0o644)
-        payload = target.read_bytes()
-        source_files.append(
-            {
-                "path": relative,
-                "sha256": hashlib.sha256(payload).hexdigest(),
-                "size": len(payload),
-            }
-        )
-        files.append(
-            {
-                **source_files[-1],
-                "mode": format(stat.S_IMODE(target.stat().st_mode), "04o"),
-            }
-        )
-    files.sort(key=lambda item: item["path"])
-    source_files.sort(key=lambda item: item["path"])
-    manifest = {
-        "schema": SCHEMA,
-        "platform": "linux/arm64",
-        "python": "3.13",
-        "builderImage": "public.ecr.aws/lambda/python@sha256:" + "2" * 64,
-        "builderImageId": "sha256:" + "3" * 64,
-        "requirementsMode": "sha256-locked",
-        "requirementsSha256": hashlib.sha256(
-            (source / "requirements.txt").read_bytes()
-        ).hexdigest(),
-        "requirementsInputSha256": hashlib.sha256(
-            (source / "requirements.in").read_bytes()
-        ).hexdigest(),
-        "sourceDateEpoch": 0,
-        "payloadBytes": sum(item["size"] for item in files),
-        "sourceFiles": source_files,
-        "files": files,
-        "dependencies": [
-            {"name": name, "version": "1.0"}
-            for name in (
-                "boto3",
-                "cryptography",
-                "google-api-python-client",
-                "google-auth",
-                "openai",
-            )
-        ],
-    }
-    payload = (json.dumps(manifest, sort_keys=True) + "\n").encode()
-    (asset / "MANIFEST.json").write_bytes(payload)
-    (asset / "SHA256SUMS").write_text(
-        "".join(f'{item["sha256"]}  {item["path"]}\n' for item in files),
-        encoding="utf-8",
-    )
-    (asset / "ASSET.sha256").write_text(
-        hashlib.sha256(payload).hexdigest() + "\n", encoding="ascii"
+    build_trusted_lambda_artifacts(
+        payload,
+        source,
+        asset,
+        source_commit="a" * 40,
+        source_tree="b" * 40,
+        builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+        builder_image_id="sha256:" + "3" * 64,
     )
     return asset
 
@@ -304,28 +405,46 @@ def test_cdk_asset_resolution_accepts_fresh_authenticated_arm64_python313_build(
     asset = _write_valid_asset(tmp_path)
 
     assert resolve_trusted_lambda_asset(
-        tmp_path, account="123456789012"
-    ) == str(asset)
+        tmp_path,
+        account="123456789012",
+        expected_commit="a" * 40,
+        expected_tree="b" * 40,
+    ) == str(asset / "trusted-lambda.zip")
 
 
 def test_cdk_asset_resolution_rejects_empty_stale_or_extra_assets(tmp_path) -> None:
     asset = _write_valid_asset(tmp_path)
     (tmp_path / "lambda" / "web" / "index.py").write_text("# changed\n", encoding="utf-8")
     with pytest.raises(TrustedLambdaAssetError, match="source"):
-        resolve_trusted_lambda_asset(tmp_path, account="123456789012")
+        resolve_trusted_lambda_asset(
+            tmp_path,
+            account="123456789012",
+            expected_commit="a" * 40,
+            expected_tree="b" * 40,
+        )
 
     second = tmp_path / "second"
     asset = _write_valid_asset(second)
     (asset / "unexpected.py").write_text("pass\n", encoding="utf-8")
-    with pytest.raises(TrustedLambdaAssetError, match="file set"):
-        resolve_trusted_lambda_asset(second, account="123456789012")
+    with pytest.raises(TrustedLambdaAssetError, match="external files"):
+        resolve_trusted_lambda_asset(
+            second,
+            account="123456789012",
+            expected_commit="a" * 40,
+            expected_tree="b" * 40,
+        )
 
 
 def test_cdk_asset_resolution_rejects_symlinks(tmp_path) -> None:
     asset = _write_valid_asset(tmp_path)
     (asset / "escape.py").symlink_to(tmp_path / "lambda" / "web" / "index.py")
-    with pytest.raises(TrustedLambdaAssetError, match="symlink"):
-        resolve_trusted_lambda_asset(tmp_path, account="123456789012")
+    with pytest.raises(TrustedLambdaAssetError, match="non-file"):
+        resolve_trusted_lambda_asset(
+            tmp_path,
+            account="123456789012",
+            expected_commit="a" * 40,
+            expected_tree="b" * 40,
+        )
 
 
 def test_source_only_synth_escape_is_limited_to_impossible_test_account(tmp_path) -> None:
@@ -353,13 +472,13 @@ def test_app_and_deploy_path_require_the_trusted_asset_for_real_stacks() -> None
     web_source = (ROOT / "stacks" / "web_stack.py").read_text(encoding="utf-8")
     deploy_source = (ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
 
-    assert "resolve_trusted_lambda_asset(" in app_source
-    assert app_source.count("trusted_code_asset_root=trusted_lambda_asset_root") == 2
+    assert "resolve_trusted_lambda_asset_metadata(" in app_source
+    assert app_source.count("trusted_code_asset_root=trusted_lambda_asset.path") == 2
+    assert app_source.count("trusted_code_asset_hash=trusted_lambda_asset.asset_hash") == 2
     assert 'web_asset_root=str(repository_root / "web" / "dist")' in app_source
-    assert "_lambda.Code.from_asset(trusted_code_asset_root)" in router_source
-    assert web_source.count(
-        "_lambda.Code.from_asset(trusted_code_asset_root)"
-    ) == 3
+    for source in (router_source, web_source):
+        assert "asset_hash=trusted_code_asset_hash" in source
+        assert "asset_hash_type=AssetHashType.CUSTOM" in source
     build = '"$PROJECT_DIR/scripts/build-trusted-lambda-asset.sh" build'
     verify = '"$PROJECT_DIR/scripts/build-trusted-lambda-asset.sh" verify'
     deploy = "cdk deploy"

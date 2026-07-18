@@ -26,7 +26,7 @@ from stacks.web_stack import WebStack
 from stacks.guardrails_stack import GuardrailsStack
 from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
-from stacks.trusted_lambda_asset import resolve_trusted_lambda_asset
+from stacks.trusted_lambda_asset import resolve_trusted_lambda_asset_metadata
 
 REQUIRED_REGION = "eu-west-1"
 
@@ -54,7 +54,7 @@ repository_root = Path(__file__).resolve().parent
 configured_account = app.node.try_get_context("account") or os.environ.get(
     "CDK_DEFAULT_ACCOUNT"
 )
-trusted_lambda_asset_root = resolve_trusted_lambda_asset(
+trusted_lambda_asset = resolve_trusted_lambda_asset_metadata(
     repository_root,
     account=configured_account,
     allow_synthetic_source=(
@@ -112,7 +112,8 @@ router_stack = RouterStack(
     cmk_arn=security_stack.cmk.key_arn,
     user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
     user_files_bucket_arn=agentcore_stack.user_files_bucket.bucket_arn,
-    trusted_code_asset_root=trusted_lambda_asset_root,
+    trusted_code_asset_root=trusted_lambda_asset.path,
+    trusted_code_asset_hash=trusted_lambda_asset.asset_hash,
     env=env,
 )
 
@@ -133,7 +134,8 @@ web_stack = WebStack(
     runtime_arn=agentcore_stack.runtime_arn,
     runtime_iam_arn=agentcore_stack.runtime_iam_arn,
     runtime_endpoint_name=agentcore_stack.runtime_endpoint_name,
-    trusted_code_asset_root=trusted_lambda_asset_root,
+    trusted_code_asset_root=trusted_lambda_asset.path,
+    trusted_code_asset_hash=trusted_lambda_asset.asset_hash,
     web_asset_root=str(repository_root / "web" / "dist"),
     auth_secret=security_stack.web_auth_secret,
     approval_secret=security_stack.approval_signing_secret,

@@ -3,6 +3,7 @@
 import re
 
 from aws_cdk import (
+    AssetHashType,
     CfnOutput,
     Duration,
     RemovalPolicy,
@@ -50,6 +51,7 @@ class RouterStack(Stack):
         user_files_bucket_name: str,
         user_files_bucket_arn: str,
         trusted_code_asset_root: str,
+        trusted_code_asset_hash: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -132,6 +134,17 @@ class RouterStack(Stack):
         registration_open = str(
             self.node.try_get_context("registration_open") or "false"
         ).lower()
+
+        def trusted_lambda_code() -> _lambda.Code:
+            if trusted_code_asset_hash is None:
+                return _lambda.Code.from_asset(trusted_code_asset_root)
+            if re.fullmatch(r"[0-9a-f]{64}", trusted_code_asset_hash) is None:
+                raise ValueError("trusted Lambda asset hash is not canonical")
+            return _lambda.Code.from_asset(
+                trusted_code_asset_root,
+                asset_hash=trusted_code_asset_hash,
+                asset_hash_type=AssetHashType.CUSTOM,
+            )
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
@@ -273,7 +286,7 @@ class RouterStack(Stack):
             # Ingress and worker execute from the same reviewed, normalized
             # ARM64 asset.  Do not bypass the manifest-verified release bundle
             # with the raw source directory.
-            code=_lambda.Code.from_asset(trusted_code_asset_root),
+            code=trusted_lambda_code(),
             timeout=Duration.seconds(ingress_timeout),
             memory_size=worker_memory,
             environment={
@@ -295,7 +308,7 @@ class RouterStack(Stack):
             handler="worker.index.lambda_handler",
             # The worker composes trusted modules from router/ and worker/;
             # package their common lambda/ root as one immutable asset.
-            code=_lambda.Code.from_asset(trusted_code_asset_root),
+            code=trusted_lambda_code(),
             timeout=Duration.seconds(worker_timeout),
             memory_size=worker_memory,
             environment={
@@ -329,7 +342,7 @@ class RouterStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             architecture=_lambda.Architecture.ARM_64,
             handler="workspace_broker.index.lambda_handler",
-            code=_lambda.Code.from_asset(trusted_code_asset_root),
+            code=trusted_lambda_code(),
             role=workspace_broker_role,
             timeout=Duration.seconds(15),
             memory_size=256,
