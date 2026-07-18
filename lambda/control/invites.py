@@ -432,4 +432,3 @@ class DynamoPilotInvites:
             if result is not None:
                 return result
             raise InviteRejected("pilot invitation is unavailable") from None
-
