@@ -9,8 +9,9 @@ installed in OpenClaw, admitted by a gateway, deployed, or production-ready.
 Capability contracts are dependency-free, immutable values. Their wire form is
 sorted-key UTF-8 JSON with no whitespace or trailing newline. Parsing rejects
 duplicate keys, alternate spellings, unknown fields, noncanonical bytes,
-non-finite or unsafe numbers, booleans in integer fields, unsafe identifiers or
-paths, and configured byte, depth, string, collection, and total-node overflow.
+all floating-point values, unsafe integers, booleans in integer fields,
+container cycles, unsafe identifiers or paths, and configured byte, depth,
+string, collection, and total-node overflow.
 Repository catalog/schema artifacts use that encoding plus one trailing LF.
 
 `catalogDigest` is non-self-referential: it is SHA-256 of the compiled canonical
@@ -18,6 +19,15 @@ catalog with only `catalogDigest` omitted. Each input/output schema digest is
 SHA-256 over the exact canonical schema artifact bytes, including its single
 trailing LF. The compiled catalog binds one exact lowercase 40-character release
 commit. A release, catalog, schema, runtime, or gateway mismatch must fail closed.
+Capability calls bind the catalog digest, exact operation/tool pair, invocation,
+tool-use identity, and canonical argument hash into `callId`; operation-specific
+input, output, proposal, and schedule shapes reject all extra fields.
+
+Public URL grants accept only canonical HTTPS authorities. Non-global IP
+literals, IPv4-mapped IPv6, numeric and hostname aliases, userinfo, ports,
+fragments, and ambiguous encodings fail closed. The target hash covers the full
+grant except the hash itself, including expiry and maximum uses. This parser
+boundary does not replace execution-time DNS resolution and address pinning.
 
 The trusted relay retains `TurnCapabilityGrantV1`; the model sees neither that
 grant nor provider, browser, database, approval-signing, or cross-user

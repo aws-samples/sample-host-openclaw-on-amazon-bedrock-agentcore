@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import ipaddress
 import json
-import math
 import re
 from types import MappingProxyType
 from typing import Any, ClassVar, Mapping, Sequence
@@ -33,7 +33,12 @@ RESULT_STATUSES = frozenset(
     {"SUCCEEDED", "PENDING_APPROVAL", "DENIED", "FAILED_RETRYABLE", "UNCERTAIN"}
 )
 APPROVAL_POLICIES = frozenset(
-    {"NONE", "CURRENT_REQUEST_TARGET_GRANT", "EXACT_ONE_TIME", "EXACT_ONE_TIME_PROPOSAL"}
+    {
+        "NONE",
+        "CURRENT_REQUEST_TARGET_GRANT",
+        "EXACT_ONE_TIME",
+        "EXACT_ONE_TIME_PROPOSAL",
+    }
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -45,8 +50,16 @@ _OPERATION_ID = re.compile(r"[a-z0-9]+(?:[.-][a-z0-9-]+){1,7}")
 _TOOL_NAME = re.compile(r"po_[a-z0-9]+(?:_[a-z0-9]+){1,7}")
 _VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-_TIMEZONE = re.compile(r"(?:UTC|[A-Za-z]+(?:[_-][A-Za-z]+)*/[A-Za-z]+(?:[_-][A-Za-z]+)*)")
+_TIMEZONE = re.compile(
+    r"(?:UTC|[A-Za-z]+(?:[_-][A-Za-z]+)*/[A-Za-z]+(?:[_-][A-Za-z]+)*)"
+)
 _PATH_SEGMENT = re.compile(r"[^/\\\x00-\x1f\x7f]+")
+_RUNTIME_ARN = re.compile(
+    r"arn:aws:bedrock-agentcore:eu-west-1:[0-9]{12}:runtime/"
+    r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+)
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_HEX_PAIR = re.compile(r"[0-9A-F]{2}")
 
 
 class ContractValidationError(ValueError):
@@ -85,6 +98,7 @@ def _fail(message: str) -> None:
 
 def _validate_json_tree(value: Any, limits: ContractLimits) -> None:
     nodes = 0
+    active_containers: set[int] = set()
 
     def visit(item: Any, depth: int) -> None:
         nonlocal nodes
@@ -104,28 +118,45 @@ def _validate_json_tree(value: Any, limits: ContractLimits) -> None:
                 _fail("canonical JSON integer exceeds the interoperable range")
             return
         if isinstance(item, float):
-            if not math.isfinite(item) or abs(item) > MAX_SAFE_INTEGER:
-                _fail("canonical JSON number is non-finite or out of range")
-            return
+            _fail("canonical JSON floats are unsupported")
         if isinstance(item, Mapping):
             if len(item) > limits.max_collection_items:
                 _fail("canonical JSON object exceeds the item limit")
-            for key, nested in item.items():
-                if not isinstance(key, str) or not key:
-                    _fail("canonical JSON object keys must be non-empty strings")
-                if len(key) > limits.max_string_chars:
-                    _fail("canonical JSON object key exceeds the character limit")
-                visit(nested, depth + 1)
+            identity = id(item)
+            if identity in active_containers:
+                _fail("canonical JSON contains a container cycle")
+            active_containers.add(identity)
+            try:
+                for key, nested in item.items():
+                    if not isinstance(key, str) or not key:
+                        _fail("canonical JSON object keys must be non-empty strings")
+                    if len(key) > limits.max_string_chars:
+                        _fail("canonical JSON object key exceeds the character limit")
+                    visit(nested, depth + 1)
+            finally:
+                active_containers.remove(identity)
             return
         if isinstance(item, (list, tuple)):
             if len(item) > limits.max_collection_items:
                 _fail("canonical JSON array exceeds the item limit")
-            for nested in item:
-                visit(nested, depth + 1)
+            identity = id(item)
+            if identity in active_containers:
+                _fail("canonical JSON contains a container cycle")
+            active_containers.add(identity)
+            try:
+                for nested in item:
+                    visit(nested, depth + 1)
+            finally:
+                active_containers.remove(identity)
             return
         _fail("canonical JSON contains an unsupported value")
 
-    visit(value, 0)
+    try:
+        visit(value, 0)
+    except RecursionError as error:
+        raise ContractValidationError(
+            "canonical JSON exceeds the depth limit"
+        ) from error
 
 
 def _thaw(value: Any) -> Any:
@@ -144,14 +175,300 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+class _FrozenList(list[Any]):
+    """List-shaped for exact JSON-matrix comparison, but non-mutable."""
+
+    __slots__ = ()
+
+    @staticmethod
+    def _immutable(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("frozen catalog sequence cannot be mutated")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+def _freeze_catalog_source(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_catalog_source(nested) for key, nested in value.items()}
+        )
+    if isinstance(value, (tuple, list)):
+        return _FrozenList(_freeze_catalog_source(nested) for nested in value)
+    return value
+
+
+def _catalog_source_pack(
+    pack_id: str,
+    operation_id: str,
+    tool_name: str,
+    input_schema: str,
+    output_schema: str,
+    risk_class: str,
+    credential_boundary: str,
+    approval_mode: str,
+    target_mode: str,
+    retry_mode: str,
+    max_calls: int,
+    max_input_bytes: int,
+    max_output_bytes: int,
+    retention_class: str,
+    max_days: int,
+    deletion_behavior: str,
+) -> dict[str, Any]:
+    """Build one release-owned row; every authority field is explicit."""
+
+    return {
+        "packId": pack_id,
+        "version": "1.0.0",
+        "riskClass": risk_class,
+        "credentialBoundary": credential_boundary,
+        "operations": [
+            {
+                "operationId": operation_id,
+                "toolName": tool_name,
+                "inputSchema": input_schema,
+                "outputSchema": output_schema,
+            }
+        ],
+        "approvalPolicy": {"mode": approval_mode, "standingAllowed": False},
+        "targetPolicy": {"mode": target_mode},
+        "retryPolicy": {
+            "mode": retry_mode,
+            "onUncertain": "STOP_AND_RECONCILE",
+        },
+        "quotaPolicy": {
+            "maxCallsPerTurn": max_calls,
+            "maxInputBytes": max_input_bytes,
+            "maxOutputBytes": max_output_bytes,
+        },
+        "retentionPolicy": {"class": retention_class, "maxDays": max_days},
+        "deletionPolicy": {
+            "authorityFence": "REQUIRED",
+            "behavior": deletion_behavior,
+        },
+    }
+
+
+FROZEN_CATALOG_PACKS_V1 = tuple(
+    _freeze_catalog_source(pack)
+    for pack in (
+        _catalog_source_pack(
+            "workspace.file-list",
+            "workspace.file.list",
+            "po_file_list",
+            "po-file-list-input.json",
+            "po-file-list-output.json",
+            "LOCAL_READ",
+            "WORKSPACE_SCOPED_SESSION",
+            "NONE",
+            "SESSION_WORKSPACE",
+            "READ_ONLY",
+            8,
+            262144,
+            1048576,
+            "WORKSPACE_LIFECYCLE",
+            30,
+            "PURGE_WITH_WORKSPACE",
+        ),
+        _catalog_source_pack(
+            "workspace.file-read",
+            "workspace.file.read",
+            "po_file_read",
+            "po-file-read-input.json",
+            "po-file-read-output.json",
+            "LOCAL_READ",
+            "WORKSPACE_SCOPED_SESSION",
+            "NONE",
+            "SESSION_WORKSPACE",
+            "READ_ONLY",
+            8,
+            262144,
+            262144,
+            "WORKSPACE_LIFECYCLE",
+            30,
+            "PURGE_WITH_WORKSPACE",
+        ),
+        _catalog_source_pack(
+            "workspace.file-write",
+            "workspace.file.write",
+            "po_file_write",
+            "po-file-write-input.json",
+            "po-file-write-output.json",
+            "LOCAL_MUTATION",
+            "WORKSPACE_SCOPED_SESSION",
+            "NONE",
+            "SESSION_WORKSPACE",
+            "IDEMPOTENT",
+            8,
+            262144,
+            262144,
+            "WORKSPACE_LIFECYCLE",
+            30,
+            "PURGE_WITH_WORKSPACE",
+        ),
+        _catalog_source_pack(
+            "workspace.file-delete",
+            "workspace.file.delete",
+            "po_file_delete",
+            "po-file-delete-input.json",
+            "po-file-delete-output.json",
+            "LOCAL_MUTATION",
+            "WORKSPACE_SCOPED_SESSION",
+            "NONE",
+            "SESSION_WORKSPACE",
+            "IDEMPOTENT",
+            8,
+            262144,
+            262144,
+            "WORKSPACE_LIFECYCLE",
+            30,
+            "PURGE_WITH_WORKSPACE",
+        ),
+        _catalog_source_pack(
+            "web.exact-read",
+            "web.exact.read",
+            "po_web_read",
+            "po-web-read-input.json",
+            "po-web-read-output.json",
+            "PUBLIC_READ",
+            "NONE",
+            "CURRENT_REQUEST_TARGET_GRANT",
+            "EXACT_PUBLIC_URL",
+            "READ_ONLY",
+            4,
+            4096,
+            65536,
+            "NONE",
+            0,
+            "REVOKE_AND_PURGE",
+        ),
+        _catalog_source_pack(
+            "schedule.list",
+            "schedule.list",
+            "po_schedule_list",
+            "po-schedule-list-input.json",
+            "po-schedule-list-output.json",
+            "LOCAL_READ",
+            "TRUSTED_CONTROL_PLANE",
+            "NONE",
+            "CONTROL_PLANE_RECORD",
+            "READ_ONLY",
+            8,
+            262144,
+            1048576,
+            "CONTROL_RECORD",
+            90,
+            "CANCEL_AND_PURGE",
+        ),
+        _catalog_source_pack(
+            "schedule.propose",
+            "schedule.propose",
+            "po_schedule_propose",
+            "po-schedule-propose-input.json",
+            "po-schedule-propose-output.json",
+            "DURABLE_MUTATION",
+            "TRUSTED_CONTROL_PLANE",
+            "EXACT_ONE_TIME_PROPOSAL",
+            "CONTROL_PLANE_RECORD",
+            "DEDUPE_KEY_REQUIRED",
+            8,
+            262144,
+            262144,
+            "CONTROL_RECORD",
+            90,
+            "CANCEL_AND_PURGE",
+        ),
+        _catalog_source_pack(
+            "schedule.cancel-propose",
+            "schedule.cancel.propose",
+            "po_schedule_cancel_propose",
+            "po-schedule-cancel-propose-input.json",
+            "po-schedule-cancel-propose-output.json",
+            "DURABLE_MUTATION",
+            "TRUSTED_CONTROL_PLANE",
+            "EXACT_ONE_TIME_PROPOSAL",
+            "CONTROL_PLANE_RECORD",
+            "DEDUPE_KEY_REQUIRED",
+            8,
+            262144,
+            262144,
+            "CONTROL_RECORD",
+            90,
+            "CANCEL_AND_PURGE",
+        ),
+        _catalog_source_pack(
+            "compute.run",
+            "compute.run",
+            "po_compute_run",
+            "po-compute-run-input.json",
+            "po-compute-run-output.json",
+            "LOCAL_MUTATION",
+            "NETWORKLESS_COMPUTE",
+            "NONE",
+            "FRESH_JOB_NAMESPACE",
+            "DEDUPE_KEY_REQUIRED",
+            2,
+            1048576,
+            1048576,
+            "JOB_RECEIPT",
+            90,
+            "FENCE_CANCEL_PURGE",
+        ),
+        _catalog_source_pack(
+            "compute.status",
+            "compute.status",
+            "po_compute_status",
+            "po-compute-status-input.json",
+            "po-compute-status-output.json",
+            "LOCAL_READ",
+            "NETWORKLESS_COMPUTE",
+            "NONE",
+            "FRESH_JOB_NAMESPACE",
+            "READ_ONLY",
+            8,
+            262144,
+            1048576,
+            "JOB_RECEIPT",
+            90,
+            "FENCE_CANCEL_PURGE",
+        ),
+    )
+)
+
+_OPERATION_METADATA_V1 = MappingProxyType(
+    {
+        pack["operations"][0]["operationId"]: MappingProxyType(
+            {
+                "packId": pack["packId"],
+                "toolName": pack["operations"][0]["toolName"],
+                "approvalMode": pack["approvalPolicy"]["mode"],
+                "retryMode": pack["retryPolicy"]["mode"],
+            }
+        )
+        for pack in FROZEN_CATALOG_PACKS_V1
+    }
+)
+
+
 def canonical_json_bytes(
     value: Any, *, limits: ContractLimits = DEFAULT_LIMITS
 ) -> bytes:
     """Return the one accepted JSON byte representation for ``value``."""
 
-    plain = _thaw(value)
-    _validate_json_tree(plain, limits)
+    _validate_json_tree(value, limits)
     try:
+        plain = _thaw(value)
         encoded = json.dumps(
             plain,
             ensure_ascii=False,
@@ -159,8 +476,10 @@ def canonical_json_bytes(
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-    except (TypeError, ValueError, UnicodeError) as error:
-        raise ContractValidationError("value cannot be encoded as canonical JSON") from error
+    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise ContractValidationError(
+            "value cannot be encoded as canonical JSON"
+        ) from error
     if len(encoded) > limits.max_bytes:
         _fail("canonical JSON exceeds the byte limit")
     return encoded
@@ -180,30 +499,55 @@ def _domain_hash(domain: bytes, *values: object) -> str:
     return digest.hexdigest()
 
 
-def derive_call_id(invocation_id: str, tool_use_id: str, args_hash: str) -> str:
+def derive_call_id(
+    invocation_id: str,
+    tool_use_id: str,
+    catalog_digest: str,
+    operation_id: str,
+    tool_name: str,
+    args_hash: str,
+) -> str:
     _string(invocation_id, "invocationId", pattern=_OPAQUE_ID)
     _string(tool_use_id, "toolUseId", pattern=_OPAQUE_ID)
+    _sha256(catalog_digest, "catalogDigest")
+    _validate_tool_identity(operation_id, tool_name)
     _sha256(args_hash, "argsHash")
-    return f"call_{_domain_hash(b'personal-operator.capability-call.v1', invocation_id, tool_use_id, args_hash)}"
+    return f"call_{_domain_hash(b'personal-operator.capability-call.v1', invocation_id, tool_use_id, catalog_digest, operation_id, tool_name, args_hash)}"
 
 
 def derive_target_hash(
-    normalized_target: str, method: str, redirect_policy: str, request_id: str
+    normalized_target: str,
+    method: str,
+    redirect_policy: str,
+    expires_at: int,
+    max_uses: int,
+    request_id: str,
 ) -> str:
     _public_https_url(normalized_target)
     _enum(method, "method", {"GET"})
     _enum(redirect_policy, "redirectPolicy", {"NO_REDIRECT", "SAME_HOST"})
+    _integer(expires_at, "expiresAt")
+    _integer(max_uses, "maxUses", minimum=1, maximum=3)
     _string(request_id, "currentRequestId", pattern=_OPAQUE_ID)
-    return _domain_hash(
-        b"personal-operator.target-grant.v1",
-        normalized_target,
-        method,
-        redirect_policy,
-        request_id,
-    )
+    return hashlib.sha256(
+        b"personal-operator.target-grant.v1\0"
+        + canonical_json_bytes(
+            {
+                "schema": "personal-operator.target-grant.v1",
+                "normalizedTarget": normalized_target,
+                "method": method,
+                "redirectPolicy": redirect_policy,
+                "expiresAt": expires_at,
+                "maxUses": max_uses,
+                "currentRequestId": request_id,
+            }
+        )
+    ).hexdigest()
 
 
-def derive_occurrence_id(schedule_id: str, generation: int, occurrence_time: int) -> str:
+def derive_occurrence_id(
+    schedule_id: str, generation: int, occurrence_time: int
+) -> str:
     _string(schedule_id, "scheduleId", pattern=_OPAQUE_ID)
     _integer(generation, "generation", minimum=1)
     _integer(occurrence_time, "occurrenceTime", minimum=0)
@@ -213,7 +557,11 @@ def derive_occurrence_id(schedule_id: str, generation: int, occurrence_time: int
 def _mapping(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         _fail(f"{label} must be an object")
-    return {key: _thaw(nested) for key, nested in value.items()}
+    _validate_json_tree(value, DEFAULT_LIMITS)
+    try:
+        return {key: _thaw(nested) for key, nested in value.items()}
+    except RecursionError as error:
+        raise ContractValidationError(f"{label} exceeds the depth limit") from error
 
 
 def _exact(value: Any, label: str, fields: Sequence[str]) -> dict[str, Any]:
@@ -298,8 +646,18 @@ def _safe_path(value: Any, label: str = "path") -> str:
 def _public_https_url(value: Any) -> str:
     target = _string(value, "normalizedTarget", maximum=2048)
     try:
+        target.encode("ascii", errors="strict")
+    except UnicodeError as error:
+        raise ContractValidationError(
+            "normalizedTarget must use an ASCII URI form"
+        ) from error
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in target):
+        _fail("normalizedTarget contains control characters")
+    if "\\" in target:
+        _fail("normalizedTarget contains an ambiguous path separator")
+    try:
         parsed = urlsplit(target)
-        port = parsed.port
+        _ = parsed.port
     except ValueError as error:
         raise ContractValidationError("normalizedTarget is invalid") from error
     host = parsed.hostname
@@ -309,14 +667,88 @@ def _public_https_url(value: Any) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
-        or port not in {None, 443}
-        or host.lower() in {"localhost", "localhost.localdomain"}
-        or host.startswith(("127.", "10.", "192.168.", "169.254.", "0."))
-        or host == "::1"
+        or parsed.netloc == ""
+        or parsed.path == ""
     ):
         _fail("normalizedTarget must be an exact public HTTPS URL")
-    if parsed.geturl() != target or host != host.lower():
+    if parsed.geturl() != target or host != host.lower() or "%" in parsed.netloc:
         _fail("normalizedTarget is not normalized")
+
+    canonical_authority: str
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            host.encode("ascii", errors="strict")
+        except UnicodeError as error:
+            raise ContractValidationError(
+                "normalizedTarget hostname must be ASCII"
+            ) from error
+        labels = host.split(".")
+        if (
+            not labels
+            or len(labels) < 2
+            or any(_DNS_LABEL.fullmatch(label) is None for label in labels)
+            or len(host) > 253
+            or host in {"localhost", "localhost.localdomain"}
+            or host.endswith(
+                (".localhost", ".local", ".internal", ".lan", ".home", ".localdomain")
+            )
+            or labels[-1]
+            in {
+                "invalid",
+                "localhost",
+                "local",
+                "internal",
+                "lan",
+                "home",
+                "onion",
+                "test",
+            }
+            or all(label.isdigit() for label in labels)
+            or host.startswith("0x")
+        ):
+            _fail("normalizedTarget hostname is not a canonical public name")
+        canonical_authority = host
+    else:
+        if (
+            not address.is_global
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_private
+            or getattr(address, "is_site_local", False)
+            or (
+                isinstance(address, ipaddress.IPv6Address)
+                and address.ipv4_mapped is not None
+            )
+        ):
+            _fail("normalizedTarget IP literal is not globally routable")
+        if isinstance(address, ipaddress.IPv6Address):
+            canonical_authority = f"[{address.compressed}]"
+        else:
+            canonical_authority = str(address)
+
+    if parsed.netloc != canonical_authority:
+        _fail("normalizedTarget authority is not canonical")
+    if any(segment in {".", ".."} for segment in parsed.path.split("/")):
+        _fail("normalizedTarget contains a path-normalization alias")
+
+    for component in (parsed.path, parsed.query):
+        offset = 0
+        while True:
+            percent = component.find("%", offset)
+            if percent < 0:
+                break
+            encoded = component[percent + 1 : percent + 3]
+            if len(encoded) != 2 or _HEX_PAIR.fullmatch(encoded) is None:
+                _fail("normalizedTarget contains a non-canonical percent escape")
+            decoded = chr(int(encoded, 16))
+            if decoded.isalnum() or decoded in "-._~/%\\":
+                _fail("normalizedTarget contains an ambiguous percent escape")
+            offset = percent + 3
     return target
 
 
@@ -338,7 +770,9 @@ def _string_list(
     return result
 
 
-def _file_records(value: Any, label: str, *, maximum_items: int = 128) -> list[dict[str, Any]]:
+def _file_records(
+    value: Any, label: str, *, maximum_items: int = 128
+) -> list[dict[str, Any]]:
     if not isinstance(value, (list, tuple)) or len(value) > maximum_items:
         _fail(f"{label} must be a bounded array")
     records: list[dict[str, Any]] = []
@@ -432,7 +866,9 @@ class CapabilityPackV1:
     def __post_init__(self) -> None:
         value = _exact(self._data, "CapabilityPackV1", self.FIELDS)
         value["packId"] = _string(value["packId"], "packId", pattern=_PACK_ID)
-        value["version"] = _string(value["version"], "version", pattern=_VERSION, maximum=32)
+        value["version"] = _string(
+            value["version"], "version", pattern=_VERSION, maximum=32
+        )
         value["riskClass"] = _enum(value["riskClass"], "riskClass", RISK_CLASSES)
         value["credentialBoundary"] = _enum(
             value["credentialBoundary"],
@@ -469,7 +905,9 @@ class CapabilityPackV1:
             operation_ids.append(item["operationId"])
             tool_names.append(item["toolName"])
             normalized_operations.append(item)
-        if len(set(operation_ids)) != len(operation_ids) or len(set(tool_names)) != len(tool_names):
+        if len(set(operation_ids)) != len(operation_ids) or len(set(tool_names)) != len(
+            tool_names
+        ):
             _fail("capability operations must have unique identities")
         value["operations"] = normalized_operations
 
@@ -503,7 +941,9 @@ class CapabilityPackV1:
 
         retry = _exact(value["retryPolicy"], "retryPolicy", ("mode", "onUncertain"))
         retry["mode"] = _enum(
-            retry["mode"], "retryPolicy.mode", {"READ_ONLY", "IDEMPOTENT", "DEDUPE_KEY_REQUIRED"}
+            retry["mode"],
+            "retryPolicy.mode",
+            {"READ_ONLY", "IDEMPOTENT", "DEDUPE_KEY_REQUIRED"},
         )
         retry["onUncertain"] = _enum(
             retry["onUncertain"], "retryPolicy.onUncertain", {"STOP_AND_RECONCILE"}
@@ -516,13 +956,20 @@ class CapabilityPackV1:
             ("maxCallsPerTurn", "maxInputBytes", "maxOutputBytes"),
         )
         quota["maxCallsPerTurn"] = _integer(
-            quota["maxCallsPerTurn"], "quotaPolicy.maxCallsPerTurn", minimum=1, maximum=64
+            quota["maxCallsPerTurn"],
+            "quotaPolicy.maxCallsPerTurn",
+            minimum=1,
+            maximum=64,
         )
         quota["maxInputBytes"] = _integer(
-            quota["maxInputBytes"], "quotaPolicy.maxInputBytes", maximum=64 * 1024 * 1024
+            quota["maxInputBytes"],
+            "quotaPolicy.maxInputBytes",
+            maximum=64 * 1024 * 1024,
         )
         quota["maxOutputBytes"] = _integer(
-            quota["maxOutputBytes"], "quotaPolicy.maxOutputBytes", maximum=64 * 1024 * 1024
+            quota["maxOutputBytes"],
+            "quotaPolicy.maxOutputBytes",
+            maximum=64 * 1024 * 1024,
         )
         value["quotaPolicy"] = quota
 
@@ -589,13 +1036,19 @@ class CapabilityCatalogV1(ContractValue):
         packs = result["packs"]
         if not isinstance(packs, (list, tuple)) or not 1 <= len(packs) <= 64:
             _fail("catalog packs must be a non-empty bounded array")
-        normalized = [CapabilityPackV1.from_mapping(pack).to_mapping() for pack in packs]
+        normalized = [
+            CapabilityPackV1.from_mapping(pack).to_mapping() for pack in packs
+        ]
         pack_ids = [pack["packId"] for pack in normalized]
         operation_ids = [
-            operation["operationId"] for pack in normalized for operation in pack["operations"]
+            operation["operationId"]
+            for pack in normalized
+            for operation in pack["operations"]
         ]
         tool_names = [
-            operation["toolName"] for pack in normalized for operation in pack["operations"]
+            operation["toolName"]
+            for pack in normalized
+            for operation in pack["operations"]
         ]
         if len(set(pack_ids)) != len(pack_ids):
             _fail("catalog pack IDs must be unique")
@@ -603,11 +1056,35 @@ class CapabilityCatalogV1(ContractValue):
             _fail("catalog operation IDs must be unique")
         if len(set(tool_names)) != len(tool_names):
             _fail("catalog tool names must be unique")
+        if len(normalized) != len(FROZEN_CATALOG_PACKS_V1):
+            _fail("catalog must contain the exact frozen v1 pack rows")
+        for actual, expected in zip(normalized, FROZEN_CATALOG_PACKS_V1, strict=True):
+            actual_metadata = {
+                key: nested for key, nested in actual.items() if key != "operations"
+            }
+            expected_metadata = {
+                key: nested for key, nested in expected.items() if key != "operations"
+            }
+            actual_operations = actual["operations"]
+            expected_operation = expected["operations"][0]
+            if (
+                canonical_json_bytes(actual_metadata)
+                != canonical_json_bytes(expected_metadata)
+                or len(actual_operations) != 1
+                or actual_operations[0]["operationId"]
+                != expected_operation["operationId"]
+                or actual_operations[0]["toolName"] != expected_operation["toolName"]
+            ):
+                _fail("catalog authority metadata differs from the frozen v1 matrix")
         result["packs"] = normalized
-        digest_input = {key: nested for key, nested in result.items() if key != "catalogDigest"}
+        digest_input = {
+            key: nested for key, nested in result.items() if key != "catalogDigest"
+        }
         expected = hashlib.sha256(canonical_json_bytes(digest_input)).hexdigest()
         if result["catalogDigest"] != expected:
-            _fail("catalogDigest does not bind the canonical catalog with that field omitted")
+            _fail(
+                "catalogDigest does not bind the canonical catalog with that field omitted"
+            )
         return result
 
 
@@ -631,12 +1108,18 @@ class CapabilityInstallationV1(ContractValue):
         result["userId"] = _string(result["userId"], "userId", pattern=_USER_ID)
         result["packId"] = _string(result["packId"], "packId", pattern=_PACK_ID)
         result["catalogDigest"] = _sha256(result["catalogDigest"], "catalogDigest")
-        result["state"] = _enum(result["state"], "state", {"ENABLED", "PAUSED", "REVOKED"})
+        result["state"] = _enum(
+            result["state"], "state", {"ENABLED", "PAUSED", "REVOKED"}
+        )
         result["policyRevision"] = _integer(
             result["policyRevision"], "policyRevision", minimum=1
         )
         result["connectionRefs"] = _string_list(
-            result["connectionRefs"], "connectionRefs", pattern=_OPAQUE_ID, maximum_items=16, sorted_unique=True
+            result["connectionRefs"],
+            "connectionRefs",
+            pattern=_OPAQUE_ID,
+            maximum_items=16,
+            sorted_unique=True,
         )
         result["killSwitch"] = _boolean(result["killSwitch"], "killSwitch")
         if result["state"] == "ENABLED" and result["killSwitch"]:
@@ -671,8 +1154,10 @@ class TurnCapabilityGrantV1(ContractValue):
         result["sub"] = _string(result["sub"], "sub", pattern=_USER_ID)
         for name in ("sessionId", "invocationId", "nonce"):
             result[name] = _string(result[name], name, pattern=_OPAQUE_ID)
-        result["runtimeArn"] = _string(result["runtimeArn"], "runtimeArn", maximum=512)
-        if not result["runtimeArn"].startswith("arn:aws:bedrock-agentcore:eu-west-1:"):
+        result["runtimeArn"] = _string(
+            result["runtimeArn"], "runtimeArn", pattern=_RUNTIME_ARN, maximum=256
+        )
+        if _RUNTIME_ARN.fullmatch(result["runtimeArn"]) is None:
             _fail("runtimeArn must identify the frozen eu-west-1 runtime")
         result["releaseCommit"] = _release_commit(result["releaseCommit"])
         expected_qualifier = f"release_{result['releaseCommit']}"
@@ -680,21 +1165,32 @@ class TurnCapabilityGrantV1(ContractValue):
             _fail("runtimeQualifier must bind the exact release commit")
         result["catalogDigest"] = _sha256(result["catalogDigest"], "catalogDigest")
         result["allowedPackIds"] = _string_list(
-            result["allowedPackIds"], "allowedPackIds", pattern=_PACK_ID, sorted_unique=True
+            result["allowedPackIds"],
+            "allowedPackIds",
+            pattern=_PACK_ID,
+            sorted_unique=True,
         )
         result["allowedOperationIds"] = _string_list(
-            result["allowedOperationIds"], "allowedOperationIds", pattern=_OPERATION_ID, sorted_unique=True
+            result["allowedOperationIds"],
+            "allowedOperationIds",
+            pattern=_OPERATION_ID,
+            sorted_unique=True,
         )
         if not result["allowedPackIds"] or not result["allowedOperationIds"]:
             _fail("turn grant must allow at least one pack and operation")
         result["targetGrantHashes"] = _string_list(
-            result["targetGrantHashes"], "targetGrantHashes", pattern=_SHA256, sorted_unique=True
+            result["targetGrantHashes"],
+            "targetGrantHashes",
+            pattern=_SHA256,
+            sorted_unique=True,
         )
         result["iat"] = _integer(result["iat"], "iat")
         result["exp"] = _integer(result["exp"], "exp")
         if result["exp"] <= result["iat"] or result["exp"] - result["iat"] > 900:
             _fail("turn grant lifetime must be positive and at most 15 minutes")
-        result["maxCalls"] = _integer(result["maxCalls"], "maxCalls", minimum=1, maximum=64)
+        result["maxCalls"] = _integer(
+            result["maxCalls"], "maxCalls", minimum=1, maximum=64
+        )
         return result
 
 
@@ -706,6 +1202,8 @@ class CapabilityCallV1(ContractValue):
         "callId",
         "invocationId",
         "toolUseId",
+        "catalogDigest",
+        "operationId",
         "toolName",
         "arguments",
         "argsHash",
@@ -714,18 +1212,34 @@ class CapabilityCallV1(ContractValue):
     @classmethod
     def _validate_mapping(cls, value: Mapping[str, Any]) -> dict[str, Any]:
         result = cls._base(value)
-        result["invocationId"] = _string(result["invocationId"], "invocationId", pattern=_OPAQUE_ID)
-        result["toolUseId"] = _string(result["toolUseId"], "toolUseId", pattern=_OPAQUE_ID)
-        result["toolName"] = _string(result["toolName"], "toolName", pattern=_TOOL_NAME)
-        result["arguments"] = _mapping(result["arguments"], "arguments")
+        result["invocationId"] = _string(
+            result["invocationId"], "invocationId", pattern=_OPAQUE_ID
+        )
+        result["toolUseId"] = _string(
+            result["toolUseId"], "toolUseId", pattern=_OPAQUE_ID
+        )
+        result["catalogDigest"] = _sha256(result["catalogDigest"], "catalogDigest")
+        result["operationId"], result["toolName"] = _validate_tool_identity(
+            result["operationId"], result["toolName"]
+        )
+        result["arguments"] = _validate_tool_input(
+            result["operationId"], result["arguments"]
+        )
         result["argsHash"] = _sha256(result["argsHash"], "argsHash")
         if canonical_sha256(result["arguments"]) != result["argsHash"]:
             _fail("argsHash does not bind canonical arguments")
         expected_call_id = derive_call_id(
-            result["invocationId"], result["toolUseId"], result["argsHash"]
+            result["invocationId"],
+            result["toolUseId"],
+            result["catalogDigest"],
+            result["operationId"],
+            result["toolName"],
+            result["argsHash"],
         )
         if result["callId"] != expected_call_id:
-            _fail("callId does not bind invocation, tool use, and arguments")
+            _fail(
+                "callId does not bind catalog, operation, invocation, tool use, and arguments"
+            )
         return result
 
 
@@ -735,6 +1249,12 @@ class CapabilityResultV1(ContractValue):
     FIELDS = (
         "schema",
         "callId",
+        "invocationId",
+        "toolUseId",
+        "catalogDigest",
+        "operationId",
+        "toolName",
+        "argsHash",
         "status",
         "data",
         "provenanceRefs",
@@ -748,18 +1268,49 @@ class CapabilityResultV1(ContractValue):
     def _validate_mapping(cls, value: Mapping[str, Any]) -> dict[str, Any]:
         result = cls._base(value)
         result["callId"] = _string(
-            result["callId"], "callId", pattern=re.compile(r"call_[0-9a-f]{64}"), maximum=69
+            result["callId"],
+            "callId",
+            pattern=re.compile(r"call_[0-9a-f]{64}"),
+            maximum=69,
         )
+        result["invocationId"] = _string(
+            result["invocationId"], "invocationId", pattern=_OPAQUE_ID
+        )
+        result["toolUseId"] = _string(
+            result["toolUseId"], "toolUseId", pattern=_OPAQUE_ID
+        )
+        result["catalogDigest"] = _sha256(result["catalogDigest"], "catalogDigest")
+        result["operationId"], result["toolName"] = _validate_tool_identity(
+            result["operationId"], result["toolName"]
+        )
+        result["argsHash"] = _sha256(result["argsHash"], "argsHash")
+        expected_call_id = derive_call_id(
+            result["invocationId"],
+            result["toolUseId"],
+            result["catalogDigest"],
+            result["operationId"],
+            result["toolName"],
+            result["argsHash"],
+        )
+        if result["callId"] != expected_call_id:
+            _fail("result identity does not bind the referenced capability call")
         result["status"] = _enum(result["status"], "status", RESULT_STATUSES)
         result["data"] = _mapping(result["data"], "data")
         result["provenanceRefs"] = _string_list(
-            result["provenanceRefs"], "provenanceRefs", maximum_items=32, sorted_unique=True
+            result["provenanceRefs"],
+            "provenanceRefs",
+            maximum_items=32,
+            sorted_unique=True,
         )
         result["proposalRef"] = _optional_string(result["proposalRef"], "proposalRef")
         result["receiptRef"] = _optional_string(result["receiptRef"], "receiptRef")
-        result["errorCode"] = _optional_string(result["errorCode"], "errorCode", maximum=128)
+        result["errorCode"] = _optional_string(
+            result["errorCode"], "errorCode", maximum=128
+        )
         result["retryPolicy"] = _enum(
-            result["retryPolicy"], "retryPolicy", {"NONE", "SAFE_RETRY", "RECONCILE_ONLY"}
+            result["retryPolicy"],
+            "retryPolicy",
+            {"NONE", "SAFE_RETRY", "RECONCILE_ONLY"},
         )
         required_retry = {
             "FAILED_RETRYABLE": "SAFE_RETRY",
@@ -767,8 +1318,48 @@ class CapabilityResultV1(ContractValue):
         }.get(result["status"], "NONE")
         if result["retryPolicy"] != required_retry:
             _fail("result retry policy is inconsistent with status")
-        if result["status"] == "PENDING_APPROVAL" and result["proposalRef"] is None:
-            _fail("pending approval result requires a proposal reference")
+        status = result["status"]
+        proposal_operation = (
+            _operation_approval_mode(result["operationId"]) == "EXACT_ONE_TIME_PROPOSAL"
+        )
+        if status == "SUCCEEDED":
+            if proposal_operation:
+                _fail("proposal operations cannot succeed before approval")
+            result["data"] = _validate_tool_output(
+                result["operationId"], result["data"]
+            )
+            if result["proposalRef"] is not None or result["errorCode"] is not None:
+                _fail("successful result contains a forbidden proposal or error")
+        elif status == "PENDING_APPROVAL":
+            if not proposal_operation:
+                _fail("only proposal operations can await approval")
+            result["data"] = _validate_tool_output(
+                result["operationId"], result["data"]
+            )
+            if (
+                result["proposalRef"] is None
+                or result["proposalRef"] != result["data"]["proposalRef"]
+                or result["argsHash"] != result["data"]["argsHash"]
+                or result["receiptRef"] is not None
+                or result["errorCode"] is not None
+                or result["provenanceRefs"]
+            ):
+                _fail("pending approval result fields are inconsistent")
+        else:
+            if (
+                result["data"]
+                or result["provenanceRefs"]
+                or result["proposalRef"] is not None
+                or result["receiptRef"] is not None
+                or result["errorCode"] is None
+            ):
+                _fail("non-success result fields are inconsistent")
+            if (
+                status == "UNCERTAIN"
+                and _operation_metadata(result["operationId"])["retryMode"]
+                == "READ_ONLY"
+            ):
+                _fail("read-only operations cannot return an uncertain effect outcome")
         return result
 
 
@@ -803,6 +1394,8 @@ class TargetGrantV1(ContractValue):
             result["normalizedTarget"],
             result["method"],
             result["redirectPolicy"],
+            result["expiresAt"],
+            result["maxUses"],
             result["currentRequestId"],
         )
         if result["targetHash"] != expected:
@@ -817,6 +1410,9 @@ class ActionProposalV1(ContractValue):
         "schema",
         "proposalId",
         "userId",
+        "catalogDigest",
+        "operationId",
+        "toolName",
         "capabilityId",
         "resource",
         "connectionRef",
@@ -831,24 +1427,49 @@ class ActionProposalV1(ContractValue):
     @classmethod
     def _validate_mapping(cls, value: Mapping[str, Any]) -> dict[str, Any]:
         result = cls._base(value)
-        result["proposalId"] = _string(result["proposalId"], "proposalId", pattern=_OPAQUE_ID)
+        result["proposalId"] = _string(
+            result["proposalId"], "proposalId", pattern=_OPAQUE_ID
+        )
         result["userId"] = _string(result["userId"], "userId", pattern=_USER_ID)
+        result["catalogDigest"] = _sha256(result["catalogDigest"], "catalogDigest")
+        result["operationId"], result["toolName"] = _validate_tool_identity(
+            result["operationId"], result["toolName"]
+        )
+        if _operation_approval_mode(result["operationId"]) != "EXACT_ONE_TIME_PROPOSAL":
+            _fail("action proposal must name an approval-gated operation")
         result["capabilityId"] = _string(
             result["capabilityId"], "capabilityId", pattern=_OPERATION_ID
         )
+        if result["capabilityId"] != result["operationId"]:
+            _fail("capabilityId must equal operationId")
         result["resource"] = _string(result["resource"], "resource", maximum=1024)
         result["connectionRef"] = (
             None
             if result["connectionRef"] is None
             else _string(result["connectionRef"], "connectionRef", pattern=_OPAQUE_ID)
         )
-        result["arguments"] = _mapping(result["arguments"], "arguments")
+        result["arguments"] = _validate_tool_input(
+            result["operationId"], result["arguments"]
+        )
+        if result["connectionRef"] is not None:
+            _fail("schedule proposals cannot carry a connector reference")
+        expected_resource = (
+            "schedule:new"
+            if result["operationId"] == "schedule.propose"
+            else f"schedule:{result['arguments']['scheduleId']}"
+        )
+        if result["resource"] != expected_resource:
+            _fail(
+                "schedule proposal resource does not match its exact operation target"
+            )
         result["argsHash"] = _sha256(result["argsHash"], "argsHash")
         if canonical_sha256(result["arguments"]) != result["argsHash"]:
             _fail("argsHash does not bind proposal arguments")
         result["revision"] = _integer(result["revision"], "revision", minimum=1)
         result["originatingInvocationId"] = _string(
-            result["originatingInvocationId"], "originatingInvocationId", pattern=_OPAQUE_ID
+            result["originatingInvocationId"],
+            "originatingInvocationId",
+            pattern=_OPAQUE_ID,
         )
         result["approvalPolicy"] = _enum(
             result["approvalPolicy"], "approvalPolicy", {"EXACT_ONE_TIME"}
@@ -875,7 +1496,9 @@ class EffectReceiptV1(ContractValue):
     @classmethod
     def _validate_mapping(cls, value: Mapping[str, Any]) -> dict[str, Any]:
         result = cls._base(value)
-        result["receiptId"] = _string(result["receiptId"], "receiptId", pattern=_OPAQUE_ID)
+        result["receiptId"] = _string(
+            result["receiptId"], "receiptId", pattern=_OPAQUE_ID
+        )
         result["capabilityId"] = _string(
             result["capabilityId"], "capabilityId", pattern=_OPERATION_ID
         )
@@ -893,7 +1516,10 @@ class EffectReceiptV1(ContractValue):
             if result["reconciledAt"] is None
             else _integer(result["reconciledAt"], "reconciledAt")
         )
-        if result["reconciledAt"] is not None and result["reconciledAt"] < result["executedAt"]:
+        if (
+            result["reconciledAt"] is not None
+            and result["reconciledAt"] < result["executedAt"]
+        ):
             _fail("reconciledAt cannot precede executedAt")
         return result
 
@@ -917,12 +1543,16 @@ class ScheduleSpecV1(ContractValue):
     @classmethod
     def _validate_mapping(cls, value: Mapping[str, Any]) -> dict[str, Any]:
         result = cls._base(value)
-        result["scheduleId"] = _string(result["scheduleId"], "scheduleId", pattern=_OPAQUE_ID)
+        result["scheduleId"] = _string(
+            result["scheduleId"], "scheduleId", pattern=_OPAQUE_ID
+        )
         result["userId"] = _string(result["userId"], "userId", pattern=_USER_ID)
         result["taskType"] = _enum(
             result["taskType"], "taskType", {"REMINDER", "READ_ONLY_AGENT_TURN"}
         )
-        result["definition"] = _mapping(result["definition"], "definition")
+        result["definition"] = _validate_schedule_definition(
+            result["taskType"], result["definition"]
+        )
         result["definitionHash"] = _sha256(result["definitionHash"], "definitionHash")
         if canonical_sha256(result["definition"]) != result["definitionHash"]:
             _fail("definitionHash does not bind the schedule definition")
@@ -933,10 +1563,17 @@ class ScheduleSpecV1(ContractValue):
         result["timezone"] = _string(
             result["timezone"], "timezone", pattern=_TIMEZONE, maximum=64
         )
+        if result["timezone"] != result["definition"]["timezone"]:
+            _fail("schedule timezone must equal the exact definition timezone")
         result["nextRunAt"] = (
-            None if result["nextRunAt"] is None else _integer(result["nextRunAt"], "nextRunAt")
+            None
+            if result["nextRunAt"] is None
+            else _integer(result["nextRunAt"], "nextRunAt")
         )
-        if result["state"] != "ENABLED" and result["nextRunAt"] is not None:
+        if result["state"] == "ENABLED":
+            if result["nextRunAt"] != result["definition"]["runAt"]:
+                _fail("enabled schedule next run must equal its hashed definition")
+        elif result["nextRunAt"] is not None:
             _fail("a disabled schedule cannot have a next run")
         return result
 
@@ -956,7 +1593,9 @@ class ScheduleOccurrenceV1(ContractValue):
     @classmethod
     def _validate_mapping(cls, value: Mapping[str, Any]) -> dict[str, Any]:
         result = cls._base(value)
-        result["scheduleId"] = _string(result["scheduleId"], "scheduleId", pattern=_OPAQUE_ID)
+        result["scheduleId"] = _string(
+            result["scheduleId"], "scheduleId", pattern=_OPAQUE_ID
+        )
         result["generation"] = _integer(result["generation"], "generation", minimum=1)
         result["occurrenceTime"] = _integer(result["occurrenceTime"], "occurrenceTime")
         expected = derive_occurrence_id(
@@ -984,6 +1623,237 @@ def _command(value: Any) -> dict[str, Any]:
         if not result["value"]:
             _fail("ARGV command cannot be empty")
     return result
+
+
+def _operation_metadata(operation_id: Any) -> Mapping[str, Any]:
+    normalized = _string(operation_id, "operationId", pattern=_OPERATION_ID)
+    metadata = _OPERATION_METADATA_V1.get(normalized)
+    if metadata is None:
+        _fail("operationId is not in the frozen v1 catalog")
+    return metadata
+
+
+def _operation_approval_mode(operation_id: Any) -> str:
+    return str(_operation_metadata(operation_id)["approvalMode"])
+
+
+def _validate_tool_identity(operation_id: Any, tool_name: Any) -> tuple[str, str]:
+    normalized_operation = _string(operation_id, "operationId", pattern=_OPERATION_ID)
+    normalized_tool = _string(tool_name, "toolName", pattern=_TOOL_NAME)
+    metadata = _operation_metadata(normalized_operation)
+    if normalized_tool != metadata["toolName"]:
+        _fail("toolName does not match the frozen operation identity")
+    return normalized_operation, normalized_tool
+
+
+def _bounded_text(value: Any, label: str, *, maximum: int, minimum: int = 0) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) < minimum
+        or len(value) > maximum
+        or "\x00" in value
+    ):
+        _fail(f"{label} is invalid")
+    return value
+
+
+def _validate_schedule_definition(task_type: Any, value: Any) -> dict[str, Any]:
+    normalized_type = _enum(task_type, "taskType", {"REMINDER", "READ_ONLY_AGENT_TURN"})
+    content_field = "message" if normalized_type == "REMINDER" else "prompt"
+    result = _exact(value, "schedule definition", (content_field, "runAt", "timezone"))
+    result[content_field] = _bounded_text(
+        result[content_field], f"definition.{content_field}", minimum=1, maximum=4096
+    )
+    result["runAt"] = _integer(result["runAt"], "definition.runAt")
+    result["timezone"] = _string(
+        result["timezone"], "definition.timezone", pattern=_TIMEZONE, maximum=64
+    )
+    return result
+
+
+def _validate_tool_input(operation_id: str, value: Any) -> dict[str, Any]:
+    _operation_metadata(operation_id)
+    if operation_id in {"workspace.file.list", "schedule.list"}:
+        return _exact(value, "arguments", ())
+    if operation_id in {"workspace.file.read", "workspace.file.delete"}:
+        result = _exact(value, "arguments", ("path",))
+        result["path"] = _safe_path(result["path"])
+        return result
+    if operation_id == "workspace.file.write":
+        result = _exact(value, "arguments", ("path", "content"))
+        result["path"] = _safe_path(result["path"])
+        result["content"] = _bounded_text(
+            result["content"], "arguments.content", maximum=262144
+        )
+        return result
+    if operation_id == "web.exact.read":
+        result = _exact(value, "arguments", ("url",))
+        result["url"] = _public_https_url(result["url"])
+        return result
+    if operation_id == "schedule.propose":
+        result = _exact(value, "arguments", ("taskType", "definition"))
+        result["taskType"] = _enum(
+            result["taskType"],
+            "arguments.taskType",
+            {"REMINDER", "READ_ONLY_AGENT_TURN"},
+        )
+        result["definition"] = _validate_schedule_definition(
+            result["taskType"], result["definition"]
+        )
+        return result
+    if operation_id == "schedule.cancel.propose":
+        result = _exact(value, "arguments", ("scheduleId",))
+        result["scheduleId"] = _string(
+            result["scheduleId"], "arguments.scheduleId", pattern=_OPAQUE_ID
+        )
+        return result
+    if operation_id == "compute.run":
+        result = _exact(
+            value, "arguments", ("command", "inputPaths", "network", "resourceProfile")
+        )
+        result["command"] = _command(result["command"])
+        result["inputPaths"] = _string_list(
+            result["inputPaths"],
+            "arguments.inputPaths",
+            maximum_items=128,
+            sorted_unique=True,
+        )
+        result["inputPaths"] = [
+            _safe_path(path, "arguments.inputPaths") for path in result["inputPaths"]
+        ]
+        result["network"] = _enum(result["network"], "arguments.network", {"NONE"})
+        result["resourceProfile"] = _enum(
+            result["resourceProfile"], "arguments.resourceProfile", {"SMALL"}
+        )
+        return result
+    if operation_id == "compute.status":
+        result = _exact(value, "arguments", ("jobId",))
+        result["jobId"] = _string(
+            result["jobId"], "arguments.jobId", pattern=_OPAQUE_ID
+        )
+        return result
+    _fail("operation input validator is unavailable")
+
+
+def _file_listing_records(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, (list, tuple)) or len(value) > 1000:
+        _fail("files must be a bounded array")
+    result: list[dict[str, Any]] = []
+    paths: list[str] = []
+    for raw in value:
+        item = _exact(raw, "file listing", ("path", "size"))
+        item["path"] = _safe_path(item["path"])
+        item["size"] = _integer(item["size"], "file size", maximum=262144)
+        result.append(item)
+        paths.append(item["path"])
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        _fail("file listing paths must be sorted and unique")
+    return result
+
+
+def _proposal_output(value: Any) -> dict[str, Any]:
+    result = _exact(value, "proposal output", ("proposalRef", "argsHash", "expiresAt"))
+    result["proposalRef"] = _string(
+        result["proposalRef"], "proposalRef", pattern=_OPAQUE_ID
+    )
+    result["argsHash"] = _sha256(result["argsHash"], "argsHash")
+    result["expiresAt"] = _integer(result["expiresAt"], "expiresAt")
+    return result
+
+
+def _validate_tool_output(operation_id: str, value: Any) -> dict[str, Any]:
+    _operation_metadata(operation_id)
+    if operation_id == "workspace.file.list":
+        result = _exact(value, "result data", ("files",))
+        result["files"] = _file_listing_records(result["files"])
+        return result
+    if operation_id == "workspace.file.read":
+        result = _exact(value, "result data", ("path", "content"))
+        result["path"] = _safe_path(result["path"])
+        result["content"] = _bounded_text(
+            result["content"], "result content", maximum=262144
+        )
+        return result
+    if operation_id == "workspace.file.write":
+        result = _exact(value, "result data", ("path", "bytes"))
+        result["path"] = _safe_path(result["path"])
+        result["bytes"] = _integer(result["bytes"], "bytes", maximum=262144)
+        return result
+    if operation_id == "workspace.file.delete":
+        result = _exact(value, "result data", ("path", "deleted"))
+        result["path"] = _safe_path(result["path"])
+        if result["deleted"] is not True:
+            _fail("delete output must confirm deletion")
+        return result
+    if operation_id == "web.exact.read":
+        result = _exact(
+            value,
+            "result data",
+            ("canonicalUrl", "contentDigest", "retrievedAt", "sourceRef", "text"),
+        )
+        result["canonicalUrl"] = _public_https_url(result["canonicalUrl"])
+        result["contentDigest"] = _sha256(result["contentDigest"], "contentDigest")
+        result["retrievedAt"] = _integer(result["retrievedAt"], "retrievedAt")
+        result["sourceRef"] = _bounded_text(
+            result["sourceRef"], "sourceRef", maximum=512
+        )
+        result["text"] = _bounded_text(result["text"], "text", maximum=32768)
+        return result
+    if operation_id == "schedule.list":
+        result = _exact(value, "result data", ("schedules",))
+        schedules = result["schedules"]
+        if not isinstance(schedules, (list, tuple)) or len(schedules) > 256:
+            _fail("schedules must be a bounded array")
+        normalized = []
+        identities = []
+        for raw in schedules:
+            item = _exact(
+                raw,
+                "schedule listing",
+                ("scheduleId", "taskType", "state", "nextRunAt"),
+            )
+            item["scheduleId"] = _string(
+                item["scheduleId"], "scheduleId", pattern=_OPAQUE_ID
+            )
+            item["taskType"] = _enum(
+                item["taskType"], "taskType", {"REMINDER", "READ_ONLY_AGENT_TURN"}
+            )
+            item["state"] = _enum(
+                item["state"], "state", {"ENABLED", "PAUSED", "CANCELLED"}
+            )
+            item["nextRunAt"] = (
+                None
+                if item["nextRunAt"] is None
+                else _integer(item["nextRunAt"], "nextRunAt")
+            )
+            if item["state"] != "ENABLED" and item["nextRunAt"] is not None:
+                _fail("disabled schedule listing cannot have a next run")
+            identities.append(item["scheduleId"])
+            normalized.append(item)
+        if identities != sorted(identities) or len(identities) != len(set(identities)):
+            _fail("schedule listings must be sorted and unique")
+        result["schedules"] = normalized
+        return result
+    if operation_id in {"schedule.propose", "schedule.cancel.propose"}:
+        return _proposal_output(value)
+    if operation_id == "compute.run":
+        result = _exact(value, "result data", ("jobId", "status"))
+        result["jobId"] = _string(result["jobId"], "jobId", pattern=_OPAQUE_ID)
+        result["status"] = _enum(result["status"], "status", {"QUEUED"})
+        return result
+    if operation_id == "compute.status":
+        result = _exact(value, "result data", ("jobId", "outputs", "status"))
+        result["jobId"] = _string(result["jobId"], "jobId", pattern=_OPAQUE_ID)
+        result["outputs"] = _file_records(result["outputs"], "outputs")
+        result["status"] = _enum(
+            result["status"],
+            "status",
+            {"QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "DENIED", "TIMED_OUT"},
+        )
+        if result["status"] != "SUCCEEDED" and result["outputs"]:
+            _fail("unfinished or failed compute output must be empty")
+        return result
+    _fail("operation output validator is unavailable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1050,9 +1920,13 @@ class ComputeReceiptV1(ContractValue):
         result["completedAt"] = _integer(result["completedAt"], "completedAt")
         if result["completedAt"] < result["startedAt"]:
             _fail("completedAt cannot precede startedAt")
-        result["errorCode"] = _optional_string(result["errorCode"], "errorCode", maximum=128)
+        result["errorCode"] = _optional_string(
+            result["errorCode"], "errorCode", maximum=128
+        )
         if (result["status"] == "SUCCEEDED") != (result["errorCode"] is None):
             _fail("compute status and errorCode are inconsistent")
+        if result["status"] != "SUCCEEDED" and result["outputFiles"]:
+            _fail("non-success compute receipts cannot publish output files")
         return result
 
 
@@ -1074,7 +1948,9 @@ class ConnectorManifestV1(ContractValue):
         result["connectorId"] = _string(
             result["connectorId"], "connectorId", pattern=_PACK_ID
         )
-        result["version"] = _string(result["version"], "version", pattern=_VERSION, maximum=32)
+        result["version"] = _string(
+            result["version"], "version", pattern=_VERSION, maximum=32
+        )
         result["schemaDigest"] = _sha256(result["schemaDigest"], "schemaDigest")
         operations = result["operations"]
         if not isinstance(operations, (list, tuple)) or not 1 <= len(operations) <= 32:
@@ -1173,7 +2049,15 @@ class PortableStateManifestV2(ContractValue):
             item["type"] = _enum(
                 item["type"],
                 "type",
-                {"FILE", "MEMORY", "SCHEDULE", "INSTALLATION", "CONNECTOR", "COMPUTE_RECEIPT", "EFFECT_RECEIPT"},
+                {
+                    "FILE",
+                    "MEMORY",
+                    "SCHEDULE",
+                    "INSTALLATION",
+                    "CONNECTOR",
+                    "COMPUTE_RECEIPT",
+                    "EFFECT_RECEIPT",
+                },
             )
             item["size"] = _integer(item["size"], "size", maximum=64 * 1024 * 1024)
             item["sha256"] = _sha256(item["sha256"], "sha256")
@@ -1183,7 +2067,10 @@ class PortableStateManifestV2(ContractValue):
             _fail("portable object paths must be sorted and unique")
         result["objects"] = normalized
         result["excludedClasses"] = _string_list(
-            result["excludedClasses"], "excludedClasses", maximum_items=32, sorted_unique=True
+            result["excludedClasses"],
+            "excludedClasses",
+            maximum_items=32,
+            sorted_unique=True,
         )
         required_exclusions = {"CREDENTIALS", "GRANTS", "PENDING_EFFECTS"}
         if not required_exclusions.issubset(result["excludedClasses"]):
@@ -1223,7 +2110,11 @@ class ImportPlanV1(ContractValue):
         result["totalBytes"] = _integer(
             result["totalBytes"], "totalBytes", maximum=256 * 1024 * 1024
         )
-        for name in ("schedulesDisabled", "connectorsDisconnected", "effectsReplayable"):
+        for name in (
+            "schedulesDisabled",
+            "connectorsDisconnected",
+            "effectsReplayable",
+        ):
             result[name] = _boolean(result[name], name)
         if not result["schedulesDisabled"] or not result["connectorsDisconnected"]:
             _fail("import must disable schedules and disconnect connectors")
@@ -1255,9 +2146,13 @@ class ImportReceiptV1(ContractValue):
         result["activatedGeneration"] = (
             None
             if result["activatedGeneration"] is None
-            else _string(result["activatedGeneration"], "activatedGeneration", pattern=_OPAQUE_ID)
+            else _string(
+                result["activatedGeneration"], "activatedGeneration", pattern=_OPAQUE_ID
+            )
         )
-        if (result["state"] == "ACTIVATED") != (result["activatedGeneration"] is not None):
+        if (result["state"] == "ACTIVATED") != (
+            result["activatedGeneration"] is not None
+        ):
             _fail("import state and activated generation are inconsistent")
         result["importedAt"] = _integer(result["importedAt"], "importedAt")
         return result
@@ -1303,7 +2198,9 @@ def parse_canonical_json(
         _fail("canonical contract bytes are absent, untrusted, or oversized")
     if isinstance(expected_schema, str):
         contract_type = CONTRACT_TYPES.get(expected_schema)
-    elif isinstance(expected_schema, type) and issubclass(expected_schema, ContractValue):
+    elif isinstance(expected_schema, type) and issubclass(
+        expected_schema, ContractValue
+    ):
         contract_type = expected_schema
         expected_schema = contract_type.SCHEMA
     else:
@@ -1322,14 +2219,24 @@ def parse_canonical_json(
     def reject_constant(value: str) -> None:
         _fail(f"canonical JSON contains non-finite number {value}")
 
+    def reject_float(value: str) -> None:
+        _fail(f"canonical JSON contains unsupported float {value}")
+
     try:
         text = raw.decode("utf-8", errors="strict")
         parsed = json.loads(
             text,
             object_pairs_hook=reject_duplicates,
             parse_constant=reject_constant,
+            parse_float=reject_float,
         )
-    except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+    except (
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        RecursionError,
+    ) as error:
         if isinstance(error, ContractValidationError):
             raise
         raise ContractValidationError("contract is not strict UTF-8 JSON") from error
@@ -1357,6 +2264,7 @@ __all__ = [
     "ContractLimits",
     "ContractValidationError",
     "EffectReceiptV1",
+    "FROZEN_CATALOG_PACKS_V1",
     "ImportPlanV1",
     "ImportReceiptV1",
     "PortableStateManifestV2",
