@@ -13,6 +13,10 @@ const {
   CAPABILITY_TOOL_NAMES,
   TOOL_DEFINITIONS,
 } = require("../../capability-catalog.js");
+const {
+  createCapabilityAdapters,
+  createLoopbackRelayClient,
+} = require("../../capability-relay.js");
 
 export const MAX_PATH_BYTES = 512;
 export const MAX_FILE_BYTES = 256 * 1024;
@@ -317,6 +321,13 @@ function disabledCapabilityError(toolName) {
 
 export function registerPersonalOperatorPlugin(api, options = {}) {
   const store = createWorkspaceStore(options);
+  const configuredCapabilityAdapters =
+    options.capabilityAdapters === undefined
+      ? createCapabilityAdapters({
+          client:
+            options.loopbackRelayClient || createLoopbackRelayClient(),
+        })
+      : options.capabilityAdapters;
   api.registerTool({
     name: "po_file_list",
     description: TOOL_DEFINITIONS.po_file_list.description,
@@ -364,11 +375,15 @@ export function registerPersonalOperatorPlugin(api, options = {}) {
       description: definition.description,
       parameters: definition.parameters,
       async execute(toolUseId, params) {
-        const adapter = capabilityAdapter(options.capabilityAdapters, toolName);
+        const adapter = capabilityAdapter(configuredCapabilityAdapters, toolName);
         if (typeof adapter !== "function") {
           throw disabledCapabilityError(toolName);
         }
-        return adapter(toolUseId, params);
+        const result = await adapter(toolUseId, params);
+        if (!result || typeof result !== "object" || Array.isArray(result)) {
+          throw new Error("Capability relay returned an invalid result");
+        }
+        return textResult(JSON.stringify(result), result);
       },
     });
   }

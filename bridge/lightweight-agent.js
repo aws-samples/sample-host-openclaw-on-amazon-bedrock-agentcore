@@ -412,7 +412,7 @@ function createToolExecutor({
   workspaceStore,
   capabilityAdapters = {},
 }) {
-  return async (toolName, args = {}) => {
+  return async (toolName, args = {}, toolUseId = undefined) => {
     try {
       switch (toolName) {
         case "po_file_list": {
@@ -442,7 +442,11 @@ function createToolExecutor({
             if (typeof adapter !== "function") {
               return `Error: Capability tool '${toolName}' is disabled`;
             }
-            return adapter(toolName, args);
+            const result = await adapter(toolUseId, args);
+            if (!result || typeof result !== "object" || Array.isArray(result)) {
+              return `Error: Capability tool '${toolName}' returned an invalid result`;
+            }
+            return JSON.stringify(result);
           }
           return `Error: Unknown tool '${toolName}'`;
       }
@@ -550,7 +554,11 @@ async function chat(userMessage, deadlineMs = 0) {
       } catch {
         args = {};
       }
-      const result = await executeTool(toolCall.function?.name, args);
+      const result = await executeTool(
+        toolCall.function?.name,
+        args,
+        toolCall.id,
+      );
       messages.push({
         role: "tool",
         tool_call_id: toolCall.id,

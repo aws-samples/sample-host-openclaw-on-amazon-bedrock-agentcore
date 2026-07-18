@@ -196,6 +196,42 @@ describe("trusted invocation admission", () => {
     assert.equal("payload" in observed, false);
   });
 
+  it("snapshots a turn grant only into trusted authority and never request data", async () => {
+    let release;
+    let observed;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const handler = createInvocationHandler({
+      sessionBinding: new SessionBinding(),
+      handlers: {
+        chat: async (context) => {
+          await gate;
+          observed = context;
+        },
+      },
+    });
+    const turnCapabilityGrant = {
+      schema: "personal-operator.turn-capability-grant.v1",
+      nonce: "nonce_secret_12345678",
+      allowedOperationIds: ["web.exact.read"],
+    };
+    const pending = handler.handle(payload("chat", { turnCapabilityGrant }));
+    turnCapabilityGrant.nonce = "attacker_mutation";
+    turnCapabilityGrant.allowedOperationIds.push("compute.run");
+    release();
+    await pending;
+
+    assert.deepEqual(observed.authority.turnCapabilityGrant, {
+      schema: "personal-operator.turn-capability-grant.v1",
+      nonce: "nonce_secret_12345678",
+      allowedOperationIds: ["web.exact.read"],
+    });
+    assert.equal(Object.isFrozen(observed.authority.turnCapabilityGrant), true);
+    assert.equal("turnCapabilityGrant" in observed.request, false);
+    assert.doesNotMatch(JSON.stringify(observed.request), /nonce_secret/);
+  });
+
   it("rejects a missing or malformed workspace capability before dispatch", () => {
     for (const workspaceCapability of [undefined, "", "x".repeat(2049), "bad-💥"]) {
       const trace = [];

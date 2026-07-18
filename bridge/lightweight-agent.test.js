@@ -302,6 +302,31 @@ describe("lightweight workspace execution", () => {
       assert.match(await executeTool(toolName, {}), /disabled/i);
     }
   });
+
+  it("forwards the server tool-use identity to an exact capability adapter", async () => {
+    const calls = [];
+    const executeTool = agentModule.createToolExecutor({
+      workspaceStore: {},
+      capabilityAdapters: {
+        po_web_read: async (...args) => {
+          calls.push(args);
+          return { status: "DENIED", errorCode: "PACK_DISABLED" };
+        },
+      },
+    });
+    assert.equal(
+      await executeTool(
+        "po_web_read",
+        { url: "https://example.com/exact" },
+        "tooluse_12345678",
+      ),
+      '{"status":"DENIED","errorCode":"PACK_DISABLED"}',
+    );
+    assert.deepEqual(calls, [[
+      "tooluse_12345678",
+      { url: "https://example.com/exact" },
+    ]]);
+  });
 });
 
 describe("web content helpers", () => {

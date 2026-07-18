@@ -77,6 +77,46 @@ describe("personal-operator plugin package", () => {
     assert.equal(typeof module.default.register, "function");
   });
 
+  it("forwards new tools through the exact loopback client without authority", async () => {
+    const module = await loadPlugin();
+    const registered = [];
+    const calls = [];
+    module.registerPersonalOperatorPlugin(
+      { registerTool: (tool) => registered.push(tool) },
+      {
+        s3Client: { send: async () => ({ Contents: [] }) },
+        env: {
+          AWS_REGION: "eu-west-1",
+          S3_USER_FILES_BUCKET: "files",
+          PERSONAL_OPERATOR_WORKSPACE_PREFIX: "user_alpha",
+        },
+        loopbackRelayClient: {
+          call: async (...args) => {
+            calls.push(args);
+            return { status: "DENIED", errorCode: "PACK_DISABLED" };
+          },
+        },
+      },
+    );
+    const tool = registered.find((candidate) => candidate.name === "po_web_read");
+    const result = await tool.execute("tooluse_12345678", {
+        url: "https://example.com/exact",
+      });
+    assert.deepEqual(result, {
+      content: [{
+        type: "text",
+        text: '{"status":"DENIED","errorCode":"PACK_DISABLED"}',
+      }],
+      details: { status: "DENIED", errorCode: "PACK_DISABLED" },
+    });
+    assert.deepEqual(calls, [[
+      "tooluse_12345678",
+      "po_web_read",
+      { url: "https://example.com/exact" },
+    ]]);
+    assert.doesNotMatch(JSON.stringify(calls), /grant|nonce|token/i);
+  });
+
   it("registers exactly ten strict catalog tools", async () => {
     const module = await loadPlugin();
     const registered = [];

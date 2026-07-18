@@ -29,6 +29,7 @@ const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
 const runtimePolicy = require("./runtime-policy");
 const gatewayInvocation = require("./gateway-invocation");
+const capabilityRelayModule = require("./capability-relay");
 const { SessionBinding } = require("./session-binding");
 const { createInvocationHandler } = require("./invocation-handler");
 const { SqliteSnapshot } = require("./sqlite-snapshot");
@@ -41,6 +42,7 @@ const RUNTIME_REGION = scopedCreds.requireExactRegion(process.env);
 const PORT = 8080;
 const PROXY_PORT = 18790;
 const OPENCLAW_PORT = 18789;
+const CAPABILITY_RELAY_PORT = 18791;
 
 const SESSION_STORAGE_MOUNT = "/mnt/workspace";
 const WORKSPACE_SEED_DIR = "/opt/personal-operator/seed";
@@ -109,6 +111,34 @@ const trustedInvocationRegistry =
   });
 const gatewayMessageExecutor =
   gatewayInvocation.createBoundedSerialExecutor({ maxPending: 7 });
+const capabilityTurnExecutor =
+  gatewayInvocation.createBoundedSerialExecutor({ maxPending: 7 });
+
+let capabilityGatewayTransport = null;
+const capabilityRelay = new capabilityRelayModule.CapabilityRelay({
+  gatewayTransport: async (envelope) => {
+    if (!capabilityGatewayTransport) {
+      capabilityGatewayTransport =
+        capabilityRelayModule.createLambdaGatewayTransport({
+          functionArn: process.env.CAPABILITY_GATEWAY_FUNCTION_ARN,
+        });
+    }
+    return capabilityGatewayTransport(envelope);
+  },
+  logger: (event) => {
+    console.log(
+      `[capability] ${event.event} callId=${event.callId}` +
+        (event.status ? ` status=${event.status}` : ""),
+    );
+  },
+});
+const capabilityRelayServer =
+  capabilityRelayModule.createCapabilityRelayServer({
+    relay: capabilityRelay,
+    host: "127.0.0.1",
+    port: CAPABILITY_RELAY_PORT,
+  });
+let capabilityRelayReady = null;
 
 // OpenClaw auto-restart on crash
 let openclawRestartCount = 0;
@@ -250,6 +280,26 @@ function createActiveTaskTracker() {
       }
     },
   });
+}
+
+async function withCapabilityTurn({ grant, task } = {}) {
+  if (typeof task !== "function") {
+    throw new TypeError("Capability turn requires an exact task callback");
+  }
+  capabilityRelay.clear_turn();
+  if (grant !== undefined) capabilityRelay.bind_turn(grant);
+  try {
+    return await task();
+  } finally {
+    capabilityRelay.clear_turn();
+  }
+}
+
+function ensureCapabilityRelayServer() {
+  if (!capabilityRelayReady) {
+    capabilityRelayReady = capabilityRelayServer.listen();
+  }
+  return capabilityRelayReady;
 }
 
 function hashBoundInvocation({ identity, delivery, request } = {}) {
@@ -697,7 +747,13 @@ async function init(
       stopSupportProcesses,
     });
     await workspaceLifecycle.initialize();
-    await agent.configureWorkspaceRuntime({ env: workspaceEnvironment });
+    await ensureCapabilityRelayServer();
+    await agent.configureWorkspaceRuntime({
+      env: workspaceEnvironment,
+      capabilityAdapters: capabilityRelayModule.createCapabilityAdapters({
+        relay: capabilityRelay,
+      }),
+    });
 
     if (credentialRefreshTimer) clearInterval(credentialRefreshTimer);
     credentialRefreshInProgress = false;
@@ -1282,103 +1338,108 @@ const server = http.createServer(async (req, res) => {
                 let executionText;
                 let executionStatus;
                 let executionErrorCode;
-                return activeTaskTracker.run(async () => {
-                  try {
-                    if (openclawReady) {
+                return capabilityTurnExecutor.submit(() =>
+                  withCapabilityTurn({
+                    grant: authority.turnCapabilityGrant,
+                    task: () => activeTaskTracker.run(async () => {
                       try {
-                        const gatewayOutcome =
-                          await gatewayRuntimeBoundary.invoke({
-                            invokePrimary: () =>
-                              enqueueMessage(bridgeText, gatewayRunId),
-                            invokeFallback: () =>
-                              agent.chat(bridgeText, Date.now() + 30000),
-                          });
-                        executionText = gatewayOutcome.text;
-                      } catch (bridgeErr) {
-                        gatewayQuarantined =
-                          gatewayRuntimeBoundary.getQuarantine();
-                        if (gatewayQuarantined) openclawReady = false;
-                        console.error(
-                          `[contract] Committed gateway invocation failed: ${bridgeErr.code || "UNKNOWN"} ${bridgeErr.message}`,
-                        );
-                        executionErrorCode =
-                          bridgeErr.code || "GATEWAY_INVOCATION_FAILED";
-                        if (bridgeErr.code === "UNCERTAIN_AGENT_RUN") {
-                          executionStatus = "uncertain";
-                          executionText =
-                            "I couldn't confirm whether that request stopped, so I won't run it again. Check its status before retrying.";
+                        if (openclawReady) {
+                          try {
+                            const gatewayOutcome =
+                              await gatewayRuntimeBoundary.invoke({
+                                invokePrimary: () =>
+                                  enqueueMessage(bridgeText, gatewayRunId),
+                                invokeFallback: () =>
+                                  agent.chat(bridgeText, Date.now() + 30000),
+                              });
+                            executionText = gatewayOutcome.text;
+                          } catch (bridgeErr) {
+                            gatewayQuarantined =
+                              gatewayRuntimeBoundary.getQuarantine();
+                            if (gatewayQuarantined) openclawReady = false;
+                            console.error(
+                              `[contract] Committed gateway invocation failed: ${bridgeErr.code || "UNKNOWN"} ${bridgeErr.message}`,
+                            );
+                            executionErrorCode =
+                              bridgeErr.code || "GATEWAY_INVOCATION_FAILED";
+                            if (bridgeErr.code === "UNCERTAIN_AGENT_RUN") {
+                              executionStatus = "uncertain";
+                              executionText =
+                                "I couldn't confirm whether that request stopped, so I won't run it again. Check its status before retrying.";
+                            } else {
+                              executionStatus = "failed";
+                              executionText =
+                                "The request failed without a committed response and was not run again.";
+                            }
+                          }
+                        } else if (proxyReady) {
+                          console.log(
+                            "[contract] Routing via lightweight agent (warm-up)",
+                          );
+                          try {
+                            executionText = await agent.chat(
+                              bridgeText,
+                              Date.now() + 620000,
+                            );
+                          } catch (agentErr) {
+                            executionText =
+                              "I'm having trouble right now. Please try again in a moment.";
+                            executionStatus = "failed";
+                            executionErrorCode = "LIGHTWEIGHT_AGENT_FAILED";
+                            console.error(
+                              `[contract] Lightweight agent error: ${agentErr.message}`,
+                            );
+                          }
                         } else {
-                          executionStatus = "failed";
                           executionText =
-                            "The request failed without a committed response and was not run again.";
+                            "I'm starting up — please try again in a moment.";
+                          executionStatus = "failed";
+                          executionErrorCode = "RUNTIME_NOT_READY";
                         }
-                      }
-                    } else if (proxyReady) {
-                      console.log(
-                        "[contract] Routing via lightweight agent (warm-up)",
-                      );
-                      try {
-                        executionText = await agent.chat(
-                          bridgeText,
-                          Date.now() + 620000,
-                        );
-                      } catch (agentErr) {
-                        executionText =
-                          "I'm having trouble right now. Please try again in a moment.";
-                        executionStatus = "failed";
-                        executionErrorCode = "LIGHTWEIGHT_AGENT_FAILED";
+                      } catch (executionError) {
                         console.error(
-                          `[contract] Lightweight agent error: ${agentErr.message}`,
+                          `[contract] Unexpected agent execution failure: ${executionError.message}`,
                         );
+                        executionText =
+                          "This request could not be executed safely.";
+                        executionStatus = "failed";
+                        executionErrorCode = "AGENT_EXECUTION_FAILED";
                       }
-                    } else {
-                      executionText =
-                        "I'm starting up — please try again in a moment.";
-                      executionStatus = "failed";
-                      executionErrorCode = "RUNTIME_NOT_READY";
-                    }
-                  } catch (executionError) {
-                    console.error(
-                      `[contract] Unexpected agent execution failure: ${executionError.message}`,
-                    );
-                    executionText =
-                      "This request could not be executed safely.";
-                    executionStatus = "failed";
-                    executionErrorCode = "AGENT_EXECUTION_FAILED";
-                  }
 
-                  if (executionText) {
-                    executionText = extractTextFromContent(executionText);
-                  }
-                  const executionOutcome = {
-                    responseText: executionText,
-                    ...(executionStatus ? { status: executionStatus } : {}),
-                    ...(executionErrorCode
-                      ? { errorCode: executionErrorCode }
-                      : {}),
-                  };
-                  try {
-                    return await persistWorkspaceOutcome({
-                      workspaceLifecycle,
-                      workspaceTurn,
-                      outcome: executionOutcome,
-                    });
-                  } catch (workspaceError) {
-                    gatewayQuarantined =
-                      workspaceLifecycle.status().quarantine ||
-                      Object.freeze({
-                        code: "WORKSPACE_PERSISTENCE_FAILED",
-                        message: "Workspace persistence failed",
-                      });
-                    openclawReady = false;
-                    void stopOpenClawForSnapshot().catch((stopError) => {
-                      console.error(
-                        `[contract] OpenClaw quarantine stop failed: ${stopError.message}`,
-                      );
-                    });
-                    throw workspaceError;
-                  }
-                });
+                      if (executionText) {
+                        executionText = extractTextFromContent(executionText);
+                      }
+                      const executionOutcome = {
+                        responseText: executionText,
+                        ...(executionStatus ? { status: executionStatus } : {}),
+                        ...(executionErrorCode
+                          ? { errorCode: executionErrorCode }
+                          : {}),
+                      };
+                      try {
+                        return await persistWorkspaceOutcome({
+                          workspaceLifecycle,
+                          workspaceTurn,
+                          outcome: executionOutcome,
+                        });
+                      } catch (workspaceError) {
+                        gatewayQuarantined =
+                          workspaceLifecycle.status().quarantine ||
+                          Object.freeze({
+                            code: "WORKSPACE_PERSISTENCE_FAILED",
+                            message: "Workspace persistence failed",
+                          });
+                        openclawReady = false;
+                        void stopOpenClawForSnapshot().catch((stopError) => {
+                          console.error(
+                            `[contract] OpenClaw quarantine stop failed: ${stopError.message}`,
+                          );
+                        });
+                        throw workspaceError;
+                      }
+                    }),
+                  }),
+                );
               },
             });
             responseText = outcome.responseText;
@@ -1465,6 +1526,7 @@ async function shutdownRuntime() {
       await stopOpenClawForSnapshot();
       await stopSupportProcesses();
     }
+    await capabilityRelayServer.close();
   } catch (err) {
     exitCode = 1;
     console.error(`[contract] Fatal shutdown error: ${err.message}`);
@@ -1476,6 +1538,9 @@ async function shutdownRuntime() {
 
 function startContractServer() {
   process.once("SIGTERM", shutdownRuntime);
+  ensureCapabilityRelayServer().catch((error) => {
+    quarantineRuntime(error, "CAPABILITY_RELAY_START_FAILED");
+  });
   return server.listen(PORT, "0.0.0.0", () => {
     console.log(
       `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
@@ -1499,5 +1564,6 @@ module.exports = {
   persistWorkspaceOutcome,
   executeSnapshotAction,
   hashBoundInvocation,
+  withCapabilityTurn,
   startContractServer,
 };
