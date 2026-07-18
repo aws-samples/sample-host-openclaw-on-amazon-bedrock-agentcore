@@ -257,9 +257,11 @@ def test_agentcore_source_has_no_runtime_owned_browser_escape_hatch():
     assert "trusted Browser Gateway" in source
 
 
-def test_app_and_both_deploy_phases_bind_the_exact_capability_release_catalog():
+def test_app_and_release_path_bind_the_exact_capability_release_catalog():
     app_source = (ROOT / "app.py").read_text(encoding="utf-8")
-    deploy_source = (ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    release_assets_source = (
+        ROOT / "release_tools" / "release_assets.py"
+    ).read_text(encoding="utf-8")
     context = (ROOT / "cdk.json").read_text(encoding="utf-8")
 
     assert 'try_get_context("capability_release_commit")' in app_source
@@ -267,10 +269,8 @@ def test_app_and_both_deploy_phases_bind_the_exact_capability_release_catalog():
     assert "cmk_arn=security_stack.cmk.key_arn" in app_source
     assert "release_commit=capability_release_commit" in app_source
     assert "catalog_digest=capability_catalog.catalog_digest" in app_source
-    assert (
-        deploy_source.count(
-            '-c "capability_release_commit=$PERSONAL_OPERATOR_DEPLOY_COMMIT"'
-        )
-        == 2
-    )
+    # The old mutable deploy.sh injected capability_release_commit via CDK -c
+    # flags. That path is retired: the journaled release synth binds the
+    # capability catalog to the exact reviewed release commit.
+    assert '"capability_release_commit": runtime.source_commit' in release_assets_source
     assert '"capability_release_commit": ""' in context

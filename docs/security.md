@@ -448,6 +448,13 @@ The `TestGuardrailSecurity` class in `tests/e2e/bot_test.py` validates guardrail
 
 ## 8. Security Operations Quick Reference
 
+> **Archived, non-executable procedure.** The commands in this section describe
+> the imported upstream sample and are not authorization to mutate Personal
+> Operator infrastructure. Current changes must use the exact-commit,
+> write-ahead journal and reviewed phase sequence in
+> [OPERATIONS.md](OPERATIONS.md) through `scripts/staging-release.py`. Direct
+> stack deployment is prohibited.
+
 ### Rotating Secrets
 
 ```bash
@@ -458,9 +465,12 @@ aws secretsmanager update-secret \
   --region $CDK_DEFAULT_REGION
 
 # The Router Lambda will pick up the new value within 15 minutes (cache TTL).
-# To force immediate refresh, redeploy the Lambda:
-cdk deploy OpenClawRouter --require-approval never
 ```
+
+Do not force refresh with a direct stack deployment. If a reviewed Personal
+Operator change also requires infrastructure replacement, package it as a new
+clean-commit candidate and advance it only through the canonical staging
+journal in [OPERATIONS.md](OPERATIONS.md).
 
 ### Managing the User Allowlist
 

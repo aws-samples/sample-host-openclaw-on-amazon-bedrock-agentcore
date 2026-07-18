@@ -6,10 +6,9 @@ channel ingestion via Router Lambda. No keepalive needed — sessions
 idle-terminate naturally.
 
 Deployment model:
-  Phase 1 (CDK): VPC, Security, AgentCore-base (Role/SG/S3), Observability
-  External gate: directly provision one reviewed runtime version and its
-  release-specific endpoint (not implemented in this repository)
-  Phase 3 (CDK): Router, web control surface, and Cron tombstone
+  Foundation (CDK): VPC, security, retained image boundary, observability
+  Release (CDK): exact digest-bound Runtime and commit-specific Endpoint
+  Consumers (CDK): Router, web control surface, and Cron tombstone
 """
 
 import os
@@ -29,7 +28,7 @@ from stacks.web_stack import WebStack
 from stacks.guardrails_stack import GuardrailsStack
 from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
-from stacks.trusted_lambda_asset import resolve_trusted_lambda_asset
+from stacks.trusted_lambda_asset import resolve_trusted_lambda_asset_metadata
 
 REQUIRED_REGION = "eu-west-1"
 RELEASE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -60,7 +59,7 @@ env = cdk.Environment(
 configured_account = app.node.try_get_context("account") or os.environ.get(
     "CDK_DEFAULT_ACCOUNT"
 )
-trusted_lambda_asset_root = resolve_trusted_lambda_asset(
+trusted_lambda_asset = resolve_trusted_lambda_asset_metadata(
     repository_root,
     account=configured_account,
     allow_synthetic_source=(
@@ -92,19 +91,23 @@ guardrails_stack = GuardrailsStack(
     env=env,
 )
 
-# --- AgentCore base resources (Role, SG, S3) ---
+# --- Capability relay and admission gateway (Task 2) ---
 # Runtime/endpoint provisioning is deliberately external. Phase 3 accepts only
 # one atomic commit-bound runtime context supplied as explicit CDK arguments.
 capability_stack = CapabilityStack(
     app,
     "PersonalOperatorCapabilities",
-    trusted_code_asset_root=trusted_lambda_asset_root,
+    trusted_code_asset_root=trusted_lambda_asset.path,
     cmk_arn=security_stack.cmk.key_arn,
     release_commit=capability_release_commit,
     catalog_digest=capability_catalog.catalog_digest,
     env=env,
 )
 
+# --- AgentCore foundation and optional immutable release resources -----------
+# Empty runtime context produces a foundation-only template. Supplying one
+# exact commit and image digest adds direct CloudFormation Runtime/Endpoint L1s;
+# a complete verified context then binds consumer stacks to that exact version.
 agentcore_stack = AgentCoreStack(
     app,
     "OpenClawAgentCore",
@@ -141,7 +144,8 @@ router_stack = RouterStack(
     cmk_arn=security_stack.cmk.key_arn,
     user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
     user_files_bucket_arn=agentcore_stack.user_files_bucket.bucket_arn,
-    trusted_code_asset_root=trusted_lambda_asset_root,
+    trusted_code_asset_root=trusted_lambda_asset.path,
+    trusted_code_asset_hash=trusted_lambda_asset.asset_hash,
     env=env,
 )
 
@@ -162,7 +166,8 @@ web_stack = WebStack(
     runtime_arn=agentcore_stack.runtime_arn,
     runtime_iam_arn=agentcore_stack.runtime_iam_arn,
     runtime_endpoint_name=agentcore_stack.runtime_endpoint_name,
-    trusted_code_asset_root=trusted_lambda_asset_root,
+    trusted_code_asset_root=trusted_lambda_asset.path,
+    trusted_code_asset_hash=trusted_lambda_asset.asset_hash,
     web_asset_root=str(repository_root / "web" / "dist"),
     auth_secret=security_stack.web_auth_secret,
     approval_secret=security_stack.approval_signing_secret,

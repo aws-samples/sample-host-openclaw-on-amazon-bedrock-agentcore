@@ -1,6 +1,6 @@
-# Personal Operator v0 Operations
+# Personal Operator v1 Staging Operations
 
-Personal Operator v0 is pre-production. These procedures are a release and
+Personal Operator is pre-production. These procedures are a release and
 incident runbook, not authorization to deploy, connect real accounts, or send
 messages. The local gates use synthetic data and require no cloud credentials.
 
@@ -125,94 +125,132 @@ this gate remains unclosed; source-only synth does not substitute for it.
 
 ## Staging preflight: prepare, do not deploy
 
-Perform this checklist against a dedicated non-production AWS account. Stop at
-the first mismatch. The final deployment command is deliberately not part of
-the preflight.
+The **staging deployment path implemented and locally verified; not deployed**
+boundary is exact. The repository now contains the strict contracts, durable
+journal, deterministic Lambda asset format, retained immutable ECR/signing
+resources, direct AgentCore CloudFormation L1 resources, injected evidence
+adapters, and phase CLI. No phase has been run against AWS.
 
-1. Freeze one clean candidate commit. Record `git rev-parse HEAD`, the Docker
-   context digest, the OpenClaw source commit, Node base image, CDK context, and
-   generated SBOM hashes. Do not release a dirty tree.
-2. Confirm local tools: Python 3.12+, Node 24.15+, Docker with ARM64 build
-   support, AWS CLI, and CDK CLI. The AgentCore toolkit is not an accepted
-   runtime deployment boundary.
-3. Resolve the AWS account through `aws sts get-caller-identity`. Require an
-   explicit allowlisted staging account and `eu-west-1`; never infer a target
-   from a developer default profile.
-4. Run `scripts/test-release-assets.sh`. Prove that `boto3`, `cryptography`,
-   `google-auth`, `google-api-python-client`, `openai`, and all four Lambda
-   handlers import from the exact Amazon Linux/ARM64 asset. Record
-   `MANIFEST.json` and `ASSET.sha256`; do not regenerate the lock casually.
-5. Build the bridge image from the frozen Dockerfile. Scan it, reject critical
-   or high unreviewed findings, push it only after explicit authorization, and
-   record the immutable private-ECR `@sha256:` URI. Tag that exact digest
-   `commit-<candidate-commit>`; the deployment preflight verifies both the
-   digest and commit tag. A mutable tag or numeric `image_version` is not
-   release identity.
-6. Synthesize with the exact staging account and inspect every IAM statement,
-   route, secret ARN, bucket, table, alarm, retention rule, and cdk-nag
-   suppression. No wildcard may grant runtime/provider/action authority.
-7. Populate separate Google read-only and founder-send OAuth secrets. Validate
-   their JSON schemas without printing values. External pilot identities must
-   never be included in the founder allowlist or receive send scope.
-8. Register only the exact emitted HTTPS OAuth callback. Confirm the Telegram
-   webhook secret, web origin, approval key, session key, and provider secrets
-   are separate and KMS protected.
-9. Require a CloudFront-scope WAF ARN, API throttling, retained access logs,
-   alarms, S3 versioning, public-access blocks, and DynamoDB point-in-time
-   recovery before accepting a pilot.
-10. Run three synthetic users through connect, runtime replacement, export, and
-    deletion. Run one synthetic provider timeout and reconcile it. Inspect logs
-    for raw email, bearer approval links, cookies, OAuth codes, credentials,
-    and cross-user identifiers.
-11. A real founder Gmail send is a separate human gate. It requires the exact
-    account, recipient, subject, body hash, approval expiry, candidate commit,
-    image digest, and rollback owner. Never use a real send to discover whether
-    the infrastructure is wired correctly.
+`scripts/deploy.sh` is only a compatibility shim for
+`scripts/staging-release.py`. Validation and state transitions live in the
+Python package. The CLI surface is:
 
-`scripts/deploy.sh` can change cloud state and create paid resources in its CDK
-modes. Do not
-run it as a preflight or from automation without fresh explicit authorization.
-It rejects unknown modes, a dirty tree, a mutable builder, an
-inferred account, an account that differs from STS, and a missing global WAF.
+- `--preflight`: validate one clean commit/tree/account/region and create the
+  canonical journal without discovering credentials;
+- `--phase <foundation|image|runtime|endpoint|context|consumer-changesets|consumers|verify>`:
+  run only the legal next phase after an exact mutation confirmation;
+- `--resume <journal>`: resume only a stable journal;
+- `--resume <journal> --reconcile --driver <reviewed-operation>`:
+  run the exact operation's phase-specific read-only live observation for an
+  `UNCERTAIN` journal. The observer, never the operator, proves `PERSISTED` or
+  `ABSENT`;
+- `--status <journal>`: print the canonical journal without credentials;
+- `--rollback <verified-transaction-id>`: write rollback intent before dispatch
+  and accept only the journal's exact rollback reference. It never retargets a
+  retained release endpoint.
 
-Runtime deployment is intentionally **not implemented**. `--full` and
-`--runtime-only` fail before account validation, credential discovery,
-preflight, or any cloud call. The removed toolkit flow first deployed mutable
-source and only then changed the runtime to the reviewed digest, leaving an
-unreviewed intermediate version. Do not restore that flow. A future runtime
-provisioner must create or update AgentCore directly from the reviewed private
-ECR digest and prove the exact artifact before enabling either mode.
-
-The following values remain the required release binding for the available CDK
-modes and for a future direct immutable runtime provisioner:
+Credential-free preflight example:
 
 ```bash
-export PERSONAL_OPERATOR_DEPLOY_ACCOUNT=123456789012
-export PERSONAL_OPERATOR_DEPLOY_COMMIT="$(git rev-parse HEAD)"
-export PERSONAL_OPERATOR_DEPLOY_CONFIRMATION='deploy:123456789012:eu-west-1'
-export PERSONAL_OPERATOR_RUNTIME_IMAGE_URI='123456789012.dkr.ecr.eu-west-1.amazonaws.com/personal-operator/bridge@sha256:<reviewed-digest>'
-export TRUSTED_LAMBDA_BUILD_IMAGE='public.ecr.aws/lambda/python@sha256:<reviewed-digest>'
-# --full and --runtime-only deliberately stop here with no cloud changes.
-./scripts/deploy.sh --full
+export PERSONAL_OPERATOR_RELEASE_ACCOUNT=123456789012
+export PERSONAL_OPERATOR_RELEASE_COMMIT="$(git rev-parse HEAD)"
+JOURNAL="$PWD/build/releases/release_${PERSONAL_OPERATOR_RELEASE_COMMIT}.json"
+./scripts/deploy.sh \
+  --preflight \
+  --journal "$JOURNAL" \
+  --account "$PERSONAL_OPERATOR_RELEASE_ACCOUNT" \
+  --commit "$PERSONAL_OPERATOR_RELEASE_COMMIT"
+./scripts/deploy.sh --status "$JOURNAL"
 ```
 
-`--phase1`, `--phase3`, and `--cdk-only` remain cloud-mutating CDK operations
-and still pause for permission broadening. Phase 3 only accepts a separately
-provisioned runtime whose candidate-bound context and authoritative metadata
-match the exact reviewed digest and whose storage contract verifies. This repo
-does not currently create that context or runtime, so the end-to-end product is
-not deployable from this script.
+Do not supply an operation or mutation confirmation during preflight. A real
+phase requires one self-contained reviewed executable. The CLI hashes and
+copies its exact bytes into a private file retained for that invocation, then
+requires the exact
+confirmation
+`mutate:release_<40-sha>:<phase>:sha256:<operation-hex>`. The journal records
+that operation digest while `UNCERTAIN`. For the first cloud phase it also
+requires the exact commit/account/region/digest-bound rollback reference.
 
-The external provisioner must write `build/runtime-context.json` with schema
-`personal-operator.runtime-context.v3`. Its endpoint name is exactly
-`release_<40-character-lowercase-candidate-commit>`; `DEFAULT`, aliases, tags,
-and user-selected names are rejected. The context separately records the
-service endpoint ID and runtime version. Phase 3 accepts it only when the
-version equals the reviewed runtime ARN suffix and the service reports that
-the exact endpoint ID and name have both `liveVersion` and `targetVersion`
-equal to that version. Consumers receive only this release endpoint, including
-their IAM runtime-endpoint resource. A later runtime version therefore cannot
-silently move an existing release.
+Immediately before each dispatch or observation, the CLI rejects conflicting
+`CDK_DEFAULT_REGION`, `AWS_REGION`, or `AWS_DEFAULT_REGION`, authenticates the
+exact account, and pins all three child variables to `eu-west-1`. Mutation must
+return only `{"dispatched":true}`. It is never treated as persistence proof:
+the same retained executable is called in read-only observation mode and must
+return one canonical, identity-bound `personal-operator.phase-observation.v1`
+record. A `PERSISTED` record contains only the evidence owned by that phase; an
+`ABSENT` record contains none. The CLI then performs the matching journal
+transition.
+
+The image phase cannot stabilize from a driver-provided digest alone. Its
+observation contains a complete strict `RuntimeImageEvidence`, including the
+exact commit/tree, immutable image subject, authenticated SBOM and provenance,
+scan, and signature evidence. Endpoint and context observations contain a
+complete strict `RuntimeContextV3`; an endpoint can never stabilize on `{}`.
+The context phase additionally supplies the SHA-256 of those exact canonical
+context bytes. All three artifacts are cross-checked against the journal before
+its phase-owned fields are derived.
+
+Reviewed observation implementations use
+`release_tools.production_observation.compose_production_evidence`. It wires
+the exact ECR and AgentCore validators from already-authorized injected clients
+without constructing a session or touching credentials at import or
+construction time. A release operation must not replace that composition with
+self-asserted cloud outcomes.
+
+After a crash or ambiguous result, use the same exact operation bytes and the
+confirmation
+`reconcile:release_<40-sha>:<phase>:sha256:<operation-hex>`. There is no
+operator `persisted|absent` switch and no local evidence-file override. A
+changed operation, timeout, noncanonical observation, account/region mismatch,
+unknown outcome, or wrong subject leaves the journal `UNCERTAIN` and blocks
+every later phase. Rollback follows the same write-ahead mutation plus
+authoritative observation rule, with
+`rollback:release_<40-sha>:sha256:<operation-hex>`.
+
+The CDK foundation owns exactly one private retained
+`personal-operator/bridge` repository with immutable tags, scan-on-push, KMS
+encryption/rotation, a frozen untagged lifecycle, one Notation OCI signing
+profile, and one exact repository signing filter. Only
+`ecr:GetAuthorizationToken` retains an unavoidable wildcard; runtime layer
+pulls use the exact repository ARN.
+
+An empty runtime context synthesizes no Runtime or RuntimeEndpoint. An exact
+lowercase 40-character commit plus the canonical private-ECR `@sha256:` URI
+synthesizes one stable `AWS::BedrockAgentCore::Runtime` and one retained
+`AWS::BedrockAgentCore::RuntimeEndpoint` named `release_<40-sha>`. The direct L1
+resource freezes the VPC, execution role, environment, `/mnt/workspace`, HTTP
+protocol, and lifecycle values. The removed mutable AgentCore toolkit path must
+not be restored.
+
+The canonical `RuntimeContextV3` records the service runtime ID, endpoint ID,
+endpoint name, exact versioned runtime ARN, and image digest. Consumer changes
+accept it only when injected live evidence proves READY runtime/endpoint state,
+the reviewed role and image, and equal endpoint live/target versions. A later
+runtime version cannot silently move an existing release endpoint.
+
+The shared trusted ZIP is consumed by five unique handler modules across six Lambda functions;
+`web.index.lambda_handler` is intentionally used by both the
+web and maintenance functions. The Docker-backed gate must import all five
+handlers from the exact Python 3.13/ARM64 ZIP with networking disabled.
+After container verification, publication is a same-filesystem atomic rename
+to an absent destination. The builder refuses to delete or replace an existing
+verified asset, so a failed rebuild cannot erase the prior release artifact.
+
+### External staging gates — all open
+
+- OPEN — runtime image push
+- OPEN — managed signing
+- OPEN — authoritative image scan
+- OPEN — CloudFormation change-set execution
+- OPEN — AgentCore runtime readiness
+- OPEN — consumer application
+- OPEN — moderated pilot
+
+Also open: the Docker-backed Lambda import proof, real account/region and IAM
+inspection, storage/recovery evidence, provider credentials/callbacks, and any
+real founder effect. Stop at the first mismatch. Never use a real message or
+email send to discover whether infrastructure is wired correctly.
 
 Rotating the CloudFront origin-verification secret also requires a Web stack
 update: CloudFront resolves the value during deployment while the web Lambda

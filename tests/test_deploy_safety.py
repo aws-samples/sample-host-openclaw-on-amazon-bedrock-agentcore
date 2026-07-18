@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
-import json
 import shutil
 import subprocess
 import sys
+
+from release_tools.contracts import canonical_json_bytes
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +26,8 @@ def _run(*args: str, **environment: str) -> subprocess.CompletedProcess[str]:
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": os.environ.get("HOME", "/tmp"),
+        "PYTHON": sys.executable,
+        "PYTHONPATH": str(ROOT),
         **environment,
     }
     return subprocess.run(
@@ -50,6 +55,11 @@ def _release_gate_harness(
     scripts = repo / "scripts"
     scripts.mkdir(parents=True)
     shutil.copy2(RELEASE_SCRIPT, scripts / RELEASE_SCRIPT.name)
+    shutil.copytree(
+        ROOT / "release_tools",
+        repo / "release_tools",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
     helper = ROOT / "scripts" / "hermetic-aws-env.sh"
     if helper.exists():
         shutil.copy2(helper, scripts / helper.name)
@@ -130,7 +140,7 @@ if observed:
     )
     (repo / "cdk.json").write_text('{"context": {}}\n', encoding="utf-8")
     (repo / ".gitignore").write_text(
-        "build/\n.env\n.env.*\n", encoding="utf-8"
+        "build/\n.env\n.env.*\n__pycache__/\n*.pyc\n", encoding="utf-8"
     )
 
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -152,6 +162,43 @@ if observed:
         f"{account}.dkr.ecr.{region}.amazonaws.com/"
         f"personal-operator/bridge@sha256:{'4' * 64}"
     )
+    role_arn = (
+        f"arn:aws:iam::{account}:role/"
+        f"openclaw-agentcore-execution-role-{region}"
+    )
+    runtime_configuration = {
+        "agentRuntimeArtifact": {
+            "containerConfiguration": {"containerUri": image}
+        },
+        "environmentVariables": {
+            "AWS_DEFAULT_REGION": region,
+            "AWS_REGION": region,
+            "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+            "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
+            "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
+                "workspace-credential-broker"
+            ),
+            "WORKSPACE_SYNC_INTERVAL_MS": "300000",
+        },
+        "filesystemConfigurations": [
+            {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+        ],
+        "lifecycleConfiguration": {
+            "idleRuntimeSessionTimeout": 1800,
+            "maxLifetime": 28800,
+        },
+        "networkConfiguration": {
+            "networkMode": "VPC",
+            "networkModeConfig": {
+                "securityGroups": ["sg-00000000000000001"],
+                "subnets": [
+                    "subnet-00000000000000001",
+                    "subnet-00000000000000002",
+                ],
+            },
+        },
+        "protocolConfiguration": {"serverProtocol": "HTTP"},
+    }
     runtime_context = {
         "schema": "personal-operator.runtime-context.v3",
         "sourceCommit": commit,
@@ -166,10 +213,23 @@ if observed:
         ),
         "runtimeVersion": "7",
         "runtimeImageUri": image,
+        "executionRoleArn": role_arn,
+        "runtimeConfiguration": runtime_configuration,
+        "runtimeConfigurationSha256": hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "executionRoleArn": role_arn,
+                    "runtimeConfiguration": runtime_configuration,
+                }
+            )
+        ).hexdigest(),
     }
     runtime_path = repo / "build" / "runtime-context.json"
     runtime_path.parent.mkdir(parents=True)
-    runtime_path.write_text(json.dumps(runtime_context), encoding="utf-8")
+    runtime_path.write_text(
+        json.dumps(runtime_context, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
 
     poison_home = tmp_path / "poison-home"
     (poison_home / ".aws").mkdir(parents=True)
@@ -210,107 +270,146 @@ if observed:
     return completed, observed
 
 
-def test_unknown_mode_and_build_mode_fail_before_any_aws_call() -> None:
+def test_unknown_mode_fails_before_any_aws_call() -> None:
     unknown = _run("--typo")
     assert unknown.returncode != 0
-    assert "unknown deployment mode" in unknown.stderr
+    assert "--preflight --phase --resume --status --rollback" in unknown.stderr
     assert "credentials" not in unknown.stdout.casefold()
 
-    build = _run("--phase1", BUILD_MODE="surprise")
-    assert build.returncode != 0
-    assert "BUILD_MODE" in build.stderr
 
-
-def test_runtime_modes_fail_closed_before_preflight_or_cloud_calls() -> None:
-    for mode in ("--full", "--runtime-only"):
+def test_legacy_modes_are_absent_from_the_new_release_cli() -> None:
+    for mode in ("--full", "--runtime-only", "--phase1", "--phase3"):
         result = _run(mode)
-
         assert result.returncode != 0
-        assert "immutable AgentCore runtime deployment is not implemented" in result.stderr
-        assert "no cloud changes were made" in result.stderr
-        assert "PERSONAL_OPERATOR_DEPLOY_ACCOUNT" not in result.stderr
-        assert "AWS credentials" not in result.stdout
+        assert "--preflight --phase --resume --status --rollback" in result.stderr
 
 
 def test_no_mutable_agentcore_toolkit_deploy_path_remains() -> None:
+    source = _source() + (ROOT / "release_tools/cli.py").read_text(encoding="utf-8")
+
+    assert "agentcore deploy" not in source.casefold()
+    assert "AGENTCORE_CLI" not in source
+    assert "update-agent-runtime-endpoint" not in source
+
+
+def test_deploy_is_only_an_exec_compatibility_shim() -> None:
     source = _source()
-
-    assert '"$AGENTCORE_CLI" deploy' not in source
-    assert "Starter Toolkit deploy" not in source
-
-
-def test_deploy_requires_explicit_account_commit_and_confirmation() -> None:
-    source = _source()
-    assert "PERSONAL_OPERATOR_DEPLOY_ACCOUNT" in source
-    assert "PERSONAL_OPERATOR_DEPLOY_COMMIT" in source
-    assert "PERSONAL_OPERATOR_DEPLOY_CONFIRMATION" in source
-    assert "aws sts get-caller-identity --query Account" in source
-    assert "must match the authenticated STS account" in source
-    assert "status --porcelain" in source
-    assert "rev-parse HEAD" in source
+    assert 'exec "${PYTHON}" "${SCRIPT_DIR}/staging-release.py" "$@"' in source
+    assert "aws " not in source
+    assert "cdk " not in source
+    assert "docker " not in source
+    assert "RuntimeContext" not in source
+    assert source.count("exec ") == 1
 
 
-def test_deploy_requires_immutable_builder_and_global_waf() -> None:
-    source = _source()
-    assert "TRUSTED_LAMBDA_BUILD_IMAGE" in source
-    assert "@sha256:" in source
-    assert "cloudfront_web_acl_arn" in source
-    assert "arn:aws:wafv2:us-east-1:" in source
-    assert "global/webacl/" in source
+def test_cli_preflight_executes_exact_git_identity_checks_without_aws(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / "README.md").write_text("release fixture\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Release Test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "release@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "fixture"],
+        cwd=repository,
+        check=True,
+    )
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        text=True,
+    ).strip()
+    journal = tmp_path / "journal.json"
+
+    wrong_head = _run(
+        "--preflight",
+        "--root",
+        str(repository),
+        "--journal",
+        str(journal),
+        "--account",
+        "123456789012",
+        "--commit",
+        "0" * 40,
+    )
+    (repository / "untracked.txt").write_text("drift\n", encoding="utf-8")
+    dirty = _run(
+        "--preflight",
+        "--root",
+        str(repository),
+        "--journal",
+        str(journal),
+        "--account",
+        "123456789012",
+        "--commit",
+        head,
+    )
+
+    assert wrong_head.returncode != 0
+    assert "exact Git HEAD" in wrong_head.stderr
+    assert dirty.returncode != 0
+    assert "clean worktree" in dirty.stderr
+    assert not journal.exists()
 
 
-def test_deploy_requires_commit_bound_immutable_bridge_runtime_image() -> None:
-    source = _source()
-
-    assert "PERSONAL_OPERATOR_RUNTIME_IMAGE_URI" in source
-    assert "runtime image must be an immutable ECR digest" in source
-    assert "aws ecr describe-images" in source
-    assert 'expected_tag = f"commit-{commit}"' in source
-    assert '"containerUri": expected_runtime_image_uri' in source
-    assert 'runtime.get("agentRuntimeArtifact") != expected_artifact' in source
-    assert 'agentRuntimeArtifact=runtime["agentRuntimeArtifact"]' not in source
+def test_cli_exposes_the_frozen_linear_phase_surface() -> None:
+    result = _run("--help")
+    assert result.returncode == 0, result.stderr
+    for value in (
+        "foundation",
+        "image",
+        "runtime",
+        "endpoint",
+        "context",
+        "consumer-changesets",
+        "consumers",
+        "verify",
+    ):
+        assert value in result.stdout
+    for option in ("--preflight", "--phase", "--resume", "--status", "--rollback"):
+        assert option in result.stdout
 
 
 def test_deploy_contains_no_privileged_runtime_builder_fallback() -> None:
-    source = _source()
+    source = _source() + (ROOT / "release_tools/cli.py").read_text(encoding="utf-8")
     assert "--privileged" not in source
     assert "tonistiigi/binfmt" not in source
     assert "AGENTCORE_CLI" not in source
 
 
-def test_runtime_identity_is_commit_bound_without_mutating_tracked_cdk_context() -> None:
+def test_deploy_shim_contains_no_embedded_runtime_context_parser() -> None:
     source = _source()
-    assert 'RUNTIME_CONTEXT_FILE="$PROJECT_DIR/build/runtime-context.json"' in source
-    assert "personal-operator.runtime-context.v3" in source
-    assert 'value.get("sourceCommit")' in source
-    assert 'runtime_version = value.get("runtimeVersion", "")' in source
-    assert 'f"release_{commit}"' in source
-    assert 'value.get("runtimeImageUri") != expected_runtime_image_uri' in source
-    assert "runtime context is not bound to this release" in source
-    assert "runtime context is not bound to the reviewed release image" in source
-    assert '-c "runtime_id=$RUNTIME_ID"' in source
-    assert '-c "runtime_source_commit=$PERSONAL_OPERATOR_DEPLOY_COMMIT"' in source
-    assert '-c "runtime_version=$RUNTIME_VERSION"' in source
-    assert '-c "runtime_arn=$RUNTIME_ARN"' in source
-    assert '-c "runtime_image_uri=$RUNTIME_IMAGE_URI"' in source
-    assert "Updating cdk.json with runtime info" not in source
-    assert "cfg['context']['runtime_id']" not in source
-    assert "target.write_text" not in source
+    assert "personal-operator.runtime-context.v3" not in source
+    assert "runtimeImageUri" not in source
+    assert "json.loads" not in source
+    assert "python3 -" not in source
 
 
-def test_phase3_binds_endpoint_id_name_and_target_version_before_cdk() -> None:
-    source = _source()
+def test_credentials_are_discovered_only_inside_confirmed_phase_execution() -> None:
+    source = (ROOT / "release_tools/cli.py").read_text(encoding="utf-8")
+    assert "def _discover_account" in source
+    assert "journal.begin_mutation" in source
+    phase_body = source.split("def _run_phase(", 1)[1].split("def _read_evidence", 1)[0]
+    assert phase_body.index("journal.begin_mutation") < phase_body.index(
+        "_discover_account("
+    )
+    assert "def _preflight" in source
 
-    assert '--endpoint-id "$RUNTIME_ENDPOINT_ID"' in source
-    assert '--endpoint-name "$RUNTIME_ENDPOINT_NAME"' in source
-    assert '"$RUNTIME_VERSION" != "${RUNTIME_ARN##*:}"' in source
-    assert 'rsplit(":", 1)[-1] != runtime_version' in source
 
-
-def test_cdk_requires_human_approval_for_permission_broadening() -> None:
-    source = _source()
+def test_no_release_path_disables_human_approval() -> None:
+    source = _source() + (ROOT / "release_tools/cli.py").read_text(encoding="utf-8")
     assert "--require-approval never" not in source
-    assert source.count("--require-approval broadening") == 2
 
 
 def test_deploy_script_has_valid_bash_syntax() -> None:
@@ -333,9 +432,12 @@ def test_release_gate_is_offline_real_account_shaped_and_docker_backed() -> None
     assert "build-trusted-lambda-asset.sh\" build" in source
     assert "build-trusted-lambda-asset.sh\" verify" in source
     assert "PERSONAL_OPERATOR_RUNTIME_CONTEXT_FILE" in source
-    assert "personal-operator.runtime-context.v3" in source
+    assert "-m release_tools.release_assets" in source
+    assert "personal-operator.runtime-context.v3" not in source
     assert "PERSONAL_OPERATOR_RUNTIME_IMAGE_URI" in source
-    assert 'f"release_{commit}"' in source
+    assert "RuntimeContextV3" in (
+        ROOT / "release_tools/release_assets.py"
+    ).read_text(encoding="utf-8")
     assert 'CDK_CONTEXT_JSON="${CDK_CONTEXT_JSON}"' in source
     assert "PERSONAL_OPERATOR_SYNTH_SOURCE_ASSET" not in source
     assert "run_with_hermetic_aws_env" in source

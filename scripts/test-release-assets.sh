@@ -53,97 +53,15 @@ assert_exact_clean_commit() {
 assert_exact_clean_commit
 readonly actual_commit="${EXPECTED_COMMIT}"
 
-CDK_CONTEXT_JSON="$("${PYTHON}" - \
-  "${REPO_ROOT}/cdk.json" "${RUNTIME_CONTEXT_FILE}" \
-  "${EXPECTED_COMMIT}" "${ACCOUNT}" "${REGION}" "${RUNTIME_IMAGE_URI}" <<'PY'
-import json
-from pathlib import Path
-import re
-import sys
-
-config_path, runtime_path, commit, account, region, reviewed_image = sys.argv[1:]
-
-
-def fail(message: str) -> None:
-    raise SystemExit(f"release asset gate: {message}")
-
-
-try:
-    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
-    runtime = json.loads(Path(runtime_path).read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError) as error:
-    fail(f"runtime context is unavailable or invalid: {type(error).__name__}")
-
-expected_fields = {
-    "schema",
-    "sourceCommit",
-    "account",
-    "region",
-    "runtimeId",
-    "runtimeEndpointId",
-    "runtimeEndpointName",
-    "runtimeArn",
-    "runtimeVersion",
-    "runtimeImageUri",
-}
-if not isinstance(runtime, dict) or set(runtime) != expected_fields:
-    fail("runtime context has the wrong fields")
-if runtime.get("schema") != "personal-operator.runtime-context.v3":
-    fail("runtime context schema is invalid")
-if (runtime.get("sourceCommit"), runtime.get("account"), runtime.get("region")) != (
-    commit,
-    account,
-    region,
-):
-    fail("runtime context is not bound to this release")
-
-identifier = r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
-if re.fullmatch(identifier, str(runtime.get("runtimeId", ""))) is None:
-    fail("runtime ID is invalid")
-if re.fullmatch(identifier, str(runtime.get("runtimeEndpointId", ""))) is None:
-    fail("runtime endpoint ID is invalid")
-if runtime.get("runtimeEndpointName") != f"release_{commit}":
-    fail("runtime endpoint name is not bound to the release commit")
-version = str(runtime.get("runtimeVersion", ""))
-if re.fullmatch(r"[1-9][0-9]{0,4}", version) is None:
-    fail("runtime version is invalid")
-runtime_arn_pattern = (
-    rf"arn:aws:bedrock-agentcore:{re.escape(region)}:{re.escape(account)}:agent/"
-    r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
-    r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
-)
-runtime_arn = str(runtime.get("runtimeArn", ""))
-if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
-    fail("runtime ARN is invalid")
-if runtime_arn.rsplit(":", 1)[-1] != version:
-    fail("runtime ARN is not bound to its version")
-image_pattern = (
-    rf"{re.escape(account)}\.dkr\.ecr\.{re.escape(region)}\.amazonaws\.com/"
-    r"[a-z0-9]+(?:[._/-][a-z0-9]+)*@sha256:[0-9a-f]{64}"
-)
-if re.fullmatch(image_pattern, reviewed_image) is None:
-    fail("PERSONAL_OPERATOR_RUNTIME_IMAGE_URI is not an exact private ECR digest")
-if runtime.get("runtimeImageUri") != reviewed_image:
-    fail("runtime context is not bound to the reviewed release image")
-
-context = config.get("context") if isinstance(config, dict) else None
-if not isinstance(context, dict):
-    fail("cdk.json context is invalid")
-context = dict(context)
-context.update(
-    {
-        "runtime_source_commit": commit,
-        "capability_release_commit": commit,
-        "runtime_id": runtime["runtimeId"],
-        "runtime_endpoint_id": runtime["runtimeEndpointId"],
-        "runtime_endpoint_name": runtime["runtimeEndpointName"],
-        "runtime_version": version,
-        "runtime_arn": runtime_arn,
-        "runtime_image_uri": reviewed_image,
-    }
-)
-print(json.dumps(context, sort_keys=True, separators=(",", ":")))
-PY
+CDK_CONTEXT_JSON="$(
+  PYTHONPATH="${REPO_ROOT}" "${PYTHON}" -m release_tools.release_assets \
+    cdk-context \
+    --config "${REPO_ROOT}/cdk.json" \
+    --runtime-context "${RUNTIME_CONTEXT_FILE}" \
+    --source-commit "${EXPECTED_COMMIT}" \
+    --account "${ACCOUNT}" \
+    --region "${REGION}" \
+    --runtime-image-uri "${RUNTIME_IMAGE_URI}"
 )"
 readonly CDK_CONTEXT_JSON
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 
 from aws_cdk import (
+    AssetHashType,
     CfnOutput,
     Duration,
     Fn,
@@ -73,6 +74,7 @@ class WebStack(Stack):
         runtime_iam_arn: str,
         runtime_endpoint_name: str,
         trusted_code_asset_root: str,
+        trusted_code_asset_hash: str | None = None,
         web_asset_root: str,
         control_table: dynamodb.ITable | None = None,
         auth_secret: secretsmanager.ISecret | None = None,
@@ -96,6 +98,17 @@ class WebStack(Stack):
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
+
+        def trusted_lambda_code() -> _lambda.Code:
+            if trusted_code_asset_hash is None:
+                return _lambda.Code.from_asset(trusted_code_asset_root)
+            if re.fullmatch(r"[0-9a-f]{64}", trusted_code_asset_hash) is None:
+                raise ValueError("trusted Lambda asset hash is not canonical")
+            return _lambda.Code.from_asset(
+                trusted_code_asset_root,
+                asset_hash=trusted_code_asset_hash,
+                asset_hash_type=AssetHashType.CUSTOM,
+            )
 
         region = Stack.of(self).region
         account = Stack.of(self).account
@@ -410,7 +423,7 @@ class WebStack(Stack):
             handler="web.index.lambda_handler",
             # auth, actions, workflows, retention, and RuntimeDriver are one
             # reviewed trusted Lambda asset rooted at lambda/.
-            code=_lambda.Code.from_asset(trusted_code_asset_root),
+            code=trusted_lambda_code(),
             timeout=Duration.seconds(30),
             memory_size=512,
             reserved_concurrent_executions=20,
@@ -427,7 +440,7 @@ class WebStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             architecture=_lambda.Architecture.ARM_64,
             handler="web.index.lambda_handler",
-            code=_lambda.Code.from_asset(trusted_code_asset_root),
+            code=trusted_lambda_code(),
             timeout=Duration.seconds(900),
             memory_size=512,
             reserved_concurrent_executions=1,
@@ -445,7 +458,7 @@ class WebStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             architecture=_lambda.Architecture.ARM_64,
             handler="control.index.lambda_handler",
-            code=_lambda.Code.from_asset(trusted_code_asset_root),
+            code=trusted_lambda_code(),
             timeout=Duration.seconds(180),
             memory_size=512,
             reserved_concurrent_executions=20,

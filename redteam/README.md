@@ -2,12 +2,17 @@
 
 Developer-only adversarial testing harness for OpenClaw's Bedrock Guardrails. Uses [promptfoo](https://promptfoo.dev/) to generate and evaluate adversarial prompts against the Bedrock model with and without guardrails.
 
-**This folder is NOT deployed** — it is a local testing tool for security evaluation.
+**This folder is NOT deployed** — it is a developer testing client, not a
+release or deployment path. It is not authorization to use AWS credentials or
+contact Bedrock. Any hardened target must already exist through the separately
+approved exact-commit staging journal in
+[`docs/OPERATIONS.md`](../docs/OPERATIONS.md).
 
 ## Prerequisites
 
 - AWS credentials with Bedrock access (`bedrock:InvokeModel`, `bedrock:Converse`)
-- Deployed `OpenClawGuardrails` stack (for hardened provider)
+- Separately authorized, journaled `OpenClawGuardrails` target (for the hardened
+  provider); this harness must not create or update it
 - Node.js 18+
 
 ## Setup
@@ -20,18 +25,9 @@ cp .env.example .env
 npm install
 ```
 
-Get guardrail IDs from CDK outputs:
-
-```bash
-export BEDROCK_GUARDRAIL_ID=$(aws cloudformation describe-stacks \
-  --stack-name OpenClawGuardrails \
-  --query "Stacks[0].Outputs[?OutputKey=='GuardrailId'].OutputValue" \
-  --output text --region ap-southeast-2)
-export BEDROCK_GUARDRAIL_VERSION=$(aws cloudformation describe-stacks \
-  --stack-name OpenClawGuardrails \
-  --query "Stacks[0].Outputs[?OutputKey=='GuardrailVersion'].OutputValue" \
-  --output text --region ap-southeast-2)
-```
+Obtain the exact guardrail ID and version only from the reviewed, commit-bound
+release evidence for that journaled target. Do not deploy or probe infrastructure
+from this harness merely to discover whether a target exists.
 
 ## The Before/After Story
 
@@ -45,14 +41,14 @@ npm run run:baseline
 
 Expected: many test failures — jailbreaks succeed, PII is generated, harmful content passes through.
 
-### Act 2 — Deploy Guardrails
+### Act 2 — Use a Separately Authorized Hardened Target
 
-Deploy the `OpenClawGuardrails` CDK stack and redeploy `OpenClawAgentCore`:
-
-```bash
-cd .. && source .venv/bin/activate
-cdk deploy OpenClawGuardrails OpenClawAgentCore --require-approval never
-```
+This harness never deploys `OpenClawGuardrails` or `OpenClawAgentCore`. A change
+must be part of a clean exact-commit candidate and advance through
+`scripts/staging-release.py` (or the `scripts/deploy.sh` compatibility shim),
+using the write-ahead journal and separately reviewed phases in
+[`docs/OPERATIONS.md`](../docs/OPERATIONS.md). If those external gates are open,
+stop here; do not substitute a direct CDK command.
 
 ### Act 3 — Hardened (Improved)
 

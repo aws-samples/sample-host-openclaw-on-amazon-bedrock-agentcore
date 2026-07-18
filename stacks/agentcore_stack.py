@@ -1,19 +1,17 @@
-"""AgentCore Stack — IAM, S3, and Security Group for AgentCore Runtime.
+"""AgentCore release foundation and Runtime support resources.
 
 Creates the supporting resources that the AgentCore Runtime needs:
-  - Execution Role (Bedrock/log/telemetry plus exact trusted invocations)
+  - Execution Role (Bedrock/log/telemetry plus exact broker invocation)
   - Trusted Credential Broker Role (the sole workspace-role assumer)
   - Workspace Session Role (S3/KMS base authority narrowed by the broker)
   - Security Group (VPC networking for the container)
   - S3 Bucket (per-user file storage and workspace sync)
 
-The Runtime itself (container, endpoint) is deployed separately via the
-AgentCore Starter Toolkit (`agentcore deploy`), which handles ECR, Docker
-build (CodeBuild), and Runtime/Endpoint lifecycle. The deploy script
-passes the execution role ARN, subnet IDs, and security group ID from
-this stack to the toolkit.
+The stack owns the immutable ECR and signing boundary. Runtime resources are
+added only for an exact digest-bound release input.
 """
 
+import json
 import re
 
 from aws_cdk import (
@@ -22,10 +20,13 @@ from aws_cdk import (
     Stack,
     RemovalPolicy,
     Token,
+    aws_bedrockagentcore as agentcore,
     aws_ec2 as ec2,
+    aws_ecr as ecr,
     aws_iam as iam,
     aws_kms as kms,
     aws_s3 as s3,
+    aws_signer as signer,
 )
 import cdk_nag
 from constructs import Construct
@@ -77,14 +78,6 @@ class AgentCoreStack(Stack):
         )
         if capability_gateway_function_arn != expected_gateway_arn:
             raise ValueError("capability gateway function ARN is not canonical")
-        enable_browser = str(
-            self.node.try_get_context("enable_browser") or "false"
-        ).casefold()
-        if enable_browser != "false":
-            raise ValueError(
-                "runtime-owned browser authority is forbidden; use the separate "
-                "trusted Browser Gateway introduced by Task 10"
-            )
 
         # --- Security Group for AgentCore Runtime containers ------------------
         self.agent_sg = ec2.SecurityGroup(
@@ -185,6 +178,8 @@ class AgentCoreStack(Stack):
                 resources=[workspace_broker_function_arn],
             )
         )
+        # The runtime may invoke exactly the release-owned capability gateway and
+        # nothing else in the capability plane.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["lambda:InvokeFunction"],
@@ -313,7 +308,99 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # ECR pull (toolkit creates the repo, but the execution role needs pull access)
+        # --- Immutable runtime image repository and managed signing ----------
+        # This repository is an independently retained release boundary. The
+        # registry-wide signing configuration has one exact repository filter.
+        self.bridge_repository_key = kms.Key(
+            self,
+            "BridgeRepositoryKey",
+            description="KMS key for Personal Operator runtime images",
+            enable_key_rotation=True,
+            pending_window=Duration.days(30),
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        lifecycle_policy = json.dumps(
+            {
+                "rules": [
+                    {
+                        "rulePriority": 1,
+                        "description": "Expire untagged images after 30 days",
+                        "selection": {
+                            "tagStatus": "untagged",
+                            "countType": "sinceImagePushed",
+                            "countUnit": "days",
+                            "countNumber": 30,
+                        },
+                        "action": {"type": "expire"},
+                    }
+                ]
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.bridge_repository = ecr.CfnRepository(
+            self,
+            "BridgeRepository",
+            repository_name="personal-operator/bridge",
+            image_tag_mutability="IMMUTABLE",
+            image_scanning_configuration=(
+                ecr.CfnRepository.ImageScanningConfigurationProperty(
+                    scan_on_push=True
+                )
+            ),
+            encryption_configuration=(
+                ecr.CfnRepository.EncryptionConfigurationProperty(
+                    encryption_type="KMS",
+                    kms_key=self.bridge_repository_key.key_arn,
+                )
+            ),
+            lifecycle_policy=ecr.CfnRepository.LifecyclePolicyProperty(
+                lifecycle_policy_text=lifecycle_policy
+            ),
+        )
+        self.bridge_repository.apply_removal_policy(
+            RemovalPolicy.RETAIN,
+            apply_to_update_replace_policy=True,
+        )
+
+        self.bridge_signing_profile = signer.CfnSigningProfile(
+            self,
+            "BridgeSigningProfile",
+            platform_id="Notation-OCI-SHA384-ECDSA",
+            profile_name="personal_operator_bridge",
+            signature_validity_period=(
+                signer.CfnSigningProfile.SignatureValidityPeriodProperty(
+                    type="DAYS",
+                    value=3650,
+                )
+            ),
+        )
+        self.bridge_signing_profile.apply_removal_policy(
+            RemovalPolicy.RETAIN,
+            apply_to_update_replace_policy=True,
+        )
+        self.bridge_signing_configuration = ecr.CfnSigningConfiguration(
+            self,
+            "BridgeSigningConfiguration",
+            rules=[
+                ecr.CfnSigningConfiguration.RuleProperty(
+                    signing_profile_arn=self.bridge_signing_profile.attr_arn,
+                    repository_filters=[
+                        ecr.CfnSigningConfiguration.RepositoryFilterProperty(
+                            filter="personal-operator/bridge",
+                            filter_type="WILDCARD_MATCH",
+                        )
+                    ],
+                )
+            ],
+        )
+        self.bridge_signing_configuration.apply_removal_policy(
+            RemovalPolicy.RETAIN,
+            apply_to_update_replace_policy=True,
+        )
+        self.bridge_signing_configuration.add_dependency(self.bridge_repository)
+
+        # AgentCore can pull only the exact retained release repository.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
@@ -322,9 +409,8 @@ class AgentCoreStack(Stack):
                     "ecr:BatchCheckLayerAvailability",
                 ],
                 resources=[
-                    f"arn:aws:ecr:{region}:{account}:repository/openclaw-bridge*",
-                    f"arn:aws:ecr:{region}:{account}:repository/openclaw_agent*",
-                    f"arn:aws:ecr:{region}:{account}:repository/bedrock-agentcore-*",
+                    f"arn:aws:ecr:{region}:{account}:"
+                    "repository/personal-operator/bridge"
                 ],
             )
         )
@@ -402,10 +488,11 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # --- Reviewed runtime release identity (read via context) -------------
-        # Runtime provisioning is deliberately outside this stack. Dependent
-        # stacks are wired only after the release gate supplies one atomic,
-        # commit-bound runtime version, immutable image, and dedicated endpoint.
+        # --- Immutable AgentCore release resources ---------------------------
+        # A foundation synth supplies no runtime values and therefore owns no
+        # Runtime/Endpoint. A release synth must supply the exact source commit
+        # and canonical digest URI together. Post-deployment consumer synths may
+        # additionally carry the complete, independently verified v3 context.
         runtime_source_commit = str(
             self.node.try_get_context("runtime_source_commit") or ""
         )
@@ -421,19 +508,18 @@ class AgentCoreStack(Stack):
         runtime_image_uri = str(
             self.node.try_get_context("runtime_image_uri") or ""
         )
-        runtime_values = (
-            runtime_source_commit,
+        release_inputs = (runtime_source_commit, runtime_image_uri)
+        persisted_runtime_values = (
             runtime_id,
             runtime_endpoint_id,
             runtime_endpoint_name,
             runtime_version,
             runtime_arn,
-            runtime_image_uri,
         )
-        if not any(runtime_values):
-            # Offline/foundation synthesis happens before Starter Toolkit has
-            # created a runtime. Dependent stacks are not deployable until the
-            # external release gate replaces every placeholder atomically.
+        if not any(release_inputs) and not any(persisted_runtime_values):
+            # Foundation stacks are synthesizable before any image mutation.
+            # Consumer placeholders are intentionally undeployable release
+            # identities; the staging transaction never deploys those stacks.
             self.runtime_source_commit = "PLACEHOLDER"
             self.runtime_id = "PLACEHOLDER"
             self.runtime_endpoint_id = "PLACEHOLDER"
@@ -442,12 +528,12 @@ class AgentCoreStack(Stack):
             self.runtime_arn = "PLACEHOLDER"
             self.runtime_image_uri = "PLACEHOLDER"
             self.runtime_iam_arn = "PLACEHOLDER"
+            self.runtime = None
+            self.runtime_endpoint = None
         else:
-            if not all(runtime_values):
+            if not all(release_inputs):
                 raise ValueError(
-                    "runtime_source_commit, runtime_id, runtime_endpoint_id, "
-                    "runtime_endpoint_name, runtime_version, runtime_arn, and "
-                    "runtime_image_uri must be set together"
+                    "runtime_source_commit and runtime_image_uri must be set together"
                 )
             source_commit_pattern = r"[0-9a-f]{40}"
             runtime_version_pattern = r"[1-9][0-9]{0,4}"
@@ -461,58 +547,189 @@ class AgentCoreStack(Stack):
             runtime_image_uri_pattern = (
                 rf"{re.escape(account)}\.dkr\.ecr\."
                 rf"{re.escape(region)}\.amazonaws\.com/"
-                r"[a-z0-9]+(?:[._/-][a-z0-9]+)*"
+                r"personal-operator/bridge"
                 r"@sha256:[0-9a-f]{64}"
             )
             if re.fullmatch(source_commit_pattern, runtime_source_commit) is None:
                 raise ValueError("runtime_source_commit must be an exact git commit")
-            if re.fullmatch(runtime_version_pattern, runtime_version) is None:
-                raise ValueError("runtime_version is not canonical")
-            if re.fullmatch(runtime_id_pattern, runtime_id) is None:
-                raise ValueError(f"runtime_id is not canonical: {runtime_id}")
-            if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
-                raise ValueError(
-                    f"runtime_endpoint_id is not canonical: {runtime_endpoint_id}"
-                )
-            expected_endpoint_name = f"release_{runtime_source_commit}"
-            if runtime_endpoint_name != expected_endpoint_name:
-                raise ValueError(
-                    "runtime_endpoint_name must be derived from the exact "
-                    "runtime_source_commit"
-                )
-            if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
-                raise ValueError(
-                    "runtime_arn must be the exact AgentCore ARN returned for "
-                    f"account {account} in {region}"
-                )
-            if runtime_arn.rsplit(":", 1)[-1] != runtime_version:
-                raise ValueError(
-                    "runtime_version must equal the exact runtime ARN version"
-                )
             if re.fullmatch(runtime_image_uri_pattern, runtime_image_uri) is None:
                 raise ValueError(
-                    "runtime_image_uri must be an immutable ECR sha256 digest "
-                    f"in account {account} and region {region}"
+                    "runtime_image_uri must be the immutable personal-operator/bridge "
+                    f"ECR digest in account {account} and region {region}"
                 )
-            self.runtime_source_commit = runtime_source_commit
-            self.runtime_id = runtime_id
-            self.runtime_endpoint_id = runtime_endpoint_id
-            self.runtime_endpoint_name = runtime_endpoint_name
-            self.runtime_version = runtime_version
-            self.runtime_arn = runtime_arn
-            self.runtime_image_uri = runtime_image_uri
-            # AgentCore has two distinct ARN namespaces. GetAgentRuntime's
-            # agent/<uuid>:<version> ARN is the invocation identity above;
-            # IAM authorization uses the documented runtime/<runtime-id>
-            # resource grammar. Derive the latter only after validating the
-            # canonical runtime ID, account, and region.
-            self.runtime_iam_arn = (
-                f"arn:aws:bedrock-agentcore:{region}:{account}:"
-                f"runtime/{runtime_id}"
+
+            has_persisted_context = any(persisted_runtime_values)
+            if has_persisted_context and not all(persisted_runtime_values):
+                raise ValueError(
+                    "runtime_id, runtime_endpoint_id, runtime_endpoint_name, "
+                    "runtime_version, and runtime_arn must be set together"
+                )
+            expected_endpoint_name = f"release_{runtime_source_commit}"
+            if has_persisted_context:
+                if re.fullmatch(runtime_version_pattern, runtime_version) is None:
+                    raise ValueError("runtime_version is not canonical")
+                if re.fullmatch(runtime_id_pattern, runtime_id) is None:
+                    raise ValueError(f"runtime_id is not canonical: {runtime_id}")
+                if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
+                    raise ValueError(
+                        f"runtime_endpoint_id is not canonical: {runtime_endpoint_id}"
+                    )
+                if runtime_endpoint_name != expected_endpoint_name:
+                    raise ValueError(
+                        "runtime_endpoint_name must be derived from the exact "
+                        "runtime_source_commit"
+                    )
+                if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
+                    raise ValueError(
+                        "runtime_arn must be the exact AgentCore ARN returned for "
+                        f"account {account} in {region}"
+                    )
+                if runtime_arn.rsplit(":", 1)[-1] != runtime_version:
+                    raise ValueError(
+                        "runtime_version must equal the exact runtime ARN version"
+                    )
+
+            idle_timeout = int(
+                self.node.try_get_context("session_idle_timeout") or "1800"
+            )
+            max_lifetime = int(
+                self.node.try_get_context("session_max_lifetime") or "28800"
+            )
+            workspace_sync_seconds = int(
+                self.node.try_get_context("workspace_sync_interval_seconds")
+                or "300"
+            )
+            runtime_environment = {
+                "AWS_REGION": region,
+                "AWS_DEFAULT_REGION": region,
+                "BEDROCK_MODEL_ID": str(
+                    self.node.try_get_context("default_model_id")
+                    or BEDROCK_INFERENCE_PROFILE_ID
+                ),
+                "S3_USER_FILES_BUCKET": self.user_files_bucket.bucket_name,
+                "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
+                    workspace_broker_function_name
+                ),
+                "WORKSPACE_SYNC_INTERVAL_MS": str(workspace_sync_seconds * 1000),
+            }
+            subagent_model_id = str(
+                self.node.try_get_context("subagent_model_id") or ""
+            )
+            if subagent_model_id:
+                runtime_environment["SUBAGENT_BEDROCK_MODEL_ID"] = (
+                    subagent_model_id
+                )
+            if guardrail_id:
+                runtime_environment.update(
+                    {
+                        "BEDROCK_GUARDRAIL_ID": guardrail_id,
+                        "BEDROCK_GUARDRAIL_VERSION": "DRAFT",
+                    }
+                )
+
+            self.runtime = agentcore.CfnRuntime(
+                self,
+                "BridgeRuntime",
+                agent_runtime_artifact=(
+                    agentcore.CfnRuntime.AgentRuntimeArtifactProperty(
+                        container_configuration=(
+                            agentcore.CfnRuntime.ContainerConfigurationProperty(
+                                container_uri=runtime_image_uri
+                            )
+                        )
+                    )
+                ),
+                agent_runtime_name="personal_operator_bridge",
+                network_configuration=(
+                    agentcore.CfnRuntime.NetworkConfigurationProperty(
+                        network_mode="VPC",
+                        network_mode_config=(
+                            agentcore.CfnRuntime.VpcConfigProperty(
+                                subnets=private_subnet_ids,
+                                security_groups=[self.agent_sg.security_group_id],
+                            )
+                        ),
+                    )
+                ),
+                role_arn=self.execution_role.role_arn,
+                environment_variables=runtime_environment,
+                filesystem_configurations=[
+                    agentcore.CfnRuntime.FilesystemConfigurationProperty(
+                        session_storage=(
+                            agentcore.CfnRuntime.SessionStorageConfigurationProperty(
+                                mount_path="/mnt/workspace"
+                            )
+                        )
+                    )
+                ],
+                lifecycle_configuration=(
+                    agentcore.CfnRuntime.LifecycleConfigurationProperty(
+                        idle_runtime_session_timeout=idle_timeout,
+                        max_lifetime=max_lifetime,
+                    )
+                ),
+                protocol_configuration="HTTP",
+                description=(
+                    "Personal Operator immutable bridge runtime at commit "
+                    f"{runtime_source_commit}"
+                ),
+                tags={"SourceCommit": runtime_source_commit},
+            )
+            self.runtime.add_dependency(self.bridge_repository)
+            self.runtime.apply_removal_policy(
+                RemovalPolicy.RETAIN,
+                apply_to_update_replace_policy=True,
+            )
+            self.runtime_endpoint = agentcore.CfnRuntimeEndpoint(
+                self,
+                "BridgeRuntimeEndpoint",
+                agent_runtime_id=self.runtime.attr_agent_runtime_id,
+                agent_runtime_version=self.runtime.attr_agent_runtime_version,
+                name=expected_endpoint_name,
+            )
+            self.runtime_endpoint.apply_removal_policy(
+                RemovalPolicy.RETAIN,
+                apply_to_update_replace_policy=True,
             )
 
-        # Browser authority is not latent in this role. Task 10 introduces a
-        # separate trusted Browser Gateway; AgentCore never owns its sessions.
+            self.runtime_source_commit = runtime_source_commit
+            self.runtime_image_uri = runtime_image_uri
+            if has_persisted_context:
+                self.runtime_id = runtime_id
+                self.runtime_endpoint_id = runtime_endpoint_id
+                self.runtime_endpoint_name = runtime_endpoint_name
+                self.runtime_version = runtime_version
+                self.runtime_arn = runtime_arn
+                self.runtime_iam_arn = (
+                    f"arn:aws:bedrock-agentcore:{region}:{account}:"
+                    f"runtime/{runtime_id}"
+                )
+            else:
+                self.runtime_id = self.runtime.attr_agent_runtime_id
+                self.runtime_endpoint_id = self.runtime_endpoint.attr_id
+                self.runtime_endpoint_name = expected_endpoint_name
+                self.runtime_version = self.runtime.attr_agent_runtime_version
+                self.runtime_arn = self.runtime.attr_agent_runtime_arn
+                # AgentCore invocation and IAM use distinct ARN namespaces.
+                self.runtime_iam_arn = Stack.of(self).format_arn(
+                    service="bedrock-agentcore",
+                    resource="runtime",
+                    resource_name=self.runtime_id,
+                )
+
+        # --- Browser authority is forbidden in the runtime -------------------
+        # The conversational runtime never owns a browser. Curated browsing is
+        # provided outside AgentCore by the separate trusted Browser Gateway
+        # introduced by Task 10, disabled by default. A runtime-owned browser
+        # escape hatch is rejected at synth time.
+        enable_browser = str(
+            self.node.try_get_context("enable_browser") or "false"
+        ).casefold()
+        if enable_browser != "false":
+            raise ValueError(
+                "runtime-owned browser authority is forbidden; use the separate "
+                "trusted Browser Gateway introduced by Task 10"
+            )
 
         # --- Outputs ----------------------------------------------------------
         CfnOutput(self, "ExecutionRoleArn", value=self.execution_role.role_arn)
@@ -538,6 +755,39 @@ class AgentCoreStack(Stack):
             "PrivateSubnetIds",
             value=",".join(private_subnet_ids),
         )
+        if self.runtime is not None:
+            CfnOutput(self, "RuntimeId", value=self.runtime.attr_agent_runtime_id)
+            CfnOutput(
+                self,
+                "RuntimeVersion",
+                value=self.runtime.attr_agent_runtime_version,
+            )
+            CfnOutput(
+                self,
+                "RuntimeArn",
+                value=self.runtime.attr_agent_runtime_arn,
+            )
+            CfnOutput(
+                self,
+                "RuntimeEndpointId",
+                value=self.runtime_endpoint.attr_id,
+            )
+            CfnOutput(
+                self,
+                "RuntimeEndpointName",
+                value=self.runtime_endpoint_name,
+            )
+            CfnOutput(
+                self,
+                "RuntimeImageUri",
+                value=self.runtime_image_uri,
+            )
+            CfnOutput(
+                self,
+                "RuntimeSourceCommit",
+                value=self.runtime_source_commit,
+            )
+
         # --- cdk-nag suppressions ---------------------------------------------
         cdk_nag.NagSuppressions.add_resource_suppressions(
             self.execution_role,
@@ -551,10 +801,6 @@ class AgentCoreStack(Stack):
                         "Resource::*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*:*",
-                        # ECR pull (toolkit-managed repos — Starter Toolkit uses bedrock-agentcore- prefix)
-                        f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw-bridge*",
-                        f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw_agent*",
-                        f"Resource::arn:aws:ecr:{region}:{account}:repository/bedrock-agentcore-*",
                         # Bedrock Guardrails (wildcard for guardrail version changes)
                         f"Resource::arn:aws:bedrock:{region}:{account}:guardrail/*",
                     ],
