@@ -16,7 +16,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 5 custom skills (S3 user files, EventBridge cron, ClawHub manage, API keys, agentcore-browser) + 2 built-in shim tools (web_fetch, web_search)
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
-- **Workspace Persistence**: AgentCore Session Storage (primary, `/mnt/workspace`) + S3 backup (5 min). `.openclaw/` symlinked to session storage mount; S3 backup restores on new sessions or version updates. **Note**: `update-agent-runtime` clears session storage — S3 backup auto-restores
+- **Workspace Persistence**: AgentCore Session Storage (primary, `/mnt/workspace`) + S3 backup (5 min). `.openclaw/` is restored through the reviewed persistence boundary for a new immutable release session; no direct Runtime update path is supported.
 - **AI Model**: Claude Opus 4.6 via Bedrock ConverseStream (configurable via `default_model_id` in `cdk.json`, default `global.anthropic.claude-opus-4-6-v1`)
 - **Identity**: DynamoDB identity table (channel→user mapping, cross-channel binding) + Cognito User Pool
 - **Observability**: CloudWatch dashboards + alarms, Bedrock invocation logging
@@ -176,547 +176,61 @@ openclaw-on-agentcore/
 |---|---|---|
 | **OpenClawVpc** | VPC (2 AZ), subnets, NAT, 7 VPC endpoints, flow logs | None |
 | **OpenClawSecurity** | KMS CMK, Secrets Manager (8 secrets incl. webhook validation + feishu), Cognito User Pool, optional CloudTrail | None |
-| **OpenClawAgentCore** | Execution Role, Security Group, S3 bucket (Runtime/Endpoint managed by Starter Toolkit) | Vpc, Security |
+| **OpenClawAgentCore** | Execution Role, Security Group, retained ECR/signing foundation, S3 bucket, and optional digest-bound release Runtime/Endpoint L1s | Vpc, Security |
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms, SNS, Bedrock invocation logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
 | **OpenClawCron** | EventBridge Scheduler group, Cron executor Lambda, Scheduler IAM role | AgentCore, Router, Security |
 
-## Expected Commands
+## Authoritative v1 commands
 
-### Hybrid Deploy (CDK + Starter Toolkit)
+The former hybrid Starter Toolkit deployment, mutable image tags, direct
+Runtime updates, and `us-west-2` instructions are retired. They are not a
+supported fallback. Do not run `agentcore deploy`, retarget an existing
+endpoint, push a mutable tag, invoke raw `update-agent-runtime`, or deploy with
+`--require-approval never`.
 
-Deployment uses a 3-phase hybrid model: CDK for infrastructure, Starter Toolkit for Runtime/container.
+Use the reviewed v1 design and plan as the source of truth:
 
-```bash
-# Full deploy via script (recommended)
-./scripts/deploy.sh                  # all 3 phases
-./scripts/deploy.sh --phase1         # CDK foundation only
-./scripts/deploy.sh --runtime-only   # Starter Toolkit only
-./scripts/deploy.sh --phase3         # CDK dependent stacks only
-```
+- `docs/superpowers/specs/2026-07-18-personal-operator-v1-design.md`
+- `docs/superpowers/plans/2026-07-18-personal-operator-v1.md`
+- `docs/OPERATIONS.md`
+- `docs/RELEASE-EVIDENCE.md`
 
-#### Phase 1: CDK foundation stacks
-```bash
-source .venv/bin/activate
-export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export CDK_DEFAULT_REGION=us-west-2
-cdk deploy OpenClawVpc OpenClawSecurity OpenClawAgentCore OpenClawObservability --require-approval never
-```
-
-#### Phase 2: Starter Toolkit (Runtime + Docker build)
-```bash
-# Configure (first time only)
-agentcore configure --name openclaw_agent --entrypoint bridge/agentcore-contract.js \
-  --execution-role <ROLE_ARN> --region us-west-2 --vpc \
-  --subnets <SUBNET_IDS> --security-groups <SG_ID> \
-  --deployment-type container --language typescript --non-interactive
-
-# Deploy (builds Docker image locally or via CodeBuild, creates/updates Runtime)
-agentcore deploy --agent openclaw_agent --local-build --auto-update-on-conflict \
-  --env "BEDROCK_MODEL_ID=global.anthropic.claude-opus-4-6-v1" \
-  --env "S3_USER_FILES_BUCKET=openclaw-user-files-..." ...
-
-# Update cdk.json with runtime_id and runtime_endpoint_id from toolkit output
-```
-
-#### Phase 3: CDK dependent stacks
-```bash
-cdk deploy OpenClawRouter OpenClawCron OpenClawTokenMonitoring --require-approval never
-```
-
-### Other CDK commands
-```bash
-cdk synth                                    # synthesize + cdk-nag checks
-cdk diff                                     # preview changes
-cdk destroy --all                            # tear down (does NOT destroy Starter Toolkit resources)
-agentcore destroy --agent openclaw_agent     # destroy Starter Toolkit resources
-```
-
-### Webhook Setup (Telegram)
-
-The setup script registers the webhook and adds you to the allowlist in one step:
-```bash
-./scripts/setup-telegram.sh
-```
-
-Or manually:
-```bash
-# Get Router API Gateway URL
-API_URL=$(aws cloudformation describe-stacks \
-  --stack-name OpenClawRouter \
-  --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
-  --output text --region $CDK_DEFAULT_REGION)
-
-# Get webhook secret (for Telegram request validation)
-WEBHOOK_SECRET=$(aws secretsmanager get-secret-value \
-  --secret-id openclaw/webhook-secret \
-  --region $CDK_DEFAULT_REGION --query SecretString --output text)
-
-# Set up Telegram webhook with secret_token for validation
-TELEGRAM_TOKEN=$(aws secretsmanager get-secret-value \
-  --secret-id openclaw/channels/telegram \
-  --region $CDK_DEFAULT_REGION --query SecretString --output text)
-curl "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}webhook/telegram&secret_token=${WEBHOOK_SECRET}"
-
-# Add yourself to the allowlist (find your ID via @userinfobot on Telegram)
-./scripts/manage-allowlist.sh add telegram:YOUR_TELEGRAM_USER_ID
-```
-
-### Channel Setup
-```bash
-# Store Telegram bot token
-aws secretsmanager update-secret \
-  --secret-id openclaw/channels/telegram \
-  --secret-string 'BOT_TOKEN' \
-  --region $CDK_DEFAULT_REGION
-
-# Store Slack credentials (JSON: bot token + signing secret for HMAC validation)
-aws secretsmanager update-secret \
-  --secret-id openclaw/channels/slack \
-  --secret-string '{"botToken":"xoxb-YOUR-BOT-TOKEN","signingSecret":"YOUR-SIGNING-SECRET"}' \
-  --region $CDK_DEFAULT_REGION
-```
-
-### Slack Setup (Event Subscriptions + Allowlist)
-```bash
-./scripts/setup-slack.sh
-```
-This displays the webhook URL for Slack Event Subscriptions, prompts for your Slack member ID, and adds you to the allowlist.
-
-### Feishu Setup (Event Subscriptions + Allowlist)
-```bash
-./scripts/setup-feishu.sh
-```
-This displays the webhook URL, guides you through Feishu developer console setup (app creation, permissions, events, publishing), stores credentials in Secrets Manager, and adds you to the allowlist. Store credentials format: `{"appId":"...","appSecret":"...","verificationToken":"...","encryptKey":"..."}`
-
-### Deploy New Bridge Version (Starter Toolkit — preferred)
-
-The project uses **CDK + AgentCore Starter Toolkit hybrid deployment**:
-- **CDK** manages infrastructure (VPC, Lambda, DynamoDB, S3, etc.)
-- **Starter Toolkit (`agentcore` CLI)** manages the AgentCore Runtime (container image, lifecycle config)
-
-Config file: `.bedrock_agentcore.yaml` (in repo root, on `deploy/starter-toolkit-hybrid` branch)
+Safe local checks are credential-free:
 
 ```bash
-# 1. Build image locally
-docker build --platform linux/arm64 -t openclaw-bridge:v${TAG} bridge/
-
-# 2. Push to ECR (starter toolkit ECR repo, NOT the CDK one)
-ECR_REPO=<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/bedrock-agentcore-openclaw_agent
-aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin $ECR_REPO
-docker tag openclaw-bridge:v${TAG} ${ECR_REPO}:v${TAG}
-docker push ${ECR_REPO}:v${TAG}
-
-# 3. Update AgentCore Runtime to use new image
-#    CRITICAL: update-agent-runtime is a FULL REPLACE — any field you omit gets cleared!
-#    You MUST include --environment-variables every time, or all env vars will be wiped.
-aws bedrock-agentcore-control update-agent-runtime \
-  --agent-runtime-id <RUNTIME_ID> \
-  --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"${ECR_REPO}:v${TAG}\"}}" \
-  --role-arn "arn:aws:iam::<ACCOUNT_ID>:role/openclaw-agentcore-execution-role-us-west-2" \
-  --network-configuration '{"networkMode":"VPC","networkModeConfig":{"securityGroups":["<SECURITY_GROUP_ID>"],"subnets":["<PRIVATE_SUBNET_1>","<PRIVATE_SUBNET_2>"]}}' \
-  --environment-variables '{
-    "AWS_REGION":"us-west-2",
-    "BEDROCK_AGENTCORE_MEMORY_ID":"<MEMORY_ID>",
-    "BEDROCK_AGENTCORE_MEMORY_NAME":"openclaw_agent_mem",
-    "BEDROCK_MODEL_ID":"global.anthropic.claude-opus-4-6-v1",
-    "COGNITO_CLIENT_ID":"<COGNITO_CLIENT_ID>",
-    "COGNITO_PASSWORD_SECRET_ID":"openclaw/cognito-password-secret",
-    "COGNITO_USER_POOL_ID":"<COGNITO_USER_POOL_ID>",
-    "CRON_LAMBDA_ARN":"arn:aws:lambda:us-west-2:<ACCOUNT_ID>:function:openclaw-cron-executor",
-    "CRON_LEAD_TIME_MINUTES":"5",
-    "EVENTBRIDGE_ROLE_ARN":"arn:aws:iam::<ACCOUNT_ID>:role/openclaw-cron-scheduler-role-us-west-2",
-    "EVENTBRIDGE_SCHEDULE_GROUP":"openclaw-cron",
-    "EXECUTION_ROLE_ARN":"arn:aws:iam::<ACCOUNT_ID>:role/openclaw-agentcore-execution-role-us-west-2",
-    "GATEWAY_TOKEN_SECRET_ID":"openclaw/gateway-token",
-    "IDENTITY_TABLE_NAME":"openclaw-identity",
-    "S3_USER_FILES_BUCKET":"openclaw-user-files-<ACCOUNT_ID>-us-west-2",
-    "SUBAGENT_BEDROCK_MODEL_ID":"global.anthropic.claude-opus-4-6-v1"
-  }' \
-  --region us-west-2
-
-# 4. Verify update completed
-aws bedrock-agentcore-control get-agent-runtime \
-  --agent-runtime-id <RUNTIME_ID> --region us-west-2 \
-  --query '{status:status,version:agentRuntimeVersion,image:agentRuntimeArtifact.containerConfiguration.containerUri}'
-
-# 5. New sessions will use the new image automatically (per-user idle termination)
+./scripts/test-local.sh
+./.venv/bin/python scripts/staging-release.py --help
+./.venv/bin/python scripts/staging-release.py \
+  --status .release/<exact-commit>/staging-transaction.json
 ```
 
-#### Starter Toolkit CLI (`agentcore`)
+A release preflight is also local and creates only a canonical journal for the
+exact clean Git commit/tree, explicit non-synthetic account, and
+`eu-west-1`. It does not discover credentials or mutate AWS:
 
 ```bash
-# Check runtime status
-agentcore status
-
-# Deploy via CodeBuild (cloud build, no local Docker needed)
-agentcore deploy -a openclaw_agent --auto-update-on-conflict --image-tag v${TAG}
-
-# Deploy with local build (requires Docker)
-agentcore deploy -a openclaw_agent --local-build --auto-update-on-conflict --image-tag v${TAG}
-
-# Stop a runtime session
-agentcore stop-session
-
-# Invoke runtime for testing
-agentcore invoke -a openclaw_agent
+./.venv/bin/python scripts/staging-release.py \
+  --preflight \
+  --journal .release/<exact-commit>/staging-transaction.json \
+  --account <12-digit-account> \
+  --region eu-west-1 \
+  --commit <exact-40-character-HEAD>
 ```
 
-#### Stop a Running Session
+Every later phase is an explicit write-ahead transaction boundary. Follow
+`docs/OPERATIONS.md` only after the candidate, exact operation digest,
+confirmation string, change sets, immutable image evidence, and rollback
+reference receive separate human review. Unknown provider outcomes remain
+`UNCERTAIN`; never guess `persisted` or `absent`, never replay a mutation
+without authoritative reconciliation, and never use a mutable `DEFAULT`
+endpoint.
 
-Required when deploying a new image and you need the user's next message to start a fresh session with the new version. Also useful for debugging.
-
-```bash
-# 1. Get the session ID from DynamoDB (look up by user's internal ID)
-aws dynamodb query --table-name openclaw-identity --region us-west-2 \
-  --key-condition-expression "PK = :pk AND SK = :sk" \
-  --expression-attribute-values '{":pk":{"S":"USER#<internalUserId>"},":sk":{"S":"SESSION"}}' \
-  --query 'Items[0].sessionId.S' --output text
-
-# 2. Stop the session via data plane API
-aws bedrock-agentcore stop-runtime-session \
-  --agent-runtime-arn "arn:aws:bedrock-agentcore:us-west-2:<ACCOUNT_ID>:runtime/<RUNTIME_ID>" \
-  --runtime-session-id "<sessionId>" \
-  --region us-west-2
-```
-
-The session receives SIGTERM, saves workspace to S3, and shuts down. The next message from that user triggers a new session with the latest image.
-
-#### Key IDs (us-west-2)
-- **Runtime ID**: `<RUNTIME_ID>`
-- **Runtime ARN**: `arn:aws:bedrock-agentcore:us-west-2:<ACCOUNT_ID>:runtime/<RUNTIME_ID>`
-- **ECR Repo**: `<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/bedrock-agentcore-openclaw_agent`
-- **Execution Role**: `arn:aws:iam::<ACCOUNT_ID>:role/openclaw-agentcore-execution-role-us-west-2`
-- **Control Plane API**: `aws bedrock-agentcore-control` (get/update/list runtime, endpoints, sessions)
-- **Data Plane API**: `aws bedrock-agentcore` (invoke-agent-runtime, stop-runtime-session)
-
-### Deploy New Bridge Version (CDK — legacy, infrastructure only)
-```bash
-# CDK no longer manages the AgentCore Runtime container image.
-# Use CDK only for infrastructure changes (Lambda, DynamoDB, VPC, etc.)
-source .venv/bin/activate && cdk deploy --all --require-approval never
-```
-
-> ⚠️ **Always run `./post-deploy.sh` after any CDK deploy.** This applies `auto-delete=no` tags to all
-> OpenClaw resources to prevent automated cleanup processes from deleting production infrastructure.
-> The script is gitignored (internal only) — if it doesn't exist, ask the user to restore it.
-
-### Bridge Tests
-```bash
-cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
-cd bridge && node --test image-support.test.js         # image upload + multimodal tests
-cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
-cd bridge && node --test subagent-routing.test.js      # subagent model routing + detection tests
-cd bridge && node --test content-extraction.test.js    # recursive content block extraction tests
-cd bridge && node --test scoped-credentials.test.js    # per-user STS credential scoping tests
-cd bridge && node --test workspace-sync.test.js        # workspace sync credential tests
-cd bridge && node --test agentcore-browser.test.js     # browser skill unit tests
-cd bridge && node --test browser-lifecycle.test.js     # browser session lifecycle tests
-cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
-```
-
-### Router Lambda Tests
-```bash
-cd lambda/router && python -m pytest test_image_upload.py -v        # image upload unit tests
-cd lambda/router && python -m pytest test_content_extraction.py -v  # content block extraction tests
-cd lambda/router && python -m pytest test_markdown_html.py -v       # markdown-to-HTML conversion tests
-cd lambda/router && python -m pytest test_screenshot_handling.py -v # screenshot marker detection + delivery tests
-```
-
-### E2E Tests
-```bash
-cd tests/e2e && python -m pytest bot_test.py -v                    # simulated Telegram webhook tests (requires deployed stack)
-cd tests/e2e && python -m pytest bot_test.py -v -k TestBrowserFeature  # browser E2E tests (requires enable_browser=true)
-```
-
-### Runtime Operations
-```bash
-# Get runtime status (via Starter Toolkit)
-agentcore status --agent openclaw_agent --verbose
-
-# Get container-level status (openclawReady, proxyReady, uptime, logs)
-agentcore invoke '{"action":"status"}' -a openclaw_agent
-
-# Send test chat to trigger init + verify end-to-end
-agentcore invoke '{"action":"chat","userId":"test","actorId":"test:123","channel":"test","message":"hello"}' -a openclaw_agent
-
-# Stop a specific session (forces new container on next invocation)
-# IMPORTANT: update-agent-runtime changes env vars but does NOT replace running containers.
-# You must stop-session to force a fresh container with updated env vars.
-agentcore stop-session -a openclaw_agent -s <SESSION_ID>
-
-# Find session ID from Router Lambda logs
-aws logs filter-log-events --log-group-name /openclaw/lambda/router --region $CDK_DEFAULT_REGION \
-  --start-time $(python3 -c "import time; print(int((time.time()-3600)*1000))") \
-  --filter-pattern "session=ses_" --query 'events[-1].message' --output text
-
-# Update runtime config (env vars, image, subnets) — bypasses Starter Toolkit limitations
-aws bedrock-agentcore-control update-agent-runtime \
-  --agent-runtime-id <RUNTIME_ID> \
-  --role-arn "arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/openclaw-agentcore-execution-role-$CDK_DEFAULT_REGION" \
-  --agent-runtime-artifact '{"containerConfiguration":{"containerUri":"<ECR_URI>:<TAG>"}}' \
-  --network-configuration '{"networkMode":"VPC","networkModeConfig":{"subnets":["<SUBNET1>","<SUBNET2>"],"securityGroups":["<SG>"]}}' \
-  --environment-variables '{...}' \
-  --region $CDK_DEFAULT_REGION
-
-# Check DynamoDB identity table
-aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
-
-# Check Router Lambda errors (last 5 min)
-aws logs filter-log-events --log-group-name /openclaw/lambda/router --region $CDK_DEFAULT_REGION \
-  --start-time $(python3 -c "import time; print(int((time.time()-300)*1000))") \
-  --filter-pattern "ERROR" --query 'events[*].message' --output text
-
-# Check ECR images
-aws ecr describe-images --repository-name bedrock-agentcore-openclaw_agent --region $CDK_DEFAULT_REGION \
-  --query 'imageDetails[*].{tag:imageTags[0],size:imageSizeInBytes,pushed:imagePushedAt}' --output table
-```
-
-### Docker Build & Push (local)
-```bash
-# Build ARM64 image from current branch
-cd bridge && sudo docker build --platform linux/arm64 -t openclaw-bridge:latest .
-
-# Test locally before pushing
-sudo docker run --rm -d --name test -p 8080:8080 -e AWS_REGION=$CDK_DEFAULT_REGION openclaw-bridge:latest
-curl http://localhost:8080/ping   # should return {"status":"Healthy",...}
-sudo docker stop test
-
-# Login + push to ECR
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-aws ecr get-login-password --region $CDK_DEFAULT_REGION | sudo docker login --username AWS --password-stdin $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com
-sudo docker tag openclaw-bridge:latest $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agentcore-openclaw_agent:local-build
-sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agentcore-openclaw_agent:local-build
-```
-
-## Key Configuration (cdk.json)
-
-| Parameter | Default | Description |
-|---|---|---|
-| `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` |
-| `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
-| `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID for Claude Opus 4.6. The `global.` prefix routes to any available region |
-| `runtime_id` | (empty) | AgentCore Runtime ID from Starter Toolkit. Populated by deploy script after `agentcore deploy` |
-| `runtime_endpoint_id` | (empty) | Exact service endpoint ID for the separately provisioned release endpoint; mutable `DEFAULT` endpoints are rejected |
-| `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
-| `cloudwatch_log_retention_days` | `30` | Log retention |
-| `daily_token_budget` | `1000000` | Token budget alarm threshold |
-| `daily_cost_budget_usd` | `5` | Cost budget alarm threshold |
-| `token_ttl_days` | `90` | DynamoDB TTL |
-| `user_files_ttl_days` | `365` | S3 per-user file expiration |
-| `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |
-| `session_max_lifetime` | `28800` | Per-user session max lifetime (seconds) |
-| `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
-| `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
-| `router_lambda_memory_mb` | `256` | Router Lambda memory |
-| `registration_open` | `false` | If true, any user can register. If false, only allowlisted users |
-| `cron_lambda_timeout_seconds` | `600` | Cron executor Lambda timeout (must exceed warmup time) |
-| `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
-| `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail (S3 bucket + trail). Off by default — most accounts already have one |
-| `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
-| `subagent_model_id` | (empty) | Bedrock model for sub-agents. Empty = use `default_model_id` |
-| `enable_browser` | `false` | Enable headless Chromium browser. Sets `BROWSER_IDENTIFIER` env var on container |
-
-## Container Startup Sequence
-
-1. **entrypoint.sh**: Configure Node.js IPv4 DNS patch, start contract server
-2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
-3. **On first `/invocations` with `action: chat` or `action: warmup`** (lazy init):
-   - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
-   - Create STS scoped credentials restricting S3 + Secrets Manager + DynamoDB to user's namespace
-   - Configure workspace-sync with scoped credentials
-   - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
-   - Start OpenClaw gateway (port 18789) with scoped credentials env (no container credentials)
-   - Set up session storage symlink (`~/.openclaw` → `/mnt/workspace/.openclaw`)
-   - If session storage empty: restore `.openclaw/` from S3 via `workspace-sync.js`
-   - Start credential refresh timer (45 min interval)
-   - If `BROWSER_IDENTIFIER` set: create browser session via AgentCore Browser API, write session file to `/tmp/agentcore-browser-session.json`
-   - Wait for proxy only (~5s)
-4. **Warm-up phase** (t=~10s to ~1-2min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, clawhub-manage, api-keys, web_fetch, web_search tools)
-5. **Handoff** (~1-2min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
-6. **After handoff**: Full OpenClaw features — `web_fetch`, `web_search` (built-in), 5 ClawHub skills (Jina reader, deep-research-pro, etc.), sub-agent support, session management
-7. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
-8. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
-9. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
-10. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
-
-## DynamoDB Identity Table Schema
-
-**Table: `openclaw-identity`** (PAY_PER_REQUEST, TTL on `ttl` attribute)
-
-| PK | SK | Purpose |
-|---|---|---|
-| `CHANNEL#telegram:123456789` | `PROFILE` | Channel→user lookup |
-| `USER#user_abc123` | `PROFILE` | User profile |
-| `USER#user_abc123` | `CHANNEL#telegram:123456789` | User's bound channels |
-| `USER#user_abc123` | `SESSION` | Current session |
-| `BIND#ABC123` | `BIND` | Cross-channel bind code (10 min TTL) |
-| `ALLOW#telegram:123456789` | `ALLOW` | User allowlist entry |
-| `USER#user_abc123` | `CRON#schedule-name` | User's cron schedule metadata (expression, message, timezone, channel) |
-
-**Cross-channel binding**: User says "link accounts" on Telegram → gets 6-char code → enters code on Slack → both channels route to same user/session.
-
-### User Allowlist
-
-When `registration_open` is `false` (default), only users with an `ALLOW#` record in DynamoDB can register. Existing users (already have a `CHANNEL#` record) are always allowed. Cross-channel binding bypasses the allowlist since it links to an already-approved user.
-
-Unauthorized users who message the bot receive a rejection message that includes their channel ID (e.g. `telegram:123456`), so they can share it with the admin for onboarding.
-
-#### First-User Bootstrap
-
-After initial deployment, no users exist. The easiest path is the setup script, which registers the webhook and adds you to the allowlist in one step:
-
-```bash
-./scripts/setup-telegram.sh
-```
-
-Alternatively, if you don't know your Telegram user ID:
-
-1. Message the bot from Telegram
-2. The bot replies with a rejection message showing your ID, e.g. `telegram:123456`
-3. Add yourself to the allowlist:
-   ```bash
-   ./scripts/manage-allowlist.sh add telegram:123456
-   ```
-4. Message the bot again — you are now registered
-
-#### Adding New Users
-
-When someone wants access to the bot:
-
-1. They message the bot and receive: *"Your ID: `telegram:789012`. Send this ID to the bot admin to request access."*
-2. The admin adds them:
-   ```bash
-   ./scripts/manage-allowlist.sh add telegram:789012
-   ```
-3. The user messages the bot again — they are now registered
-
-#### Managing the Allowlist
-
-```bash
-# Add a user to the allowlist
-./scripts/manage-allowlist.sh add telegram:123456
-
-# Remove a user
-./scripts/manage-allowlist.sh remove telegram:123456
-
-# List all allowed users
-./scripts/manage-allowlist.sh list
-```
-
-Only the **first channel identity** needs to be allowlisted. When a user binds a second channel (e.g. Slack) via `link`, the new channel maps to their existing approved user — no separate allowlist entry needed.
-
-## Gotchas
-
-### AgentCore Runtime
-- **Hybrid deploy**: Runtime/Endpoint/ECR managed by Starter Toolkit (`agentcore deploy`), not CDK. CDK manages IAM Role, SG, S3, Lambda, etc. See `./scripts/deploy.sh` for the 3-phase flow
-- **ARM64 required**: Build with `--platform linux/arm64`. This machine is ARM64 native — use `--local-build` mode
-- **Docker Hub rate limit**: Dockerfile uses `public.ecr.aws/docker/library/node:22-slim` (ECR Public Gallery) instead of Docker Hub to avoid anonymous pull rate limits in CodeBuild
-- **IAM role names are region-suffixed**: `openclaw-agentcore-execution-role-{region}` and `openclaw-cron-scheduler-role-{region}` to avoid cross-region conflicts (IAM roles are global)
-- **Trust policy self-assume**: Uses `AccountRootPrincipal()` + `ArnEquals` condition (not `ArnPrincipal`) to avoid chicken-and-egg during role creation
-- **`update-agent-runtime` is a FULL REPLACE**: Omitting `--environment-variables` wipes ALL env vars. Always include the full env vars JSON in every update call. This is the most common deployment mistake — the container starts but init fails because secrets/config env vars are missing
-- **Resource names**: Must match `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` — underscores, not hyphens
-- **Health check timing**: Contract server on port 8080 must start within seconds
-- **Per-user sessions**: Contract returns `Healthy` (not `HealthyBusy`) — allows natural idle termination
-- **Session recreation**: InvokeAgentRuntime with terminated session creates new microVM; workspace restored on init
-- **VPC endpoints**: `bedrock-agentcore-runtime` endpoint not available in all regions
-- **Starter Toolkit source_path**: Must point to `bridge/` directory (contains Dockerfile and all COPY sources). If source_path is project root, COPY commands fail because paths are relative to bridge/
-
-### IAM / Bedrock
-- **Cross-region inference**: Model `minimax.minimax-m2.1` uses a global cross-region inference profile that routes to any available region — IAM uses `arn:aws:bedrock:*::foundation-model/*` and inference-profile wildcards
-- **Inference profile ARN**: Separate from foundation model — `arn:aws:bedrock:{region}:{account}:inference-profile/*`
-
-### Node.js 22 + VPC
-- **IPv6 issue**: Node.js 22 Happy Eyeballs fails in VPCs without IPv6 — `force-ipv4.js` patches `dns.lookup()` to force IPv4
-- **NODE_OPTIONS**: `--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js`
-
-### CDK
-- `logs.RetentionDays` is an enum — use helper in `stacks/__init__.py`
-- Cross-stack cyclic deps: use string ARN params + `add_to_policy()` instead of `grant_*()`
-- Empty `cdk.json` account: falls back to `CDK_DEFAULT_ACCOUNT` env var via `app.py`
-
-### OpenClaw
-- Startup takes ~1-2 minutes (plugin registration); lightweight agent shim handles messages during this time
-- Correct start command: `openclaw gateway run --port 18789 --verbose` (no `--bind lan` — localhost binding sufficient since both processes run in the same container)
-- **Tool profile**: Uses `"full"` profile with a deny list. Do NOT use `"basic"` (undocumented, may disable web tools). Documented profiles: `minimal`, `coding`, `messaging`, `full`
-- **Deny list**: `["write", "edit", "apply_patch", "read", "browser", "canvas", "cron", "gateway"]` — local writes use S3 skill, `read` blocked to prevent credential reads, no browser/UI in container, EventBridge replaces built-in cron. `exec` is NOT denied — skills like `clawhub-manage` need it; scoped STS credentials limit blast radius
-- **Sub-agent sandbox**: Must be `"off"` — no Docker inside AgentCore microVMs. MicroVMs already provide per-user isolation
-- **Sub-agent model**: Configurable via `SUBAGENT_BEDROCK_MODEL_ID` env var (from `subagent_model_id` in cdk.json). Empty = use same as main model. Subagents use a distinct model name (`bedrock-agentcore-subagent`) so the proxy can detect and count them separately
-- **`skipBootstrap` removed**: No longer a valid config key — OpenClaw rejects unknown keys and exits with code 1
-- **`skills.allowBundled`**: Must be an array (e.g., `[]` for none, `["*"]` for all), not a boolean. Set to `[]` for fast startup
-- **ClawHub skill paths**: `clawhub install` installs to managed skills path — OpenClaw scans this automatically. Custom skills in `/skills/` loaded via `extraDirs`
-- **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--no-input --force` for non-interactive Docker builds
-- **5 ClawHub skills installed**: jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer (reduced from 8 — duckduckgo-search, hackernews, news-feed removed to optimize cold start; web search handled by lightweight agent's built-in web_search tool)
-- **Image updates**: New sessions use new image automatically (no keepalive restart needed)
-- **WebSocket bridge protocol**: Connect → auth (type:req, method:connect, protocol:3, auth:{token}) → agent.chat → streaming deltas → final
-- **OpenClaw 2026.3.2 WebSocket origin enforcement**: OpenClaw enforces origin checks on all WebSocket connections that carry an `Origin` header. The `ws` Node.js library must use the `origin` **option** (not `headers.Origin`) to set the header correctly for the HTTP upgrade request. Config: `controlUi: { enabled: false, allowInsecureAuth: true, dangerouslyDisableDeviceAuth: true, allowedOrigins: ["*"] }`. Without both the `origin` option on the client and `allowedOrigins` in config, connections fail with "Auth failed: origin not allowed"
-- **Workspace sync overwrites config**: The `.openclaw/` S3 sync can overwrite `openclaw.json` with stale configs. `openclaw.json` is excluded from sync via SKIP_PATTERNS — config is always programmatically generated by `writeOpenClawConfig()`
-
-### Cognito Identity
-- Self-signup disabled — users auto-provisioned by proxy via `AdminCreateUser`
-- Passwords: `HMAC-SHA256(secret, actorId).slice(0, 32)` — deterministic, never stored
-- Usernames are channel-prefixed: `telegram:123456789`
-- JWT tokens cached per user with 60s early refresh
-
-### Router Lambda
-- **API Gateway HTTP API**: Only explicit routes exposed (`POST /webhook/telegram`, `POST /webhook/slack`, `GET /health`). Rate limiting: burst 50, sustained 100 req/s
-- **Webhook validation**: Telegram uses `X-Telegram-Bot-Api-Secret-Token` header (set via `secret_token` on `setWebhook`). Slack uses `X-Slack-Signature` HMAC-SHA256 with 5-minute replay window
-- **Async dispatch**: Self-invokes with `InvocationType=Event` for actual processing; returns 200 immediately to webhook
-- **Slack**: Handles `url_verification` challenge synchronously; ignores retries via `x-slack-retry-num` header
-- **Cold start latency**: First message to a new user triggers microVM creation; lightweight agent responds in ~10-15s while OpenClaw starts in background (~1-2 min)
-- **Typing indicator + progress message**: Telegram typing indicator sent every 4s while waiting; after 30s of waiting, a one-time progress message ("Working on your request...") is sent to both Telegram and Slack so users know the bot is still working during long subagent tasks
-- **Content block extraction**: `_extract_text_from_content_blocks()` recursively unwraps nested `[{"type":"text","text":"..."}]` JSON — subagent responses (deep-research-pro, task-decomposer) can wrap content multiple levels deep
-- **Markdown-to-HTML conversion**: `_markdown_to_telegram_html()` converts markdown to Telegram-compatible HTML before sending. Handles bold, italic, strikethrough, code blocks, inline code, headers, links, blockquotes, horizontal rules, and markdown tables (rendered as monospace `<pre>` blocks with aligned columns). Uses `parse_mode: "HTML"` (not `"Markdown"` v1 which is too strict for AI-generated content)
-- **Cross-channel binding**: "link accounts" generates 6-char code in DynamoDB with 10-min TTL
-- **Image uploads**: Telegram photos and Slack file attachments (JPEG, PNG, GIF, WebP, max 3.75 MB) are downloaded by the Router Lambda, uploaded to S3 under `{namespace}/_uploads/`, and passed to AgentCore as a structured message `{text, images[{s3Key, contentType}]}`
-- **Telegram captions**: `message.get("text", "") or message.get("caption", "")` — photos use `caption`, not `text`
-- **Secret cache TTL**: Secrets Manager values cached for 15 minutes (was indefinite). Rotated secrets reflected within 15 min without container restart
-
-### Image Upload Flow
-- **Router Lambda** downloads image from channel API (Telegram `getFile` / Slack `url_private_download`), uploads to S3 `{namespace}/_uploads/img_{ts}_{hex}.{ext}`
-- **Contract server** converts structured message to bridge text with `[OPENCLAW_IMAGES:[...]]` marker appended
-- **Proxy** extracts marker via regex, fetches image bytes from S3 (with namespace validation to prevent cross-user reads), builds Bedrock multimodal content blocks (`{image: {format, source: {bytes}}}`)
-- **Supported types**: `image/jpeg`, `image/png`, `image/gif`, `image/webp` (max 3.75 MB per Bedrock limit)
-- **Security**: S3 key validated against user's namespace prefix + path traversal (`..`) rejection. Format validated against `VALID_BEDROCK_FORMATS` set
-- **Slack prerequisite**: Bot needs `files:read` OAuth scope to download image files
-
-### Workspace Persistence (Session Storage + S3 Backup)
-- **Primary**: AgentCore Session Storage — service-managed persistent filesystem mounted at `/mnt/workspace`. Data survives session stop/resume automatically. Configured via `filesystemConfigurations` on the Runtime
-- **Symlink**: `~/.openclaw` → `/mnt/workspace/.openclaw` — created during lazy init, transparent to OpenClaw and all skills
-- **S3 backup**: `workspace-sync.js` continues to run at 5 min interval (unchanged). Backs up to `{namespace}/.openclaw/` in the user files S3 bucket
-- **Restore logic**: On init, if session storage has existing data → skip S3 restore (resumed session). If empty → restore from S3 backup (new session or version update)
-- **Fallback**: If session storage mount not available → full S3 sync mode (5 min interval, existing behavior)
-- **Data lifecycle**: Session storage cleared on 14-day inactivity or runtime version update. S3 backup preserves data across these events
-- **⚠️ Version update clears session storage**: Every `update-agent-runtime` (new container image) resets session storage to empty. S3 backup auto-restores on next session start, but there is a window where the latest changes (since last S3 backup) may be lost. Always ensure S3 backup has run before deploying new versions
-- **VPC permissions**: S3 Gateway Endpoint defaults to allow-all — no policy change needed. Session storage is managed by AgentCore platform (not the execution role), so no IAM changes required
-- **SIGTERM grace**: Platform flushes session storage + 10s for S3 final backup
-- **Skip patterns**: `node_modules/`, `.cache/`, `*.log`, files > 10MB (S3 backup only)
-- **Same S3 bucket**: Uses `S3_USER_FILES_BUCKET` (shared with s3-user-files skill)
-
-### EventBridge Cron Scheduling
-- **Schedule group**: All schedules created under `openclaw-cron` group in EventBridge Scheduler
-- **Schedule naming**: `openclaw-{namespace}-{shortId}` (e.g., `openclaw-telegram_123456789-87a86927`)
-- **DynamoDB storage**: Schedule metadata stored as `CRON#` SK under the user's PK in the identity table
-- **Cron executor Lambda**: Warms up the user's AgentCore session (sends `action: warmup`), then sends the cron message (sends `action: cron`), then delivers the response to the user's chat channel
-- **Lead time**: Cron Lambda invoked with `cron_lead_time_minutes` (default 5 min) to allow session warmup before the scheduled time
-- **Environment variables**: Container receives `EVENTBRIDGE_SCHEDULE_GROUP`, `CRON_LAMBDA_ARN`, `EVENTBRIDGE_ROLE_ARN`, `IDENTITY_TABLE_NAME`, `CRON_LEAD_TIME_MINUTES` for the eventbridge-cron skill
-
-### AgentCore Browser (Optional)
-- **Opt-in**: Only active when `enable_browser=true` in `cdk.json` and `BROWSER_IDENTIFIER` is set as container env var
-- **Session file**: `/tmp/agentcore-browser-session.json` — written by contract server on init, read by skill scripts
-- **Session timeout**: 1 hour (`BROWSER_SESSION_TIMEOUT_SECONDS = 3600`). Session recreated automatically on expiry
-- **Screenshot delivery**: Screenshots uploaded to `{namespace}/_screenshots/` in S3, embedded in response as `[SCREENSHOT:key]` marker. Router Lambda detects markers and delivers as photos to Telegram/Slack
-- **Not available during warm-up**: Browser skill requires full OpenClaw startup — the lightweight agent does not include browser tools
-- **Lifecycle**: `startBrowserSession()` called during init (parallel with proxy/OpenClaw start), `stopBrowserSession()` called on SIGTERM
-- **Skill scripts**: `navigate.js` (CDP Page.navigate), `screenshot.js` (CDP Page.captureScreenshot → S3 upload), `interact.js` (click/type/scroll/wait via CDP)
-
-### Per-User Identity Resolution
-- **Priority order**: (0) `USER_ID` env var (set by contract server) → (1) `x-openclaw-actor-id` header → (2) OpenAI `user` field → (3) message envelope parsing → (4) message `name` field → (5) fallback `default-user`
-- **Per-user sessions**: Contract server sets `USER_ID` env var when starting proxy, so identity is always resolved from environment in per-user mode
-- **S3-backed isolation**: User files in `s3://openclaw-user-files-{account}-{region}/{namespace}/`
-- **Namespace immutability**: System-determined from channel identity, cannot be changed by user request
-- **actorId vs namespace**: actorId uses colon format (`telegram:123456789`), namespace uses underscore format (`telegram_123456789`). Skill scripts (s3-user-files, eventbridge-cron) expect namespace format. The lightweight agent's `chat()` converts via `userId.replace(/:/g, "_")` before passing to tools. The proxy and workspace sync also use namespace format for S3 keys
+All external gates are currently open: Docker-backed artifact reproduction,
+AWS identity and IAM, ECR push/sign/scan/SBOM/provenance, AgentCore readiness,
+change-set inspection, consumers, provider credentials, and pilot evidence.
+Local implementation work must not claim or perform any of them.
 
 ### Per-User Credential Isolation
 - **STS session-scoped credentials**: On init, the contract server calls `STS:AssumeRole` on the execution role with a minimal session policy that restricts S3 access to `{namespace}/*`. Other services (DynamoDB, Scheduler, SecretsManager) use `Resource: "*"` in the session policy — the execution role's own policy provides the actual resource-level restrictions. This design keeps the session policy under the **AWS 2048-byte packed limit** (long policies with per-resource Conditions easily exceed this)
@@ -734,7 +248,11 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 Always confirm which git branch you are on BEFORE making any code changes or deployments. If the user specifies a branch, switch to it first and verify with `git branch --show-current`. Never assume the current branch is correct.
 
 ### Deployment Target
-Default deployment region is `us-west-2`. Hybrid deployment: CDK manages infrastructure (VPC, IAM, S3, Lambda, etc.), Starter Toolkit manages Runtime/Endpoint/ECR/Docker build. Use `./scripts/deploy.sh` for the full 3-phase flow. After deploying, verify the old session/container is replaced — stale sessions can mask fixes.
+The only release region is `eu-west-1`. CDK owns the retained immutable ECR
+and signing foundation plus digest-bound AgentCore Runtime/Endpoint L1s. The
+canonical staging journal and reviewed phase operations are the sole release
+path. Direct deployment, mutable tag, endpoint retarget, and Starter Toolkit
+paths are prohibited.
 
 ### Git Operations
 Never push to any remote (GitHub, GitLab, or otherwise) without explicit user confirmation. Always ask before pushing.
@@ -778,14 +296,16 @@ To add a new messaging channel (e.g., WhatsApp, Discord, LINE), follow the Feish
 - **User ID format**: `<channel>:<platform_user_id>` (e.g., `feishu:ou_xxxx`, `telegram:123456`)
 - **Event encryption**: Some platforms (Feishu) encrypt webhook events. Decrypt in the handler using platform-provided keys. Use system libcrypto (ctypes) for AES to avoid native dependency issues across Lambda architectures
 
-## Deployment Gotchas (Learned the Hard Way)
+## Release invariants
 
-### Starter Toolkit + CDK Hybrid
-- **ECR repo naming**: Starter Toolkit creates repos with `bedrock-agentcore-` prefix (e.g., `bedrock-agentcore-openclaw_agent`). CDK IAM policies must include this pattern — mismatch causes "initialization exceeded 120s" (misleading error, actually ECR permission denied)
-- **`update-agent-runtime` does NOT replace running containers**: Env var changes only apply to NEW sessions. Always `agentcore stop-session` after updating runtime env vars
-- **Starter Toolkit `--local-build` skips CodeBuild**: Useful for pre-pushed images. Default mode always triggers CodeBuild which rebuilds and overwrites the image tag
-- **Starter Toolkit VPC subnet changes**: "Immutable" via `agentcore configure`, but actually mutable via direct `aws bedrock-agentcore-control update-agent-runtime` API
-- **CodeBuild Docker Hub rate limit**: Dockerfile must use `public.ecr.aws/docker/library/node:22-slim` instead of Docker Hub
+- The retained repository name is exactly `personal-operator/bridge` and tags
+  are immutable. Runtime input is always an exact `@sha256:` URI.
+- A release endpoint is commit-named and never retargeted. Runtime and endpoint
+  evidence must match the exact account, region, commit, role, image, and
+  version recorded by the transaction.
+- An ambiguous phase or rollback remains `UNCERTAIN` until a phase-specific
+  authoritative read proves the exact subject persisted or is absent.
+- Do not revive the archived Starter Toolkit or direct Runtime mutation path.
 
 ### VPC + Bedrock
 - **Cross-region inference profiles work through VPC endpoints**: `global.anthropic.claude-opus-4-6-v1` works fine through `bedrock-runtime` VPC endpoint (despite initial suspicion otherwise)
