@@ -6,6 +6,9 @@ from pathlib import Path
 
 import aws_cdk as cdk
 from aws_cdk.assertions import Template
+from aws_cdk import aws_dynamodb as dynamodb
+from aws_cdk import aws_iam as iam
+from aws_cdk import aws_kms as kms
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +53,34 @@ def _actions(template: dict) -> set[str]:
             actions = statement.get("Action", [])
             result.update([actions] if isinstance(actions, str) else actions)
     return result
+
+
+def _reference_dynamodb_cmk_data_actions() -> set[str]:
+    app = cdk.App()
+    stack = cdk.Stack(
+        app,
+        "ReferenceDynamoCmk",
+        env=cdk.Environment(account=ACCOUNT, region=REGION),
+    )
+    key = kms.Key(stack, "ReferenceKey")
+    table = dynamodb.Table(
+        stack,
+        "ReferenceTable",
+        partition_key=dynamodb.Attribute(
+            name="PK",
+            type=dynamodb.AttributeType.STRING,
+        ),
+        encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+        encryption_key=key,
+    )
+    role = iam.Role(
+        stack,
+        "ReferenceRole",
+        assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+    )
+    table.grant_read_write_data(role)
+    template = Template.from_stack(stack).to_json()
+    return {action for action in _actions(template) if action.startswith("kms:")}
 
 
 def test_capability_stack_is_one_fail_closed_gateway_with_exact_identity():
@@ -99,7 +130,8 @@ def test_gateway_role_has_only_exact_logs_dynamo_and_kms_authority():
         "kms:Decrypt",
         "kms:DescribeKey",
         "kms:Encrypt",
-        "kms:GenerateDataKey",
+        "kms:GenerateDataKey*",
+        "kms:ReEncrypt*",
         "logs:CreateLogStream",
         "logs:PutLogEvents",
     }
@@ -178,6 +210,36 @@ def test_gateway_dynamo_and_kms_statements_are_resource_and_condition_bounded():
             "kms:CallerAccount": ACCOUNT,
             "kms:ViaService": f"dynamodb.{REGION}.amazonaws.com",
         }
+    }
+
+
+def test_gateway_cmk_actions_match_cdk_dynamodb_data_plane_reference():
+    _, template = _synth_capability_stack()
+    statements = [
+        statement
+        for policy in _resources(template, "AWS::IAM::Policy")
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    production = next(
+        statement
+        for statement in statements
+        if "kms:Decrypt" in statement.get("Action", [])
+    )
+    reference = _reference_dynamodb_cmk_data_actions()
+
+    assert reference == {
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:Encrypt",
+        "kms:GenerateDataKey*",
+        "kms:ReEncrypt*",
+    }
+    assert set(production["Action"]) == reference
+    assert "kms:CreateGrant" not in production["Action"]
+    assert production["Resource"] == CMK_ARN
+    assert production["Condition"]["StringEquals"] == {
+        "kms:CallerAccount": ACCOUNT,
+        "kms:ViaService": f"dynamodb.{REGION}.amazonaws.com",
     }
 
 

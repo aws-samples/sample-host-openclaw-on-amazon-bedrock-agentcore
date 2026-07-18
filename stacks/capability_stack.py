@@ -132,7 +132,8 @@ class CapabilityStack(Stack):
                 actions=[
                     "kms:Decrypt",
                     "kms:Encrypt",
-                    "kms:GenerateDataKey",
+                    "kms:GenerateDataKey*",
+                    "kms:ReEncrypt*",
                     "kms:DescribeKey",
                 ],
                 resources=[cmk_arn],
@@ -203,6 +204,19 @@ class CapabilityStack(Stack):
                     applies_to=[
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:"
                         "/personal-operator/lambda/capability-gateway:*"
+                    ],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason=(
+                        "DynamoDB CMK data access requires both ReEncrypt directions "
+                        "and both GenerateDataKey variants; these actions remain "
+                        "restricted to the exact key, account, region, and "
+                        "DynamoDB via-service boundary."
+                    ),
+                    applies_to=[
+                        "Action::kms:GenerateDataKey*",
+                        "Action::kms:ReEncrypt*",
                     ],
                 ),
             ],
