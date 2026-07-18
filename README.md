@@ -24,9 +24,10 @@ foundation stage.
 The foundation and all three runtime-hardening gates are implemented locally.
 The runtime now has a frozen tool boundary, immutable per-user identity,
 S3-only scoped workspace credentials, and a manifest-based lossless workspace
-lifecycle. The final workspace integration is still undergoing exact-commit
-review. Nothing in this repository has been deployed and no real credentials
-or messages were used.
+lifecycle. Both final exact-commit reviews passed after the stale-writer,
+turn-overlap, proxy-reinitialization, shutdown-deadline, and health-accounting
+findings were closed. Nothing in this repository has been deployed and no real
+credentials or messages were used.
 
 The implementation proceeds in reviewed tasks described by the approved
 [design](docs/superpowers/specs/2026-07-17-personal-operator-v0-design.md) and

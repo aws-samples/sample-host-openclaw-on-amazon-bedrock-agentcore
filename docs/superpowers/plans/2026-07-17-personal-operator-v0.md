@@ -39,14 +39,14 @@
 **Interfaces:**
 - Produces a reproducible local test command and frozen product/runtime configuration consumed by every later task.
 
-- [ ] Add failing static configuration tests asserting the region/model/runtime defaults, Node base image, OpenClaw pin, invite-only registration, disabled browser, empty imported runtime IDs, and absence of ClawHub installation in the image.
-- [ ] Run `./.venv/bin/python -m pytest tests/test_product_configuration.py -v` and capture the expected failures against the imported sample.
-- [ ] Change product configuration to `eu-west-1`, `eu.anthropic.claude-sonnet-4-6`, browser disabled, 30-day pilot workspace retention, empty runtime IDs, and a fresh image version.
-- [ ] Upgrade the bridge image and package engine to Node 24.15+, pin OpenClaw 2026.7.2, and remove ClawHub CLI/community-skill installation from the image.
-- [ ] Add `scripts/test-local.sh` that runs Python unit tests, Node tests deterministically with `AWS_REGION=eu-west-1`, syntax checks, and CDK contract checks without cloud credentials.
-- [ ] Record the upstream commit/license, imported test failures, local toolchain, and commands in `docs/UPSTREAM.md` and `docs/BASELINE.md`; update the README product identity without claiming production readiness.
-- [ ] Run focused tests green, then the local suite. Record any remaining imported failures that Task 2 intentionally removes.
-- [ ] Commit as `chore(foundation): establish personal operator baseline`.
+- [x] Add failing static configuration tests asserting the region/model/runtime defaults, Node base image, OpenClaw pin, invite-only registration, disabled browser, empty imported runtime IDs, and absence of ClawHub installation in the image.
+- [x] Run `./.venv/bin/python -m pytest tests/test_product_configuration.py -v` and capture the expected failures against the imported sample.
+- [x] Change product configuration to `eu-west-1`, `eu.anthropic.claude-sonnet-4-6`, browser disabled, 30-day pilot workspace retention, empty runtime IDs, and a fresh image version.
+- [x] Upgrade the bridge image and package engine to Node 24.15+, pin OpenClaw 2026.7.2, and remove ClawHub CLI/community-skill installation from the image.
+- [x] Add `scripts/test-local.sh` that runs Python unit tests, Node tests deterministically with `AWS_REGION=eu-west-1`, syntax checks, and CDK contract checks without cloud credentials.
+- [x] Record the upstream commit/license, imported test failures, local toolchain, and commands in `docs/UPSTREAM.md` and `docs/BASELINE.md`; update the README product identity without claiming production readiness.
+- [x] Run focused tests green, then the local suite. Record any remaining imported failures that Task 2 intentionally removes.
+- [x] Commit as `chore(foundation): establish personal operator baseline`.
 
 ### Task 2: Curated and least-privilege OpenClaw runtime
 
@@ -66,13 +66,13 @@
 **Interfaces:**
 - Produces: `buildRuntimePolicy()` and `buildSessionPolicy(namespace, bucketArn)` with only scoped workspace and approved scheduling access.
 
-- [ ] Write failing tests proving arbitrary skill/API-key tools are absent, OpenClaw deny/allow rules are explicit, provider secrets are stripped, and session policies cannot read another namespace.
-- [ ] Run the focused tests and verify failures are caused by the experimental full-tool configuration.
-- [ ] Implement one frozen runtime policy shared by warm-up and full OpenClaw configuration; remove ClawHub/API-key scripts and all corresponding Secrets Manager/DynamoDB permissions.
-- [ ] Restrict workspace keys to the server-derived namespace and retain zero-access fallback if scoped STS assumption fails.
-- [ ] Regenerate runtime instructions so they describe only available curated capabilities and never encourage users to paste secrets.
-- [ ] Run bridge tests, syntax checks, static credential scans, and source searches for deleted capabilities.
-- [ ] Commit as `feat(runtime): enforce curated least-privilege tools`.
+- [x] Write failing tests proving arbitrary skill/API-key tools are absent, OpenClaw deny/allow rules are explicit, provider secrets are stripped, and session policies cannot read another namespace.
+- [x] Run the focused tests and verify failures are caused by the experimental full-tool configuration.
+- [x] Implement one frozen runtime policy shared by warm-up and full OpenClaw configuration; remove ClawHub/API-key scripts and all corresponding Secrets Manager/DynamoDB permissions.
+- [x] Restrict workspace keys to the server-derived namespace and retain zero-access fallback if scoped STS assumption fails.
+- [x] Regenerate runtime instructions so they describe only available curated capabilities and never encourage users to paste secrets.
+- [x] Run bridge tests, syntax checks, static credential scans, and source searches for deleted capabilities.
+- [x] Commit as `feat(runtime): enforce curated least-privilege tools`.
 
 ### Task 3: Runtime driver, leases, and durable workspace lifecycle
 
