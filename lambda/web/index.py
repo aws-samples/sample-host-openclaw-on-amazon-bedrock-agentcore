@@ -14,6 +14,13 @@ from urllib.parse import unquote_to_bytes
 
 from workflows.gmail.repository import READONLY_PROVIDER
 
+from portable.manifest import (
+    BundleIntegrityError,
+    ImportRejected,
+    ImportUncertain,
+    PortableError,
+)
+
 from .auth import AuthenticationError, ConnectTicketError
 from .overview import ConnectionDisconnectPending
 from .retention import DeletionPending, ExportBoundaryError
@@ -138,6 +145,21 @@ def _json_body(event: Mapping) -> Mapping:
     return parsed
 
 
+MAX_IMPORT_BUNDLE_BYTES = 8 * 1024 * 1024
+
+
+def _portable_bundle(value: object) -> bytes:
+    if not isinstance(value, str) or not value:
+        raise ValueError("import bundle is invalid")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except Exception as error:
+        raise ValueError("import bundle is invalid") from error
+    if not decoded or len(decoded) > MAX_IMPORT_BUNDLE_BYTES:
+        raise ValueError("import bundle is invalid")
+    return decoded
+
+
 def _oauth_callback_query(event: Mapping) -> dict[str, str]:
     raw = event.get("rawQueryString")
     if not isinstance(raw, str):
@@ -200,6 +222,7 @@ class WebApplication:
         workspace,
         gmail_workspace,
         exporter,
+        importer,
         deletion,
         retention,
         overview,
@@ -219,6 +242,11 @@ class WebApplication:
         self._workspace = workspace
         self._gmail_workspace = gmail_workspace
         self._exporter = exporter
+        if not callable(getattr(importer, "build_plan", None)) or not callable(
+            getattr(importer, "activate", None)
+        ):
+            raise TypeError("portable importer is invalid")
+        self._importer = importer
         self._deletion = deletion
         self._retention = retention
         if not callable(getattr(overview, "get", None)):
@@ -497,6 +525,42 @@ class WebApplication:
                     raise ValueError("exact deletion confirmation is required")
                 return self._response(200, self._deletion.delete(identity.user_id))
 
+            if method == "POST" and path == "/api/import/plan":
+                identity = self._identity(headers, mutate=True)
+                body = _json_body(event)
+                if set(body) != {"bundle"}:
+                    raise ValueError("import plan request fields are invalid")
+                bundle = _portable_bundle(body["bundle"])
+                plan = self._importer.build_plan(bundle)
+                return self._response(
+                    200,
+                    {
+                        "bundleHash": plan.bundle_hash,
+                        "counts": plan.counts,
+                        "landing": plan.landing,
+                        "ownerClaim": plan.owner_claim,
+                        "rejections": list(plan.rejections),
+                    },
+                )
+
+            if method == "POST" and path == "/api/import/activate":
+                identity = self._identity(headers, mutate=True)
+                body = _json_body(event)
+                if set(body) != {"bundle", "bundleHash", "confirm"}:
+                    raise ValueError("import activation request fields are invalid")
+                if body.get("confirm") is not True:
+                    raise ValueError("import activation must be explicitly confirmed")
+                bundle_hash = body.get("bundleHash")
+                if not isinstance(bundle_hash, str):
+                    raise ValueError("import activation bundle hash is invalid")
+                bundle = _portable_bundle(body["bundle"])
+                result = self._importer.activate(
+                    bundle,
+                    approved_bundle_hash=bundle_hash,
+                    target_user_id=identity.user_id,
+                )
+                return self._response(200, result)
+
             known_paths = {
                 "/api/session/connect",
                 "/oauth/google/start",
@@ -506,6 +570,8 @@ class WebApplication:
                 "/api/gmail",
                 "/api/export",
                 "/api/delete",
+                "/api/import/plan",
+                "/api/import/activate",
                 f"/api/connections/{READONLY_PROVIDER}/disconnect",
                 "/api/session/logout",
             }
@@ -514,6 +580,12 @@ class WebApplication:
             return self._response(404, {"error": "not found"})
         except (AuthenticationError,) as error:
             return self._response(401, {"error": str(error)})
+        except ImportUncertain:
+            # Activation could not be confirmed. No partial state exists; the
+            # client may retry once the staging backend recovers.
+            return self._response(409, {"error": "operation could not be completed"})
+        except (BundleIntegrityError, ImportRejected, PortableError) as error:
+            return self._response(400, {"error": str(error)})
         except (ConnectTicketError, ValueError, TypeError, ExportBoundaryError) as error:
             return self._response(400, {"error": str(error)})
         except PermissionError as error:

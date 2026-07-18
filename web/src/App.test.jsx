@@ -312,6 +312,61 @@ describe("consumer control surface", () => {
     expect(screen.queryByText(/encrypted-ready/i)).not.toBeInTheDocument();
   });
 
+  it("previews a dry-run import plan and gates activation on the exact bundle hash", async () => {
+    history.replaceState({}, "", "/import");
+    sessionStorage.setItem("personal-operator.csrf", "c".repeat(43));
+    const bundleHash = "a".repeat(64);
+    fetch.mockImplementation((path) => {
+      if (path === "/api/import/plan") {
+        return response({
+          bundleHash,
+          counts: { memory: 2, schedules: 1, receipts: 3, workspace: 4 },
+          landing: { schedules: "DISABLED", connectors: "DISCONNECTED", receipts: { replayable: false } },
+          ownerClaim: "user_exporter",
+          rejections: [],
+        });
+      }
+      if (path === "/api/import/activate") {
+        return response({ status: "activated", generation: 1, bundleHash });
+      }
+      throw new Error(`unexpected request: ${path}`);
+    });
+
+    render(<App />);
+    expect(screen.getByText(/dry-run-first transfer/i)).toBeInTheDocument();
+
+    const file = new File([new Uint8Array([80, 75, 3, 4, 9, 9])], "bundle.zip", {
+      type: "application/zip",
+    });
+    fireEvent.change(screen.getByLabelText(/Choose a portable bundle/i), {
+      target: { files: [file] },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /Preview import/i }));
+
+    await screen.findByText(/Dry-run plan/i);
+    expect(screen.getAllByText(bundleHash, { exact: false }).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Schedules: 1/)).toBeInTheDocument();
+    expect(screen.getByText(/Receipts: 3/)).toBeInTheDocument();
+    expect(screen.getByText(/Connectors: land/)).toBeInTheDocument();
+
+    const activate = screen.getByRole("button", { name: "Activate import" });
+    expect(activate).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox"));
+    expect(activate).toBeEnabled();
+
+    fireEvent.click(activate);
+    await screen.findByText(/Import activated/i);
+
+    const planCall = fetch.mock.calls.find((call) => call[0] === "/api/import/plan");
+    expect(planCall[1].headers["X-PO-CSRF"]).toBe("c".repeat(43));
+    const activateCall = fetch.mock.calls.find((call) => call[0] === "/api/import/activate");
+    expect(JSON.parse(activateCall[1].body)).toEqual({
+      bundle: btoa(String.fromCharCode(80, 75, 3, 4, 9, 9)),
+      bundleHash,
+      confirm: true,
+    });
+  });
+
   it("logs out with replacement navigation and removes private workspace state from the DOM", async () => {
     history.replaceState({}, "", "/workspace?draft=draft_action_12345678");
     sessionStorage.setItem("personal-operator.csrf", "c".repeat(43));

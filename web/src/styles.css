@@ -58,6 +58,9 @@ p { line-height: 1.55; }
 .status { border-color: #aaa79d; }
 .error { border-color: #a92f18; background: #f7dfd7; }
 .success { border-color: #27734f; background: #dcecdf; }
+.import-plan { margin-top: 28px; padding: 24px; background: #fff; border: 1px solid #d3d0c6; }
+.import-plan ul { padding-left: 20px; }
+.bundle-hash code { display: inline-block; word-break: break-all; font-family: ui-monospace, monospace; font-size: 13px; }
 .file-list { padding: 0; list-style: none; border-top: 1px solid #d3d0c6; }
 .file-list li { display: flex; justify-content: space-between; gap: 24px; padding: 14px 4px; border-bottom: 1px solid #d3d0c6; font-family: ui-monospace, monospace; }
 .file-list li span:last-child { color: #77746c; white-space: nowrap; }
