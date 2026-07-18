@@ -29,7 +29,7 @@ def envelope(**overrides):
         "trace_id": derive_event_trace("telegram", "user_ab12", "42001"),
         "kind": "message",
         "payload": {
-            "chatId": "991",
+            "chatId": "77",
             "actorId": "telegram:77",
             "message": "please summarize this",
         },
@@ -60,7 +60,7 @@ def test_fifo_group_and_dedupe_are_the_immutable_bound_event_identity():
     first = envelope()
     replay = envelope()
     mutated_receipt = envelope(
-        payload={"chatId": "991", "actorId": "telegram:77", "message": "mutated retry body"},
+        payload={"chatId": "77", "actorId": "telegram:77", "message": "mutated retry body"},
     )
 
     assert first.message_group_id == "user_ab12"
@@ -128,15 +128,61 @@ def test_identity_and_discriminator_bounds_are_fail_closed(field, value):
         envelope(**{field: value})
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"chatId": "-100", "actorId": "telegram:7", "message": "group"},
+        {"chatId": "8", "actorId": "telegram:7", "message": "cross actor"},
+        {"chatId": "0", "actorId": "telegram:0", "message": "noncanonical"},
+    ],
+)
+def test_queue_envelope_requires_one_private_actor_bound_chat(payload):
+    with pytest.raises(EnvelopeValidationError, match="private|actor|chat"):
+        envelope(payload=payload)
+
+
 def test_payload_shape_must_match_kind():
     with pytest.raises(EnvelopeValidationError):
-        envelope(payload={"chatId": "1", "actorId": "telegram:7", "command": "/status"})
+        envelope(payload={"chatId": "7", "actorId": "telegram:7", "command": "/status"})
 
     command = envelope(
         kind="command",
-        payload={"chatId": "1", "actorId": "telegram:7", "command": "/status"},
+        payload={"chatId": "7", "actorId": "telegram:7", "command": "/status"},
     )
     assert command.payload["command"] == "/status"
+
+
+def test_callback_envelope_accepts_only_one_bounded_opaque_card_action():
+    callback = envelope(
+        kind="callback",
+        payload={
+            "chatId": "7",
+            "actorId": "telegram:7",
+            "callbackData": "poc1:prepare:ABCDEFGHIJKLMNOPQRSTUV",
+        },
+    )
+
+    assert callback.payload == {
+        "chatId": "7",
+        "actorId": "telegram:7",
+        "callbackData": "poc1:prepare:ABCDEFGHIJKLMNOPQRSTUV",
+    }
+
+    for data in (
+        "prepare:gmail:trusted:thread",
+        "poc1:send:ABCDEFGHIJKLMNOPQRSTUV",
+        "poc1:why:too-short",
+        "poc1:why:" + "A" * 40,
+    ):
+        with pytest.raises(EnvelopeValidationError):
+            envelope(
+                kind="callback",
+                payload={
+                    "chatId": "7",
+                    "actorId": "telegram:7",
+                    "callbackData": data,
+                },
+            )
 
 
 def test_json_parser_rejects_extra_fields_nonfinite_numbers_and_oversize_body():
@@ -159,7 +205,7 @@ def test_json_parser_rejects_extra_fields_nonfinite_numbers_and_oversize_body():
 
 def test_message_text_may_discuss_tokens_without_becoming_a_credential_field():
     item = envelope(payload={
-        "chatId": "1",
+        "chatId": "7",
         "actorId": "telegram:7",
         "message": "Explain how OAuth tokens work without using any credentials.",
     })
@@ -174,8 +220,8 @@ def test_constructed_envelope_cannot_be_mutated_after_validation():
 
     exposed = item.payload
     exposed["chatId"] = "777"
-    assert item.payload["chatId"] == "991"
-    assert json.loads(item.to_json())["payload"]["chatId"] == "991"
+    assert item.payload["chatId"] == "77"
+    assert json.loads(item.to_json())["payload"]["chatId"] == "77"
 
 
 def test_duplicate_json_keys_are_rejected_instead_of_last_value_winning():

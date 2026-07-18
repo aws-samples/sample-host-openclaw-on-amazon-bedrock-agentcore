@@ -255,10 +255,12 @@ class DynamoGmailRepository:
         if not isinstance(key, str) or _STATE_KEY.fullmatch(key) is None:
             raise RepositoryRecordError("OAuth state key is invalid")
         expires_at = _ttl(expires_at)
+        state = _validate_oauth_state(value, expires_at)
         item = {
             "PK": f"OAUTH_STATE#{key}",
             "SK": "OAUTH_STATE",
-            "state": _validate_oauth_state(value, expires_at),
+            "userId": state["user_id"],
+            "state": state,
             "ttl": expires_at,
         }
         try:

@@ -68,6 +68,7 @@ def action(*, state=models.ActionState.APPROVED, revision=7, overrides=None):
         "approvedDraftRevision": 4,
         "approvalExpiresAt": (NOW + timedelta(minutes=5)).isoformat(),
         "approvedAt": (NOW - timedelta(minutes=1)).isoformat(),
+        "ttl": int((NOW + timedelta(days=14)).timestamp()),
     }
     if state in {models.ActionState.DISPATCHING, models.ActionState.UNCERTAIN}:
         record.update(
@@ -160,7 +161,13 @@ def operation_ids():
     return next_id
 
 
-def executor(record, provider=None, founders={"founder-1"}, repo=None):
+def executor(
+    record,
+    provider=None,
+    founders={"founder-1"},
+    repo=None,
+    deletion_blocked=lambda _user_id: False,
+):
     repo = repo or Repository(record)
     provider = provider or Provider()
     machine = machine_module.ActionStateMachine(
@@ -174,6 +181,7 @@ def executor(record, provider=None, founders={"founder-1"}, repo=None):
             connection_id="google_conn_1234",
             account_email="founder@example.com",
             sender_address="founder@example.com",
+            deletion_blocked=deletion_blocked,
             now=lambda: NOW,
         ),
         repo,
@@ -181,7 +189,11 @@ def executor(record, provider=None, founders={"founder-1"}, repo=None):
     )
 
 
-def reconciler(record, provider):
+def reconciler(
+    record,
+    provider,
+    deletion_blocked=lambda _user_id: False,
+):
     repo = Repository(record)
     return (
         reconcile_module.GmailEffectReconciler(
@@ -193,6 +205,8 @@ def reconciler(record, provider):
             connection_id="google_conn_1234",
             account_email="founder@example.com",
             sender_address="founder@example.com",
+            founder_user_ids={"founder-1"},
+            deletion_blocked=deletion_blocked,
             now=lambda: NOW,
         ),
         repo,
@@ -224,6 +238,37 @@ def test_sends_exact_plain_text_once_and_receipt_uses_provider_execution_time():
     assert confirmed["effectReceipt"] == receipt.record()
     assert confirmed["waitingForReply"]["since"] == PROVIDER_TIME.isoformat()
     assert confirmed["confirmationMethod"] == "provider-send-evidence"
+
+
+@pytest.mark.parametrize("fence_error", [None, TimeoutError("fence unknown")])
+def test_account_deletion_is_rechecked_after_dispatch_claim_before_provider(
+    fence_error,
+):
+    record = action()
+    repo = Repository(record)
+    provider = Provider()
+    calls = []
+
+    def deletion_blocked(user_id):
+        calls.append((user_id, repo.record["state"]))
+        if fence_error is not None:
+            raise fence_error
+        return True
+
+    gateway, repo, provider = executor(
+        record,
+        provider=provider,
+        repo=repo,
+        deletion_blocked=deletion_blocked,
+    )
+
+    with pytest.raises(send_module.EffectUncertain, match="account deletion"):
+        gateway.execute(record)
+
+    assert calls == [("founder-1", "DISPATCHING")]
+    assert provider.send_calls == []
+    assert repo.record["state"] == "UNCERTAIN"
+    assert repo.record["uncertaintyReason"] == "account-deletion-fence"
 
 
 @pytest.mark.parametrize(
@@ -288,6 +333,18 @@ def test_expired_approval_never_dispatches():
     assert provider.send_calls == []
 
 
+def test_logically_expired_action_never_dispatches_even_if_approval_is_live():
+    record = action()
+    record["ttl"] = int(NOW.timestamp())
+    gateway, repo, provider = executor(record)
+
+    with pytest.raises(models.CapabilityDenied, match="retention expired"):
+        gateway.execute(record)
+
+    assert repo.record["state"] == "EXPIRED"
+    assert provider.send_calls == []
+
+
 @pytest.mark.parametrize(
     "provider",
     [
@@ -338,6 +395,93 @@ def test_uncertain_reconciliation_confirms_only_full_sent_exact_evidence_and_nev
     assert provider.send_calls == []
     assert provider.find_calls[0]["sender_address"] == "founder@example.com"
     assert provider.find_calls[0]["recipient"] == "person@example.net"
+
+
+def test_reconciliation_is_bound_to_the_configured_founder_identity():
+    record = action(state=models.ActionState.UNCERTAIN, revision=9)
+    record["userId"] = "pilot-2"
+    provider = Provider(
+        found=lambda call: provider_evidence(
+            message_id=call["message_id"], payload_hash=call["payload_hash"]
+        )
+    )
+    gateway, repo = reconciler(record, provider)
+
+    assert gateway.reconcile(action_id=record["actionId"], user_id="pilot-2") is None
+    assert repo.record["state"] == "UNCERTAIN"
+    assert provider.find_calls == []
+
+
+def test_reconciliation_surfaces_provider_timeout_as_typed_deferred_without_resend():
+    record = action(state=models.ActionState.UNCERTAIN, revision=9)
+    provider = Provider(error=TimeoutError("provider stalled"))
+    gateway, repo = reconciler(record, provider)
+
+    with pytest.raises(reconcile_module.ReconciliationDeferred):
+        gateway.reconcile(action_id=record["actionId"], user_id=record["userId"])
+
+    assert provider.send_calls == []
+    assert len(provider.find_calls) == 1
+    assert repo.transitions == []
+
+
+@pytest.mark.parametrize("fence_error", [None, TimeoutError("fence unknown")])
+def test_reconciliation_rechecks_deletion_immediately_before_history_query(
+    fence_error,
+):
+    record = action(state=models.ActionState.UNCERTAIN, revision=9)
+    provider = Provider(
+        found=lambda call: provider_evidence(
+            message_id=call["message_id"], payload_hash=call["payload_hash"]
+        )
+    )
+    calls = []
+
+    def deletion_blocked(user_id):
+        calls.append(user_id)
+        if fence_error is not None:
+            raise fence_error
+        return True
+
+    gateway, repo = reconciler(
+        record,
+        provider,
+        deletion_blocked=deletion_blocked,
+    )
+
+    if fence_error is None:
+        assert gateway.reconcile(
+            action_id=record["actionId"], user_id=record["userId"]
+        ) is None
+    else:
+        with pytest.raises(
+            reconcile_module.ReconciliationDeferred,
+            match="deletion fence",
+        ):
+            gateway.reconcile(
+                action_id=record["actionId"], user_id=record["userId"]
+            )
+
+    assert calls == ["founder-1"]
+    assert provider.find_calls == []
+    assert repo.record["state"] == "UNCERTAIN"
+
+
+def test_reconciliation_never_queries_provider_after_action_retention_expires():
+    record = action(state=models.ActionState.UNCERTAIN, revision=9)
+    record["ttl"] = int(NOW.timestamp())
+    provider = Provider(
+        found=lambda call: provider_evidence(
+            message_id=call["message_id"], payload_hash=call["payload_hash"]
+        )
+    )
+    gateway, repo = reconciler(record, provider)
+
+    assert gateway.reconcile(
+        action_id=record["actionId"], user_id=record["userId"]
+    ) is None
+    assert repo.record["state"] == "UNCERTAIN"
+    assert provider.find_calls == []
 
 
 @pytest.mark.parametrize(

@@ -25,8 +25,11 @@ MAX_JSON_COLLECTION_ITEMS = 64
 _WIRE_KEYS = ("userId", "channel", "updateId", "traceId", "kind", "payload")
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
 _UPDATE_ID = re.compile(r"[0-9]{1,20}")
-_CHAT_ID = re.compile(r"-?[0-9]{1,20}")
-_ACTOR_ID = re.compile(r"telegram:[0-9]{1,20}")
+_CHAT_ID = re.compile(r"[1-9][0-9]{0,19}")
+_ACTOR_ID = re.compile(r"telegram:([1-9][0-9]{0,19})")
+_CALLBACK_DATA = re.compile(
+    r"poc1:(edit|prepare|skip|why):[A-Za-z0-9_-]{22,32}"
+)
 _S3_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_/-]{1,1023}(?:\.[A-Za-z0-9]{1,16})?")
 _CONTENT_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
@@ -126,17 +129,41 @@ def _validate_payload(user_id: str, kind: str, payload: Any) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise EnvelopeValidationError("payload must be an object")
     _validate_json_value(payload)
-    expected = {"chatId", "actorId", "command" if kind == "command" else "message"}
+    content_field = {
+        "command": "command",
+        "message": "message",
+        "callback": "callbackData",
+    }.get(kind)
+    if content_field is None:
+        raise EnvelopeValidationError("unsupported message kind")
+    expected = {"chatId", "actorId", content_field}
     if set(payload) != expected:
         raise EnvelopeValidationError("payload fields do not match the envelope kind")
 
     chat_id = _require_string("Telegram chat ID", payload["chatId"], _CHAT_ID)
     actor_id = _require_string("Telegram actor ID", payload["actorId"], _ACTOR_ID)
+    if chat_id != actor_id.removeprefix("telegram:"):
+        raise EnvelopeValidationError(
+            "Telegram private chat must equal its authenticated actor"
+        )
     if kind == "command":
         command = parse_product_command(payload["command"])
         if command is None or payload["command"].lower().split("@", 1)[0] != command.name:
             raise EnvelopeValidationError("invalid product command")
         return {"chatId": chat_id, "actorId": actor_id, "command": command.name}
+
+    if kind == "callback":
+        callback_data = payload["callbackData"]
+        if (
+            not isinstance(callback_data, str)
+            or _CALLBACK_DATA.fullmatch(callback_data) is None
+        ):
+            raise EnvelopeValidationError("invalid opaque callback action")
+        return {
+            "chatId": chat_id,
+            "actorId": actor_id,
+            "callbackData": callback_data,
+        }
 
     message = payload["message"]
     if isinstance(message, str):
@@ -189,7 +216,7 @@ class QueueEnvelope:
             )
         except ValueError as error:
             raise EnvelopeValidationError(str(error)) from error
-        if kind not in {"command", "message"}:
+        if kind not in {"command", "message", "callback"}:
             raise EnvelopeValidationError("unsupported message kind")
         self.kind = kind
         validated_payload = _validate_payload(self.user_id, self.kind, payload)

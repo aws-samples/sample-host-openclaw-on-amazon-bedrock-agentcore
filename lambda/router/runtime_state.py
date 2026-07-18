@@ -17,6 +17,7 @@ _RUNTIME_ARN = re.compile(
     r"(?P<agent>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}):(?P<version>[1-9][0-9]{0,4})"
 )
+_RELEASE_ENDPOINT = re.compile(r"release_[0-9a-f]{40}")
 
 
 class RuntimeState(str, Enum):
@@ -53,6 +54,10 @@ class LeaseLost(RuntimeStateError):
     pass
 
 
+class InactivityFenceLost(RuntimeStateError):
+    """The scanned inactivity snapshot no longer matches the live record."""
+
+
 class StaleLease(RuntimeStateError):
     def __init__(self, record: "RuntimeRecord") -> None:
         super().__init__(f"stale runtime lease for {record.user_id}")
@@ -85,6 +90,14 @@ class RuntimeRecord:
     tombstoned_at: int | None
     last_mutation_id: str | None
     stop_operation_id: str | None
+    purge_reason: str | None = None
+    purge_completed_at: int | None = None
+    workspace_stop_verified_at: int | None = None
+    purge_observed_updated_at: int | None = None
+    purge_observed_revision: int | None = None
+    purge_inactive_before: int | None = None
+    last_purge_reason: str | None = None
+    last_purge_completed_at: int | None = None
 
     def public(self) -> dict:
         return {
@@ -97,6 +110,8 @@ class RuntimeRecord:
             "leaseEpoch": self.lease_epoch,
             "updatedAt": self.updated_at,
             "tombstonedAt": self.tombstoned_at,
+            "purgeReason": self.purge_reason,
+            "purgeCompletedAt": self.purge_completed_at,
             "workspaceReceipt": (
                 {
                     "generation": self.last_workspace_generation,
@@ -144,8 +159,8 @@ def runtime_lineage(runtime_arn: str) -> tuple[str, str, str]:
 
 def canonical_runtime_qualifier(qualifier: str) -> str:
     value = str(qualifier or "")
-    if value != "DEFAULT":
-        raise ValueError("runtime qualifier must be exactly DEFAULT")
+    if _RELEASE_ENDPOINT.fullmatch(value) is None:
+        raise ValueError("runtime qualifier must be an exact release endpoint")
     return value
 
 
@@ -211,7 +226,7 @@ class RuntimeStateRepository:
 
     def _record(self, item: dict) -> RuntimeRecord:
         try:
-            return RuntimeRecord(
+            record = RuntimeRecord(
                 user_id=canonical_user_id(item["userId"]),
                 session_id=(
                     canonical_session_id(item["sessionId"])
@@ -246,7 +261,54 @@ class RuntimeStateRepository:
                 ),
                 last_mutation_id=item.get("lastMutationId"),
                 stop_operation_id=item.get("stopOperationId"),
+                purge_reason=item.get("purgeReason"),
+                purge_completed_at=(
+                    int(item["purgeCompletedAt"])
+                    if item.get("purgeCompletedAt") is not None
+                    else None
+                ),
+                workspace_stop_verified_at=(
+                    int(item["workspaceStopVerifiedAt"])
+                    if item.get("workspaceStopVerifiedAt") is not None
+                    else None
+                ),
+                purge_observed_updated_at=(
+                    int(item["purgeObservedUpdatedAt"])
+                    if item.get("purgeObservedUpdatedAt") is not None
+                    else None
+                ),
+                purge_observed_revision=(
+                    int(item["purgeObservedRevision"])
+                    if item.get("purgeObservedRevision") is not None
+                    else None
+                ),
+                purge_inactive_before=(
+                    int(item["purgeInactiveBefore"])
+                    if item.get("purgeInactiveBefore") is not None
+                    else None
+                ),
+                last_purge_reason=item.get("lastPurgeReason"),
+                last_purge_completed_at=(
+                    int(item["lastPurgeCompletedAt"])
+                    if item.get("lastPurgeCompletedAt") is not None
+                    else None
+                ),
             )
+            if record.purge_reason not in {None, "ACCOUNT_DELETION", "WORKSPACE_EXPIRY"}:
+                raise ValueError("invalid purge reason")
+            if record.last_purge_reason not in {None, "WORKSPACE_EXPIRY"}:
+                raise ValueError("invalid completed purge reason")
+            positive = (
+                record.purge_completed_at,
+                record.workspace_stop_verified_at,
+                record.purge_observed_updated_at,
+                record.purge_observed_revision,
+                record.purge_inactive_before,
+                record.last_purge_completed_at,
+            )
+            if any(value is not None and value <= 0 for value in positive):
+                raise ValueError("invalid purge timestamp or revision")
+            return record
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeStateError("corrupt runtime-state record") from error
 
@@ -1036,7 +1098,8 @@ class RuntimeStateRepository:
                 Key={"userId": user_id},
                 UpdateExpression=(
                     "SET tombstonedAt=if_not_exists(tombstonedAt,:now), "
-                    "#state=:deleting, leaseOwner=:owner, leaseExpiresAt=:until, "
+                    "#state=:deleting, purgeReason=:purgeReason, "
+                    "leaseOwner=:owner, leaseExpiresAt=:until, "
                     "leaseEpoch=if_not_exists(leaseEpoch,:zero)+:one, "
                     "runtimeArn=if_not_exists(runtimeArn,:runtimeArn), "
                     "runtimeQualifier=if_not_exists(runtimeQualifier,:runtimeQualifier), "
@@ -1046,6 +1109,7 @@ class RuntimeStateRepository:
                     "revision=if_not_exists(revision,:zero)+:one"
                 ),
                 ConditionExpression=(
+                    "attribute_not_exists(purgeCompletedAt) AND "
                     "(attribute_not_exists(leaseExpiresAt) OR leaseExpiresAt < :now)"
                 ),
                 ExpressionAttributeNames={"#state": "state"},
@@ -1053,6 +1117,7 @@ class RuntimeStateRepository:
                     ":now": now,
                     ":until": now + lease_ms,
                     ":deleting": RuntimeState.DELETING.value,
+                    ":purgeReason": "ACCOUNT_DELETION",
                     ":owner": owner,
                     ":runtimeArn": self.runtime_arn,
                     ":runtimeQualifier": self.runtime_qualifier,
@@ -1072,6 +1137,7 @@ class RuntimeStateRepository:
                         mutation_id,
                         lambda value: value.state is RuntimeState.DELETING
                         and value.tombstoned_at is not None
+                        and value.purge_reason == "ACCOUNT_DELETION"
                         and value.lease_owner == owner,
                     )
                 except Exception:
@@ -1095,6 +1161,137 @@ class RuntimeStateRepository:
         ):
             return current
         raise LeaseBusy(user_id)
+
+    def begin_inactive_purge(
+        self,
+        user_id: str,
+        *,
+        owner: str,
+        lease_ms: int,
+        observed_updated_at_ms: int,
+        observed_revision: int,
+        inactive_before_ms: int,
+    ) -> RuntimeRecord:
+        """Tombstone only the exact inactive snapshot selected by retention."""
+
+        user_id = canonical_user_id(user_id)
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("inactive purge owner is required")
+        integer_fields = {
+            "lease duration": lease_ms,
+            "observed update millisecond": observed_updated_at_ms,
+            "observed revision": observed_revision,
+            "inactive cutoff millisecond": inactive_before_ms,
+        }
+        for label, value in integer_fields.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{label} is invalid")
+        if observed_updated_at_ms > inactive_before_ms:
+            raise ValueError("observed runtime is not inactive")
+        raw_now = self.clock_ms()
+        if isinstance(raw_now, bool) or not isinstance(raw_now, int) or raw_now <= 0:
+            raise RuntimeStateError("runtime millisecond clock is invalid")
+        now = raw_now
+        operation_id = deterministic_id(
+            "op",
+            "inactive-purge",
+            user_id,
+            observed_updated_at_ms,
+            observed_revision,
+        )
+        mutation_id = deterministic_id(
+            "mut", "begin-inactive-purge", operation_id, owner, now
+        )
+        try:
+            response = self.table.update_item(
+                Key={"userId": user_id},
+                UpdateExpression=(
+                    "SET tombstonedAt=if_not_exists(tombstonedAt,:now), "
+                    "#state=:deleting, purgeReason=:purgeReason, "
+                    "purgeObservedUpdatedAt=:observedUpdatedAt, "
+                    "purgeObservedRevision=:observedRevision, "
+                    "purgeInactiveBefore=:inactiveBefore, "
+                    "leaseOwner=:owner, leaseExpiresAt=:until, "
+                    "leaseEpoch=if_not_exists(leaseEpoch,:zero)+:one, "
+                    "stopOperationId=:operation, updatedAt=:now, "
+                    "lastMutationId=:mutation, "
+                    "revision=if_not_exists(revision,:zero)+:one"
+                ),
+                ConditionExpression=(
+                    "attribute_exists(userId) AND ("
+                    "(attribute_not_exists(tombstonedAt) AND "
+                    "#state <> :deleting AND updatedAt=:observedUpdatedAt AND "
+                    "revision=:observedRevision AND updatedAt <= :inactiveBefore) OR "
+                    "(attribute_exists(tombstonedAt) AND #state=:deleting AND "
+                    "purgeReason=:purgeReason AND "
+                    "purgeObservedUpdatedAt=:observedUpdatedAt AND "
+                    "purgeObservedRevision=:observedRevision AND "
+                    "purgeInactiveBefore=:inactiveBefore AND "
+                    "attribute_not_exists(purgeCompletedAt))) AND "
+                    "runtimeArn=:runtimeArn AND "
+                    "runtimeQualifier=:runtimeQualifier AND "
+                    "((attribute_not_exists(leaseOwner) AND "
+                    "attribute_not_exists(leaseExpiresAt)) OR "
+                    "(attribute_exists(leaseOwner) AND leaseExpiresAt < :now))"
+                ),
+                ExpressionAttributeNames={"#state": "state"},
+                ExpressionAttributeValues={
+                    ":now": now,
+                    ":until": now + lease_ms,
+                    ":deleting": RuntimeState.DELETING.value,
+                    ":purgeReason": "WORKSPACE_EXPIRY",
+                    ":owner": owner,
+                    ":runtimeArn": self.runtime_arn,
+                    ":runtimeQualifier": self.runtime_qualifier,
+                    ":observedUpdatedAt": observed_updated_at_ms,
+                    ":observedRevision": observed_revision,
+                    ":inactiveBefore": inactive_before_ms,
+                    ":operation": operation_id,
+                    ":mutation": mutation_id,
+                    ":zero": 0,
+                    ":one": 1,
+                },
+                ReturnValues="ALL_NEW",
+            )
+            return self._record(response["Attributes"])
+        except Exception as error:
+            if _is_conditional(error) or _is_ambiguous(error):
+                try:
+                    reconciled = self._reconcile(
+                        user_id,
+                        mutation_id,
+                        lambda value: value.state is RuntimeState.DELETING
+                        and value.tombstoned_at is not None
+                        and value.purge_reason == "WORKSPACE_EXPIRY"
+                        and value.lease_owner == owner
+                        and value.stop_operation_id == operation_id,
+                    )
+                except Exception:
+                    reconciled = None
+                if reconciled is not None:
+                    return reconciled
+            if _is_conditional(error):
+                try:
+                    current = self.get(user_id)
+                except Exception:
+                    current = None
+                if (
+                    current is not None
+                    and current.state is RuntimeState.DELETING
+                    and current.tombstoned_at is not None
+                    and current.purge_reason == "WORKSPACE_EXPIRY"
+                    and current.purge_observed_updated_at == observed_updated_at_ms
+                    and current.purge_observed_revision == observed_revision
+                    and current.purge_inactive_before == inactive_before_ms
+                    and current.purge_completed_at is None
+                ):
+                    raise LeaseBusy(user_id) from error
+                raise InactivityFenceLost(user_id) from error
+            if _is_ambiguous(error):
+                raise RuntimeStateError(
+                    "inactive runtime purge fencing outcome is uncertain"
+                ) from error
+            raise RuntimeStateError("inactive runtime purge fencing failed") from error
 
     def finish_purge(self, lease: RuntimeRecord) -> RuntimeRecord:
         now = int(self.clock_ms())
@@ -1123,11 +1320,13 @@ class RuntimeStateRepository:
             mutation_id=mutation_id,
             expected=lambda value: value.tombstoned_at is not None
             and value.state is RuntimeState.DELETING
+            and value.purge_reason == "ACCOUNT_DELETION"
+            and value.purge_completed_at is not None
             and value.session_id is None
             and value.lease_owner is None,
             Key={"userId": lease.user_id},
             UpdateExpression=(
-                "SET updatedAt=:now, lastMutationId=:mutation, "
+                "SET purgeCompletedAt=:now, updatedAt=:now, lastMutationId=:mutation, "
                 "revision=if_not_exists(revision,:zero)+:one "
                 "REMOVE sessionId, leaseOwner, leaseExpiresAt, lastTraceId, "
                 "lastInvocationId, lastWorkspaceGeneration, "
@@ -1136,6 +1335,7 @@ class RuntimeStateRepository:
             ConditionExpression=(
                 "leaseOwner=:owner AND leaseEpoch=:epoch AND "
                 "attribute_exists(tombstonedAt) AND #state=:deleting AND "
+                "purgeReason=:accountReason AND "
                 f"{session_condition} AND runtimeArn=:runtimeArn AND "
                 "runtimeQualifier=:runtimeQualifier"
             ),
@@ -1144,9 +1344,151 @@ class RuntimeStateRepository:
                 ":owner": lease.lease_owner,
                 ":epoch": lease.lease_epoch,
                 ":deleting": RuntimeState.DELETING.value,
+                ":accountReason": "ACCOUNT_DELETION",
                 **session_values,
                 ":runtimeArn": lease.runtime_arn,
                 ":runtimeQualifier": lease.runtime_qualifier,
+                ":now": now,
+                ":mutation": mutation_id,
+                ":zero": 0,
+                ":one": 1,
+            },
+        )
+
+    def finish_inactive_stop(self, lease: RuntimeRecord) -> RuntimeRecord:
+        """Record a verified stop while retaining the workspace-expiry fence."""
+
+        now = int(self.clock_ms())
+        mutation_id = deterministic_id(
+            "mut",
+            "finish-inactive-stop",
+            lease.user_id,
+            lease.lease_epoch,
+            lease.stop_operation_id,
+        )
+        if (
+            lease.session_id is None
+            and lease.lease_owner is None
+            and lease.workspace_stop_verified_at is not None
+        ):
+            return lease
+        session_condition = (
+            "sessionId=:oldSession"
+            if lease.session_id is not None
+            else "attribute_not_exists(sessionId)"
+        )
+        session_values = (
+            {":oldSession": lease.session_id}
+            if lease.session_id is not None
+            else {}
+        )
+        return self._conditional_update(
+            "finish-inactive-stop",
+            user_id=lease.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.tombstoned_at is not None
+            and value.state is RuntimeState.DELETING
+            and value.purge_reason == "WORKSPACE_EXPIRY"
+            and value.workspace_stop_verified_at is not None
+            and value.session_id is None
+            and value.lease_owner is None,
+            Key={"userId": lease.user_id},
+            UpdateExpression=(
+                "SET workspaceStopVerifiedAt=:now, updatedAt=:now, "
+                "lastMutationId=:mutation, "
+                "revision=if_not_exists(revision,:zero)+:one "
+                "REMOVE sessionId, leaseOwner, leaseExpiresAt, lastTraceId, "
+                "lastInvocationId"
+            ),
+            ConditionExpression=(
+                "leaseOwner=:owner AND leaseEpoch=:epoch AND "
+                "attribute_exists(tombstonedAt) AND #state=:deleting AND "
+                "purgeReason=:workspaceReason AND "
+                f"{session_condition} AND runtimeArn=:runtimeArn AND "
+                "runtimeQualifier=:runtimeQualifier"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":owner": lease.lease_owner,
+                ":epoch": lease.lease_epoch,
+                ":deleting": RuntimeState.DELETING.value,
+                ":workspaceReason": "WORKSPACE_EXPIRY",
+                **session_values,
+                ":runtimeArn": lease.runtime_arn,
+                ":runtimeQualifier": lease.runtime_qualifier,
+                ":now": now,
+                ":mutation": mutation_id,
+                ":zero": 0,
+                ":one": 1,
+            },
+        )
+
+    def complete_workspace_expiry(
+        self, current: RuntimeRecord, *, session_id: str
+    ) -> RuntimeRecord:
+        """Clear only a verified workspace tombstone into a fresh cold session."""
+
+        if (
+            current.state is not RuntimeState.DELETING
+            or current.tombstoned_at is None
+            or current.purge_reason != "WORKSPACE_EXPIRY"
+            or current.workspace_stop_verified_at is None
+            or current.session_id is not None
+            or current.lease_owner is not None
+        ):
+            raise LeaseLost("workspace-expiry-complete")
+        session_id = canonical_session_id(session_id)
+        now = int(self.clock_ms())
+        mutation_id = deterministic_id(
+            "mut",
+            "complete-workspace-expiry",
+            current.user_id,
+            current.revision,
+            current.workspace_stop_verified_at,
+            session_id,
+        )
+        return self._conditional_update(
+            "complete-workspace-expiry",
+            user_id=current.user_id,
+            mutation_id=mutation_id,
+            expected=lambda value: value.state is RuntimeState.COLD
+            and value.session_id == session_id
+            and value.tombstoned_at is None
+            and value.purge_reason is None
+            and value.last_purge_reason == "WORKSPACE_EXPIRY",
+            Key={"userId": current.user_id},
+            UpdateExpression=(
+                "SET sessionId=:session, #state=:cold, updatedAt=:now, "
+                "lastPurgeReason=:workspaceReason, lastPurgeCompletedAt=:now, "
+                "lastMutationId=:mutation, "
+                "revision=if_not_exists(revision,:zero)+:one "
+                "REMOVE tombstonedAt, purgeReason, purgeCompletedAt, "
+                "workspaceStopVerifiedAt, purgeObservedUpdatedAt, "
+                "purgeObservedRevision, purgeInactiveBefore, stopOperationId, "
+                "lastTraceId, lastInvocationId, lastWorkspaceGeneration, "
+                "lastWorkspaceManifestSha256"
+            ),
+            ConditionExpression=(
+                "revision=:revision AND updatedAt=:updatedAt AND "
+                "attribute_exists(tombstonedAt) AND #state=:deleting AND "
+                "purgeReason=:workspaceReason AND "
+                "workspaceStopVerifiedAt=:stopVerifiedAt AND "
+                "attribute_not_exists(sessionId) AND "
+                "attribute_not_exists(leaseOwner) AND "
+                "attribute_not_exists(leaseExpiresAt) AND "
+                "runtimeArn=:runtimeArn AND runtimeQualifier=:runtimeQualifier"
+            ),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":session": session_id,
+                ":cold": RuntimeState.COLD.value,
+                ":deleting": RuntimeState.DELETING.value,
+                ":workspaceReason": "WORKSPACE_EXPIRY",
+                ":revision": current.revision,
+                ":updatedAt": current.updated_at,
+                ":stopVerifiedAt": current.workspace_stop_verified_at,
+                ":runtimeArn": current.runtime_arn,
+                ":runtimeQualifier": current.runtime_qualifier,
                 ":now": now,
                 ":mutation": mutation_id,
                 ":zero": 0,

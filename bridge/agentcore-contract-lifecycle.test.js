@@ -37,6 +37,23 @@ describe("AgentCore workspace lifecycle production coupling", () => {
     assert.doesNotMatch(contract, /workspaceSync\.(configureCredentials|getS3Client)/);
   });
 
+  it("uses only the admitted bearer capability to obtain and refresh workspace credentials", () => {
+    const init = functionBody(contract, "init", "/**\n * Extract plain text");
+    assert.match(init, /createScopedCredentials\(\s*workspaceCapability/);
+    assert.doesNotMatch(init, /createScopedCredentials\(namespace\)/);
+    assert.match(contract, /authority\.workspaceCapability/);
+    assert.doesNotMatch(
+      contract,
+      /message\s*=\s*authority\.workspaceCapability|buildBridgeText\(authority/,
+    );
+    assert.match(init, /credentialRefreshInProgress/);
+    assert.match(init, /10\s*\*\s*60\s*\*\s*1000/);
+    assert.match(
+      init,
+      /catch \(error\)[\s\S]*quarantineRuntime\(error, "SCOPED_CREDENTIAL_FAILURE"\)/,
+    );
+  });
+
   it("restores and verifies the mount before config or either child starts", () => {
     const init = functionBody(contract, "init", "/**\n * Extract plain text");
     const initialize = init.indexOf("await workspaceLifecycle.initialize()");

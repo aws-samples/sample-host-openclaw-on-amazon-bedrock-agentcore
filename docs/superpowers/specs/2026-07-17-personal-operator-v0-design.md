@@ -2,7 +2,13 @@
 
 ## Product
 
-Personal Operator is a consumer personal AI computer reached through one shared Telegram bot. Each user has a persistent logical workspace backed by isolated, replaceable compute. The assistant can research the public web, create and retain files, run restricted workspace tasks, schedule work, and connect to consumer applications. Sensitive external effects are proposed by the runtime but executed only by a separate trusted capability gateway after exact user approval.
+Personal Operator is a consumer personal AI computer reached through one shared
+Telegram bot. Each user has a persistent logical workspace backed by isolated,
+replaceable compute. In v0 the assistant can create or retain scoped workspace
+files; model-callable URL retrieval, public search, scheduling, and code
+execution remain deferred. Gmail is connected through a
+separate trusted plane. Sensitive external effects are proposed first and may
+be executed only by that trusted capability gateway after exact user approval.
 
 The first governed application is Gmail. External pilots receive read-only follow-up discovery, source-backed cards, draft generation, edits, and preparation. Only the founder account receives incremental `gmail.send` scope for controlled, allowlisted tests with approval, idempotency, reconciliation, and receipts.
 
@@ -22,7 +28,12 @@ The control plane stores identity, connections, workflow state, approvals, recei
 - One backend-generated AgentCore session identifier per user; clients never choose session IDs.
 - Default idle timeout: 1,800 seconds. Maximum lifetime: 28,800 seconds.
 - Workspace restore on startup; save after successful state-changing turns, periodically, and on shutdown.
-- Runtime tools: public search/fetch, scoped workspace file operations, EventBridge schedules, and restricted workspace execution.
+- Runtime tools: exactly four scoped workspace file operations. The upstream
+  `session_status` tool is denied because it can persist model overrides. The
+  visible model catalog is restricted to the single loopback AgentCore route.
+  URL retrieval, search, scheduling, and code execution are deferred. A future
+  URL reader must authorize exact user-selected targets outside the model tool
+  loop so workspace contents cannot be sent to model-selected destinations.
 - No arbitrary ClawHub installation, user-supplied API keys, arbitrary MCP/plugin installation, or provider credentials inside the runtime.
 
 ## Trusted application boundary
@@ -37,7 +48,11 @@ Gmail pilot scanning is bounded to at most 50 sent threads from 3–30 days ago.
 - Derived excerpts and drafts expire after 14 days.
 - Audit and effect receipts expire after 90 days.
 - Inactive pilot workspaces expire after 30 days.
-- Deletion revokes provider access immediately and purges workspace, schedules, credentials, and derived records within 24 hours.
+- Deletion first persists an authority fence. Gmail and Telegram strongly
+  recheck it at the last application-controlled point before provider
+  dispatch; a network request that already crossed that point cannot be
+  recalled. Local authority and active data are removed asynchronously in two
+  purge passes; v0 makes no 24-hour completion claim.
 - A deletion tombstone prevents stale runtime snapshots from restoring deleted state.
 - Export contains user-authored files, saved memory, schedules, and receipts in documented JSON/ZIP form.
 

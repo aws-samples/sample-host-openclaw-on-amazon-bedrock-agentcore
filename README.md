@@ -14,20 +14,34 @@ OpenClaw on Amazon Bedrock AgentCore; credentials and sensitive external
 effects remain in a separate trusted control plane.
 
 The first governed application is Gmail. External pilots are limited to
-read-only follow-up discovery and draft preparation. A founder-only send path
-is planned behind exact-payload approval, idempotency, reconciliation, and
-effect receipts. None of those application workflows is complete at the
-foundation stage.
+read-only follow-up discovery and draft preparation. A separate founder-only
+send credential is reachable only through exact-payload approval, a durable
+dispatch fence, provider reconciliation, and an effect receipt.
 
 ## Current state
 
-The foundation and all three runtime-hardening gates are implemented locally.
-The runtime now has a frozen tool boundary, immutable per-user identity,
-S3-only scoped workspace credentials, and a manifest-based lossless workspace
-lifecycle. Both final exact-commit reviews passed after the stale-writer,
-turn-overlap, proxy-reinitialization, shutdown-deadline, and health-accounting
-findings were closed. Nothing in this repository has been deployed and no real
-credentials or messages were used.
+The v0 implementation is complete as a local, synthetic prototype. It includes
+the hardened per-user runtime; signed Telegram ingress and a per-user FIFO
+worker; deterministic product commands; read-only Gmail OAuth, scanning,
+ranking, and revisioned draft editing; founder-only approval-gated sending; a
+trusted browser control surface; export; 14/30/90-day lifecycle enforcement;
+and two-pass resumable account deletion. Deployment assets are fail-closed:
+real-account synthesis requires a verified Lambda Python 3.13 ARM64 bundle and
+consumer wiring requires an exact commit-bound private-ECR runtime digest,
+while the raw source escape is limited to the impossible account used by local
+tests.
+
+Active observability uses aggregate AWS service metrics and alarms only. It
+does not enable model invocation text or image payload logging, and the
+archived legacy token-monitoring stack is not active.
+
+This is not deployment evidence. The Lambda dependency image and OpenClaw
+runtime image have not been built or scanned on this machine, no AWS stack has
+been deployed, and no Telegram, Google, OpenAI, or Gmail credential or real
+message was used. Direct immutable AgentCore runtime provisioning is not yet
+implemented, so `scripts/deploy.sh --full` and `--runtime-only` deliberately
+fail before any cloud call. The remaining gates are recorded in
+[docs/RELEASE-EVIDENCE.md](docs/RELEASE-EVIDENCE.md).
 
 The implementation proceeds in reviewed tasks described by the approved
 [design](docs/superpowers/specs/2026-07-17-personal-operator-v0-design.md) and
@@ -35,11 +49,14 @@ The implementation proceeds in reviewed tasks described by the approved
 
 ## Runtime boundary now enforced
 
-- OpenClaw uses the `minimal` profile with exactly `session_status`,
-  `web_fetch`, `po_file_list`, `po_file_read`, `po_file_write`, and
-  `po_file_delete`. A live pinned-gateway invocation verified `web_fetch`;
-  `web_search` is deliberately deferred because the reviewed key-free
-  DuckDuckGo provider returned a bot-detection challenge.
+- OpenClaw uses the `minimal` profile but explicitly denies its mutable
+  `session_status` built-in. The effective surface is exactly `po_file_list`,
+  `po_file_read`, `po_file_write`, and `po_file_delete`. Model visibility and
+  selection are pinned to the single loopback `agentcore/bedrock-agentcore`
+  route; no fallback provider is visible.
+  Model-callable URL retrieval and search are deliberately deferred: combining
+  workspace reads with arbitrary network egress would create a data-exfiltration
+  path. A later URL reader must authorize targets outside the model tool loop.
 - The image loads only the repository-owned `personal-operator` plugin from an
   explicit path. All inherited executable skill trees are removed, bundled
   skills are disabled, and the agent's effective skill inventory is empty.
@@ -60,6 +77,12 @@ The implementation proceeds in reviewed tasks described by the approved
   Later mismatched invocations fail before initialization, workspace access,
   model execution, or mutable counters. The runtime receives only expiring,
   explicit S3 credentials for that user's exact namespace.
+- The runtime cannot call STS or construct its own S3 session policy. A trusted
+  broker alone can assume the bucket-wide base role. It accepts only a
+  worker-minted HMAC capability, strongly rechecks the exact live
+  user/session/runtime/release binding, derives the namespace policy on the
+  server, and returns credentials valid for at most 15 minutes. Refresh is
+  single-flight every 10 minutes; any denial quarantines the runtime.
 - S3 is authoritative for durable OpenClaw state. Each save writes immutable
   content-addressed payloads and a canonical manifest, then advances one
   compare-and-swap pointer. Deletion is represented by absence from the new
@@ -81,13 +104,14 @@ not prove the behavior of a deployed AgentCore runtime, S3 bucket, or IAM role.
 |---|---|
 | AWS region | `eu-west-1` |
 | Bedrock model | `eu.anthropic.claude-sonnet-4-6` |
-| Node.js image | `24.15.0-slim` |
+| Node.js image | `24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d` |
 | OpenClaw package version | `2026.7.2` |
 | OpenClaw source commit | `4bfaccafd62ac2ff2e70ca1decc40fb1297ab438` |
 | Registration | Invite-only |
 | Browser | Disabled |
 | Inactive pilot workspace retention | 30 days |
 | AgentCore runtime identifiers | Empty until an explicit deployment |
+| AgentCore release endpoint | `release_<exact-candidate-commit>`; mutable `DEFAULT` is rejected |
 
 OpenClaw `2026.7.2` is not a published npm release. The bridge image fetches
 the audited immutable source commit, verifies the package version, builds it
@@ -115,26 +139,48 @@ Run the complete local baseline:
 ./scripts/test-local.sh
 ```
 
-The local script runs Python unit tests, serialized Node tests with
-`AWS_REGION=eu-west-1`, JavaScript and Python syntax checks, and an offline CDK
-synthesis contract using a synthetic account number. It never deploys or
-requires cloud credentials. Cloud-specific behavior remains provisional until
-a later credentialed staging gate; local tests do not constitute deployment
-evidence.
+The local script runs the Python unit, security, integration, replay, and
+synthetic-journey suites; serialized runtime Node tests; web tests and a
+production build; JavaScript/Python syntax checks; repository whitespace
+checks; and offline CDK/cdk-nag synthesis using a synthetic account number. It
+never deploys or requires cloud credentials. Cloud-specific behavior remains
+provisional until a later credentialed staging gate.
 
-## Remaining product boundaries
+The separate release-candidate gate requires a clean exact commit, Docker, an
+explicitly reviewed immutable AWS Lambda Python image digest, a commit-bound
+runtime-context v3 file, its exact private-ECR runtime digest, and a
+non-synthetic account-shaped value. It builds and verifies the transitive,
+hash-locked Python 3.13/ARM64 asset, reruns the local suite, and synthesizes all
+stacks without AWS credentials:
 
-- The completed v0 must remain invite-only with browser automation disabled.
-- The target runtime must not allow arbitrary marketplace skill, MCP server,
+```bash
+export PERSONAL_OPERATOR_RELEASE_ACCOUNT=123456789012
+export PERSONAL_OPERATOR_RELEASE_COMMIT="$(git rev-parse HEAD)"
+export TRUSTED_LAMBDA_BUILD_IMAGE='public.ecr.aws/lambda/python@sha256:<reviewed-digest>'
+export PERSONAL_OPERATOR_RUNTIME_CONTEXT_FILE="$PWD/build/runtime-context.json"
+export PERSONAL_OPERATOR_RUNTIME_IMAGE_URI='123456789012.dkr.ecr.eu-west-1.amazonaws.com/personal-operator/bridge@sha256:<reviewed-digest>'
+./scripts/test-release-assets.sh
+```
+
+This command never deploys, but it does pull the pinned public builder image
+and hash-locked Python packages. It refuses an absent, mismatched, or
+placeholder runtime binding. A pass is packaging and synthesis evidence, not
+cloud behavior evidence.
+
+## Release boundary
+
+- v0 remains invite-only with browser automation disabled.
+- The runtime does not allow arbitrary marketplace skill, MCP server,
   plugin, or user API-key installation.
-- The target OpenClaw boundary must never receive Telegram, Google, database,
+- The OpenClaw boundary never receives Telegram, Google, database,
   approval-signing, or cross-user credentials.
-- Raw Gmail bodies must remain transient and must not be persisted or logged.
-- External effects must require a trusted capability gateway and exact
+- Raw Gmail bodies are transient and are not intentionally persisted or logged.
+- External effects require the trusted capability gateway and exact
   approval.
-- Provider timeouts must become `UNCERTAIN` and be reconciled before retry.
+- Provider timeouts become `UNCERTAIN` and cannot be retried before
+  reconciliation.
 - No deployment, push, paid resource creation, or real message is part of the
-  local baseline workflow.
+  local implementation workflow.
 
 ## Repository map
 
@@ -142,12 +188,24 @@ evidence.
 app.py                  AWS CDK application entry point
 cdk.json                Frozen product and runtime defaults
 bridge/                 AgentCore/OpenClaw container bridge
-lambda/                 Imported router and cron functions
-stacks/                 Imported CDK stacks
-tests/                  Static product and end-to-end contracts
-scripts/test-local.sh   Credential-free local baseline command
+lambda/router/          Signed ingress and AgentCore runtime driver
+lambda/worker/          Ordered worker and durable Telegram delivery ledger
+lambda/control/         Deterministic product-command application boundary
+lambda/workflows/       Read-only Gmail application workflow
+lambda/actions/         Approval, effect, and reconciliation state machines
+lambda/web/             Browser auth, approval, export, retention, deletion
+web/                    React/Vite consumer control surface
+stacks/                 CDK infrastructure and exact IAM boundaries
+tests/                  Unit, security, replay, and synthetic journey contracts
+scripts/test-local.sh   Credential-free aggregate local gate
+scripts/test-release-assets.sh
+                        Docker-backed exact-asset release gate (no deployment)
+scripts/build-trusted-lambda-asset.sh
+                        Verified ARM64 dependency asset builder
 docs/BASELINE.md        Reproducible imported and current test evidence
 docs/UPSTREAM.md        Upstream source and license ledger
+docs/RELEASE-EVIDENCE.md
+                        Current evidence and unclosed external gates
 ```
 
 ## Upstream and license

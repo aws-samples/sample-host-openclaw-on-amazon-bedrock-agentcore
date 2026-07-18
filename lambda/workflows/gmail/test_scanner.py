@@ -384,3 +384,39 @@ def test_provider_listing_failure_is_redacted_and_fails_closed(caplog):
     assert "ACCESS-TOKEN" not in caplog.text
     assert "SECRET-CONTENT" not in caplog.text
     assert "RuntimeError" in caplog.text
+
+
+def test_google_adapter_disables_library_level_retries_for_every_provider_read():
+    execute_calls = []
+
+    class Request:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def execute(self, **kwargs):
+            execute_calls.append(kwargs)
+            return self.payload
+
+    class Threads:
+        def list(self, **kwargs):
+            return Request({"threads": [{"id": "thread-1"}]})
+
+        def get(self, **kwargs):
+            return Request({"id": "thread-1", "messages": []})
+
+    class Users:
+        def threads(self):
+            return Threads()
+
+    class Service:
+        def users(self):
+            return Users()
+
+    client = scanner_module.GoogleGmailApiClient(Service())
+
+    assert client.list_threads(query="in:sent", max_results=1) == [{"id": "thread-1"}]
+    assert client.get_thread(thread_id="thread-1", format="full") == {
+        "id": "thread-1",
+        "messages": [],
+    }
+    assert execute_calls == [{"num_retries": 0}, {"num_retries": 0}]

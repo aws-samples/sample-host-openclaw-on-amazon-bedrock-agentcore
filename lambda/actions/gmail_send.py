@@ -44,6 +44,10 @@ class ProviderEvidenceAmbiguous(RuntimeError):
     pass
 
 
+class ProviderCallTimeout(ProviderEvidenceAmbiguous):
+    """A provider request crossed its explicit no-retry time boundary."""
+
+
 _EMAIL = re.compile(
     r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@"
     r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?"
@@ -51,6 +55,16 @@ _EMAIL = re.compile(
 _ACTION = re.compile(r"[A-Za-z0-9_-]{8,128}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MESSAGE_ID = re.compile(r"<po-[0-9a-f]{24}@personal-operator\.invalid>")
+
+
+def _assert_action_retention_live(
+    action: Mapping[str, object], *, now: datetime
+) -> None:
+    ttl = action.get("ttl")
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+        raise CapabilityDenied("action retention boundary is invalid")
+    if int(now.astimezone(timezone.utc).timestamp()) >= ttl:
+        raise CapabilityDenied("action retention expired")
 
 
 def validate_email_args(args: object) -> dict[str, str]:
@@ -148,6 +162,7 @@ class GmailApiAdapter:
         connection_id: str,
         account_email: str,
         user_id: str = "me",
+        timeout_seconds: int = 5,
     ) -> None:
         if service is None:
             raise ValueError("Gmail service is required")
@@ -158,8 +173,15 @@ class GmailApiAdapter:
         self._account_email = account_email
         if not isinstance(user_id, str) or not user_id or len(user_id) > 320 or "\x00" in user_id:
             raise ValueError("Gmail user_id is invalid")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 20
+        ):
+            raise ValueError("Gmail provider timeout must be between 1 and 20 seconds")
         self._service = service
         self._user_id = user_id
+        self._timeout_seconds = timeout_seconds
 
     @staticmethod
     def _message_id(value: str) -> str:
@@ -173,15 +195,39 @@ class GmailApiAdapter:
         except Exception as error:
             raise ProviderEvidenceAmbiguous("Gmail API boundary is unavailable") from error
 
+    def _execute(self, request):
+        """Execute exactly once over a transport with a proven socket timeout."""
+
+        transport = getattr(request, "http", None)
+        if transport is None:
+            transport = getattr(self._service, "_http", None)
+        socket_transport = getattr(transport, "http", transport)
+        if socket_transport is None or not hasattr(socket_transport, "timeout"):
+            raise ProviderEvidenceAmbiguous(
+                "Gmail request transport has no bounded timeout"
+            )
+        try:
+            socket_transport.timeout = self._timeout_seconds
+            if socket_transport.timeout != self._timeout_seconds:
+                raise ValueError("transport rejected timeout")
+        except Exception:
+            raise ProviderEvidenceAmbiguous(
+                "Gmail request transport timeout cannot be enforced"
+            ) from None
+        try:
+            return request.execute(num_retries=0)
+        except TimeoutError:
+            raise ProviderCallTimeout("Gmail provider request timed out") from None
+
     def _assert_bound_provider_account(self) -> None:
         """Prove the OAuth connection currently resolves to the approved account."""
 
         try:
-            response = (
-                self._service.users()
-                .getProfile(userId=self._user_id)
-                .execute()
+            response = self._execute(
+                self._service.users().getProfile(userId=self._user_id)
             )
+        except ProviderCallTimeout:
+            raise
         except Exception as error:
             raise ProviderEvidenceAmbiguous("Gmail account binding is unavailable") from error
         if (
@@ -202,11 +248,15 @@ class GmailApiAdapter:
         payload_hash: str,
     ) -> dict[str, object]:
         try:
-            evidence = (
-                self._messages()
-                .get(userId=self._user_id, id=provider_id, format="raw")
-                .execute()
+            evidence = self._execute(
+                self._messages().get(
+                    userId=self._user_id,
+                    id=provider_id,
+                    format="raw",
+                )
             )
+        except ProviderCallTimeout:
+            raise
         except Exception as error:
             raise ProviderEvidenceAmbiguous("Gmail evidence lookup is unavailable") from error
         if not isinstance(evidence, Mapping):
@@ -282,11 +332,14 @@ class GmailApiAdapter:
         self._assert_bound_provider_account()
         encoded = base64.urlsafe_b64encode(raw).decode("ascii")
         try:
-            response = (
-                self._messages()
-                .send(userId=self._user_id, body={"raw": encoded})
-                .execute()
+            response = self._execute(
+                self._messages().send(
+                    userId=self._user_id,
+                    body={"raw": encoded},
+                )
             )
+        except ProviderCallTimeout:
+            raise
         except Exception as error:
             raise ProviderEvidenceAmbiguous("Gmail send outcome is unproven") from error
         if not isinstance(response, Mapping) or not isinstance(response.get("id"), str) or not response["id"]:
@@ -314,16 +367,16 @@ class GmailApiAdapter:
         self._assert_bound_provider_account()
         bare_id = message_id[1:-1]
         try:
-            response = (
-                self._messages()
-                .list(
+            response = self._execute(
+                self._messages().list(
                     userId=self._user_id,
                     q=f"rfc822msgid:{bare_id}",
                     maxResults=2,
                     includeSpamTrash=True,
                 )
-                .execute()
             )
+        except ProviderCallTimeout:
+            raise
         except Exception as error:
             raise ProviderEvidenceAmbiguous("Gmail history lookup is unavailable") from error
         if not isinstance(response, Mapping) or not isinstance(response.get("messages", []), list):
@@ -376,6 +429,7 @@ class GmailSendExecutor:
         connection_id: str,
         account_email: str,
         sender_address: str,
+        deletion_blocked,
         now=None,
     ) -> None:
         self._resource = gmail_resource(
@@ -385,8 +439,11 @@ class GmailSendExecutor:
             raise ValueError("sender_address must be one canonical email address")
         if sender_address != account_email:
             raise ValueError("v0 sender must equal the bound Google account")
+        if not callable(deletion_blocked):
+            raise ValueError("Gmail effect deletion fence is required")
         self._machine = state_machine
         self._provider = provider
+        self._deletion_blocked = deletion_blocked
         self._founders = frozenset(founder_user_ids)
         self._connection_id = connection_id
         self._account_email = account_email
@@ -450,6 +507,25 @@ class GmailSendExecutor:
             or approved_at >= approval_expires_at
         ):
             raise SendValidationError("action does not match the approved exact payload and Google account")
+        now = self._now().astimezone(timezone.utc)
+        try:
+            _assert_action_retention_live(action, now=now)
+        except CapabilityDenied:
+            if state is ActionState.APPROVED:
+                try:
+                    self._machine.transition(
+                        action_id=action_id,
+                        user_id=user_id,
+                        current=ActionState.APPROVED,
+                        target=ActionState.EXPIRED,
+                        revision=revision,
+                        updates={"expiredAt": now.isoformat()},
+                    )
+                except Exception as error:
+                    raise EffectUncertain(
+                        "action retention expiry transition could not be proven"
+                    ) from error
+            raise
         if state is ActionState.CONFIRMED:
             try:
                 receipt = EffectReceipt.from_record(action.get("effectReceipt"))
@@ -463,7 +539,6 @@ class GmailSendExecutor:
         if state is not ActionState.APPROVED:
             raise SendValidationError("action is not approved for dispatch")
 
-        now = self._now().astimezone(timezone.utc)
         if now >= approval_expires_at:
             try:
                 self._machine.transition(
@@ -515,7 +590,14 @@ class GmailSendExecutor:
         ):
             raise EffectUncertain("dispatch operation ownership is unproven")
         dispatch_revision = int(dispatching["revision"])
+        provider_attempted = False
         try:
+            blocked = self._deletion_blocked(user_id)
+            if not isinstance(blocked, bool):
+                raise TypeError("account deletion fence returned an invalid result")
+            if blocked:
+                raise CapabilityDenied("account deletion blocks Gmail effects")
+            provider_attempted = True
             outcome = self._provider.send_raw(
                 raw=raw,
                 message_id=message_id,
@@ -536,13 +618,22 @@ class GmailSendExecutor:
                     revision=dispatch_revision,
                     updates={
                         "uncertainAt": self._now().astimezone(timezone.utc).isoformat(),
-                        "uncertaintyReason": "provider-outcome-unproven",
+                        "uncertaintyReason": (
+                            "provider-outcome-unproven"
+                            if provider_attempted
+                            else "account-deletion-fence"
+                        ),
                         "uncertainDraftRevision": draft_revision,
                     },
                 )
             except Exception:
                 pass
-            raise EffectUncertain("Gmail effect outcome is uncertain and was not retried") from error
+            message = (
+                "Gmail effect outcome is uncertain and was not retried"
+                if provider_attempted
+                else "account deletion fence blocked Gmail before provider dispatch"
+            )
+            raise EffectUncertain(message) from error
 
         tracker = WaitingForReply(
             action_id=action_id,

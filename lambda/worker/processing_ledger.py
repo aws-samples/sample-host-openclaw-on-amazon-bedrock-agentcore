@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from numbers import Number
 import re
 import time
 from typing import Mapping
@@ -15,6 +16,8 @@ except ImportError:
 
 
 PROCESSING_LEASE_MS = 300_000
+DELIVERY_LEASE_MS = 300_000
+TERMINAL_RETENTION_SECONDS = 90 * 24 * 60 * 60
 MAX_RESULT_CHARS = 3_500
 _OWNER = re.compile(r"worker-[0-9a-f]{32}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -46,6 +49,20 @@ def result_sha256(result: str) -> str:
     if not isinstance(result, str) or not result or len(result) > MAX_RESULT_CHARS:
         raise LedgerError("result must be non-empty bounded text")
     return hashlib.sha256(result.encode("utf-8")).hexdigest()
+
+
+def _exact_integer(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, Number):
+        return None
+    try:
+        converted = int(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return converted if value == converted else None
+
+
+def _terminal_ttl(now_ms: int) -> int:
+    return now_ms // 1_000 + TERMINAL_RETENTION_SECONDS
 
 
 def _is_conditional(error: BaseException) -> bool:
@@ -134,6 +151,10 @@ class DynamoProcessingLedger:
                 current.get("claimExpiresAt", 0)
             ) < now:
                 current = self._expire_processing(current, now=now)
+            if current.get("state") == "DELIVERY_IN_FLIGHT":
+                started_at = _exact_integer(current.get("deliveryStartedAt"))
+                if started_at is not None and started_at < now - DELIVERY_LEASE_MS:
+                    current = self._expire_delivery(current, now=now)
             return self._claim(current)
 
     def _expire_processing(self, current: Mapping, *, now: int) -> dict:
@@ -143,12 +164,13 @@ class DynamoProcessingLedger:
             ":owner": current.get("processingOwner"),
             ":epoch": int(current.get("processingEpoch", 0)),
             ":now": now,
+            ":ttl": _terminal_ttl(now),
         }
         try:
             response = self._table.update_item(
                 Key={"eventId": current["eventId"]},
                 UpdateExpression=(
-                    "SET #state=:uncertain, updatedAt=:now, "
+                    "SET #state=:uncertain, updatedAt=:now, ttl=:ttl, "
                     "uncertaintyReason=:reason REMOVE claimExpiresAt"
                 ),
                 ConditionExpression=(
@@ -168,6 +190,56 @@ class DynamoProcessingLedger:
             if reconciled and reconciled.get("state") == "PROCESSING_UNCERTAIN":
                 return reconciled
             raise LedgerError("could not quarantine expired processing") from error
+
+    def _expire_delivery(self, current: Mapping, *, now: int) -> dict:
+        owner = current.get("deliveryOwner")
+        epoch = _exact_integer(current.get("deliveryEpoch"))
+        started_at = _exact_integer(current.get("deliveryStartedAt"))
+        if (
+            not isinstance(owner, str)
+            or _OWNER.fullmatch(owner) is None
+            or epoch is None
+            or epoch < 1
+            or started_at is None
+        ):
+            raise LedgerError("stale delivery record has an invalid fence")
+        cutoff = now - DELIVERY_LEASE_MS
+        try:
+            response = self._table.update_item(
+                Key={"eventId": current["eventId"]},
+                UpdateExpression=(
+                    "SET #state=:uncertain, updatedAt=:now, ttl=:ttl, "
+                    "uncertaintyReason=:reason REMOVE deliveryOwner"
+                ),
+                ConditionExpression=(
+                    "#state=:inflight AND requestSha256=:requestSha AND "
+                    "deliveryOwner=:owner AND deliveryEpoch=:epoch AND "
+                    "deliveryStartedAt=:startedAt AND deliveryStartedAt < :cutoff"
+                ),
+                ExpressionAttributeNames={"#state": "state"},
+                ExpressionAttributeValues={
+                    ":inflight": "DELIVERY_IN_FLIGHT",
+                    ":uncertain": "DELIVERY_UNCERTAIN",
+                    ":owner": owner,
+                    ":epoch": epoch,
+                    ":requestSha": current["requestSha256"],
+                    ":startedAt": started_at,
+                    ":cutoff": cutoff,
+                    ":reason": "delivery-claim-expired",
+                    ":now": now,
+                    ":ttl": _terminal_ttl(now),
+                },
+                ReturnValues="ALL_NEW",
+            )
+            return dict(response["Attributes"])
+        except Exception as error:
+            reconciled = self._read(current["eventId"])
+            if reconciled and reconciled.get("state") in {
+                "DELIVERY_UNCERTAIN",
+                "DELIVERED",
+            }:
+                return reconciled
+            raise LedgerError("could not quarantine expired delivery") from error
 
     def complete_result(self, claim: LedgerClaim, result: str) -> LedgerClaim:
         digest = result_sha256(result)
@@ -220,7 +292,7 @@ class DynamoProcessingLedger:
                 Key={"eventId": claim.key},
                 UpdateExpression=(
                     "SET #state=:uncertain, uncertaintyReason=:reason, "
-                    "updatedAt=:now REMOVE claimExpiresAt"
+                    "updatedAt=:now, ttl=:ttl REMOVE claimExpiresAt"
                 ),
                 ConditionExpression=(
                     "#state=:processing AND processingOwner=:owner AND "
@@ -234,6 +306,7 @@ class DynamoProcessingLedger:
                     ":epoch": claim.epoch,
                     ":reason": str(error_type)[:128],
                     ":now": now,
+                    ":ttl": _terminal_ttl(now),
                 },
             )
         except Exception:
@@ -308,7 +381,8 @@ class DynamoProcessingLedger:
                 Key={"eventId": claim.key},
                 UpdateExpression=(
                     "SET #state=:delivered, providerMessageId=:providerId, "
-                    "deliveredAt=:now, updatedAt=:now REMOVE deliveryOwner"
+                    "deliveredAt=:now, updatedAt=:now, ttl=:ttl "
+                    "REMOVE deliveryOwner"
                 ),
                 ConditionExpression=(
                     "#state=:inflight AND deliveryOwner=:owner AND "
@@ -322,6 +396,7 @@ class DynamoProcessingLedger:
                     ":owner": claim.owner,
                     ":epoch": claim.epoch,
                     ":now": now,
+                    ":ttl": _terminal_ttl(now),
                 },
                 ReturnValues="ALL_NEW",
             )
@@ -347,7 +422,7 @@ class DynamoProcessingLedger:
                 Key={"eventId": claim.key},
                 UpdateExpression=(
                     "SET #state=:uncertain, uncertaintyReason=:reason, "
-                    "updatedAt=:now REMOVE deliveryOwner"
+                    "updatedAt=:now, ttl=:ttl REMOVE deliveryOwner"
                 ),
                 ConditionExpression=(
                     "#state=:inflight AND deliveryOwner=:owner AND "
@@ -361,6 +436,7 @@ class DynamoProcessingLedger:
                     ":epoch": claim.epoch,
                     ":reason": str(error_type)[:128],
                     ":now": now,
+                    ":ttl": _terminal_ttl(now),
                 },
             )
         except Exception:

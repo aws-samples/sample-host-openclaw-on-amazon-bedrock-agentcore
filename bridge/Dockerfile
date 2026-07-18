@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Builder — install all dependencies and tools
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim AS builder
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d AS builder
 
 # Install system dependencies
 RUN apt-get update && \
@@ -43,7 +43,7 @@ RUN mkdir -p /app/.compile-cache && \
     NODE_COMPILE_CACHE=/app/.compile-cache node -e " \
       require('@aws-sdk/client-bedrock-runtime'); \
       require('@aws-sdk/client-s3'); \
-      require('@aws-sdk/client-sts'); \
+      require('@aws-sdk/client-lambda'); \
       require('typebox'); \
       require('ws'); \
       console.log('[build] V8 compile cache pre-warmed'); \
@@ -52,7 +52,7 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 # Stage 2: Runtime — minimal image with only needed artifacts
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
 
 # Install only runtime system dependencies (no git, no pip, no build tools)
 RUN apt-get update && \

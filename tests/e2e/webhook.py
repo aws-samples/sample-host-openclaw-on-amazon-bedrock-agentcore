@@ -2,12 +2,16 @@
 
 import json
 import random
+import re
 import time
 from dataclasses import dataclass
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
 from .config import E2EConfig
+
+
+_PRIVATE_TELEGRAM_ID = re.compile(r"[1-9][0-9]{0,19}")
 
 
 @dataclass
@@ -25,6 +29,13 @@ def build_telegram_payload(
     display_name: str = "E2E Test User",
 ) -> dict:
     """Build a realistic Telegram Update JSON payload."""
+    if (
+        not isinstance(chat_id, str)
+        or not isinstance(user_id, str)
+        or _PRIVATE_TELEGRAM_ID.fullmatch(chat_id) is None
+        or chat_id != user_id
+    ):
+        raise ValueError("E2E requires one exact private Telegram identity")
     update_id = random.randint(100_000_000, 999_999_999)
     message_id = random.randint(1, 999_999)
     ts = int(time.time())

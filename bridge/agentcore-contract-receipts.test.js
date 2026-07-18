@@ -155,6 +155,7 @@ describe("trusted snapshot invocation", () => {
       action: "snapshot",
       internalUserId: "user_A",
       namespace: "user_A",
+      workspaceCapability: "signed.capability",
     });
 
     assert.deepEqual(bound.identity, {

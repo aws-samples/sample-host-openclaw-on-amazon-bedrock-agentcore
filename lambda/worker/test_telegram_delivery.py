@@ -69,6 +69,61 @@ def test_one_exact_telegram_attempt_returns_provider_receipt_without_exposing_to
     assert TOKEN not in repr(receipt)
 
 
+def test_validated_opportunity_keyboard_is_included_in_the_same_provider_attempt():
+    requests = []
+    adapter = delivery_module.TelegramDeliveryAdapter(
+        token_provider=lambda: TOKEN,
+        opener=lambda request, timeout: (
+            requests.append((request, timeout))
+            or Response({"ok": True, "result": {"message_id": 12345}})
+        ),
+    )
+    reply_markup = {
+        "inline_keyboard": [[
+            {"text": "Edit", "callback_data": "poc1:edit:AAAAAAAAAAAAAAAAAAAAAA"},
+            {"text": "Prepare", "callback_data": "poc1:prepare:BBBBBBBBBBBBBBBBBBBBBB"},
+            {"text": "Skip", "callback_data": "poc1:skip:CCCCCCCCCCCCCCCCCCCCCC"},
+            {"text": "Why", "callback_data": "poc1:why:DDDDDDDDDDDDDDDDDDDDDD"},
+        ]]
+    }
+
+    adapter.send_message(
+        chat_id="9001",
+        html="<b>Reply to Ada</b>",
+        reply_markup=reply_markup,
+        trace_id="po1_" + "a" * 64,
+        idempotency_key="po1_" + "a" * 64,
+    )
+
+    assert len(requests) == 1
+    assert json.loads(requests[0][0].data)["reply_markup"] == reply_markup
+
+
+def test_keyboard_validation_rejects_urls_send_and_action_mismatch_before_token_read():
+    token_calls = []
+    adapter = delivery_module.TelegramDeliveryAdapter(
+        token_provider=lambda: token_calls.append(True),
+    )
+    for markup in (
+        {"inline_keyboard": [[{"text": "Open", "url": "https://attacker.test"}]]},
+        {"inline_keyboard": [[
+            {"text": "Edit", "callback_data": "poc1:edit:AAAAAAAAAAAAAAAAAAAAAA"},
+            {"text": "Send", "callback_data": "poc1:prepare:BBBBBBBBBBBBBBBBBBBBBB"},
+            {"text": "Skip", "callback_data": "poc1:skip:CCCCCCCCCCCCCCCCCCCCCC"},
+            {"text": "Why", "callback_data": "poc1:why:DDDDDDDDDDDDDDDDDDDDDD"},
+        ]]},
+    ):
+        with pytest.raises(delivery_module.TelegramDeliveryValidationError):
+            adapter.send_message(
+                chat_id="9001",
+                html="safe",
+                reply_markup=markup,
+                trace_id="po1_" + "a" * 64,
+                idempotency_key="po1_" + "a" * 64,
+            )
+    assert token_calls == []
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -140,3 +195,41 @@ def test_local_validation_fails_before_token_or_network():
             )
     assert token_calls == []
     assert network_calls == []
+
+
+def test_shared_renderer_enforces_bound_after_html_escape_and_formatting():
+    assert delivery_module.render_safe_telegram_html("<done> & **safe**") == (
+        "&lt;done&gt; &amp; <b>safe</b>"
+    )
+
+    with pytest.raises(delivery_module.TelegramDeliveryValidationError):
+        delivery_module.render_safe_telegram_html(
+            "&" * (delivery_module.TELEGRAM_MAX_HTML_CHARS // 5 + 1)
+        )
+
+
+def test_adapter_reuses_exact_shared_html_bound_before_provider_attempt():
+    token_calls = []
+    network_calls = []
+    adapter = delivery_module.TelegramDeliveryAdapter(
+        token_provider=lambda: token_calls.append(True),
+        opener=lambda *_args, **_kwargs: network_calls.append(True),
+    )
+    oversized = "x" * (delivery_module.TELEGRAM_MAX_HTML_CHARS + 1)
+
+    with pytest.raises(delivery_module.TelegramDeliveryValidationError):
+        adapter.send_message(
+            chat_id="9001",
+            html=oversized,
+            trace_id="po1_" + "a" * 64,
+            idempotency_key="po1_" + "a" * 64,
+        )
+
+    assert token_calls == []
+    assert network_calls == []
+
+
+def test_shared_bound_counts_utf16_units_conservatively_for_telegram():
+    assert delivery_module.validate_safe_telegram_html("😀" * 2_048)
+    with pytest.raises(delivery_module.TelegramDeliveryValidationError):
+        delivery_module.validate_safe_telegram_html("😀" * 2_049)

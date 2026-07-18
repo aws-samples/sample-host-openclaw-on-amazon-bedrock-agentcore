@@ -1,0 +1,8 @@
+# Direct dependencies for trusted Python Lambdas. The deployment consumes the
+# generated, hash-locked requirements.txt; update it only with the documented
+# uv command after reviewing the full transitive diff.
+boto3==1.43.50
+cryptography==49.0.0
+google-api-python-client==2.198.0
+google-auth==2.56.0
+openai==2.46.0

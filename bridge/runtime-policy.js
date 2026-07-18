@@ -8,20 +8,18 @@ const {
 } = require("./scoped-credentials");
 
 const APPROVED_TOOLS = Object.freeze([
-  "session_status",
-  "web_fetch",
   "po_file_list",
   "po_file_read",
   "po_file_write",
   "po_file_delete",
 ]);
 
-// OpenClaw's minimal profile contains only session_status. This version rejects
-// allow and alsoAllow in the same scope, so the exact effective boundary is the
-// minimal profile plus these reviewed additions.
-const PROFILE_ADDITIONS = Object.freeze(
-  APPROVED_TOOLS.filter((tool) => tool !== "session_status"),
-);
+// OpenClaw's pinned minimal profile contributes the mutable session_status
+// tool. Keep the reviewed plugin tools additive, then deny that built-in so the
+// effective model-callable surface is exactly APPROVED_TOOLS.
+const PROFILE_ADDITIONS = APPROVED_TOOLS;
+const DENIED_BUILTIN_TOOLS = Object.freeze(["session_status"]);
+const APPROVED_MODEL = "agentcore/bedrock-agentcore";
 
 const PLUGIN_ID = "personal-operator";
 const PLUGIN_PATH = "/app/plugins/personal-operator";
@@ -70,6 +68,7 @@ function buildRuntimePolicy() {
     tools: {
       profile: "minimal",
       alsoAllow: [...PROFILE_ADDITIONS],
+      deny: [...DENIED_BUILTIN_TOOLS],
     },
     plugins: {
       enabled: true,
@@ -95,6 +94,7 @@ function buildOpenClawConfig({
   const policy = buildRuntimePolicy();
   return {
     models: {
+      mode: "replace",
       providers: {
         agentcore: {
           baseUrl: `http://127.0.0.1:${proxyPort}/v1`,
@@ -106,7 +106,8 @@ function buildOpenClawConfig({
     },
     agents: {
       defaults: {
-        model: { primary: "agentcore/bedrock-agentcore" },
+        model: { primary: APPROVED_MODEL },
+        models: { [APPROVED_MODEL]: {} },
         skills: [],
       },
     },
@@ -216,6 +217,8 @@ function createLocalGatewayToken() {
 module.exports = {
   APPROVED_TOOLS,
   PROFILE_ADDITIONS,
+  DENIED_BUILTIN_TOOLS,
+  APPROVED_MODEL,
   PLUGIN_ID,
   PLUGIN_PATH,
   GATEWAY_CLIENT_SCOPES,

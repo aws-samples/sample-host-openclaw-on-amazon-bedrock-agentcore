@@ -6,13 +6,14 @@ from botocore.exceptions import ClientError
 import pytest
 
 from .config import E2EConfig
-from . import session
+from . import session, webhook
 
 
 RUNTIME_ARN = (
     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
     "agent/12345678-1234-1234-1234-123456789abc:7"
 )
+RELEASE_ENDPOINT = "release_" + "a" * 40
 
 
 def config() -> E2EConfig:
@@ -20,14 +21,14 @@ def config() -> E2EConfig:
         region="eu-west-1",
         api_url="https://example.invalid",
         webhook_secret="synthetic",
-        telegram_chat_id="10001",
+        telegram_chat_id="10002",
         telegram_user_id="10002",
         workspace_session_role_arn=(
             "arn:aws:iam::123456789012:role/"
             "openclaw-workspace-session-role-eu-west-1"
         ),
         runtime_arn=RUNTIME_ARN,
-        runtime_endpoint_name="DEFAULT",
+        runtime_endpoint_name=RELEASE_ENDPOINT,
     )
 
 
@@ -90,7 +91,7 @@ def test_existing_session_is_stopped_by_exact_arn_and_name_then_deleted(monkeypa
     assert agentcore.calls == [
         {
             "agentRuntimeArn": RUNTIME_ARN,
-            "qualifier": "DEFAULT",
+            "qualifier": RELEASE_ENDPOINT,
             "runtimeSessionId": "session-1",
         }
     ]
@@ -151,3 +152,25 @@ def test_already_terminated_session_still_deletes_the_stale_record(monkeypatch) 
         "recordDeleted": True,
     }
     assert table.deleted
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "user_id"),
+    [("10001", "10002"), ("-10001", "10001"), ("0", "0"), ("abc", "abc")],
+)
+def test_e2e_webhook_rejects_non_private_or_noncanonical_identity(
+    chat_id: str, user_id: str
+) -> None:
+    with pytest.raises(ValueError, match="private Telegram identity"):
+        webhook.build_telegram_payload(chat_id, user_id, "hello")
+
+
+def test_e2e_webhook_emits_one_exact_private_actor_chat() -> None:
+    payload = webhook.build_telegram_payload("10002", "10002", "hello")
+
+    assert payload["message"]["chat"] == {
+        "id": 10002,
+        "first_name": "E2E Test User",
+        "type": "private",
+    }
+    assert payload["message"]["from"]["id"] == 10002

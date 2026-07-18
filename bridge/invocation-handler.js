@@ -62,6 +62,20 @@ function snapshotOptionalString(value, label) {
   return value;
 }
 
+function snapshotWorkspaceCapability(value, { required } = {}) {
+  if (value === undefined && !required) return undefined;
+  if (
+    typeof value !== "string" ||
+    !value ||
+    !value.isWellFormed() ||
+    !/^[\x20-\x7e]+$/.test(value) ||
+    Buffer.byteLength(value, "ascii") > 2_048
+  ) {
+    throw new TypeError("workspace capability must be bounded ASCII text");
+  }
+  return value;
+}
+
 function snapshotRequest(payload) {
   const request = {};
   for (const key of ["message", "invocationId"]) {
@@ -97,6 +111,14 @@ function createInvocationHandler({ sessionBinding, handlers = {} } = {}) {
         throw new InvocationActionError(`Unsupported invocation action: ${action}`);
       }
 
+      const workspaceCapability = snapshotWorkspaceCapability(
+        payload.workspaceCapability,
+        { required: action !== "status" },
+      );
+      const authority = Object.freeze({
+        ...(workspaceCapability === undefined ? {} : { workspaceCapability }),
+      });
+
       const actorId = snapshotOptionalString(payload.actorId, "actorId");
       const channel = snapshotOptionalString(payload.channel, "channel");
       const delivery = Object.freeze({
@@ -108,6 +130,7 @@ function createInvocationHandler({ sessionBinding, handlers = {} } = {}) {
       return actionHandler(Object.freeze({
         identity,
         delivery,
+        authority,
         request,
       }));
     },

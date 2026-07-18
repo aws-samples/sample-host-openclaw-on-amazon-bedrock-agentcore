@@ -1,4 +1,6 @@
-"""Security Stack — KMS CMK, Secrets Manager secrets, CloudTrail."""
+"""Security Stack — KMS CMK, exact-purpose secrets, and CloudTrail."""
+
+import json
 
 from aws_cdk import (
     Stack,
@@ -123,8 +125,118 @@ class SecurityStack(Stack):
             ),
         )
 
+        # Domain-separated control-plane signing keys. These never enter the
+        # OpenClaw runtime and are read only by their exact trusted Lambdas.
+        self.web_auth_secret = secretsmanager.Secret(
+            self,
+            "WebAuthSecret",
+            secret_name="personal-operator/web-auth",
+            description="HMAC key for one-time connect tickets and opaque web sessions",
+            encryption_key=self.cmk,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=64,
+                exclude_punctuation=True,
+            ),
+        )
+        self.approval_signing_secret = secretsmanager.Secret(
+            self,
+            "ApprovalSigningSecret",
+            secret_name="personal-operator/approval-signing",
+            description="HMAC key for exact founder approval grants",
+            encryption_key=self.cmk,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=64,
+                exclude_punctuation=True,
+            ),
+        )
+        self.workspace_capability_secret = secretsmanager.Secret(
+            self,
+            "WorkspaceCapabilitySecret",
+            secret_name="personal-operator/workspace-capability",
+            description=(
+                "HMAC key for exact user and AgentCore-session workspace capabilities"
+            ),
+            encryption_key=self.cmk,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=64,
+                exclude_punctuation=True,
+            ),
+        )
+        self.origin_verification_secret = secretsmanager.Secret(
+            self,
+            "OriginVerificationSecret",
+            secret_name="personal-operator/cloudfront-origin-verification",
+            description=(
+                "CloudFront-to-HTTP-API origin proof; never accepted from a viewer"
+            ),
+            encryption_key=self.cmk,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=64,
+                exclude_punctuation=True,
+                include_space=False,
+                require_each_included_type=False,
+            ),
+        )
+
+        def provider_placeholder(
+            construct_id: str,
+            *,
+            secret_name: str,
+            description: str,
+            fields: dict[str, str],
+        ) -> secretsmanager.Secret:
+            return secretsmanager.Secret(
+                self,
+                construct_id,
+                secret_name=secret_name,
+                description=description,
+                encryption_key=self.cmk,
+                generate_secret_string=secretsmanager.SecretStringGenerator(
+                    secret_string_template=json.dumps(fields),
+                    generate_string_key="bootstrap_nonce",
+                    password_length=32,
+                    exclude_punctuation=True,
+                ),
+            )
+
+        self.google_readonly_oauth_secret = provider_placeholder(
+            "GoogleReadonlyOAuthSecret",
+            secret_name="personal-operator/google-readonly-oauth",
+            description="Google OAuth client for the Gmail read-only pilot",
+            fields={"client_id": "REPLACE_ME", "client_secret": "REPLACE_ME"},
+        )
+        self.google_send_oauth_secret = provider_placeholder(
+            "GoogleSendOAuthSecret",
+            secret_name="personal-operator/google-send-oauth",
+            description="Separate founder-only Gmail send connection",
+            fields={
+                "client_id": "REPLACE_ME",
+                "client_secret": "REPLACE_ME",
+                "refresh_token": "REPLACE_ME",
+                "email": "REPLACE_ME",
+                "connection_id": "REPLACE_ME",
+                "user_id": "REPLACE_ME",
+            },
+        )
+        self.openai_api_key_secret = provider_placeholder(
+            "OpenAiApiKeySecret",
+            secret_name="personal-operator/openai-api-key",
+            description="OpenAI API key for non-retained opportunity ranking",
+            fields={"api_key": "REPLACE_ME"},
+        )
+
         # --- cdk-nag suppressions ---
-        all_secrets = [self.webhook_secret] + list(self.channel_secrets.values())
+        all_secrets = [
+            self.webhook_secret,
+            self.web_auth_secret,
+            self.approval_signing_secret,
+            self.workspace_capability_secret,
+            self.origin_verification_secret,
+            self.google_readonly_oauth_secret,
+            self.google_send_oauth_secret,
+            self.openai_api_key_secret,
+            *self.channel_secrets.values(),
+        ]
         cdk_nag.NagSuppressions.add_resource_suppressions(
             all_secrets,
             [

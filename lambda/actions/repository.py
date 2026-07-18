@@ -38,6 +38,31 @@ _ACTION_ID = re.compile(r"[A-Za-z0-9_-]{8,128}")
 _OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{16,128}")
 _MESSAGE_ID = re.compile(r"<po-[0-9a-f]{24}@personal-operator\.invalid>")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+NONTERMINAL_RETENTION_SECONDS = 14 * 24 * 60 * 60
+TERMINAL_RETENTION_SECONDS = 90 * 24 * 60 * 60
+_TERMINAL_STATES = frozenset(
+    {
+        ActionState.CONFIRMED,
+        ActionState.REJECTED,
+        ActionState.EXPIRED,
+        ActionState.STALE,
+        ActionState.CANCELLED,
+        # UNCERTAIN is a no-resend effect quarantine. It remains observable
+        # for reconciliation, but has no executable authority and therefore
+        # receives the same bounded audit-retention window as terminal states.
+        ActionState.UNCERTAIN,
+    }
+)
+_REQUIRES_LIVE_ACTION = frozenset(
+    {
+        (ActionState.PREPARED, ActionState.APPROVAL_PENDING),
+        (ActionState.APPROVAL_PENDING, ActionState.APPROVED),
+        (ActionState.APPROVED, ActionState.DISPATCHING),
+        (ActionState.DISPATCHING, ActionState.CONFIRMED),
+        (ActionState.DISPATCHING, ActionState.UNCERTAIN),
+        (ActionState.UNCERTAIN, ActionState.CONFIRMED),
+    }
+)
 _PROTECTED = frozenset(
     {
         "PK",
@@ -266,6 +291,7 @@ def _validate_transition_updates(
     if "uncertaintyReason" in exact and exact["uncertaintyReason"] not in {
         "provider-outcome-unproven",
         "confirmation-persistence-unproven",
+        "account-deletion-fence",
     }:
         raise ValueError("uncertaintyReason is invalid")
     if "staleReason" in exact and exact["staleReason"] != "newer-draft-revision":
@@ -320,9 +346,6 @@ class DynamoActionRepository:
             raise ValueError("table is required")
         self._table = table
         self._now = now or (lambda: datetime.now(timezone.utc))
-
-    def _timestamp(self) -> str:
-        return _utc(self._now(), "now").isoformat()
 
     @staticmethod
     def _assert_binding(
@@ -394,7 +417,8 @@ class DynamoActionRepository:
                 "userId": user_id,
             }
         )
-        timestamp = self._timestamp()
+        created_at = _utc(self._now(), "now")
+        timestamp = created_at.isoformat()
         item: dict[str, object] = {
             **key,
             "actionId": action_id,
@@ -413,6 +437,7 @@ class DynamoActionRepository:
             "creationId": creation_id,
             "createdAt": timestamp,
             "updatedAt": timestamp,
+            "ttl": int(created_at.timestamp()) + NONTERMINAL_RETENTION_SECONDS,
         }
         try:
             self._table.put_item(
@@ -436,6 +461,7 @@ class DynamoActionRepository:
                 and current.get("capability") == capability
                 and current.get("resource") == resource
                 and current.get("args") == exact_args
+                and current.get("ttl") == item["ttl"]
             ):
                 return current
             raise ConcurrentActionUpdate(
@@ -486,6 +512,12 @@ class DynamoActionRepository:
             raise ValueError("transition update field is invalid")
         _canonical(exact_updates)
         next_revision = expected_revision + 1
+        transition_time = _utc(self._now(), "now")
+        retention_ttl = (
+            int(transition_time.timestamp()) + TERMINAL_RETENTION_SECONDS
+            if target_state in _TERMINAL_STATES
+            else None
+        )
         names = {
             "#actionId": "actionId",
             "#userId": "userId",
@@ -501,7 +533,7 @@ class DynamoActionRepository:
             ":targetState": target_state.value,
             ":expectedRevision": expected_revision,
             ":nextRevision": next_revision,
-            ":updatedAt": self._timestamp(),
+            ":updatedAt": transition_time.isoformat(),
             ":transitionId": transition_id,
         }
         conditions = [
@@ -510,6 +542,16 @@ class DynamoActionRepository:
             "#state=:expectedState",
             "#revision=:expectedRevision",
         ]
+        if (expected_state, target_state) in _REQUIRES_LIVE_ACTION:
+            names["#ttl"] = "ttl"
+            values[":transitionEpoch"] = int(transition_time.timestamp())
+            conditions.append("#ttl>:transitionEpoch")
+        if (expected_state, target_state) in {
+            (ActionState.APPROVAL_PENDING, ActionState.APPROVED),
+            (ActionState.APPROVED, ActionState.DISPATCHING),
+        }:
+            names["#approvalExpiresAt"] = "approvalExpiresAt"
+            conditions.append("#approvalExpiresAt>:updatedAt")
         if draft_fence is not None:
             names["#draftRevision"] = "draftRevision"
             values[":expectedDraftRevision"] = draft_fence
@@ -550,6 +592,10 @@ class DynamoActionRepository:
             "#updatedAt=:updatedAt",
             "#lastTransitionId=:transitionId",
         ]
+        if retention_ttl is not None:
+            names["#retentionTtl"] = "ttl"
+            values[":retentionTtl"] = retention_ttl
+            assignments.append("#retentionTtl=:retentionTtl")
         for index, (name, value) in enumerate(sorted(exact_updates.items())):
             name_token = f"#u{index}"
             value_token = f":u{index}"
@@ -574,6 +620,10 @@ class DynamoActionRepository:
                 result.get("state") != target_state.value
                 or result.get("revision") != next_revision
                 or result.get("lastTransitionId") != transition_id
+                or (
+                    retention_ttl is not None
+                    and result.get("ttl") != retention_ttl
+                )
                 or any(
                     result.get(name) != value
                     for name, value in exact_updates.items()
@@ -588,6 +638,10 @@ class DynamoActionRepository:
                 and current.get("state") == target_state.value
                 and current.get("revision") == next_revision
                 and current.get("lastTransitionId") == transition_id
+                and (
+                    retention_ttl is None
+                    or current.get("ttl") == retention_ttl
+                )
                 and all(current.get(name) == value for name, value in exact_updates.items())
             ):
                 return current

@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# deploy.sh — Hybrid deployment: CDK + AgentCore Starter Toolkit.
+# deploy.sh — guarded CDK deployment utilities.
 #
-# Three-phase deployment:
-#   Phase 1: CDK deploys foundation (VPC, Security, AgentCore base, Observability)
-#   Phase 2: Starter Toolkit deploys Runtime (ECR, Docker build, Runtime, Endpoint)
-#   Phase 3: CDK deploys Router, the legacy Cron tombstone, and TokenMonitoring
+# AgentCore runtime creation/update is deliberately unavailable in v0. The
+# previous toolkit path deployed mutable source first and only replaced it with
+# the reviewed image afterward, so it could not satisfy the release boundary.
 #
 # Usage:
-#   ./scripts/deploy.sh                  # full 3-phase deploy
+#   ./scripts/deploy.sh --full           # disabled until immutable runtime provisioning exists
 #   ./scripts/deploy.sh --cdk-only       # CDK stacks only (skip toolkit)
-#   ./scripts/deploy.sh --runtime-only   # toolkit deploy only (Phase 2)
+#   ./scripts/deploy.sh --runtime-only   # disabled until immutable runtime provisioning exists
 #   ./scripts/deploy.sh --phase1         # Phase 1 only
 #   ./scripts/deploy.sh --phase3         # Phase 3 only (assumes runtime already deployed)
 #
@@ -17,32 +16,173 @@
 #   BUILD_MODE          local-build (default) or codebuild
 #                       local-build: builds ARM64 container locally with Docker (recommended)
 #                       codebuild: builds in AWS CodeBuild (no Docker required, adds cost)
-#   CDK_DEFAULT_ACCOUNT AWS account ID (auto-detected if not set)
+#   PERSONAL_OPERATOR_DEPLOY_ACCOUNT exact allowed AWS account ID
+#   PERSONAL_OPERATOR_DEPLOY_COMMIT  exact clean Git commit being released
+#   PERSONAL_OPERATOR_DEPLOY_CONFIRMATION exact deploy:<account>:eu-west-1
+#   PERSONAL_OPERATOR_RUNTIME_IMAGE_URI exact private-ECR bridge image digest;
+#                       the digest must carry tag commit-<candidate> in target ECR
+#   TRUSTED_LAMBDA_BUILD_IMAGE immutable reviewed Lambda builder digest
 #   CDK_DEFAULT_REGION  AWS region; must be exactly eu-west-1
-#   AGENTCORE_CLI       Path to agentcore CLI (auto-detected)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUNTIME_CONTEXT_FILE="$PROJECT_DIR/build/runtime-context.json"
 
 # --- Build mode ---
 BUILD_MODE="${BUILD_MODE:-local-build}"
 REQUIRED_REGION="eu-west-1"
+MODE="${1:---full}"
+
+if [ "$#" -gt 1 ]; then
+  echo "ERROR: exactly one deployment mode is allowed." >&2
+  exit 2
+fi
+case "$MODE" in
+  --full|--phase1|--runtime-only|--phase3|--cdk-only) ;;
+  *)
+    echo "ERROR: unknown deployment mode: $MODE" >&2
+    exit 2
+    ;;
+esac
+case "$BUILD_MODE" in
+  local-build|codebuild) ;;
+  *)
+    echo "ERROR: BUILD_MODE must be exactly local-build or codebuild; got $BUILD_MODE." >&2
+    exit 2
+    ;;
+esac
+
+runtime_deployment_unavailable() {
+  echo "ERROR: immutable AgentCore runtime deployment is not implemented; no cloud changes were made." >&2
+  echo "Build and review a direct immutable-image create/update path before enabling --full or --runtime-only." >&2
+  exit 1
+}
+
+# Fail before account validation, credential discovery, preflight, or any cloud
+# mutation. A full deploy must never leave a partially deployed foundation when
+# its reviewed runtime cannot be provisioned safely.
+case "$MODE" in
+  --full|--runtime-only)
+    runtime_deployment_unavailable
+    ;;
+esac
 
 # --- Pre-flight checks ---
 preflight() {
   local errors=0
+  local actual_commit=""
+  local sts_account=""
+  local expected_confirmation="deploy:${ACCOUNT}:${REGION}"
+  local runtime_image_metadata=""
+  local web_acl_arn=""
+
+  if ! command -v git &>/dev/null; then
+    echo "ERROR: git is required to bind deployment to a reviewed commit."
+    errors=$((errors + 1))
+  else
+    actual_commit=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || true)
+    if [ -z "$PERSONAL_OPERATOR_DEPLOY_COMMIT" ] || [ "$PERSONAL_OPERATOR_DEPLOY_COMMIT" != "$actual_commit" ]; then
+      echo "ERROR: PERSONAL_OPERATOR_DEPLOY_COMMIT must equal current HEAD ($actual_commit)."
+      errors=$((errors + 1))
+    fi
+    if [ -n "$(git -C "$PROJECT_DIR" status --porcelain 2>/dev/null)" ]; then
+      echo "ERROR: deployment requires a completely clean Git worktree, including untracked files."
+      errors=$((errors + 1))
+    fi
+  fi
+
+  if [ "$PERSONAL_OPERATOR_DEPLOY_CONFIRMATION" != "$expected_confirmation" ]; then
+    echo "ERROR: PERSONAL_OPERATOR_DEPLOY_CONFIRMATION must be exactly $expected_confirmation."
+    errors=$((errors + 1))
+  fi
+
+  if [[ ! "$TRUSTED_LAMBDA_BUILD_IMAGE" =~ ^public\.ecr\.aws/lambda/python@sha256:[0-9a-f]{64}$ ]]; then
+    echo "ERROR: TRUSTED_LAMBDA_BUILD_IMAGE must be an immutable reviewed official image digest."
+    errors=$((errors + 1))
+  fi
+
+  if [[ "$PERSONAL_OPERATOR_RUNTIME_IMAGE_URI" =~ ^${ACCOUNT}\.dkr\.ecr\.${REGION}\.amazonaws\.com/([a-z0-9]+([._/-][a-z0-9]+)*)@(sha256:[0-9a-f]{64})$ ]]; then
+    RUNTIME_IMAGE_REPOSITORY="${BASH_REMATCH[1]}"
+    RUNTIME_IMAGE_DIGEST="${BASH_REMATCH[3]}"
+  else
+    echo "ERROR: runtime image must be an immutable ECR digest in account $ACCOUNT and region $REGION."
+    errors=$((errors + 1))
+  fi
+
+  web_acl_arn=$(python3 - "$PROJECT_DIR/cdk.json" <<'PY' 2>/dev/null || true
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["context"].get(
+    "cloudfront_web_acl_arn", ""
+)
+print(value if isinstance(value, str) else "")
+PY
+)
+  if [[ ! "$web_acl_arn" =~ ^arn:aws:wafv2:us-east-1:${ACCOUNT}:global/webacl/[A-Za-z0-9_-]{1,128}/[0-9a-f-]{36}$ ]]; then
+    echo "ERROR: cdk.json cloudfront_web_acl_arn must be an exact global us-east-1 Web ACL ARN in account $ACCOUNT."
+    errors=$((errors + 1))
+  fi
 
   # AWS credentials
-  if ! aws sts get-caller-identity &>/dev/null; then
+  if ! command -v aws &>/dev/null; then
+    echo "ERROR: AWS CLI is required."
+    errors=$((errors + 1))
+  elif ! sts_account=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); then
     echo "ERROR: AWS credentials not configured. Run 'aws configure' or set AWS_PROFILE."
     errors=$((errors + 1))
+  elif [ "$sts_account" != "$ACCOUNT" ]; then
+    echo "ERROR: PERSONAL_OPERATOR_DEPLOY_ACCOUNT must match the authenticated STS account; expected $ACCOUNT, got $sts_account."
+    errors=$((errors + 1))
+  fi
+
+  if [ -n "$RUNTIME_IMAGE_REPOSITORY" ] && [ -n "$RUNTIME_IMAGE_DIGEST" ] && \
+     [ -n "$PERSONAL_OPERATOR_DEPLOY_COMMIT" ] && [ "$sts_account" = "$ACCOUNT" ]; then
+    if ! runtime_image_metadata=$(aws ecr describe-images \
+      --repository-name "$RUNTIME_IMAGE_REPOSITORY" \
+      --image-ids "imageDigest=$RUNTIME_IMAGE_DIGEST" \
+      --region "$REGION" --output json 2>/dev/null); then
+      echo "ERROR: immutable runtime image is unavailable in the exact target ECR repository."
+      errors=$((errors + 1))
+    elif ! RUNTIME_IMAGE_METADATA_JSON="$runtime_image_metadata" python3 - \
+      "$PERSONAL_OPERATOR_DEPLOY_COMMIT" "$RUNTIME_IMAGE_DIGEST" <<'PY'
+import json
+import os
+import sys
+
+commit, expected_digest = sys.argv[1:]
+try:
+    value = json.loads(os.environ["RUNTIME_IMAGE_METADATA_JSON"])
+except (KeyError, json.JSONDecodeError) as error:
+    raise SystemExit(f"runtime image metadata is invalid: {error}")
+details = value.get("imageDetails") if isinstance(value, dict) else None
+if not isinstance(details, list) or len(details) != 1:
+    raise SystemExit("runtime image metadata must contain one exact image")
+detail = details[0]
+if not isinstance(detail, dict) or detail.get("imageDigest") != expected_digest:
+    raise SystemExit("runtime image digest differs from the reviewed candidate")
+tags = detail.get("imageTags")
+expected_tag = f"commit-{commit}"
+if not isinstance(tags, list) or expected_tag not in tags:
+    raise SystemExit("runtime image is not tagged for the exact candidate commit")
+PY
+    then
+      echo "ERROR: immutable runtime image is not bound to the exact candidate commit."
+      errors=$((errors + 1))
+    fi
   fi
 
   # CDK CLI
   if ! command -v cdk &>/dev/null; then
     echo "ERROR: AWS CDK CLI not found. Install with: npm install -g aws-cdk"
+    errors=$((errors + 1))
+  fi
+
+  if ! command -v npm &>/dev/null; then
+    echo "ERROR: npm is required to test and build the trusted browser asset."
     errors=$((errors + 1))
   fi
 
@@ -52,20 +192,14 @@ preflight() {
     errors=$((errors + 1))
   fi
 
-  # Docker (only for local-build)
-  if [ "$BUILD_MODE" = "local-build" ]; then
-    if ! command -v docker &>/dev/null; then
-      echo "ERROR: Docker not found (required for BUILD_MODE=local-build). Install Docker or set BUILD_MODE=codebuild."
-      errors=$((errors + 1))
-    elif ! docker info &>/dev/null 2>&1; then
-      echo "ERROR: Docker daemon not running. Start Docker or set BUILD_MODE=codebuild."
-      errors=$((errors + 1))
-    fi
-  fi
-
-  # Agentcore CLI
-  if ! command -v "${AGENTCORE_CLI:-agentcore}" &>/dev/null && [ ! -x "$HOME/.local/bin/agentcore" ]; then
-    echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-cli"
+  # Docker is always required for the trusted ARM64 Lambda asset. The runtime
+  # image may use CodeBuild, but provider dependencies must still be built and
+  # import-verified in the exact Lambda Python 3.13 ARM64 image first.
+  if ! command -v docker &>/dev/null; then
+    echo "ERROR: Docker not found (required for the trusted Lambda asset)."
+    errors=$((errors + 1))
+  elif ! docker info &>/dev/null 2>&1; then
+    echo "ERROR: Docker daemon not running; trusted Lambda packaging fails closed."
     errors=$((errors + 1))
   fi
 
@@ -96,21 +230,26 @@ if [ "$REGION" != "$REQUIRED_REGION" ]; then
   exit 1
 fi
 
-ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
-
-if [ -z "$ACCOUNT" ]; then
-  echo "ERROR: Could not determine AWS account. Set CDK_DEFAULT_ACCOUNT or configure AWS CLI."
+ACCOUNT="${PERSONAL_OPERATOR_DEPLOY_ACCOUNT:-}"
+if [[ ! "$ACCOUNT" =~ ^[0-9]{12}$ ]]; then
+  echo "ERROR: PERSONAL_OPERATOR_DEPLOY_ACCOUNT must be an explicit 12-digit account ID." >&2
+  exit 1
+fi
+if [ -n "${CDK_DEFAULT_ACCOUNT:-}" ] && [ "$CDK_DEFAULT_ACCOUNT" != "$ACCOUNT" ]; then
+  echo "ERROR: CDK_DEFAULT_ACCOUNT differs from PERSONAL_OPERATOR_DEPLOY_ACCOUNT." >&2
   exit 1
 fi
 
+PERSONAL_OPERATOR_DEPLOY_COMMIT="${PERSONAL_OPERATOR_DEPLOY_COMMIT:-}"
+PERSONAL_OPERATOR_DEPLOY_CONFIRMATION="${PERSONAL_OPERATOR_DEPLOY_CONFIRMATION:-}"
+PERSONAL_OPERATOR_RUNTIME_IMAGE_URI="${PERSONAL_OPERATOR_RUNTIME_IMAGE_URI:-}"
+TRUSTED_LAMBDA_BUILD_IMAGE="${TRUSTED_LAMBDA_BUILD_IMAGE:-}"
+RUNTIME_IMAGE_REPOSITORY=""
+RUNTIME_IMAGE_DIGEST=""
+export TRUSTED_LAMBDA_BUILD_IMAGE
+
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT"
 export CDK_DEFAULT_REGION="$REGION"
-
-# Agentcore CLI path
-AGENTCORE_CLI="${AGENTCORE_CLI:-agentcore}"
-if ! command -v "$AGENTCORE_CLI" &>/dev/null; then
-  AGENTCORE_CLI="$HOME/.local/bin/agentcore"
-fi
 
 # Run pre-flight checks
 preflight
@@ -121,12 +260,33 @@ echo "  Region:     $REGION"
 echo "  Build mode: $BUILD_MODE"
 echo ""
 
-MODE="${1:-full}"
-
 activate_venv() {
   if [ -f "$PROJECT_DIR/.venv/bin/activate" ]; then
     # shellcheck disable=SC1091
     source "$PROJECT_DIR/.venv/bin/activate"
+  fi
+}
+
+prepare_trusted_assets() {
+  echo "--- Building trusted browser and Lambda assets ---"
+  cd "$PROJECT_DIR"
+  npm --prefix web ci --ignore-scripts
+  npm --prefix web test
+  npm --prefix web run build
+  "$PROJECT_DIR/scripts/build-trusted-lambda-asset.sh" build
+  "$PROJECT_DIR/scripts/build-trusted-lambda-asset.sh" verify
+}
+
+assert_release_binding() {
+  local actual_commit
+  actual_commit=$(git -C "$PROJECT_DIR" rev-parse HEAD)
+  if [ "$actual_commit" != "$PERSONAL_OPERATOR_DEPLOY_COMMIT" ]; then
+    echo "ERROR: HEAD changed after deployment preflight." >&2
+    exit 1
+  fi
+  if [ -n "$(git -C "$PROJECT_DIR" status --porcelain)" ]; then
+    echo "ERROR: tracked or untracked source changed after deployment preflight." >&2
+    exit 1
   fi
 }
 
@@ -135,6 +295,8 @@ phase1_cdk() {
   echo "=== Phase 1: CDK foundation stacks ==="
   cd "$PROJECT_DIR"
   activate_venv
+  assert_release_binding
+  prepare_trusted_assets
 
   cdk deploy \
     OpenClawVpc \
@@ -142,7 +304,7 @@ phase1_cdk() {
     OpenClawGuardrails \
     OpenClawAgentCore \
     OpenClawObservability \
-    --require-approval never
+    --require-approval broadening
 
   echo "  Phase 1 complete."
   echo ""
@@ -203,14 +365,22 @@ read_cdk_outputs() {
 validate_runtime_metadata() {
   local runtime_metadata_json="$1"
   local candidate_runtime_id="$2"
+  local expected_runtime_image_uri="$3"
   RUNTIME_METADATA_JSON="$runtime_metadata_json" python3 - \
-    "$ACCOUNT" "$REGION" "$EXECUTION_ROLE_ARN" "$candidate_runtime_id" <<'PY'
+    "$ACCOUNT" "$REGION" "$EXECUTION_ROLE_ARN" "$candidate_runtime_id" \
+    "$expected_runtime_image_uri" <<'PY'
 import json
 import os
 import re
 import sys
 
-account, region, expected_role_arn, candidate_runtime_id = sys.argv[1:]
+(
+    account,
+    region,
+    expected_role_arn,
+    candidate_runtime_id,
+    expected_runtime_image_uri,
+) = sys.argv[1:]
 
 
 def fail(message: str) -> None:
@@ -250,6 +420,11 @@ if runtime.get("status") != "READY":
     fail(f"AgentCore runtime is not READY: {runtime.get('status', '<missing>')}")
 if runtime.get("roleArn") != expected_role_arn:
     fail("AgentCore runtime execution role does not match the deployed role")
+expected_artifact = {
+    "containerConfiguration": {"containerUri": expected_runtime_image_uri}
+}
+if runtime.get("agentRuntimeArtifact") != expected_artifact:
+    fail("AgentCore runtime artifact is not the reviewed immutable image digest")
 
 print(actual_runtime_id)
 print(actual_runtime_arn)
@@ -290,309 +465,146 @@ wait_for_runtime_ready() {
   return 1
 }
 
-# --- Check ARM64 build capability (for local-build mode) ---
-check_arm64_build() {
-  local arch
-  arch=$(uname -m)
-  if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
-    return 0  # native ARM64, no QEMU needed
-  fi
-  # x86 host — check for ARM64 emulation via buildx/QEMU
-  if docker buildx ls 2>/dev/null | grep -q "linux/arm64"; then
-    return 0
-  fi
-  echo "WARNING: ARM64 emulation not available. Attempting to register QEMU..."
-  docker run --rm --privileged tonistiigi/binfmt --install arm64 || {
-    echo "ERROR: Could not set up ARM64 emulation. Install QEMU or use BUILD_MODE=codebuild."
-    exit 1
-  }
-}
-
-# --- Phase 2: Starter Toolkit deploy ---
-phase2_toolkit() {
-  echo "=== Phase 2: Starter Toolkit deploy ==="
-  cd "$PROJECT_DIR"
-  activate_venv
-
-  read_cdk_outputs
-
-  # Configure the agent (creates/updates .bedrock_agentcore.yaml)
-  echo "--- Configuring agent ---"
-  "$AGENTCORE_CLI" configure \
-    --name openclaw_agent \
-    --entrypoint bridge/agentcore-contract.js \
-    --execution-role "$EXECUTION_ROLE_ARN" \
-    --region "$REGION" \
-    --vpc \
-    --subnets "$PRIVATE_SUBNET_IDS" \
-    --security-groups "$SECURITY_GROUP_ID" \
-    --idle-timeout "$SESSION_IDLE" \
-    --max-lifetime "$SESSION_MAX" \
-    --deployment-type container \
-    --language typescript \
-    --non-interactive
-
-  # Fix: agentcore configure expands source_path to project root, but our
-  # Dockerfile COPY commands expect paths relative to bridge/. Patch it back.
-  local yaml_file="$PROJECT_DIR/.bedrock_agentcore.yaml"
-  if grep -q "source_path:.*$PROJECT_DIR$" "$yaml_file" 2>/dev/null; then
-    local tmp_file="${yaml_file}.tmp"
-    sed "s|source_path: $PROJECT_DIR$|source_path: $PROJECT_DIR/bridge|" "$yaml_file" > "$tmp_file" && mv "$tmp_file" "$yaml_file"
-    echo "  (patched source_path -> bridge/)"
-  fi
-
-  # Ensure the generated Dockerfile matches our actual Dockerfile
-  local gen_dockerfile="$PROJECT_DIR/.bedrock_agentcore/openclaw_agent/Dockerfile"
-  if [ -f "$gen_dockerfile" ] && [ -f "$PROJECT_DIR/bridge/Dockerfile" ]; then
-    cp "$PROJECT_DIR/bridge/Dockerfile" "$gen_dockerfile"
-    echo "  (synced Dockerfile from bridge/)"
-  fi
-
-  # Build deploy command based on BUILD_MODE
-  echo "--- Deploying runtime (mode: $BUILD_MODE) ---"
-  local deploy_flags=()
-  if [ "$BUILD_MODE" = "local-build" ]; then
-    check_arm64_build
-    deploy_flags+=("--local-build")
-  fi
-  # codebuild mode: no extra flags (default behavior)
-
-  "$AGENTCORE_CLI" deploy \
-    --agent openclaw_agent \
-    --auto-update-on-conflict \
-    "${deploy_flags[@]}" \
-    --env "AWS_REGION=$REGION" \
-    --env "BEDROCK_MODEL_ID=$DEFAULT_MODEL_ID" \
-    --env "S3_USER_FILES_BUCKET=$USER_FILES_BUCKET" \
-    --env "WORKSPACE_SYNC_INTERVAL_MS=$WORKSPACE_SYNC_MS" \
-    --env "IMAGE_VERSION=$IMAGE_VERSION" \
-    --env "WORKSPACE_SESSION_ROLE_ARN=$WORKSPACE_SESSION_ROLE_ARN" \
-    --env "CMK_ARN=$CMK_ARN"
-
-  # Read runtime ID and endpoint ID from toolkit
-  echo "--- Reading runtime info ---"
-  TOOLKIT_STATUS=$("$AGENTCORE_CLI" status --agent openclaw_agent --verbose 2>&1 || true)
-
-  # Extract runtime_id from status output (handles non-JSON prefix lines from warnings)
-  RUNTIME_ID=$(echo "$TOOLKIT_STATUS" | python3 -c "
-import sys, re, json
-text = sys.stdin.read()
-# Try to find JSON object in the output
-m = re.search(r'\{.*\}', text, re.DOTALL)
-if m:
-    try:
-        data = json.loads(m.group())
-        # Navigate nested structure: {config: {agent_id: ...}} or flat {agent_id: ...}
-        cfg = data.get('config', data)
-        rid = cfg.get('agent_id', cfg.get('runtime_id', ''))
-        if rid:
-            print(rid)
-            sys.exit(0)
-    except json.JSONDecodeError:
-        pass
-# Regex fallback
-m = re.search(r'\"agent_id\"\s*:\s*\"([a-zA-Z0-9_-]+)\"', text)
-print(m.group(1) if m else '')
-" 2>/dev/null || echo "")
-
-  # Fallback: read from .bedrock_agentcore.yaml (uses simple text parsing, no yaml dep)
-  if [ -z "$RUNTIME_ID" ]; then
-    RUNTIME_ID=$(python3 -c "
-import re
-with open('$PROJECT_DIR/.bedrock_agentcore.yaml') as f:
-    text = f.read()
-m = re.search(r'agent_id:\s*(\S+)', text)
-print(m.group(1) if m else '')
-" 2>/dev/null || echo "")
-  fi
-
-  if [[ ! "$RUNTIME_ID" =~ ^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$ ]]; then
-    echo "ERROR: Could not extract a canonical runtime_id from AgentCore Toolkit." >&2
-    exit 1
-  fi
-  echo "  Runtime ID candidate: $RUNTIME_ID"
-
-  # Toolkit deploy is asynchronous; never layer a storage update onto a
-  # runtime that is still creating or updating.
-  wait_for_runtime_ready "$RUNTIME_ID" >/dev/null
-
-  # The toolkit does not yet configure managed session storage. Reissue the
-  # exact runtime configuration with one mount, preserving every supported
-  # optional field. Any read/update error is fatal under set -e.
-  echo "--- Enforcing exact session storage ---"
-  python3 - "$RUNTIME_ID" "$REGION" <<'PY'
-import boto3
-import sys
-
-runtime_id, region = sys.argv[1:]
-client = boto3.client("bedrock-agentcore-control", region_name=region)
-runtime = client.get_agent_runtime(agentRuntimeId=runtime_id)
-expected = [{"sessionStorage": {"mountPath": "/mnt/workspace"}}]
-if runtime.get("filesystemConfigurations") == expected:
-    print("  Exact session storage already configured.")
-    raise SystemExit(0)
-
-required = ("agentRuntimeArtifact", "roleArn", "networkConfiguration")
-missing = [key for key in required if key not in runtime]
-if missing:
-    raise RuntimeError(
-        f"GetAgentRuntime omitted fields required for safe update: {missing}"
-    )
-request = {
-    "agentRuntimeId": runtime_id,
-    "agentRuntimeArtifact": runtime["agentRuntimeArtifact"],
-    "roleArn": runtime["roleArn"],
-    "networkConfiguration": runtime["networkConfiguration"],
-    "filesystemConfigurations": expected,
-}
-for key in (
-    "description",
-    "authorizerConfiguration",
-    "requestHeaderConfiguration",
-    "protocolConfiguration",
-    "lifecycleConfiguration",
-    "metadataConfiguration",
-    "environmentVariables",
-):
-    if runtime.get(key) is not None:
-        request[key] = runtime[key]
-response = client.update_agent_runtime(**request)
-if response.get("status") in {"CREATE_FAILED", "UPDATE_FAILED", "DELETING"}:
-    raise RuntimeError(
-        f"session-storage update entered terminal status {response.get('status')}"
-    )
-print("  Exact session storage update accepted.")
-PY
-
-  # GetAgentRuntime is authoritative for runtime identity. The ARN contains an
-  # opaque UUID and positive version and must never be synthesized from the ID.
-  RUNTIME_METADATA_JSON=$(wait_for_runtime_ready "$RUNTIME_ID")
-  VALIDATED_RUNTIME=$(validate_runtime_metadata "$RUNTIME_METADATA_JSON" "$RUNTIME_ID")
-  VALIDATED_RUNTIME_ID=$(printf '%s\n' "$VALIDATED_RUNTIME" | sed -n '1p')
-  RUNTIME_ARN=$(printf '%s\n' "$VALIDATED_RUNTIME" | sed -n '2p')
-  RUNTIME_VERSION=$(printf '%s\n' "$VALIDATED_RUNTIME" | sed -n '3p')
-  if [ "$VALIDATED_RUNTIME_ID" != "$RUNTIME_ID" ] || [ -z "$RUNTIME_ARN" ] || [[ ! "$RUNTIME_VERSION" =~ ^[1-9][0-9]{0,4}$ ]]; then
-    echo "ERROR: Validated AgentCore runtime metadata was incomplete." >&2
-    exit 1
-  fi
-  echo "  Runtime ARN: $RUNTIME_ARN"
-
-  # The storage update can create a new runtime version after toolkit deploy.
-  # Bind DEFAULT to that exact version, then poll the endpoint to READY.
-  ENDPOINT_TARGET=$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
-    --agent-runtime-id "$RUNTIME_ID" --endpoint-name DEFAULT \
-    --region "$REGION" --query targetVersion --output text)
-  if [ "$ENDPOINT_TARGET" != "$RUNTIME_VERSION" ]; then
-    aws bedrock-agentcore-control update-agent-runtime-endpoint \
-      --agent-runtime-id "$RUNTIME_ID" \
-      --endpoint-name DEFAULT \
-      --agent-runtime-version "$RUNTIME_VERSION" \
-      --region "$REGION" >/dev/null
-  fi
-
-  ENDPOINT_METADATA_JSON=""
-  for ((attempt = 1; attempt <= 60; attempt++)); do
-    ENDPOINT_METADATA_JSON=$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
-      --agent-runtime-id "$RUNTIME_ID" --endpoint-name DEFAULT \
-      --region "$REGION" --output json)
-    ENDPOINT_STATUS=$(ENDPOINT_METADATA_JSON="$ENDPOINT_METADATA_JSON" python3 -c \
-      'import json, os; print(json.loads(os.environ["ENDPOINT_METADATA_JSON"]).get("status", ""))')
-    case "$ENDPOINT_STATUS" in
-      READY)
-        break
-        ;;
-      CREATE_FAILED|UPDATE_FAILED|DELETING|"")
-        echo "ERROR: AgentCore DEFAULT endpoint entered terminal status ${ENDPOINT_STATUS:-<missing>}." >&2
-        exit 1
-        ;;
-      *)
-        echo "  Waiting for DEFAULT endpoint READY ($ENDPOINT_STATUS, attempt $attempt/60)..."
-        sleep 5
-        ;;
-    esac
-  done
-  if [ "$ENDPOINT_STATUS" != "READY" ]; then
-    echo "ERROR: Timed out waiting for AgentCore DEFAULT endpoint READY." >&2
-    exit 1
-  fi
-  ENDPOINT_ID=$(ENDPOINT_METADATA_JSON="$ENDPOINT_METADATA_JSON" python3 -c \
-    'import json, os; print(json.loads(os.environ["ENDPOINT_METADATA_JSON"]).get("id", ""))')
-  if [[ ! "$ENDPOINT_ID" =~ ^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$ ]]; then
-    echo "ERROR: AgentCore DEFAULT endpoint ID is missing or noncanonical." >&2
-    exit 1
-  fi
-  echo "  Endpoint ID: $ENDPOINT_ID"
-
-  python3 "$PROJECT_DIR/scripts/verify-agentcore-storage.py" \
-    --runtime-id "$RUNTIME_ID" \
-    --endpoint-name DEFAULT \
-    --runtime-arn "$RUNTIME_ARN" \
-    --execution-role-arn "$EXECUTION_ROLE_ARN" \
-    --bucket "$USER_FILES_BUCKET" \
-    --kms-key-arn "$CMK_ARN"
-
-  # Persist the exact API-returned ARN atomically with its ID and endpoint.
-  echo "--- Updating cdk.json with runtime info ---"
-  python3 -c "
-import json
-with open('$PROJECT_DIR/cdk.json') as f:
-    cfg = json.load(f)
-cfg['context']['runtime_id'] = '$RUNTIME_ID'
-cfg['context']['runtime_endpoint_id'] = '$ENDPOINT_ID'
-cfg['context']['runtime_endpoint_name'] = 'DEFAULT'
-cfg['context']['runtime_arn'] = '$RUNTIME_ARN'
-with open('$PROJECT_DIR/cdk.json', 'w') as f:
-    json.dump(cfg, f, indent=2)
-    f.write('\n')
-"
-  echo "  cdk.json updated."
-
-  echo "  Phase 2 complete."
-  echo ""
-}
+# AgentCore runtime provisioning is intentionally absent. The only former
+# implementation deployed mutable source before applying the reviewed digest.
+# --full and --runtime-only fail above, before preflight or any cloud call.
 
 # --- Phase 3: CDK dependent stacks ---
 phase3_cdk() {
   echo "=== Phase 3: CDK dependent stacks ==="
   cd "$PROJECT_DIR"
   activate_venv
+  assert_release_binding
+  prepare_trusted_assets
+  read_cdk_outputs
 
-  # AgentCoreStack validates that all exact runtime fields are present together.
-  RUNTIME_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_id',''))")
-  RUNTIME_ENDPOINT_NAME=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_endpoint_name',''))")
-  RUNTIME_ARN=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('runtime_arn',''))")
-  if [ -z "$RUNTIME_ID" ] || [ "$RUNTIME_ENDPOINT_NAME" != "DEFAULT" ] || [ -z "$RUNTIME_ARN" ]; then
-    echo "ERROR: exact runtime identity not set in cdk.json. Run Phase 2 first."
+  # AgentCoreStack validates all exact runtime fields again. This parser also
+  # refuses context emitted for any other source commit, account, or region.
+  RUNTIME_CONTEXT=$(python3 - "$RUNTIME_CONTEXT_FILE" \
+    "$PERSONAL_OPERATOR_DEPLOY_COMMIT" "$ACCOUNT" "$REGION" \
+    "$PERSONAL_OPERATOR_RUNTIME_IMAGE_URI" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path, commit, account, region, expected_runtime_image_uri = sys.argv[1:]
+try:
+    value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"runtime context is unavailable: {type(error).__name__}")
+if not isinstance(value, dict) or set(value) != {
+    "schema", "sourceCommit", "account", "region", "runtimeId",
+    "runtimeEndpointId", "runtimeEndpointName", "runtimeArn",
+    "runtimeVersion", "runtimeImageUri",
+}:
+    raise SystemExit("runtime context has the wrong fields")
+if value.get("schema") != "personal-operator.runtime-context.v3":
+    raise SystemExit("runtime context schema is invalid")
+if (value.get("sourceCommit"), value.get("account"), value.get("region")) != (
+    commit, account, region
+):
+    raise SystemExit("runtime context is not bound to this release")
+if value.get("runtimeImageUri") != expected_runtime_image_uri:
+    raise SystemExit("runtime context is not bound to the reviewed release image")
+identifier = r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
+if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+    raise SystemExit("release commit is invalid")
+if re.fullmatch(identifier, value.get("runtimeId", "")) is None:
+    raise SystemExit("runtime ID is invalid")
+if re.fullmatch(identifier, value.get("runtimeEndpointId", "")) is None:
+    raise SystemExit("runtime endpoint ID is invalid")
+if value.get("runtimeEndpointName") != f"release_{commit}":
+    raise SystemExit("runtime endpoint name is not bound to the release commit")
+runtime_version = value.get("runtimeVersion", "")
+if re.fullmatch(r"[1-9][0-9]{0,4}", runtime_version) is None:
+    raise SystemExit("runtime version is invalid")
+arn = (
+    rf"arn:aws:bedrock-agentcore:{re.escape(region)}:{re.escape(account)}:agent/"
+    r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
+    r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
+)
+if re.fullmatch(arn, value.get("runtimeArn", "")) is None:
+    raise SystemExit("runtime ARN is invalid")
+if value.get("runtimeArn", "").rsplit(":", 1)[-1] != runtime_version:
+    raise SystemExit("runtime context ARN is not bound to its runtime version")
+image_uri = (
+    rf"{re.escape(account)}\.dkr\.ecr\."
+    rf"{re.escape(region)}\.amazonaws\.com/"
+    r"[a-z0-9]+(?:[._/-][a-z0-9]+)*"
+    r"@sha256:[0-9a-f]{64}"
+)
+if re.fullmatch(image_uri, value.get("runtimeImageUri", "")) is None:
+    raise SystemExit("runtime image URI is invalid")
+print(value["runtimeId"])
+print(value["runtimeEndpointId"])
+print(value["runtimeEndpointName"])
+print(value["runtimeVersion"])
+print(value["runtimeArn"])
+print(value["runtimeImageUri"])
+PY
+)
+  RUNTIME_ID=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '1p')
+  RUNTIME_ENDPOINT_ID=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '2p')
+  RUNTIME_ENDPOINT_NAME=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '3p')
+  RUNTIME_VERSION=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '4p')
+  RUNTIME_ARN=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '5p')
+  RUNTIME_IMAGE_URI=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '6p')
+
+  # Re-fetch the exact immutable version before CDK can wire any consumer.
+  # The release-specific endpoint may coexist with newer runtime versions, but
+  # its ID, name, liveVersion, and targetVersion must remain on this version.
+  if [ "$RUNTIME_VERSION" != "${RUNTIME_ARN##*:}" ]; then
+    echo "ERROR: runtime context version differs from its exact ARN." >&2
     exit 1
   fi
+  RUNTIME_METADATA_JSON=$(aws bedrock-agentcore-control get-agent-runtime \
+    --agent-runtime-id "$RUNTIME_ID" \
+    --agent-runtime-version "$RUNTIME_VERSION" \
+    --region "$REGION" --output json)
+  validate_runtime_metadata \
+    "$RUNTIME_METADATA_JSON" "$RUNTIME_ID" "$RUNTIME_IMAGE_URI" >/dev/null
+  python3 "$PROJECT_DIR/scripts/verify-agentcore-storage.py" \
+    --runtime-id "$RUNTIME_ID" \
+    --endpoint-id "$RUNTIME_ENDPOINT_ID" \
+    --endpoint-name "$RUNTIME_ENDPOINT_NAME" \
+    --runtime-arn "$RUNTIME_ARN" \
+    --execution-role-arn "$EXECUTION_ROLE_ARN" \
+    --bucket "$USER_FILES_BUCKET" \
+    --kms-key-arn "$CMK_ARN"
 
   cdk deploy \
     OpenClawRouter \
+    PersonalOperatorWeb \
     OpenClawCron \
-    OpenClawTokenMonitoring \
-    --require-approval never
+    -c "runtime_source_commit=$PERSONAL_OPERATOR_DEPLOY_COMMIT" \
+    -c "runtime_id=$RUNTIME_ID" \
+    -c "runtime_endpoint_id=$RUNTIME_ENDPOINT_ID" \
+    -c "runtime_endpoint_name=$RUNTIME_ENDPOINT_NAME" \
+    -c "runtime_version=$RUNTIME_VERSION" \
+    -c "runtime_arn=$RUNTIME_ARN" \
+    -c "runtime_image_uri=$RUNTIME_IMAGE_URI" \
+    --require-approval broadening
 
   echo "  Phase 3 complete."
   echo ""
 }
 
 case "$MODE" in
+  --full)
+    runtime_deployment_unavailable
+    ;;
   --phase1)
     phase1_cdk
     ;;
   --runtime-only)
-    phase2_toolkit
+    runtime_deployment_unavailable
     ;;
   --phase3)
     phase3_cdk
     ;;
   --cdk-only)
     phase1_cdk
-    phase3_cdk
-    ;;
-  *)
-    phase1_cdk
-    phase2_toolkit
     phase3_cdk
     ;;
 esac

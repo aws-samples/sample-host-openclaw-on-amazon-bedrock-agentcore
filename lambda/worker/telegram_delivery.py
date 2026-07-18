@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import html as html_escape
 import json
 import re
 from urllib import request as urllib_request
 
+try:
+    from worker.telegram_cards import (
+        TelegramCardValidationError,
+        validate_reply_markup,
+    )
+except ImportError:  # focused direct-file tests
+    from telegram_cards import TelegramCardValidationError, validate_reply_markup
+
 
 MAX_RESPONSE_BYTES = 64 * 1024
+TELEGRAM_MAX_HTML_CHARS = 4_096
 _CHAT_ID = re.compile(r"-?[0-9]{1,20}")
 _TRACE_ID = re.compile(r"po1_[0-9a-f]{64}")
 _TOKEN = re.compile(r"[0-9]{3,20}:[A-Za-z0-9_-]{20,256}")
@@ -19,6 +29,33 @@ class TelegramDeliveryValidationError(ValueError):
 
 class TelegramDeliveryUncertain(RuntimeError):
     pass
+
+
+def validate_safe_telegram_html(html: str) -> str:
+    """Return already-rendered HTML only when one provider attempt is safe."""
+
+    if not isinstance(html, str) or not html:
+        raise TelegramDeliveryValidationError("Telegram HTML must fit one message")
+    try:
+        units = len(html.encode("utf-16-le")) // 2
+    except UnicodeEncodeError:
+        raise TelegramDeliveryValidationError(
+            "Telegram HTML contains invalid Unicode"
+        ) from None
+    if units > TELEGRAM_MAX_HTML_CHARS:
+        raise TelegramDeliveryValidationError("Telegram HTML must fit one message")
+    return html
+
+
+def render_safe_telegram_html(text: str) -> str:
+    """Escape untrusted text, allow minimal markup, then enforce the shared bound."""
+
+    if not isinstance(text, str) or not text:
+        raise TelegramDeliveryValidationError("Telegram source text is invalid")
+    rendered = html_escape.escape(text, quote=False)
+    rendered = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", rendered)
+    return validate_safe_telegram_html(rendered)
 
 
 class TelegramDeliveryAdapter:
@@ -42,13 +79,17 @@ class TelegramDeliveryAdapter:
         *,
         chat_id: str,
         html: str,
+        reply_markup=None,
         trace_id: str,
         idempotency_key: str,
     ) -> dict[str, str]:
         if not isinstance(chat_id, str) or _CHAT_ID.fullmatch(chat_id) is None:
             raise TelegramDeliveryValidationError("invalid Telegram chat identity")
-        if not isinstance(html, str) or not html or len(html) > 4_096:
-            raise TelegramDeliveryValidationError("Telegram HTML must fit one message")
+        validate_safe_telegram_html(html)
+        try:
+            checked_markup = validate_reply_markup(reply_markup)
+        except TelegramCardValidationError as error:
+            raise TelegramDeliveryValidationError(str(error)) from error
         if (
             not isinstance(trace_id, str)
             or _TRACE_ID.fullmatch(trace_id) is None
@@ -58,13 +99,16 @@ class TelegramDeliveryAdapter:
         token = self._token_provider()
         if not isinstance(token, str) or _TOKEN.fullmatch(token) is None:
             raise TelegramDeliveryValidationError("Telegram bot token is unavailable")
+        provider_payload = {
+            "chat_id": chat_id,
+            "text": html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if checked_markup is not None:
+            provider_payload["reply_markup"] = checked_markup
         payload = json.dumps(
-            {
-                "chat_id": chat_id,
-                "text": html,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
+            provider_payload,
             separators=(",", ":"),
         ).encode()
         request = urllib_request.Request(

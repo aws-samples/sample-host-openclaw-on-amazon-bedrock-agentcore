@@ -92,6 +92,7 @@ def prepared_item():
         "approvedDraftRevision": 4,
         "approvalExpiresAt": (NOW + timedelta(minutes=5)).isoformat(),
         "approvedAt": (NOW - timedelta(minutes=1)).isoformat(),
+        "ttl": int((NOW + timedelta(days=14)).timestamp()),
     }
 
 
@@ -218,6 +219,8 @@ def test_reconciliation_rejects_message_id_match_without_sent_and_exact_payload_
         connection_id="google_conn_1234",
         account_email="founder@example.com",
         sender_address="founder@example.com",
+        founder_user_ids={"founder-1"},
+        deletion_blocked=lambda _user_id: False,
         now=lambda: NOW,
     )
 

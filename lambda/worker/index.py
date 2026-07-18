@@ -7,11 +7,9 @@ SQS FIFO partial-batch failure semantics without importing an AWS SDK.
 
 from __future__ import annotations
 
-import html
 import json
 import logging
 import os
-import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
@@ -23,11 +21,39 @@ except ImportError:  # focused tests add lambda/router directly to sys.path
     from message_queue import QueueEnvelope
     from product_commands import ProductCommand, parse_product_command
 
+try:
+    from worker.telegram_delivery import (
+        TELEGRAM_MAX_HTML_CHARS,
+        TelegramDeliveryValidationError,
+        render_safe_telegram_html,
+    )
+except ImportError:
+    from telegram_delivery import (
+        TELEGRAM_MAX_HTML_CHARS,
+        TelegramDeliveryValidationError,
+        render_safe_telegram_html,
+    )
+
+try:
+    from worker.telegram_cards import (
+        TelegramCardValidationError,
+        TelegramCommandResult,
+        decode_ledger_result,
+        encode_ledger_result,
+    )
+except ImportError:
+    from telegram_cards import (
+        TelegramCardValidationError,
+        TelegramCommandResult,
+        decode_ledger_result,
+        encode_ledger_result,
+    )
+
 
 logger = logging.getLogger(__name__)
 
 MAX_RUNTIME_RESPONSE_CHARS = 3_500
-MAX_TELEGRAM_HTML_CHARS = 4_096
+MAX_TELEGRAM_HTML_CHARS = TELEGRAM_MAX_HTML_CHARS
 MAX_SQS_BATCH_SIZE = 10
 
 
@@ -53,7 +79,21 @@ class ProductCommandHandler(Protocol):
         channel: str,
         trace_id: str,
         idempotency_key: str,
-    ) -> str: ...
+        chat_id: str,
+        actor_id: str,
+    ) -> str | TelegramCommandResult: ...
+
+    def handle_callback(
+        self,
+        *,
+        user_id: str,
+        channel: str,
+        trace_id: str,
+        idempotency_key: str,
+        chat_id: str,
+        actor_id: str,
+        callback_data: str,
+    ) -> str | TelegramCommandResult: ...
 
 
 class TelegramDelivery(Protocol):
@@ -62,6 +102,7 @@ class TelegramDelivery(Protocol):
         *,
         chat_id: str,
         html: str,
+        reply_markup: Mapping[str, Any] | None,
         trace_id: str,
         idempotency_key: str,
     ) -> Mapping[str, Any]: ...
@@ -83,12 +124,29 @@ class ProcessingLedger(Protocol):
     def mark_delivery_uncertain(self, delivery_claim, *, error_type: str) -> None: ...
 
 
+class DeletionFence(Protocol):
+    def is_account_deleted(self, user_id: str) -> bool: ...
+
+
+class ControlDeletionFence(Protocol):
+    def deletion_blocked(
+        self,
+        *,
+        user_id: str,
+        channel: str,
+        trace_id: str,
+        idempotency_key: str,
+    ) -> bool: ...
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerDependencies:
     runtime_driver: RuntimeDriver
     command_handler: ProductCommandHandler
     telegram_delivery: TelegramDelivery
     ledger: ProcessingLedger
+    control_deletion_fence: ControlDeletionFence
+    deletion_fence: DeletionFence
 
 
 def render_telegram_html(text: str) -> str:
@@ -96,12 +154,12 @@ def render_telegram_html(text: str) -> str:
 
     if not isinstance(text, str) or not text or len(text) > MAX_RUNTIME_RESPONSE_CHARS:
         raise WorkerContractError("runtime response must be non-empty bounded text")
-    escaped = html.escape(text, quote=False)
-    escaped = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
-    if len(escaped) > MAX_TELEGRAM_HTML_CHARS:
-        raise WorkerContractError("rendered Telegram message exceeds one safe send")
-    return escaped
+    try:
+        return render_safe_telegram_html(text)
+    except TelegramDeliveryValidationError as error:
+        raise WorkerContractError(
+            "rendered Telegram message exceeds one safe send"
+        ) from error
 
 
 def _extract_runtime_text(result: Any) -> str:
@@ -147,10 +205,37 @@ def _command_result(
         channel=envelope.channel,
         trace_id=envelope.trace_id,
         idempotency_key=idempotency_key,
+        chat_id=envelope.payload["chatId"],
+        actor_id=envelope.payload["actorId"],
     )
-    if not isinstance(result, str) or not result or len(result) > MAX_RUNTIME_RESPONSE_CHARS:
-        raise WorkerContractError("command handler returned invalid text")
-    return result
+    try:
+        return encode_ledger_result(result)
+    except (TypeError, ValueError, TelegramCardValidationError) as error:
+        raise WorkerContractError("command handler returned an invalid result") from error
+
+
+def _callback_result(
+    envelope: QueueEnvelope,
+    idempotency_key: str,
+    dependencies: WorkerDependencies,
+) -> str:
+    payload = envelope.payload
+    handler = getattr(dependencies.command_handler, "handle_callback", None)
+    if not callable(handler):
+        raise WorkerContractError("callback control handler is unavailable")
+    result = handler(
+        user_id=envelope.user_id,
+        channel=envelope.channel,
+        trace_id=envelope.trace_id,
+        idempotency_key=idempotency_key,
+        chat_id=payload["chatId"],
+        actor_id=payload["actorId"],
+        callback_data=payload["callbackData"],
+    )
+    try:
+        return encode_ledger_result(result)
+    except (TypeError, ValueError, TelegramCardValidationError) as error:
+        raise WorkerContractError("callback handler returned an invalid result") from error
 
 
 def _runtime_result(
@@ -178,6 +263,21 @@ def process_envelope(envelope: QueueEnvelope, dependencies: WorkerDependencies) 
     if not isinstance(dependencies, WorkerDependencies):
         raise TypeError("dependencies must be WorkerDependencies")
 
+    # The durable control intent is the first deletion authority and can exist
+    # even when runtime purge failed. Check it synchronously through the exact
+    # control alias before creating any new message-ledger state.
+    if dependencies.control_deletion_fence.deletion_blocked(
+        user_id=envelope.user_id,
+        channel=envelope.channel,
+        trace_id=envelope.trace_id,
+        idempotency_key=envelope.message_deduplication_id,
+    ):
+        return
+    # Keep the runtime tombstone as defense in depth and as the permanent fence
+    # after the control-table deletion intent itself reaches completion.
+    if dependencies.deletion_fence.is_account_deleted(envelope.user_id):
+        return
+
     owner = f"worker-{uuid.uuid4().hex}"
     claim = dependencies.ledger.claim_processing(envelope, owner=owner)
     state = getattr(claim, "state", None)
@@ -203,6 +303,10 @@ def process_envelope(envelope: QueueEnvelope, dependencies: WorkerDependencies) 
                 proposed_result = _runtime_result(
                     envelope, envelope.message_deduplication_id, dependencies
                 )
+            elif envelope.kind == "callback":
+                proposed_result = _callback_result(
+                    envelope, envelope.message_deduplication_id, dependencies
+                )
             else:
                 raise WorkerContractError("unsupported worker message kind")
             claim = dependencies.ledger.complete_result(claim, proposed_result)
@@ -221,6 +325,18 @@ def process_envelope(envelope: QueueEnvelope, dependencies: WorkerDependencies) 
     result = getattr(claim, "result", None)
     if not isinstance(result, str) or not result or len(result) > MAX_RUNTIME_RESPONSE_CHARS:
         raise WorkerContractError("ledger returned invalid result text")
+    try:
+        delivery_result = (
+            decode_ledger_result(result)
+            if envelope.kind in {"command", "callback"}
+            else TelegramCommandResult(text=result)
+        )
+    except (TypeError, ValueError, TelegramCardValidationError) as error:
+        raise WorkerContractError("ledger returned an invalid Telegram result") from error
+    # Rendering is deterministic and validated before the durable delivery
+    # claim. A pathological escaped payload therefore cannot consume the
+    # at-most-one provider-attempt fence without making a network call.
+    rendered = render_telegram_html(delivery_result.text)
 
     delivery_claim = dependencies.ledger.begin_delivery(claim, owner=owner)
     delivery_state = getattr(delivery_claim, "state", None)
@@ -232,9 +348,24 @@ def process_envelope(envelope: QueueEnvelope, dependencies: WorkerDependencies) 
         )
 
     try:
+        # A command/runtime turn can take minutes. Re-read the first durable
+        # deletion authority after claiming the outbox and immediately before
+        # the provider call. If deletion won the race, quarantine this claimed
+        # delivery without making a network request.
+        if dependencies.control_deletion_fence.deletion_blocked(
+            user_id=envelope.user_id,
+            channel=envelope.channel,
+            trace_id=envelope.trace_id,
+            idempotency_key=envelope.message_deduplication_id,
+        ):
+            dependencies.ledger.mark_delivery_uncertain(
+                delivery_claim, error_type="AccountDeletionFence"
+            )
+            return
         receipt = dependencies.telegram_delivery.send_message(
             chat_id=envelope.payload["chatId"],
-            html=render_telegram_html(result),
+            html=rendered,
+            reply_markup=delivery_result.reply_markup(),
             trace_id=envelope.trace_id,
             idempotency_key=envelope.message_deduplication_id,
         )
@@ -341,6 +472,9 @@ def _build_production_dependencies() -> WorkerDependencies:
             "RUNTIME_LEASE_MS",
             "LAMBDA_TIMEOUT_SECONDS",
             "TELEGRAM_TOKEN_SECRET_ID",
+            "CONTROL_FUNCTION_NAME",
+            "WORKSPACE_CAPABILITY_SECRET_ID",
+            "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME",
         )
     }
     missing = [name for name, value in required.items() if not value]
@@ -350,15 +484,19 @@ def _build_production_dependencies() -> WorkerDependencies:
     import boto3
     from botocore.config import Config
     try:
-        from router.product_commands import DeterministicProductCommandHandler
         from router.runtime_driver import AgentCoreAdapter, RuntimeDriver
         from router.runtime_state import RuntimeStateRepository
+        from router.workspace_capability import WorkspaceCapabilitySigner
+        from worker.control_client import LambdaProductCommandHandler
+        from worker.deletion_fence import RuntimeAccountDeletionFence
         from worker.processing_ledger import DynamoProcessingLedger
         from worker.telegram_delivery import TelegramDeliveryAdapter
     except ImportError:  # direct lambda/worker asset is unsupported but testable
-        from product_commands import DeterministicProductCommandHandler
         from runtime_driver import AgentCoreAdapter, RuntimeDriver
         from runtime_state import RuntimeStateRepository
+        from workspace_capability import WorkspaceCapabilitySigner
+        from control_client import LambdaProductCommandHandler
+        from deletion_fence import RuntimeAccountDeletionFence
         from processing_ledger import DynamoProcessingLedger
         from telegram_delivery import TelegramDeliveryAdapter
 
@@ -374,7 +512,17 @@ def _build_production_dependencies() -> WorkerDependencies:
         ),
     )
     secrets = boto3.client("secretsmanager", region_name=region, config=no_retries)
+    control_lambda = boto3.client(
+        "lambda",
+        region_name=region,
+        config=Config(
+            connect_timeout=10,
+            read_timeout=180,
+            retries={"max_attempts": 0},
+        ),
+    )
     token_cache: list[str] = []
+    workspace_capability_key_cache: list[str] = []
 
     def telegram_token() -> str:
         if token_cache:
@@ -399,6 +547,18 @@ def _build_production_dependencies() -> WorkerDependencies:
         token_cache.append(token)
         return token
 
+    def workspace_capability_key() -> str:
+        if workspace_capability_key_cache:
+            return workspace_capability_key_cache[0]
+        response = secrets.get_secret_value(
+            SecretId=required["WORKSPACE_CAPABILITY_SECRET_ID"]
+        )
+        value = response.get("SecretString")
+        if not isinstance(value, str) or len(value.encode("utf-8")) < 32:
+            raise RuntimeError("workspace capability secret is unavailable")
+        workspace_capability_key_cache.append(value)
+        return value
+
     try:
         lease_ms = int(required["RUNTIME_LEASE_MS"])
         maximum_execution_ms = int(required["LAMBDA_TIMEOUT_SECONDS"]) * 1_000
@@ -406,27 +566,40 @@ def _build_production_dependencies() -> WorkerDependencies:
         raise RuntimeError("worker runtime authority must be integral") from error
     if maximum_execution_ms <= 0 or lease_ms <= maximum_execution_ms:
         raise RuntimeError("worker lease must outlive Lambda execution authority")
+    runtime_repository = RuntimeStateRepository(
+        dynamodb.Table(required["RUNTIME_STATE_TABLE_NAME"]),
+        runtime_arn=required["AGENTCORE_RUNTIME_ARN"],
+        runtime_qualifier=required["AGENTCORE_QUALIFIER"],
+    )
+    control_handler = LambdaProductCommandHandler(
+        control_lambda,
+        function_name=required["CONTROL_FUNCTION_NAME"],
+    )
     _production_dependencies = WorkerDependencies(
         runtime_driver=RuntimeDriver(
-            repository=RuntimeStateRepository(
-                dynamodb.Table(required["RUNTIME_STATE_TABLE_NAME"]),
-                runtime_arn=required["AGENTCORE_RUNTIME_ARN"],
-                runtime_qualifier=required["AGENTCORE_QUALIFIER"],
-            ),
+            repository=runtime_repository,
             adapter=AgentCoreAdapter(
                 agentcore,
                 runtime_arn=required["AGENTCORE_RUNTIME_ARN"],
                 qualifier=required["AGENTCORE_QUALIFIER"],
                 region=region,
             ),
+            workspace_capability_signer=WorkspaceCapabilitySigner(
+                key_provider=workspace_capability_key,
+                audience=required[
+                    "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME"
+                ],
+            ),
             lease_ms=lease_ms,
             max_execution_ms=maximum_execution_ms,
         ),
-        command_handler=DeterministicProductCommandHandler(),
+        command_handler=control_handler,
         telegram_delivery=TelegramDeliveryAdapter(token_provider=telegram_token),
         ledger=DynamoProcessingLedger(
             dynamodb.Table(required["MESSAGE_LEDGER_TABLE_NAME"])
         ),
+        control_deletion_fence=control_handler,
+        deletion_fence=RuntimeAccountDeletionFence(runtime_repository),
     )
     return _production_dependencies
 

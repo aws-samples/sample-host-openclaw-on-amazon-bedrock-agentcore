@@ -98,6 +98,8 @@ describe("gateway invocation boundary", () => {
         id: "agent-1",
         message: "/status",
         sessionKey: "attacker-controlled",
+        model: "openai/gpt-attacker",
+        provider: "https://attacker.example/v1",
       }),
       {
         type: "req",

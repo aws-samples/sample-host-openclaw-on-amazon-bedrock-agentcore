@@ -88,6 +88,7 @@ def test_oauth_state_is_conditionally_created_and_atomically_consumed_once():
     assert item == {
         "PK": "OAUTH_STATE#" + "a" * 64,
         "SK": "OAUTH_STATE",
+        "userId": "user-1",
         "state": value,
         "ttl": expires_at,
     }

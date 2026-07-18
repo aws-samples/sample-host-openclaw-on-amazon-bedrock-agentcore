@@ -18,6 +18,9 @@ SPEC.loader.exec_module(storage)
 
 RUNTIME_ID = "openclaw_agent-abcdefghij"
 VERSION = "7"
+SOURCE_COMMIT = "a" * 40
+ENDPOINT_NAME = f"release_{SOURCE_COMMIT}"
+ENDPOINT_ID = "openclaw_endpoint-abcdefghij"
 ACCOUNT = "123456789012"
 RUNTIME_ARN = (
     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
@@ -50,8 +53,8 @@ def endpoint_response(*, status: str = "READY", live: str = VERSION, target: str
     return {
         "agentRuntimeArn": RUNTIME_ARN.removesuffix(f":{VERSION}") + f":{live}",
         "agentRuntimeEndpointArn": ENDPOINT_ARN,
-        "name": "DEFAULT",
-        "id": "openclaw_endpoint-abcdefghij",
+        "name": ENDPOINT_NAME,
+        "id": ENDPOINT_ID,
         "status": status,
         "liveVersion": live,
         "targetVersion": target,
@@ -63,13 +66,20 @@ class FakeControl:
         self.meta = SimpleNamespace(region_name=region)
         self.latest = list(latest)
         self.endpoints = list(endpoints)
-        self.exact = exact or runtime_response()
+        if exact is None:
+            self.exact = list(latest)
+        elif isinstance(exact, list):
+            self.exact = list(exact)
+        else:
+            self.exact = [exact]
         self.calls = []
 
     def get_agent_runtime(self, **kwargs):
         self.calls.append(("runtime", kwargs))
         if "agentRuntimeVersion" in kwargs:
-            return self.exact
+            if len(self.exact) > 1:
+                return self.exact.pop(0)
+            return self.exact[0]
         if len(self.latest) > 1:
             return self.latest.pop(0)
         return self.latest[0]
@@ -135,7 +145,8 @@ def verify(control=None, s3=None, **overrides):
         or FakeControl([runtime_response()], [endpoint_response()]),
         s3_client=s3 or FakeS3(),
         runtime_id=RUNTIME_ID,
-        endpoint_name="DEFAULT",
+        endpoint_name=ENDPOINT_NAME,
+        expected_endpoint_id=ENDPOINT_ID,
         expected_runtime_arn=RUNTIME_ARN,
         expected_role_arn=ROLE_ARN,
         bucket="personal-operator-workspaces",
@@ -155,7 +166,8 @@ def test_verifies_ready_endpoint_exact_runtime_version_and_bucket_controls() -> 
 
     assert evidence == {
         "bucket": "personal-operator-workspaces",
-        "endpointName": "DEFAULT",
+        "endpointId": ENDPOINT_ID,
+        "endpointName": ENDPOINT_NAME,
         "mountPath": "/mnt/workspace",
         "region": "eu-west-1",
         "runtimeArn": RUNTIME_ARN,
@@ -163,14 +175,13 @@ def test_verifies_ready_endpoint_exact_runtime_version_and_bucket_controls() -> 
         "runtimeVersion": VERSION,
     }
     assert control.calls == [
-        ("runtime", {"agentRuntimeId": RUNTIME_ID}),
-        (
-            "endpoint",
-            {"agentRuntimeId": RUNTIME_ID, "endpointName": "DEFAULT"},
-        ),
         (
             "runtime",
             {"agentRuntimeId": RUNTIME_ID, "agentRuntimeVersion": VERSION},
+        ),
+        (
+            "endpoint",
+            {"agentRuntimeId": RUNTIME_ID, "endpointName": ENDPOINT_NAME},
         ),
     ]
 
@@ -196,16 +207,35 @@ def test_rejects_any_runtime_without_one_exact_session_mount(filesystems) -> Non
         )
 
 
-def test_polls_until_both_resources_are_ready_then_refetches_the_live_version() -> None:
+def test_polls_until_the_exact_runtime_version_and_endpoint_are_ready() -> None:
     control = FakeControl(
-        [runtime_response(status="UPDATING"), runtime_response()],
+        [runtime_response()],
         [endpoint_response(status="UPDATING"), endpoint_response()],
+        exact=[runtime_response(status="UPDATING"), runtime_response()],
     )
 
     assert verify(control=control)["runtimeVersion"] == VERSION
-    assert control.calls[-1] == (
+    assert control.calls[-2] == (
         "runtime",
         {"agentRuntimeId": RUNTIME_ID, "agentRuntimeVersion": VERSION},
+    )
+
+
+def test_newer_runtime_version_cannot_move_the_release_endpoint_binding() -> None:
+    newer = runtime_response(version="8")
+    control = FakeControl(
+        [newer],
+        [endpoint_response()],
+        exact=runtime_response(),
+    )
+
+    evidence = verify(control=control)
+
+    assert evidence["runtimeVersion"] == VERSION
+    assert all(
+        kwargs.get("agentRuntimeVersion") == VERSION
+        for kind, kwargs in control.calls
+        if kind == "runtime"
     )
 
 
@@ -229,6 +259,13 @@ def test_rejects_terminal_status_and_every_endpoint_or_version_drift(
 ) -> None:
     with pytest.raises(storage.StorageVerificationError, match=message):
         verify(control=FakeControl([latest], [endpoint], exact=exact))
+
+
+def test_rejects_endpoint_id_drift_even_when_name_and_version_match() -> None:
+    endpoint = {**endpoint_response(), "id": "other_endpoint-abcdefghij"}
+
+    with pytest.raises(storage.StorageVerificationError, match="endpoint ID"):
+        verify(control=FakeControl([runtime_response()], [endpoint]))
 
 
 @pytest.mark.parametrize(
@@ -291,7 +328,8 @@ def test_times_out_without_accepting_non_ready_state() -> None:
             ),
             s3_client=FakeS3(),
             runtime_id=RUNTIME_ID,
-            endpoint_name="DEFAULT",
+            expected_endpoint_id=ENDPOINT_ID,
+            endpoint_name=ENDPOINT_NAME,
             expected_runtime_arn=RUNTIME_ARN,
             expected_role_arn=ROLE_ARN,
             bucket="personal-operator-workspaces",

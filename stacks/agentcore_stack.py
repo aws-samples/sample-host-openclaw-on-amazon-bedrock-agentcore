@@ -1,8 +1,9 @@
 """AgentCore Stack — IAM, S3, and Security Group for AgentCore Runtime.
 
 Creates the supporting resources that the AgentCore Runtime needs:
-  - Execution Role (Bedrock/log/telemetry plus exact workspace-role assumption)
-  - Workspace Session Role (S3/KMS base authority narrowed per user by STS)
+  - Execution Role (Bedrock/log/telemetry plus exact broker invocation)
+  - Trusted Credential Broker Role (the sole workspace-role assumer)
+  - Workspace Session Role (S3/KMS base authority narrowed by the broker)
   - Security Group (VPC networking for the container)
   - S3 Bucket (per-user file storage and workspace sync)
 
@@ -21,6 +22,7 @@ from aws_cdk import (
     Duration,
     Stack,
     RemovalPolicy,
+    Token,
     aws_bedrockagentcore as agentcore,
     aws_ec2 as ec2,
     aws_iam as iam,
@@ -54,6 +56,7 @@ class AgentCoreStack(Stack):
         cmk_arn: str,
         vpc: ec2.IVpc,
         private_subnet_ids: list[str],
+        workspace_capability_secret_name: str,
         guardrail_id: str = "",
         **kwargs,
     ) -> None:
@@ -65,6 +68,12 @@ class AgentCoreStack(Stack):
             raise ValueError(
                 f"AgentCoreStack must be deployed in {REQUIRED_REGION}; got {region}"
             )
+        if (
+            not Token.is_unresolved(workspace_capability_secret_name)
+            and workspace_capability_secret_name
+            != "personal-operator/workspace-capability"
+        ):
+            raise ValueError("workspace capability secret name is not canonical")
 
         # --- Security Group for AgentCore Runtime containers ------------------
         self.agent_sg = ec2.SecurityGroup(
@@ -145,17 +154,106 @@ class AgentCoreStack(Stack):
                 )
             )
 
-        # The execution role has no direct workspace access. It can only assume
-        # the dedicated base role, after which the bridge supplies a narrower
-        # per-user inline session policy.
+        # The potentially compromised runtime has neither direct workspace nor
+        # STS authority. It may invoke only the trusted credential broker, which
+        # derives and applies the exact per-user session policy outside AgentCore.
         workspace_session_role_name = f"openclaw-workspace-session-role-{region}"
         workspace_session_role_arn_str = (
             f"arn:aws:iam::{account}:role/{workspace_session_role_name}"
         )
+        workspace_broker_function_name = (
+            "personal-operator-workspace-credential-broker"
+        )
+        workspace_broker_function_arn = (
+            f"arn:aws:lambda:{region}:{account}:function:"
+            f"{workspace_broker_function_name}"
+        )
         self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["lambda:InvokeFunction"],
+                resources=[workspace_broker_function_arn],
+            )
+        )
+
+        workspace_broker_role_name = (
+            f"personal-operator-workspace-credential-broker-{region}"
+        )
+        workspace_broker_role_arn_str = (
+            f"arn:aws:iam::{account}:role/{workspace_broker_role_name}"
+        )
+        self.workspace_broker_function_name = workspace_broker_function_name
+        self.workspace_broker_role_arn = workspace_broker_role_arn_str
+        self.workspace_session_role_arn = workspace_session_role_arn_str
+        self.workspace_broker_role = iam.Role(
+            self,
+            "WorkspaceCredentialBrokerRole",
+            role_name=workspace_broker_role_name,
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description=(
+                "Trusted boundary that validates user/session capabilities before "
+                "assuming the workspace base role"
+            ),
+        )
+        self.workspace_broker_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["sts:AssumeRole"],
                 resources=[workspace_session_role_arn_str],
+            )
+        )
+        self.workspace_broker_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:GetItem"],
+                resources=[
+                    f"arn:aws:dynamodb:{region}:{account}:"
+                    "table/personal-operator-runtime-state"
+                ],
+            )
+        )
+        self.workspace_broker_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "secretsmanager:GetSecretValue",
+                    "secretsmanager:DescribeSecret",
+                ],
+                resources=[
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:"
+                    f"{workspace_capability_secret_name}-??????"
+                ],
+            )
+        )
+        self.workspace_broker_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["kms:Decrypt"],
+                resources=[cmk_arn],
+                conditions={
+                    "StringEquals": {
+                        "kms:CallerAccount": account,
+                        "kms:ViaService": (
+                            f"secretsmanager.{region}.amazonaws.com"
+                        ),
+                    }
+                },
+            )
+        )
+        self.workspace_broker_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["kms:Decrypt", "kms:DescribeKey"],
+                resources=[cmk_arn],
+                conditions={
+                    "StringEquals": {
+                        "kms:CallerAccount": account,
+                        "kms:ViaService": f"dynamodb.{region}.amazonaws.com",
+                    }
+                },
+            )
+        )
+        self.workspace_broker_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                resources=[
+                    f"arn:aws:logs:{region}:{account}:log-group:"
+                    "/personal-operator/lambda/workspace-credential-broker:*"
+                ],
             )
         )
 
@@ -181,10 +279,7 @@ class AgentCoreStack(Stack):
                 resources=["*"],
                 conditions={
                     "StringEquals": {
-                        "cloudwatch:namespace": [
-                            "OpenClaw/AgentCore",
-                            "OpenClaw/TokenUsage",
-                        ]
+                        "cloudwatch:namespace": "OpenClaw/AgentCore"
                     }
                 },
             )
@@ -250,22 +345,21 @@ class AgentCoreStack(Stack):
             versioned=True,
         )
 
-        # Workspace access base role. Its trust is limited to the exact runtime
-        # execution role, while a per-user AssumeRole session policy provides
-        # the namespace boundary.
+        # Workspace access base role. Its trust is limited to the exact broker
+        # role. AgentCore cannot assume it, even if runtime code omits a policy.
         self.workspace_session_role = iam.Role(
             self,
             "WorkspaceSessionRole",
             role_name=workspace_session_role_name,
             assumed_by=iam.AccountRootPrincipal().with_conditions(
                 {
-                    "ArnEquals": {"aws:PrincipalArn": execution_role_arn_str},
+                    "ArnEquals": {"aws:PrincipalArn": workspace_broker_role_arn_str},
                     "StringLike": {"sts:RoleSessionName": "workspace-*"},
                 }
             ),
             description="Base S3/KMS role narrowed by per-user STS session policy",
         )
-        self.workspace_session_role.node.add_dependency(self.execution_role)
+        self.workspace_session_role.node.add_dependency(self.workspace_broker_role)
         self.workspace_session_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["s3:ListBucket"],
@@ -291,10 +385,13 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # --- Runtime info (from Starter Toolkit, read via context) ------------
-        # Runtime/Endpoint/ECR managed by Starter Toolkit (`agentcore deploy`),
-        # not CDK. These are populated by the deploy script after `agentcore deploy`
-        # and passed to the dependent Router stack.
+        # --- Reviewed runtime release identity (read via context) -------------
+        # Runtime provisioning is deliberately outside this stack. Dependent
+        # stacks are wired only after the release gate supplies one atomic,
+        # commit-bound runtime version, immutable image, and dedicated endpoint.
+        runtime_source_commit = str(
+            self.node.try_get_context("runtime_source_commit") or ""
+        )
         runtime_id = str(self.node.try_get_context("runtime_id") or "")
         runtime_endpoint_id = str(
             self.node.try_get_context("runtime_endpoint_id") or ""
@@ -302,28 +399,41 @@ class AgentCoreStack(Stack):
         runtime_endpoint_name = str(
             self.node.try_get_context("runtime_endpoint_name") or ""
         )
+        runtime_version = str(self.node.try_get_context("runtime_version") or "")
         runtime_arn = str(self.node.try_get_context("runtime_arn") or "")
+        runtime_image_uri = str(
+            self.node.try_get_context("runtime_image_uri") or ""
+        )
         runtime_values = (
+            runtime_source_commit,
             runtime_id,
             runtime_endpoint_id,
             runtime_endpoint_name,
+            runtime_version,
             runtime_arn,
+            runtime_image_uri,
         )
         if not any(runtime_values):
             # Offline/foundation synthesis happens before Starter Toolkit has
-            # created a runtime. The dependent Router stack is not deployable
-            # until Phase 2 replaces all three placeholders atomically.
+            # created a runtime. Dependent stacks are not deployable until the
+            # external release gate replaces every placeholder atomically.
+            self.runtime_source_commit = "PLACEHOLDER"
             self.runtime_id = "PLACEHOLDER"
             self.runtime_endpoint_id = "PLACEHOLDER"
             self.runtime_endpoint_name = "PLACEHOLDER"
+            self.runtime_version = "PLACEHOLDER"
             self.runtime_arn = "PLACEHOLDER"
+            self.runtime_image_uri = "PLACEHOLDER"
             self.runtime_iam_arn = "PLACEHOLDER"
         else:
             if not all(runtime_values):
                 raise ValueError(
-                    "runtime_id, runtime_endpoint_id, runtime_endpoint_name, "
-                    "and runtime_arn must be set together"
+                    "runtime_source_commit, runtime_id, runtime_endpoint_id, "
+                    "runtime_endpoint_name, runtime_version, runtime_arn, and "
+                    "runtime_image_uri must be set together"
                 )
+            source_commit_pattern = r"[0-9a-f]{40}"
+            runtime_version_pattern = r"[1-9][0-9]{0,4}"
             runtime_id_pattern = r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
             runtime_arn_pattern = (
                 rf"arn:aws:bedrock-agentcore:{re.escape(region)}:"
@@ -331,25 +441,49 @@ class AgentCoreStack(Stack):
                 r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
                 r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
             )
+            runtime_image_uri_pattern = (
+                rf"{re.escape(account)}\.dkr\.ecr\."
+                rf"{re.escape(region)}\.amazonaws\.com/"
+                r"[a-z0-9]+(?:[._/-][a-z0-9]+)*"
+                r"@sha256:[0-9a-f]{64}"
+            )
+            if re.fullmatch(source_commit_pattern, runtime_source_commit) is None:
+                raise ValueError("runtime_source_commit must be an exact git commit")
+            if re.fullmatch(runtime_version_pattern, runtime_version) is None:
+                raise ValueError("runtime_version is not canonical")
             if re.fullmatch(runtime_id_pattern, runtime_id) is None:
                 raise ValueError(f"runtime_id is not canonical: {runtime_id}")
             if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
                 raise ValueError(
                     f"runtime_endpoint_id is not canonical: {runtime_endpoint_id}"
                 )
-            if runtime_endpoint_name != "DEFAULT":
+            expected_endpoint_name = f"release_{runtime_source_commit}"
+            if runtime_endpoint_name != expected_endpoint_name:
                 raise ValueError(
-                    "runtime_endpoint_name must be the exact DEFAULT qualifier"
+                    "runtime_endpoint_name must be derived from the exact "
+                    "runtime_source_commit"
                 )
             if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
                 raise ValueError(
                     "runtime_arn must be the exact AgentCore ARN returned for "
                     f"account {account} in {region}"
                 )
+            if runtime_arn.rsplit(":", 1)[-1] != runtime_version:
+                raise ValueError(
+                    "runtime_version must equal the exact runtime ARN version"
+                )
+            if re.fullmatch(runtime_image_uri_pattern, runtime_image_uri) is None:
+                raise ValueError(
+                    "runtime_image_uri must be an immutable ECR sha256 digest "
+                    f"in account {account} and region {region}"
+                )
+            self.runtime_source_commit = runtime_source_commit
             self.runtime_id = runtime_id
             self.runtime_endpoint_id = runtime_endpoint_id
             self.runtime_endpoint_name = runtime_endpoint_name
+            self.runtime_version = runtime_version
             self.runtime_arn = runtime_arn
+            self.runtime_image_uri = runtime_image_uri
             # AgentCore has two distinct ARN namespaces. GetAgentRuntime's
             # agent/<uuid>:<version> ARN is the invocation identity above;
             # IAM authorization uses the documented runtime/<runtime-id>
@@ -411,6 +545,16 @@ class AgentCoreStack(Stack):
         CfnOutput(self, "ExecutionRoleArn", value=self.execution_role.role_arn)
         CfnOutput(
             self,
+            "WorkspaceCredentialBrokerRoleArn",
+            value=workspace_broker_role_arn_str,
+        )
+        CfnOutput(
+            self,
+            "WorkspaceCredentialBrokerFunctionName",
+            value=workspace_broker_function_name,
+        )
+        CfnOutput(
+            self,
             "WorkspaceSessionRoleArn",
             value=workspace_session_role_arn_str,
         )
@@ -464,6 +608,20 @@ class AgentCoreStack(Stack):
                     applies_to=[
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*",
                     ],
+                ),
+            ],
+            apply_to_children=True,
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            self.workspace_broker_role,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason=(
+                        "Secrets Manager appends an unknown six-character suffix "
+                        "to the otherwise exact capability-secret name; the log "
+                        "stream wildcard is confined to one exact broker log group."
+                    ),
                 ),
             ],
             apply_to_children=True,

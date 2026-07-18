@@ -37,8 +37,10 @@ community marketplace CLI or skill.
 
 ## Runtime release policy
 
-- Builder and runtime use Node.js `24.15.0-slim`; local verification uses an
-  installed Node.js 24 release at or above that floor.
+- Builder and runtime use Node.js `24.15.0-slim` pinned to image-index digest
+  `sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d`;
+  local verification uses an installed Node.js 24 release at or above that
+  floor.
 - OpenClaw remains pinned by full Git commit, not by a moving branch or npm
   tag.
 - A release image must additionally be recorded by immutable ECR digest and

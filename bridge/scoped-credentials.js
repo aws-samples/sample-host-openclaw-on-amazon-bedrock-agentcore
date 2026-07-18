@@ -2,13 +2,13 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { createHash } = require("node:crypto");
-const { canonicalNamespace } = require("./session-binding");
 
 const RUNTIME_REGION = "eu-west-1";
 const VALID_BUCKET = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
-const ROLE_ARN_PATTERN = /^arn:aws:iam::(\d{12}):role\/[A-Za-z0-9_+=,.@\/-]{1,512}$/;
-const CMK_ARN_PATTERN = /^arn:aws:kms:([^:]+):(\d{12}):key\/([A-Za-z0-9-]+)$/;
+const BROKER_FUNCTION_NAME = "personal-operator-workspace-credential-broker";
+const MAX_CAPABILITY_BYTES = 2_048;
+const MAX_BROKER_RESPONSE_BYTES = 16_384;
+const MAX_SCOPED_CREDENTIAL_LIFETIME_MS = 15.5 * 60 * 1000;
 
 const FORWARDED_ENV_KEYS = Object.freeze(["S3_USER_FILES_BUCKET"]);
 const FIXED_CHILD_ENV = Object.freeze({
@@ -54,63 +54,6 @@ function validateBucket(bucket) {
   return bucket;
 }
 
-function parseCmkArn(cmkArn, callerAccount) {
-  const match = typeof cmkArn === "string" ? cmkArn.match(CMK_ARN_PATTERN) : null;
-  if (!match || match[1] !== RUNTIME_REGION) {
-    throw new Error(`CMK ARN must name an exact key in ${RUNTIME_REGION}`);
-  }
-  const account = match[2];
-  if (callerAccount !== undefined && callerAccount !== account) {
-    throw new Error("CMK account must equal the caller account");
-  }
-  return { account };
-}
-
-function buildSessionPolicy({
-  bucket,
-  namespace,
-  cmkArn,
-  callerAccount,
-  region,
-} = {}) {
-  const validatedBucket = validateBucket(bucket);
-  const canonical = canonicalNamespace(namespace);
-  if (region !== undefined && region !== RUNTIME_REGION) {
-    throw new Error(`Session policy region must be ${RUNTIME_REGION}`);
-  }
-
-  const statements = [
-    {
-      Effect: "Allow",
-      Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      Resource: `arn:aws:s3:::${validatedBucket}/${canonical}/*`,
-    },
-    {
-      Effect: "Allow",
-      Action: "s3:ListBucket",
-      Resource: `arn:aws:s3:::${validatedBucket}`,
-      Condition: { StringLike: { "s3:prefix": `${canonical}/*` } },
-    },
-  ];
-
-  if (cmkArn !== undefined) {
-    const { account } = parseCmkArn(cmkArn, callerAccount);
-    statements.push({
-      Effect: "Allow",
-      Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"],
-      Resource: cmkArn,
-      Condition: {
-        StringEquals: {
-          "kms:ViaService": `s3.${RUNTIME_REGION}.amazonaws.com`,
-          "kms:CallerAccount": account,
-        },
-      },
-    });
-  }
-
-  return JSON.stringify({ Version: "2012-10-17", Statement: statements });
-}
-
 function validateTemporaryCredentials(credentials, now = Date.now()) {
   if (
     !credentials ||
@@ -127,6 +70,9 @@ function validateTemporaryCredentials(credentials, now = Date.now()) {
   if (!Number.isFinite(expiration.getTime()) || expiration.getTime() <= now) {
     throw new Error("STS returned expired scoped credentials");
   }
+  if (expiration.getTime() > now + MAX_SCOPED_CREDENTIAL_LIFETIME_MS) {
+    throw new Error("Scoped credentials exceeded their fixed maximum lifetime");
+  }
   return {
     accessKeyId: credentials.AccessKeyId,
     secretAccessKey: credentials.SecretAccessKey,
@@ -135,53 +81,75 @@ function validateTemporaryCredentials(credentials, now = Date.now()) {
   };
 }
 
-async function createScopedCredentials(namespace, options = {}) {
+async function createScopedCredentials(capability, options = {}) {
   const env = options.env || process.env;
   const region = requireExactRegion(env);
-  const canonical = canonicalNamespace(namespace);
-  const bucket = env.S3_USER_FILES_BUCKET;
-  const roleArn = env.WORKSPACE_SESSION_ROLE_ARN;
-  const cmkArn = env.CMK_ARN;
-
-  if (!bucket) throw new Error("S3_USER_FILES_BUCKET is required");
-  if (!roleArn) throw new Error("WORKSPACE_SESSION_ROLE_ARN is required");
-  if (!cmkArn) throw new Error("CMK_ARN is required");
-  validateBucket(bucket);
-
-  const roleMatch = roleArn.match(ROLE_ARN_PATTERN);
-  if (!roleMatch) throw new Error("WORKSPACE_SESSION_ROLE_ARN is invalid");
-  const callerAccount = roleMatch[1];
-  parseCmkArn(cmkArn, callerAccount);
-
-  const hashSuffix = createHash("sha256")
-    .update(canonical)
-    .digest("hex")
-    .slice(0, 12);
-  const readable = canonical.slice(0, 41);
+  if (
+    typeof capability !== "string" ||
+    !capability ||
+    !capability.isWellFormed() ||
+    !/^[\x20-\x7e]+$/.test(capability) ||
+    Buffer.byteLength(capability, "ascii") > MAX_CAPABILITY_BYTES
+  ) {
+    throw new Error("A bounded ASCII workspace capability is required");
+  }
+  const functionName = env.WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME;
+  if (functionName !== BROKER_FUNCTION_NAME) {
+    throw new Error(
+      `WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME must be exactly ${BROKER_FUNCTION_NAME}`,
+    );
+  }
   const commandInput = {
-    RoleArn: roleArn,
-    RoleSessionName: `workspace-${readable}-${hashSuffix}`,
-    DurationSeconds: 3600,
-    Policy: buildSessionPolicy({
-      bucket,
-      namespace: canonical,
-      cmkArn,
-      callerAccount,
-      region,
-    }),
+    FunctionName: functionName,
+    InvocationType: "RequestResponse",
+    Payload: Buffer.from(JSON.stringify({ capability })),
   };
 
-  let stsClient = options.stsClient;
+  let lambdaClient = options.lambdaClient;
   let command;
-  if (stsClient) {
+  if (lambdaClient) {
     command = { input: commandInput };
   } else {
-    const { STSClient, AssumeRoleCommand } = require("@aws-sdk/client-sts");
-    stsClient = new STSClient({ region });
-    command = new AssumeRoleCommand(commandInput);
+    const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
+    lambdaClient = new LambdaClient({ region, maxAttempts: 1 });
+    command = new InvokeCommand(commandInput);
   }
-  const response = await stsClient.send(command);
-  return validateTemporaryCredentials(response?.Credentials);
+  const response = await lambdaClient.send(command);
+  if (
+    response?.StatusCode !== 200 ||
+    response?.FunctionError ||
+    !response?.Payload
+  ) {
+    throw new Error("Workspace credential broker invocation failed");
+  }
+  const raw = Buffer.from(response.Payload);
+  if (!raw.length || raw.length > MAX_BROKER_RESPONSE_BYTES) {
+    throw new Error("Workspace credential broker response is invalid");
+  }
+  let credentials;
+  try {
+    credentials = JSON.parse(raw.toString("utf8"));
+  } catch {
+    throw new Error("Workspace credential broker response is invalid");
+  }
+  const exactKeys = [
+    "AccessKeyId",
+    "Expiration",
+    "SecretAccessKey",
+    "SessionToken",
+    "Version",
+  ];
+  if (
+    !credentials ||
+    typeof credentials !== "object" ||
+    Array.isArray(credentials) ||
+    credentials.Version !== 1 ||
+    !exactKeys.every((key) => Object.hasOwn(credentials, key)) ||
+    Object.keys(credentials).length !== exactKeys.length
+  ) {
+    throw new Error("Workspace credential broker returned malformed credentials");
+  }
+  return validateTemporaryCredentials(credentials);
 }
 
 function normalizeCredentialFileInput(credentials) {
@@ -276,7 +244,6 @@ module.exports = {
   FORWARDED_ENV_KEYS,
   FIXED_CHILD_ENV,
   requireExactRegion,
-  buildSessionPolicy,
   createScopedCredentials,
   writeCredentialFiles,
   buildOpenClawEnv,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Mapping
+from typing import Iterable, Mapping
 
 try:
     from .gmail_send import deterministic_message_id, validate_email_args
@@ -25,6 +25,10 @@ except ImportError:
     )
 
 
+class ReconciliationDeferred(RuntimeError):
+    """Provider observation or durable confirmation did not complete safely."""
+
+
 class GmailEffectReconciler:
     def __init__(
         self,
@@ -35,6 +39,8 @@ class GmailEffectReconciler:
         connection_id: str,
         account_email: str,
         sender_address: str,
+        founder_user_ids: Iterable[str],
+        deletion_blocked,
         now=None,
     ) -> None:
         self._resource = gmail_resource(
@@ -48,15 +54,39 @@ class GmailEffectReconciler:
         self._connection_id = connection_id
         self._account_email = account_email
         self._sender_address = sender_address
+        self._founder_user_ids = frozenset(founder_user_ids)
+        if (
+            not self._founder_user_ids
+            or any(
+                not isinstance(value, str) or not value or len(value) > 128
+                for value in self._founder_user_ids
+            )
+        ):
+            raise ValueError("Gmail reconciliation founder identities are invalid")
+        if not callable(deletion_blocked):
+            raise ValueError("Gmail reconciliation deletion fence is required")
+        self._deletion_blocked = deletion_blocked
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     def reconcile(self, *, action_id: str, user_id: str) -> EffectReceipt | None:
+        if user_id not in self._founder_user_ids:
+            return None
         action = self._repository.get(action_id=action_id, user_id=user_id)
         if not isinstance(action, Mapping):
             return None
         try:
             state = ActionState(action["state"])
             if state not in {ActionState.DISPATCHING, ActionState.UNCERTAIN}:
+                return None
+            observed_at = self._now()
+            ttl = action.get("ttl")
+            if (
+                not isinstance(observed_at, datetime)
+                or observed_at.tzinfo is None
+                or isinstance(ttl, bool)
+                or not isinstance(ttl, int)
+                or ttl <= int(observed_at.timestamp())
+            ):
                 return None
             args = validate_email_args(action["args"])
             payload_hash = canonical_args_hash(args)
@@ -93,12 +123,29 @@ class GmailEffectReconciler:
             )
             if action.get("messageId") != message_id:
                 return None
-            evidence = self._provider.find_by_message_id(
-                message_id=message_id,
-                sender_address=self._sender_address,
-                recipient=args["to"],
-                payload_hash=payload_hash,
-            )
+            try:
+                blocked = self._deletion_blocked(user_id)
+            except Exception:
+                raise ReconciliationDeferred(
+                    "account deletion fence is unavailable"
+                ) from None
+            if not isinstance(blocked, bool):
+                raise ReconciliationDeferred(
+                    "account deletion fence returned an invalid result"
+                )
+            if blocked:
+                return None
+            try:
+                evidence = self._provider.find_by_message_id(
+                    message_id=message_id,
+                    sender_address=self._sender_address,
+                    recipient=args["to"],
+                    payload_hash=payload_hash,
+                )
+            except Exception:
+                raise ReconciliationDeferred(
+                    "Gmail provider observation is deferred"
+                ) from None
             if evidence is None:
                 return None
             receipt = EffectReceipt.from_provider_evidence(evidence)
@@ -121,9 +168,11 @@ class GmailEffectReconciler:
                 provider_thread_id=receipt.provider_thread_id,
                 since=receipt.executed_at,
             )
+        except ReconciliationDeferred:
+            raise
         except Exception:
             return None
-        confirmed_at = self._now().astimezone(timezone.utc)
+        confirmed_at = observed_at.astimezone(timezone.utc)
         try:
             self._machine.transition(
                 action_id=action_id,
@@ -139,5 +188,7 @@ class GmailEffectReconciler:
                 },
             )
         except Exception:
-            return None
+            raise ReconciliationDeferred(
+                "Gmail confirmation persistence is deferred"
+            ) from None
         return receipt

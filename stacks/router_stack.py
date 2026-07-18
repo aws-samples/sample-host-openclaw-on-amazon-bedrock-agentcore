@@ -7,6 +7,7 @@ from aws_cdk import (
     Duration,
     RemovalPolicy,
     Stack,
+    Token,
     aws_apigatewayv2 as apigwv2,
     aws_apigatewayv2_integrations as apigwv2_integrations,
     aws_cloudwatch as cloudwatch,
@@ -25,6 +26,7 @@ from stacks import retention_days
 
 
 REQUIRED_REGION = "eu-west-1"
+CONTROL_FUNCTION_NAME = "personal-operator-control-command:live"
 
 
 class RouterStack(Stack):
@@ -40,9 +42,14 @@ class RouterStack(Stack):
         slack_token_secret_name: str,
         feishu_token_secret_name: str,
         webhook_secret_name: str,
+        workspace_capability_secret_name: str,
+        workspace_broker_role_arn: str,
+        workspace_broker_function_name: str,
+        workspace_session_role_arn: str,
         cmk_arn: str,
         user_files_bucket_name: str,
         user_files_bucket_arn: str,
+        trusted_code_asset_root: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -53,6 +60,29 @@ class RouterStack(Stack):
             raise ValueError(
                 f"RouterStack must be deployed in {REQUIRED_REGION}; got {region}"
             )
+        expected_broker_function = (
+            "personal-operator-workspace-credential-broker"
+        )
+        expected_broker_role_arn = (
+            f"arn:aws:iam::{account}:role/"
+            f"personal-operator-workspace-credential-broker-{region}"
+        )
+        expected_workspace_role_arn = (
+            f"arn:aws:iam::{account}:role/"
+            f"openclaw-workspace-session-role-{region}"
+        )
+        if workspace_broker_function_name != expected_broker_function:
+            raise ValueError("workspace broker function name is not canonical")
+        if workspace_broker_role_arn != expected_broker_role_arn:
+            raise ValueError("workspace broker role ARN is not canonical")
+        if workspace_session_role_arn != expected_workspace_role_arn:
+            raise ValueError("workspace session role ARN is not canonical")
+        if (
+            not Token.is_unresolved(workspace_capability_secret_name)
+            and workspace_capability_secret_name
+            != "personal-operator/workspace-capability"
+        ):
+            raise ValueError("workspace capability secret name is not canonical")
 
         runtime_values = (runtime_arn, runtime_iam_arn, runtime_endpoint_name)
         if runtime_values == ("PLACEHOLDER", "PLACEHOLDER", "PLACEHOLDER"):
@@ -84,9 +114,9 @@ class RouterStack(Stack):
                 raise ValueError(
                     "runtime_iam_arn must be the exact AgentCore IAM runtime resource"
                 )
-            if runtime_endpoint_name != "DEFAULT":
+            if re.fullmatch(r"release_[0-9a-f]{40}", runtime_endpoint_name) is None:
                 raise ValueError(
-                    "runtime_endpoint_name must be the exact DEFAULT qualifier"
+                    "runtime_endpoint_name must be an exact release endpoint"
                 )
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         worker_timeout = int(
@@ -124,6 +154,13 @@ class RouterStack(Stack):
             encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
             encryption_key=identity_cmk,
         )
+        self.identity_table.add_global_secondary_index(
+            index_name="userId-index",
+            partition_key=dynamodb.Attribute(
+                name="userId", type=dynamodb.AttributeType.STRING
+            ),
+            projection_type=dynamodb.ProjectionType.KEYS_ONLY,
+        )
 
         # Runtime state has a deliberately separate, single-item-per-user
         # boundary. Session mapping, lease fencing, and deletion tombstone are
@@ -145,8 +182,9 @@ class RouterStack(Stack):
         )
 
         # One immutable event record combines the execution claim, durable
-        # result, and Telegram outbox fence. There is no TTL during the pilot;
-        # Task 7's retention controller will expire only terminal records.
+        # result, and Telegram outbox fence. The worker assigns the TTL only
+        # after a record becomes terminal or quarantined, preserving active
+        # recovery fences while bounding retained message/result content.
         self.message_ledger_table = dynamodb.Table(
             self,
             "MessageLedgerTable",
@@ -156,11 +194,19 @@ class RouterStack(Stack):
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.RETAIN,
+            time_to_live_attribute="ttl",
             point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
                 point_in_time_recovery_enabled=True,
             ),
             encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
             encryption_key=identity_cmk,
+        )
+        self.message_ledger_table.add_global_secondary_index(
+            index_name="userId-index",
+            partition_key=dynamodb.Attribute(
+                name="userId", type=dynamodb.AttributeType.STRING
+            ),
+            projection_type=dynamodb.ProjectionType.KEYS_ONLY,
         )
 
         self.update_dead_letter_queue = sqs.Queue(
@@ -206,6 +252,15 @@ class RouterStack(Stack):
             retention=retention_days(log_retention),
             removal_policy=RemovalPolicy.DESTROY,
         )
+        workspace_broker_log_group = logs.LogGroup(
+            self,
+            "WorkspaceCredentialBrokerLogGroup",
+            log_group_name=(
+                "/personal-operator/lambda/workspace-credential-broker"
+            ),
+            retention=retention_days(log_retention),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
 
         # --- Lambda Function ---
         self.router_fn = _lambda.Function(
@@ -213,8 +268,12 @@ class RouterStack(Stack):
             "RouterFn",
             function_name="openclaw-router",
             runtime=_lambda.Runtime.PYTHON_3_13,
-            handler="index.handler",
-            code=_lambda.Code.from_asset("lambda/router"),
+            architecture=_lambda.Architecture.ARM_64,
+            handler="router.index.handler",
+            # Ingress and worker execute from the same reviewed, normalized
+            # ARM64 asset.  Do not bypass the manifest-verified release bundle
+            # with the raw source directory.
+            code=_lambda.Code.from_asset(trusted_code_asset_root),
             timeout=Duration.seconds(ingress_timeout),
             memory_size=worker_memory,
             environment={
@@ -232,10 +291,11 @@ class RouterStack(Stack):
             "TelegramWorkerFn",
             function_name="personal-operator-telegram-worker",
             runtime=_lambda.Runtime.PYTHON_3_13,
+            architecture=_lambda.Architecture.ARM_64,
             handler="worker.index.lambda_handler",
             # The worker composes trusted modules from router/ and worker/;
             # package their common lambda/ root as one immutable asset.
-            code=_lambda.Code.from_asset("lambda"),
+            code=_lambda.Code.from_asset(trusted_code_asset_root),
             timeout=Duration.seconds(worker_timeout),
             memory_size=worker_memory,
             environment={
@@ -246,8 +306,48 @@ class RouterStack(Stack):
                 "RUNTIME_LEASE_MS": str(runtime_lease_ms),
                 "LAMBDA_TIMEOUT_SECONDS": str(worker_timeout),
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
+                "CONTROL_FUNCTION_NAME": CONTROL_FUNCTION_NAME,
+                "WORKSPACE_CAPABILITY_SECRET_ID": (
+                    workspace_capability_secret_name
+                ),
+                "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
+                    workspace_broker_function_name
+                ),
             },
             log_group=worker_log_group,
+        )
+        workspace_broker_role = iam.Role.from_role_arn(
+            self,
+            "ImportedWorkspaceCredentialBrokerRole",
+            workspace_broker_role_arn,
+            mutable=False,
+        )
+        self.workspace_broker_fn = _lambda.Function(
+            self,
+            "WorkspaceCredentialBrokerFn",
+            function_name=workspace_broker_function_name,
+            runtime=_lambda.Runtime.PYTHON_3_13,
+            architecture=_lambda.Architecture.ARM_64,
+            handler="workspace_broker.index.lambda_handler",
+            code=_lambda.Code.from_asset(trusted_code_asset_root),
+            role=workspace_broker_role,
+            timeout=Duration.seconds(15),
+            memory_size=256,
+            environment={
+                "WORKSPACE_CAPABILITY_SECRET_ID": (
+                    workspace_capability_secret_name
+                ),
+                "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
+                    workspace_broker_function_name
+                ),
+                "WORKSPACE_SESSION_ROLE_ARN": workspace_session_role_arn,
+                "RUNTIME_STATE_TABLE_NAME": self.runtime_state_table.table_name,
+                "S3_USER_FILES_BUCKET": user_files_bucket_name,
+                "CMK_ARN": cmk_arn,
+                "AGENTCORE_RUNTIME_ARN": runtime_arn,
+                "AGENTCORE_QUALIFIER": runtime_endpoint_name,
+            },
+            log_group=workspace_broker_log_group,
         )
         self.worker_fn.add_event_source(
             lambda_event_sources.SqsEventSource(
@@ -255,6 +355,18 @@ class RouterStack(Stack):
                 batch_size=1,
                 report_batch_item_failures=True,
             )
+        )
+        logs.MetricFilter(
+            self,
+            "TelegramWorkerFailedRecordMetric",
+            log_group=worker_log_group,
+            filter_pattern=logs.FilterPattern.literal(
+                '"Telegram FIFO record failed"'
+            ),
+            metric_namespace="PersonalOperator/Worker",
+            metric_name="FailedRecords",
+            metric_value="1",
+            default_value=0,
         )
 
         # --- API Gateway HTTP API ---
@@ -312,8 +424,26 @@ class RouterStack(Stack):
         # AgentCore, send Telegram messages, upload files, or invoke itself.
         self.router_fn.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["dynamodb:GetItem", "dynamodb:PutItem"],
+                actions=["dynamodb:GetItem", "dynamodb:TransactWriteItems"],
                 resources=[self.identity_table.table_arn],
+            )
+        )
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "kms:Decrypt",
+                    "kms:DescribeKey",
+                    "kms:Encrypt",
+                    "kms:GenerateDataKey*",
+                    "kms:ReEncrypt*",
+                ],
+                resources=[cmk_arn],
+                conditions={
+                    "StringEquals": {
+                        "kms:CallerAccount": account,
+                        "kms:ViaService": f"dynamodb.{region}.amazonaws.com",
+                    }
+                },
             )
         )
         self.router_fn.add_to_role_policy(
@@ -375,6 +505,14 @@ class RouterStack(Stack):
         )
         self.worker_fn.add_to_role_policy(
             iam.PolicyStatement(
+                actions=["lambda:InvokeFunction"],
+                resources=[
+                    f"arn:aws:lambda:{region}:{account}:function:{CONTROL_FUNCTION_NAME}"
+                ],
+            )
+        )
+        self.worker_fn.add_to_role_policy(
+            iam.PolicyStatement(
                 actions=["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
                 resources=[
                     self.runtime_state_table.table_arn,
@@ -384,10 +522,30 @@ class RouterStack(Stack):
         )
         self.worker_fn.add_to_role_policy(
             iam.PolicyStatement(
+                actions=[
+                    "kms:Decrypt",
+                    "kms:DescribeKey",
+                    "kms:Encrypt",
+                    "kms:GenerateDataKey*",
+                    "kms:ReEncrypt*",
+                ],
+                resources=[cmk_arn],
+                conditions={
+                    "StringEquals": {
+                        "kms:CallerAccount": account,
+                        "kms:ViaService": f"dynamodb.{region}.amazonaws.com",
+                    }
+                },
+            )
+        )
+        self.worker_fn.add_to_role_policy(
+            iam.PolicyStatement(
                 actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
                 resources=[
                     f"arn:aws:secretsmanager:{region}:{account}:secret:"
                     f"{telegram_token_secret_name}-??????",
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:"
+                    f"{workspace_capability_secret_name}-??????",
                 ],
             )
         )
@@ -426,6 +584,20 @@ class RouterStack(Stack):
             alarm_name="personal-operator-telegram-worker-throttles",
             metric=self.worker_fn.metric_throttles(
                 period=Duration.minutes(5), statistic="Sum"
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+        cloudwatch.Alarm(
+            self,
+            "TelegramWorkerFailedRecordsAlarm",
+            alarm_name="personal-operator-telegram-worker-failed-records",
+            metric=cloudwatch.Metric(
+                namespace="PersonalOperator/Worker",
+                metric_name="FailedRecords",
+                period=Duration.minutes(1),
+                statistic="Sum",
             ),
             threshold=1,
             evaluation_periods=1,
@@ -501,8 +673,10 @@ class RouterStack(Stack):
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
                     reason="Secrets Manager appends an unknown six-character suffix "
-                    "to each otherwise exact secret name; SQS's generated CMK grant "
-                    "uses the AWS-defined GenerateDataKey family.",
+                    "to each otherwise exact secret name; the exact CMK statements "
+                    "use only the AWS-defined GenerateDataKey and ReEncrypt action "
+                    "families constrained to this account and DynamoDB service; SQS "
+                    "and Secrets Manager remain in separate service-bound statements.",
                 ),
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-L1",
@@ -510,6 +684,18 @@ class RouterStack(Stack):
                 ),
             ],
             apply_to_children=True,
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            self.workspace_broker_fn,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-L1",
+                    reason=(
+                        "Python 3.13 is the latest stable runtime supported in "
+                        "the required region."
+                    ),
+                ),
+            ],
         )
         cdk_nag.NagSuppressions.add_resource_suppressions(
             self.http_api,

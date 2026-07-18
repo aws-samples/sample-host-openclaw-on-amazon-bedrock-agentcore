@@ -61,7 +61,7 @@ class GoogleGmailApiClient:
                 self._service.users()
                 .threads()
                 .list(userId=self._mailbox, q=query, maxResults=bounded_max)
-                .execute()
+                .execute(num_retries=0)
             )
         except Exception:
             # Provider exceptions can include request metadata. Never retain or
@@ -96,7 +96,7 @@ class GoogleGmailApiClient:
                     id=thread_id,
                     format=format,
                 )
-                .execute()
+                .execute(num_retries=0)
             )
         except Exception:
             raise GmailProviderError("Gmail thread retrieval failed") from None

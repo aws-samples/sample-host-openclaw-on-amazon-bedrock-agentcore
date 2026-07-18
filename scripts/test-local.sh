@@ -7,6 +7,9 @@ AWS_TEST_REGION="eu-west-1"
 SYNTH_ACCOUNT="000000000000"
 failures=0
 
+# shellcheck source=hermetic-aws-env.sh
+source "$ROOT_DIR/scripts/hermetic-aws-env.sh"
+
 if [[ ! -x "$PYTHON" ]]; then
   echo "ERROR: Python environment not found at $PYTHON" >&2
   echo "Create it and install requirements.txt before running this script." >&2
@@ -33,10 +36,24 @@ cd "$ROOT_DIR"
 run_check "Node.js 24.15 or newer" \
   node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 24 || (major === 24 && minor < 15)) { console.error(`Node ${process.versions.node} is too old; require >=24.15.0`); process.exit(1); }'
 
+run_check "Bridge hash-locked dependencies" \
+  npm --prefix bridge ci --ignore-scripts
+
+run_check "Web hash-locked dependencies" \
+  npm --prefix web ci --ignore-scripts
+
 run_check "Python unit tests" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
-  "$PYTHON" -m pytest lambda/router lambda/cron \
-  tests/test_product_configuration.py tests/test_verify_agentcore_storage.py -v
+  PYTHONPATH="$ROOT_DIR/lambda/router:$ROOT_DIR/lambda" \
+  "$PYTHON" -m pytest lambda/router lambda/worker lambda/workflows \
+  lambda/actions lambda/control lambda/web lambda/cron lambda/workspace_broker \
+  tests/test_product_configuration.py \
+  tests/test_telegram_queue_infrastructure.py \
+  tests/test_deploy_safety.py \
+  tests/test_trusted_lambda_packaging.py \
+  tests/test_verify_agentcore_storage.py \
+  tests/test_web_stack.py \
+  tests/security tests/integration -v
 
 run_check "E2E session-control unit tests" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
@@ -46,23 +63,34 @@ run_check "Bridge Node tests (serialized)" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
   npm --prefix bridge test
 
+run_check "Web UI tests" \
+  npm --prefix web test
+
+run_check "Web UI production build" \
+  npm --prefix web run build
+
 run_check "JavaScript syntax" \
   bash -c 'while IFS= read -r file; do node --check "$file" || exit 1; done < <(find bridge -type f -name "*.js" -not -path "*/node_modules/*" | sort)'
 
 run_check "Python syntax" \
   "$PYTHON" -m compileall -q app.py stacks lambda scripts tests
 
+run_check "Repository whitespace contract" \
+  git diff --check
+
 CDK_CONTEXT_JSON="$($PYTHON -c 'import json; print(json.dumps(json.load(open("cdk.json", encoding="utf-8"))["context"]))')"
-SYNTH_OUT="$(mktemp -d "${TMPDIR:-/tmp}/personal-operator-cdk.XXXXXX")"
-trap 'rm -rf "$SYNTH_OUT"' EXIT
+SYNTH_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/personal-operator-cdk.XXXXXX")"
+SYNTH_OUT="$SYNTH_WORK_DIR/cdk.out"
+AWS_HERMETIC_HOME="$SYNTH_WORK_DIR/home"
+trap 'rm -rf "$SYNTH_WORK_DIR"' EXIT
 
 run_check "CDK offline synthesis contract" \
-  env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-  AWS_EC2_METADATA_DISABLED=true \
+  run_with_hermetic_aws_env "$AWS_HERMETIC_HOME" env \
   AWS_REGION="$AWS_TEST_REGION" \
   AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
   CDK_DEFAULT_ACCOUNT="$SYNTH_ACCOUNT" \
   CDK_DEFAULT_REGION="$AWS_TEST_REGION" \
+  PERSONAL_OPERATOR_SYNTH_SOURCE_ASSET=1 \
   CDK_CONTEXT_JSON="$CDK_CONTEXT_JSON" \
   CDK_OUTDIR="$SYNTH_OUT" \
   "$PYTHON" app.py

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 # Set required env vars before importing the module
 os.environ.setdefault("AGENTCORE_RUNTIME_ARN",
     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/test")
-os.environ.setdefault("AGENTCORE_QUALIFIER", "test-endpoint")
+os.environ.setdefault("AGENTCORE_QUALIFIER", "release_" + "a" * 40)
 os.environ.setdefault("IDENTITY_TABLE_NAME", "openclaw-identity")
 os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-eu-west-1")
 os.environ.setdefault("SLACK_TOKEN_SECRET_ID", "openclaw/channels/slack")

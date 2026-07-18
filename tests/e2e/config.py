@@ -54,10 +54,21 @@ class E2EConfig:
 def load_config() -> E2EConfig:
     """Build config from AWS resources. Raises on missing critical values."""
     region = _resolve_region()
-    cdk_json = Path(__file__).resolve().parents[2] / "cdk.json"
-    context = json.loads(cdk_json.read_text(encoding="utf-8")).get("context", {})
-    runtime_arn = str(context.get("runtime_arn") or "")
-    runtime_endpoint_name = str(context.get("runtime_endpoint_name") or "")
+    runtime_context_path = (
+        Path(__file__).resolve().parents[2] / "build" / "runtime-context.json"
+    )
+    try:
+        context = json.loads(runtime_context_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("exact release runtime context is unavailable") from error
+    if not isinstance(context, dict) or context.get("schema") != (
+        "personal-operator.runtime-context.v3"
+    ):
+        raise RuntimeError("release runtime context schema is invalid")
+    source_commit = str(context.get("sourceCommit") or "")
+    runtime_version = str(context.get("runtimeVersion") or "")
+    runtime_arn = str(context.get("runtimeArn") or "")
+    runtime_endpoint_name = str(context.get("runtimeEndpointName") or "")
     if re.fullmatch(
         r"arn:aws:bedrock-agentcore:eu-west-1:[0-9]{12}:agent/"
         r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
@@ -65,8 +76,12 @@ def load_config() -> E2EConfig:
         runtime_arn,
     ) is None:
         raise RuntimeError("cdk context has no exact deployed runtime ARN")
-    if runtime_endpoint_name != "DEFAULT":
-        raise RuntimeError("cdk context endpoint qualifier must be exactly DEFAULT")
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+        raise RuntimeError("release runtime source commit is invalid")
+    if runtime_endpoint_name != f"release_{source_commit}":
+        raise RuntimeError("runtime endpoint is not bound to the release commit")
+    if runtime_version != runtime_arn.rsplit(":", 1)[-1]:
+        raise RuntimeError("runtime endpoint version differs from the runtime ARN")
     cf = boto3.client("cloudformation", region_name=region)
     sm = boto3.client("secretsmanager", region_name=region)
 

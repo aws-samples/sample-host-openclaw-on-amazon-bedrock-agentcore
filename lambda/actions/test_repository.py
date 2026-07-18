@@ -61,6 +61,7 @@ def prepared_record():
         "payloadHash": value.payload_hash,
         "createdAt": NOW.isoformat(),
         "updatedAt": NOW.isoformat(),
+        "ttl": int((NOW + timedelta(days=14)).timestamp()),
     }
 
 
@@ -104,6 +105,8 @@ def test_create_prepared_accepts_only_typed_immutable_draft_boundary():
     assert created["draftRevision"] == 4
     assert created["resource"] == draft().resource
     assert created["connectionId"] == "google_conn_1234"
+    assert created["ttl"] == int((NOW + timedelta(days=14)).timestamp())
+    assert table.put_item.call_args.kwargs["Item"]["ttl"] == created["ttl"]
     assert table.put_item.call_args.kwargs["ConditionExpression"] == (
         "attribute_not_exists(PK) AND attribute_not_exists(SK)"
     )
@@ -121,6 +124,20 @@ def test_create_reconciles_response_loss_only_for_exact_typed_revision():
     created = repository(table).create_prepared(draft=draft())
 
     assert created["creationId"] == table.put_item.call_args.kwargs["Item"]["creationId"]
+
+
+def test_create_does_not_accept_a_corrupt_or_extended_retention_boundary():
+    table = MagicMock()
+    table.put_item.side_effect = TimeoutError("response lost")
+
+    def corrupt_read(**_kwargs):
+        item = dict(table.put_item.call_args.kwargs["Item"])
+        item["ttl"] += 1
+        return {"Item": item}
+
+    table.get_item.side_effect = corrupt_read
+    with pytest.raises(machine_module.ConcurrentActionUpdate):
+        repository(table).create_prepared(draft=draft())
 
 
 def test_create_rejects_same_key_for_different_draft_revision():
@@ -154,8 +171,12 @@ def test_transition_fences_binding_state_revision_draft_and_unique_operation():
         "#state=:expectedState",
         "#revision=:expectedRevision",
         "#draftRevision=:expectedDraftRevision",
+        "#ttl>:transitionEpoch",
     ):
         assert fragment in condition
+    assert call["ExpressionAttributeValues"][":transitionEpoch"] == int(NOW.timestamp())
+    assert ":retentionTtl" not in call["ExpressionAttributeValues"]
+    assert updated["ttl"] == int((NOW + timedelta(days=14)).timestamp())
     assert updated["lastTransitionId"] == "op_request_123456789"
 
 
@@ -247,6 +268,55 @@ def test_dispatch_transition_requires_operation_marker_to_equal_unique_caller_id
         )
 
 
+def test_approval_and_dispatch_are_atomically_fenced_by_both_retention_deadlines():
+    pending = {
+        **prepared_record(),
+        **approval_updates(),
+        "state": "APPROVAL_PENDING",
+        "revision": 2,
+    }
+    approved_updates = {
+        "approvalId": pending["approvalId"],
+        "approvedActionId": pending["actionId"],
+        "approvedDraftRevision": pending["draftRevision"],
+        "approvedArgsHash": pending["payloadHash"],
+        "approvedAt": NOW.isoformat(),
+    }
+    table = MagicMock()
+    table.update_item.side_effect = applied_response(pending)
+    approved = repository(table).transition(
+        action_id=pending["actionId"],
+        user_id=pending["userId"],
+        expected_state=models.ActionState.APPROVAL_PENDING,
+        target_state=models.ActionState.APPROVED,
+        expected_revision=2,
+        transition_id="op_approve_123456789",
+        updates=approved_updates,
+    )
+    condition = table.update_item.call_args.kwargs["ConditionExpression"]
+    assert "#ttl>:transitionEpoch" in condition
+    assert "#approvalExpiresAt>:updatedAt" in condition
+
+    table = MagicMock()
+    table.update_item.side_effect = applied_response(approved)
+    repository(table).transition(
+        action_id=approved["actionId"],
+        user_id=approved["userId"],
+        expected_state=models.ActionState.APPROVED,
+        target_state=models.ActionState.DISPATCHING,
+        expected_revision=3,
+        transition_id="op_dispatch_aaaaaaaa",
+        updates={
+            "messageId": "<po-aaaaaaaaaaaaaaaaaaaaaaaa@personal-operator.invalid>",
+            "dispatchOperationId": "op_dispatch_aaaaaaaa",
+            "dispatchDraftRevision": approved["draftRevision"],
+        },
+    )
+    condition = table.update_item.call_args.kwargs["ConditionExpression"]
+    assert "#ttl>:transitionEpoch" in condition
+    assert "#approvalExpiresAt>:updatedAt" in condition
+
+
 def valid_confirmation():
     receipt = models.EffectReceipt(
         provider_message_id="gmail-1",
@@ -300,6 +370,114 @@ def test_confirmation_requires_validated_sent_receipt_and_exact_reply_tracker(mu
             transition_id="op_confirm_123456789",
             updates=updates,
         )
+
+
+def test_terminal_action_and_receipt_gain_exact_ninety_day_ttl():
+    table = MagicMock()
+
+    def applied(**kwargs):
+        values = kwargs["ExpressionAttributeValues"]
+        return {
+            "Attributes": {
+                **prepared_record(),
+                **valid_confirmation(),
+                "state": "CONFIRMED",
+                "revision": 10,
+                "lastTransitionId": "op_confirm_123456789",
+                "ttl": values[":retentionTtl"],
+            }
+        }
+
+    table.update_item.side_effect = applied
+    result = repository(table).transition(
+        action_id="action_12345678",
+        user_id="founder-1",
+        expected_state=models.ActionState.UNCERTAIN,
+        target_state=models.ActionState.CONFIRMED,
+        expected_revision=9,
+        transition_id="op_confirm_123456789",
+        updates=valid_confirmation(),
+    )
+
+    expected = int((NOW + timedelta(days=90)).timestamp())
+    call = table.update_item.call_args.kwargs
+    assert call["ExpressionAttributeValues"][":retentionTtl"] == expected
+    assert "#retentionTtl=:retentionTtl" in call["UpdateExpression"]
+    assert "#ttl>:transitionEpoch" in call["ConditionExpression"]
+    assert result["ttl"] == expected
+
+
+def test_dispatch_confirmation_is_also_atomically_fenced_by_live_retention():
+    table = MagicMock()
+
+    def applied(**kwargs):
+        values = kwargs["ExpressionAttributeValues"]
+        return {
+            "Attributes": {
+                **prepared_record(),
+                **valid_confirmation(),
+                "state": "CONFIRMED",
+                "revision": 9,
+                "lastTransitionId": "op_confirm_123456789",
+                "ttl": values[":retentionTtl"],
+            }
+        }
+
+    table.update_item.side_effect = applied
+    repository(table).transition(
+        action_id="action_12345678",
+        user_id="founder-1",
+        expected_state=models.ActionState.DISPATCHING,
+        target_state=models.ActionState.CONFIRMED,
+        expected_revision=8,
+        transition_id="op_confirm_123456789",
+        updates=valid_confirmation(),
+    )
+
+    call = table.update_item.call_args.kwargs
+    assert "#ttl>:transitionEpoch" in call["ConditionExpression"]
+    assert call["ExpressionAttributeValues"][":transitionEpoch"] == int(
+        NOW.timestamp()
+    )
+
+
+def test_uncertain_effect_quarantine_gains_exact_ninety_day_ttl():
+    table = MagicMock()
+
+    def applied(**kwargs):
+        values = kwargs["ExpressionAttributeValues"]
+        return {
+            "Attributes": {
+                **prepared_record(),
+                "state": "UNCERTAIN",
+                "revision": 9,
+                "lastTransitionId": "op_uncertain_123456789",
+                "uncertainAt": NOW.isoformat(),
+                "uncertaintyReason": "provider-outcome-unproven",
+                "uncertainDraftRevision": 4,
+                "ttl": values[":retentionTtl"],
+            }
+        }
+
+    table.update_item.side_effect = applied
+    result = repository(table).transition(
+        action_id="action_12345678",
+        user_id="founder-1",
+        expected_state=models.ActionState.DISPATCHING,
+        target_state=models.ActionState.UNCERTAIN,
+        expected_revision=8,
+        transition_id="op_uncertain_123456789",
+        updates={
+            "uncertainAt": NOW.isoformat(),
+            "uncertaintyReason": "provider-outcome-unproven",
+            "uncertainDraftRevision": 4,
+        },
+    )
+
+    expected = int((NOW + timedelta(days=90)).timestamp())
+    call = table.update_item.call_args.kwargs
+    assert call["ExpressionAttributeValues"][":retentionTtl"] == expected
+    assert result["ttl"] == expected
 
 
 def test_get_is_strongly_consistent_and_rejects_cross_binding_corruption():

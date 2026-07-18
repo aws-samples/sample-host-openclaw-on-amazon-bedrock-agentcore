@@ -15,6 +15,7 @@ from typing import Any
 REQUIRED_REGION = "eu-west-1"
 REQUIRED_MOUNT = "/mnt/workspace"
 RUNTIME_ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$")
+RELEASE_ENDPOINT_PATTERN = re.compile(r"^release_[0-9a-f]{40}$")
 VERSION_PATTERN = re.compile(r"^[1-9][0-9]{0,4}$")
 RUNTIME_ARN_PATTERN = re.compile(
     r"^arn:aws:bedrock-agentcore:eu-west-1:[0-9]{12}:"
@@ -48,6 +49,7 @@ def _require_client_region(client: Any, label: str) -> None:
 def _validate_inputs(
     *,
     runtime_id: str,
+    expected_endpoint_id: str,
     endpoint_name: str,
     expected_runtime_arn: str,
     expected_role_arn: str,
@@ -56,8 +58,10 @@ def _validate_inputs(
 ) -> None:
     if not RUNTIME_ID_PATTERN.fullmatch(runtime_id or ""):
         _fail("runtime ID is missing or noncanonical")
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", endpoint_name or ""):
-        _fail("endpoint name is missing or noncanonical")
+    if not RUNTIME_ID_PATTERN.fullmatch(expected_endpoint_id or ""):
+        _fail("endpoint ID is missing or noncanonical")
+    if not RELEASE_ENDPOINT_PATTERN.fullmatch(endpoint_name or ""):
+        _fail("endpoint name is not an exact release endpoint")
     if not RUNTIME_ARN_PATTERN.fullmatch(expected_runtime_arn or ""):
         _fail("expected runtime ARN is missing, noncanonical, or outside eu-west-1")
     if not ROLE_ARN_PATTERN.fullmatch(expected_role_arn or ""):
@@ -103,10 +107,13 @@ def _validate_runtime(
 def _validate_endpoint(
     response: dict[str, Any],
     *,
+    expected_endpoint_id: str,
     endpoint_name: str,
     expected_runtime_arn: str,
     expected_version: str,
 ) -> None:
+    if response.get("id") != expected_endpoint_id:
+        _fail("AgentCore endpoint ID differs from the expected endpoint")
     if response.get("name") != endpoint_name:
         _fail("AgentCore endpoint name differs from the requested endpoint")
     live = response.get("liveVersion")
@@ -175,6 +182,7 @@ def verify_agentcore_storage(
     control_client: Any,
     s3_client: Any,
     runtime_id: str,
+    expected_endpoint_id: str,
     endpoint_name: str,
     expected_runtime_arn: str,
     expected_role_arn: str,
@@ -193,17 +201,24 @@ def verify_agentcore_storage(
     _require_client_region(s3_client, "S3")
     _validate_inputs(
         runtime_id=runtime_id,
+        expected_endpoint_id=expected_endpoint_id,
         endpoint_name=endpoint_name,
         expected_runtime_arn=expected_runtime_arn,
         expected_role_arn=expected_role_arn,
         bucket=bucket,
         expected_kms_key_arn=expected_kms_key_arn,
     )
+    expected_runtime_match = RUNTIME_ARN_PATTERN.fullmatch(expected_runtime_arn)
+    assert expected_runtime_match is not None
+    expected_version = expected_runtime_match.group(1)
 
     deadline = monotonic() + timeout_seconds
     while True:
-        latest = control_client.get_agent_runtime(agentRuntimeId=runtime_id)
-        runtime_status = latest.get("status")
+        exact = control_client.get_agent_runtime(
+            agentRuntimeId=runtime_id,
+            agentRuntimeVersion=expected_version,
+        )
+        runtime_status = exact.get("status")
         if runtime_status not in KNOWN_RUNTIME_STATES:
             _fail(f"AgentCore returned unknown runtime status {runtime_status!r}")
         if runtime_status in TERMINAL_RUNTIME_FAILURES:
@@ -220,28 +235,19 @@ def verify_agentcore_storage(
             _fail(f"AgentCore endpoint entered failed terminal status {endpoint_status}")
 
         if runtime_status == "READY" and endpoint_status == "READY":
-            latest_version = _validate_runtime(
-                latest,
-                runtime_id=runtime_id,
-                expected_runtime_arn=expected_runtime_arn,
-                expected_role_arn=expected_role_arn,
-            )
-            _validate_endpoint(
-                endpoint,
-                endpoint_name=endpoint_name,
-                expected_runtime_arn=expected_runtime_arn,
-                expected_version=latest_version,
-            )
-            exact = control_client.get_agent_runtime(
-                agentRuntimeId=runtime_id,
-                agentRuntimeVersion=latest_version,
-            )
-            _validate_runtime(
+            exact_version = _validate_runtime(
                 exact,
                 runtime_id=runtime_id,
                 expected_runtime_arn=expected_runtime_arn,
                 expected_role_arn=expected_role_arn,
-                expected_version=latest_version,
+                expected_version=expected_version,
+            )
+            _validate_endpoint(
+                endpoint,
+                expected_endpoint_id=expected_endpoint_id,
+                endpoint_name=endpoint_name,
+                expected_runtime_arn=expected_runtime_arn,
+                expected_version=exact_version,
             )
             _verify_bucket(
                 s3_client,
@@ -250,12 +256,13 @@ def verify_agentcore_storage(
             )
             return {
                 "bucket": bucket,
+                "endpointId": expected_endpoint_id,
                 "endpointName": endpoint_name,
                 "mountPath": REQUIRED_MOUNT,
                 "region": REQUIRED_REGION,
                 "runtimeArn": expected_runtime_arn,
                 "runtimeId": runtime_id,
-                "runtimeVersion": latest_version,
+                "runtimeVersion": exact_version,
             }
 
         if monotonic() >= deadline:
@@ -266,6 +273,7 @@ def verify_agentcore_storage(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-id", required=True)
+    parser.add_argument("--endpoint-id", required=True)
     parser.add_argument("--endpoint-name", required=True)
     parser.add_argument("--runtime-arn", required=True)
     parser.add_argument("--execution-role-arn", required=True)
@@ -287,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
             control_client=control,
             s3_client=s3,
             runtime_id=args.runtime_id,
+            expected_endpoint_id=args.endpoint_id,
             endpoint_name=args.endpoint_name,
             expected_runtime_arn=args.runtime_arn,
             expected_role_arn=args.execution_role_arn,

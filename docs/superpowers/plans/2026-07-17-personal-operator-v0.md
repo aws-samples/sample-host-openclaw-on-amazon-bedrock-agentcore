@@ -89,12 +89,12 @@
 - Produces: `RuntimeDriver.ensure(user_id)`, `invoke(user_id, request, trace_id)`, `status(user_id)`, `snapshot(user_id)`, `stop(user_id)`, and `purge(user_id)`.
 - Produces runtime states `COLD|STARTING|READY|BUSY|IDLE|UNHEALTHY|QUARANTINED|DELETING`.
 
-- [ ] Write failing tests for server-generated session mapping, conditional per-user leases, stale lease takeover, no client-provided session IDs, post-turn snapshot signalling, and tombstoned-user refusal.
-- [ ] Implement the runtime state repository and AgentCore adapter behind the interface without changing Telegram behavior.
-- [ ] Make successful state-changing turns request an S3 flush while retaining periodic and shutdown saves.
-- [ ] Add DynamoDB lease/session records and least-privilege router permissions.
-- [ ] Run unit tests plus existing workspace/identity tests and CDK synthesis contract tests.
-- [ ] Commit as `feat(runtime): add durable user runtime driver`.
+- [x] Write failing tests for server-generated session mapping, conditional per-user leases, stale lease takeover, no client-provided session IDs, post-turn snapshot signalling, and tombstoned-user refusal.
+- [x] Implement the runtime state repository and AgentCore adapter behind the interface without changing Telegram behavior.
+- [x] Make successful state-changing turns request an S3 flush while retaining periodic and shutdown saves.
+- [x] Add DynamoDB lease/session records and least-privilege router permissions.
+- [x] Run unit tests plus existing workspace/identity tests and CDK synthesis contract tests.
+- [x] Commit as `feat(runtime): add durable user runtime driver`.
 
 ### Task 4: Ordered Telegram product router and commands
 
@@ -112,12 +112,12 @@
 - Produces deterministic commands `/start`, `/connect`, `/scan`, `/tasks`, `/workspace`, `/status`, and `/delete`.
 - Produces FIFO messages `{userId, channel, updateId, traceId, kind, payload}` with `MessageGroupId=userId`.
 
-- [ ] Write failing tests for webhook-secret rejection, update deduplication, immediate acknowledgement, command routing, per-user ordering, worker retry/dead-letter behavior, and free-form runtime routing.
-- [ ] Replace recursive Lambda self-invocation with SQS FIFO enqueue and a separate worker Lambda.
-- [ ] Keep Telegram formatting/delivery in the trusted worker and prohibit bot-token propagation to runtime payloads.
-- [ ] Add queue, DLQ, IAM, alarms, explicit routes, throttling, and environment wiring in CDK.
-- [ ] Run router/worker unit tests, one hundred replayed duplicate updates, and CDK contract tests.
-- [ ] Commit as `feat(telegram): add ordered consumer command router`.
+- [x] Write failing tests for webhook-secret rejection, update deduplication, immediate acknowledgement, command routing, per-user ordering, worker retry/dead-letter behavior, and free-form runtime routing.
+- [x] Replace recursive Lambda self-invocation with SQS FIFO enqueue and a separate worker Lambda.
+- [x] Keep Telegram formatting/delivery in the trusted worker and prohibit bot-token propagation to runtime payloads.
+- [x] Add queue, DLQ, IAM, alarms, explicit routes, throttling, and environment wiring in CDK.
+- [x] Run router/worker unit tests, one hundred replayed duplicate updates, and CDK contract tests.
+- [x] Commit as `feat(telegram): add ordered consumer command router`.
 
 ### Task 5: Read-only Gmail opportunity and draft workflow
 
@@ -136,14 +136,14 @@
 - Produces `Opportunity{id,userId,source,waitingSince,title,reason,confidence}` and `DraftRevision{actionId,revision,to,subject,body,payloadHash}`.
 - Consumes only Google read-only OAuth tokens for pilot accounts.
 
-- [ ] Write failing scanner tests covering the 3–30 day range, 50-thread cap, latest-human-outbound/no-reply rule, bulk/no-reply exclusion, transient raw bodies, and source deep links.
-- [ ] Write failing ranker tests for at-most-three results, OpenAI structured output, `store:false`, source-ID membership validation, and safe failure on malformed or invented IDs.
-- [ ] Implement OAuth PKCE/state binding and KMS envelope encryption behind provider-connection interfaces.
-- [ ] Implement scanner and ranker with dependency-injected Gmail/OpenAI clients and log redaction.
-- [ ] Persist only derived source excerpts, opportunities, and draft revisions with 14-day TTL.
-- [ ] Render full Telegram cards with `Edit`, `Prepare`, `Skip`, and `Why`; pilots cannot reach a send transition.
-- [ ] Run synthetic fixture, prompt-injection, logging, and scope-split tests.
-- [ ] Commit as `feat(gmail): add source-backed read-only follow-ups`.
+- [x] Write failing scanner tests covering the 3–30 day range, 50-thread cap, latest-human-outbound/no-reply rule, bulk/no-reply exclusion, transient raw bodies, and source deep links.
+- [x] Write failing ranker tests for at-most-three results, OpenAI structured output, `store:false`, source-ID membership validation, and safe failure on malformed or invented IDs.
+- [x] Implement OAuth PKCE/state binding and KMS envelope encryption behind provider-connection interfaces.
+- [x] Implement scanner and ranker with dependency-injected Gmail/OpenAI clients and log redaction.
+- [x] Persist only derived source excerpts, opportunities, and draft revisions with 14-day TTL.
+- [x] Render full Telegram cards with `Edit`, `Prepare`, `Skip`, and `Why`; pilots cannot reach a send transition.
+- [x] Run synthetic fixture, prompt-injection, logging, and scope-split tests.
+- [x] Commit as `feat(gmail): add source-backed read-only follow-ups`.
 
 ### Task 6: Capability gateway, exact approval, and effect receipts
 
@@ -162,13 +162,13 @@
 - Produces `CapabilityGrant` bound to `userId`, capability, resource, `argsHash`, expiry, and approval ID.
 - Produces `EffectReceipt{providerMessageId,providerThreadId,payloadHash,executedAt}`.
 
-- [ ] Write failing tests for every legal/illegal state transition, canonical payload hashing, approval expiry/replay/tamper/wrong-user protection, founder-only scope, deterministic Message-ID, and idempotent dispatch.
-- [ ] Implement exact-payload approval and conditional DynamoDB transitions.
-- [ ] Implement plain-text, allowlisted founder Gmail sending with no CC/BCC/attachments.
-- [ ] On provider timeout, persist `UNCERTAIN`; reconcile by deterministic Message-ID/provider history before any retry.
-- [ ] Emit a receipt and waiting-for-reply tracker only after confirmed provider evidence.
-- [ ] Run ten synthetic fault-injection sequences around the provider call and concurrent approval replay tests.
-- [ ] Commit as `feat(actions): add approval-gated gmail receipts`.
+- [x] Write failing tests for every legal/illegal state transition, canonical payload hashing, approval expiry/replay/tamper/wrong-user protection, founder-only scope, deterministic Message-ID, and idempotent dispatch.
+- [x] Implement exact-payload approval and conditional DynamoDB transitions.
+- [x] Implement plain-text, allowlisted founder Gmail sending with no CC/BCC/attachments.
+- [x] On provider timeout, persist `UNCERTAIN`; reconcile by deterministic Message-ID/provider history before any retry.
+- [x] Emit a receipt and waiting-for-reply tracker only after confirmed provider evidence.
+- [x] Run ten synthetic fault-injection sequences around the provider call and concurrent approval replay tests.
+- [x] Commit as `feat(actions): add approval-gated gmail receipts`.
 
 ### Task 7: Consumer web surface, export, retention, and deletion
 
@@ -185,13 +185,13 @@
 **Interfaces:**
 - Produces `/oauth/google/start`, `/oauth/google/callback`, `/approve/:token`, `/api/actions/:id/approve`, `/api/actions/:id/reject`, `/api/workspace`, `/api/export`, and `/api/delete`.
 
-- [ ] Write failing tests for signed Telegram connect tickets, OAuth PKCE/state/nonce, opaque secure sessions, CSRF, approval GET-without-effect, matching-user POST, and one-time tokens.
-- [ ] Build minimal React/Vite connect, approval, workspace, export, and delete pages with accessible loading/error states.
-- [ ] Add CloudFront/S3 hosting and explicit API routes; do not expose the OpenClaw gateway.
-- [ ] Implement TTL policy, token revocation, schedule cleanup, workspace purge, deletion tombstones, and stale-snapshot restore refusal.
-- [ ] Implement JSON/ZIP export for user-authored files, memory, schedules, and receipts.
-- [ ] Run auth, deletion, tombstone, retention, accessibility, and production build tests.
-- [ ] Commit as `feat(web): add trusted consumer control surface`.
+- [x] Write failing tests for signed Telegram connect tickets, OAuth PKCE/state/nonce, opaque secure sessions, CSRF, approval GET-without-effect, matching-user POST, and one-time tokens.
+- [x] Build minimal React/Vite connect, approval, workspace, export, and delete pages with accessible loading/error states.
+- [x] Add CloudFront/S3 hosting and explicit API routes; do not expose the OpenClaw gateway.
+- [x] Implement TTL policy, token revocation, schedule cleanup, workspace purge, deletion tombstones, and stale-snapshot restore refusal.
+- [x] Implement JSON/ZIP export for user-authored files, memory, schedules, and receipts.
+- [x] Run auth, deletion, tombstone, retention, accessibility, and production build tests.
+- [x] Commit as `feat(web): add trusted consumer control surface`.
 
 ### Task 8: Integrated security, fault, and release verification
 
@@ -207,10 +207,10 @@
 **Interfaces:**
 - Produces a release evidence ledger and deterministic staging preflight; it does not deploy or send email by itself.
 
-- [ ] Add cross-tenant Cartesian canary tests, 100x webhook replay/concurrency, provider fault injection, prompt-injection fixtures, credential-absence checks, retention/deletion tests, and a complete synthetic founder journey.
-- [ ] Add static checks for no public gateway, no runtime provider secrets, user-prefix-only STS access, immutable image pin metadata, and forbidden capabilities.
-- [ ] Generate an SBOM and dependency/license inventory without committing secrets or local environment data.
-- [ ] Run the complete local suite, Python compilation, Node syntax/tests, web production build, CDK synth/contract checks, secret scan, and repository diff review.
-- [ ] Document exact pass/fail evidence and any external blockers such as missing AWS, Telegram, Google, or OpenAI credentials.
-- [ ] Prepare but do not execute the `eu-west-1` staging deployment preflight or any real Gmail send.
-- [ ] Commit as `test(release): verify personal operator v0`.
+- [x] Add cross-tenant Cartesian canary tests, 100x webhook replay/concurrency, provider fault injection, prompt-injection fixtures, credential-absence checks, retention/deletion tests, and a complete synthetic founder journey.
+- [x] Add static checks for no public gateway, no runtime provider secrets, user-prefix-only STS access, immutable image pin metadata, and forbidden capabilities.
+- [x] Generate an SBOM and dependency/license inventory without committing secrets or local environment data.
+- [x] Run the complete local suite, Python compilation, Node syntax/tests, web production build, CDK synth/contract checks, secret scan, and repository diff review.
+- [x] Document exact pass/fail evidence and any external blockers such as missing AWS, Telegram, Google, or OpenAI credentials.
+- [x] Prepare but do not execute the `eu-west-1` staging deployment preflight or any real Gmail send.
+- [x] Commit as `test(release): verify personal operator v0`.

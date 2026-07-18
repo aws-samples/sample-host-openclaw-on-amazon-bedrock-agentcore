@@ -155,6 +155,7 @@ def prepared_action(action_id="action_12345678", revision=4):
         "resource": "google:gmail:connection:google_conn_1234:account:founder@example.com",
         "args": args,
         "payloadHash": models.canonical_args_hash(args),
+        "ttl": int((NOW + timedelta(days=14)).timestamp()),
     }
 
 
@@ -237,6 +238,68 @@ def test_request_approval_generates_and_reserves_approval_id_inside_trusted_serv
             args=record["args"],
             expires_at=NOW + timedelta(minutes=5),
             approval_id="caller_chosen_1234",
+        )
+
+
+def test_logically_expired_action_cannot_create_or_consume_effect_authority():
+    prepared = prepared_action()
+    prepared["ttl"] = int(NOW.timestamp())
+    service, repo = approval_service(prepared)
+
+    with pytest.raises(models.CapabilityDenied, match="retention expired"):
+        request_approval(service, prepared)
+    assert repo.calls == []
+
+    pending = prepared_action()
+    clock = [NOW]
+    pending["ttl"] = int((NOW + timedelta(seconds=1)).timestamp())
+    service, repo = approval_service(pending, now=lambda: clock[0])
+    token = request_approval(service, pending)
+    clock[0] = NOW + timedelta(seconds=1)
+
+    with pytest.raises(models.CapabilityDenied, match="retention expired"):
+        service.approve(
+            action_id=pending["actionId"],
+            revision=2,
+            acting_user_id=pending["userId"],
+            token=token,
+            args=pending["args"],
+        )
+    assert repo.record["state"] == "APPROVAL_PENDING"
+
+
+def test_pending_approval_token_is_recovered_from_the_durable_exact_grant():
+    record = prepared_action()
+    service, repo = approval_service(record)
+
+    original = request_approval(service, record)
+    recovered = service.pending_token(
+        action_id=record["actionId"],
+        acting_user_id=record["userId"],
+    )
+
+    assert recovered == original
+    assert service.decode(recovered).approval_id == repo.record["approvalId"]
+    assert len(repo.calls) == 1
+
+
+def test_pending_approval_token_recovery_rejects_expired_or_nonfounder_authority():
+    record = prepared_action()
+    clock = [NOW]
+    service, _ = approval_service(record, now=lambda: clock[0])
+    request_approval(service, record, expires_at=NOW + timedelta(minutes=5))
+
+    with pytest.raises(models.CapabilityDenied):
+        service.pending_token(
+            action_id=record["actionId"],
+            acting_user_id="other-user",
+        )
+
+    clock[0] = NOW + timedelta(minutes=5)
+    with pytest.raises(models.CapabilityDenied):
+        service.pending_token(
+            action_id=record["actionId"],
+            acting_user_id=record["userId"],
         )
 
 

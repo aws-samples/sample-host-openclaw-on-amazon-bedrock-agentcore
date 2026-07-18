@@ -22,11 +22,14 @@ scanner_module = _load("gmail_scanner_providers", "scanner.py")
 
 
 class Request:
-    def __init__(self, result=None, error=None):
+    def __init__(self, result=None, error=None, calls=None):
         self._result = result
         self._error = error
+        self._calls = calls
 
-    def execute(self):
+    def execute(self, **kwargs):
+        if self._calls is not None:
+            self._calls.append(kwargs)
         if self._error is not None:
             raise self._error
         return self._result
@@ -35,14 +38,21 @@ class Request:
 class ThreadsResource:
     def __init__(self):
         self.calls = []
+        self.execute_calls = []
 
     def list(self, **kwargs):
         self.calls.append(("list", kwargs))
-        return Request({"threads": [{"id": "thread-1"}]})
+        return Request(
+            {"threads": [{"id": "thread-1"}]},
+            calls=self.execute_calls,
+        )
 
     def get(self, **kwargs):
         self.calls.append(("get", kwargs))
-        return Request({"id": kwargs["id"], "messages": []})
+        return Request(
+            {"id": kwargs["id"], "messages": []},
+            calls=self.execute_calls,
+        )
 
 
 class UsersResource:
@@ -81,6 +91,10 @@ def test_google_api_adapter_exposes_only_read_thread_operations():
             "get",
             {"userId": "me", "id": "thread-1", "format": "full"},
         ),
+    ]
+    assert threads.execute_calls == [
+        {"num_retries": 0},
+        {"num_retries": 0},
     ]
     assert not hasattr(adapter, "send")
     assert not hasattr(adapter, "create_draft")

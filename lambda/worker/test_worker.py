@@ -34,12 +34,17 @@ class FakeRuntimeDriver:
 
 
 class FakeCommandHandler:
-    def __init__(self):
+    def __init__(self, response=None):
         self.calls = []
+        self.response = response
 
     def handle(self, **kwargs):
         self.calls.append(kwargs)
-        return f"handled {kwargs['command'].name}"
+        return self.response or f"handled {kwargs['command'].name}"
+
+    def handle_callback(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.response or "callback handled"
 
 
 class FakeDelivery:
@@ -123,12 +128,50 @@ class FakeLedger:
             record.state = "DELIVERY_UNCERTAIN"
 
 
-def dependencies(*, runtime=None, commands=None, delivery=None, ledger=None):
+class ActiveDeletionFence:
+    def __init__(self, *, deleted=False, error=None):
+        self.deleted = deleted
+        self.error = error
+        self.calls = []
+
+    def is_account_deleted(self, user_id):
+        self.calls.append(user_id)
+        if self.error:
+            raise self.error
+        return self.deleted
+
+
+class ActiveControlDeletionFence:
+    def __init__(self, *, blocked=False, error=None):
+        self.blocked = blocked
+        self.error = error
+        self.calls = []
+
+    def deletion_blocked(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        return self.blocked
+
+
+def dependencies(
+    *,
+    runtime=None,
+    commands=None,
+    delivery=None,
+    ledger=None,
+    deletion_fence=None,
+    control_deletion_fence=None,
+):
     return worker.WorkerDependencies(
         runtime_driver=runtime or FakeRuntimeDriver(),
         command_handler=commands or FakeCommandHandler(),
         telegram_delivery=delivery or FakeDelivery(),
         ledger=ledger or FakeLedger(),
+        deletion_fence=deletion_fence or ActiveDeletionFence(),
+        control_deletion_fence=(
+            control_deletion_fence or ActiveControlDeletionFence()
+        ),
     )
 
 
@@ -141,7 +184,7 @@ def make_envelope(
 ):
     if payload is None:
         payload = {
-            "chatId": "9001",
+            "chatId": "42",
             "actorId": "telegram:42",
             "message": "hello",
         }
@@ -174,7 +217,7 @@ def test_free_form_input_invokes_runtime_with_minimal_secret_free_request():
     delivery = FakeDelivery()
     deps = dependencies(runtime=runtime, delivery=delivery)
     item = make_envelope(payload={
-        "chatId": "9001",
+        "chatId": "42",
         "actorId": "telegram:42",
         "message": {"text": "hello", "images": [{"s3Key": "user_a1/_uploads/x.png", "contentType": "image/png"}]},
     })
@@ -190,7 +233,7 @@ def test_free_form_input_invokes_runtime_with_minimal_secret_free_request():
     assert "token" not in serialized
     assert "credential" not in serialized
     assert "chatid" not in serialized
-    assert delivery.calls[0]["chat_id"] == "9001"
+    assert delivery.calls[0]["chat_id"] == "42"
     assert delivery.calls[0]["html"] == "<b>Done</b> &lt;safely&gt;"
 
 
@@ -204,7 +247,7 @@ def test_every_product_command_routes_locally_and_never_reaches_runtime():
         item = make_envelope(
             update_id=str(index + 1),
             kind="command",
-            payload={"chatId": "9001", "actorId": "telegram:42", "command": name},
+            payload={"chatId": "42", "actorId": "telegram:42", "command": name},
         )
         worker.process_envelope(item, deps)
 
@@ -213,6 +256,159 @@ def test_every_product_command_routes_locally_and_never_reaches_runtime():
         "/start", "/connect", "/scan", "/tasks", "/workspace", "/status", "/delete"
     ]
     assert len(delivery.calls) == 7
+
+
+def test_scan_card_result_reaches_one_validated_inline_keyboard_delivery():
+    result = worker.TelegramCommandResult(
+        text="**Reply to Ada**\nWaiting seven days.",
+        inline_keyboard=((
+            ("Edit", "poc1:edit:AAAAAAAAAAAAAAAAAAAAAA"),
+            ("Prepare", "poc1:prepare:BBBBBBBBBBBBBBBBBBBBBB"),
+            ("Skip", "poc1:skip:CCCCCCCCCCCCCCCCCCCCCC"),
+            ("Why", "poc1:why:DDDDDDDDDDDDDDDDDDDDDD"),
+        ),),
+    )
+    commands = FakeCommandHandler(response=result)
+    delivery = FakeDelivery()
+
+    worker.process_envelope(
+        make_envelope(
+            kind="command",
+            payload={"chatId": "42", "actorId": "telegram:42", "command": "/scan"},
+        ),
+        dependencies(commands=commands, delivery=delivery),
+    )
+
+    assert commands.calls[0]["chat_id"] == "42"
+    assert commands.calls[0]["actor_id"] == "telegram:42"
+    assert delivery.calls[0]["html"].startswith("<b>Reply to Ada</b>")
+    assert delivery.calls[0]["reply_markup"] == result.reply_markup()
+
+
+def test_callback_routes_to_control_and_new_update_replay_cannot_repeat_effect():
+    commands = FakeCommandHandler()
+    ledger = FakeLedger()
+    delivery = FakeDelivery()
+    item = make_envelope(
+        update_id="201",
+        kind="callback",
+        payload={
+            "chatId": "42",
+            "actorId": "telegram:42",
+            "callbackData": "poc1:prepare:BBBBBBBBBBBBBBBBBBBBBB",
+        },
+    )
+    deps = dependencies(commands=commands, ledger=ledger, delivery=delivery)
+
+    worker.process_envelope(item, deps)
+    worker.process_envelope(item, deps)
+
+    assert len(commands.calls) == 1
+    assert commands.calls[0]["callback_data"] == (
+        "poc1:prepare:BBBBBBBBBBBBBBBBBBBBBB"
+    )
+    assert commands.calls[0]["chat_id"] == "42"
+    assert len(delivery.calls) == 1
+
+
+def test_durable_account_tombstone_is_checked_before_ledger_claim():
+    fence = ActiveDeletionFence(deleted=True)
+    ledger = FakeLedger()
+    delivery = FakeDelivery()
+
+    worker.process_envelope(
+        make_envelope(),
+        dependencies(deletion_fence=fence, ledger=ledger, delivery=delivery),
+    )
+
+    assert fence.calls == ["user_a1"]
+    assert ledger.records == {}
+    assert delivery.calls == []
+
+
+def test_first_control_deletion_intent_blocks_before_runtime_or_ledger_tombstone():
+    fence = ActiveControlDeletionFence(blocked=True)
+    runtime_fence = ActiveDeletionFence()
+    ledger = FakeLedger()
+    runtime = FakeRuntimeDriver()
+
+    worker.process_envelope(
+        make_envelope(),
+        dependencies(
+            control_deletion_fence=fence,
+            deletion_fence=runtime_fence,
+            ledger=ledger,
+            runtime=runtime,
+        ),
+    )
+
+    assert fence.calls[0] == {
+        "user_id": "user_a1",
+        "channel": "telegram",
+        "trace_id": derive_event_trace("telegram", "user_a1", "100"),
+        "idempotency_key": derive_event_trace("telegram", "user_a1", "100"),
+    }
+    assert runtime_fence.calls == []
+    assert ledger.records == {}
+    assert runtime.calls == []
+
+
+def test_deletion_is_rechecked_after_delivery_claim_immediately_before_telegram():
+    class FenceAppearsBeforeDelivery(ActiveControlDeletionFence):
+        def deletion_blocked(self, **kwargs):
+            self.calls.append(kwargs)
+            return len(self.calls) == 2
+
+    fence = FenceAppearsBeforeDelivery()
+    runtime = FakeRuntimeDriver()
+    delivery = FakeDelivery()
+    ledger = FakeLedger()
+    item = make_envelope()
+
+    worker.process_envelope(
+        item,
+        dependencies(
+            control_deletion_fence=fence,
+            runtime=runtime,
+            delivery=delivery,
+            ledger=ledger,
+        ),
+    )
+
+    assert len(fence.calls) == 2
+    assert len(runtime.calls) == 1
+    assert delivery.calls == []
+    assert ledger.records[item.message_deduplication_id].state == (
+        "DELIVERY_UNCERTAIN"
+    )
+
+
+def test_control_deletion_fence_ambiguity_retries_before_ledger_claim():
+    fence = ActiveControlDeletionFence(error=TimeoutError("unknown"))
+    ledger = FakeLedger()
+    item = make_envelope()
+
+    result = worker.process_sqs_event(
+        {"Records": [sqs_record(item)]},
+        dependencies(control_deletion_fence=fence, ledger=ledger),
+    )
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "sqs-100"}]}
+    assert ledger.records == {}
+
+
+def test_deletion_fence_lookup_failure_retries_without_creating_ledger_state():
+    fence = ActiveDeletionFence(error=TimeoutError("unknown"))
+    ledger = FakeLedger()
+    item = make_envelope()
+
+    result = worker.process_sqs_event(
+        {"Records": [sqs_record(item)]},
+        dependencies(deletion_fence=fence, ledger=ledger),
+    )
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "sqs-100"}]}
+    assert ledger.records == {}
 
 
 def test_successful_duplicate_replay_does_not_repeat_runtime_or_delivery():
@@ -299,9 +495,9 @@ def test_fifo_batch_returns_partial_failures_and_stops_after_first_failure():
 
     runtime = SelectiveRuntime()
     deps = dependencies(runtime=runtime)
-    first = make_envelope(update_id="1", payload={"chatId": "1", "actorId": "telegram:42", "message": "ok"})
-    second = make_envelope(update_id="2", payload={"chatId": "1", "actorId": "telegram:42", "message": "fail"})
-    third = make_envelope(update_id="3", payload={"chatId": "1", "actorId": "telegram:42", "message": "must wait"})
+    first = make_envelope(update_id="1", payload={"chatId": "42", "actorId": "telegram:42", "message": "ok"})
+    second = make_envelope(update_id="2", payload={"chatId": "42", "actorId": "telegram:42", "message": "fail"})
+    third = make_envelope(update_id="3", payload={"chatId": "42", "actorId": "telegram:42", "message": "must wait"})
 
     result = worker.process_sqs_event(
         {"Records": [sqs_record(first), sqs_record(second), sqs_record(third)]},

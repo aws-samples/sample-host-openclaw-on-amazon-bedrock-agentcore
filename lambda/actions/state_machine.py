@@ -80,6 +80,23 @@ def assert_transition(current: ActionState, target: ActionState) -> ActionState:
     return target
 
 
+def assert_action_retention_live(
+    record: Mapping[str, object], *, now: datetime
+) -> Mapping[str, object]:
+    """Reject records DynamoDB TTL has not physically removed yet."""
+
+    if not isinstance(record, Mapping):
+        raise CapabilityDenied("action record is invalid")
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    ttl = record.get("ttl")
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+        raise CapabilityDenied("action retention boundary is invalid")
+    if int(now.astimezone(timezone.utc).timestamp()) >= ttl:
+        raise CapabilityDenied("action retention expired")
+    return record
+
+
 def _default_operation_id() -> str:
     return "op_" + secrets.token_urlsafe(24)
 
@@ -264,6 +281,7 @@ class ApprovalService:
             or record.get("revision") != revision
         ):
             raise ConcurrentActionUpdate("action state or revision was already consumed")
+        assert_action_retention_live(record, now=self._exact_time(self._now(), "now"))
         return record
 
     @staticmethod
@@ -359,6 +377,81 @@ class ApprovalService:
                 "approvalExpiresAt": grant.expires_at.isoformat(),
                 "approvalRequestedAt": now.isoformat(),
             },
+        )
+        return self._codec.encode(grant)
+
+    def pending_token(
+        self,
+        *,
+        action_id: str,
+        acting_user_id: str,
+    ) -> str:
+        """Rebuild the token for one already-reserved durable approval.
+
+        This path never creates an approval identity or changes action state.
+        It exists so a retried producer can recover after a lost response or a
+        conditional race without weakening the one-time transition fences.
+        """
+
+        self._founder(acting_user_id)
+        record = self._machine.get(
+            action_id=action_id,
+            user_id=acting_user_id,
+        )
+        if not isinstance(record, Mapping):
+            raise ConcurrentActionUpdate("pending approval does not exist")
+        revision = record.get("revision")
+        args = record.get("args")
+        if (
+            record.get("actionId") != action_id
+            or record.get("userId") != acting_user_id
+            or record.get("state") != ActionState.APPROVAL_PENDING.value
+            or isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+            or not isinstance(args, Mapping)
+        ):
+            raise ConcurrentActionUpdate("action is not an exact pending approval")
+        assert_action_retention_live(record, now=self._exact_time(self._now(), "now"))
+        args_hash, draft_revision, resource = self._assert_exact_action(
+            record,
+            action_id=action_id,
+            user_id=acting_user_id,
+            args=args,
+        )
+        expiry = self._exact_time(record.get("approvalExpiresAt"), "approvalExpiresAt")
+        now = self._exact_time(self._now(), "now")
+        try:
+            grant = CapabilityGrant(
+                action_id=action_id,
+                draft_revision=draft_revision,
+                user_id=acting_user_id,
+                capability="gmail.send",
+                resource=resource,
+                args_hash=args_hash,
+                expires_at=expiry,
+                approval_id=record.get("approvalId"),
+            )
+        except (TypeError, ValueError) as error:
+            raise CapabilityDenied("persisted pending approval is invalid") from error
+        if (
+            record.get("approvalActionId") != action_id
+            or record.get("approvalDraftRevision") != draft_revision
+            or not hmac.compare_digest(
+                str(record.get("approvalArgsHash", "")), args_hash
+            )
+        ):
+            raise CapabilityDenied(
+                "persisted pending approval does not match its action revision"
+            )
+        grant.assert_authorized(
+            action_id=action_id,
+            draft_revision=draft_revision,
+            user_id=acting_user_id,
+            capability="gmail.send",
+            resource=resource,
+            args=args,
+            now=now,
         )
         return self._codec.encode(grant)
 

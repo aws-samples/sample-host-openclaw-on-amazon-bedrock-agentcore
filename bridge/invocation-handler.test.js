@@ -15,6 +15,7 @@ function payload(action, overrides = {}) {
     namespace: "user_A",
     actorId: "telegram:111",
     channel: "telegram",
+    workspaceCapability: "signed.capability",
     ...overrides,
   };
 }
@@ -164,6 +165,10 @@ describe("trusted invocation admission", () => {
       actorId: "telegram:111",
       channel: "telegram",
     });
+    assert.deepEqual(observed.authority, {
+      workspaceCapability: "signed.capability",
+    });
+    assert.equal(Object.isFrozen(observed.authority), true);
     assert.deepEqual(observed.request, {
       message: {
         text: "original",
@@ -187,7 +192,23 @@ describe("trusted invocation admission", () => {
     assert.equal("sessionId" in observed.request, false);
     assert.equal("action" in observed.request, false);
     assert.equal("unexpected" in observed.request, false);
+    assert.equal("workspaceCapability" in observed.request, false);
     assert.equal("payload" in observed, false);
+  });
+
+  it("rejects a missing or malformed workspace capability before dispatch", () => {
+    for (const workspaceCapability of [undefined, "", "x".repeat(2049), "bad-💥"]) {
+      const trace = [];
+      const handler = createInvocationHandler({
+        sessionBinding: new SessionBinding(),
+        handlers: { chat: () => trace.push("dispatch") },
+      });
+      const candidate = payload("chat", { workspaceCapability });
+      if (workspaceCapability === undefined) delete candidate.workspaceCapability;
+
+      assert.throws(() => handler.handle(candidate), /workspace capability/i);
+      assert.deepEqual(trace, []);
+    }
   });
 
   it("does not treat legacy userId or delivery metadata as identity", () => {
@@ -422,7 +443,7 @@ describe("production contract admission boundary", () => {
       "await checkProxyHealth()",
       "lastActivityTime =",
       "trustedInvocationRegistry.invoke(",
-      "init(identity.internalUserId",
+      "init(\n",
     ]) {
       assert.ok(
         invocationSource.indexOf(mutation, parseIndex) > admissionIndex,

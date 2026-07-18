@@ -30,8 +30,12 @@ class Request:
     def __init__(self, result=None, error=None):
         self.result = result
         self.error = error
+        self.http = type("AuthorizedHttp", (), {})()
+        self.http.http = type("Http", (), {"timeout": None})()
+        self.execute_calls = []
 
-    def execute(self):
+    def execute(self, *, num_retries=None):
+        self.execute_calls.append({"num_retries": num_retries})
         if self.error:
             raise self.error
         return self.result
@@ -46,19 +50,26 @@ class Messages:
         self.list_calls = []
         self.get_calls = []
         self.profile_result = {"emailAddress": "founder@example.com"}
+        self.profile_error = None
         self.profile_calls = []
+        self.requests = []
+
+    def _request(self, result=None, error=None):
+        request = Request(result, error)
+        self.requests.append(request)
+        return request
 
     def send(self, **kwargs):
         self.send_calls.append(kwargs)
-        return Request(self.send_result)
+        return self._request(self.send_result)
 
     def list(self, **kwargs):
         self.list_calls.append(kwargs)
-        return Request(self.list_result)
+        return self._request(self.list_result)
 
     def get(self, **kwargs):
         self.get_calls.append(kwargs)
-        return Request(self.get_result)
+        return self._request(self.get_result)
 
 
 class Users:
@@ -70,7 +81,10 @@ class Users:
 
     def getProfile(self, **kwargs):
         self._messages.profile_calls.append(kwargs)
-        return Request(self._messages.profile_result)
+        return self._messages._request(
+            self._messages.profile_result,
+            self._messages.profile_error,
+        )
 
 
 class GmailService:
@@ -88,6 +102,37 @@ def adapter(messages):
         account_email="founder@example.com",
         user_id="me",
     )
+
+
+def test_every_google_request_is_no_retry_and_transport_timeout_bounded():
+    messages = Messages()
+    messages.profile_error = TimeoutError("provider stalled")
+    value = send_module.GmailApiAdapter(
+        GmailService(messages),
+        connection_id="google_conn_1234",
+        account_email="founder@example.com",
+        timeout_seconds=20,
+    )
+    message_id = "<po-aaaaaaaaaaaaaaaaaaaaaaaa@personal-operator.invalid>"
+
+    with pytest.raises(send_module.ProviderCallTimeout):
+        value.find_by_message_id(
+            message_id=message_id,
+            sender_address="founder@example.com",
+            recipient="person@example.net",
+            payload_hash="a" * 64,
+        )
+
+    assert len(messages.requests) == 1
+    assert messages.requests[0].http.http.timeout == 20
+    assert messages.requests[0].execute_calls == [{"num_retries": 0}]
+    with pytest.raises(ValueError, match="timeout"):
+        send_module.GmailApiAdapter(
+            GmailService(Messages()),
+            connection_id="google_conn_1234",
+            account_email="founder@example.com",
+            timeout_seconds=21,
+        )
 
 
 def raw_message(message_id, *, sender="founder@example.com", recipient="person@example.net", body="Hello"):
@@ -140,6 +185,12 @@ def test_send_returns_only_exact_sent_evidence_with_provider_execution_time():
     assert messages.get_calls == [{"userId": "me", "id": "gmail-1", "format": "raw"}]
     assert messages.profile_calls == [{"userId": "me"}]
     assert base64.urlsafe_b64decode(messages.send_calls[0]["body"]["raw"]) == raw
+    assert len(messages.requests) == 3
+    assert all(request.http.http.timeout == 5 for request in messages.requests)
+    assert all(
+        request.execute_calls == [{"num_retries": 0}]
+        for request in messages.requests
+    )
 
 
 @pytest.mark.parametrize(

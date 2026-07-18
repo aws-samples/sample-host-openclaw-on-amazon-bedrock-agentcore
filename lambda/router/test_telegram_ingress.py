@@ -45,9 +45,31 @@ def update(*, update_id=100, text="hello"):
         "update_id": update_id,
         "message": {
             "message_id": 55,
-            "chat": {"id": 9001},
+            "chat": {"id": 42, "type": "private"},
             "from": {"id": 42, "first_name": "Ada"},
             "text": text,
+        },
+    }
+
+
+def callback_update(
+    *,
+    update_id=101,
+    data="poc1:why:ABCDEFGHIJKLMNOPQRSTUV",
+    actor_id=42,
+    chat_id=42,
+    chat_type="private",
+):
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": "telegram-callback-query-1",
+            "from": {"id": actor_id, "first_name": "Ada"},
+            "message": {
+                "message_id": 55,
+                "chat": {"id": chat_id, "type": chat_type},
+            },
+            "data": data,
         },
     }
 
@@ -90,7 +112,7 @@ def test_valid_text_is_enqueued_once_before_immediate_success_ack():
     wire = json.loads(request["MessageBody"])
     assert wire["kind"] == "message"
     assert wire["payload"] == {
-        "chatId": "9001",
+        "chatId": "42",
         "actorId": "telegram:42",
         "message": "hello",
     }
@@ -110,6 +132,76 @@ def test_known_product_command_is_classified_locally_for_worker():
     wire = json.loads(queue.calls[0]["MessageBody"])
     assert wire["kind"] == "command"
     assert wire["payload"]["command"] == "/status"
+
+
+def test_authenticated_callback_is_tenant_bound_and_durably_enqueued():
+    resolver = Resolver()
+    queue = Queue()
+    ingress = router(resolver=resolver, queue=queue)
+
+    result = ingress.handle(
+        json.dumps(callback_update()),
+        {"x-telegram-bot-api-secret-token": SECRET},
+    )
+
+    assert result == {"statusCode": 200, "body": "ok"}
+    assert resolver.calls == [("telegram", "42", "Ada")]
+    wire = json.loads(queue.calls[0]["MessageBody"])
+    assert wire["kind"] == "callback"
+    assert wire["payload"] == {
+        "chatId": "42",
+        "actorId": "telegram:42",
+        "callbackData": "poc1:why:ABCDEFGHIJKLMNOPQRSTUV",
+    }
+    assert queue.calls[0]["MessageGroupId"] == "user_a1"
+    assert queue.calls[0]["MessageDeduplicationId"] == wire["traceId"]
+
+
+def test_callback_payload_cannot_smuggle_an_opportunity_or_effect_name():
+    queue = Queue()
+    ingress = router(queue=queue)
+
+    for data in (
+        "send:gmail:attacker-selected-message",
+        "poc1:send:ABCDEFGHIJKLMNOPQRSTUV",
+        "poc1:prepare:short",
+    ):
+        assert ingress.handle(
+            json.dumps(callback_update(data=data)),
+            {"x-telegram-bot-api-secret-token": SECRET},
+        ) == {"statusCode": 200, "body": "ok"}
+
+    assert queue.calls == []
+
+
+def test_group_channel_and_cross_actor_updates_never_resolve_or_enqueue():
+    resolver = Resolver()
+    queue = Queue()
+    ingress = router(resolver=resolver, queue=queue)
+    headers = {"x-telegram-bot-api-secret-token": SECRET}
+
+    hostile_updates = []
+    for chat_type, chat_id in (
+        ("group", -100),
+        ("supergroup", -101),
+        ("channel", -102),
+        ("private", 9001),
+    ):
+        message = update()
+        message["message"]["chat"] = {"id": chat_id, "type": chat_type}
+        hostile_updates.append(message)
+        hostile_updates.append(
+            callback_update(chat_id=chat_id, chat_type=chat_type)
+        )
+
+    for item in hostile_updates:
+        assert ingress.handle(json.dumps(item), headers) == {
+            "statusCode": 200,
+            "body": "ok",
+        }
+
+    assert resolver.calls == []
+    assert queue.calls == []
 
 
 def test_one_hundred_replays_keep_one_bound_fifo_identity():

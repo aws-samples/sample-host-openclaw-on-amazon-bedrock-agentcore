@@ -5,17 +5,23 @@ its tool surface as a frozen security contract, not an extensibility point.
 
 OpenClaw runs with the `minimal` profile and exactly these allowed tools:
 
-- `session_status`
-- `web_fetch`
 - `po_file_list`
 - `po_file_read`
 - `po_file_write`
 - `po_file_delete`
 
+The mutable upstream `session_status` built-in is explicitly denied because it
+can persist a model/provider override. The generated config exposes only the
+loopback `agentcore/bedrock-agentcore` model and has no fallback.
+
 The only enabled plugin is `personal-operator`, loaded from
 `/app/plugins/personal-operator`. Its four file tools derive the S3 prefix only
 from `PERSONAL_OPERATOR_WORKSPACE_PREFIX`; identity and namespace are never
 accepted as tool arguments.
+
+URL retrieval and search are deferred. Do not expose model-selected network
+egress in the same runtime as workspace reads. A future reader must derive
+exact targets from the current authenticated user request in trusted code.
 
 Do not add local command execution, process control, generic filesystem access,
 headless UI automation, scheduling, cross-session control, delegated workers,

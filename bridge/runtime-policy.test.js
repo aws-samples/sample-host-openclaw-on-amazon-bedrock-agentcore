@@ -13,16 +13,13 @@ try {
 }
 
 const APPROVED_TOOLS = [
-  "session_status",
-  "web_fetch",
   "po_file_list",
   "po_file_read",
   "po_file_write",
   "po_file_delete",
 ];
-const PROFILE_ADDITIONS = APPROVED_TOOLS.filter(
-  (tool) => tool !== "session_status",
-);
+const PROFILE_ADDITIONS = APPROVED_TOOLS;
+const APPROVED_MODEL = "agentcore/bedrock-agentcore";
 
 const FORBIDDEN_TOOL_FAMILIES = [
   "exec",
@@ -52,9 +49,14 @@ describe("frozen runtime policy", () => {
 
     assert.equal(policy.tools.profile, "minimal");
     assert.deepEqual(policy.tools.alsoAllow, PROFILE_ADDITIONS);
+    assert.deepEqual(policy.tools.deny, ["session_status"]);
     assert.deepEqual(policyModule.APPROVED_TOOLS, APPROVED_TOOLS);
     assert.deepEqual(policyModule.PROFILE_ADDITIONS, PROFILE_ADDITIONS);
-    assert.deepEqual(["session_status", ...policy.tools.alsoAllow], APPROVED_TOOLS);
+    const effectiveTools = ["session_status", ...policy.tools.alsoAllow].filter(
+      (tool) => !policy.tools.deny.includes(tool),
+    );
+    assert.deepEqual(effectiveTools, APPROVED_TOOLS);
+    assert.equal(effectiveTools.includes("session_status"), false);
     assert.equal(new Set(APPROVED_TOOLS).size, APPROVED_TOOLS.length);
   });
 
@@ -88,6 +90,18 @@ describe("frozen runtime policy", () => {
       );
     }
   });
+
+  it("exposes no model-callable network egress tool", () => {
+    const serialized = JSON.stringify(policyModule.buildOpenClawConfig({
+      gatewayToken: "a".repeat(43),
+    }));
+
+    assert.doesNotMatch(serialized, /web_fetch|web_search|browser|http_request/i);
+    assert.equal(
+      policyModule.APPROVED_TOOLS.some((tool) => /^web(?:_|\.)/.test(tool)),
+      false,
+    );
+  });
 });
 
 describe("generated OpenClaw configuration", () => {
@@ -100,6 +114,7 @@ describe("generated OpenClaw configuration", () => {
 
     assert.equal(config.tools.profile, "minimal");
     assert.deepEqual(config.tools.alsoAllow, PROFILE_ADDITIONS);
+    assert.deepEqual(config.tools.deny, ["session_status"]);
     assert.equal("allow" in config.tools, false);
     assert.deepEqual(config.plugins.allow, ["personal-operator"]);
     assert.deepEqual(config.plugins.load.paths, [
@@ -119,6 +134,33 @@ describe("generated OpenClaw configuration", () => {
     assert.doesNotMatch(serialized, /allowInsecureAuth/i);
     assert.doesNotMatch(serialized, /allowedOrigins/i);
     assert.doesNotMatch(serialized, /\/skills/);
+  });
+
+  it("freezes model visibility and selection to the loopback AgentCore route", () => {
+    const config = policyModule.buildOpenClawConfig({
+      gatewayToken: "a".repeat(43),
+      proxyPort: 18790,
+    });
+
+    assert.equal(config.models.mode, "replace");
+    assert.deepEqual(Object.keys(config.models.providers), ["agentcore"]);
+    assert.deepEqual(config.models.providers.agentcore.models, [
+      { id: "bedrock-agentcore", name: "Bedrock AgentCore" },
+    ]);
+    assert.equal(
+      config.models.providers.agentcore.baseUrl,
+      "http://127.0.0.1:18790/v1",
+    );
+    assert.deepEqual(config.agents.defaults.model, { primary: APPROVED_MODEL });
+    assert.deepEqual(config.agents.defaults.models, { [APPROVED_MODEL]: {} });
+    assert.equal("fallbacks" in config.agents.defaults.model, false);
+
+    const serialized = JSON.stringify(config);
+    assert.doesNotMatch(serialized, /https?:\/\/(?!127\.0\.0\.1:18790\/v1)/i);
+    assert.equal("openai" in config.models.providers, false);
+    assert.equal("anthropic" in config.models.providers, false);
+    assert.equal("google" in config.models.providers, false);
+    assert.equal("openrouter" in config.models.providers, false);
   });
 
   it("uses only read/write gateway scopes and gives the client no config authority", () => {

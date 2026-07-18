@@ -80,6 +80,8 @@ let initPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
+let credentialRefreshInProgress = false;
+let currentWorkspaceCapability = null;
 let workspaceLifecycle = null;
 const runtimeInitializationGuard = createRuntimeInitializationGuard();
 const activeTaskTracker = createActiveTaskTracker();
@@ -444,7 +446,7 @@ function writeOpenClawConfig() {
         "# Agent Instructions",
         "",
         "You are a helpful AI assistant running in a per-user container on AWS.",
-        "You have web page retrieval and four bounded persistent workspace tools.",
+        "You have four bounded persistent workspace tools.",
         "",
         "## Response Formatting",
         "",
@@ -452,13 +454,6 @@ function writeOpenClawConfig() {
         "- **No markdown tables** — use bullet lists or plain text paragraphs instead",
         "- Tables do not render in most chat apps; bullets always work",
         "- Keep responses concise and chat-appropriate",
-        "",
-        "## Built-in Web Tool",
-        "",
-        "You have the built-in **web_fetch** tool:",
-        "- **web_fetch**: Fetch and read a public web page as markdown",
-        "",
-        "Use it when a request includes or identifies a page URL to read.",
         "",
         "## File Storage",
         "",
@@ -571,6 +566,7 @@ function quarantineRuntime(error, code = "RUNTIME_INITIALIZATION_FAILED") {
     clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = null;
   }
+  credentialRefreshInProgress = false;
   for (const child of [openclawProcess, proxyProcess]) {
     try {
       child?.kill("SIGTERM");
@@ -633,7 +629,20 @@ async function stopSupportProcesses() {
   await cwLogger.shutdown();
 }
 
-async function init(internalUserId, namespace, { warmModel = true } = {}) {
+async function init(
+  internalUserId,
+  namespace,
+  workspaceCapability,
+  { warmModel = true } = {},
+) {
+  if (
+    typeof workspaceCapability !== "string" ||
+    !workspaceCapability ||
+    workspaceCapability.length > 2_048
+  ) {
+    throw new Error("A trusted workspace capability is required");
+  }
+  currentWorkspaceCapability = workspaceCapability;
   if (proxyReady) return; // Already initialized
   if (initInProgress) return initPromise;
   runtimeInitializationGuard.claim();
@@ -641,7 +650,9 @@ async function init(internalUserId, namespace, { warmModel = true } = {}) {
 
   initPromise = (async () => {
     console.log("[contract] Creating scoped S3 credentials");
-    const credentials = await scopedCreds.createScopedCredentials(namespace);
+    const credentials = await scopedCreds.createScopedCredentials(
+      workspaceCapability,
+    );
     const credentialFiles = scopedCreds.writeCredentialFiles(
       credentials,
       SCOPED_CREDS_DIR,
@@ -689,16 +700,23 @@ async function init(internalUserId, namespace, { warmModel = true } = {}) {
     await agent.configureWorkspaceRuntime({ env: workspaceEnvironment });
 
     if (credentialRefreshTimer) clearInterval(credentialRefreshTimer);
+    credentialRefreshInProgress = false;
     credentialRefreshTimer = setInterval(async () => {
+      if (credentialRefreshInProgress) return;
+      credentialRefreshInProgress = true;
       try {
-        const refreshed = await scopedCreds.createScopedCredentials(namespace);
+        const refreshed = await scopedCreds.createScopedCredentials(
+          currentWorkspaceCapability,
+        );
         scopedCreds.writeCredentialFiles(refreshed, SCOPED_CREDS_DIR);
         refreshingS3.setCredentials(refreshed);
         console.log("[contract] Scoped S3 credentials refreshed");
       } catch (error) {
         quarantineRuntime(error, "SCOPED_CREDENTIAL_FAILURE");
+      } finally {
+        credentialRefreshInProgress = false;
       }
-    }, 45 * 60 * 1000);
+    }, 10 * 60 * 1000);
     credentialRefreshTimer.unref?.();
 
     writeOpenClawConfig();
@@ -1034,7 +1052,7 @@ const server = http.createServer(async (req, res) => {
           );
           return;
         }
-        const { identity, delivery, request } = boundInvocation;
+        const { identity, delivery, authority, request } = boundInvocation;
 
         if (action === "status") {
           const proxyHealth = await checkProxyHealth();
@@ -1082,7 +1100,11 @@ const server = http.createServer(async (req, res) => {
           }
           // Trigger init in background if not already running
           if (!initInProgress) {
-            init(identity.internalUserId, identity.namespace).catch((err) => {
+            init(
+              identity.internalUserId,
+              identity.namespace,
+              authority.workspaceCapability,
+            ).catch((err) => {
               console.error(`[contract] Warmup init failed: ${err.message}`);
             });
           }
@@ -1110,9 +1132,12 @@ const server = http.createServer(async (req, res) => {
             const snapshotOutcome = await activeTaskTracker.run(() =>
               executeSnapshotAction({
                 initialize: () =>
-                  init(identity.internalUserId, identity.namespace, {
-                    warmModel: false,
-                  }),
+                  init(
+                    identity.internalUserId,
+                    identity.namespace,
+                    authority.workspaceCapability,
+                    { warmModel: false },
+                  ),
                 getWorkspaceLifecycle: () => workspaceLifecycle,
               }),
             );
@@ -1204,7 +1229,11 @@ const server = http.createServer(async (req, res) => {
 
                 if (!proxyReady && !initInProgress) {
                   try {
-                    await init(identity.internalUserId, identity.namespace);
+                    await init(
+                      identity.internalUserId,
+                      identity.namespace,
+                      authority.workspaceCapability,
+                    );
                   } catch (err) {
                     console.error(`[contract] Init failed: ${err.message}`);
                     return {
@@ -1426,6 +1455,7 @@ async function shutdownRuntime() {
     clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = null;
   }
+  credentialRefreshInProgress = false;
 
   let exitCode = 0;
   try {

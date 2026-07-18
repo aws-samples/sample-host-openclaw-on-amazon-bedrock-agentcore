@@ -6,6 +6,7 @@ set -euo pipefail
 REQUIRED_REGION="eu-west-1"
 REQUIRED_MODEL_ID="eu.anthropic.claude-sonnet-4-6"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNTIME_CONTEXT_FILE="$PROJECT_DIR/build/runtime-context.json"
 SKIP_DEPLOY=false
 TEST_FILTER=""
 
@@ -64,9 +65,14 @@ if [ -z "${E2E_TELEGRAM_USER_ID:-}" ] || [ -z "${E2E_TELEGRAM_CHAT_ID:-}" ]; the
   echo "ERROR: E2E_TELEGRAM_USER_ID and E2E_TELEGRAM_CHAT_ID must be set." >&2
   exit 1
 fi
+if [[ ! "$E2E_TELEGRAM_USER_ID" =~ ^[1-9][0-9]{0,19}$ ]] || \
+   [ "$E2E_TELEGRAM_CHAT_ID" != "$E2E_TELEGRAM_USER_ID" ]; then
+  echo "ERROR: E2E chat and user must be the same positive private Telegram ID." >&2
+  exit 1
+fi
 TG_CHAT_ID="$E2E_TELEGRAM_CHAT_ID"
 
-read_context() {
+read_cdk_context() {
   local key="$1"
   python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('$key',''))"
 }
@@ -130,52 +136,96 @@ validate_deployed_runtime() {
     exit 1
   fi
 
-  RUNTIME_ID=$(read_context runtime_id)
-  RUNTIME_ENDPOINT_ID=$(read_context runtime_endpoint_id)
-  RUNTIME_ENDPOINT_NAME=$(read_context runtime_endpoint_name)
-  RUNTIME_ARN=$(read_context runtime_arn)
-  MODEL_ID=$(read_context default_model_id)
+  RUNTIME_CONTEXT=$(python3 - "$RUNTIME_CONTEXT_FILE" "$ACCOUNT" "$REGION" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path, account, region = sys.argv[1:]
+try:
+    value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"runtime context is unavailable: {type(error).__name__}")
+required = {
+    "schema", "sourceCommit", "account", "region", "runtimeId",
+    "runtimeEndpointId", "runtimeEndpointName", "runtimeVersion",
+    "runtimeArn", "runtimeImageUri",
+}
+if not isinstance(value, dict) or set(value) != required:
+    raise SystemExit("runtime context has the wrong fields")
+commit = value.get("sourceCommit", "")
+if value.get("schema") != "personal-operator.runtime-context.v3":
+    raise SystemExit("runtime context schema is invalid")
+if value.get("account") != account or value.get("region") != region:
+    raise SystemExit("runtime context is outside the authenticated account or region")
+if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+    raise SystemExit("runtime context source commit is invalid")
+if value.get("runtimeEndpointName") != f"release_{commit}":
+    raise SystemExit("runtime endpoint name is not bound to the release commit")
+version = value.get("runtimeVersion", "")
+if re.fullmatch(r"[1-9][0-9]{0,4}", version) is None:
+    raise SystemExit("runtime context version is invalid")
+if value.get("runtimeArn", "").rsplit(":", 1)[-1] != version:
+    raise SystemExit("runtime context ARN is not bound to its version")
+for key in (
+    "runtimeId", "runtimeEndpointId", "runtimeEndpointName",
+    "runtimeVersion", "runtimeArn",
+):
+    print(value[key])
+PY
+)
+  RUNTIME_ID=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '1p')
+  RUNTIME_ENDPOINT_ID=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '2p')
+  RUNTIME_ENDPOINT_NAME=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '3p')
+  RUNTIME_VERSION=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '4p')
+  RUNTIME_ARN=$(printf '%s\n' "$RUNTIME_CONTEXT" | sed -n '5p')
+  MODEL_ID=$(read_cdk_context default_model_id)
   if [[ ! "$RUNTIME_ID" =~ ^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$ ]]; then
-    echo "ERROR: cdk.json does not contain a deployed runtime_id." >&2
+    echo "ERROR: release context does not contain a deployed runtime ID." >&2
     exit 1
   fi
   if [[ ! "$RUNTIME_ENDPOINT_ID" =~ ^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$ ]]; then
-    echo "ERROR: cdk.json does not contain a deployed runtime_endpoint_id." >&2
+    echo "ERROR: release context does not contain a deployed endpoint ID." >&2
     exit 1
   fi
-  require_equal "runtime endpoint qualifier" "DEFAULT" "$RUNTIME_ENDPOINT_NAME"
+  if [[ ! "$RUNTIME_ENDPOINT_NAME" =~ ^release_[0-9a-f]{40}$ ]]; then
+    echo "ERROR: runtime endpoint name is not an exact release endpoint." >&2
+    exit 1
+  fi
   if [[ ! "$RUNTIME_ARN" =~ ^arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT}:agent/[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}$ ]]; then
-    echo "ERROR: cdk.json does not contain a canonical deployed runtime_arn." >&2
+    echo "ERROR: release context does not contain a canonical runtime ARN." >&2
     exit 1
   fi
+  require_equal "runtime ARN version" "$RUNTIME_VERSION" "${RUNTIME_ARN##*:}"
   require_equal "configured model" "$REQUIRED_MODEL_ID" "$MODEL_ID"
 
   ACTUAL_RUNTIME_ARN=$(aws bedrock-agentcore-control get-agent-runtime \
-    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --region "$REGION" \
     --query agentRuntimeArn --output text)
   ACTUAL_RUNTIME_ID=$(aws bedrock-agentcore-control get-agent-runtime \
-    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --region "$REGION" \
     --query agentRuntimeId --output text)
   ACTUAL_RUNTIME_STATUS=$(aws bedrock-agentcore-control get-agent-runtime \
-    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --region "$REGION" \
     --query status --output text)
   ACTUAL_EXECUTION_ROLE_ARN=$(aws bedrock-agentcore-control get-agent-runtime \
-    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --region "$REGION" \
     --query roleArn --output text)
   ACTUAL_WORKSPACE_ROLE_ARN=$(aws bedrock-agentcore-control get-agent-runtime \
-    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --region "$REGION" \
     --query environmentVariables.WORKSPACE_SESSION_ROLE_ARN --output text)
   ACTUAL_REGION=$(aws bedrock-agentcore-control get-agent-runtime \
-    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --region "$REGION" \
     --query environmentVariables.AWS_REGION --output text)
   ACTUAL_MODEL_ID=$(aws bedrock-agentcore-control get-agent-runtime \
-    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --region "$REGION" \
     --query environmentVariables.BEDROCK_MODEL_ID --output text)
   ACTUAL_BUCKET=$(aws bedrock-agentcore-control get-agent-runtime \
-    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --region "$REGION" \
     --query environmentVariables.S3_USER_FILES_BUCKET --output text)
   ACTUAL_CMK_ARN=$(aws bedrock-agentcore-control get-agent-runtime \
-    --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
+    --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --region "$REGION" \
     --query environmentVariables.CMK_ARN --output text)
   ACTUAL_ENDPOINT_ID=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
     --agent-runtime-id "$RUNTIME_ID" --region "$REGION" \
@@ -200,7 +250,8 @@ validate_deployed_runtime() {
   "$PROJECT_DIR/.venv/bin/python" \
     "$PROJECT_DIR/scripts/verify-agentcore-storage.py" \
     --runtime-id "$RUNTIME_ID" \
-    --endpoint-name DEFAULT \
+    --endpoint-id "$RUNTIME_ENDPOINT_ID" \
+    --endpoint-name "$RUNTIME_ENDPOINT_NAME" \
     --runtime-arn "$RUNTIME_ARN" \
     --execution-role-arn "$EXECUTION_ROLE_ARN" \
     --bucket "$USER_FILES_BUCKET" \
@@ -215,6 +266,13 @@ validate_deployed_runtime() {
     --function-name openclaw-router --region "$REGION" \
     --query Environment.Variables.AGENTCORE_RUNTIME_ARN --output text)
   require_equal "router invocation ARN" "$RUNTIME_ARN" "$ROUTER_RUNTIME_ARN"
+  ROUTER_RUNTIME_ENDPOINT=$(aws lambda get-function-configuration \
+    --function-name personal-operator-telegram-worker --region "$REGION" \
+    --query Environment.Variables.AGENTCORE_QUALIFIER --output text)
+  require_equal \
+    "router worker release endpoint" \
+    "$RUNTIME_ENDPOINT_NAME" \
+    "$ROUTER_RUNTIME_ENDPOINT"
 
   ROUTER_ROLE_ARN=$(aws lambda get-function-configuration \
     --function-name openclaw-router --region "$REGION" \
@@ -245,7 +303,7 @@ validate_deployed_runtime() {
   done
   ROUTER_AGENTCORE_RESOURCES=$(printf '%s\n' "$ROUTER_AGENTCORE_RESOURCES" \
     | tr '\t\n' '  ' | awk '{$1=$1; print}')
-  EXPECTED_ROUTER_IAM_RESOURCES="${RUNTIME_IAM_ARN} ${RUNTIME_IAM_ARN}/runtime-endpoint/DEFAULT"
+  EXPECTED_ROUTER_IAM_RESOURCES="${RUNTIME_IAM_ARN} ${RUNTIME_IAM_ARN}/runtime-endpoint/${RUNTIME_ENDPOINT_NAME}"
   require_equal \
     "router IAM runtime resources" \
     "$EXPECTED_ROUTER_IAM_RESOURCES" \

@@ -1,4 +1,5 @@
 import importlib.util
+from decimal import Decimal
 from pathlib import Path
 import sys
 from unittest.mock import MagicMock
@@ -39,7 +40,7 @@ def envelope(message="hello"):
         trace_id=derive_event_trace("telegram", "user_a1", "100"),
         kind="message",
         payload={
-            "chatId": "9001",
+            "chatId": "42",
             "actorId": "telegram:42",
             "message": message,
         },
@@ -117,6 +118,147 @@ def test_unresolved_processing_claim_is_never_reclaimed_or_reexecuted():
     assert ":processing" in update["ExpressionAttributeValues"]
     assert ":uncertain" in update["ExpressionAttributeValues"]
     assert "processingEpoch" in update["ConditionExpression"]
+    assert update["ExpressionAttributeValues"][":ttl"] == (
+        1 + ledger_module.TERMINAL_RETENTION_SECONDS
+    )
+
+
+def test_stale_delivery_in_flight_is_quarantined_without_becoming_sendable_again():
+    table = MagicMock()
+    table.put_item.side_effect = AwsError()
+    item = envelope()
+    in_flight = {
+        "eventId": item.trace_id,
+        "requestSha256": item.request_sha256,
+        "userId": item.user_id,
+        "traceId": item.trace_id,
+        "state": "DELIVERY_IN_FLIGHT",
+        "result": "done",
+        "resultSha256": ledger_module.result_sha256("done"),
+        "deliveryOwner": OWNER_A,
+        "deliveryEpoch": 3,
+        "deliveryStartedAt": 1_000,
+    }
+    table.get_item.return_value = {"Item": in_flight}
+    table.update_item.return_value = {
+        "Attributes": {
+            **in_flight,
+            "state": "DELIVERY_UNCERTAIN",
+            "uncertaintyReason": "delivery-claim-expired",
+        }
+    }
+    now = 1_000 + ledger_module.DELIVERY_LEASE_MS + 1
+    ledger = ledger_module.DynamoProcessingLedger(table, clock_ms=lambda: now)
+
+    claim = ledger.claim_processing(item, owner=OWNER_B)
+
+    assert claim.state == "DELIVERY_UNCERTAIN"
+    update = table.update_item.call_args.kwargs
+    assert update["ExpressionAttributeValues"][":inflight"] == "DELIVERY_IN_FLIGHT"
+    assert update["ExpressionAttributeValues"][":uncertain"] == "DELIVERY_UNCERTAIN"
+    assert update["ExpressionAttributeValues"][":reason"] == "delivery-claim-expired"
+    assert update["ExpressionAttributeValues"][":cutoff"] == 1_001
+    assert update["ExpressionAttributeValues"][":requestSha"] == item.request_sha256
+    assert update["ExpressionAttributeValues"][":startedAt"] == 1_000
+    assert update["ExpressionAttributeValues"][":ttl"] == (
+        now // 1_000 + ledger_module.TERMINAL_RETENTION_SECONDS
+    )
+    assert "requestSha256=:requestSha" in update["ConditionExpression"]
+    assert "deliveryOwner=:owner" in update["ConditionExpression"]
+    assert "deliveryEpoch=:epoch" in update["ConditionExpression"]
+    assert "deliveryStartedAt=:startedAt" in update["ConditionExpression"]
+    assert "deliveryStartedAt < :cutoff" in update["ConditionExpression"]
+
+    with pytest.raises(ledger_module.LedgerFenceLost):
+        ledger.begin_delivery(claim, owner=OWNER_B)
+
+
+def test_fresh_delivery_in_flight_is_observed_but_never_reclaimed_or_updated():
+    table = MagicMock()
+    table.put_item.side_effect = AwsError()
+    item = envelope()
+    table.get_item.return_value = {
+        "Item": {
+            "eventId": item.trace_id,
+            "requestSha256": item.request_sha256,
+            "userId": item.user_id,
+            "traceId": item.trace_id,
+            "state": "DELIVERY_IN_FLIGHT",
+            "result": "done",
+            "resultSha256": ledger_module.result_sha256("done"),
+            "deliveryOwner": OWNER_A,
+            "deliveryEpoch": 1,
+            "deliveryStartedAt": 9_999,
+        }
+    }
+    ledger = ledger_module.DynamoProcessingLedger(table, clock_ms=lambda: 10_000)
+
+    claim = ledger.claim_processing(item, owner=OWNER_B)
+
+    assert claim.state == "DELIVERY_IN_FLIGHT"
+    table.update_item.assert_not_called()
+
+
+def test_stale_delivery_classification_accepts_dynamodb_decimal_numbers():
+    table = MagicMock()
+    table.put_item.side_effect = AwsError()
+    item = envelope()
+    in_flight = {
+        "eventId": item.trace_id,
+        "requestSha256": item.request_sha256,
+        "userId": item.user_id,
+        "traceId": item.trace_id,
+        "state": "DELIVERY_IN_FLIGHT",
+        "result": "done",
+        "deliveryOwner": OWNER_A,
+        "deliveryEpoch": Decimal("2"),
+        "deliveryStartedAt": Decimal("1000"),
+    }
+    table.get_item.return_value = {"Item": in_flight}
+    table.update_item.return_value = {
+        "Attributes": {**in_flight, "state": "DELIVERY_UNCERTAIN"}
+    }
+    ledger = ledger_module.DynamoProcessingLedger(
+        table,
+        clock_ms=lambda: 1_000 + ledger_module.DELIVERY_LEASE_MS + 1,
+    )
+
+    claim = ledger.claim_processing(item, owner=OWNER_B)
+
+    assert claim.state == "DELIVERY_UNCERTAIN"
+
+
+def test_stale_delivery_classification_reconciles_a_concurrent_confirmation():
+    table = MagicMock()
+    table.put_item.side_effect = AwsError()
+    table.update_item.side_effect = AwsError()
+    item = envelope()
+    in_flight = {
+        "eventId": item.trace_id,
+        "requestSha256": item.request_sha256,
+        "userId": item.user_id,
+        "traceId": item.trace_id,
+        "state": "DELIVERY_IN_FLIGHT",
+        "result": "done",
+        "deliveryOwner": OWNER_A,
+        "deliveryEpoch": 1,
+        "deliveryStartedAt": 1_000,
+    }
+    delivered = {
+        **in_flight,
+        "state": "DELIVERED",
+        "providerMessageId": "tg-1",
+    }
+    table.get_item.side_effect = [{"Item": in_flight}, {"Item": delivered}]
+    ledger = ledger_module.DynamoProcessingLedger(
+        table,
+        clock_ms=lambda: 1_000 + ledger_module.DELIVERY_LEASE_MS + 1,
+    )
+
+    claim = ledger.claim_processing(item, owner=OWNER_B)
+
+    assert claim.state == "DELIVERED"
+    assert table.get_item.call_count == 2
 
 
 def test_result_completion_reconciles_an_ambiguous_applied_write():
@@ -197,4 +339,56 @@ def test_delivery_claim_precedes_send_and_ambiguous_confirmation_reconciles():
     assert "#state=:ready" in first["ConditionExpression"]
     table.get_item.assert_called_with(
         Key={"eventId": item.trace_id}, ConsistentRead=True
+    )
+
+
+def test_delivery_confirmation_sets_terminal_retention_ttl():
+    table = MagicMock()
+    table.update_item.return_value = {"Attributes": {}}
+    item = envelope()
+    ledger = ledger_module.DynamoProcessingLedger(table, clock_ms=lambda: 1_000)
+    claim = ledger_module.LedgerClaim(
+        key=item.trace_id,
+        request_sha256=item.request_sha256,
+        state="DELIVERY_CLAIMED",
+        result="done",
+        owner=OWNER_A,
+        epoch=1,
+    )
+
+    ledger.confirm_delivery(claim, {"providerMessageId": "tg-1"})
+
+    update = table.update_item.call_args.kwargs
+    assert "ttl=:ttl" in update["UpdateExpression"]
+    assert update["ExpressionAttributeValues"][":ttl"] == (
+        1 + ledger_module.TERMINAL_RETENTION_SECONDS
+    )
+
+
+@pytest.mark.parametrize(
+    ("method_name", "claim_state"),
+    [
+        ("mark_processing_uncertain", "CLAIMED"),
+        ("mark_delivery_uncertain", "DELIVERY_CLAIMED"),
+    ],
+)
+def test_explicit_uncertainty_sets_terminal_retention_ttl(method_name, claim_state):
+    table = MagicMock()
+    item = envelope()
+    ledger = ledger_module.DynamoProcessingLedger(table, clock_ms=lambda: 1_000)
+    claim = ledger_module.LedgerClaim(
+        key=item.trace_id,
+        request_sha256=item.request_sha256,
+        state=claim_state,
+        result="done" if claim_state == "DELIVERY_CLAIMED" else None,
+        owner=OWNER_A,
+        epoch=1,
+    )
+
+    getattr(ledger, method_name)(claim, error_type="TimeoutError")
+
+    update = table.update_item.call_args.kwargs
+    assert "ttl=:ttl" in update["UpdateExpression"]
+    assert update["ExpressionAttributeValues"][":ttl"] == (
+        1 + ledger_module.TERMINAL_RETENTION_SECONDS
     )

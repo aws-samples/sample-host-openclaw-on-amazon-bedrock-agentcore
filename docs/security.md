@@ -1,5 +1,20 @@
 # OpenClaw on AgentCore — Security Architecture
 
+> **Archived upstream reference.** This document describes the imported AWS
+> sample and contains capabilities that Personal Operator v0 deliberately
+> removed. It is not the current product or release boundary. Use
+> [PRIVACY-BOUNDARY.md](PRIVACY-BOUNDARY.md),
+> [OPERATIONS.md](OPERATIONS.md), and
+> [RELEASE-EVIDENCE.md](RELEASE-EVIDENCE.md) as the current source of truth.
+>
+> In particular, the current Personal Operator runtime does **not** call STS,
+> assume the workspace role, or construct a session policy. Its exact IAM
+> authority is limited to invoking a trusted credential broker. That broker
+> verifies a worker-minted HMAC capability against a strongly read live
+> user/session/runtime/release record, derives the exact S3/KMS policy on the
+> server, and issues at-most-15-minute credentials refreshed single-flight
+> every 10 minutes. Broker denial or refresh failure quarantines the runtime.
+
 ## 1. Executive Summary
 
 OpenClaw on AgentCore implements a **security-first, defense-in-depth architecture** that leverages AWS managed services to provide enterprise-grade protection for a multi-user AI messaging bot. The design philosophy follows three core principles:
@@ -192,17 +207,15 @@ Users frequently need to store third-party API keys for skills and integrations.
 
 ### 3.7 Application-Level Security
 
-#### SSRF Prevention
+#### Model network egress
 
-The lightweight agent's `web_fetch` tool implements multi-layer SSRF protection:
-
-| Check | Details |
-|---|---|
-| IP blocklist (pre-connect) | Blocks loopback (`127.*`), private (`10.*`, `172.16-31.*`, `192.168.*`), link-local (`169.254.*` — covers IMDS), RFC 6598, IPv6 unique local/link-local, IPv4-mapped IPv6 addresses |
-| Hostname blocklist | `localhost`, `metadata.google.internal`, `metadata.internal`, `instance-data` |
-| DNS rebinding mitigation | `validateResolvedIps()` resolves hostname and checks resolved IPs against blocklist before connecting |
-| Redirect validation | Each redirect target re-validated (URL safety + DNS resolution) with depth limit of 3 |
-| Protocol restriction | Only `http:` and `https:` allowed |
+The credential-bearing runtime exposes no model-callable URL retrieval, search,
+browser, or generic HTTP tool. This prevents a model from reading workspace
+data and selecting an external destination for it. URL retrieval remains
+deferred until exact targets can be derived from the current authenticated user
+request and enforced outside the model tool loop. The unused bounded-fetch
+helpers retain SSRF tests but are not registered in either OpenClaw or the
+warm-up tool surface.
 
 #### Path Traversal Prevention
 

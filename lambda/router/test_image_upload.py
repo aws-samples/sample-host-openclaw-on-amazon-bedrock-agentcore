@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 # Set required env vars before importing the module
 os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/test")
-os.environ.setdefault("AGENTCORE_QUALIFIER", "test-endpoint")
+os.environ.setdefault("AGENTCORE_QUALIFIER", "release_" + "a" * 40)
 os.environ.setdefault("IDENTITY_TABLE_NAME", "openclaw-identity")
 os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-eu-west-1")
 
@@ -307,7 +307,7 @@ class TestHandleTelegramWithImages(unittest.TestCase):
         body = json.dumps({
             "update_id": 1001,
             "message": {
-                "chat": {"id": 123},
+                "chat": {"id": 456, "type": "private"},
                 "from": {"id": 456, "first_name": "Test"},
                 "photo": [{"file_id": "abc", "width": 1280}],
                 "caption": "What's this?",
@@ -346,7 +346,7 @@ class TestHandleTelegramWithImages(unittest.TestCase):
         body = json.dumps({
             "update_id": 1002,
             "message": {
-                "chat": {"id": 123},
+                "chat": {"id": 456, "type": "private"},
                 "from": {"id": 456, "first_name": "Test"},
                 "text": "Hello",
             }

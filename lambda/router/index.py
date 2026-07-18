@@ -19,6 +19,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from urllib import request as urllib_request
 from urllib.parse import quote
 
@@ -26,8 +27,12 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from event_identity import derive_event_trace
-from telegram_ingress import TelegramWebhookIngress
+try:
+    from .event_identity import derive_event_trace
+    from .telegram_ingress import MAX_WEBHOOK_BYTES, TelegramWebhookIngress
+except ImportError:  # focused tests execute with lambda/router on sys.path
+    from event_identity import derive_event_trace
+    from telegram_ingress import MAX_WEBHOOK_BYTES, TelegramWebhookIngress
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -90,6 +95,10 @@ _token_cache = {}  # {secret_id: (value, fetched_at)}
 BIND_CODE_TTL_SECONDS = 600  # 10 minutes
 
 
+class SecretProviderUnavailable(RuntimeError):
+    """A configured secret could not be read from its authority."""
+
+
 def _get_secret(secret_id):
     """Fetch a secret value, cached with a 15-minute TTL."""
     cached = _token_cache.get(secret_id)
@@ -104,9 +113,14 @@ def _get_secret(secret_id):
         value = resp["SecretString"]
         _token_cache[secret_id] = (value, time.time())
         return value
-    except Exception as e:
-        logger.warning("Failed to fetch secret %s: %s", secret_id, e)
-        return ""
+    except Exception as error:
+        # Secret identifiers, provider endpoints, and exception text may contain
+        # deployment or credential material. Keep only a bounded error class.
+        logger.warning(
+            "Secret provider unavailable: error_type=%s",
+            type(error).__name__,
+        )
+        raise SecretProviderUnavailable("secret provider unavailable") from None
 
 
 def _get_telegram_token():
@@ -198,6 +212,59 @@ def _get_feishu_tenant_token():
 # ---------------------------------------------------------------------------
 # Webhook validation helpers
 # ---------------------------------------------------------------------------
+
+
+def _telegram_preflight(body, headers):
+    """Authenticate and strictly parse Telegram input before any mutation.
+
+    The durable ingress deliberately owns identity resolution and enqueueing.
+    This outer preflight exists to preserve auth-before-parse ordering while
+    rejecting JSON objects whose duplicate keys would otherwise be silently
+    resolved by Python's last-key-wins decoder.
+    """
+    if not isinstance(headers, Mapping):
+        return {"statusCode": 401, "body": "Unauthorized"}
+    normalized = {
+        str(key).casefold(): value
+        for key, value in headers.items()
+        if isinstance(value, str)
+    }
+    supplied = normalized.get("x-telegram-bot-api-secret-token", "")
+    if not supplied:
+        return {"statusCode": 401, "body": "Unauthorized"}
+
+    expected = _get_webhook_secret()
+    if (
+        not isinstance(expected, str)
+        or not expected
+        or not hmac.compare_digest(expected, supplied)
+    ):
+        return {"statusCode": 401, "body": "Unauthorized"}
+
+    if not isinstance(body, str) or not body:
+        return {"statusCode": 400, "body": "Invalid update"}
+    try:
+        if len(body.encode("utf-8")) > MAX_WEBHOOK_BYTES:
+            return {"statusCode": 400, "body": "Invalid update"}
+    except UnicodeError:
+        return {"statusCode": 400, "body": "Invalid update"}
+
+    def reject_duplicate_keys(pairs):
+        parsed = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError("duplicate JSON key")
+            parsed[key] = value
+        return parsed
+
+    try:
+        parsed = json.loads(body, object_pairs_hook=reject_duplicate_keys)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {"statusCode": 400, "body": "Invalid update"}
+    if not isinstance(parsed, Mapping):
+        return {"statusCode": 400, "body": "Invalid update"}
+    return None
+
 
 def validate_telegram_webhook(headers):
     """Validate Telegram webhook using X-Telegram-Bot-Api-Secret-Token header.
@@ -432,7 +499,10 @@ def is_user_allowed(channel, channel_user_id):
         return True
     channel_key = f"{channel}:{channel_user_id}"
     try:
-        resp = identity_table.get_item(Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"})
+        resp = identity_table.get_item(
+            Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"},
+            ConsistentRead=True,
+        )
         if "Item" in resp:
             return True
     except ClientError as e:
@@ -440,32 +510,102 @@ def is_user_allowed(channel, channel_user_id):
     return False
 
 
+def _canonical_channel_key(channel, channel_user_id):
+    """Return the sole canonical identity string used by fences and mappings."""
+    if channel not in {"telegram", "slack", "feishu"}:
+        raise ValueError("unsupported identity channel")
+    if not isinstance(channel_user_id, str) or not channel_user_id:
+        raise ValueError("channel user identity is invalid")
+    if len(channel_user_id) > 256 or any(ord(char) < 32 for char in channel_user_id):
+        raise ValueError("channel user identity is invalid")
+    return f"{channel}:{channel_user_id}"
+
+
+def _channel_tombstone_pk(channel_key):
+    """Hash the canonical channel key so the permanent marker stores no raw ID."""
+    return f"CHANNEL_TOMBSTONE#{hashlib.sha256(channel_key.encode('utf-8')).hexdigest()}"
+
+
+def _user_tombstone_pk(user_id):
+    """Hash the internal user ID for the permanent identity-write fence."""
+    user_id = _canonical_namespace(user_id)
+    return f"USER_TOMBSTONE#{hashlib.sha256(user_id.encode('utf-8')).hexdigest()}"
+
+
+def _string_item(item):
+    """Encode a string-only record for the low-level DynamoDB transaction API."""
+    return {key: {"S": value} for key, value in item.items()}
+
+
+def _read_channel_mapping(channel_key):
+    """Strongly read and exactly validate the authoritative channel mapping."""
+    channel, channel_user_id = channel_key.split(":", 1)
+    expected_pk = f"CHANNEL#{channel_key}"
+    try:
+        response = identity_table.get_item(
+            Key={"PK": expected_pk, "SK": "PROFILE"},
+            ConsistentRead=True,
+        )
+    except Exception as error:
+        logger.error(
+            "Strong channel mapping read failed: error_type=%s",
+            type(error).__name__,
+        )
+        return None
+    item = response.get("Item") if isinstance(response, Mapping) else None
+    if not isinstance(item, Mapping):
+        return None
+    if (
+        item.get("PK") != expected_pk
+        or item.get("SK") != "PROFILE"
+        or item.get("channel") != channel
+        or item.get("channelUserId") != channel_user_id
+    ):
+        logger.error("Rejected inexact channel identity mapping")
+        return None
+    try:
+        user_id = _canonical_namespace(item["userId"])
+    except (KeyError, ValueError):
+        logger.error("Rejected corrupt channel identity mapping")
+        return None
+    try:
+        tombstone = identity_table.get_item(
+            Key={"PK": _user_tombstone_pk(user_id), "SK": "TOMBSTONE"},
+            ConsistentRead=True,
+        )
+    except Exception as error:
+        logger.error(
+            "Strong user-deletion fence read failed: error_type=%s",
+            type(error).__name__,
+        )
+        return None
+    if not isinstance(tombstone, Mapping) or tombstone.get("Item") is not None:
+        logger.warning("Rejected channel mapping behind a user-deletion fence")
+        return None
+    return user_id
+
+
 def resolve_user(channel, channel_user_id, display_name=""):
     """Look up or create a user for the given channel identity.
 
     Returns (user_id, is_new). Returns (None, False) if user is not allowed.
     """
-    channel_key = f"{channel}:{channel_user_id}"
+    try:
+        channel_key = _canonical_channel_key(channel, channel_user_id)
+    except ValueError:
+        return None, False
     pk = f"CHANNEL#{channel_key}"
 
-    # 1. Try to find existing mapping
-    try:
-        resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"})
-        if "Item" in resp:
-            try:
-                return _canonical_namespace(resp["Item"]["userId"]), False
-            except (KeyError, ValueError):
-                logger.error("Rejected corrupt channel identity mapping for %s", channel_key)
-                return None, False
-    except ClientError as e:
-        logger.error("DynamoDB get_item failed: %s", e)
+    # A strong read avoids returning a stale historical mapping. It is not the
+    # registration authority: the transaction below rechecks both the invite
+    # and the permanent deletion fence at the exact commit point.
+    existing_user = _read_channel_mapping(channel_key)
+    if existing_user is not None:
+        return existing_user, False
 
-    # 2. Check allowlist before creating a new user
-    if not is_user_allowed(channel, channel_user_id):
-        logger.warning("User %s not on allowlist — rejecting registration", channel_key)
-        return None, False
-
-    # 3. Create new user (conditional write to handle race conditions)
+    # Create the complete bidirectional mapping in one transaction. A channel
+    # deletion tombstone permanently wins over both invite-only and open
+    # registration, closing registration/account-deletion interleavings.
     # STABILITY NOTE: userId is deterministic (SHA-256 of channel_key) so that
     # EventBridge schedules and DynamoDB CRON# records survive redeployments.
     # Existing users registered before this fix keep their random userIds —
@@ -475,66 +615,94 @@ def resolve_user(channel, channel_user_id, display_name=""):
     user_id = f"user_{hashlib.sha256(channel_key.encode()).hexdigest()[:16]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    try:
-        # User profile
-        identity_table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": "PROFILE",
-                "userId": user_id,
-                "createdAt": now_iso,
-                "displayName": display_name or channel_user_id,
-            },
-            ConditionExpression="attribute_not_exists(PK)",
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            logger.error("Failed to create user profile: %s", e)
-
-    try:
-        # Channel -> user mapping (conditional to prevent race)
-        identity_table.put_item(
-            Item={
-                "PK": pk,
-                "SK": "PROFILE",
-                "userId": user_id,
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "displayName": display_name or channel_user_id,
-                "boundAt": now_iso,
-            },
-            ConditionExpression="attribute_not_exists(PK)",
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            # Another invocation created it first — read and return theirs
-            resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"})
-            if "Item" in resp:
-                try:
-                    return _canonical_namespace(resp["Item"]["userId"]), False
-                except (KeyError, ValueError):
-                    logger.error("Rejected corrupt raced identity mapping for %s", channel_key)
-                    return None, False
-        logger.error("Failed to create channel mapping: %s", e)
-
-    # User -> channel back-reference
-    try:
-        identity_table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": f"CHANNEL#{channel_key}",
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "boundAt": now_iso,
+    profile = {
+        "PK": f"USER#{user_id}",
+        "SK": "PROFILE",
+        "userId": user_id,
+        "createdAt": now_iso,
+        "displayName": display_name or channel_user_id,
+    }
+    forward = {
+        "PK": pk,
+        "SK": "PROFILE",
+        "userId": user_id,
+        "channel": channel,
+        "channelUserId": channel_user_id,
+        "displayName": display_name or channel_user_id,
+        "boundAt": now_iso,
+    }
+    backref = {
+        "PK": f"USER#{user_id}",
+        "SK": f"CHANNEL#{channel_key}",
+        "userId": user_id,
+        "channel": channel,
+        "channelUserId": channel_user_id,
+        "boundAt": now_iso,
+    }
+    transaction = []
+    if not REGISTRATION_OPEN:
+        transaction.append(
+            {
+                "ConditionCheck": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Key": _string_item(
+                        {"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"}
+                    ),
+                    "ConditionExpression": (
+                        "attribute_exists(PK) AND attribute_exists(SK)"
+                    ),
+                }
             }
         )
-    except ClientError:
-        pass  # Non-critical
+    transaction.append(
+        {
+            "ConditionCheck": {
+                "TableName": IDENTITY_TABLE_NAME,
+                "Key": _string_item(
+                    {"PK": _channel_tombstone_pk(channel_key), "SK": "TOMBSTONE"}
+                ),
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        }
+    )
+    transaction.append(
+        {
+            "ConditionCheck": {
+                "TableName": IDENTITY_TABLE_NAME,
+                "Key": _string_item(
+                    {"PK": _user_tombstone_pk(user_id), "SK": "TOMBSTONE"}
+                ),
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        }
+    )
+    for item in (profile, forward, backref):
+        transaction.append(
+            {
+                "Put": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Item": _string_item(item),
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            }
+        )
 
-    logger.info("New user created: %s for %s", user_id, channel_key)
+    try:
+        identity_table.meta.client.transact_write_items(TransactItems=transaction)
+    except Exception as error:
+        # Any cancellation, timeout, or ambiguous response is denied unless an
+        # exact strong read proves a complete mapping committed by a winner.
+        logger.warning(
+            "Identity registration transaction did not commit locally: error_type=%s",
+            type(error).__name__,
+        )
+        raced_user = _read_channel_mapping(channel_key)
+        if raced_user is not None:
+            return raced_user, False
+        return None, False
+
+    logger.info("New user mapping committed")
     return user_id, True
-
-
 
 def get_or_create_session(user_id):
     """Return the driver's server-created session mapping for legacy handlers."""
@@ -547,21 +715,42 @@ def get_or_create_session(user_id):
 # ---------------------------------------------------------------------------
 
 def create_bind_code(user_id):
-    """Generate an 8-char bind code and store it in DynamoDB with TTL."""
+    """Generate a bind code only while the target user has no deletion fence."""
     user_id = _canonical_namespace(user_id)
     code = uuid.uuid4().hex[:8].upper()  # 16^8 = 4.3B keyspace
     ttl = int(time.time()) + BIND_CODE_TTL_SECONDS
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    identity_table.put_item(
-        Item={
-            "PK": f"BIND#{code}",
-            "SK": "BIND",
-            "userId": user_id,
-            "createdAt": now_iso,
-            "ttl": ttl,
-        }
-    )
+    transaction = [
+        {
+            "ConditionCheck": {
+                "TableName": IDENTITY_TABLE_NAME,
+                "Key": _string_item(
+                    {"PK": _user_tombstone_pk(user_id), "SK": "TOMBSTONE"}
+                ),
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        },
+        {
+            "Put": {
+                "TableName": IDENTITY_TABLE_NAME,
+                "Item": {
+                    "PK": {"S": f"BIND#{code}"},
+                    "SK": {"S": "BIND"},
+                    "userId": {"S": user_id},
+                    "createdAt": {"S": now_iso},
+                    "ttl": {"N": str(ttl)},
+                },
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        },
+    ]
+    try:
+        identity_table.meta.client.transact_write_items(TransactItems=transaction)
+    except Exception as error:
+        logger.warning(
+            "Bind-code creation denied: error_type=%s", type(error).__name__
+        )
+        raise RuntimeError("bind-code creation is unavailable") from error
     return code
 
 
@@ -572,47 +761,102 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
     """
     code = code.strip().upper()
     try:
-        resp = identity_table.get_item(Key={"PK": f"BIND#{code}", "SK": "BIND"})
+        if re.fullmatch(r"[A-F0-9]{8}", code) is None:
+            return None, False
+        resp = identity_table.get_item(
+            Key={"PK": f"BIND#{code}", "SK": "BIND"},
+            ConsistentRead=True,
+        )
         item = resp.get("Item")
-        if not item:
+        if not isinstance(item, Mapping):
             return None, False
         # Check TTL (DynamoDB TTL deletion is eventual)
-        if item.get("ttl", 0) < int(time.time()):
+        now = int(time.time())
+        ttl = item.get("ttl")
+        if (
+            item.get("PK") != f"BIND#{code}"
+            or item.get("SK") != "BIND"
+            or isinstance(ttl, bool)
+            or not isinstance(ttl, int)
+            or ttl < now
+        ):
             return None, False
 
         user_id = _canonical_namespace(item["userId"])
-        channel_key = f"{channel}:{channel_user_id}"
+        channel_key = _canonical_channel_key(channel, channel_user_id)
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        forward = {
+            "PK": f"CHANNEL#{channel_key}",
+            "SK": "PROFILE",
+            "userId": user_id,
+            "channel": channel,
+            "channelUserId": channel_user_id,
+            "displayName": display_name or channel_user_id,
+            "boundAt": now_iso,
+        }
+        backref = {
+            "PK": f"USER#{user_id}",
+            "SK": f"CHANNEL#{channel_key}",
+            "userId": user_id,
+            "channel": channel,
+            "channelUserId": channel_user_id,
+            "boundAt": now_iso,
+        }
+        transaction = [
+            {
+                "Delete": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Key": _string_item({"PK": f"BIND#{code}", "SK": "BIND"}),
+                    "ConditionExpression": (
+                        "userId = :userId AND ttl = :ttl AND ttl >= :now"
+                    ),
+                    "ExpressionAttributeValues": {
+                        ":userId": {"S": user_id},
+                        ":ttl": {"N": str(ttl)},
+                        ":now": {"N": str(now)},
+                    },
+                }
+            },
+            {
+                "ConditionCheck": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Key": _string_item(
+                        {"PK": _user_tombstone_pk(user_id), "SK": "TOMBSTONE"}
+                    ),
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            },
+            {
+                "ConditionCheck": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Key": _string_item(
+                        {
+                            "PK": _channel_tombstone_pk(channel_key),
+                            "SK": "TOMBSTONE",
+                        }
+                    ),
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            },
+        ]
+        for record in (forward, backref):
+            transaction.append(
+                {
+                    "Put": {
+                        "TableName": IDENTITY_TABLE_NAME,
+                        "Item": _string_item(record),
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }
+                }
+            )
+        identity_table.meta.client.transact_write_items(TransactItems=transaction)
 
-        # Create channel -> user mapping
-        identity_table.put_item(
-            Item={
-                "PK": f"CHANNEL#{channel_key}",
-                "SK": "PROFILE",
-                "userId": user_id,
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "displayName": display_name or channel_user_id,
-                "boundAt": now_iso,
-            }
-        )
-        # Back-reference
-        identity_table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": f"CHANNEL#{channel_key}",
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "boundAt": now_iso,
-            }
-        )
-        # Delete the bind code
-        identity_table.delete_item(Key={"PK": f"BIND#{code}", "SK": "BIND"})
-
-        logger.info("Bind code %s redeemed: %s -> %s", code, channel_key, user_id)
+        logger.info("Bind code redeemed with a fenced identity transaction")
         return user_id, True
-    except (ClientError, KeyError, ValueError) as e:
-        logger.error("Bind code redemption failed: %s", e)
+    except Exception as error:
+        logger.warning(
+            "Bind code redemption denied: error_type=%s", type(error).__name__
+        )
         return None, False
 
 
@@ -1202,9 +1446,14 @@ def _get_secret(secret_id):
         value = resp["SecretString"]
         _token_cache[secret_id] = (value, time.time())
         return value
-    except Exception as e:
-        logger.warning("Failed to fetch secret %s: %s", secret_id, e)
-        return ""
+    except Exception as error:
+        # Secret identifiers, provider endpoints, and exception text may contain
+        # deployment or credential material. Keep only a bounded error class.
+        logger.warning(
+            "Secret provider unavailable: error_type=%s",
+            type(error).__name__,
+        )
+        raise SecretProviderUnavailable("secret provider unavailable") from None
 
 
 def _get_telegram_token():
@@ -1411,9 +1660,24 @@ def handle_telegram(body):
     update = json.loads(body) if isinstance(body, str) else body
     message = update.get("message", {})
     text = message.get("text", "") or message.get("caption", "")
-    chat_id = message.get("chat", {}).get("id")
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
     user = message.get("from", {})
-    user_id_tg = str(user.get("id", ""))
+    user_id = user.get("id")
+    if (
+        chat.get("type") != "private"
+        or isinstance(chat_id, bool)
+        or not isinstance(chat_id, int)
+        or isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or chat_id <= 0
+        or user_id <= 0
+        or chat_id != user_id
+        or len(str(chat_id)) > 20
+    ):
+        logger.info("Telegram: ignoring non-private or inexact actor chat")
+        return
+    user_id_tg = str(user_id)
     display_name = user.get("first_name", "") or user.get("username", "")
 
     # Detect image: photo array or document with image mime type
@@ -1928,7 +2192,20 @@ def handler(event, context):
         # FIFO acceptance form one synchronous boundary. A 200 is returned
         # only after SQS provides an exact acceptance receipt.
         try:
+            rejected = _telegram_preflight(body, headers)
+        except Exception as error:
+            logger.warning(
+                "Telegram secret provider unavailable: error_type=%s",
+                type(error).__name__,
+            )
+            return {"statusCode": 503, "body": "service unavailable"}
+        if rejected is not None:
+            return rejected
+        try:
             return _get_telegram_ingress().handle(body, headers)
+        except SecretProviderUnavailable:
+            logger.warning("Telegram secret provider unavailable")
+            return {"statusCode": 503, "body": "service unavailable"}
         except Exception as error:
             logger.warning(
                 "Telegram ingress unavailable: error_type=%s",

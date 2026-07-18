@@ -46,15 +46,33 @@ def _create_e2e_script_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Pa
                 "context": {
                     "region": "eu-west-1",
                     "default_model_id": "eu.anthropic.claude-sonnet-4-6",
-                    "runtime_id": "openclaw_agent-0123456789",
-                    "runtime_endpoint_id": "DEFAULT-0123456789",
-                    "runtime_endpoint_name": "DEFAULT",
-                    "runtime_arn": (
-                        "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
-                        "agent/12345678-1234-1234-1234-123456789abc:1"
-                    ),
                     "image_version": "71",
                 }
+            }
+        ),
+        encoding="utf-8",
+    )
+    build = project / "build"
+    build.mkdir()
+    (build / "runtime-context.json").write_text(
+        json.dumps(
+            {
+                "schema": "personal-operator.runtime-context.v3",
+                "sourceCommit": "a" * 40,
+                "account": "123456789012",
+                "region": "eu-west-1",
+                "runtimeId": "openclaw_agent-0123456789",
+                "runtimeEndpointId": "release_endpoint-0123456789",
+                "runtimeEndpointName": "release_" + "a" * 40,
+                "runtimeVersion": "1",
+                "runtimeArn": (
+                    "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
+                    "agent/12345678-1234-1234-1234-123456789abc:1"
+                ),
+                "runtimeImageUri": (
+                    "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
+                    "personal-operator/bridge@sha256:" + "a" * 64
+                ),
             }
         ),
         encoding="utf-8",
@@ -89,11 +107,12 @@ case "$args" in
   *"get-agent-runtime"*"BEDROCK_MODEL_ID"*) echo 'eu.anthropic.claude-sonnet-4-6' ;;
   *"get-agent-runtime"*"S3_USER_FILES_BUCKET"*) echo 'openclaw-user-files-test' ;;
   *"get-agent-runtime"*"CMK_ARN"*) echo 'arn:aws:kms:eu-west-1:123456789012:key/test-key' ;;
-  *"list-agent-runtime-endpoints"*) echo 'DEFAULT-0123456789' ;;
+  *"list-agent-runtime-endpoints"*) echo 'release_endpoint-0123456789' ;;
   *"lambda get-function-configuration"*"AGENTCORE_RUNTIME_ARN"*) echo "${E2E_FAKE_ROUTER_RUNTIME_ARN:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:agent/12345678-1234-1234-1234-123456789abc:1}" ;;
+  *"lambda get-function-configuration"*"AGENTCORE_QUALIFIER"*) echo 'release_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
   *"lambda get-function-configuration"*"Role"*) echo 'arn:aws:iam::123456789012:role/OpenClawRouter-RouterFnServiceRole-test' ;;
   *"iam list-role-policies"*) echo 'OpenClawRouter-RouterFnServiceRoleDefaultPolicy-test' ;;
-  *"iam get-role-policy"*) printf '%s\n' "${E2E_FAKE_ROUTER_IAM_RESOURCES:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789 arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789/runtime-endpoint/DEFAULT}" ;;
+  *"iam get-role-policy"*) printf '%s\n' "${E2E_FAKE_ROUTER_IAM_RESOURCES:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789 arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789/runtime-endpoint/release_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
   *"describe-repositories"*) echo 'example.invalid/openclaw-bridge' ;;
   *"get-login-password"*) echo 'not-a-password' ;;
   *"get-secret-value"*) echo 'not-a-token' ;;
@@ -129,7 +148,7 @@ esac
     env.update(
         {
             "E2E_CALL_LOG": str(call_log),
-            "E2E_TELEGRAM_CHAT_ID": "10001",
+            "E2E_TELEGRAM_CHAT_ID": "10002",
             "E2E_TELEGRAM_USER_ID": "10002",
             "PATH": f"{fake_bin}:{env['PATH']}",
         }
@@ -148,10 +167,13 @@ def test_cdk_product_defaults_are_frozen() -> None:
     assert context["user_files_ttl_days"] == 30
     assert context["registration_open"] is False
     assert context["enable_browser"] is False
+    assert context["runtime_source_commit"] == ""
     assert context["runtime_id"] == ""
     assert context["runtime_endpoint_id"] == ""
     assert context["runtime_endpoint_name"] == ""
+    assert context["runtime_version"] == ""
     assert context["runtime_arn"] == ""
+    assert context["runtime_image_uri"] == ""
     assert context["image_version"] == "71"
 
 
@@ -160,9 +182,13 @@ def test_bridge_runtime_versions_are_frozen() -> None:
     dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
 
     assert package["engines"]["node"] == ">=24.15.0"
+    pinned_node = (
+        "24.15.0-slim@sha256:"
+        "4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d"
+    )
     assert re.findall(r"^FROM .*node:(\S+)", dockerfile, flags=re.MULTILINE) == [
-        "24.15.0-slim",
-        "24.15.0-slim",
+        pinned_node,
+        pinned_node,
     ]
     assert re.findall(
         r"^ARG OPENCLAW_VERSION=([^\s]+)", dockerfile, flags=re.MULTILINE
@@ -299,9 +325,9 @@ def test_runtime_role_is_separated_from_workspace_and_legacy_cron_authority() ->
     assert "WorkspaceSessionRoleArn" in agentcore
     assert "workspace_session_role" in agentcore
     assert "self.user_files_bucket.grant_read_write(self.execution_role)" not in agentcore
-    assert 'actions=["sts:AssumeRole"]' in agentcore
+    assert "WorkspaceCredentialBrokerRole" in agentcore
+    assert 'self.execution_role.add_to_policy' in agentcore
     assert "scheduler:" not in agentcore.casefold()
-    assert "dynamodb:" not in agentcore.casefold()
     assert "iam:PassRole" not in agentcore
     assert "DIRECT_CRON_DISABLED" in cron
     assert "aws_scheduler" not in cron
@@ -333,7 +359,7 @@ def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
 
     assert 'REQUIRED_REGION="eu-west-1"' in deploy
     assert 'WORKSPACE_SESSION_ROLE_ARN=$(aws cloudformation describe-stacks' in deploy
-    assert '--env "WORKSPACE_SESSION_ROLE_ARN=$WORKSPACE_SESSION_ROLE_ARN"' in deploy
+    assert '"$AGENTCORE_CLI" deploy' not in deploy
     assert "get-agent-runtime" in deploy
     assert "validate_runtime_metadata" in deploy
     assert "runtime_arn" in deploy
@@ -347,15 +373,15 @@ def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
     assert 'REQUIRED_REGION = "eu-west-1"' in app
 
 
-def test_deploy_makes_session_storage_and_exact_version_verification_fatal() -> None:
+def test_deploy_only_verifies_preprovisioned_session_storage_and_exact_version() -> None:
     deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
     e2e = (ROOT / "scripts/e2e-deploy-and-test.sh").read_text(encoding="utf-8")
     local = (ROOT / "scripts/test-local.sh").read_text(encoding="utf-8")
 
-    assert '"filesystemConfigurations": expected' in deploy
-    assert '{"sessionStorage": {"mountPath": "/mnt/workspace"}}' in deploy
-    assert "update_agent_runtime(" in deploy
-    assert "update-agent-runtime-endpoint" in deploy
+    assert "update_agent_runtime(" not in deploy
+    assert "update-agent-runtime-endpoint" not in deploy
+    assert '"$AGENTCORE_CLI" deploy' not in deploy
+    assert "immutable AgentCore runtime deployment is not implemented" in deploy
     assert "--agent-runtime-version" in deploy
     assert '"$PROJECT_DIR/scripts/verify-agentcore-storage.py"' in deploy
     assert '"$PROJECT_DIR/scripts/verify-agentcore-storage.py"' in e2e
@@ -397,6 +423,9 @@ def test_deploy_runtime_metadata_validator_is_fail_closed() -> None:
         "agentRuntimeId": runtime_id,
         "agentRuntimeArn": TEST_RUNTIME_ARN,
         "agentRuntimeVersion": "1",
+        "agentRuntimeArtifact": {
+            "containerConfiguration": {"containerUri": TEST_RUNTIME_IMAGE_URI}
+        },
         "status": "READY",
         "roleArn": role_arn,
     }
@@ -405,7 +434,16 @@ def test_deploy_runtime_metadata_validator_is_fail_closed() -> None:
         env = os.environ.copy()
         env["RUNTIME_METADATA_JSON"] = json.dumps(document)
         return subprocess.run(
-            [sys.executable, "-c", validator, account, region, role_arn, runtime_id],
+            [
+                sys.executable,
+                "-c",
+                validator,
+                account,
+                region,
+                role_arn,
+                runtime_id,
+                TEST_RUNTIME_IMAGE_URI,
+            ],
             env=env,
             capture_output=True,
             text=True,
@@ -424,6 +462,26 @@ def test_deploy_runtime_metadata_validator_is_fail_closed() -> None:
         {**valid, "agentRuntimeVersion": "2"},
         {**valid, "status": "UPDATING"},
         {**valid, "roleArn": role_arn.replace("openclaw-agentcore", "unexpected")},
+        {**valid, "agentRuntimeArtifact": {}},
+        {
+            **valid,
+            "agentRuntimeArtifact": {
+                "containerConfiguration": {
+                    "containerUri": TEST_RUNTIME_IMAGE_URI.replace("a" * 64, "b" * 64)
+                }
+            },
+        },
+        {
+            **valid,
+            "agentRuntimeArtifact": {
+                "containerConfiguration": {
+                    "containerUri": (
+                        "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
+                        "personal-operator/bridge:latest"
+                    )
+                }
+            },
+        },
     ]
     for invalid in invalid_documents:
         completed = run(invalid)
@@ -651,8 +709,10 @@ def test_e2e_region_resolver_rejects_explicit_wrong_region_before_clients(monkey
 
 
 TEST_RUNTIME_ID = "openclaw_agent-0123456789"
-TEST_RUNTIME_ENDPOINT_ID = "DEFAULT-0123456789"
-TEST_RUNTIME_ENDPOINT_NAME = "DEFAULT"
+TEST_SOURCE_COMMIT = "a" * 40
+TEST_RUNTIME_ENDPOINT_ID = "release_endpoint-0123456789"
+TEST_RUNTIME_ENDPOINT_NAME = f"release_{TEST_SOURCE_COMMIT}"
+TEST_RUNTIME_VERSION = "1"
 TEST_RUNTIME_ARN = (
     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
     "agent/12345678-1234-1234-1234-123456789abc:1"
@@ -660,6 +720,10 @@ TEST_RUNTIME_ARN = (
 TEST_RUNTIME_IAM_ARN = (
     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
     f"runtime/{TEST_RUNTIME_ID}"
+)
+TEST_RUNTIME_IMAGE_URI = (
+    "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
+    "personal-operator/bridge@sha256:" + "a" * 64
 )
 
 
@@ -671,10 +735,13 @@ def _build_agentcore_stack(
 
     account = "123456789012"
     context = {
+        "runtime_source_commit": TEST_SOURCE_COMMIT,
         "runtime_id": TEST_RUNTIME_ID,
         "runtime_endpoint_id": TEST_RUNTIME_ENDPOINT_ID,
         "runtime_endpoint_name": TEST_RUNTIME_ENDPOINT_NAME,
+        "runtime_version": TEST_RUNTIME_VERSION,
         "runtime_arn": TEST_RUNTIME_ARN,
+        "runtime_image_uri": TEST_RUNTIME_IMAGE_URI,
         "user_files_ttl_days": "30",
         "enable_browser": "false",
     }
@@ -691,6 +758,9 @@ def _build_agentcore_stack(
         cmk_arn=f"arn:aws:kms:{region}:{account}:key/test-key",
         vpc=vpc,
         private_subnet_ids=["subnet-00000000000000001"],
+        workspace_capability_secret_name=(
+            "personal-operator/workspace-capability"
+        ),
         env=env,
     )
     return stack
@@ -706,34 +776,46 @@ def _synth_agentcore_template(region: str = "eu-west-1") -> dict:
 def test_agentcore_stack_uses_only_persisted_runtime_arn() -> None:
     stack = _build_agentcore_stack()
 
+    assert stack.runtime_source_commit == TEST_SOURCE_COMMIT
     assert stack.runtime_arn == TEST_RUNTIME_ARN
     assert stack.runtime_iam_arn == TEST_RUNTIME_IAM_ARN
     assert stack.runtime_endpoint_id == TEST_RUNTIME_ENDPOINT_ID
     assert stack.runtime_endpoint_name == TEST_RUNTIME_ENDPOINT_NAME
+    assert stack.runtime_version == TEST_RUNTIME_VERSION
+    assert stack.runtime_image_uri == TEST_RUNTIME_IMAGE_URI
 
 
 def test_agentcore_stack_allows_only_fully_empty_offline_runtime_context() -> None:
     stack = _build_agentcore_stack(
         context_overrides={
+            "runtime_source_commit": "",
             "runtime_id": "",
             "runtime_endpoint_id": "",
             "runtime_endpoint_name": "",
+            "runtime_version": "",
             "runtime_arn": "",
+            "runtime_image_uri": "",
         }
     )
 
     assert stack.runtime_arn == "PLACEHOLDER"
+    assert stack.runtime_source_commit == "PLACEHOLDER"
     assert stack.runtime_iam_arn == "PLACEHOLDER"
     assert stack.runtime_endpoint_id == "PLACEHOLDER"
     assert stack.runtime_endpoint_name == "PLACEHOLDER"
+    assert stack.runtime_version == "PLACEHOLDER"
+    assert stack.runtime_image_uri == "PLACEHOLDER"
 
 
 def test_agentcore_stack_rejects_incomplete_or_noncanonical_runtime_context() -> None:
     invalid_contexts = [
+        {"runtime_source_commit": ""},
         {"runtime_arn": ""},
         {"runtime_id": ""},
         {"runtime_endpoint_id": ""},
         {"runtime_endpoint_name": ""},
+        {"runtime_version": ""},
+        {"runtime_image_uri": ""},
         {
             "runtime_arn": (
                 "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
@@ -752,7 +834,26 @@ def test_agentcore_stack_rejects_incomplete_or_noncanonical_runtime_context() ->
         },
         {"runtime_id": "runtime-test"},
         {"runtime_endpoint_id": "endpoint-test"},
-        {"runtime_endpoint_name": "NOT_DEFAULT"},
+        {"runtime_source_commit": "A" * 40},
+        {"runtime_endpoint_name": "DEFAULT"},
+        {"runtime_endpoint_name": "release_" + "b" * 40},
+        {"runtime_version": "2"},
+        {
+            "runtime_image_uri": (
+                "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
+                "personal-operator/bridge:latest"
+            )
+        },
+        {
+            "runtime_image_uri": TEST_RUNTIME_IMAGE_URI.replace(
+                "123456789012", "999999999999"
+            )
+        },
+        {
+            "runtime_image_uri": TEST_RUNTIME_IMAGE_URI.replace(
+                "eu-west-1", "us-east-1"
+            )
+        },
     ]
 
     for context_overrides in invalid_contexts:
@@ -789,11 +890,26 @@ def _synth_router_template(
         slack_token_secret_name="openclaw/channels/slack",
         feishu_token_secret_name="openclaw/channels/feishu",
         webhook_secret_name="openclaw/webhook-secret",
+        workspace_capability_secret_name=(
+            "personal-operator/workspace-capability"
+        ),
+        workspace_broker_role_arn=(
+            f"arn:aws:iam::{account}:role/"
+            "personal-operator-workspace-credential-broker-eu-west-1"
+        ),
+        workspace_broker_function_name=(
+            "personal-operator-workspace-credential-broker"
+        ),
+        workspace_session_role_arn=(
+            f"arn:aws:iam::{account}:role/"
+            "openclaw-workspace-session-role-eu-west-1"
+        ),
         cmk_arn=f"arn:aws:kms:eu-west-1:{account}:key/test-key",
         user_files_bucket_name="openclaw-user-files-test",
         user_files_bucket_arn=(
             f"arn:aws:s3:::openclaw-user-files-{account}-eu-west-1"
         ),
+        trusted_code_asset_root="lambda",
         env=Environment(account=account, region="eu-west-1"),
     )
     return Template.from_stack(stack).to_json()
@@ -902,7 +1018,7 @@ def _flatten_statement_actions(statements: list[dict]) -> list[str]:
     return actions
 
 
-def test_synthesized_workspace_role_has_exact_trust_and_base_authority() -> None:
+def test_synthesized_workspace_role_trusts_only_the_credential_broker() -> None:
     template = _synth_agentcore_template()
     role, statements = _role_and_statements(
         template, "openclaw-workspace-session-role-eu-west-1"
@@ -927,7 +1043,7 @@ def test_synthesized_workspace_role_has_exact_trust_and_base_authority() -> None
         "ArnEquals": {
             "aws:PrincipalArn": (
                 "arn:aws:iam::123456789012:role/"
-                "openclaw-agentcore-execution-role-eu-west-1"
+                "personal-operator-workspace-credential-broker-eu-west-1"
             )
         },
         "StringLike": {"sts:RoleSessionName": "workspace-*"},
@@ -985,7 +1101,7 @@ def test_synthesized_workspace_role_has_exact_trust_and_base_authority() -> None
     }
 
 
-def test_synthesized_execution_role_has_only_exact_workspace_assume_authority() -> None:
+def test_synthesized_runtime_has_no_sts_and_invokes_only_the_credential_broker() -> None:
     template = _synth_agentcore_template()
     _, statements = _role_and_statements(
         template, "openclaw-agentcore-execution-role-eu-west-1"
@@ -997,15 +1113,40 @@ def test_synthesized_execution_role_has_only_exact_workspace_assume_authority() 
     assert not any(action.startswith("secretsmanager:") for action in actions)
     assert not any(action.startswith("iam:") for action in actions)
     assert "iam:PassRole" not in actions
-    assert [action for action in actions if action.startswith("sts:")] == [
-        "sts:AssumeRole"
-    ]
-    assume_statements = [
+    assert [action for action in actions if action.startswith("sts:")] == []
+    invoke_statements = [
         statement
         for statement in statements
+        if statement.get("Action") == "lambda:InvokeFunction"
+    ]
+    assert invoke_statements == [
+        {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": (
+                "arn:aws:lambda:eu-west-1:123456789012:function:"
+                "personal-operator-workspace-credential-broker"
+            ),
+        }
+    ]
+
+
+def test_synthesized_credential_broker_is_the_sole_workspace_role_assumer() -> None:
+    template = _synth_agentcore_template()
+    _, broker_statements = _role_and_statements(
+        template,
+        "personal-operator-workspace-credential-broker-eu-west-1",
+    )
+    _, runtime_statements = _role_and_statements(
+        template, "openclaw-agentcore-execution-role-eu-west-1"
+    )
+
+    broker_assume = [
+        statement
+        for statement in broker_statements
         if statement.get("Action") == "sts:AssumeRole"
     ]
-    assert assume_statements == [
+    assert broker_assume == [
         {
             "Action": "sts:AssumeRole",
             "Effect": "Allow",
@@ -1014,6 +1155,53 @@ def test_synthesized_execution_role_has_only_exact_workspace_assume_authority() 
                 "openclaw-workspace-session-role-eu-west-1"
             ),
         }
+    ]
+    assert not any(
+        action.startswith("s3:")
+        for action in _flatten_statement_actions(broker_statements)
+    )
+    assert not any(
+        action.startswith("sts:")
+        for action in _flatten_statement_actions(runtime_statements)
+    )
+
+    broker_kms = [
+        statement
+        for statement in broker_statements
+        if statement.get("Resource")
+        == "arn:aws:kms:eu-west-1:123456789012:key/test-key"
+        and any(
+            action.startswith("kms:")
+            for action in (
+                statement["Action"]
+                if isinstance(statement["Action"], list)
+                else [statement["Action"]]
+            )
+        )
+    ]
+    assert broker_kms == [
+        {
+            "Action": "kms:Decrypt",
+            "Condition": {
+                "StringEquals": {
+                    "kms:CallerAccount": "123456789012",
+                    "kms:ViaService": "secretsmanager.eu-west-1.amazonaws.com",
+                }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:kms:eu-west-1:123456789012:key/test-key",
+        },
+        {
+            "Action": ["kms:Decrypt", "kms:DescribeKey"],
+            "Condition": {
+                "StringEquals": {
+                    "kms:CallerAccount": "123456789012",
+                    "kms:ViaService": "dynamodb.eu-west-1.amazonaws.com",
+                }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:kms:eu-west-1:123456789012:key/test-key",
+        },
     ]
 
 
@@ -1142,8 +1330,11 @@ def test_shell_region_guards_fail_before_aws_cli(tmp_path: Path) -> None:
                 "PATH": f"{poison_bin}:{env['PATH']}",
             }
         )
+        arguments = ["bash", str(ROOT / relative_script)]
+        if relative_script == "scripts/deploy.sh":
+            arguments.append("--phase1")
         completed = subprocess.run(
-            ["bash", str(ROOT / relative_script)],
+            arguments,
             cwd=ROOT,
             env=env,
             capture_output=True,
@@ -1153,6 +1344,40 @@ def test_shell_region_guards_fail_before_aws_cli(tmp_path: Path) -> None:
         assert completed.returncode == 1
         assert "must be exactly eu-west-1" in completed.stderr
         assert not marker.exists(), f"{relative_script} called aws before region gate"
+
+
+def test_e2e_script_rejects_mismatched_private_telegram_identity_before_aws(
+    tmp_path: Path,
+) -> None:
+    poison_bin = tmp_path / "bin"
+    poison_bin.mkdir()
+    marker = tmp_path / "aws-called"
+    _write_executable(
+        poison_bin / "aws",
+        '#!/usr/bin/env bash\ntouch "$AWS_POISON_MARKER"\nexit 97\n',
+    )
+    env = _without_aws_regions()
+    env.update(
+        {
+            "AWS_POISON_MARKER": str(marker),
+            "E2E_TELEGRAM_CHAT_ID": "10001",
+            "E2E_TELEGRAM_USER_ID": "10002",
+            "PATH": f"{poison_bin}:{env['PATH']}",
+        }
+    )
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "scripts/e2e-deploy-and-test.sh")],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "same positive private Telegram ID" in completed.stderr
+    assert not marker.exists()
 
 
 def test_setup_and_allowlist_scripts_default_to_canonical_region(
@@ -1288,4 +1513,21 @@ def test_synthesized_security_stack_has_only_active_control_plane_secrets() -> N
         "openclaw/channels/slack",
         "openclaw/channels/feishu",
         "openclaw/webhook-secret",
+        "personal-operator/web-auth",
+        "personal-operator/approval-signing",
+        "personal-operator/cloudfront-origin-verification",
+        "personal-operator/google-readonly-oauth",
+        "personal-operator/google-send-oauth",
+        "personal-operator/openai-api-key",
+        "personal-operator/workspace-capability",
     }
+    send_secret = next(
+        resource
+        for resource in resources
+        if resource["Type"] == "AWS::SecretsManager::Secret"
+        and resource["Properties"]["Name"]
+        == "personal-operator/google-send-oauth"
+    )
+    assert '"user_id": "REPLACE_ME"' in send_secret["Properties"][
+        "GenerateSecretString"
+    ]["SecretStringTemplate"]

@@ -498,7 +498,7 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agen
 | `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
 | `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID for Claude Opus 4.6. The `global.` prefix routes to any available region |
 | `runtime_id` | (empty) | AgentCore Runtime ID from Starter Toolkit. Populated by deploy script after `agentcore deploy` |
-| `runtime_endpoint_id` | (empty) | AgentCore Runtime Endpoint ID. Typically `DEFAULT` when using Starter Toolkit |
+| `runtime_endpoint_id` | (empty) | Exact service endpoint ID for the separately provisioned release endpoint; mutable `DEFAULT` endpoints are rejected |
 | `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
 | `cloudwatch_log_retention_days` | `30` | Log retention |
 | `daily_token_budget` | `1000000` | Token budget alarm threshold |

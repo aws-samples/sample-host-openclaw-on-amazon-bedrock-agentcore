@@ -12,6 +12,7 @@ from collections.abc import Mapping
 try:
     from .runtime_state import (
         DuplicateTraceUncertain,
+        InactivityFenceLost,
         LeaseLost,
         RuntimeRecord,
         RuntimeState,
@@ -29,6 +30,7 @@ try:
 except ImportError:  # direct router Lambda asset and focused tests
     from runtime_state import (
         DuplicateTraceUncertain,
+        InactivityFenceLost,
         LeaseLost,
         RuntimeRecord,
         RuntimeState,
@@ -64,6 +66,7 @@ _FORBIDDEN_REQUEST_FIELDS = frozenset(
         "leaseOwner",
         "leaseEpoch",
         "invocationId",
+        "workspaceCapability",
     }
 )
 
@@ -78,6 +81,13 @@ class RuntimeInvocationUncertain(RuntimeDriverError):
 
 class AgentCoreStopUncertain(RuntimeDriverError):
     pass
+
+
+class NoWorkspaceCapabilitySigner:
+    """Explicitly disables model invocation for status/purge-only drivers."""
+
+    def mint(self, **_kwargs) -> str:
+        raise RuntimeError("workspace capability minting is disabled")
 
 
 class AgentCoreAdapter:
@@ -244,6 +254,7 @@ class RuntimeDriver:
         *,
         repository,
         adapter: AgentCoreAdapter,
+        workspace_capability_signer,
         owner_factory=None,
         session_id_factory=None,
         lease_ms: int = 120_000,
@@ -252,6 +263,8 @@ class RuntimeDriver:
     ) -> None:
         if max_execution_ms <= 0:
             raise ValueError("maximum execution authority must be positive")
+        if not callable(getattr(workspace_capability_signer, "mint", None)):
+            raise TypeError("workspace capability signer is required")
         if lease_ms <= max_execution_ms:
             raise ValueError("lease duration must outlive maximum execution authority")
         if (
@@ -263,6 +276,7 @@ class RuntimeDriver:
             raise ValueError("repository and AgentCore runtime binding disagree")
         self.repository = repository
         self.adapter = adapter
+        self.workspace_capability_signer = workspace_capability_signer
         self.owner_factory = owner_factory or (lambda: f"op-{uuid.uuid4().hex}")
         self.session_id_factory = session_id_factory or generate_session_id
         self.lease_ms = lease_ms
@@ -605,6 +619,29 @@ class RuntimeDriver:
                 "runtime invocation outcome is unknown and was not retried"
             ) from error
 
+    def _workspace_capability(self, lease: RuntimeRecord) -> str:
+        try:
+            capability = self.workspace_capability_signer.mint(
+                user_id=lease.user_id,
+                session_id=lease.session_id,
+            )
+        except Exception as error:
+            self._quarantine(lease)
+            raise RuntimeInvocationUncertain(
+                "workspace capability could not be minted"
+            ) from error
+        if (
+            not isinstance(capability, str)
+            or not capability
+            or not capability.isascii()
+            or len(capability.encode("ascii")) > 2_048
+        ):
+            self._quarantine(lease)
+            raise RuntimeInvocationUncertain(
+                "workspace capability signer returned an invalid token"
+            )
+        return capability
+
     def _with_heartbeat(self, lease: RuntimeRecord, operation):
         try:
             active_lease = self.repository.heartbeat(
@@ -645,7 +682,7 @@ class RuntimeDriver:
         user_id = canonical_user_id(user_id)
         trace_id = self._trace(trace_id)
         request = self._validated_request(user_id, request)
-        payload = {
+        payload_base = {
             "action": "chat",
             "internalUserId": user_id,
             "namespace": user_id,
@@ -654,8 +691,17 @@ class RuntimeDriver:
             "message": request["message"],
             "invocationId": trace_id,
         }
-        self._validate_payload_json_bound(payload)
+        # Reject oversized caller content before acquiring durable execution
+        # authority, reserving the broker token's full bounded size.
+        self._validate_payload_json_bound(
+            {**payload_base, "workspaceCapability": "x" * 2_048}
+        )
         lease = self._acquire(user_id, trace_id)
+        payload = {
+            **payload_base,
+            "workspaceCapability": self._workspace_capability(lease),
+        }
+        self._validate_payload_json_bound(payload)
         response, receipt = self._invoke_with_receipt(
             lease, payload=payload, trace_id=trace_id
         )
@@ -692,6 +738,7 @@ class RuntimeDriver:
             "action": "snapshot",
             "internalUserId": user_id,
             "namespace": user_id,
+            "workspaceCapability": self._workspace_capability(lease),
         }
         _, receipt = self._invoke_with_receipt(
             lease, payload=payload, trace_id=trace_id
@@ -755,4 +802,56 @@ class RuntimeDriver:
                 except LeaseLost:
                     pass
             raise RuntimeInvocationUncertain("runtime purge stop was not proven") from error
+        return result.public()
+
+    def purge_inactive(
+        self,
+        user_id: str,
+        *,
+        observed_updated_at_ms: int,
+        observed_revision: int,
+        inactive_before_ms: int,
+    ) -> dict | None:
+        """Purge only if the scheduler's exact inactive snapshot is still live."""
+
+        user_id = canonical_user_id(user_id)
+        owner = self.owner_factory()
+        try:
+            lease = self.repository.begin_inactive_purge(
+                user_id,
+                owner=owner,
+                lease_ms=self.lease_ms,
+                observed_updated_at_ms=observed_updated_at_ms,
+                observed_revision=observed_revision,
+                inactive_before_ms=inactive_before_ms,
+            )
+        except InactivityFenceLost:
+            return None
+        try:
+            if lease.session_id:
+                self._synchronized_stop(lease)
+            result = self.repository.finish_inactive_stop(lease)
+        except Exception as error:
+            marker = getattr(self.repository, "mark_purge_uncertain", None)
+            if marker:
+                try:
+                    marker(lease)
+                except LeaseLost:
+                    pass
+            raise RuntimeInvocationUncertain(
+                "inactive runtime purge stop was not proven"
+            ) from error
+        return result.public()
+
+    def complete_inactive_purge(self, user_id: str) -> dict:
+        """Reset a stopped, namespace-purged workspace to a fresh cold session."""
+
+        user_id = canonical_user_id(user_id)
+        current = self.repository.get(user_id)
+        if current is None:
+            raise RuntimeUnavailable("runtime does not exist")
+        result = self.repository.complete_workspace_expiry(
+            current,
+            session_id=canonical_session_id(self.session_id_factory()),
+        )
         return result.public()

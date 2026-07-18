@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Every behavior change follows red-green-refactor and receives a separate review before the next task starts.
 
-**Goal:** Replace the imported experimental OpenClaw runtime with a fail-closed, single-user runtime that exposes only four namespaced workspace tools plus safe URL retrieval, never receives product/provider authority, and preserves user workspace bytes and deletions across restarts.
+**Goal:** Replace the imported experimental OpenClaw runtime with a fail-closed, single-user runtime that exposes only four namespaced workspace tools, never receives product/provider authority, and preserves user workspace bytes and deletions across restarts.
 
 **Architecture:** OpenClaw remains the conversational runtime, but it runs with the `minimal` tool profile and one repository-owned plugin loaded from an explicit path. The plugin derives the user's S3 namespace only from server-controlled environment, while the trusted Node contract owns initialization and credential setup. A session is immutably bound to one canonical user. Restore completes before OpenClaw starts, and synchronization uses a manifest so failed copies and user deletions cannot silently resurrect data.
 
@@ -10,7 +10,7 @@
 
 ## Frozen Security Decisions
 
-- OpenClaw's exact approved tools are `session_status`, `web_fetch`, `po_file_list`, `po_file_read`, `po_file_write`, and `po_file_delete`. Search is deferred: the pinned key-free DuckDuckGo provider reached a bot challenge in a live gateway proof and is not enabled or claimed.
+- OpenClaw's exact approved tools are `po_file_list`, `po_file_read`, `po_file_write`, and `po_file_delete`. The `minimal` profile's mutable `session_status` built-in is explicitly denied, and the visible model catalog contains only the loopback `agentcore/bedrock-agentcore` route with no fallback. URL retrieval and search are deferred. No model-callable network tool may be combined with credential-bearing workspace reads; a future reader must authorize exact user-selected targets outside the model tool loop.
 - `exec`, `process`, generic filesystem tools, browser tools, cron, gateway controls, cross-session tools, subagents, arbitrary plugins, arbitrary MCP servers, ClawHub, and user API-key storage are forbidden.
 - Linux/code execution is disabled in this credential-bearing runtime. A later credential-free sandbox may provide it through a typed capability boundary.
 - The only loaded plugin is `personal-operator`, from `/app/plugins/personal-operator`; the plugin accepts no user ID or S3 namespace argument.

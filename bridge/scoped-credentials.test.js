@@ -7,246 +7,77 @@ const os = require("node:os");
 const path = require("node:path");
 
 const {
-  buildSessionPolicy,
   createScopedCredentials,
   writeCredentialFiles,
   buildOpenClawEnv,
 } = require("./scoped-credentials");
 
-const ACCOUNT = "123456789012";
-const CMK_ARN = `arn:aws:kms:eu-west-1:${ACCOUNT}:key/abc-123`;
-const ROLE_ARN = `arn:aws:iam::${ACCOUNT}:role/personal-operator-workspace-session`;
 const MOCK_CREDS = {
   AccessKeyId: "ASIAIOSFODNN7EXAMPLE",
   SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
   SessionToken: "FwoGZXIvYXdzEBYaDH...",
-  Expiration: new Date(Date.now() + 30 * 60 * 1000),
+  Expiration: new Date(Date.now() + 10 * 60 * 1000),
 };
 
-function parsedPolicy(overrides = {}) {
-  return JSON.parse(
-    buildSessionPolicy({
-      bucket: "personal-operator-workspace",
-      namespace: "user_A",
-      ...overrides,
-    }),
-  );
-}
-
-function allActions(policy) {
-  return policy.Statement.flatMap((statement) =>
-    Array.isArray(statement.Action) ? statement.Action : [statement.Action],
-  );
-}
-
-function allResources(policy) {
-  return policy.Statement.flatMap((statement) =>
-    Array.isArray(statement.Resource) ? statement.Resource : [statement.Resource],
-  );
-}
-
-describe("exact workspace session policy", () => {
-  it("grants only exact namespace S3 object and prefix-list access", () => {
-    const policy = parsedPolicy();
-    assert.deepEqual(policy, {
-      Version: "2012-10-17",
-      Statement: [
-        {
-          Effect: "Allow",
-          Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-          Resource:
-            "arn:aws:s3:::personal-operator-workspace/user_A/*",
-        },
-        {
-          Effect: "Allow",
-          Action: "s3:ListBucket",
-          Resource: "arn:aws:s3:::personal-operator-workspace",
-          Condition: { StringLike: { "s3:prefix": "user_A/*" } },
-        },
-      ],
-    });
-  });
-
-  it("adds only exact-key KMS encryption operations with exact conditions", () => {
-    const policy = parsedPolicy({ cmkArn: CMK_ARN, callerAccount: ACCOUNT });
-    assert.deepEqual(policy.Statement[2], {
-      Effect: "Allow",
-      Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"],
-      Resource: CMK_ARN,
-      Condition: {
-        StringEquals: {
-          "kms:ViaService": "s3.eu-west-1.amazonaws.com",
-          "kms:CallerAccount": ACCOUNT,
-        },
-      },
-    });
-  });
-
-  it("contains no wildcard resource/action or non-S3/KMS authority", () => {
-    const policy = parsedPolicy({ cmkArn: CMK_ARN, callerAccount: ACCOUNT });
-    const actions = allActions(policy);
-    assert.deepEqual(new Set(actions), new Set([
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:DeleteObject",
-      "s3:ListBucket",
-      "kms:Encrypt",
-      "kms:Decrypt",
-      "kms:GenerateDataKey",
-    ]));
-    assert.equal(actions.some((action) => action.includes("*")), false);
-    assert.equal(allResources(policy).includes("*"), false);
-    assert.doesNotMatch(
-      JSON.stringify(policy),
-      /scheduler|events|eventbridge|dynamodb|secretsmanager|iam:|sts:|PassRole/i,
-    );
-  });
-
-  it("produces disjoint object resources and list prefixes for two users", () => {
-    const first = parsedPolicy({ namespace: "user_A" });
-    const second = parsedPolicy({ namespace: "user_B" });
-    assert.notEqual(first.Statement[0].Resource, second.Statement[0].Resource);
-    assert.notEqual(
-      first.Statement[1].Condition.StringLike["s3:prefix"],
-      second.Statement[1].Condition.StringLike["s3:prefix"],
-    );
-    assert.doesNotMatch(first.Statement[0].Resource, /user_B/);
-    assert.doesNotMatch(second.Statement[0].Resource, /user_A/);
-  });
-
-  it("rejects invalid buckets, namespaces, regions, and CMK accounts", () => {
-    for (const bucket of ["", "Bad_Bucket", "bucket/*", "bucket/name"] ) {
-      assert.throws(
-        () => buildSessionPolicy({ bucket, namespace: "user_A" }),
-        /bucket/i,
-      );
-    }
-    for (const namespace of ["", "a", "telegram:123", "../user_A"] ) {
-      assert.throws(
-        () => buildSessionPolicy({ bucket: "valid-bucket", namespace }),
-        /identity|namespace/i,
-      );
-    }
-    assert.throws(
-      () =>
-        parsedPolicy({
-          cmkArn: `arn:aws:kms:us-west-2:${ACCOUNT}:key/abc`,
-          callerAccount: ACCOUNT,
-        }),
-      /CMK|region/i,
-    );
-    assert.throws(
-      () => parsedPolicy({ cmkArn: CMK_ARN, callerAccount: "999999999999" }),
-      /CMK|account/i,
-    );
-  });
-});
-
-describe("fatal scoped credential minting", () => {
+describe("trusted broker credential issuance", () => {
   let env;
-  let stsClient;
+  let lambdaClient;
 
   beforeEach(() => {
     env = {
       AWS_REGION: "eu-west-1",
       AWS_DEFAULT_REGION: "eu-west-1",
-      S3_USER_FILES_BUCKET: "personal-operator-workspace",
-      WORKSPACE_SESSION_ROLE_ARN: ROLE_ARN,
-      CMK_ARN,
+      WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME:
+        "personal-operator-workspace-credential-broker",
     };
-    stsClient = {
-      send: mock.fn(async () => ({ Credentials: { ...MOCK_CREDS } })),
+    lambdaClient = {
+      send: mock.fn(async () => ({
+        StatusCode: 200,
+        Payload: Buffer.from(
+          JSON.stringify({
+            Version: 1,
+            AccessKeyId: MOCK_CREDS.AccessKeyId,
+            SecretAccessKey: MOCK_CREDS.SecretAccessKey,
+            SessionToken: MOCK_CREDS.SessionToken,
+            Expiration: MOCK_CREDS.Expiration.toISOString(),
+          }),
+        ),
+      })),
     };
   });
 
-  it("assumes only the workspace session role with a bounded workspace name", async () => {
-    const result = await createScopedCredentials("user_A", { env, stsClient });
+  it("sends only the opaque capability to the exact trusted broker", async () => {
+    const result = await createScopedCredentials("signed.capability", {
+      env,
+      lambdaClient,
+    });
     assert.equal(result.accessKeyId, MOCK_CREDS.AccessKeyId);
-    assert.equal(stsClient.send.mock.calls.length, 1);
-    const input = stsClient.send.mock.calls[0].arguments[0].input;
-    assert.equal(input.RoleArn, ROLE_ARN);
-    assert.match(input.RoleSessionName, /^workspace-[A-Za-z0-9_-]+$/);
-    assert.ok(input.RoleSessionName.length <= 64);
-    assert.equal(input.DurationSeconds, 3600);
-    assert.deepEqual(
-      new Set(allActions(JSON.parse(input.Policy))),
-      new Set([
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject",
-        "s3:ListBucket",
-        "kms:Encrypt",
-        "kms:Decrypt",
-        "kms:GenerateDataKey",
-      ]),
-    );
+    assert.equal(lambdaClient.send.mock.calls.length, 1);
+    const input = lambdaClient.send.mock.calls[0].arguments[0].input;
+    assert.deepEqual(input, {
+      FunctionName: "personal-operator-workspace-credential-broker",
+      InvocationType: "RequestResponse",
+      Payload: Buffer.from(JSON.stringify({ capability: "signed.capability" })),
+    });
+    assert.doesNotMatch(JSON.stringify(input), /RoleArn|Policy|namespace|user_A/);
   });
 
-  it("derives deterministic and namespace-distinct role session names", async () => {
-    await createScopedCredentials("user_A", { env, stsClient });
-    await createScopedCredentials("user_A", { env, stsClient });
-    await createScopedCredentials("user_B", { env, stsClient });
-    const names = stsClient.send.mock.calls.map(
-      (call) => call.arguments[0].input.RoleSessionName,
-    );
-
-    assert.equal(names[0], names[1]);
-    assert.notEqual(names[0], names[2]);
-    assert.ok(names.every((name) => name.length <= 64));
-  });
-
-  it("does not accept EXECUTION_ROLE_ARN as a fallback", async () => {
-    delete env.WORKSPACE_SESSION_ROLE_ARN;
-    env.EXECUTION_ROLE_ARN =
-      `arn:aws:iam::${ACCOUNT}:role/personal-operator-execution`;
+  it("requires exact broker configuration and rejects ambient legacy role inputs", async () => {
+    delete env.WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME;
+    env.WORKSPACE_SESSION_ROLE_ARN = "arn:aws:iam::123456789012:role/legacy";
+    env.CMK_ARN = "arn:aws:kms:eu-west-1:123456789012:key/legacy";
     await assert.rejects(
-      () => createScopedCredentials("user_A", { env, stsClient }),
-      /WORKSPACE_SESSION_ROLE_ARN/,
+      () => createScopedCredentials("signed.capability", { env, lambdaClient }),
+      /WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME/,
     );
-    assert.equal(stsClient.send.mock.calls.length, 0);
+    assert.equal(lambdaClient.send.mock.calls.length, 0);
   });
 
-  it("rejects a workspace role and CMK from different accounts before STS", async () => {
-    const poisoned = {
-      ...env,
-      WORKSPACE_SESSION_ROLE_ARN:
-        "arn:aws:iam::999999999999:role/personal-operator-workspace-session",
-    };
-
-    await assert.rejects(
-      () => createScopedCredentials("user_A", { env: poisoned, stsClient }),
-      /CMK account must equal the caller account/i,
-    );
-    assert.equal(stsClient.send.mock.calls.length, 0);
-  });
-
-  it("rejects malformed role and non-key KMS ARNs before STS", async () => {
-    for (const poisoned of [
-      { ...env, WORKSPACE_SESSION_ROLE_ARN: "arn:aws:iam::123:role/bad" },
-      {
-        ...env,
-        CMK_ARN: `arn:aws:kms:eu-west-1:${ACCOUNT}:alias/workspace`,
-      },
-    ]) {
+  it("fails before broker invocation for malformed capability or wrong region", async () => {
+    for (const capability of ["", "x".repeat(2049), "not ascii 💥"]) {
       await assert.rejects(
-        () => createScopedCredentials("user_A", { env: poisoned, stsClient }),
-        /role|CMK|key|ARN/i,
-      );
-    }
-    assert.equal(stsClient.send.mock.calls.length, 0);
-  });
-
-  it("fails before STS for missing configuration or an explicit wrong region", async () => {
-    for (const key of [
-      "S3_USER_FILES_BUCKET",
-      "WORKSPACE_SESSION_ROLE_ARN",
-      "CMK_ARN",
-    ]) {
-      const poisoned = { ...env };
-      delete poisoned[key];
-      await assert.rejects(
-        () => createScopedCredentials("user_A", { env: poisoned, stsClient }),
-        new RegExp(key),
+        () => createScopedCredentials(capability, { env, lambdaClient }),
+        /capability/i,
       );
     }
     for (const poisoned of [
@@ -254,26 +85,37 @@ describe("fatal scoped credential minting", () => {
       { ...env, AWS_DEFAULT_REGION: "us-west-2" },
     ]) {
       await assert.rejects(
-        () => createScopedCredentials("user_A", { env: poisoned, stsClient }),
+        () => createScopedCredentials("signed.capability", {
+          env: poisoned,
+          lambdaClient,
+        }),
         /eu-west-1|region/i,
       );
     }
-    assert.equal(stsClient.send.mock.calls.length, 0);
+    assert.equal(lambdaClient.send.mock.calls.length, 0);
   });
 
-  it("fails on malformed, incomplete, or expired STS credentials", async () => {
-    for (const credentials of [
-      undefined,
-      {},
-      { ...MOCK_CREDS, AccessKeyId: "" },
-      { ...MOCK_CREDS, SecretAccessKey: "" },
-      { ...MOCK_CREDS, SessionToken: "" },
-      { ...MOCK_CREDS, Expiration: new Date(Date.now() - 1_000) },
+  it("fails closed on broker function errors and malformed credentials", async () => {
+    for (const response of [
+      { StatusCode: 500, Payload: Buffer.from("{}") },
+      { StatusCode: 200, FunctionError: "Unhandled", Payload: Buffer.from("{}") },
+      { StatusCode: 200, Payload: Buffer.from("not-json") },
+      { StatusCode: 200, Payload: Buffer.from("{}") },
+      {
+        StatusCode: 200,
+        Payload: Buffer.from(JSON.stringify({
+          Version: 1,
+          AccessKeyId: MOCK_CREDS.AccessKeyId,
+          SecretAccessKey: MOCK_CREDS.SecretAccessKey,
+          SessionToken: MOCK_CREDS.SessionToken,
+          Expiration: new Date(Date.now() + 16 * 60 * 1000).toISOString(),
+        })),
+      },
     ]) {
-      const client = { send: async () => ({ Credentials: credentials }) };
+      const client = { send: async () => response };
       await assert.rejects(
-        () => createScopedCredentials("user_A", { env, stsClient: client }),
-        /credentials|expired/i,
+        () => createScopedCredentials("signed.capability", { env, lambdaClient: client }),
+        /broker|credentials|response/i,
       );
     }
   });
@@ -331,7 +173,7 @@ describe("credential files and OpenClaw child environment", () => {
     const refreshed = {
       ...credentials,
       accessKeyId: "ASIAREFRESHED",
-      expiration: new Date(Date.now() + 45 * 60 * 1000),
+      expiration: new Date(Date.now() + 8 * 60 * 1000),
     };
     writeCredentialFiles(refreshed, tmpDir);
     const document = JSON.parse(

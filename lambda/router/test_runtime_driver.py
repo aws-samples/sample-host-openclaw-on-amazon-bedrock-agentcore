@@ -20,6 +20,7 @@ from runtime_driver import (
 )
 from runtime_state import (
     ALL_RUNTIME_STATES,
+    InactivityFenceLost,
     LeaseBusy,
     LeaseLost,
     RuntimeRecord,
@@ -51,6 +52,8 @@ OTHER_RUNTIME_ARN = (
     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:agent/"
     "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1"
 )
+SOURCE_COMMIT = "a" * 40
+RELEASE_ENDPOINT = f"release_{SOURCE_COMMIT}"
 
 
 class AwsServiceError(Exception):
@@ -72,7 +75,7 @@ def record(**changes) -> RuntimeRecord:
         user_id=USER,
         session_id=SESSION,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         state=RuntimeState.COLD,
         revision=1,
         lease_owner=None,
@@ -113,6 +116,14 @@ def item_from_record(value: RuntimeRecord) -> dict:
         "tombstonedAt": value.tombstoned_at,
         "lastMutationId": value.last_mutation_id,
         "stopOperationId": value.stop_operation_id,
+        "purgeReason": value.purge_reason,
+        "purgeCompletedAt": value.purge_completed_at,
+        "workspaceStopVerifiedAt": value.workspace_stop_verified_at,
+        "purgeObservedUpdatedAt": value.purge_observed_updated_at,
+        "purgeObservedRevision": value.purge_observed_revision,
+        "purgeInactiveBefore": value.purge_inactive_before,
+        "lastPurgeReason": value.last_purge_reason,
+        "lastPurgeCompletedAt": value.last_purge_completed_at,
     }
     item.update({key: field for key, field in optional.items() if field is not None})
     return item
@@ -161,7 +172,7 @@ def test_ensure_conditionally_creates_server_session_then_reads_race_winner():
             "userId": USER,
             "sessionId": SESSION,
             "runtimeArn": RUNTIME_ARN_V2,
-            "runtimeQualifier": "DEFAULT",
+            "runtimeQualifier": RELEASE_ENDPOINT,
             "state": "COLD",
             "revision": 1,
             "leaseEpoch": 0,
@@ -172,7 +183,7 @@ def test_ensure_conditionally_creates_server_session_then_reads_race_winner():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 1_000,
         session_id_factory=lambda: NEW_SESSION,
     )
@@ -199,7 +210,7 @@ def test_ensure_refuses_same_item_tombstone_after_create_race():
         "Item": {
             "userId": USER,
             "runtimeArn": RUNTIME_ARN_V2,
-            "runtimeQualifier": "DEFAULT",
+            "runtimeQualifier": RELEASE_ENDPOINT,
             "state": "DELETING",
             "revision": 4,
             "leaseEpoch": 3,
@@ -211,7 +222,7 @@ def test_ensure_refuses_same_item_tombstone_after_create_race():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 3,
     )
 
@@ -225,7 +236,7 @@ def test_ensure_persists_exact_runtime_binding_in_the_same_atomic_item():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 1_000,
         session_id_factory=lambda: NEW_SESSION,
     )
@@ -233,10 +244,10 @@ def test_ensure_persists_exact_runtime_binding_in_the_same_atomic_item():
     created = repo.ensure(USER)
 
     assert created.runtime_arn == RUNTIME_ARN_V2
-    assert created.runtime_qualifier == "DEFAULT"
+    assert created.runtime_qualifier == RELEASE_ENDPOINT
     item = table.put_item.call_args.kwargs["Item"]
     assert item["runtimeArn"] == RUNTIME_ARN_V2
-    assert item["runtimeQualifier"] == "DEFAULT"
+    assert item["runtimeQualifier"] == RELEASE_ENDPOINT
     assert item["lastMutationId"].startswith("mut_")
 
 
@@ -248,7 +259,7 @@ def test_lease_and_finalize_conditions_bind_exact_runtime_and_session():
             "userId": USER,
             "sessionId": SESSION,
             "runtimeArn": RUNTIME_ARN_V2,
-            "runtimeQualifier": "DEFAULT",
+            "runtimeQualifier": RELEASE_ENDPOINT,
             "state": "BUSY",
             "revision": 4,
             "leaseOwner": "other",
@@ -261,7 +272,7 @@ def test_lease_and_finalize_conditions_bind_exact_runtime_and_session():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -275,7 +286,7 @@ def test_lease_and_finalize_conditions_bind_exact_runtime_and_session():
     table.update_item.side_effect = conditional_error()
     lease = record(
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         state=RuntimeState.BUSY,
         lease_owner="owner",
         lease_epoch=7,
@@ -297,7 +308,7 @@ def test_acquire_uses_one_conditional_update_and_reports_live_owner():
             "userId": USER,
             "sessionId": SESSION,
             "runtimeArn": RUNTIME_ARN_V2,
-            "runtimeQualifier": "DEFAULT",
+            "runtimeQualifier": RELEASE_ENDPOINT,
             "state": "BUSY",
             "revision": 4,
             "leaseOwner": "other",
@@ -310,7 +321,7 @@ def test_acquire_uses_one_conditional_update_and_reports_live_owner():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -334,7 +345,7 @@ def test_acquire_returns_stale_lease_without_overwriting_it():
         "userId": USER,
         "sessionId": SESSION,
         "runtimeArn": RUNTIME_ARN_V2,
-        "runtimeQualifier": "DEFAULT",
+        "runtimeQualifier": RELEASE_ENDPOINT,
         "state": "BUSY",
         "revision": 4,
         "leaseOwner": "old",
@@ -347,7 +358,7 @@ def test_acquire_returns_stale_lease_without_overwriting_it():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -365,7 +376,7 @@ def test_finalize_and_release_are_fenced_by_owner_and_epoch():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
     lease = record(
@@ -398,7 +409,7 @@ def test_heartbeat_and_finalize_require_the_unexpired_owner_epoch_fence():
             "userId": USER,
             "sessionId": SESSION,
             "runtimeArn": RUNTIME_ARN_V2,
-            "runtimeQualifier": "DEFAULT",
+            "runtimeQualifier": RELEASE_ENDPOINT,
             "state": "BUSY",
             "revision": 2,
             "leaseOwner": "owner",
@@ -411,7 +422,7 @@ def test_heartbeat_and_finalize_require_the_unexpired_owner_epoch_fence():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
     lease = record(
@@ -436,7 +447,7 @@ def test_begin_purge_atomically_tombstones_even_when_runtime_never_existed():
         "Attributes": {
             "userId": USER,
             "runtimeArn": RUNTIME_ARN_V2,
-            "runtimeQualifier": "DEFAULT",
+            "runtimeQualifier": RELEASE_ENDPOINT,
             "state": "DELETING",
             "revision": 1,
             "leaseOwner": "purger",
@@ -450,7 +461,7 @@ def test_begin_purge_atomically_tombstones_even_when_runtime_never_existed():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -461,6 +472,8 @@ def test_begin_purge_atomically_tombstones_even_when_runtime_never_existed():
     assert "attribute_exists(userId)" not in kwargs["ConditionExpression"]
     assert "createdAt=if_not_exists(createdAt,:now)" in kwargs["UpdateExpression"]
     assert kwargs["ExpressionAttributeValues"][":until"] == 40_000
+    assert kwargs["ExpressionAttributeValues"][":purgeReason"] == "ACCOUNT_DELETION"
+    assert "purgeReason=:purgeReason" in kwargs["UpdateExpression"]
 
 
 def test_begin_purge_is_resumable_with_one_durable_stop_operation():
@@ -480,7 +493,7 @@ def test_begin_purge_is_resumable_with_one_durable_stop_operation():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -513,7 +526,7 @@ def test_already_finished_tombstone_makes_purge_idempotently_complete():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -533,7 +546,7 @@ def test_ambiguous_purge_stop_releases_lease_but_keeps_deleting_tombstone():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 50_000,
     )
     purging = record(
@@ -585,7 +598,7 @@ def test_ambiguous_finalize_reconciles_the_exact_deterministic_mutation():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -629,7 +642,7 @@ def test_ambiguous_stale_fence_reconciles_owner_epoch_and_stop_operation():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -670,7 +683,7 @@ def test_ambiguous_rotation_reconciles_new_session_and_exact_binding():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -698,6 +711,7 @@ def test_ambiguous_begin_purge_reconciles_tombstone_and_operation():
                     lease_expires_at=40_000,
                     stop_operation_id=values[":operation"],
                     last_mutation_id=values[":mutation"],
+                    purge_reason="ACCOUNT_DELETION",
                 )
             )
         }
@@ -707,7 +721,7 @@ def test_ambiguous_begin_purge_reconciles_tombstone_and_operation():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 10_000,
     )
 
@@ -721,10 +735,11 @@ class FakeRepository:
     def __init__(self, initial: RuntimeRecord | None = None):
         self.current = initial or record()
         self.runtime_arn = RUNTIME_ARN_V2
-        self.runtime_qualifier = "DEFAULT"
+        self.runtime_qualifier = RELEASE_ENDPOINT
         self.events = []
         self.acquire_error = None
         self.finalize_error = None
+        self.inactivity_fence_lost = False
         self.heartbeat_event = threading.Event()
 
     def ensure(self, user_id):
@@ -873,19 +888,89 @@ class FakeRepository:
             lease_epoch=self.current.lease_epoch + 1,
             lease_expires_at=50_000,
             stop_operation_id="op_" + "6" * 64,
+            purge_reason="ACCOUNT_DELETION",
+        )
+        return self.current
+
+    def begin_inactive_purge(
+        self,
+        user_id,
+        *,
+        owner,
+        lease_ms,
+        observed_updated_at_ms,
+        observed_revision,
+        inactive_before_ms,
+    ):
+        self.events.append(
+            (
+                "inactive-purge",
+                user_id,
+                owner,
+                observed_updated_at_ms,
+                observed_revision,
+                inactive_before_ms,
+            )
+        )
+        if self.inactivity_fence_lost:
+            raise InactivityFenceLost(user_id)
+        self.current = replace(
+            self.current,
+            state=RuntimeState.DELETING,
+            tombstoned_at=40_000,
+            lease_owner=owner,
+            lease_epoch=self.current.lease_epoch + 1,
+            lease_expires_at=50_000,
+            stop_operation_id="op_" + "5" * 64,
+            purge_reason="WORKSPACE_EXPIRY",
+            purge_observed_updated_at=observed_updated_at_ms,
+            purge_observed_revision=observed_revision,
+            purge_inactive_before=inactive_before_ms,
         )
         return self.current
 
     def finish_purge(self, lease):
         self.events.append(("purged", lease.lease_epoch))
-        self.current = replace(lease, session_id=None, lease_owner=None)
+        self.current = replace(
+            lease,
+            session_id=None,
+            lease_owner=None,
+            purge_completed_at=40_001,
+        )
+        return self.current
+
+    def finish_inactive_stop(self, lease):
+        self.events.append(("inactive-stopped", lease.lease_epoch))
+        self.current = replace(
+            lease,
+            session_id=None,
+            lease_owner=None,
+            lease_expires_at=None,
+            workspace_stop_verified_at=40_001,
+        )
+        return self.current
+
+    def complete_workspace_expiry(self, current, *, session_id):
+        self.events.append(("workspace-expiry-complete", session_id))
+        self.current = replace(
+            current,
+            session_id=session_id,
+            state=RuntimeState.COLD,
+            tombstoned_at=None,
+            purge_reason=None,
+            workspace_stop_verified_at=None,
+            lease_owner=None,
+            lease_expires_at=None,
+            last_purge_reason="WORKSPACE_EXPIRY",
+            last_purge_completed_at=40_002,
+        )
         return self.current
 
 
 class FakeAdapter:
     def __init__(self, response=None):
         self.runtime_arn = RUNTIME_ARN_V2
-        self.qualifier = "DEFAULT"
+        self.qualifier = RELEASE_ENDPOINT
         self.response = response or {
             "status": "ok",
             "internalUserId": USER,
@@ -924,16 +1009,48 @@ class FakeAdapter:
         return {"stopped": True, "notFound": False}
 
 
+class FakeWorkspaceCapabilitySigner:
+    def __init__(self):
+        self.calls = []
+
+    def mint(self, *, user_id, session_id):
+        self.calls.append((user_id, session_id))
+        return f"capability.{user_id}.{session_id}"
+
+
 def build_driver(repo=None, adapter=None):
     ids = iter(["owner-a", "owner-b", "owner-c"])
     sessions = iter([NEW_SESSION, "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
     return RuntimeDriver(
         repository=repo or FakeRepository(),
         adapter=adapter or FakeAdapter(),
+        workspace_capability_signer=FakeWorkspaceCapabilitySigner(),
         owner_factory=lambda: next(ids),
         session_id_factory=lambda: next(sessions),
         lease_ms=30_000,
         max_execution_ms=20_000,
+    )
+
+
+def test_runtime_driver_mints_capability_only_after_exact_session_acquisition():
+    repo = FakeRepository()
+    adapter = FakeAdapter()
+    signer = FakeWorkspaceCapabilitySigner()
+    driver = RuntimeDriver(
+        repository=repo,
+        adapter=adapter,
+        workspace_capability_signer=signer,
+        owner_factory=lambda: "owner-a",
+        session_id_factory=lambda: NEW_SESSION,
+        lease_ms=30_000,
+        max_execution_ms=20_000,
+    )
+
+    driver.invoke(USER, {"message": "hello"}, TRACE)
+
+    assert signer.calls == [(USER, SESSION)]
+    assert adapter.events[0][3]["workspaceCapability"] == (
+        f"capability.{USER}.{SESSION}"
     )
 
 
@@ -948,6 +1065,7 @@ def test_driver_heartbeats_long_running_invocation_under_same_fence():
     driver = RuntimeDriver(
         repository=repo,
         adapter=WaitingAdapter(),
+        workspace_capability_signer=FakeWorkspaceCapabilitySigner(),
         owner_factory=lambda: "owner-heartbeat",
         session_id_factory=lambda: NEW_SESSION,
         lease_ms=30_000,
@@ -970,6 +1088,7 @@ def test_driver_heartbeats_long_running_invocation_under_same_fence():
         "leaseOwner",
         "leaseEpoch",
         "invocationId",
+        "workspaceCapability",
     ],
 )
 def test_invoke_rejects_client_controlled_authority_fields(forbidden):
@@ -1000,6 +1119,7 @@ def test_successful_chat_uses_server_session_and_persists_bridge_receipt():
         "action": "chat",
         "internalUserId": USER,
         "namespace": USER,
+        "workspaceCapability": f"capability.{USER}.{SESSION}",
         "actorId": "telegram:5",
         "channel": "telegram",
         "message": "hello",
@@ -1213,7 +1333,7 @@ def test_same_trace_stale_lease_is_quarantined_without_reexecution():
 def test_runtime_version_mismatch_fences_stops_recorded_version_then_rotates_current():
     old = record(
         runtime_arn=RUNTIME_ARN_V1,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         state=RuntimeState.IDLE,
     )
     repo = FakeRepository(old)
@@ -1227,7 +1347,7 @@ def test_runtime_version_mismatch_fences_stops_recorded_version_then_rotates_cur
     stop = adapter.events[0]
     assert stop[0:2] == ("stop", SESSION)
     assert stop[2] == "op_" + "9" * 64
-    assert stop[3:5] == (RUNTIME_ARN_V1, "DEFAULT")
+    assert stop[3:5] == (RUNTIME_ARN_V1, RELEASE_ENDPOINT)
     assert repo.events[3] == ("binding-rotate", 1, NEW_SESSION)
     assert current.runtime_arn == RUNTIME_ARN_V2
     assert current.session_id == NEW_SESSION
@@ -1303,6 +1423,7 @@ def test_snapshot_is_a_trusted_runtime_action_and_requires_receipt():
         "action": "snapshot",
         "internalUserId": USER,
         "namespace": USER,
+        "workspaceCapability": f"capability.{USER}.{SESSION}",
     }
     assert repo.current.last_workspace_manifest_sha256 == SHA256
 
@@ -1389,6 +1510,7 @@ def test_lease_must_outlive_the_entire_lambda_execution_authority():
         RuntimeDriver(
             repository=FakeRepository(),
             adapter=FakeAdapter(),
+            workspace_capability_signer=FakeWorkspaceCapabilitySigner(),
             lease_ms=300_000,
             max_execution_ms=300_000,
         )
@@ -1402,6 +1524,7 @@ def test_driver_refuses_repository_and_adapter_binding_disagreement():
         RuntimeDriver(
             repository=repo,
             adapter=FakeAdapter(),
+            workspace_capability_signer=FakeWorkspaceCapabilitySigner(),
             lease_ms=30_000,
             max_execution_ms=20_000,
         )
@@ -1455,7 +1578,7 @@ def test_quarantine_cas_keeps_owner_epoch_binding_after_lease_expiry():
     repo = RuntimeStateRepository(
         table,
         runtime_arn=RUNTIME_ARN_V2,
-        runtime_qualifier="DEFAULT",
+        runtime_qualifier=RELEASE_ENDPOINT,
         clock_ms=lambda: 50_000,
     )
     expired = record(
@@ -1496,6 +1619,203 @@ def test_purge_tombstones_before_stop_and_refuses_future_ensure():
         driver.ensure(USER)
 
 
+def test_inactive_purge_atomically_fences_the_exact_observed_revision_and_millis():
+    table = MagicMock()
+    fenced = record(
+        state=RuntimeState.DELETING,
+        revision=8,
+        lease_owner="retention-owner",
+        lease_epoch=4,
+        lease_expires_at=130_000,
+        updated_at=100_000,
+        tombstoned_at=100_000,
+        stop_operation_id="op_" + "4" * 64,
+    )
+    table.update_item.return_value = {"Attributes": item_from_record(fenced)}
+    repo = RuntimeStateRepository(
+        table,
+        runtime_arn=RUNTIME_ARN_V2,
+        runtime_qualifier=RELEASE_ENDPOINT,
+        clock_ms=lambda: 100_000,
+    )
+
+    result = repo.begin_inactive_purge(
+        USER,
+        owner="retention-owner",
+        lease_ms=30_000,
+        observed_updated_at_ms=1_000,
+        observed_revision=7,
+        inactive_before_ms=2_000,
+    )
+
+    assert result.state is RuntimeState.DELETING
+    request = table.update_item.call_args.kwargs
+    assert request["Key"] == {"userId": USER}
+    condition = request["ConditionExpression"]
+    assert "updatedAt=:observedUpdatedAt" in condition
+    assert "revision=:observedRevision" in condition
+    assert "updatedAt <= :inactiveBefore" in condition
+    assert "attribute_not_exists(tombstonedAt)" in condition
+    assert "#state <> :deleting" in condition
+    assert (
+        "attribute_not_exists(leaseOwner) AND attribute_not_exists(leaseExpiresAt)"
+        in condition
+    )
+    assert "attribute_exists(leaseOwner) AND leaseExpiresAt < :now" in condition
+    assert request["ExpressionAttributeValues"][":observedUpdatedAt"] == 1_000
+    assert request["ExpressionAttributeValues"][":observedRevision"] == 7
+    assert request["ExpressionAttributeValues"][":inactiveBefore"] == 2_000
+    assert request["ExpressionAttributeValues"][":purgeReason"] == "WORKSPACE_EXPIRY"
+    assert "purgeReason=:purgeReason" in request["UpdateExpression"]
+
+
+def test_inactive_purge_loses_fence_if_activity_updates_record_after_scan():
+    table = MagicMock()
+    table.update_item.side_effect = conditional_error()
+    table.get_item.return_value = {
+        "Item": item_from_record(record(revision=8, updated_at=2_001))
+    }
+    repo = RuntimeStateRepository(
+        table,
+        runtime_arn=RUNTIME_ARN_V2,
+        runtime_qualifier=RELEASE_ENDPOINT,
+        clock_ms=lambda: 100_000,
+    )
+
+    with pytest.raises(InactivityFenceLost):
+        repo.begin_inactive_purge(
+            USER,
+            owner="retention-owner",
+            lease_ms=30_000,
+            observed_updated_at_ms=1_000,
+            observed_revision=7,
+            inactive_before_ms=2_000,
+        )
+
+    assert table.update_item.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("observed_updated_at_ms", True),
+        ("observed_updated_at_ms", 1.5),
+        ("observed_revision", 0),
+        ("observed_revision", True),
+        ("inactive_before_ms", 0),
+        ("inactive_before_ms", 999),
+    ],
+)
+def test_inactive_purge_rejects_invalid_or_noninactive_millisecond_fence(field, value):
+    table = MagicMock()
+    repo = RuntimeStateRepository(
+        table,
+        runtime_arn=RUNTIME_ARN_V2,
+        runtime_qualifier=RELEASE_ENDPOINT,
+        clock_ms=lambda: 100_000,
+    )
+    kwargs = {
+        "observed_updated_at_ms": 1_000,
+        "observed_revision": 7,
+        "inactive_before_ms": 2_000,
+    }
+    kwargs[field] = value
+
+    with pytest.raises(ValueError, match="inactive|revision|millisecond"):
+        repo.begin_inactive_purge(
+            USER,
+            owner="retention-owner",
+            lease_ms=30_000,
+            **kwargs,
+        )
+
+    table.update_item.assert_not_called()
+
+
+def test_driver_inactive_purge_stops_only_after_repository_wins_atomic_fence():
+    repo = FakeRepository(record(state=RuntimeState.IDLE, updated_at=1_000, revision=7))
+    adapter = FakeAdapter()
+    driver = build_driver(repo, adapter)
+
+    result = driver.purge_inactive(
+        USER,
+        observed_updated_at_ms=1_000,
+        observed_revision=7,
+        inactive_before_ms=2_000,
+    )
+
+    assert repo.events[0][0] == "inactive-purge"
+    assert adapter.events[0][0] == "stop"
+    assert repo.events[-1][0] == "inactive-stopped"
+    assert result["state"] == "DELETING"
+
+
+def test_driver_completes_verified_workspace_expiry_as_fresh_cold_session():
+    repo = FakeRepository(
+        record(
+            session_id=None,
+            state=RuntimeState.DELETING,
+            tombstoned_at=40_000,
+        )
+    )
+    driver = build_driver(repo, FakeAdapter())
+
+    result = driver.complete_inactive_purge(USER)
+
+    assert repo.events == [
+        ("get", USER),
+        ("workspace-expiry-complete", NEW_SESSION),
+    ]
+    assert result["state"] == "COLD"
+    assert result["sessionId"] == NEW_SESSION
+    assert result["tombstonedAt"] is None
+
+
+def test_finished_account_purge_marks_runtime_tombstone_completed():
+    table = MagicMock()
+    purging = record(
+        state=RuntimeState.DELETING,
+        tombstoned_at=10_000,
+        lease_owner="purger",
+        lease_epoch=4,
+        lease_expires_at=40_000,
+        stop_operation_id="op_" + "4" * 64,
+    )
+    table.update_item.return_value = {
+        "Attributes": item_from_record(replace(purging, session_id=None))
+    }
+    repo = RuntimeStateRepository(
+        table,
+        runtime_arn=RUNTIME_ARN_V2,
+        runtime_qualifier=RELEASE_ENDPOINT,
+        clock_ms=lambda: 50_000,
+    )
+
+    repo.finish_purge(purging)
+
+    request = table.update_item.call_args.kwargs
+    assert "purgeCompletedAt=:now" in request["UpdateExpression"]
+    assert request["ExpressionAttributeValues"][":accountReason"] == "ACCOUNT_DELETION"
+    assert "purgeReason=:accountReason" in request["ConditionExpression"]
+
+
+def test_driver_inactive_purge_returns_none_without_stop_when_activity_wins_race():
+    repo = FakeRepository(record(state=RuntimeState.IDLE, updated_at=2_001, revision=8))
+    repo.inactivity_fence_lost = True
+    adapter = FakeAdapter()
+    driver = build_driver(repo, adapter)
+
+    result = driver.purge_inactive(
+        USER,
+        observed_updated_at_ms=1_000,
+        observed_revision=7,
+        inactive_before_ms=2_000,
+    )
+
+    assert result is None
+    assert adapter.events == []
+
+
 def test_agentcore_adapter_uses_exact_region_runtime_default_and_server_session():
     client = MagicMock()
     client.meta.region_name = "eu-west-1"
@@ -1513,7 +1833,7 @@ def test_agentcore_adapter_uses_exact_region_runtime_default_and_server_session(
     adapter = AgentCoreAdapter(
         client,
         runtime_arn="arn:aws:bedrock-agentcore:eu-west-1:123456789012:agent/12345678-1234-1234-1234-123456789abc:1",
-        qualifier="DEFAULT",
+        qualifier=RELEASE_ENDPOINT,
         region="eu-west-1",
     )
     payload = {"action": "chat", "message": "hello"}
@@ -1525,7 +1845,7 @@ def test_agentcore_adapter_uses_exact_region_runtime_default_and_server_session(
     assert response["workspaceReceipt"] == RECEIPT
     client.invoke_agent_runtime.assert_called_once_with(
         agentRuntimeArn=adapter.runtime_arn,
-        qualifier="DEFAULT",
+        qualifier=RELEASE_ENDPOINT,
         runtimeSessionId=SESSION,
         runtimeUserId=USER,
         traceId=TRACE,
@@ -1546,7 +1866,7 @@ def test_agentcore_adapter_rejects_duplicate_json_response_keys():
     adapter = AgentCoreAdapter(
         client,
         runtime_arn=RUNTIME_ARN_V1,
-        qualifier="DEFAULT",
+        qualifier=RELEASE_ENDPOINT,
         region="eu-west-1",
     )
 
@@ -1571,7 +1891,7 @@ def test_agentcore_invoke_requires_exact_200_completion(status_code):
     adapter = AgentCoreAdapter(
         client,
         runtime_arn=RUNTIME_ARN_V1,
-        qualifier="DEFAULT",
+        qualifier=RELEASE_ENDPOINT,
         region="eu-west-1",
     )
 
@@ -1595,7 +1915,7 @@ def test_agentcore_stop_requires_exact_200_completion(status_code):
     adapter = AgentCoreAdapter(
         client,
         runtime_arn=RUNTIME_ARN_V1,
-        qualifier="DEFAULT",
+        qualifier=RELEASE_ENDPOINT,
         region="eu-west-1",
     )
 
@@ -1610,7 +1930,7 @@ def test_agentcore_stop_uses_deterministic_valid_token_and_accepts_not_found():
     adapter = AgentCoreAdapter(
         client,
         runtime_arn="arn:aws:bedrock-agentcore:eu-west-1:123456789012:agent/12345678-1234-1234-1234-123456789abc:1",
-        qualifier="DEFAULT",
+        qualifier=RELEASE_ENDPOINT,
         region="eu-west-1",
     )
 
@@ -1621,7 +1941,7 @@ def test_agentcore_stop_uses_deterministic_valid_token_and_accepts_not_found():
     assert result == {"stopped": True, "notFound": True}
     kwargs = client.stop_runtime_session.call_args.kwargs
     assert kwargs["agentRuntimeArn"] == adapter.runtime_arn
-    assert kwargs["qualifier"] == "DEFAULT"
+    assert kwargs["qualifier"] == RELEASE_ENDPOINT
     assert kwargs["runtimeSessionId"] == SESSION
     assert len(kwargs["clientToken"]) >= 33
     assert kwargs["clientToken"].isalnum()
@@ -1635,7 +1955,7 @@ def test_agentcore_adapter_rejects_wrong_region_before_client_call():
         AgentCoreAdapter(
             client,
             runtime_arn="arn:test",
-            qualifier="DEFAULT",
+            qualifier=RELEASE_ENDPOINT,
             region="eu-west-1",
         )
 
@@ -1661,7 +1981,7 @@ def test_agentcore_adapter_requires_the_full_exact_runtime_arn_grammar(runtime_a
         AgentCoreAdapter(
             client,
             runtime_arn=runtime_arn,
-            qualifier="DEFAULT",
+            qualifier=RELEASE_ENDPOINT,
             region="eu-west-1",
         )
 
@@ -1683,7 +2003,7 @@ def test_agentcore_invoke_requires_exact_outer_session_identity():
     adapter = AgentCoreAdapter(
         client,
         runtime_arn=RUNTIME_ARN_V1,
-        qualifier="DEFAULT",
+        qualifier=RELEASE_ENDPOINT,
         region="eu-west-1",
     )
 
@@ -1706,7 +2026,7 @@ def test_agentcore_stop_token_is_stable_per_operation_and_changes_for_later_stop
     adapter = AgentCoreAdapter(
         client,
         runtime_arn=RUNTIME_ARN_V2,
-        qualifier="DEFAULT",
+        qualifier=RELEASE_ENDPOINT,
         region="eu-west-1",
     )
 
@@ -1728,7 +2048,7 @@ def test_agentcore_stop_requires_exact_outer_session_identity():
     adapter = AgentCoreAdapter(
         client,
         runtime_arn=RUNTIME_ARN_V1,
-        qualifier="DEFAULT",
+        qualifier=RELEASE_ENDPOINT,
         region="eu-west-1",
     )
 
@@ -1756,14 +2076,29 @@ def test_worker_stack_provisions_exact_runtime_state_boundary():
             "12345678-1234-1234-1234-123456789abc:1"
         ),
         runtime_iam_arn=runtime_iam_arn,
-        runtime_endpoint_name="DEFAULT",
+        runtime_endpoint_name=RELEASE_ENDPOINT,
         telegram_token_secret_name="openclaw/channels/telegram",
         slack_token_secret_name="openclaw/channels/slack",
         feishu_token_secret_name="openclaw/channels/feishu",
         webhook_secret_name="openclaw/webhook-secret",
+        workspace_capability_secret_name=(
+            "personal-operator/workspace-capability"
+        ),
+        workspace_broker_role_arn=(
+            f"arn:aws:iam::{account}:role/"
+            "personal-operator-workspace-credential-broker-eu-west-1"
+        ),
+        workspace_broker_function_name=(
+            "personal-operator-workspace-credential-broker"
+        ),
+        workspace_session_role_arn=(
+            f"arn:aws:iam::{account}:role/"
+            "openclaw-workspace-session-role-eu-west-1"
+        ),
         cmk_arn=f"arn:aws:kms:eu-west-1:{account}:key/test-key",
         user_files_bucket_name="openclaw-user-files-test",
         user_files_bucket_arn="arn:aws:s3:::openclaw-user-files-test",
+        trusted_code_asset_root="lambda",
         env=Environment(account=account, region="eu-west-1"),
     )
     template = Template.from_stack(stack).to_json()
@@ -1853,7 +2188,7 @@ def test_worker_stack_provisions_exact_runtime_state_boundary():
     }
     assert runtime_policy["Resource"] == [
         runtime_iam_arn,
-        f"{runtime_iam_arn}/runtime-endpoint/DEFAULT",
+        f"{runtime_iam_arn}/runtime-endpoint/{RELEASE_ENDPOINT}",
     ]
 
 

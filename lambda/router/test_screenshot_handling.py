@@ -27,7 +27,7 @@ sys.modules.setdefault("botocore.exceptions", _mock_botocore_exceptions)
 
 # Set required env vars before importing index
 os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock:eu-west-1:123456789012:agentcore/test")
-os.environ.setdefault("AGENTCORE_QUALIFIER", "test-qualifier")
+os.environ.setdefault("AGENTCORE_QUALIFIER", "release_" + "a" * 40)
 os.environ.setdefault("IDENTITY_TABLE_NAME", "test-identity")
 os.environ.setdefault("USER_FILES_BUCKET", "test-bucket")
 os.environ.setdefault("AWS_REGION", "eu-west-1")
