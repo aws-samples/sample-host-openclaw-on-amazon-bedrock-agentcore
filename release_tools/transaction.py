@@ -175,6 +175,8 @@ class TransactionJournal:
 
         if self.current.state != "UNCERTAIN":
             raise TransactionError("only an UNCERTAIN phase can be reconciled")
+        if self.current.uncertain_phase == "ROLLBACK":
+            raise TransactionError("UNCERTAIN rollback requires rollback reconciliation")
         supplied = dict(evidence or {})
         unknown = set(supplied) - _EVIDENCE_FIELDS
         if unknown:
@@ -201,6 +203,45 @@ class TransactionJournal:
         }
         for name, value in supplied.items():
             mapping[aliases[name]] = value
+        return self._persist(StagingTransactionV1.from_mapping(mapping))
+
+    def begin_rollback(self, rollback_reference: str) -> StagingTransactionV1:
+        """Durably record rollback intent for one fully verified transaction."""
+
+        if self.current.state == "UNCERTAIN":
+            raise TransactionError("staging transaction is already UNCERTAIN")
+        if self.current.state != "VERIFIED":
+            raise TransactionError("only a VERIFIED transaction can roll back")
+        if rollback_reference != self.current.rollback_reference:
+            raise TransactionError("rollback reference does not match the journal")
+        mapping = self.current.to_mapping()
+        mapping.update(
+            {
+                "state": "UNCERTAIN",
+                "lastStableState": "VERIFIED",
+                "revision": self.current.revision + 1,
+                "uncertainPhase": "ROLLBACK",
+            }
+        )
+        return self._persist(StagingTransactionV1.from_mapping(mapping))
+
+    def reconcile_rollback(self, *, persisted: bool) -> StagingTransactionV1:
+        """Resolve write-ahead rollback intent from authoritative evidence."""
+
+        if (
+            self.current.state != "UNCERTAIN"
+            or self.current.uncertain_phase != "ROLLBACK"
+        ):
+            raise TransactionError("only an UNCERTAIN rollback can be reconciled")
+        mapping = self.current.to_mapping()
+        mapping.update(
+            {
+                "state": "ROLLED_BACK" if persisted else "VERIFIED",
+                "lastStableState": "VERIFIED",
+                "revision": self.current.revision + 1,
+                "uncertainPhase": "",
+            }
+        )
         return self._persist(StagingTransactionV1.from_mapping(mapping))
 
     def run_mutation(

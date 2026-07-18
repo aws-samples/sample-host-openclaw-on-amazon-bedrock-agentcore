@@ -353,16 +353,16 @@ def test_workspace_role_policy_is_exact_s3_and_cmk_only() -> None:
 
 def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
     deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+    release_cli = (ROOT / "release_tools/cli.py").read_text(encoding="utf-8")
     local = (ROOT / "scripts/test-local.sh").read_text(encoding="utf-8")
     e2e = (ROOT / "scripts/e2e-deploy-and-test.sh").read_text(encoding="utf-8")
     app = (ROOT / "app.py").read_text(encoding="utf-8")
 
-    assert 'REQUIRED_REGION="eu-west-1"' in deploy
-    assert 'WORKSPACE_SESSION_ROLE_ARN=$(aws cloudformation describe-stacks' in deploy
-    assert '"$AGENTCORE_CLI" deploy' not in deploy
-    assert "get-agent-runtime" in deploy
-    assert "validate_runtime_metadata" in deploy
-    assert "runtime_arn" in deploy
+    assert 'REQUIRED_REGION = "eu-west-1"' in release_cli
+    assert 'exec "${PYTHON}" "${SCRIPT_DIR}/staging-release.py" "$@"' in deploy
+    assert "agentcore deploy" not in deploy.casefold()
+    assert "get-agent-runtime" not in deploy
+    assert "RuntimeContext" not in deploy
     assert "EVENTBRIDGE_SCHEDULE_GROUP" not in deploy
     assert "CRON_LAMBDA_ARN" not in deploy
     assert "EVENTBRIDGE_ROLE_ARN" not in deploy
@@ -373,17 +373,20 @@ def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
     assert 'REQUIRED_REGION = "eu-west-1"' in app
 
 
-def test_deploy_only_verifies_preprovisioned_session_storage_and_exact_version() -> None:
+def test_release_owns_direct_l1_runtime_and_verifies_exact_storage_version() -> None:
     deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+    stack = (ROOT / "stacks/agentcore_stack.py").read_text(encoding="utf-8")
+    adapter = (ROOT / "release_tools/agentcore.py").read_text(encoding="utf-8")
     e2e = (ROOT / "scripts/e2e-deploy-and-test.sh").read_text(encoding="utf-8")
     local = (ROOT / "scripts/test-local.sh").read_text(encoding="utf-8")
 
     assert "update_agent_runtime(" not in deploy
     assert "update-agent-runtime-endpoint" not in deploy
-    assert '"$AGENTCORE_CLI" deploy' not in deploy
-    assert "immutable AgentCore runtime deployment is not implemented" in deploy
-    assert "--agent-runtime-version" in deploy
-    assert '"$PROJECT_DIR/scripts/verify-agentcore-storage.py"' in deploy
+    assert "agentcore deploy" not in deploy.casefold()
+    assert "agentcore.CfnRuntime(" in stack
+    assert "agentcore.CfnRuntimeEndpoint(" in stack
+    assert 'container_uri=runtime_image_uri' in stack
+    assert 'endpointName=expected_endpoint_name' in adapter
     assert '"$PROJECT_DIR/scripts/verify-agentcore-storage.py"' in e2e
     assert "tests/test_verify_agentcore_storage.py" in local
     assert "WARNING: Failed to configure session storage" not in deploy
@@ -402,91 +405,16 @@ def test_workspace_bucket_never_expires_the_authoritative_current_objects() -> N
     assert "bucket_key_enabled=True" in source
 
 
-def test_deploy_runtime_metadata_validator_is_fail_closed() -> None:
+def test_runtime_metadata_validation_is_not_embedded_in_the_shell_shim() -> None:
     deploy = (ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
-    match = re.search(
-        r"validate_runtime_metadata\(\) \{.*?<<'PY'\n"
-        r"(?P<validator>.*?)\nPY\n\}",
-        deploy,
-        flags=re.DOTALL,
-    )
-    assert match is not None, "could not locate embedded runtime metadata validator"
-    validator = match.group("validator")
-    account = "123456789012"
-    region = "eu-west-1"
-    role_arn = (
-        "arn:aws:iam::123456789012:role/"
-        "openclaw-agentcore-execution-role-eu-west-1"
-    )
-    runtime_id = TEST_RUNTIME_ID
-    valid = {
-        "agentRuntimeId": runtime_id,
-        "agentRuntimeArn": TEST_RUNTIME_ARN,
-        "agentRuntimeVersion": "1",
-        "agentRuntimeArtifact": {
-            "containerConfiguration": {"containerUri": TEST_RUNTIME_IMAGE_URI}
-        },
-        "status": "READY",
-        "roleArn": role_arn,
-    }
+    adapter = (ROOT / "release_tools/agentcore.py").read_text(encoding="utf-8")
 
-    def run(document: dict) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        env["RUNTIME_METADATA_JSON"] = json.dumps(document)
-        return subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                validator,
-                account,
-                region,
-                role_arn,
-                runtime_id,
-                TEST_RUNTIME_IMAGE_URI,
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-    completed = run(valid)
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.splitlines() == [runtime_id, TEST_RUNTIME_ARN, "1"]
-
-    invalid_documents = [
-        {**valid, "agentRuntimeId": "other_agent-0123456789"},
-        {**valid, "agentRuntimeArn": TEST_RUNTIME_ARN.replace(":agent/", ":runtime/")},
-        {**valid, "agentRuntimeArn": TEST_RUNTIME_ARN.replace("eu-west-1", "us-east-1")},
-        {**valid, "agentRuntimeVersion": "0"},
-        {**valid, "agentRuntimeVersion": "2"},
-        {**valid, "status": "UPDATING"},
-        {**valid, "roleArn": role_arn.replace("openclaw-agentcore", "unexpected")},
-        {**valid, "agentRuntimeArtifact": {}},
-        {
-            **valid,
-            "agentRuntimeArtifact": {
-                "containerConfiguration": {
-                    "containerUri": TEST_RUNTIME_IMAGE_URI.replace("a" * 64, "b" * 64)
-                }
-            },
-        },
-        {
-            **valid,
-            "agentRuntimeArtifact": {
-                "containerConfiguration": {
-                    "containerUri": (
-                        "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
-                        "personal-operator/bridge:latest"
-                    )
-                }
-            },
-        },
-    ]
-    for invalid in invalid_documents:
-        completed = run(invalid)
-        assert completed.returncode != 0, invalid
-        assert completed.stderr, invalid
+    assert "validate_runtime_metadata" not in deploy
+    assert "json.loads" not in deploy
+    assert "AgentCoreEvidenceAdapter" in adapter
+    assert "runtime artifact differs from the immutable release image" in adapter
+    assert "endpoint was retargeted away from the release version" in adapter
+    assert "returned unknown status" in adapter
 
 
 def test_e2e_non_skip_deploys_canonical_runtime_before_validation(
@@ -1328,11 +1256,25 @@ def test_shell_region_guards_fail_before_aws_cli(tmp_path: Path) -> None:
                 "AWS_REGION": "us-west-2",
                 "AWS_POISON_MARKER": str(marker),
                 "PATH": f"{poison_bin}:{env['PATH']}",
+                "PYTHON": sys.executable,
+                "PYTHONPATH": str(ROOT),
             }
         )
         arguments = ["bash", str(ROOT / relative_script)]
         if relative_script == "scripts/deploy.sh":
-            arguments.append("--phase1")
+            arguments.extend(
+                [
+                    "--preflight",
+                    "--journal",
+                    str(tmp_path / "journal.json"),
+                    "--root",
+                    str(ROOT),
+                    "--account",
+                    "123456789012",
+                    "--commit",
+                    "a" * 40,
+                ]
+            )
         completed = subprocess.run(
             arguments,
             cwd=ROOT,

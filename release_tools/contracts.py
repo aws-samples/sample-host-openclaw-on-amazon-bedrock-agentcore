@@ -726,14 +726,20 @@ class StagingTransactionV1:
         elif state == "UNCERTAIN":
             if not uncertain_phase or revision < 1:
                 raise ContractError("UNCERTAIN staging transaction lacks its phase")
-            stable_index = LINEAR_TRANSACTION_STATES.index(stable)
-            expected_phase = (
-                LINEAR_TRANSACTION_STATES[stable_index + 1]
-                if stable_index + 1 < len(LINEAR_TRANSACTION_STATES)
-                else None
-            )
-            if uncertain_phase != expected_phase:
-                raise ContractError("UNCERTAIN phase is not the legal next state")
+            if uncertain_phase == "ROLLBACK":
+                if stable != "VERIFIED" or not rollback:
+                    raise ContractError(
+                        "UNCERTAIN rollback requires one verified transaction"
+                    )
+            else:
+                stable_index = LINEAR_TRANSACTION_STATES.index(stable)
+                expected_phase = (
+                    LINEAR_TRANSACTION_STATES[stable_index + 1]
+                    if stable_index + 1 < len(LINEAR_TRANSACTION_STATES)
+                    else None
+                )
+                if uncertain_phase != expected_phase:
+                    raise ContractError("UNCERTAIN phase is not the legal next state")
         elif uncertain_phase:
             raise ContractError("uncertain phase is set outside UNCERTAIN")
         if state in LINEAR_TRANSACTION_STATES and state != stable:
