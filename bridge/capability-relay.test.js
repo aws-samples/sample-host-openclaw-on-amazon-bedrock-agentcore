@@ -97,6 +97,62 @@ function failedResult(
   };
 }
 
+async function assertTypedLambdaAmbiguity(relayModule, send) {
+  const cases = [
+    {
+      args: { url: "https://example.com/exact" },
+      expectedRetry: "SAFE_RETRY",
+      expectedStatus: "FAILED_RETRYABLE",
+      grant: grant({ maxCalls: 1 }),
+      toolName: "po_web_read",
+      toolUseId: "tooluse_12345678",
+    },
+    {
+      args: { path: "notes/a.md", content: "hello" },
+      expectedRetry: "RECONCILE_ONLY",
+      expectedStatus: "UNCERTAIN",
+      grant: grant({
+        allowedPackIds: ["workspace.file-write"],
+        allowedOperationIds: ["workspace.file.write"],
+        targetGrantHashes: [],
+        maxCalls: 1,
+      }),
+      toolName: "po_file_write",
+      toolUseId: "tooluse_11111111",
+    },
+  ];
+  for (const testCase of cases) {
+    let sends = 0;
+    const transport = relayModule.createLambdaGatewayTransport({
+      functionArn:
+        "arn:aws:lambda:eu-west-1:123456789012:function:capability-gateway",
+      lambdaClient: {
+        async send(command) {
+          sends += 1;
+          return send(command);
+        },
+      },
+    });
+    const relay = new relayModule.CapabilityRelay({
+      now: () => 1_800_000_100,
+      gatewayTransport: transport,
+    });
+    relay.bind_turn(testCase.grant);
+
+    const result = await relay.call(
+      testCase.toolUseId,
+      testCase.toolName,
+      testCase.args,
+    );
+
+    assert.equal(result.status, testCase.expectedStatus);
+    assert.equal(result.errorCode, "CAPABILITY_GATEWAY_RESPONSE_UNAVAILABLE");
+    assert.equal(result.retryPolicy, testCase.expectedRetry);
+    assert.equal(result.toolUseId, testCase.toolUseId);
+    assert.equal(sends, 1);
+  }
+}
+
 describe("trusted capability relay", () => {
   it("exists with the frozen public interface", () => {
     const relayModule = loadRelay();
@@ -302,6 +358,40 @@ describe("trusted capability relay", () => {
     assert.equal(transportCalls, 2);
   });
 
+  it("types Lambda FunctionError responses after dispatch", async () => {
+    const relayModule = loadRelay();
+    await assertTypedLambdaAmbiguity(relayModule, async () => ({
+      FunctionError: "Unhandled",
+      Payload: Buffer.from('{"errorMessage":"hidden"}'),
+    }));
+  });
+
+  it("types absent Lambda payloads after dispatch", async () => {
+    const relayModule = loadRelay();
+    await assertTypedLambdaAmbiguity(relayModule, async () => ({}));
+  });
+
+  it("types malformed Lambda payloads after dispatch", async () => {
+    const relayModule = loadRelay();
+    await assertTypedLambdaAmbiguity(relayModule, async () => ({
+      Payload: Buffer.from("{"),
+    }));
+  });
+
+  it("types schema-invalid Lambda payloads after dispatch", async () => {
+    const relayModule = loadRelay();
+    await assertTypedLambdaAmbiguity(relayModule, async () => ({
+      Payload: Buffer.from("{}"),
+    }));
+  });
+
+  it("types ambiguous Lambda SDK rejections after dispatch", async () => {
+    const relayModule = loadRelay();
+    await assertTypedLambdaAmbiguity(relayModule, async () => {
+      throw new Error("synthetic connection reset after request write");
+    });
+  });
+
   it("caps read dispatch at two attempts and blocks fresh-tool retry bypass", async () => {
     const relayModule = loadRelay();
     let transportCalls = 0;
@@ -342,7 +432,7 @@ describe("trusted capability relay", () => {
     assert.equal(transportCalls, 2);
   });
 
-  it("rejects noncanonical grants, arguments, and mismatched or authority-leaking results", async () => {
+  it("rejects local invalid input and types post-dispatch invalid results", async () => {
     const relayModule = loadRelay();
     const relay = new relayModule.CapabilityRelay({
       now: () => 1_800_000_100,
@@ -362,12 +452,19 @@ describe("trusted capability relay", () => {
       }),
       (error) => error.code === "CAPABILITY_ARGUMENTS_INVALID",
     );
-    await assert.rejects(
-      () => relay.call("tooluse_12345678", "po_web_read", {
+    const mismatched = await relay.call(
+      "tooluse_12345678",
+      "po_web_read",
+      {
         url: "https://example.com/exact",
-      }),
-      (error) => error.code === "CAPABILITY_RESULT_INVALID",
+      },
     );
+    assert.equal(mismatched.status, "FAILED_RETRYABLE");
+    assert.equal(
+      mismatched.errorCode,
+      "CAPABILITY_GATEWAY_RESPONSE_UNAVAILABLE",
+    );
+    assert.equal(mismatched.retryPolicy, "SAFE_RETRY");
 
     const leaking = new relayModule.CapabilityRelay({
       now: () => 1_800_000_100,
@@ -379,12 +476,16 @@ describe("trusted capability relay", () => {
       }),
     });
     leaking.bind_turn(grant());
-    await assert.rejects(
-      () => leaking.call("tooluse_12345678", "po_web_read", {
+    const redacted = await leaking.call(
+      "tooluse_12345678",
+      "po_web_read",
+      {
         url: "https://example.com/exact",
-      }),
-      (error) => error.code === "CAPABILITY_RESULT_SENSITIVE",
+      },
     );
+    assert.equal(redacted.status, "FAILED_RETRYABLE");
+    assert.equal(redacted.errorCode, "CAPABILITY_GATEWAY_RESPONSE_UNAVAILABLE");
+    assert.doesNotMatch(JSON.stringify(redacted), new RegExp(NONCE));
   });
 
   it("keeps grants and relay tokens out of child env, model data, workspace, results, and logs", async () => {

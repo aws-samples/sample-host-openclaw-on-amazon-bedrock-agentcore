@@ -700,24 +700,28 @@ class CapabilityRelay {
         operationId: entry.call.operationId,
       });
       try {
-        let rawResult;
+        let result;
         try {
-          rawResult = await this.#gatewayTransport(entry.envelope);
-        } catch (error) {
-          if (error instanceof CapabilityRelayError) throw error;
+          const rawResult = await this.#gatewayTransport(entry.envelope);
+          result = validateResult(
+            rawResult,
+            entry.call,
+            entry.operation,
+            this.#sensitiveValues,
+          );
+        } catch {
           const isRead = entry.operation.retryPolicy.mode === "READ_ONLY";
-          rawResult = localFailureResult(entry.call, {
-            status: isRead ? "FAILED_RETRYABLE" : "UNCERTAIN",
-            errorCode: "CAPABILITY_GATEWAY_RESPONSE_UNAVAILABLE",
-            retryPolicy: isRead ? "SAFE_RETRY" : "RECONCILE_ONLY",
-          });
+          result = validateResult(
+            localFailureResult(entry.call, {
+              status: isRead ? "FAILED_RETRYABLE" : "UNCERTAIN",
+              errorCode: "CAPABILITY_GATEWAY_RESPONSE_UNAVAILABLE",
+              retryPolicy: isRead ? "SAFE_RETRY" : "RECONCILE_ONLY",
+            }),
+            entry.call,
+            entry.operation,
+            this.#sensitiveValues,
+          );
         }
-        const result = validateResult(
-          rawResult,
-          entry.call,
-          entry.operation,
-          this.#sensitiveValues,
-        );
         entry.result = result;
         emitSafe(this.#logger, {
           event: "capability_call_finished",
