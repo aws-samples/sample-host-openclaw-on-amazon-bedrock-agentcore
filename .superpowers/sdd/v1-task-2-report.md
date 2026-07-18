@@ -184,3 +184,89 @@ IAM boundary tests passed `3/3`. `compileall` and `git diff --check` also passed
 
 No authoritative external, deployment, provider, browser, message, AWS, push,
 or production-readiness claim is made by this report.
+
+## Independent-review remediation
+
+The hostile review identified four release-blocking gaps in the original
+implementation: replay state was not tenant-isolated, mutation transport loss
+could be replayed under a fresh tool-use ID, the bridge could listen before
+release/catalog parity was proved, and the packaged Lambda still used a
+fail-closed placeholder rather than the durable gateway composition. The
+remediation was kept inside Task 2; no adapter, provider, browser, scheduler,
+secret, or deployment path was added.
+
+Commits:
+
+- `47f5a3f docs(plan): map task 2 review fixes`
+- `d327745 fix(capabilities): isolate replay and fence effects`
+- `9666cd2 fix(relay): bound retries and fence ambiguous effects`
+- `2f1934e fix(runtime): gate startup on release catalog parity`
+- `aca6635 fix(capabilities): compose durable packaged gateway`
+- `ce6c87e test(capabilities): isolate sdk imports in aggregate suite`
+
+### Review RED evidence
+
+- Four hostile ledger/gateway tests failed before tenant-scoped authority
+  keys, full grant binding, stable logical-call fencing, and conservative
+  in-flight/uncertain mutation handling existed.
+- Three relay retry/fencing tests failed initially; a fourth failed when the
+  fresh-tool-use-ID bypass case was made explicit.
+- Five startup tests failed before release metadata was authenticated and the
+  parent delayed child construction and listener binding until the gate
+  passed.
+- Four CDK/packaging tests failed before the exact DynamoDB table, CMK, IAM,
+  release environment, and authenticated source set existed.
+- Three production-composition tests failed before the real Dynamo repository,
+  durable ledger, and cold-start assembly existed.
+
+### Review GREEN result
+
+The final boundary now derives tenant identity from the authenticated
+session/runtime/release/catalog tuple, binds the complete grant before cache
+or dispatch, and scopes turn, call, tool-use, and stable logical-operation
+records to that tenant. Reads receive at most one same-call retry without
+budget recharge. Mutations are fenced across fresh tool-use IDs; ambiguous
+post-dispatch completion is a typed `UNCERTAIN`/reconcile-only result and is
+never automatically replayed.
+
+The bridge image contains authenticated release metadata and refuses startup
+on a commit or catalog mismatch before constructing the child or opening a
+listener. The packaged Lambda now compiles the reviewed catalog, constructs
+the strongly consistent DynamoDB-backed admission repository and durable
+ledger, and exposes no production adapters. Configuration or storage failure
+remains typed and fail closed.
+
+The stack provisions one deletion-protected, retained, point-in-time-recovery,
+pay-per-request DynamoDB table encrypted by one customer-managed key. The
+gateway role is limited to exact log, table, and key resources; DynamoDB calls
+are limited to `GetItem`, `PutItem`, `UpdateItem`, and
+`TransactWriteItems`, and KMS use is constrained through DynamoDB in
+`eu-west-1` for the deployment account. Isolated `AwsSolutionsChecks`
+synthesis reported `NONCOMPLIANT 0`.
+
+Focused final evidence included:
+
+```text
+lambda/capabilities
+176 passed in 2.78s
+
+tests/test_capability_stack.py tests/test_trusted_lambda_packaging.py
+21 passed in 6.37s
+
+tests/security/test_release_boundaries.py
+13 passed in 1.38s
+
+tests/e2e/test_session_control.py
+11 passed in 0.09s
+```
+
+The exact review-remediated code candidate was
+`ce6c87e4413b2ae8a251d691b6d9a52611aca67d`, tree
+`6804a22c3456a249c08b3740d11c53b1f9c5b7f6`. Its complete Python aggregate
+passed `1131` tests plus `10` subtests in `111.45s`; the complete Node 24
+aggregate passed `338/338`. Ruff, Black, `bash -n`, `compileall`,
+`git diff --check`, authenticated asset parity, and a direct credential scan
+were clean.
+
+No deployment, provider invocation, browser action, real message, AWS call,
+push, or cloud mutation was performed during review remediation.
