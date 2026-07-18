@@ -391,9 +391,8 @@ class DynamoScanMeasurements:
 
         user_pk = self._pk(user_id)
         start_key = None
-        keys: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
-        for _page in range(40):
+        for page_number in range(40):
             request = {
                 "KeyConditionExpression": (
                     "PK = :pk AND begins_with(SK, :prefix)"
@@ -412,6 +411,7 @@ class DynamoScanMeasurements:
             items = response.get("Items") if isinstance(response, Mapping) else None
             if not isinstance(items, list) or len(items) > 100:
                 raise ScanMeasurementError("scan deletion listing is invalid")
+            page_keys: list[dict[str, str]] = []
             for item in items:
                 if not isinstance(item, Mapping):
                     raise ScanMeasurementError("scan deletion listing is invalid")
@@ -429,27 +429,31 @@ class DynamoScanMeasurements:
                 ):
                     raise ScanMeasurementError("scan deletion listing is invalid")
                 seen.add(signature)
-                keys.append({"PK": pk, "SK": sk})
+                page_keys.append({"PK": pk, "SK": sk})
             next_key = response.get("LastEvaluatedKey")
+            if next_key is not None:
+                if (
+                    not isinstance(next_key, Mapping)
+                    or set(next_key) != {"PK", "SK"}
+                    or next_key.get("PK") != user_pk
+                    or not isinstance(next_key.get("SK"), str)
+                ):
+                    raise ScanMeasurementError("scan deletion cursor is invalid")
+            # Delete only after validating the complete page and its cursor.
+            # This guarantees bounded progress even when more than forty
+            # pages exist, while a later pass safely resumes the remainder.
+            for key in page_keys:
+                try:
+                    self._table.delete_item(Key=key)
+                except Exception:
+                    # Reconcile the complete partition below. A response can
+                    # be lost after DynamoDB durably applies the exact delete.
+                    pass
             if next_key is None:
                 break
-            if (
-                not isinstance(next_key, Mapping)
-                or set(next_key) != {"PK", "SK"}
-                or next_key.get("PK") != user_pk
-                or not isinstance(next_key.get("SK"), str)
-            ):
-                raise ScanMeasurementError("scan deletion cursor is invalid")
+            if page_number == 39:
+                raise ScanMeasurementError("scan deletion exceeded its page bound")
             start_key = dict(next_key)
-        else:
-            raise ScanMeasurementError("scan deletion exceeded its page bound")
-        for key in keys:
-            try:
-                self._table.delete_item(Key=key)
-            except Exception:
-                # Reconcile the complete partition below. A response can be
-                # lost after DynamoDB durably applies the exact delete.
-                pass
         remaining = self._table.query(
             KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
             ExpressionAttributeValues={":pk": user_pk, ":prefix": "SCAN#"},

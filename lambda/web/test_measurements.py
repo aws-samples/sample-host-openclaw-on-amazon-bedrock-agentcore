@@ -221,3 +221,59 @@ def test_account_deletion_removes_only_the_pseudonymous_user_partition():
     deleted = [call for call in table.calls if call[0] == "delete"]
     assert len(deleted) == 2
     assert USER not in repr(deleted)
+
+
+def test_account_deletion_makes_bounded_progress_above_four_thousand_records():
+    class PagingTable(Table):
+        def query(self, **kwargs):
+            self.calls.append(("query", kwargs))
+            pk = kwargs["ExpressionAttributeValues"][":pk"]
+            prefix = kwargs["ExpressionAttributeValues"][":prefix"]
+            values = sorted(
+                (
+                    dict(item)
+                    for (item_pk, sk), item in self.items.items()
+                    if item_pk == pk and sk.startswith(prefix)
+                ),
+                key=lambda item: item["SK"],
+            )
+            start = kwargs.get("ExclusiveStartKey")
+            if start is not None:
+                values = [item for item in values if item["SK"] > start["SK"]]
+            limit = kwargs.get("Limit", len(values))
+            page = values[:limit]
+            response = {"Items": page}
+            if len(values) > limit:
+                response["LastEvaluatedKey"] = {
+                    "PK": page[-1]["PK"],
+                    "SK": page[-1]["SK"],
+                }
+            return response
+
+    table = PagingTable()
+    store = measurements(table)
+    user_pk = store._pk(USER)
+    other_pk = store._pk(OTHER)
+    for index in range(4_001):
+        key = {
+            "PK": user_pk,
+            "SK": f"SCAN#{1_700_000_000 + index:020d}#{index:032d}",
+        }
+        table.items[(key["PK"], key["SK"])] = key
+    other_key = {
+        "PK": other_pk,
+        "SK": f"SCAN#{1_700_000_000:020d}#{'z' * 32}",
+    }
+    table.items[(other_key["PK"], other_key["SK"])] = other_key
+
+    with pytest.raises(ScanMeasurementError, match="page bound"):
+        store.delete_user_records(USER)
+
+    assert sum(1 for pk, _ in table.items if pk == user_pk) == 1
+    assert len([call for call in table.calls if call[0] == "delete"]) == 4_000
+    assert (other_key["PK"], other_key["SK"]) in table.items
+
+    store.delete_user_records(USER)
+
+    assert all(pk != user_pk for pk, _ in table.items)
+    assert (other_key["PK"], other_key["SK"]) in table.items
