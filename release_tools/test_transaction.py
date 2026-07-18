@@ -116,6 +116,77 @@ def test_reconcile_persisted_requires_exact_phase_evidence(tmp_path: Path) -> No
     assert reconciled.runtime_image_digest == DIGEST
 
 
+@pytest.mark.parametrize(
+    ("phase", "prior_evidence"),
+    [
+        ("RUNTIME_READY", {"runtime_image_digest": "sha256:" + "e" * 64}),
+        ("ENDPOINT_READY", {"runtime_id": "Runtime-ZZZZZZZZZZ"}),
+        ("CONTEXT_WRITTEN", {"runtime_version": "8"}),
+        ("CONSUMER_CHANGESETS_READY", {"runtime_context_sha256": "f" * 64}),
+    ],
+)
+def test_reconciliation_cannot_rewrite_evidence_owned_by_prior_phases(
+    tmp_path: Path,
+    phase: str,
+    prior_evidence: dict[str, str],
+) -> None:
+    journal = _create(tmp_path)
+    journal.advance_local("PREFLIGHTED")
+    journal.run_mutation(
+        "FOUNDATION_READY", rollback_reference=ROLLBACK, operation=lambda: {}
+    )
+    journal.run_mutation(
+        "IMAGE_PUBLISHED",
+        rollback_reference=ROLLBACK,
+        operation=lambda: {"runtime_image_digest": DIGEST},
+    )
+    if phase in {
+        "ENDPOINT_READY",
+        "CONTEXT_WRITTEN",
+        "CONSUMER_CHANGESETS_READY",
+    }:
+        journal.run_mutation(
+            "RUNTIME_READY",
+            rollback_reference=ROLLBACK,
+            operation=lambda: {
+                "runtime_id": "Runtime-ABCDEFGHIJ",
+                "runtime_version": "7",
+            },
+        )
+    if phase in {"CONTEXT_WRITTEN", "CONSUMER_CHANGESETS_READY"}:
+        journal.run_mutation(
+            "ENDPOINT_READY", rollback_reference=ROLLBACK, operation=lambda: {}
+        )
+    if phase == "CONSUMER_CHANGESETS_READY":
+        journal.run_mutation(
+            "CONTEXT_WRITTEN",
+            rollback_reference=ROLLBACK,
+            operation=lambda: {"runtime_context_sha256": "1" * 64},
+        )
+    journal.begin_mutation(phase, rollback_reference=ROLLBACK)
+    before = journal.current
+
+    with pytest.raises(TransactionError, match="evidence fields"):
+        journal.reconcile(persisted=True, evidence=prior_evidence)
+
+    after = TransactionJournal.load(journal.path).current
+    assert after == before
+
+
+def test_absent_reconciliation_rejects_all_claimed_evidence(tmp_path: Path) -> None:
+    journal = _create(tmp_path)
+    journal.advance_local("PREFLIGHTED")
+    journal.begin_mutation("FOUNDATION_READY", rollback_reference=ROLLBACK)
+
+    with pytest.raises(TransactionError, match="absent.*evidence"):
+        journal.reconcile(
+            persisted=False,
+            evidence={"runtime_image_digest": DIGEST},
+        )
+
+    assert TransactionJournal.load(journal.path).current.state == "UNCERTAIN"
+
+
 def test_resume_and_rollback_are_bound_to_the_exact_recorded_reference(
     tmp_path: Path,
 ) -> None:
@@ -124,13 +195,55 @@ def test_resume_and_rollback_are_bound_to_the_exact_recorded_reference(
     journal.run_mutation(
         "FOUNDATION_READY", rollback_reference=ROLLBACK, operation=lambda: {}
     )
+    journal.run_mutation(
+        "IMAGE_PUBLISHED",
+        rollback_reference=ROLLBACK,
+        operation=lambda: {"runtime_image_digest": DIGEST},
+    )
+    journal.run_mutation(
+        "RUNTIME_READY",
+        rollback_reference=ROLLBACK,
+        operation=lambda: {
+            "runtime_id": "Runtime-ABCDEFGHIJ",
+            "runtime_version": "7",
+        },
+    )
+    journal.run_mutation(
+        "ENDPOINT_READY", rollback_reference=ROLLBACK, operation=lambda: {}
+    )
+    journal.run_mutation(
+        "CONTEXT_WRITTEN",
+        rollback_reference=ROLLBACK,
+        operation=lambda: {"runtime_context_sha256": "1" * 64},
+    )
+    journal.run_mutation(
+        "CONSUMER_CHANGESETS_READY",
+        rollback_reference=ROLLBACK,
+        operation=lambda: {},
+    )
+    journal.run_mutation(
+        "CONSUMERS_APPLIED", rollback_reference=ROLLBACK, operation=lambda: {}
+    )
+    journal.run_mutation("VERIFIED", rollback_reference=ROLLBACK, operation=lambda: {})
 
     with pytest.raises(TransactionError, match="does not match"):
-        journal.record_rollback(ROLLBACK[:-1] + "e")
+        journal.begin_rollback(ROLLBACK[:-1] + "e")
 
-    rolled_back = journal.record_rollback(ROLLBACK)
+    journal.begin_rollback(ROLLBACK)
+    rolled_back = journal.reconcile_rollback(persisted=True)
     assert rolled_back.state == "ROLLED_BACK"
+    assert rolled_back.last_stable_state == "VERIFIED"
     assert journal.resume_target() is None
+
+
+def test_no_direct_rollback_completion_bypass_exists(tmp_path: Path) -> None:
+    journal = _create(tmp_path)
+    journal.advance_local("PREFLIGHTED")
+    journal.run_mutation(
+        "FOUNDATION_READY", rollback_reference=ROLLBACK, operation=lambda: {}
+    )
+
+    assert not hasattr(journal, "record_rollback")
 
 
 def test_stale_journal_writer_cannot_overwrite_a_newer_revision(tmp_path: Path) -> None:

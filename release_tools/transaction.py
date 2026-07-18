@@ -17,11 +17,15 @@ from release_tools.contracts import (
 
 Evidence = Mapping[str, str]
 Mutation = Callable[[], Evidence]
-_EVIDENCE_FIELDS = {
-    "runtime_image_digest",
-    "runtime_id",
-    "runtime_version",
-    "runtime_context_sha256",
+_PHASE_EVIDENCE_FIELDS = {
+    "FOUNDATION_READY": frozenset(),
+    "IMAGE_PUBLISHED": frozenset({"runtime_image_digest"}),
+    "RUNTIME_READY": frozenset({"runtime_id", "runtime_version"}),
+    "ENDPOINT_READY": frozenset(),
+    "CONTEXT_WRITTEN": frozenset({"runtime_context_sha256"}),
+    "CONSUMER_CHANGESETS_READY": frozenset(),
+    "CONSUMERS_APPLIED": frozenset(),
+    "VERIFIED": frozenset(),
 }
 _LOCAL_STATES = {"PREFLIGHTED"}
 
@@ -178,9 +182,16 @@ class TransactionJournal:
         if self.current.uncertain_phase == "ROLLBACK":
             raise TransactionError("UNCERTAIN rollback requires rollback reconciliation")
         supplied = dict(evidence or {})
-        unknown = set(supplied) - _EVIDENCE_FIELDS
-        if unknown:
-            raise TransactionError(f"unknown reconciliation evidence: {sorted(unknown)}")
+        if not persisted and supplied:
+            raise TransactionError("absent reconciliation accepts no evidence")
+        expected_fields = _PHASE_EVIDENCE_FIELDS.get(self.current.uncertain_phase)
+        if expected_fields is None:
+            raise TransactionError("UNCERTAIN phase has no evidence ownership rule")
+        if persisted and set(supplied) != expected_fields:
+            raise TransactionError(
+                "reconciliation evidence fields differ from the uncertain phase: "
+                f"expected {sorted(expected_fields)}, got {sorted(supplied)}"
+            )
         target = (
             self.current.uncertain_phase
             if persisted
@@ -258,25 +269,3 @@ class TransactionJournal:
         if not isinstance(evidence, Mapping):
             raise TransactionError("mutation evidence must be a mapping")
         return self.reconcile(persisted=True, evidence=evidence)
-
-    def record_rollback(self, rollback_reference: str) -> StagingTransactionV1:
-        """Record a separately proven rollback only for the exact stored target."""
-
-        if self.current.state == "UNCERTAIN":
-            raise TransactionError("UNCERTAIN staging transaction must reconcile first")
-        if not self.current.rollback_reference:
-            raise TransactionError("staging transaction has no rollback reference")
-        if rollback_reference != self.current.rollback_reference:
-            raise TransactionError("rollback reference does not match the journal")
-        if self.current.state == "ROLLED_BACK":
-            return self.current
-        mapping = self.current.to_mapping()
-        mapping.update(
-            {
-                "state": "ROLLED_BACK",
-                "lastStableState": self.current.state,
-                "revision": self.current.revision + 1,
-                "uncertainPhase": "",
-            }
-        )
-        return self._persist(StagingTransactionV1.from_mapping(mapping))
