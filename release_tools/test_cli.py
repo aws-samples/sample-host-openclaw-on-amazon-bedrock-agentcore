@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -28,9 +29,13 @@ def _write_executable(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
+def _sha256(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _fixture(tmp_path: Path) -> dict[str, object]:
     repository = tmp_path / "repo"
-    repository.mkdir()
+    repository.mkdir(parents=True)
     (repository / "README.md").write_text("fixture\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
     subprocess.run(
@@ -74,23 +79,62 @@ fi
         driver,
         """#!/bin/bash
 set -eu
+mode=""
 phase=""
+transaction_id=""
+source_commit=""
+source_tree=""
+account=""
+region=""
+operation_sha256=""
 while (($#)); do
   case "$1" in
+    --mode) mode="$2"; shift 2 ;;
     --phase) phase="$2"; shift 2 ;;
+    --transaction-id) transaction_id="$2"; shift 2 ;;
+    --source-commit) source_commit="$2"; shift 2 ;;
+    --source-tree) source_tree="$2"; shift 2 ;;
+    --account) account="$2"; shift 2 ;;
+    --region) region="$2"; shift 2 ;;
+    --operation-sha256) operation_sha256="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
-printf 'driver <%s>\n' "$phase" >> "$RELEASE_CALL_LOG"
-if [[ "${RELEASE_FAIL_PHASE:-}" == "$phase" ]]; then
+printf 'driver %s <%s> region=<%s>/<%s>/<%s>\n' \
+  "$mode" "$phase" "${CDK_DEFAULT_REGION:-}" "${AWS_REGION:-}" \
+  "${AWS_DEFAULT_REGION:-}" >> "$RELEASE_CALL_LOG"
+if [[ "$mode" == "mutate" && "${RELEASE_FAIL_PHASE:-}" == "$phase" ]]; then
   exit 75
 fi
+if [[ "$mode" == "mutate" ]]; then
+  if [[ "${RELEASE_BAD_ACK_PHASE:-}" == "$phase" ]]; then
+    printf '{}\n'
+    exit 0
+  fi
+  printf '{"dispatched":true}\n'
+  exit 0
+fi
+if [[ "$mode" != "observe" ]]; then
+  exit 76
+fi
+if [[ "${RELEASE_FAIL_OBSERVE_PHASE:-}" == "$phase" ]]; then
+  exit 77
+fi
+outcome="${RELEASE_OBSERVE_OUTCOME:-PERSISTED}"
+evidence='{}'
+if [[ "$outcome" == "PERSISTED" ]]; then
+  case "$phase" in
+    image) evidence='{"runtime_image_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}' ;;
+    runtime) evidence='{"runtime_id":"Runtime-ABCDEFGHIJ","runtime_version":"7"}' ;;
+    context) evidence='{"runtime_context_sha256":"1111111111111111111111111111111111111111111111111111111111111111"}' ;;
+    rollback) printf -v evidence '{"rollback_reference":"%s"}' \
+      "$RELEASE_ROLLBACK_REFERENCE" ;;
+  esac
+fi
 case "$phase" in
-  image) printf '{"runtime_image_digest":"sha256:%064d"}\n' 0 ;;
-  runtime) printf '{"runtime_id":"Runtime-ABCDEFGHIJ","runtime_version":"7"}\n' ;;
-  context) printf '{"runtime_context_sha256":"%064d"}\n' 1 ;;
-  rollback) printf '{"rollback_reference":"%s"}\n' "$RELEASE_ROLLBACK_REFERENCE" ;;
-  *) printf '{}\n' ;;
+  *) printf '{"account":"%s","evidence":%s,"operationSha256":"%s","outcome":"%s","phase":"%s","region":"%s","schema":"personal-operator.phase-observation.v1","sourceCommit":"%s","sourceTree":"%s","transactionId":"%s"}\n' \
+    "$account" "$evidence" "$operation_sha256" "$outcome" "$phase" \
+    "$region" "$source_commit" "$source_tree" "$transaction_id" ;;
 esac
 """,
     )
@@ -169,6 +213,7 @@ def _phase(
     **environment: str,
 ) -> subprocess.CompletedProcess[str]:
     transaction_id = f"release_{fixture['commit']}"
+    operation_sha256 = _sha256(fixture["driver"])
     args = [
         "--journal",
         str(fixture["journal"]),
@@ -182,7 +227,12 @@ def _phase(
     if confirmation is not None:
         args.extend(["--confirm", confirmation])
     elif phase:
-        args.extend(["--confirm", f"mutate:{transaction_id}:{phase}"])
+        args.extend(
+            [
+                "--confirm",
+                f"mutate:{transaction_id}:{phase}:{operation_sha256}",
+            ]
+        )
     return _run(fixture, *args, **environment)
 
 
@@ -240,6 +290,37 @@ def test_mutation_requires_exact_confirmation_before_credentials_or_driver(
     assert TransactionJournal.load(fixture["journal"]).current.state == "PREFLIGHTED"
 
 
+def test_mutation_rejects_a_symlinked_driver_before_write_ahead_or_credentials(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+    link = tmp_path / "phase-driver-link"
+    link.symlink_to(fixture["driver"])
+
+    completed = _run(
+        fixture,
+        "--journal",
+        str(fixture["journal"]),
+        "--phase",
+        "foundation",
+        "--driver",
+        str(link),
+        "--rollback-reference",
+        str(fixture["rollback"]),
+        "--confirm",
+        (
+            f"mutate:release_{fixture['commit']}:foundation:"
+            f"{_sha256(fixture['driver'])}"
+        ),
+    )
+
+    assert completed.returncode != 0
+    assert "symlink" in completed.stderr.casefold()
+    assert not fixture["log"].exists()
+    assert TransactionJournal.load(fixture["journal"]).current.state == "PREFLIGHTED"
+
+
 def test_confirmed_phase_discovers_exact_account_immediately_before_driver(
     tmp_path: Path,
 ) -> None:
@@ -251,10 +332,57 @@ def test_confirmed_phase_discovers_exact_account_immediately_before_driver(
     assert completed.returncode == 0, completed.stderr
     assert fixture["log"].read_text(encoding="utf-8").splitlines() == [
         "aws <sts get-caller-identity --query Account --output text --region eu-west-1>",
-        "driver <foundation>",
+        "driver mutate <foundation> region=<eu-west-1>/<eu-west-1>/<eu-west-1>",
+        "aws <sts get-caller-identity --query Account --output text --region eu-west-1>",
+        "driver observe <foundation> region=<eu-west-1>/<eu-west-1>/<eu-west-1>",
     ]
     assert TransactionJournal.load(fixture["journal"]).current.state == (
         "FOUNDATION_READY"
+    )
+
+
+def test_phase_revalidates_region_before_write_ahead_or_credentials(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+
+    completed = _phase(fixture, "foundation", AWS_REGION="us-east-1")
+
+    assert completed.returncode != 0
+    assert "AWS_REGION" in completed.stderr
+    assert not fixture["log"].exists()
+    assert TransactionJournal.load(fixture["journal"]).current.state == "PREFLIGHTED"
+
+
+def test_mutation_requires_typed_ack_and_authoritative_observation(
+    tmp_path: Path,
+) -> None:
+    bad_ack = _fixture(tmp_path / "ack")
+    assert _preflight(bad_ack).returncode == 0
+
+    rejected = _phase(
+        bad_ack,
+        "foundation",
+        RELEASE_BAD_ACK_PHASE="foundation",
+    )
+
+    assert rejected.returncode != 0
+    assert "acknowledgement" in rejected.stderr
+    assert TransactionJournal.load(bad_ack["journal"]).current.state == "UNCERTAIN"
+
+    no_observation = _fixture(tmp_path / "observe")
+    assert _preflight(no_observation).returncode == 0
+    ambiguous = _phase(
+        no_observation,
+        "foundation",
+        RELEASE_FAIL_OBSERVE_PHASE="foundation",
+    )
+
+    assert ambiguous.returncode != 0
+    assert "observe" in ambiguous.stderr
+    assert TransactionJournal.load(no_observation["journal"]).current.state == (
+        "UNCERTAIN"
     )
 
 
@@ -273,10 +401,6 @@ def test_post_dispatch_failure_stays_uncertain_and_blocks_later_phases(
         fixture,
         "--resume",
         str(fixture["journal"]),
-        "--driver",
-        str(fixture["driver"]),
-        "--confirm",
-        f"mutate:release_{fixture['commit']}:image",
     )
 
     assert failed.returncode != 0
@@ -287,9 +411,9 @@ def test_post_dispatch_failure_stays_uncertain_and_blocks_later_phases(
     assert resume.returncode != 0
     assert "reconcile" in resume.stderr.casefold()
     assert fixture["log"].read_text(encoding="utf-8").splitlines().count(
-        "driver <image>"
+        "driver mutate <image> region=<eu-west-1>/<eu-west-1>/<eu-west-1>"
     ) == 1
-    assert "driver <runtime>" not in fixture["log"].read_text(encoding="utf-8")
+    assert "<runtime>" not in fixture["log"].read_text(encoding="utf-8")
 
 
 def test_explicit_absent_reconciliation_allows_safe_resume(
@@ -305,23 +429,95 @@ def test_explicit_absent_reconciliation_allows_safe_resume(
         "--resume",
         str(fixture["journal"]),
         "--reconcile",
-        "absent",
-    )
-    resumed = _run(
-        fixture,
-        "--resume",
-        str(fixture["journal"]),
         "--driver",
         str(fixture["driver"]),
         "--confirm",
-        f"mutate:release_{fixture['commit']}:image",
+        (
+            f"reconcile:release_{fixture['commit']}:image:"
+            f"{_sha256(fixture['driver'])}"
+        ),
+        RELEASE_OBSERVE_OUTCOME="ABSENT",
     )
+    resumed = _phase(fixture, "image")
 
     assert reconciled.returncode == 0, reconciled.stderr
     assert resumed.returncode == 0, resumed.stderr
     current = TransactionJournal.load(fixture["journal"]).current
     assert current.state == "IMAGE_PUBLISHED"
     assert current.runtime_image_digest == "sha256:" + "0" * 64
+
+
+def test_reconciliation_rejects_operator_outcome_and_changed_driver(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+    assert _phase(fixture, "foundation").returncode == 0
+    assert _phase(fixture, "image", RELEASE_FAIL_PHASE="image").returncode != 0
+    before_calls = fixture["log"].read_text(encoding="utf-8")
+
+    operator_claim = _run(
+        fixture,
+        "--resume",
+        str(fixture["journal"]),
+        "--reconcile",
+        "persisted",
+    )
+    fixture["driver"].write_text(
+        fixture["driver"].read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    fixture["driver"].chmod(0o755)
+    changed_digest = _sha256(fixture["driver"])
+    replaced = _run(
+        fixture,
+        "--resume",
+        str(fixture["journal"]),
+        "--reconcile",
+        "--driver",
+        str(fixture["driver"]),
+        "--confirm",
+        (
+            f"reconcile:release_{fixture['commit']}:image:"
+            f"{changed_digest}"
+        ),
+    )
+
+    assert operator_claim.returncode != 0
+    assert replaced.returncode != 0
+    assert "digest differs" in replaced.stderr
+    assert fixture["log"].read_text(encoding="utf-8") == before_calls
+    assert TransactionJournal.load(fixture["journal"]).current.state == "UNCERTAIN"
+
+
+def test_reconciliation_revalidates_region_before_live_observation(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+    assert _phase(fixture, "foundation").returncode == 0
+    assert _phase(fixture, "image", RELEASE_FAIL_PHASE="image").returncode != 0
+    before_calls = fixture["log"].read_text(encoding="utf-8")
+
+    completed = _run(
+        fixture,
+        "--resume",
+        str(fixture["journal"]),
+        "--reconcile",
+        "--driver",
+        str(fixture["driver"]),
+        "--confirm",
+        (
+            f"reconcile:release_{fixture['commit']}:image:"
+            f"{_sha256(fixture['driver'])}"
+        ),
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+
+    assert completed.returncode != 0
+    assert "AWS_DEFAULT_REGION" in completed.stderr
+    assert fixture["log"].read_text(encoding="utf-8") == before_calls
+    assert TransactionJournal.load(fixture["journal"]).current.state == "UNCERTAIN"
 
 
 def test_verified_rollback_is_write_ahead_and_never_exposes_endpoint_retarget(
@@ -346,10 +542,29 @@ def test_verified_rollback_is_write_ahead_and_never_exposes_endpoint_retarget(
             "runtimeContextSha256": "1" * 64,
             "rollbackReference": fixture["rollback"],
             "uncertainPhase": "",
+            "uncertainOperationSha256": "",
         }
     )
     write_new_contract(fixture["journal"], verified)
     transaction_id = f"release_{fixture['commit']}"
+    operation_sha256 = _sha256(fixture["driver"])
+
+    poisoned = _run(
+        fixture,
+        "--journal",
+        str(fixture["journal"]),
+        "--rollback",
+        transaction_id,
+        "--driver",
+        str(fixture["driver"]),
+        "--confirm",
+        f"rollback:{transaction_id}:{operation_sha256}",
+        CDK_DEFAULT_REGION="us-east-1",
+    )
+    assert poisoned.returncode != 0
+    assert "CDK_DEFAULT_REGION" in poisoned.stderr
+    assert not fixture["log"].exists()
+    assert TransactionJournal.load(fixture["journal"]).current.state == "VERIFIED"
 
     completed = _run(
         fixture,
@@ -360,18 +575,17 @@ def test_verified_rollback_is_write_ahead_and_never_exposes_endpoint_retarget(
         "--driver",
         str(fixture["driver"]),
         "--confirm",
-        f"rollback:{transaction_id}",
+        f"rollback:{transaction_id}:{operation_sha256}",
     )
 
     assert completed.returncode == 0, completed.stderr
     current = TransactionJournal.load(fixture["journal"]).current
     assert current.state == "ROLLED_BACK"
-    assert fixture["log"].read_text(encoding="utf-8").endswith(
-        "driver <rollback>\n"
-    )
-    source = SCRIPT.read_text(encoding="utf-8")
-    assert "update-agent-runtime-endpoint" not in source
-    assert "agentcore deploy" not in source.casefold()
+    assert current.runtime_endpoint_name == f"release_{fixture['commit']}"
+    assert fixture["log"].read_text(encoding="utf-8").splitlines()[-2:] == [
+        "aws <sts get-caller-identity --query Account --output text --region eu-west-1>",
+        "driver observe <rollback> region=<eu-west-1>/<eu-west-1>/<eu-west-1>",
+    ]
 
 
 def test_status_rejects_noncanonical_journal_without_aws_access(

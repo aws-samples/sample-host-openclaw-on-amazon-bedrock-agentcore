@@ -139,8 +139,11 @@ Python package. The CLI surface is:
   canonical journal without discovering credentials;
 - `--phase <foundation|image|runtime|endpoint|context|consumer-changesets|consumers|verify>`:
   run only the legal next phase after an exact mutation confirmation;
-- `--resume <journal>`: resume only a stable journal, or explicitly reconcile
-  an `UNCERTAIN` mutation as `persisted` or `absent` first;
+- `--resume <journal>`: resume only a stable journal;
+- `--resume <journal> --reconcile --driver <reviewed-operation>`:
+  run the exact operation's phase-specific read-only live observation for an
+  `UNCERTAIN` journal. The observer, never the operator, proves `PERSISTED` or
+  `ABSENT`;
 - `--status <journal>`: print the canonical journal without credentials;
 - `--rollback <verified-transaction-id>`: write rollback intent before dispatch
   and accept only the journal's exact rollback reference. It never retargets a
@@ -160,13 +163,34 @@ JOURNAL="$PWD/build/releases/release_${PERSONAL_OPERATOR_RELEASE_COMMIT}.json"
 ./scripts/deploy.sh --status "$JOURNAL"
 ```
 
-Do not supply a phase driver or mutation confirmation during preflight. A real
-phase requires a separately reviewed executable driver, an exact
-`mutate:release_<40-sha>:<phase>` confirmation, and for the first cloud phase an
-exact commit/account/region/digest-bound rollback reference. The journal is
-fsynced as `UNCERTAIN` before credential discovery and dispatch. A timeout,
-noncanonical response, account mismatch, or driver failure blocks every later
-phase until authoritative reconciliation.
+Do not supply an operation or mutation confirmation during preflight. A real
+phase requires one self-contained reviewed executable. The CLI hashes and
+copies its exact bytes into a private file retained for that invocation, then
+requires the exact
+confirmation
+`mutate:release_<40-sha>:<phase>:sha256:<operation-hex>`. The journal records
+that operation digest while `UNCERTAIN`. For the first cloud phase it also
+requires the exact commit/account/region/digest-bound rollback reference.
+
+Immediately before each dispatch or observation, the CLI rejects conflicting
+`CDK_DEFAULT_REGION`, `AWS_REGION`, or `AWS_DEFAULT_REGION`, authenticates the
+exact account, and pins all three child variables to `eu-west-1`. Mutation must
+return only `{"dispatched":true}`. It is never treated as persistence proof:
+the same retained executable is called in read-only observation mode and must
+return one canonical, identity-bound `personal-operator.phase-observation.v1`
+record. A `PERSISTED` record contains only the evidence owned by that phase; an
+`ABSENT` record contains none. The CLI then performs the matching journal
+transition.
+
+After a crash or ambiguous result, use the same exact operation bytes and the
+confirmation
+`reconcile:release_<40-sha>:<phase>:sha256:<operation-hex>`. There is no
+operator `persisted|absent` switch and no local evidence-file override. A
+changed operation, timeout, noncanonical observation, account/region mismatch,
+unknown outcome, or wrong subject leaves the journal `UNCERTAIN` and blocks
+every later phase. Rollback follows the same write-ahead mutation plus
+authoritative observation rule, with
+`rollback:release_<40-sha>:sha256:<operation-hex>`.
 
 The CDK foundation owns exactly one private retained
 `personal-operator/bridge` repository with immutable tags, scan-on-push, KMS

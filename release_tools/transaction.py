@@ -75,6 +75,7 @@ class TransactionJournal:
                 "runtimeContextSha256": "",
                 "rollbackReference": "",
                 "uncertainPhase": "",
+                "uncertainOperationSha256": "",
             }
         )
         write_new_contract(Path(path), value)
@@ -145,6 +146,7 @@ class TransactionJournal:
         target_state: str,
         *,
         rollback_reference: str,
+        operation_sha256: str,
     ) -> StagingTransactionV1:
         """Persist write-ahead UNCERTAIN intent before crossing a mutation boundary."""
 
@@ -165,6 +167,7 @@ class TransactionJournal:
                 "revision": self.current.revision + 1,
                 "rollbackReference": rollback_reference,
                 "uncertainPhase": target_state,
+                "uncertainOperationSha256": operation_sha256,
             }
         )
         return self._persist(StagingTransactionV1.from_mapping(mapping))
@@ -173,6 +176,7 @@ class TransactionJournal:
         self,
         *,
         persisted: bool,
+        operation_sha256: str,
         evidence: Evidence | None = None,
     ) -> StagingTransactionV1:
         """Resolve UNCERTAIN using authoritative live-state evidence."""
@@ -181,6 +185,10 @@ class TransactionJournal:
             raise TransactionError("only an UNCERTAIN phase can be reconciled")
         if self.current.uncertain_phase == "ROLLBACK":
             raise TransactionError("UNCERTAIN rollback requires rollback reconciliation")
+        if operation_sha256 != self.current.uncertain_operation_sha256:
+            raise TransactionError(
+                "reconciliation operation digest differs from the journal"
+            )
         supplied = dict(evidence or {})
         if not persisted and supplied:
             raise TransactionError("absent reconciliation accepts no evidence")
@@ -204,6 +212,7 @@ class TransactionJournal:
                 "lastStableState": target,
                 "revision": self.current.revision + 1,
                 "uncertainPhase": "",
+                "uncertainOperationSha256": "",
             }
         )
         aliases = {
@@ -216,7 +225,12 @@ class TransactionJournal:
             mapping[aliases[name]] = value
         return self._persist(StagingTransactionV1.from_mapping(mapping))
 
-    def begin_rollback(self, rollback_reference: str) -> StagingTransactionV1:
+    def begin_rollback(
+        self,
+        rollback_reference: str,
+        *,
+        operation_sha256: str,
+    ) -> StagingTransactionV1:
         """Durably record rollback intent for one fully verified transaction."""
 
         if self.current.state == "UNCERTAIN":
@@ -232,11 +246,17 @@ class TransactionJournal:
                 "lastStableState": "VERIFIED",
                 "revision": self.current.revision + 1,
                 "uncertainPhase": "ROLLBACK",
+                "uncertainOperationSha256": operation_sha256,
             }
         )
         return self._persist(StagingTransactionV1.from_mapping(mapping))
 
-    def reconcile_rollback(self, *, persisted: bool) -> StagingTransactionV1:
+    def reconcile_rollback(
+        self,
+        *,
+        persisted: bool,
+        operation_sha256: str,
+    ) -> StagingTransactionV1:
         """Resolve write-ahead rollback intent from authoritative evidence."""
 
         if (
@@ -244,6 +264,10 @@ class TransactionJournal:
             or self.current.uncertain_phase != "ROLLBACK"
         ):
             raise TransactionError("only an UNCERTAIN rollback can be reconciled")
+        if operation_sha256 != self.current.uncertain_operation_sha256:
+            raise TransactionError(
+                "rollback reconciliation operation digest differs from the journal"
+            )
         mapping = self.current.to_mapping()
         mapping.update(
             {
@@ -251,6 +275,7 @@ class TransactionJournal:
                 "lastStableState": "VERIFIED",
                 "revision": self.current.revision + 1,
                 "uncertainPhase": "",
+                "uncertainOperationSha256": "",
             }
         )
         return self._persist(StagingTransactionV1.from_mapping(mapping))
@@ -260,12 +285,21 @@ class TransactionJournal:
         target_state: str,
         *,
         rollback_reference: str,
+        operation_sha256: str,
         operation: Mutation,
     ) -> StagingTransactionV1:
         """Run one mutation only after durable intent; ambiguity remains UNCERTAIN."""
 
-        self.begin_mutation(target_state, rollback_reference=rollback_reference)
+        self.begin_mutation(
+            target_state,
+            rollback_reference=rollback_reference,
+            operation_sha256=operation_sha256,
+        )
         evidence = operation()
         if not isinstance(evidence, Mapping):
             raise TransactionError("mutation evidence must be a mapping")
-        return self.reconcile(persisted=True, evidence=evidence)
+        return self.reconcile(
+            persisted=True,
+            operation_sha256=operation_sha256,
+            evidence=evidence,
+        )

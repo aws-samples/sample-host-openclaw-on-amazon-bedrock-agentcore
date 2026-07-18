@@ -252,14 +252,65 @@ def test_deploy_is_only_an_exec_compatibility_shim() -> None:
     assert source.count("exec ") == 1
 
 
-def test_cli_owns_exact_identity_and_confirmation_validation() -> None:
-    source = (ROOT / "release_tools/cli.py").read_text(encoding="utf-8")
-    assert "PERSONAL_OPERATOR_RELEASE_ACCOUNT" in source
-    assert "PERSONAL_OPERATOR_RELEASE_COMMIT" in source
-    assert 'f"mutate:{journal.current.transaction_id}:{phase}"' in source
-    assert 'f"rollback:{transaction_id}"' in source
-    assert '"status", "--porcelain", "--untracked-files=all"' in source
-    assert '"rev-parse", "HEAD^{tree}"' in source
+def test_cli_preflight_executes_exact_git_identity_checks_without_aws(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / "README.md").write_text("release fixture\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Release Test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "release@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "fixture"],
+        cwd=repository,
+        check=True,
+    )
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        text=True,
+    ).strip()
+    journal = tmp_path / "journal.json"
+
+    wrong_head = _run(
+        "--preflight",
+        "--root",
+        str(repository),
+        "--journal",
+        str(journal),
+        "--account",
+        "123456789012",
+        "--commit",
+        "0" * 40,
+    )
+    (repository / "untracked.txt").write_text("drift\n", encoding="utf-8")
+    dirty = _run(
+        "--preflight",
+        "--root",
+        str(repository),
+        "--journal",
+        str(journal),
+        "--account",
+        "123456789012",
+        "--commit",
+        head,
+    )
+
+    assert wrong_head.returncode != 0
+    assert "exact Git HEAD" in wrong_head.stderr
+    assert dirty.returncode != 0
+    assert "clean worktree" in dirty.stderr
+    assert not journal.exists()
 
 
 def test_cli_exposes_the_frozen_linear_phase_surface() -> None:

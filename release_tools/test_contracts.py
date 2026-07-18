@@ -24,6 +24,7 @@ REGION = "eu-west-1"
 COMMIT = "a" * 40
 TREE = "b" * 40
 DIGEST = "sha256:" + "c" * 64
+OPERATION = "sha256:" + "f" * 64
 IMAGE_URI = (
     f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/"
     f"personal-operator/bridge@{DIGEST}"
@@ -129,6 +130,7 @@ def _transaction() -> dict[str, object]:
         "runtimeContextSha256": "",
         "rollbackReference": "",
         "uncertainPhase": "",
+        "uncertainOperationSha256": "",
     }
 
 
@@ -260,6 +262,33 @@ def test_staging_transaction_contract_enforces_new_state_invariants() -> None:
 
     with pytest.raises(ContractError, match="state"):
         StagingTransactionV1.from_mapping({**_transaction(), "state": "SURPRISE"})
+
+
+def test_uncertain_transaction_is_bound_to_one_exact_operation_digest() -> None:
+    uncertain = {
+        **_transaction(),
+        "state": "UNCERTAIN",
+        "lastStableState": "PREFLIGHTED",
+        "revision": 2,
+        "rollbackReference": (
+            f"rollback:v1:{ACCOUNT}:{REGION}:{COMMIT}:sha256:" + "9" * 64
+        ),
+        "uncertainPhase": "FOUNDATION_READY",
+        "uncertainOperationSha256": OPERATION,
+    }
+
+    parsed = StagingTransactionV1.from_mapping(uncertain)
+
+    assert parsed.uncertain_operation_sha256 == OPERATION
+    for invalid in ("", "f" * 64, "sha256:" + "F" * 64):
+        with pytest.raises(ContractError, match="operation"):
+            StagingTransactionV1.from_mapping(
+                {**uncertain, "uncertainOperationSha256": invalid}
+            )
+    with pytest.raises(ContractError, match="operation"):
+        StagingTransactionV1.from_mapping(
+            {**_transaction(), "uncertainOperationSha256": OPERATION}
+        )
 
 
 def test_write_new_contract_is_atomic_and_never_clobbers(tmp_path: Path) -> None:

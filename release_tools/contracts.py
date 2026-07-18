@@ -662,6 +662,7 @@ class StagingTransactionV1:
         "runtimeContextSha256",
         "rollbackReference",
         "uncertainPhase",
+        "uncertainOperationSha256",
     }
 
     transaction_id: str
@@ -679,6 +680,7 @@ class StagingTransactionV1:
     runtime_context_sha256: str
     rollback_reference: str
     uncertain_phase: str
+    uncertain_operation_sha256: str
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "StagingTransactionV1":
@@ -718,14 +720,34 @@ class StagingTransactionV1:
             value["rollbackReference"], account=account, region=region, commit=commit
         )
         uncertain_phase = _text(value["uncertainPhase"], field="uncertain phase")
+        operation_digest = _text(
+            value["uncertainOperationSha256"],
+            field="uncertain operation digest",
+        )
+        if state != "UNCERTAIN" and operation_digest:
+            raise ContractError(
+                "uncertain operation digest is set outside UNCERTAIN"
+            )
         if state == "NEW":
             if stable != "NEW" or revision != 0 or any(
-                (image_digest, runtime_id, runtime_version, context_digest, rollback, uncertain_phase)
+                (
+                    image_digest,
+                    runtime_id,
+                    runtime_version,
+                    context_digest,
+                    rollback,
+                    uncertain_phase,
+                    operation_digest,
+                )
             ):
                 raise ContractError("NEW staging transaction contains later-phase evidence")
         elif state == "UNCERTAIN":
             if not uncertain_phase or revision < 1:
                 raise ContractError("UNCERTAIN staging transaction lacks its phase")
+            if _DIGEST.fullmatch(operation_digest) is None:
+                raise ContractError(
+                    "UNCERTAIN staging transaction lacks its exact operation digest"
+                )
             if uncertain_phase == "ROLLBACK":
                 if stable != "VERIFIED" or not rollback:
                     raise ContractError(
@@ -780,6 +802,7 @@ class StagingTransactionV1:
             context_digest,
             rollback,
             uncertain_phase,
+            operation_digest,
         )
 
     @classmethod
@@ -804,6 +827,7 @@ class StagingTransactionV1:
             "runtimeContextSha256": self.runtime_context_sha256,
             "rollbackReference": self.rollback_reference,
             "uncertainPhase": self.uncertain_phase,
+            "uncertainOperationSha256": self.uncertain_operation_sha256,
         }
 
     def to_bytes(self) -> bytes:
