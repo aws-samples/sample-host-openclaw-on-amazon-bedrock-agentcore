@@ -287,20 +287,54 @@ describe("consumer control surface", () => {
     expect(screen.queryByText(/encrypted-ready/i)).not.toBeInTheDocument();
   });
 
-  it("logs out only the current browser session and clears the in-memory CSRF handle", async () => {
-    history.replaceState({}, "", "/");
+  it("logs out with replacement navigation and removes private workspace state from the DOM", async () => {
+    history.replaceState({}, "", "/workspace?draft=draft_action_12345678");
     sessionStorage.setItem("personal-operator.csrf", "c".repeat(43));
-    fetch
-      .mockReturnValueOnce(response(overview()))
-      .mockReturnValueOnce(response({}, { status: 204 }));
-    render(<App />);
-    await screen.findByRole("heading", { name: /read-only operator/i });
+    fetch.mockImplementation((path) => {
+      if (path === "/api/workspace") {
+        return response({
+          userId: "user_founder", runtimeState: "IDLE",
+          workspaceReceipt: null, files: [{ path: "memory.md", size: 12 }],
+        });
+      }
+      if (path === "/api/gmail") {
+        return response({
+          userId: "user_founder",
+          opportunities: [{
+            id: "opportunity_123", title: "Follow up with Ada",
+            reason: "Ada is waiting.", waitingSince: "2026-07-10T10:00:00+00:00",
+            sourceUrl: "https://mail.google.com/mail/u/0/#inbox/thread-1",
+            correspondent: "ada@example.com", subject: "Project update",
+            confidence: 0.9,
+          }],
+          drafts: [{
+            actionId: "draft_action_12345678", revision: 1,
+            to: "ada@example.com", subject: "Following up",
+            body: "Hi Ada, just following up.", payloadHash: "a".repeat(64),
+          }],
+        });
+      }
+      if (path === "/api/session/logout") return response({}, { status: 204 });
+      throw new Error(`unexpected request: ${path}`);
+    });
+    const replaceDocument = vi.fn();
+    render(<App replaceDocument={replaceDocument} />);
+    await screen.findByDisplayValue("Hi Ada, just following up.");
+    expect(screen.getAllByText("ada@example.com")).toHaveLength(2);
+    expect(screen.getByText("memory.md")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
 
-    await screen.findByText("Signed out");
+    await screen.findByRole("heading", { name: "Signed out" });
     expect(sessionStorage.getItem("personal-operator.csrf")).toBeNull();
     expect(fetch.mock.calls.at(-1)[0]).toBe("/api/session/logout");
     expect(fetch.mock.calls.at(-1)[1].headers["X-PO-CSRF"]).toBe("c".repeat(43));
+    expect(replaceDocument).toHaveBeenCalledWith("/signed-out");
+    expect(screen.queryByText("ada@example.com")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Hi Ada, just following up.")).not.toBeInTheDocument();
+    expect(screen.queryByText("memory.md")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Open source in Gmail/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
   });
 });

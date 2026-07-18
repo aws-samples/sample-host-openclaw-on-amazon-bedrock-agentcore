@@ -1,19 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { api, forgetCsrf, rememberCsrf } from "./api";
+
+const LogoutContext = createContext(null);
 
 function LogoutButton() {
   const [state, setState] = useState("ready");
+  const onSignedOut = useContext(LogoutContext);
   async function logout() {
     setState("loading");
     try {
       await api("/api/session/logout", { method: "POST", body: {}, csrf: true });
       forgetCsrf();
-      setState("done");
+      onSignedOut();
     } catch {
       setState("error");
     }
   }
-  if (state === "done") return <span className="nav-status" role="status">Signed out</span>;
   return (
     <button className="nav-action" disabled={state === "loading"} onClick={logout} type="button">
       {state === "error" ? "Try sign out again" : "Sign out"}
@@ -24,17 +26,21 @@ function LogoutButton() {
 function Shell({ eyebrow, title, children, authenticated = true }) {
   return (
     <main className="shell">
-      <nav aria-label="Primary">
-        <a className="brand" href="/">PO<span>.</span></a>
-        <div className="nav-links">
-          <a href="/">Overview</a>
-          <a href="/connections">Connections</a>
-          <a href="/workspace">Workspace</a>
-          <a href="/export">Export</a>
-          <a href="/delete">Delete</a>
-          {authenticated && <LogoutButton />}
-        </div>
-      </nav>
+      {authenticated ? (
+        <nav aria-label="Primary">
+          <a className="brand" href="/">PO<span>.</span></a>
+          <div className="nav-links">
+            <a href="/">Overview</a>
+            <a href="/connections">Connections</a>
+            <a href="/workspace">Workspace</a>
+            <a href="/export">Export</a>
+            <a href="/delete">Delete</a>
+            <LogoutButton />
+          </div>
+        </nav>
+      ) : (
+        <div className="brand" aria-hidden="true">PO<span>.</span></div>
+      )}
       <section className="surface">
         <p className="eyebrow">{eyebrow}</p>
         <h1>{title}</h1>
@@ -501,8 +507,25 @@ function Route({ path }) {
   return <OverviewPage />;
 }
 
-export default function App() {
+function SignedOutPage() {
+  return (
+    <Shell eyebrow="Private control plane" title="Signed out" authenticated={false}>
+      <p>This browser session is closed. Open a new one-time link from Telegram when you are ready to return.</p>
+    </Shell>
+  );
+}
+
+export default function App({ replaceDocument = (path) => location.replace(path) } = {}) {
+  const [signedOut, setSignedOut] = useState(location.pathname === "/signed-out");
+  function finishLogout() {
+    setSignedOut(true);
+    replaceDocument("/signed-out");
+  }
+  if (signedOut) return <SignedOutPage />;
   const ticket = new URLSearchParams(location.search).get("ticket");
-  if (ticket) return <TicketBootstrap />;
-  return <Route path={location.pathname} />;
+  return (
+    <LogoutContext.Provider value={finishLogout}>
+      {ticket ? <TicketBootstrap /> : <Route path={location.pathname} />}
+    </LogoutContext.Provider>
+  );
 }
