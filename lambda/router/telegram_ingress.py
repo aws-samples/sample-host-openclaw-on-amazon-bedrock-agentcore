@@ -25,7 +25,12 @@ MAX_WEBHOOK_BYTES = 128 * 1024
 _INVITE_START = re.compile(
     r"/start(?:@[A-Za-z0-9_]{5,32})? (poi1_[A-Za-z0-9_-]{32})"
 )
+_INVITE_BEARER = re.compile(r"poi1_[A-Za-z0-9_-]{32}")
 _START_WITH_PAYLOAD = re.compile(r"/start(?:@[A-Za-z0-9_]{5,32})?\s+.*", re.DOTALL)
+
+
+def _contains_invite_bearer(value: object) -> bool:
+    return isinstance(value, str) and _INVITE_BEARER.search(value) is not None
 
 
 class TelegramWebhookIngress:
@@ -97,12 +102,16 @@ class TelegramWebhookIngress:
         message = update.get("message")
         callback = update.get("callback_query")
         if isinstance(message, Mapping):
-            text = message.get("text") or message.get("caption")
+            message_text = message.get("text")
+            message_caption = message.get("caption")
+            text = message_text or message_caption
             chat = message.get("chat")
             actor = message.get("from")
             callback_data = None
             callback_query_id = None
         elif isinstance(callback, Mapping):
+            message_text = None
+            message_caption = None
             callback_message = callback.get("message")
             text = None
             chat = (
@@ -134,15 +143,29 @@ class TelegramWebhookIngress:
             # contract. It is deliberately a no-op until that contract exists.
             return {"statusCode": 200, "body": "ok"}
         actor_id = str(actor["id"])
-        display_name = actor.get("first_name") or actor.get("username") or ""
-        if not isinstance(display_name, str):
-            display_name = ""
-        canonical_invite_start = False
         invite_match = (
             _INVITE_START.fullmatch(text)
             if callback_data is None and isinstance(text, str)
             else None
         )
+        display_fields = (actor.get("first_name"), actor.get("username"))
+        if any(_contains_invite_bearer(value) for value in display_fields):
+            return {"statusCode": 200, "body": "ok"}
+        bearer_message_fields = [
+            value
+            for value in (message_text, message_caption)
+            if _contains_invite_bearer(value)
+        ]
+        if bearer_message_fields and not (
+            len(bearer_message_fields) == 1
+            and bearer_message_fields[0] == text
+            and invite_match is not None
+        ):
+            return {"statusCode": 200, "body": "ok"}
+        display_name = actor.get("first_name") or actor.get("username") or ""
+        if not isinstance(display_name, str):
+            display_name = ""
+        canonical_invite_start = False
         if callback_data is None and isinstance(text, str) and _START_WITH_PAYLOAD.fullmatch(text):
             # A /start payload is an authorization bearer lane, never ordinary
             # chat content. Malformed payloads are discarded before identity

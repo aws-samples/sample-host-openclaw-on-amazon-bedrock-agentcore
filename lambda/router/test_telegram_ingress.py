@@ -327,6 +327,58 @@ def test_invalid_used_or_cross_actor_invite_is_a_safe_noop_without_registration(
     assert queue.calls == []
 
 
+def test_invite_bearer_inside_ordinary_text_or_caption_is_discarded_before_identity():
+    token = "poi1_" + "E" * 32
+    resolver = Resolver()
+    redeemer = Redeemer()
+    queue = Queue()
+    ingress = router(resolver=resolver, redeemer=redeemer, queue=queue)
+    headers = {"x-telegram-bot-api-secret-token": SECRET}
+
+    ordinary = update(text=f"please inspect {token} before continuing")
+    caption = update(text="placeholder")
+    caption["message"].pop("text")
+    caption["message"]["caption"] = f"screenshot caption: {token}"
+
+    for payload in (ordinary, caption):
+        assert ingress.handle(json.dumps(payload), headers) == {
+            "statusCode": 200,
+            "body": "ok",
+        }
+
+    assert resolver.calls == []
+    assert redeemer.calls == []
+    assert queue.calls == []
+    assert token not in repr(queue.calls)
+
+
+def test_invite_bearer_inside_display_fields_is_discarded_before_redeem_or_resolve():
+    token = "poi1_" + "F" * 32
+    resolver = Resolver()
+    redeemer = Redeemer()
+    queue = Queue()
+    ingress = router(resolver=resolver, redeemer=redeemer, queue=queue)
+    headers = {"x-telegram-bot-api-secret-token": SECRET}
+
+    first_name = update(text="hello")
+    first_name["message"]["from"]["first_name"] = f"Pilot {token}"
+    username = update(text="hello")
+    username["message"]["from"].pop("first_name")
+    username["message"]["from"]["username"] = f"pilot_{token}"
+    invite_with_tainted_display = update(text=f"/start {token}")
+    invite_with_tainted_display["message"]["from"]["first_name"] = token
+
+    for payload in (first_name, username, invite_with_tainted_display):
+        assert ingress.handle(json.dumps(payload), headers) == {
+            "statusCode": 200,
+            "body": "ok",
+        }
+
+    assert resolver.calls == []
+    assert redeemer.calls == []
+    assert queue.calls == []
+
+
 def test_invite_store_unavailability_is_retryable_without_ordinary_resolution():
     token = "poi1_" + "D" * 32
     resolver = Resolver()
