@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:po-web-read-input:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"url":{"maxLength":2048,"minLength":9,"pattern":"^https://","type":"string"}},"required":["url"],"title":"Exact public URL read input","type":"object"}

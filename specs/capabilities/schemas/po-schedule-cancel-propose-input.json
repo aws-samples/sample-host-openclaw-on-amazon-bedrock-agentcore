@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:po-schedule-cancel-propose-input:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"scheduleId":{"maxLength":128,"minLength":8,"type":"string"}},"required":["scheduleId"],"title":"Schedule cancellation proposal input","type":"object"}

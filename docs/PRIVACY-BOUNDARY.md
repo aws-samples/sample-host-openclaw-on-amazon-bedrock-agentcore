@@ -4,6 +4,34 @@ This document describes the implemented local boundary and the remaining
 deployment claims. It is not a privacy policy and does not claim that a cloud
 deployment has been verified.
 
+## v1 source-contract extension
+
+The frozen v1 source catalog and canonical value types extend this document
+without changing any v0 runtime or deployment claim. The source catalog names
+the existing four workspace tools plus `po_web_read`, `po_schedule_list`,
+`po_schedule_propose`, `po_schedule_cancel_propose`, `po_compute_run`, and
+`po_compute_status`. At this task boundary those six entries are contracts, not
+installed runtime authority. They remain unavailable until the separately
+tested runtime catalog, trusted relay, admission gateway, and isolated adapters
+have exact release/catalog/schema parity.
+
+The catalog does not place provider, browser, database, approval-signing, or
+cross-user credentials in OpenClaw, model input, workspace, grants, tool
+arguments, results, or logs. The target reader is credential-free and bound to
+an exact current-request public URL grant. Schedule authority remains in the
+trusted control plane. Compute inputs are copied into a disposable networkless,
+credential-free job and validated outputs enter only a fresh job namespace.
+Durable mutations remain exact proposals requiring one-time approval; standing
+approval and irreversible effects are rejected.
+
+Catalog retention and deletion fields are mandatory admission metadata, not a
+claim that deletion execution is implemented by the catalog compiler. Live
+services must still strong-read the account-deletion fence at their last
+application-controlled point, cancel stale work, and purge under the lifecycle
+described below. The detailed per-tool credential holder, authority decider,
+executor, retry, quota, retention, and deletion rules are frozen in
+`docs/CAPABILITY-BOUNDARY.md`.
+
 ## Trust split
 
 The Telegram router, ordered worker, web control surface, OAuth adapters,
