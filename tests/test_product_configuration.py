@@ -765,6 +765,10 @@ TEST_RUNTIME_IMAGE_URI = (
     "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
     "personal-operator/bridge@sha256:" + "a" * 64
 )
+TEST_CAPABILITY_GATEWAY_ARN = (
+    "arn:aws:lambda:eu-west-1:123456789012:function:"
+    "personal-operator-capability-gateway"
+)
 
 
 def _build_agentcore_stack(
@@ -801,6 +805,7 @@ def _build_agentcore_stack(
         workspace_capability_secret_name=(
             "personal-operator/workspace-capability"
         ),
+        capability_gateway_function_arn=TEST_CAPABILITY_GATEWAY_ARN,
         env=env,
     )
     return stack
@@ -1141,7 +1146,7 @@ def test_synthesized_workspace_role_trusts_only_the_credential_broker() -> None:
     }
 
 
-def test_synthesized_runtime_has_no_sts_and_invokes_only_the_credential_broker() -> None:
+def test_synthesized_runtime_invokes_only_exact_broker_and_capability_gateway() -> None:
     template = _synth_agentcore_template()
     _, statements = _role_and_statements(
         template, "openclaw-agentcore-execution-role-eu-west-1"
@@ -1167,8 +1172,33 @@ def test_synthesized_runtime_has_no_sts_and_invokes_only_the_credential_broker()
                 "arn:aws:lambda:eu-west-1:123456789012:function:"
                 "personal-operator-workspace-credential-broker"
             ),
-        }
+        },
+        {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": TEST_CAPABILITY_GATEWAY_ARN,
+        },
     ]
+
+
+def test_runtime_owned_browser_flag_is_rejected_and_never_synthesizes_iam() -> None:
+    try:
+        _build_agentcore_stack(context_overrides={"enable_browser": "true"})
+    except ValueError as error:
+        assert "trusted Browser Gateway" in str(error)
+    else:
+        raise AssertionError("runtime-owned browser authority was accepted")
+
+    template = _synth_agentcore_template()
+    _, statements = _role_and_statements(
+        template, "openclaw-agentcore-execution-role-eu-west-1"
+    )
+    actions = _flatten_statement_actions(statements)
+    assert not any("browser" in action.casefold() for action in actions)
+    assert not any(
+        resource["Type"] == "AWS::BedrockAgentCore::BrowserCustom"
+        for resource in template["Resources"].values()
+    )
 
 
 def test_synthesized_credential_broker_is_the_sole_workspace_role_assumer() -> None:

@@ -166,9 +166,11 @@ def test_verify_is_offline_and_checks_required_provider_imports() -> None:
     assert "import web.composition" in verify_body
     assert "import workspace_broker.index" in verify_body
     assert '"workspace_broker/index.py"' in verify_body
+    assert "import capabilities.gateway" in verify_body
+    assert '"capabilities/gateway.py"' in verify_body
 
 
-def test_workspace_broker_is_in_every_local_and_release_asset_gate() -> None:
+def test_broker_and_capability_gateway_are_in_every_asset_gate() -> None:
     local_gate = (ROOT / "scripts" / "test-local.sh").read_text(encoding="utf-8")
     resolver = (ROOT / "stacks" / "trusted_lambda_asset.py").read_text(
         encoding="utf-8"
@@ -179,6 +181,10 @@ def test_workspace_broker_is_in_every_local_and_release_asset_gate() -> None:
     assert '"workspace_broker/index.py"' in resolver
     assert '"workspace_broker/index.py"' in packaging
     assert "import workspace_broker.index" in packaging
+    assert "lambda/capabilities" in local_gate
+    assert '"capabilities/gateway.py"' in resolver
+    assert '"capabilities/gateway.py"' in packaging
+    assert "import capabilities.gateway" in packaging
 
 
 def test_cdk_hook_root_is_unambiguous() -> None:
@@ -219,6 +225,7 @@ def _write_valid_asset(repository_root: pathlib.Path) -> pathlib.Path:
         "web/index.py",
         "control/index.py",
         "workspace_broker/index.py",
+        "capabilities/gateway.py",
     ):
         path = source / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -354,7 +361,7 @@ def test_app_and_deploy_path_require_the_trusted_asset_for_real_stacks() -> None
     deploy_source = (ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
 
     assert "resolve_trusted_lambda_asset(" in app_source
-    assert app_source.count("trusted_code_asset_root=trusted_lambda_asset_root") == 2
+    assert app_source.count("trusted_code_asset_root=trusted_lambda_asset_root") == 3
     assert 'web_asset_root=str(repository_root / "web" / "dist")' in app_source
     assert "_lambda.Code.from_asset(trusted_code_asset_root)" in router_source
     assert web_source.count(
@@ -366,4 +373,5 @@ def test_app_and_deploy_path_require_the_trusted_asset_for_real_stacks() -> None
     assert build in deploy_source and verify in deploy_source
     assert deploy_source.index(build) < deploy_source.index(deploy)
     assert deploy_source.index(verify) < deploy_source.index(deploy)
+    assert "PersonalOperatorCapabilities" in deploy_source
     assert "PersonalOperatorWeb" in deploy_source

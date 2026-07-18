@@ -251,10 +251,19 @@ describe("immutable capability catalog", () => {
       });
     }
     const statusTool = registered.find((tool) => tool.name === "po_compute_status");
-    assert.deepEqual(await statusTool.execute("tooluse_00000002", { jobId: "job_00000001" }), {
-      status: "SUCCEEDED",
-      data: { jobId: "job_00000001" },
-    });
+    assert.deepEqual(
+      await statusTool.execute("tooluse_00000002", { jobId: "job_00000001" }),
+      {
+        content: [{
+          type: "text",
+          text: '{"status":"SUCCEEDED","data":{"jobId":"job_00000001"}}',
+        }],
+        details: {
+          status: "SUCCEEDED",
+          data: { jobId: "job_00000001" },
+        },
+      },
+    );
     assert.deepEqual(calls, [["tooluse_00000002", { jobId: "job_00000001" }]]);
   });
 });

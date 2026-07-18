@@ -21,6 +21,7 @@ import cdk_nag
 from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
+from stacks.capability_stack import CapabilityStack
 from stacks.router_stack import RouterStack
 from stacks.web_stack import WebStack
 from stacks.guardrails_stack import GuardrailsStack
@@ -78,6 +79,13 @@ guardrails_stack = GuardrailsStack(
 # --- AgentCore base resources (Role, SG, S3) ---
 # Runtime/endpoint provisioning is deliberately external. Phase 3 accepts only
 # one atomic commit-bound runtime context supplied as explicit CDK arguments.
+capability_stack = CapabilityStack(
+    app,
+    "PersonalOperatorCapabilities",
+    trusted_code_asset_root=trusted_lambda_asset_root,
+    env=env,
+)
+
 agentcore_stack = AgentCoreStack(
     app,
     "OpenClawAgentCore",
@@ -87,8 +95,10 @@ agentcore_stack = AgentCoreStack(
     workspace_capability_secret_name=(
         security_stack.workspace_capability_secret.secret_name
     ),
+    capability_gateway_function_arn=capability_stack.gateway_function_arn,
     env=env,
 )
+agentcore_stack.add_dependency(capability_stack)
 
 # --- Router (Lambda + API Gateway HTTP API for Telegram/Slack webhooks) ---
 router_stack = RouterStack(

@@ -241,6 +241,7 @@ required_handlers = {
     "web/index.py",
     "control/index.py",
     "workspace_broker/index.py",
+    "capabilities/gateway.py",
 }
 if not required_handlers.issubset(source_names):
     raise SystemExit("asset source inventory is missing a handler")
@@ -296,6 +297,7 @@ import web.index  # noqa: F401,E402
 import web.composition  # noqa: F401,E402
 import worker.index  # noqa: F401,E402
 import workspace_broker.index  # noqa: F401,E402
+import capabilities.gateway  # noqa: F401,E402
 
 print(f'verified {len(actual_files)} files and {len(dependencies)} distributions')
 PY

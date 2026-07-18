@@ -1,7 +1,7 @@
 """AgentCore Stack — IAM, S3, and Security Group for AgentCore Runtime.
 
 Creates the supporting resources that the AgentCore Runtime needs:
-  - Execution Role (Bedrock/log/telemetry plus exact broker invocation)
+  - Execution Role (Bedrock/log/telemetry plus exact trusted invocations)
   - Trusted Credential Broker Role (the sole workspace-role assumer)
   - Workspace Session Role (S3/KMS base authority narrowed by the broker)
   - Security Group (VPC networking for the container)
@@ -17,13 +17,11 @@ this stack to the toolkit.
 import re
 
 from aws_cdk import (
-    Annotations,
     CfnOutput,
     Duration,
     Stack,
     RemovalPolicy,
     Token,
-    aws_bedrockagentcore as agentcore,
     aws_ec2 as ec2,
     aws_iam as iam,
     aws_kms as kms,
@@ -32,9 +30,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-# Regions where AgentCore Browser (CfnBrowserCustom) is confirmed available.
 REQUIRED_REGION = "eu-west-1"
-BROWSER_SUPPORTED_REGIONS = {REQUIRED_REGION}
 BEDROCK_INFERENCE_PROFILE_ID = "eu.anthropic.claude-sonnet-4-6"
 BEDROCK_FOUNDATION_MODEL_ID = "anthropic.claude-sonnet-4-6"
 BEDROCK_DESTINATION_REGIONS = (
@@ -57,6 +53,7 @@ class AgentCoreStack(Stack):
         vpc: ec2.IVpc,
         private_subnet_ids: list[str],
         workspace_capability_secret_name: str,
+        capability_gateway_function_arn: str,
         guardrail_id: str = "",
         **kwargs,
     ) -> None:
@@ -74,6 +71,20 @@ class AgentCoreStack(Stack):
             != "personal-operator/workspace-capability"
         ):
             raise ValueError("workspace capability secret name is not canonical")
+        expected_gateway_arn = (
+            f"arn:aws:lambda:{region}:{account}:function:"
+            "personal-operator-capability-gateway"
+        )
+        if capability_gateway_function_arn != expected_gateway_arn:
+            raise ValueError("capability gateway function ARN is not canonical")
+        enable_browser = str(
+            self.node.try_get_context("enable_browser") or "false"
+        ).casefold()
+        if enable_browser != "false":
+            raise ValueError(
+                "runtime-owned browser authority is forbidden; use the separate "
+                "trusted Browser Gateway introduced by Task 10"
+            )
 
         # --- Security Group for AgentCore Runtime containers ------------------
         self.agent_sg = ec2.SecurityGroup(
@@ -172,6 +183,12 @@ class AgentCoreStack(Stack):
             iam.PolicyStatement(
                 actions=["lambda:InvokeFunction"],
                 resources=[workspace_broker_function_arn],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["lambda:InvokeFunction"],
+                resources=[capability_gateway_function_arn],
             )
         )
 
@@ -494,52 +511,8 @@ class AgentCoreStack(Stack):
                 f"runtime/{runtime_id}"
             )
 
-        # --- AgentCore Browser (optional) -------------------------------------
-        enable_browser = str(self.node.try_get_context("enable_browser") or "false").lower() == "true"
-        self.browser = None
-        if enable_browser:
-            if region not in BROWSER_SUPPORTED_REGIONS:
-                Annotations.of(self).add_warning(
-                    f"enable_browser=true but region {region} is not in "
-                    f"BROWSER_SUPPORTED_REGIONS {BROWSER_SUPPORTED_REGIONS}. "
-                    f"Browser resource will NOT be deployed."
-                )
-            else:
-                self.browser = agentcore.CfnBrowserCustom(
-                    self,
-                    "BrowserCustom",
-                    name="openclaw_browser",
-                    network_configuration=agentcore.CfnBrowserCustom.BrowserNetworkConfigurationProperty(
-                        network_mode="VPC",
-                        vpc_config=agentcore.CfnBrowserCustom.VpcConfigProperty(
-                            subnets=private_subnet_ids,
-                            security_groups=[self.agent_sg.security_group_id],
-                        ),
-                    ),
-                    execution_role_arn=self.execution_role.role_arn,
-                    recording_config=agentcore.CfnBrowserCustom.RecordingConfigProperty(
-                        enabled=False,
-                    ),
-                    description="AgentCore Browser for OpenClaw (per-user browsing sessions)",
-                )
-
-                self.execution_role.add_to_policy(
-                    iam.PolicyStatement(
-                        actions=[
-                            "bedrock-agentcore:StartBrowserSession",
-                            "bedrock-agentcore:StopBrowserSession",
-                            "bedrock-agentcore:GetBrowserSession",
-                            "bedrock-agentcore:UpdateBrowserStream",
-                            "bedrock-agentcore:ConnectBrowserAutomationStream",
-                        ],
-                        resources=[self.browser.attr_browser_arn],
-                    )
-                )
-
-                # In hybrid deploy mode, Runtime is managed by Starter Toolkit.
-                # Browser identifier is passed via --env BROWSER_IDENTIFIER=<id>
-                # during `agentcore deploy`. Export it for the deploy script.
-                self.browser_id = self.browser.attr_browser_id
+        # Browser authority is not latent in this role. Task 10 introduces a
+        # separate trusted Browser Gateway; AgentCore never owns its sessions.
 
         # --- Outputs ----------------------------------------------------------
         CfnOutput(self, "ExecutionRoleArn", value=self.execution_role.role_arn)
@@ -565,14 +538,6 @@ class AgentCoreStack(Stack):
             "PrivateSubnetIds",
             value=",".join(private_subnet_ids),
         )
-        if self.browser:
-            CfnOutput(
-                self,
-                "BrowserIdentifier",
-                value=self.browser.attr_browser_id,
-                description="AgentCore Browser identifier",
-            )
-
         # --- cdk-nag suppressions ---------------------------------------------
         cdk_nag.NagSuppressions.add_resource_suppressions(
             self.execution_role,

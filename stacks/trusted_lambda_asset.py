@@ -25,6 +25,7 @@ _REQUIRED_HANDLERS = {
     "web/index.py",
     "control/index.py",
     "workspace_broker/index.py",
+    "capabilities/gateway.py",
 }
 _REQUIRED_DEPENDENCIES = {
     "boto3",

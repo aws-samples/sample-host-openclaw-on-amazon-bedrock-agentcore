@@ -302,6 +302,7 @@ phase1_cdk() {
     OpenClawVpc \
     OpenClawSecurity \
     OpenClawGuardrails \
+    PersonalOperatorCapabilities \
     OpenClawAgentCore \
     OpenClawObservability \
     --require-approval broadening
