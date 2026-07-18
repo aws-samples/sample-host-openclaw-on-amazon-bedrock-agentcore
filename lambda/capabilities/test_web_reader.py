@@ -553,6 +553,12 @@ def test_workspace_derived_url_yields_no_grant():
         "https://0x7f000001/x",  # hex ip form
         "https://localhost/x",
         "https://foo.internal/x",
+        # IPv6 tunnel encapsulation of private/metadata IPv4 must be rejected:
+        "https://[2002:a9fe:a9fe::]/x",   # 6to4 wrapping 169.254.169.254
+        "https://[2002:0a00:0001::]/x",   # 6to4 wrapping 10.0.0.1
+        "https://[2002:7f00:0001::]/x",   # 6to4 wrapping 127.0.0.1
+        "https://[64:ff9b::a9fe:a9fe]/x",  # NAT64 wrapping 169.254.169.254
+        "https://[::a9fe:a9fe]/x",        # IPv4-compatible wrapping 169.254.169.254
     ],
 )
 def test_private_special_ip_and_nonhttps_rejected_at_mint(message):

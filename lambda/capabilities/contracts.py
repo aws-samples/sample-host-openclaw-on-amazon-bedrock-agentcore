@@ -708,7 +708,33 @@ def _ip_is_globally_routable(
         )
     ):
         return False
+    # IPv6 tunnel forms embed an IPv4 address that Python treats as globally
+    # routable regardless of the private/metadata IPv4 inside. Decode and
+    # re-classify the embedded IPv4 for 6to4 (2002::/16), NAT64 (64:ff9b::/96),
+    # and IPv4-compatible (::/96), rejecting any that wraps a non-global IPv4,
+    # so IPv6 encapsulation cannot smuggle 169.254.169.254 / 10.x / 127.x past
+    # this gate.
+    if isinstance(address, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(address)
+        if embedded is not None and not _ip_is_globally_routable(embedded):
+            return False
     return True
+
+
+def _embedded_ipv4(
+    address: ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 embedded by a 6to4/NAT64/IPv4-compatible IPv6 address."""
+
+    packed = address.packed
+    if address in ipaddress.ip_network("2002::/16"):  # 6to4: 2002:V4::/48
+        return ipaddress.IPv4Address(packed[2:6])
+    if address in ipaddress.ip_network("64:ff9b::/96"):  # NAT64
+        return ipaddress.IPv4Address(packed[12:16])
+    if address in ipaddress.ip_network("::/96") and not address.is_unspecified:
+        # IPv4-compatible (deprecated) — the low 32 bits are an IPv4 literal.
+        return ipaddress.IPv4Address(packed[12:16])
+    return None
 
 
 def public_ip_or_none(
