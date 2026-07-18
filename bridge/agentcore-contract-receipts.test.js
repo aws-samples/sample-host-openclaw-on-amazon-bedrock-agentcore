@@ -69,7 +69,7 @@ describe("immutable workspace receipts", () => {
       });
 
       assert.equal(commitCalls, 1);
-      assert.equal(outcome.status, status);
+      assert.equal(outcome.status, status || "ok");
       assert.deepEqual(outcome.workspaceReceipt, {
         generation: committedHead().generation,
         manifestSha256: committedHead().manifestSha256,

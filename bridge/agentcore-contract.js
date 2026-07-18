@@ -154,8 +154,11 @@ async function persistWorkspaceOutcome({
     throw new TypeError("Workspace outcome must be an object");
   }
   const head = await lifecycle.commitAfterTurn(workspaceTurn);
+  const committedOutcome = Object.hasOwn(outcome, "status")
+    ? outcome
+    : { ...outcome, status: "ok" };
   return Object.freeze({
-    ...outcome,
+    ...committedOutcome,
     workspaceReceipt: createWorkspaceReceipt(head),
   });
 }
