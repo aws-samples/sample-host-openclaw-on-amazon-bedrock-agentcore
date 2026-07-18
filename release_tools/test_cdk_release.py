@@ -157,6 +157,8 @@ def test_foundation_configures_notation_signing_for_only_the_bridge_repo() -> No
         {"Filter": REPOSITORY_NAME, "FilterType": "WILDCARD_MATCH"}
     ]
     assert rules[0]["SigningProfileArn"]["Fn::GetAtt"][1] == "Arn"
+    assert configurations[0]["DeletionPolicy"] == "Retain"
+    assert configurations[0]["UpdateReplacePolicy"] == "Retain"
 
 
 def test_runtime_pull_role_is_scoped_to_the_exact_release_repository() -> None:

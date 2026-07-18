@@ -44,9 +44,11 @@ Telegram, Google, OpenAI, or Gmail credential or real message was used. The
 remaining gates are recorded in
 [docs/RELEASE-EVIDENCE.md](docs/RELEASE-EVIDENCE.md).
 
-The implementation proceeds in reviewed tasks described by the approved
-[design](docs/superpowers/specs/2026-07-17-personal-operator-v0-design.md) and
-[plan](docs/superpowers/plans/2026-07-17-personal-operator-v0.md).
+The current v1 implementation proceeds in reviewed tasks described by the
+approved
+[design](docs/superpowers/specs/2026-07-18-personal-operator-v1-design.md) and
+[plan](docs/superpowers/plans/2026-07-18-personal-operator-v1.md). The v0
+documents remain historical evidence for the completed baseline.
 
 ## Runtime boundary now enforced
 

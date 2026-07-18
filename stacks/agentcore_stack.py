@@ -382,6 +382,10 @@ class AgentCoreStack(Stack):
                 )
             ],
         )
+        self.bridge_signing_configuration.apply_removal_policy(
+            RemovalPolicy.RETAIN,
+            apply_to_update_replace_policy=True,
+        )
         self.bridge_signing_configuration.add_dependency(self.bridge_repository)
 
         # AgentCore can pull only the exact retained release repository.
