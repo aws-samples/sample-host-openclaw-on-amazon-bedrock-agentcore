@@ -262,3 +262,92 @@ PASS
 The focused subprocess suite used a fake `aws` executable and fake operation
 driver. It made no AWS, network, deploy, image, signing, or credentialed call.
 Behavioral container-boundary tests and final independent review remain open.
+
+## Final independent-review remediation
+
+### Behavioral trusted-Lambda packaging boundary
+
+RED: the replacement subprocess/fault test executed the real packaging shell
+through a fake Docker command and a failing publication command. The focused
+run proved the existing implementation deleted `build/trusted-lambda` before
+publication: `test_failed_republication_preserves_the_existing_verified_asset`
+failed because the prior marker no longer existed. The same replacement suite
+initially exposed test-harness command-selection defects before reaching one
+meaningful production RED; those harness defects were corrected without
+changing production code.
+
+GREEN at `b0107485c23cf5ad89752b6f099670357b247cc4`: the shell verifies the
+staging directory first, then calls the typed publisher. Publication requires
+the staging and destination to share one filesystem, refuses an existing or
+symlinked destination, performs one directory rename, and fsyncs the parent.
+It never deletes or replaces a prior verified asset. The tests execute the
+real shell with a recording fake Docker command and prove the exact immutable
+ARM64 image pull, Python 3.13/Amazon Linux probe, no host credential or config
+forwarding, no AWS/CDK invocation, hardened container arguments, offline exact
+verification, provider/handler imports, deterministic ZIP bytes, and required
+handler/dependency inventory. All Docker and forbidden-cloud commands were
+local fakes; no container daemon or cloud command ran.
+
+### Full typed live image and endpoint evidence
+
+RED 1: the hostile CLI probe returned success when the driver supplied only a
+bare image digest. RED 2: the endpoint could not yet be tested with the new
+fixture because a full `RuntimeImageEvidence` was rejected as an unknown field.
+The focused command reported `2 failed` and demonstrated both the permissive
+legacy path and the missing typed path.
+
+GREEN at `bac9ce94a8dfc0f16ce69178fd769cfa140cb491`: an image observation must
+contain one strict full `RuntimeImageEvidence`, cross-bound to the exact
+commit, tree, account, and region; the transaction derives only its immutable
+digest. Endpoint and context observations must contain one strict full
+`RuntimeContextV3`, cross-bound to the journal's commit, account, region,
+runtime ID/version, endpoint name, and exact private-ECR digest URI. The
+endpoint cannot stabilize on `{}`. The context phase also proves the SHA-256
+of the exact canonical context bytes.
+
+RED 3: `release_tools/test_production_observation.py` failed collection because
+the production composition did not exist. GREEN: the new credential-lazy
+composition wires the exact `EcrEvidenceAdapter` and
+`AgentCoreEvidenceAdapter` from injected already-authorized clients. Import and
+construction create no SDK session, discover no credential, and make no
+client/blob call. The focused production-observation suite passed `5 passed`.
+
+Fresh final local evidence on exact head
+`bac9ce94a8dfc0f16ce69178fd769cfa140cb491`, tree
+`5c52f1927046030b7d30f61a114f0f4a43a140cb`:
+
+```text
+.venv/bin/python -m pytest -q release_tools
+110 passed in 13.80s
+
+.venv/bin/python -m pytest -q \
+  tests/test_trusted_lambda_packaging.py tests/test_deploy_safety.py \
+  tests/security/test_release_documentation.py \
+  tests/security/test_release_boundaries.py \
+  tests/test_product_configuration.py tests/test_verify_agentcore_storage.py
+114 passed in 24.82s
+
+PYTHON=/Users/konstantin.tuzikov/Documents/personal-operator/.venv/bin/python \
+  PATH="/opt/homebrew/opt/node@24/bin:$PATH" ./scripts/test-local.sh
+1063 Python passed plus 10 subtests
+11 E2E passed
+313 bridge Node passed
+5 web passed
+web production build passed
+JavaScript and Python syntax passed
+repository whitespace passed
+offline CDK synthesis passed
+cdk-nag passed
+All local checks passed.
+
+/bin/bash -n scripts/build-trusted-lambda-asset.sh
+.venv/bin/python -m compileall -q release_tools \
+  tests/test_trusted_lambda_packaging.py
+git diff --check
+PASS
+```
+
+No AWS call, deployment, image operation, signing job, provider effect, paid
+resource, credential use, or Git push occurred. The real Docker Python
+3.13/ARM64 build/import proof and every documented external staging gate remain
+open. Final independent review is still required before integration.
