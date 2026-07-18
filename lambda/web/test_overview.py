@@ -252,7 +252,17 @@ class DisconnectTable:
         key = (kwargs["Key"]["PK"], kwargs["Key"]["SK"])
         item = self.items.get(key)
         values = kwargs["ExpressionAttributeValues"]
-        if item is None or item.get("generation") != values[":expected"]:
+        expected_statuses = {
+            value
+            for name, value in values.items()
+            if name.startswith(":expectedStatus")
+        }
+        if (
+            item is None
+            or item.get("generation") != values[":expected"]
+            or expected_statuses
+            and item.get("status") not in expected_statuses
+        ):
             raise RuntimeError("condition")
         item["generation"] = values[":next"]
         item["status"] = values[":status"]
@@ -308,3 +318,60 @@ def test_disconnect_fences_writers_and_purges_all_gmail_derived_namespaces():
     assert lifecycle.status(USER) == "DISCONNECTED"
     assert lifecycle.disconnect(USER) == "DISCONNECTED"
     assert remaining["MEMORY#main"]["private"] == "preserve"
+
+
+def test_disconnect_keeps_fence_pending_when_delete_and_confirmation_read_fail():
+    pk = f"USER#{USER}"
+    connection_key = (pk, f"CONNECTION#{PROVIDER}")
+
+    class AmbiguousConnectionDelete(DisconnectTable):
+        def __init__(self, items):
+            super().__init__(items)
+            self.fail_connection_delete = True
+            self.confirming_connection_delete = False
+
+        def delete_item(self, **kwargs):
+            key = (kwargs["Key"]["PK"], kwargs["Key"]["SK"])
+            if key == connection_key and self.fail_connection_delete:
+                self.confirming_connection_delete = True
+                raise TimeoutError("delete outcome is unknown")
+            return super().delete_item(**kwargs)
+
+        def get_item(self, **kwargs):
+            key = (kwargs["Key"]["PK"], kwargs["Key"]["SK"])
+            if key == connection_key and self.confirming_connection_delete:
+                raise TimeoutError("confirmation read is unavailable")
+            return super().get_item(**kwargs)
+
+    table = AmbiguousConnectionDelete(
+        [
+            {
+                "PK": pk,
+                "SK": f"CONNECTION#{PROVIDER}",
+                "envelope": {
+                    "format": "personal-operator.oauth-envelope.v1",
+                    "binding": "a" * 64,
+                    "wrappedKey": "wrapped",
+                    "nonce": "nonce",
+                    "ciphertext": "ciphertext",
+                },
+            }
+        ]
+    )
+    lifecycle = DynamoConnectionLifecycle(table)
+
+    with pytest.raises(RuntimeError, match="uncertain"):
+        lifecycle.disconnect(USER)
+
+    assert connection_key in table.items
+    fence = table.items[(pk, "GMAIL#CONNECTION_FENCE")]
+    assert fence["generation"] == 1
+    assert fence["status"] == "DISCONNECTING"
+
+    table.fail_connection_delete = False
+    table.confirming_connection_delete = False
+    assert lifecycle.disconnect(USER) == "DISCONNECTED"
+    assert connection_key not in table.items
+    assert table.items[(pk, "GMAIL#CONNECTION_FENCE")]["status"] == (
+        "DISCONNECTED"
+    )

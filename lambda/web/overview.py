@@ -142,10 +142,12 @@ class DynamoConnectionLifecycle:
         except Exception as error:
             try:
                 response = self._table.get_item(Key=dict(key), ConsistentRead=True)
-            except Exception:
-                response = None
+            except Exception as read_error:
+                raise RuntimeError(
+                    "connection purge outcome is uncertain"
+                ) from read_error
             item = response.get("Item") if isinstance(response, Mapping) else None
-            if item is not None:
+            if not isinstance(response, Mapping) or item is not None:
                 raise RuntimeError("connection purge outcome is uncertain") from error
 
     def _purge_prefix(self, user_id: str, prefix: str) -> None:
