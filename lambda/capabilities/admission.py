@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Callable, Mapping, Protocol
 
 from .contracts import (
@@ -28,6 +29,7 @@ class AdmissionDenied(RuntimeError):
 class LiveTargetGrant:
     grant: TargetGrantV1
     uses: int
+    claimed_call_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.grant, TargetGrantV1):
@@ -38,6 +40,20 @@ class LiveTargetGrant:
             or self.uses < 0
         ):
             raise TypeError("live target use count must be a non-negative integer")
+        if (
+            not isinstance(self.claimed_call_ids, tuple)
+            or self.claimed_call_ids != tuple(sorted(set(self.claimed_call_ids)))
+            or any(
+                not isinstance(call_id, str)
+                or re.fullmatch(r"call_[0-9a-f]{64}", call_id) is None
+                for call_id in self.claimed_call_ids
+            )
+        ):
+            raise TypeError("live target claimed call inventory is invalid")
+        if self.uses != len(self.claimed_call_ids):
+            raise TypeError("live target use count does not match claimed calls")
+        if self.uses > self.grant.max_uses:
+            raise TypeError("live target use count exceeds its grant")
 
 
 class AdmissionRepository(Protocol):
@@ -314,9 +330,7 @@ class AdmissionGate:
         expired = False
         exhausted = False
         for target_hash in grant.target_grant_hashes:
-            live = self._strong(
-                self._repository.strong_read_target_grant, target_hash
-            )
+            live = self._strong(self._repository.strong_read_target_grant, target_hash)
             if live is None:
                 continue
             if not isinstance(live, LiveTargetGrant):
@@ -329,7 +343,10 @@ class AdmissionGate:
             if now >= target.expires_at:
                 expired = True
                 continue
-            if live.uses >= target.max_uses:
+            if (
+                live.uses >= target.max_uses
+                and call.call_id not in live.claimed_call_ids
+            ):
                 exhausted = True
                 continue
             return live

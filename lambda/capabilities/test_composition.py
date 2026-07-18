@@ -38,6 +38,7 @@ from capabilities.test_gateway import (
     RELEASE_COMMIT,
     _call,
     _catalog,
+    _target_grant,
     _turn_grant,
 )
 
@@ -166,16 +167,12 @@ def _environment(catalog_digest: str) -> dict[str, str]:
     }
 
 
-def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
-    user_id = "user_alpha"
-    session_id = "session_12345678"
-    runtime_arn = "arn:aws:bedrock-agentcore:eu-west-1:000000000000:runtime/example"
-    runtime_qualifier = f"release_{RELEASE_COMMIT}"
+def _seed_installation(client: MemoryDynamoClient, catalog, pack_id: str) -> None:
     installation = CapabilityInstallationV1.from_mapping(
         {
             "schema": CapabilityInstallationV1.SCHEMA,
-            "userId": user_id,
-            "packId": "schedule.list",
+            "userId": "user_alpha",
+            "packId": pack_id,
             "catalogDigest": catalog.catalog_digest,
             "state": "ENABLED",
             "policyRevision": 1,
@@ -183,6 +180,21 @@ def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
             "killSwitch": False,
         }
     )
+    client.put(
+        "USER#user_alpha",
+        f"INSTALL#{pack_id}",
+        recordJson=json.dumps(
+            installation.to_mapping(), sort_keys=True, separators=(",", ":")
+        ),
+        version=1,
+    )
+
+
+def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
+    user_id = "user_alpha"
+    session_id = "session_12345678"
+    runtime_arn = "arn:aws:bedrock-agentcore:eu-west-1:000000000000:runtime/example"
+    runtime_qualifier = f"release_{RELEASE_COMMIT}"
     records = [
         ("CONTROL", "GLOBAL", {"enabled": False}),
         (f"USER#{user_id}", "DELETION", {"enabled": False}),
@@ -215,11 +227,6 @@ def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
                 "state": "READY",
             },
         ),
-        (
-            f"USER#{user_id}",
-            "INSTALL#schedule.list",
-            installation.to_mapping(),
-        ),
     ]
     for pk, sk, payload in records:
         client.put(
@@ -228,6 +235,92 @@ def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
             recordJson=json.dumps(payload, sort_keys=True, separators=(",", ":")),
             version=1,
         )
+    _seed_installation(client, catalog, "schedule.list")
+
+
+class SequencedAdapter:
+    def __init__(self, *steps):
+        self.steps = list(steps)
+        self.calls = []
+
+    def invoke(self, admitted):
+        self.calls.append(admitted.call.call_id)
+        step = self.steps.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+def _durable_web_gateway(client: MemoryDynamoClient, catalog, adapter):
+    from capabilities.durable import (
+        DynamoAdmissionRepository,
+        DynamoCapabilityLedger,
+    )
+    from capabilities.gateway import CapabilityGateway
+
+    return CapabilityGateway(
+        catalog=catalog,
+        repository=DynamoAdmissionRepository(
+            client=client,
+            table_name="capability-state",
+        ),
+        ledger=DynamoCapabilityLedger(
+            client=client,
+            table_name="capability-state",
+        ),
+        adapters={"web.exact.read": adapter},
+        allowed_caller_arn=CALLER_ARN,
+        clock=lambda: NOW,
+    )
+
+
+def _seed_web_target(client: MemoryDynamoClient, catalog):
+    target = _target_grant(max_uses=1)
+    _seed_installation(client, catalog, "web.exact-read")
+    client.put(
+        f"TARGET#{target.target_hash}",
+        "GRANT",
+        recordJson=json.dumps(
+            {
+                "grant": target.to_mapping(),
+                "uses": 0,
+                "claimedCallIds": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        version=1,
+    )
+    return target
+
+
+def _web_success():
+    from capabilities.gateway import AdapterOutcome
+
+    return AdapterOutcome(
+        status="SUCCEEDED",
+        data={
+            "canonicalUrl": "https://example.com/exact",
+            "contentDigest": "c" * 64,
+            "retrievedAt": NOW,
+            "sourceRef": "source_12345678",
+            "text": "reviewed public text",
+        },
+        provenance_refs=("source_12345678",),
+    )
+
+
+def _target_record(client, target):
+    item = client.items[(f"TARGET#{target.target_hash}", "GRANT")]
+    return json.loads(item["recordJson"])
+
+
+def _turn_record(client):
+    return next(
+        item
+        for (pk, sk), item in client.items.items()
+        if pk.startswith("TENANT#") and sk == "TURN#invocation_12345678"
+    )
 
 
 def test_cold_start_recompiles_packaged_catalog_and_rejects_one_byte_drift(
@@ -310,6 +403,139 @@ def test_composition_rejects_wrong_region_release_digest_and_event_shape(tmp_pat
                 dynamodb_client=client,
                 clock=lambda: NOW,
             )
+
+
+def test_durable_target_claim_allows_exact_cached_response_loss_recovery_only():
+    catalog = _catalog()
+    client = MemoryDynamoClient()
+    _seed_authority(client, catalog)
+    target = _seed_web_target(client, catalog)
+    adapter = SequencedAdapter(_web_success())
+    gateway = _durable_web_gateway(client, catalog, adapter)
+    call = _call(
+        catalog,
+        "web.exact.read",
+        {"url": "https://example.com/exact"},
+    )
+    grant = _turn_grant(catalog, target_grant=target, max_calls=1)
+    iam = {"callerArn": CALLER_ARN, "turnGrant": grant}
+
+    ignored_response = gateway.invoke(call, iam)
+    recovered = gateway.invoke(call, iam)
+    wrong_grant = gateway.invoke(
+        call,
+        {
+            "callerArn": CALLER_ARN,
+            "turnGrant": _turn_grant(
+                catalog,
+                target_grant=target,
+                max_calls=1,
+                overrides={"nonce": "nonce_876543210abcdef"},
+            ),
+        },
+    )
+    fresh_call = gateway.invoke(
+        _call(
+            catalog,
+            "web.exact.read",
+            {"url": "https://example.com/exact"},
+            tool_use_id="tooluse_87654321",
+        ),
+        iam,
+    )
+
+    assert ignored_response.status == "SUCCEEDED"
+    assert recovered.to_bytes() == ignored_response.to_bytes()
+    assert wrong_grant.status == "DENIED"
+    assert wrong_grant.error_code == "CAPABILITY_GRANT_BINDING_MISMATCH"
+    assert fresh_call.status == "DENIED"
+    assert fresh_call.error_code == "TARGET_GRANT_EXHAUSTED"
+    assert adapter.calls == [call.call_id]
+    assert _target_record(client, target) == {
+        "grant": target.to_mapping(),
+        "uses": 1,
+        "claimedCallIds": [call.call_id],
+    }
+    assert _turn_record(client)["callCount"] == 1
+    assert _turn_record(client)["packCounts"] == {"web.exact-read": 1}
+
+
+def test_durable_target_claim_allows_one_same_call_read_retry_without_recharge():
+    catalog = _catalog()
+    client = MemoryDynamoClient()
+    _seed_authority(client, catalog)
+    target = _seed_web_target(client, catalog)
+    adapter = SequencedAdapter(TimeoutError("response lost"), _web_success())
+    gateway = _durable_web_gateway(client, catalog, adapter)
+    call = _call(
+        catalog,
+        "web.exact.read",
+        {"url": "https://example.com/exact"},
+    )
+    iam = {
+        "callerArn": CALLER_ARN,
+        "turnGrant": _turn_grant(catalog, target_grant=target, max_calls=1),
+    }
+
+    retryable = gateway.invoke(call, iam)
+    succeeded = gateway.invoke(call, iam)
+    cached = gateway.invoke(call, iam)
+
+    assert retryable.status == "FAILED_RETRYABLE"
+    assert retryable.retry_policy == "SAFE_RETRY"
+    assert succeeded.status == "SUCCEEDED"
+    assert cached.to_bytes() == succeeded.to_bytes()
+    assert adapter.calls == [call.call_id, call.call_id]
+    assert _target_record(client, target)["uses"] == 1
+    assert _target_record(client, target)["claimedCallIds"] == [call.call_id]
+    assert _turn_record(client)["callCount"] == 1
+    assert _turn_record(client)["packCounts"] == {"web.exact-read": 1}
+
+
+def test_durable_target_claim_preserves_retry_exhaustion_and_fresh_call_denial():
+    catalog = _catalog()
+    client = MemoryDynamoClient()
+    _seed_authority(client, catalog)
+    target = _seed_web_target(client, catalog)
+    adapter = SequencedAdapter(
+        TimeoutError("first response lost"),
+        TimeoutError("second response lost"),
+    )
+    gateway = _durable_web_gateway(client, catalog, adapter)
+    call = _call(
+        catalog,
+        "web.exact.read",
+        {"url": "https://example.com/exact"},
+    )
+    iam = {
+        "callerArn": CALLER_ARN,
+        "turnGrant": _turn_grant(catalog, target_grant=target, max_calls=1),
+    }
+
+    first = gateway.invoke(call, iam)
+    second = gateway.invoke(call, iam)
+    exhausted = gateway.invoke(call, iam)
+    fresh = gateway.invoke(
+        _call(
+            catalog,
+            "web.exact.read",
+            {"url": "https://example.com/exact"},
+            tool_use_id="tooluse_87654321",
+        ),
+        iam,
+    )
+
+    assert first.status == "FAILED_RETRYABLE"
+    assert second.status == "FAILED_RETRYABLE"
+    assert exhausted.status == "DENIED"
+    assert exhausted.error_code == "CAPABILITY_READ_RETRY_EXHAUSTED"
+    assert fresh.status == "DENIED"
+    assert fresh.error_code == "TARGET_GRANT_EXHAUSTED"
+    assert adapter.calls == [call.call_id, call.call_id]
+    assert _target_record(client, target)["uses"] == 1
+    assert _target_record(client, target)["claimedCallIds"] == [call.call_id]
+    assert _turn_record(client)["callCount"] == 1
+    assert _turn_record(client)["packCounts"] == {"web.exact-read": 1}
 
 
 def test_durable_ledger_isolates_tenants_fences_mutations_and_caps_read_retry():

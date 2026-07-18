@@ -220,9 +220,14 @@ class FakeRepository:
         seen = self.claimed_target_calls.setdefault(target_hash, set())
         if call_id in seen:
             return True
-        if target.uses + len(seen) >= target.grant.max_uses:
+        if target.uses >= target.grant.max_uses:
             return False
         seen.add(call_id)
+        self.targets[target_hash] = type(target)(
+            grant=target.grant,
+            uses=target.uses + 1,
+            claimed_call_ids=tuple(sorted((*target.claimed_call_ids, call_id))),
+        )
         return True
 
 
@@ -794,7 +799,11 @@ def test_expired_or_exhausted_target_grant_denies_with_zero_network_adapter_call
     catalog2, repository2, adapter2, gateway2, _ = _gateway(
         operation_id="web.exact.read", target_grant=live
     )
-    repository2.targets[live.target_hash] = LiveTargetGrant(grant=live, uses=1)
+    repository2.targets[live.target_hash] = LiveTargetGrant(
+        grant=live,
+        uses=1,
+        claimed_call_ids=("call_" + "f" * 64,),
+    )
     result2 = gateway2.invoke(
         _call(catalog2, "web.exact.read", {"url": "https://example.com/exact"}),
         _iam(catalog2, target_grant=live),

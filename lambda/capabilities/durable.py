@@ -148,6 +148,7 @@ class DynamoAdmissionRepository:
         return LiveTargetGrant(
             grant=TargetGrantV1.from_mapping(record["grant"]),
             uses=record["uses"],
+            claimed_call_ids=tuple(claimed),
         )
 
     def claim_target_use(self, target_hash: str, call_id: str) -> bool:
