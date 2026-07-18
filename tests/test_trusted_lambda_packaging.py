@@ -559,6 +559,82 @@ def test_verifier_rejects_missing_required_runtime_inventory(
         )
 
 
+@pytest.mark.parametrize("drift", ["nineteen", "twenty_one"])
+def test_build_rejects_a_drifted_capability_schema_count(
+    tmp_path: pathlib.Path,
+    drift: str,
+) -> None:
+    # The immutable admission catalog ships with exactly 20 capability schemas.
+    # A build with 19 or 21 must fail closed rather than silently ship a
+    # narrowed or widened admission surface.
+    source, payload = _write_source_and_payload(tmp_path)
+    # _write_source_and_payload created specs beside the lambda source root.
+    schema_dir = tmp_path / "specs" / "capabilities" / "schemas"
+    if drift == "nineteen":
+        next(iter(sorted(schema_dir.glob("*.json")))).unlink()
+    else:
+        (schema_dir / "po_extra.json").write_text('{"po":99}\n', encoding="utf-8")
+
+    with pytest.raises(ContractError, match="capability schema inventory is not exact"):
+        build_trusted_lambda_artifacts(
+            payload,
+            source,
+            tmp_path / "asset",
+            source_commit="a" * 40,
+            source_tree="b" * 40,
+            builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+            builder_image_id="sha256:" + "3" * 64,
+        )
+
+
+def test_build_rejects_a_missing_capability_catalog_source_input(
+    tmp_path: pathlib.Path,
+) -> None:
+    # The capability catalog is an authenticated source input bound byte-for-byte
+    # to the payload; dropping it from the payload fails the source binding.
+    source, payload = _write_source_and_payload(tmp_path)
+    (payload / "capabilities" / "artifacts" / "catalog-v1.json").unlink()
+
+    with pytest.raises(ContractError, match="packaged source differs"):
+        build_trusted_lambda_artifacts(
+            payload,
+            source,
+            tmp_path / "asset",
+            source_commit="a" * 40,
+            source_tree="b" * 40,
+            builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+            builder_image_id="sha256:" + "3" * 64,
+        )
+
+
+def test_verifier_rejects_a_missing_capability_gateway_handler(
+    tmp_path: pathlib.Path,
+) -> None:
+    # The capability gateway is a required handler; an asset built without it
+    # must fail verification against _REQUIRED_HANDLERS.
+    source, payload = _write_source_and_payload(tmp_path)
+    for root in (source, payload):
+        (root / "capabilities" / "gateway.py").unlink()
+    output = tmp_path / "asset"
+    build_trusted_lambda_artifacts(
+        payload,
+        source,
+        output,
+        source_commit="a" * 40,
+        source_tree="b" * 40,
+        builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+        builder_image_id="sha256:" + "3" * 64,
+    )
+
+    with pytest.raises(ContractError, match="missing a handler"):
+        verify_trusted_lambda_artifact(
+            output,
+            source,
+            expected_commit="a" * 40,
+            expected_tree="b" * 40,
+        )
+
+
 def test_cdk_resolves_authenticated_zip_and_exact_custom_hash(
     tmp_path: pathlib.Path,
 ) -> None:
