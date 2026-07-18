@@ -47,6 +47,9 @@ def test_one_hundred_concurrent_webhook_replays_have_one_immutable_fifo_identity
     ingress = TelegramWebhookIngress(
         secret_provider=lambda: "webhook-secret",
         resolve_user=lambda *_: ("pilot_alpha", False),
+        redeem_invite=lambda *_: (_ for _ in ()).throw(
+            AssertionError("ordinary messages must not enter invite redemption")
+        ),
         sqs_client=sqs,
         queue_url="https://sqs.eu-west-1.amazonaws.com/123456789012/operator.fifo",
     )
