@@ -174,20 +174,29 @@ class CapabilityGateway:
                 admitted.retry_mode,
                 "CAPABILITY_CALL_IN_FLIGHT",
             )
+        if claim.disposition is LedgerDisposition.LOGICAL_FENCE:
+            return _ambiguous(
+                validated_call,
+                admitted.retry_mode,
+                "CAPABILITY_LOGICAL_EFFECT_UNCERTAIN",
+            )
+        if claim.disposition is LedgerDisposition.RETRY_EXHAUSTED:
+            return _denied(
+                validated_call,
+                "CAPABILITY_READ_RETRY_EXHAUSTED",
+            )
 
         adapter = self._adapters.get(validated_call.operation_id)
         if adapter is None:
             result = _denied(validated_call, "ADAPTER_DISABLED")
-            self._ledger.complete(validated_call, result)
-            return result
+            return self._complete_result(admitted, result, effect_dispatched=False)
 
         try:
             self._admission.claim_target(admitted)
             self._admission.recheck_deletion_fence(admitted)
         except AdmissionDenied as error:
             result = _denied(validated_call, error.code)
-            self._ledger.complete(validated_call, result)
-            return result
+            return self._complete_result(admitted, result, effect_dispatched=False)
 
         try:
             outcome = adapter.invoke(admitted)
@@ -198,8 +207,43 @@ class CapabilityGateway:
                 admitted.retry_mode,
                 "ADAPTER_OUTCOME_UNAVAILABLE",
             )
-        self._ledger.complete(validated_call, result)
-        return result
+        return self._complete_result(admitted, result, effect_dispatched=True)
+
+    def _complete_result(
+        self,
+        admitted: AdmittedCall,
+        result: CapabilityResultV1,
+        *,
+        effect_dispatched: bool,
+    ) -> CapabilityResultV1:
+        try:
+            self._ledger.complete(
+                call=admitted.call,
+                grant=admitted.grant,
+                result=result,
+            )
+            return result
+        except Exception:
+            if not effect_dispatched:
+                return result
+
+        ambiguous = _ambiguous(
+            admitted.call,
+            admitted.retry_mode,
+            "CAPABILITY_COMPLETION_UNAVAILABLE",
+        )
+        try:
+            # A transient post-dispatch completion failure must leave a durable
+            # typed fence. If persistence is still unavailable, the original
+            # IN_FLIGHT logical claim remains the conservative fence.
+            self._ledger.complete(
+                call=admitted.call,
+                grant=admitted.grant,
+                result=ambiguous,
+            )
+        except Exception:
+            pass
+        return ambiguous
 
     @staticmethod
     def _result_from_adapter(
@@ -233,8 +277,7 @@ def lambda_handler(event: Any, _context: Any) -> dict[str, Any]:
     if (
         not isinstance(event, Mapping)
         or set(event) != {"schema", "grant", "call"}
-        or event.get("schema")
-        != "personal-operator.capability-relay-envelope.v1"
+        or event.get("schema") != "personal-operator.capability-relay-envelope.v1"
     ):
         raise ValueError("capability relay envelope is invalid")
     try:

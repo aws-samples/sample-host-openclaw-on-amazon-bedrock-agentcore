@@ -17,15 +17,11 @@ from capabilities.contracts import (
     derive_target_hash,
 )
 
-
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
-RUNTIME_ARN = (
-    "arn:aws:bedrock-agentcore:eu-west-1:000000000000:runtime/example"
-)
+RUNTIME_ARN = "arn:aws:bedrock-agentcore:eu-west-1:000000000000:runtime/example"
 RUNTIME_QUALIFIER = f"release_{RELEASE_COMMIT}"
 CALLER_ARN = (
-    "arn:aws:iam::000000000000:role/"
-    "openclaw-agentcore-execution-role-eu-west-1"
+    "arn:aws:iam::000000000000:role/" "openclaw-agentcore-execution-role-eu-west-1"
 )
 NOW = 1_800_000_100
 SCHEMA_DIR = Path(__file__).resolve().parents[2] / "specs/capabilities/schemas"
@@ -48,10 +44,7 @@ def _catalog():
 def _operation_rows(catalog) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
     rows = {}
     for pack in catalog.packs:
-        pack_mapping = {
-            key: value
-            for key, value in pack.items()
-        }
+        pack_mapping = {key: value for key, value in pack.items()}
         operation = dict(pack_mapping["operations"][0])
         rows[operation["operationId"]] = (pack_mapping, operation)
     return rows
@@ -203,16 +196,15 @@ class FakeRepository:
 
     def strong_read_runtime(self, runtime_arn: str, runtime_qualifier: str):
         self.trace.append("runtime")
-        if (
-            runtime_arn == self.runtime.get("runtimeArn")
-            and runtime_qualifier == self.runtime.get("runtimeQualifier")
-        ):
+        if runtime_arn == self.runtime.get(
+            "runtimeArn"
+        ) and runtime_qualifier == self.runtime.get("runtimeQualifier"):
             return self.runtime
         return None
 
     def strong_read_installation(self, user_id: str, pack_id: str):
         self.trace.append("installation")
-        if user_id != "user_alpha":
+        if user_id != self.user.get("userId"):
             return None
         return self.installations.get(pack_id)
 
@@ -269,6 +261,50 @@ def _gateway(*, operation_id="schedule.list", adapter=True, target_grant=None):
         clock=lambda: NOW,
     )
     return catalog, repository, recording, gateway, AdapterOutcome
+
+
+def _rebind_repository(repository, *, user_id: str, session_id: str) -> None:
+    repository.user = {
+        "userId": user_id,
+        "state": "ACTIVE",
+        "deletionFence": False,
+    }
+    repository.session = {
+        **repository.session,
+        "sessionId": session_id,
+        "userId": user_id,
+    }
+    repository.runtime = {
+        **repository.runtime,
+        "sessionId": session_id,
+        "userId": user_id,
+    }
+    repository.installations = {
+        pack_id: CapabilityInstallationV1.from_mapping(
+            {
+                **installation.to_mapping(),
+                "userId": user_id,
+            }
+        )
+        for pack_id, installation in repository.installations.items()
+    }
+
+
+class FailFirstCompletionLedger:
+    """Inject one post-adapter persistence loss without test-only gateway hooks."""
+
+    def __init__(self, delegate):
+        self.delegate = delegate
+        self.failures = 1
+
+    def begin(self, **kwargs):
+        return self.delegate.begin(**kwargs)
+
+    def complete(self, *args, **kwargs):
+        if self.failures:
+            self.failures -= 1
+            raise OSError("synthetic completion loss")
+        return self.delegate.complete(*args, **kwargs)
 
 
 def _iam(catalog, *, target_grant=None, grant_overrides=None):
@@ -435,6 +471,171 @@ def test_exact_replay_returns_cached_result_and_argument_mutation_is_denied():
     assert len(adapter.calls) == 1
 
 
+def test_ledger_isolates_identical_call_ids_tool_uses_and_budgets_per_tenant():
+    loaded = _load_gateway_modules()
+    assert loaded is not None
+    LiveTargetGrant, AdapterOutcome, CapabilityGateway, Ledger = loaded
+    catalog = _catalog()
+    shared_ledger = Ledger()
+    call = _call(catalog, "schedule.list", {})
+
+    repository_alpha = FakeRepository(catalog, LiveTargetGrant)
+    adapter_alpha = RecordingAdapter(
+        AdapterOutcome(
+            status="SUCCEEDED",
+            data={"schedules": []},
+            provenance_refs=("tenant:alpha",),
+        )
+    )
+    gateway_alpha = CapabilityGateway(
+        catalog=catalog,
+        repository=repository_alpha,
+        ledger=shared_ledger,
+        adapters={"schedule.list": adapter_alpha},
+        allowed_caller_arn=CALLER_ARN,
+        clock=lambda: NOW,
+    )
+
+    repository_beta = FakeRepository(catalog, LiveTargetGrant)
+    _rebind_repository(
+        repository_beta,
+        user_id="user_beta",
+        session_id="session_87654321",
+    )
+    adapter_beta = RecordingAdapter(
+        AdapterOutcome(
+            status="SUCCEEDED",
+            data={"schedules": []},
+            provenance_refs=("tenant:beta",),
+        )
+    )
+    gateway_beta = CapabilityGateway(
+        catalog=catalog,
+        repository=repository_beta,
+        ledger=shared_ledger,
+        adapters={"schedule.list": adapter_beta},
+        allowed_caller_arn=CALLER_ARN,
+        clock=lambda: NOW,
+    )
+
+    result_alpha = gateway_alpha.invoke(call, _iam(catalog))
+    result_beta = gateway_beta.invoke(
+        call,
+        _iam(
+            catalog,
+            grant_overrides={
+                "sub": "user_beta",
+                "sessionId": "session_87654321",
+                "nonce": "nonce_876543210abcdef",
+            },
+        ),
+    )
+
+    assert result_alpha.provenance_refs == ("tenant:alpha",)
+    assert result_beta.provenance_refs == ("tenant:beta",)
+    assert len(adapter_alpha.calls) == 1
+    assert len(adapter_beta.calls) == 1
+
+
+def test_cached_call_rejects_a_different_exact_grant_before_returning_result():
+    catalog, _, adapter, gateway, _ = _gateway()
+    call = _call(catalog, "schedule.list", {})
+
+    first = gateway.invoke(call, _iam(catalog))
+    changed = gateway.invoke(
+        call,
+        _iam(catalog, grant_overrides={"maxCalls": 9}),
+    )
+
+    assert first.status == "SUCCEEDED"
+    assert changed.status == "DENIED"
+    assert changed.error_code == "CAPABILITY_GRANT_BINDING_MISMATCH"
+    assert len(adapter.calls) == 1
+
+
+def test_lost_mutation_completion_is_uncertain_and_fences_fresh_tool_use():
+    loaded = _load_gateway_modules()
+    assert loaded is not None
+    LiveTargetGrant, AdapterOutcome, CapabilityGateway, Ledger = loaded
+    catalog = _catalog()
+    repository = FakeRepository(catalog, LiveTargetGrant)
+    adapter = RecordingAdapter(
+        AdapterOutcome(
+            status="SUCCEEDED",
+            data={"path": "notes/a.md", "bytes": 5},
+        )
+    )
+    gateway = CapabilityGateway(
+        catalog=catalog,
+        repository=repository,
+        ledger=FailFirstCompletionLedger(Ledger()),
+        adapters={"workspace.file.write": adapter},
+        allowed_caller_arn=CALLER_ARN,
+        clock=lambda: NOW,
+    )
+    original = _call(
+        catalog,
+        "workspace.file.write",
+        {"path": "notes/a.md", "content": "hello"},
+        tool_use_id="tooluse_11111111",
+    )
+    fresh_tool = _call(
+        catalog,
+        "workspace.file.write",
+        {"path": "notes/a.md", "content": "hello"},
+        tool_use_id="tooluse_22222222",
+    )
+
+    ambiguous = gateway.invoke(original, _iam(catalog))
+    fenced = gateway.invoke(fresh_tool, _iam(catalog))
+
+    assert ambiguous.status == "UNCERTAIN"
+    assert ambiguous.retry_policy == "RECONCILE_ONLY"
+    assert ambiguous.error_code == "CAPABILITY_COMPLETION_UNAVAILABLE"
+    assert fenced.status == "UNCERTAIN"
+    assert fenced.retry_policy == "RECONCILE_ONLY"
+    assert fenced.error_code == "CAPABILITY_LOGICAL_EFFECT_UNCERTAIN"
+    assert fenced.call_id == fresh_tool.call_id
+    assert len(adapter.calls) == 1
+
+
+def test_read_retry_is_bounded_and_fresh_tool_use_cannot_bypass_same_call_fence():
+    catalog, _, adapter, gateway, AdapterOutcome = _gateway(
+        operation_id="workspace.file.read"
+    )
+    adapter.outcome = AdapterOutcome(
+        status="SUCCEEDED",
+        data={"path": "notes/a.md", "content": "hello"},
+        provenance_refs=("workspace:notes/a.md",),
+    )
+    adapter.failures = [TimeoutError("first"), TimeoutError("second")]
+    original = _call(
+        catalog,
+        "workspace.file.read",
+        {"path": "notes/a.md"},
+        tool_use_id="tooluse_11111111",
+    )
+    fresh_tool = _call(
+        catalog,
+        "workspace.file.read",
+        {"path": "notes/a.md"},
+        tool_use_id="tooluse_22222222",
+    )
+
+    first = gateway.invoke(original, _iam(catalog))
+    bypass = gateway.invoke(fresh_tool, _iam(catalog))
+    second = gateway.invoke(original, _iam(catalog))
+    exhausted = gateway.invoke(original, _iam(catalog))
+
+    assert first.status == "FAILED_RETRYABLE"
+    assert bypass.status == "DENIED"
+    assert bypass.error_code == "CAPABILITY_READ_RETRY_REQUIRES_SAME_CALL"
+    assert second.status == "FAILED_RETRYABLE"
+    assert exhausted.status == "DENIED"
+    assert exhausted.error_code == "CAPABILITY_READ_RETRY_EXHAUSTED"
+    assert len(adapter.calls) == 2
+
+
 def test_grant_and_pack_call_quotas_are_atomic_and_deny_before_second_dispatch():
     catalog, _, adapter, gateway, _ = _gateway()
     iam = _iam(catalog, grant_overrides={"maxCalls": 1})
@@ -585,8 +786,7 @@ def test_deletion_fence_race_after_admission_denies_at_last_point_without_adapte
     assert reads == 2
 
 
-def test_lambda_handler_is_exact_and_fails_closed_without_live_repository_configuration(
-):
+def test_lambda_handler_is_exact_and_fails_closed_without_live_repository_configuration():
     from capabilities.gateway import lambda_handler
 
     catalog = _catalog()

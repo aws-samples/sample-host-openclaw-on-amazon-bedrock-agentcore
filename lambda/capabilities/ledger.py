@@ -26,6 +26,8 @@ class LedgerDisposition(str, Enum):
     RETRY = "RETRY"
     CACHED = "CACHED"
     IN_FLIGHT = "IN_FLIGHT"
+    LOGICAL_FENCE = "LOGICAL_FENCE"
+    RETRY_EXHAUSTED = "RETRY_EXHAUSTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,22 +48,69 @@ class CapabilityLedger(Protocol):
     ) -> LedgerClaim: ...
 
     def complete(
-        self, call: CapabilityCallV1, result: CapabilityResultV1
+        self,
+        *,
+        call: CapabilityCallV1,
+        grant: TurnCapabilityGrantV1,
+        result: CapabilityResultV1,
     ) -> None: ...
 
 
 @dataclass(slots=True)
 class _Entry:
     call: CapabilityCallV1
+    tenant_binding: str
+    grant_binding: str
+    logical_key: str
+    attempts: int
     state: str
     result: CapabilityResultV1 | None
 
 
 @dataclass(slots=True)
 class _TurnState:
-    binding_hash: str
+    grant_binding: str
     call_ids: set[str]
     pack_call_ids: dict[str, set[str]]
+
+
+def derive_tenant_binding(grant: TurnCapabilityGrantV1) -> str:
+    """Bind replay state to one exact authenticated release/runtime tenant."""
+
+    if not isinstance(grant, TurnCapabilityGrantV1):
+        raise TypeError("tenant binding requires a validated turn grant")
+    return canonical_sha256(
+        {
+            "sub": grant.sub,
+            "sessionId": grant.session_id,
+            "runtimeArn": grant.runtime_arn,
+            "runtimeQualifier": grant.runtime_qualifier,
+            "releaseCommit": grant.release_commit,
+            "catalogDigest": grant.catalog_digest,
+        }
+    )
+
+
+def derive_logical_call_key(
+    call: CapabilityCallV1,
+    tenant_binding: str,
+) -> str:
+    """Return the stable effect identity independent of a fresh tool-use ID."""
+
+    if not isinstance(call, CapabilityCallV1):
+        raise TypeError("logical call key requires a validated call")
+    if not isinstance(tenant_binding, str) or len(tenant_binding) != 64:
+        raise TypeError("logical call key requires an exact tenant binding")
+    return canonical_sha256(
+        {
+            "tenantBinding": tenant_binding,
+            "invocationId": call.invocation_id,
+            "catalogDigest": call.catalog_digest,
+            "operationId": call.operation_id,
+            "toolName": call.tool_name,
+            "argsHash": call.args_hash,
+        }
+    )
 
 
 class InMemoryCapabilityLedger:
@@ -73,9 +122,10 @@ class InMemoryCapabilityLedger:
 
     def __init__(self) -> None:
         self._lock = RLock()
-        self._entries: dict[str, _Entry] = {}
-        self._tool_uses: dict[tuple[str, str], tuple[str, str, str]] = {}
-        self._turns: dict[str, _TurnState] = {}
+        self._entries: dict[tuple[str, str], _Entry] = {}
+        self._tool_uses: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+        self._turns: dict[tuple[str, str], _TurnState] = {}
+        self._logical_calls: dict[tuple[str, str], str] = {}
 
     def begin(
         self,
@@ -101,27 +151,36 @@ class InMemoryCapabilityLedger:
         if retry_mode not in {"READ_ONLY", "IDEMPOTENT", "DEDUPE_KEY_REQUIRED"}:
             raise TypeError("ledger retry mode is invalid")
 
-        binding_hash = canonical_sha256(grant.to_mapping())
-        tool_key = (call.invocation_id, call.tool_use_id)
+        tenant_binding = derive_tenant_binding(grant)
+        grant_binding = canonical_sha256(grant.to_mapping())
+        logical_key = derive_logical_call_key(call, tenant_binding)
+        turn_key = (tenant_binding, call.invocation_id)
+        entry_key = (tenant_binding, call.call_id)
+        tool_key = (tenant_binding, call.invocation_id, call.tool_use_id)
         tool_identity = (call.operation_id, call.args_hash, call.call_id)
         with self._lock:
-            turn = self._turns.get(grant.nonce)
+            turn = self._turns.get(turn_key)
             if turn is None:
                 turn = _TurnState(
-                    binding_hash=binding_hash,
+                    grant_binding=grant_binding,
                     call_ids=set(),
                     pack_call_ids={},
                 )
-                self._turns[grant.nonce] = turn
-            elif turn.binding_hash != binding_hash:
-                raise LedgerDenied("GRANT_NONCE_CONFLICT")
+                self._turns[turn_key] = turn
+            elif turn.grant_binding != grant_binding:
+                raise LedgerDenied("CAPABILITY_GRANT_BINDING_MISMATCH")
 
             known_tool = self._tool_uses.get(tool_key)
             if known_tool is not None and known_tool != tool_identity:
                 raise LedgerDenied("CAPABILITY_ARGUMENT_MUTATION")
 
-            entry = self._entries.get(call.call_id)
+            entry = self._entries.get(entry_key)
             if entry is not None:
+                if (
+                    entry.tenant_binding != tenant_binding
+                    or entry.grant_binding != grant_binding
+                ):
+                    raise LedgerDenied("CAPABILITY_GRANT_BINDING_MISMATCH")
                 if entry.call.to_bytes() != call.to_bytes():
                     raise LedgerDenied("CAPABILITY_CALL_ID_CONFLICT")
                 if entry.state == "IN_FLIGHT":
@@ -131,10 +190,28 @@ class InMemoryCapabilityLedger:
                     and entry.result.status == "FAILED_RETRYABLE"
                     and retry_mode == "READ_ONLY"
                 ):
+                    if entry.attempts >= 2:
+                        return LedgerClaim(LedgerDisposition.RETRY_EXHAUSTED)
+                    entry.attempts += 1
                     entry.state = "IN_FLIGHT"
                     entry.result = None
                     return LedgerClaim(LedgerDisposition.RETRY)
                 return LedgerClaim(LedgerDisposition.CACHED, entry.result)
+
+            prior_call_id = self._logical_calls.get((tenant_binding, logical_key))
+            if prior_call_id is not None and prior_call_id != call.call_id:
+                if retry_mode == "READ_ONLY":
+                    prior_entry = self._entries.get((tenant_binding, prior_call_id))
+                    if prior_entry is None or (
+                        prior_entry.state == "IN_FLIGHT"
+                        or (
+                            prior_entry.result is not None
+                            and prior_entry.result.status == "FAILED_RETRYABLE"
+                        )
+                    ):
+                        raise LedgerDenied("CAPABILITY_READ_RETRY_REQUIRES_SAME_CALL")
+                else:
+                    return LedgerClaim(LedgerDisposition.LOGICAL_FENCE)
 
             pack_calls = turn.pack_call_ids.setdefault(pack_id, set())
             if (
@@ -146,23 +223,43 @@ class InMemoryCapabilityLedger:
             turn.call_ids.add(call.call_id)
             pack_calls.add(call.call_id)
             self._tool_uses[tool_key] = tool_identity
-            self._entries[call.call_id] = _Entry(
+            self._logical_calls[(tenant_binding, logical_key)] = call.call_id
+            self._entries[entry_key] = _Entry(
                 call=call,
+                tenant_binding=tenant_binding,
+                grant_binding=grant_binding,
+                logical_key=logical_key,
+                attempts=1,
                 state="IN_FLIGHT",
                 result=None,
             )
             return LedgerClaim(LedgerDisposition.NEW)
 
-    def complete(self, call: CapabilityCallV1, result: CapabilityResultV1) -> None:
-        if not isinstance(call, CapabilityCallV1) or not isinstance(
-            result, CapabilityResultV1
+    def complete(
+        self,
+        *,
+        call: CapabilityCallV1,
+        grant: TurnCapabilityGrantV1,
+        result: CapabilityResultV1,
+    ) -> None:
+        if (
+            not isinstance(call, CapabilityCallV1)
+            or not isinstance(result, CapabilityResultV1)
+            or not isinstance(grant, TurnCapabilityGrantV1)
         ):
             raise TypeError("ledger completion requires validated contracts")
         result.validate_against_call(call)
+        tenant_binding = derive_tenant_binding(grant)
+        grant_binding = canonical_sha256(grant.to_mapping())
         with self._lock:
-            entry = self._entries.get(call.call_id)
+            entry = self._entries.get((tenant_binding, call.call_id))
             if entry is None or entry.call.to_bytes() != call.to_bytes():
                 raise LedgerDenied("CAPABILITY_CALL_NOT_CLAIMED")
+            if (
+                entry.tenant_binding != tenant_binding
+                or entry.grant_binding != grant_binding
+            ):
+                raise LedgerDenied("CAPABILITY_GRANT_BINDING_MISMATCH")
             if entry.state != "IN_FLIGHT":
                 if (
                     entry.result is not None
@@ -180,4 +277,6 @@ __all__ = [
     "LedgerClaim",
     "LedgerDenied",
     "LedgerDisposition",
+    "derive_logical_call_key",
+    "derive_tenant_binding",
 ]
