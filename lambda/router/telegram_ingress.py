@@ -101,6 +101,7 @@ class TelegramWebhookIngress:
             chat = message.get("chat")
             actor = message.get("from")
             callback_data = None
+            callback_query_id = None
         elif isinstance(callback, Mapping):
             callback_message = callback.get("message")
             text = None
@@ -111,6 +112,7 @@ class TelegramWebhookIngress:
             )
             actor = callback.get("from")
             callback_data = callback.get("data")
+            callback_query_id = callback.get("id")
         else:
             return {"statusCode": 200, "body": "ok"}
         if (
@@ -178,7 +180,10 @@ class TelegramWebhookIngress:
             )
             if callback_data is not None:
                 kind = "callback"
-                work = {"callbackData": callback_data}
+                work = {
+                    "callbackData": callback_data,
+                    "callbackQueryId": callback_query_id,
+                }
             elif command:
                 kind = "command"
                 work = {"command": command.name}

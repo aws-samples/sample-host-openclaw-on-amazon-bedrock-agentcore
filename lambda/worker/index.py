@@ -97,6 +97,8 @@ class ProductCommandHandler(Protocol):
 
 
 class TelegramDelivery(Protocol):
+    def acknowledge_callback(self, *, callback_query_id: str) -> None: ...
+
     def send_message(
         self,
         *,
@@ -262,6 +264,24 @@ def process_envelope(envelope: QueueEnvelope, dependencies: WorkerDependencies) 
         raise TypeError("envelope must be a QueueEnvelope")
     if not isinstance(dependencies, WorkerDependencies):
         raise TypeError("dependencies must be WorkerDependencies")
+
+    # Telegram's UI acknowledgement is deliberately outside the business
+    # ledger. It may repeat on SQS replay and its failure must never suppress
+    # or duplicate the exactly-once callback transition below.
+    if envelope.kind == "callback":
+        callback_query_id = envelope.payload.get("callbackQueryId")
+        if callback_query_id is not None:
+            try:
+                acknowledge = getattr(
+                    dependencies.telegram_delivery,
+                    "acknowledge_callback",
+                )
+                acknowledge(callback_query_id=callback_query_id)
+            except Exception as error:
+                logger.warning(
+                    "Telegram callback acknowledgement failed: error_type=%s",
+                    type(error).__name__,
+                )
 
     # The durable control intent is the first deletion authority and can exist
     # even when runtime purge failed. Check it synchronously through the exact

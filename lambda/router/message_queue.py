@@ -30,6 +30,7 @@ _ACTOR_ID = re.compile(r"telegram:([1-9][0-9]{0,19})")
 _CALLBACK_DATA = re.compile(
     r"poc1:(edit|prepare|skip|why):[A-Za-z0-9_-]{22,32}"
 )
+_CALLBACK_QUERY_ID = re.compile(r"[A-Za-z0-9_-]{1,256}")
 _S3_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_/-]{1,1023}(?:\.[A-Za-z0-9]{1,16})?")
 _CONTENT_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
@@ -137,7 +138,10 @@ def _validate_payload(user_id: str, kind: str, payload: Any) -> dict[str, Any]:
     if content_field is None:
         raise EnvelopeValidationError("unsupported message kind")
     expected = {"chatId", "actorId", content_field}
-    if set(payload) != expected:
+    accepted = {frozenset(expected)}
+    if kind == "callback":
+        accepted.add(frozenset(expected | {"callbackQueryId"}))
+    if frozenset(payload) not in accepted:
         raise EnvelopeValidationError("payload fields do not match the envelope kind")
 
     chat_id = _require_string("Telegram chat ID", payload["chatId"], _CHAT_ID)
@@ -159,11 +163,18 @@ def _validate_payload(user_id: str, kind: str, payload: Any) -> dict[str, Any]:
             or _CALLBACK_DATA.fullmatch(callback_data) is None
         ):
             raise EnvelopeValidationError("invalid opaque callback action")
-        return {
+        result = {
             "chatId": chat_id,
             "actorId": actor_id,
             "callbackData": callback_data,
         }
+        if "callbackQueryId" in payload:
+            result["callbackQueryId"] = _require_string(
+                "Telegram callback query ID",
+                payload["callbackQueryId"],
+                _CALLBACK_QUERY_ID,
+            )
+        return result
 
     message = payload["message"]
     if isinstance(message, str):

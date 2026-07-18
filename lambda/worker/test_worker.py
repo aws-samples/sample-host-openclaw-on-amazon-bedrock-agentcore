@@ -48,9 +48,16 @@ class FakeCommandHandler:
 
 
 class FakeDelivery:
-    def __init__(self, fail_times=0):
+    def __init__(self, fail_times=0, *, acknowledgement_error=None):
         self.fail_times = fail_times
         self.calls = []
+        self.acknowledgements = []
+        self.acknowledgement_error = acknowledgement_error
+
+    def acknowledge_callback(self, *, callback_query_id):
+        self.acknowledgements.append(callback_query_id)
+        if self.acknowledgement_error is not None:
+            raise self.acknowledgement_error
 
     def send_message(self, **kwargs):
         if self.fail_times:
@@ -296,6 +303,7 @@ def test_callback_routes_to_control_and_new_update_replay_cannot_repeat_effect()
             "chatId": "42",
             "actorId": "telegram:42",
             "callbackData": "poc1:prepare:BBBBBBBBBBBBBBBBBBBBBB",
+            "callbackQueryId": "telegram_callback_query_201",
         },
     )
     deps = dependencies(commands=commands, ledger=ledger, delivery=delivery)
@@ -308,6 +316,36 @@ def test_callback_routes_to_control_and_new_update_replay_cannot_repeat_effect()
         "poc1:prepare:BBBBBBBBBBBBBBBBBBBBBB"
     )
     assert commands.calls[0]["chat_id"] == "42"
+    assert len(delivery.calls) == 1
+    assert delivery.acknowledgements == [
+        "telegram_callback_query_201",
+        "telegram_callback_query_201",
+    ]
+
+
+def test_callback_acknowledgement_failure_never_blocks_business_processing():
+    delivery = FakeDelivery(
+        acknowledgement_error=TimeoutError("Telegram acknowledgement lost")
+    )
+    commands = FakeCommandHandler()
+    item = make_envelope(
+        update_id="202",
+        kind="callback",
+        payload={
+            "chatId": "42",
+            "actorId": "telegram:42",
+            "callbackData": "poc1:why:BBBBBBBBBBBBBBBBBBBBBB",
+            "callbackQueryId": "telegram_callback_query_202",
+        },
+    )
+
+    worker.process_envelope(
+        item,
+        dependencies(commands=commands, delivery=delivery),
+    )
+
+    assert delivery.acknowledgements == ["telegram_callback_query_202"]
+    assert len(commands.calls) == 1
     assert len(delivery.calls) == 1
 
 

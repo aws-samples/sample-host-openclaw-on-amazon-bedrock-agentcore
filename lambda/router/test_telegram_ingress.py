@@ -166,6 +166,7 @@ def test_authenticated_callback_is_tenant_bound_and_durably_enqueued():
         "chatId": "42",
         "actorId": "telegram:42",
         "callbackData": "poc1:why:ABCDEFGHIJKLMNOPQRSTUV",
+        "callbackQueryId": "telegram-callback-query-1",
     }
     assert queue.calls[0]["MessageGroupId"] == "user_a1"
     assert queue.calls[0]["MessageDeduplicationId"] == wire["traceId"]
