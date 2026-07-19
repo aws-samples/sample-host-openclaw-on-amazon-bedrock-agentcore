@@ -16,11 +16,25 @@ from pathlib import PurePosixPath
 import re
 from typing import Mapping
 
+from capabilities.contracts import (
+    ContractValidationError,
+    PortableStateManifestV2,
+)
 
-FORMAT = "personal-operator.portable.v2"
+FORMAT = PortableStateManifestV2.SCHEMA
 
 # Categories that may appear in a portable bundle.
-INCLUDE_CATEGORIES = frozenset({"memory", "schedules", "receipts", "workspace"})
+INCLUDE_CATEGORIES = frozenset(
+    {
+        "memory",
+        "schedules",
+        "installed_packs",
+        "connectors",
+        "compute_receipts",
+        "receipts",
+        "workspace",
+    }
+)
 # Categories that are structurally documented but MUST NEVER be emitted or
 # accepted.  They carry live authority, secrets, or uncertain effects.
 EXCLUDE_CATEGORIES = frozenset(
@@ -37,7 +51,26 @@ EXCLUDE_CATEGORIES = frozenset(
 
 # Record categories that are serialized from ``records_for_user``.  ``workspace``
 # is materialized from authored files rather than a record category.
-RECORD_CATEGORIES = frozenset({"memory", "schedules", "receipts"})
+RECORD_CATEGORIES = frozenset(INCLUDE_CATEGORIES - {"workspace"})
+CATEGORY_TYPES = {
+    "memory": "MEMORY",
+    "schedules": "SCHEDULE",
+    "installed_packs": "INSTALLATION",
+    "connectors": "CONNECTOR",
+    "compute_receipts": "COMPUTE_RECEIPT",
+    "receipts": "EFFECT_RECEIPT",
+    "workspace": "FILE",
+}
+TYPE_CATEGORIES = {value: key for key, value in CATEGORY_TYPES.items()}
+EXCLUDED_CLASSES = (
+    "APPROVALS",
+    "CREDENTIALS",
+    "GRANTS",
+    "PENDING_EFFECTS",
+    "RUNTIME_INTERNALS",
+    "SESSIONS",
+    "TOMBSTONES",
+)
 
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -46,25 +79,26 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 # is case-insensitive and substring-based so ``refreshToken``/``refresh_token``
 # and nested variants are all caught.
 SECRET_KEY_MARKERS = (
-    "refresh_token",
     "refreshtoken",
-    "access_token",
     "accesstoken",
-    "client_secret",
+    "idtoken",
+    "sessiontoken",
+    "authtoken",
+    "oauthtoken",
+    "securitytoken",
+    "apikey",
     "clientsecret",
     "cookie",
     "csrf",
     "sessionid",
-    "session_id",
     "grant",
     "approvaltoken",
-    "approval_token",
     "authorization",
     "bearer",
     "privatekey",
-    "private_key",
     "password",
     "secret",
+    "credential",
 )
 
 
@@ -95,10 +129,32 @@ def canonical_json(value: object) -> bytes:
 
     return json.dumps(
         value,
+        allow_nan=False,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def strict_json_loads(value: object) -> object:
+    """Parse interoperable JSON, rejecting constants and duplicate keys."""
+
+    def reject_constant(_value: str) -> None:
+        raise ValueError("non-finite JSON number")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, nested in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = nested
+        return result
+
+    return json.loads(
+        value,
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
 
 
 def object_sha256(payload: bytes) -> str:
@@ -118,19 +174,19 @@ def safe_path(value: object) -> str:
         path.is_absolute()
         or any(part in {"", ".", ".."} or part.startswith(".") for part in parts)
         or not parts
+        or path.as_posix() != value
     ):
         raise PortableError("workspace path is invalid")
     return path.as_posix()
 
 
-def descriptor(path: str, category: str, type_: str, payload: bytes) -> dict:
+def descriptor(path: str, type_: str, payload: bytes) -> dict:
     """Build the canonical per-object descriptor for ``path``."""
 
-    if category not in INCLUDE_CATEGORIES:
-        raise PortableError("portable object category is not exportable")
+    if type_ not in TYPE_CATEGORIES:
+        raise PortableError("portable object type is not exportable")
     return {
         "path": path,
-        "category": category,
         "type": type_,
         "size": len(payload),
         "sha256": object_sha256(payload),
@@ -142,31 +198,53 @@ def default_landing() -> dict:
 
     return {
         "schedules": "DISABLED",
+        "installedPacks": "PAUSED",
         "connectors": "DISCONNECTED",
+        "computeReceipts": {"replayable": False},
         "receipts": {"replayable": False},
     }
 
 
-def build_manifest(*, owner_id: str, objects: list, landing: dict) -> dict:
-    return {
-        "format": FORMAT,
-        "userId": owner_id,
-        "landing": landing,
-        "objects": sorted(objects, key=lambda entry: entry["path"]),
+def build_manifest(*, objects: list) -> dict:
+    """Build the frozen v2 manifest with a deterministic content generation.
+
+    ``bundleHash`` hashes every canonical manifest field except itself.  The
+    generation and createdAt values are deterministic state-format metadata so
+    the same source snapshot always emits identical bytes.
+    """
+
+    ordered = sorted(objects, key=lambda entry: entry["path"])
+    generation_root = object_sha256(canonical_json(ordered))
+    manifest = {
+        "schema": FORMAT,
+        "generation": f"generation_{generation_root[:32]}",
+        "bundleHash": "0" * 64,
+        "objects": ordered,
+        "excludedClasses": list(EXCLUDED_CLASSES),
+        "createdAt": 0,
     }
+    manifest["bundleHash"] = complete_bundle_hash(manifest)
+    try:
+        return PortableStateManifestV2.from_mapping(manifest).to_mapping()
+    except ContractValidationError as error:
+        raise PortableError("portable manifest is invalid") from error
 
 
 def complete_bundle_hash(manifest: Mapping) -> str:
     """Content address of the whole bundle: SHA-256 over the canonical manifest.
 
     The manifest embeds every object's SHA-256, so this hash transitively
-    binds all content plus the format tag and exporting userId, without
-    depending on ZIP framing or compression.
+    binds all content plus the frozen schema/generation/exclusion metadata,
+    without depending on ZIP framing or compression. The embedded self-hash
+    field is the sole field omitted from its own preimage.
     """
 
     if not isinstance(manifest, Mapping):
         raise BundleIntegrityError("portable manifest is invalid")
-    return object_sha256(canonical_json(manifest))
+    preimage = {
+        key: value for key, value in manifest.items() if key != "bundleHash"
+    }
+    return object_sha256(canonical_json(preimage))
 
 
 def scan_for_secrets(value: object, *, _depth: int = 0) -> None:
@@ -177,7 +255,10 @@ def scan_for_secrets(value: object, *, _depth: int = 0) -> None:
     if isinstance(value, Mapping):
         for key, nested in value.items():
             if isinstance(key, str):
-                folded = key.casefold()
+                # Normalize separators and casing so camelCase, snake_case,
+                # kebab-case, and header-style spellings share one fail-closed
+                # credential/session corpus.
+                folded = re.sub(r"[^a-z0-9]", "", key.casefold())
                 if any(marker in folded for marker in SECRET_KEY_MARKERS):
                     raise ImportRejected("portable bundle embeds a secret-shaped key")
             scan_for_secrets(nested, _depth=_depth + 1)

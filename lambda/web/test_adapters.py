@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import hashlib
 import io
 
@@ -434,6 +435,9 @@ def test_user_records_export_allowlist_excludes_connections_and_deletion_removes
     assert records == {
         "memory": [{"text": "remember"}],
         "schedules": [{"name": "weekly"}],
+        "installed_packs": [],
+        "connectors": [{"connectorId": "google", "state": "DISCONNECTED"}],
+        "compute_receipts": [],
         "receipts": [_effect_receipt()],
     }
     store.revoke_all(USER)
@@ -476,6 +480,150 @@ def test_user_record_export_logically_skips_expired_ttl_during_dynamodb_lag():
     records = DynamoUserDataStore(table, now=lambda: 100).records_for_user(USER)
 
     assert records["memory"] == [{"text": "still-live", "ttl": 101}]
+
+
+def test_user_record_export_normalizes_integral_boto3_decimals_to_json_ints():
+    table = PaginatedTable(
+        [
+            {
+                "Items": [
+                    {
+                        "PK": f"USER#{USER}",
+                        "SK": "MEMORY#decimal",
+                        "ttl": Decimal("101"),
+                        "revision": Decimal("7"),
+                        "nested": [{"count": Decimal("2")}],
+                    }
+                ]
+            }
+        ]
+    )
+
+    records = DynamoUserDataStore(table, now=lambda: 100).records_for_user(USER)
+
+    assert records["memory"] == [
+        {
+            "ttl": 101,
+            "revision": 7,
+            "nested": [{"count": 2}],
+        }
+    ]
+
+
+def test_user_record_export_rejects_fractional_decimal_without_precision_loss():
+    table = PaginatedTable(
+        [
+            {
+                "Items": [
+                    {
+                        "PK": f"USER#{USER}",
+                        "SK": "MEMORY#fractional",
+                        "exact": Decimal(
+                            "0.12345678901234567890123456789012345678"
+                        ),
+                    }
+                ]
+            }
+        ]
+    )
+
+    with pytest.raises(DataAdapterError, match="number is not exactly portable"):
+        DynamoUserDataStore(table).records_for_user(USER)
+
+
+def test_portable_native_source_reads_installations_and_typed_compute_history_only():
+    compute_receipt = {
+        "schema": "personal-operator.compute-receipt.v1",
+        "jobId": "job_" + "a" * 64,
+        "status": "FAILED",
+        "imageDigest": "sha256:" + "b" * 64,
+        "inputDigest": "c" * 64,
+        "outputFiles": [],
+        "startedAt": 100,
+        "completedAt": 101,
+        "errorCode": "SYNTHETIC_FAILURE",
+    }
+    table = PaginatedTable(
+        [
+            {
+                "Items": [
+                    {
+                        "PK": f"USER#{USER}",
+                        "SK": "COMPUTE_RECEIPT#job_" + "a" * 64,
+                        "computeReceipt": compute_receipt,
+                    },
+                    {
+                        "PK": f"USER#{USER}",
+                        "SK": "CONNECTION#google-gmail-readonly",
+                        "envelope": {"ciphertext": "must-not-export"},
+                    },
+                ]
+            }
+        ]
+    )
+
+    class InstallationTable:
+        def __init__(self):
+            self.reads = []
+
+        def get_item(self, **request):
+            self.reads.append(request)
+            if request["Key"]["SK"] != "INSTALL#schedule.list":
+                return {}
+            return {
+                "Item": {
+                    "PK": f"USER#{USER}",
+                    "SK": "INSTALL#schedule.list",
+                    "recordJson": (
+                        '{"catalogDigest":"' + "d" * 64
+                        + '","connectionRefs":["conn_12345678"],'
+                        '"killSwitch":false,"packId":"schedule.list",'
+                        '"policyRevision":1,'
+                        '"schema":"personal-operator.capability-installation.v1",'
+                        '"state":"ENABLED","userId":"' + USER + '"}'
+                    ),
+                    "version": 1,
+                }
+            }
+
+    installations = InstallationTable()
+    records = DynamoUserDataStore(
+        table,
+        installation_table=installations,
+    ).records_for_user(USER)
+
+    assert records["installed_packs"] == [
+        {
+            "schema": "personal-operator.capability-installation.v1",
+            "userId": USER,
+            "packId": "schedule.list",
+            "catalogDigest": "d" * 64,
+            "state": "PAUSED",
+            "policyRevision": 1,
+            "connectionRefs": [],
+            "killSwitch": True,
+        }
+    ]
+    assert records["connectors"] == [
+        {"connectorId": "google-gmail-readonly", "state": "DISCONNECTED"}
+    ]
+    assert records["compute_receipts"] == [compute_receipt]
+    assert "ciphertext" not in str(records)
+    assert installations.reads
+    assert all(read["ConsistentRead"] is True for read in installations.reads)
+
+
+@pytest.mark.parametrize("response", [None, [], "malformed", 1])
+def test_portable_installation_read_rejects_malformed_success_response(response):
+    class InstallationTable:
+        def get_item(self, **_request):
+            return response
+
+    with pytest.raises(DataAdapterError, match="installation read"):
+        DynamoUserDataStore(
+            PaginatedTable([{"Items": []}]),
+            installation_table=InstallationTable(),
+        ).records_for_user(USER)
 
 
 @pytest.mark.parametrize("ttl", [True, 0, 1.5, "100"])
@@ -551,6 +699,9 @@ def test_user_record_query_follows_every_page_with_an_exact_bounded_request():
     assert records == {
         "memory": [{}],
         "schedules": [{}],
+        "installed_packs": [],
+        "connectors": [],
+        "compute_receipts": [],
         "receipts": [],
     }
     assert len(table.queries) == 2

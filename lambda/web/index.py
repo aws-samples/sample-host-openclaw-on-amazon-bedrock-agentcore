@@ -29,6 +29,8 @@ from .retention import DeletionPending, ExportBoundaryError
 LOG = logging.getLogger(__name__)
 MAX_BODY_BYTES = 64 * 1024
 MAX_QUERY_BYTES = 16 * 1024
+MAX_IMPORT_BUNDLE_BYTES = 4 * 1024 * 1024
+MAX_IMPORT_BODY_BYTES = 4 * ((MAX_IMPORT_BUNDLE_BYTES + 2) // 3) + 4_096
 _ACTION_ROUTE = re.compile(
     r"/api/actions/(?P<action>[A-Za-z0-9_-]{8,128})/(?P<verb>approve|reject)"
 )
@@ -127,14 +129,14 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _json_body(event: Mapping) -> Mapping:
+def _json_body(event: Mapping, *, max_bytes: int = MAX_BODY_BYTES) -> Mapping:
     body = event.get("body", "")
     if event.get("isBase64Encoded"):
         try:
             body = base64.b64decode(body, validate=True).decode()
         except Exception as error:
             raise ValueError("request body is invalid") from error
-    if not isinstance(body, str) or len(body.encode()) > MAX_BODY_BYTES:
+    if not isinstance(body, str) or len(body.encode()) > max_bytes:
         raise ValueError("request body is invalid")
     try:
         parsed = json.loads(body, object_pairs_hook=_unique_json_object)
@@ -143,9 +145,6 @@ def _json_body(event: Mapping) -> Mapping:
     if not isinstance(parsed, Mapping):
         raise ValueError("request body must be an object")
     return parsed
-
-
-MAX_IMPORT_BUNDLE_BYTES = 8 * 1024 * 1024
 
 
 def _portable_bundle(value: object) -> bytes:
@@ -242,8 +241,9 @@ class WebApplication:
         self._workspace = workspace
         self._gmail_workspace = gmail_workspace
         self._exporter = exporter
-        if not callable(getattr(importer, "build_plan", None)) or not callable(
-            getattr(importer, "activate", None)
+        if any(
+            not callable(getattr(importer, method, None))
+            for method in ("build_plan", "prepare_activation", "activate")
         ):
             raise TypeError("portable importer is invalid")
         self._importer = importer
@@ -512,7 +512,7 @@ class WebApplication:
                     base64.b64encode(archive).decode(),
                     headers={
                         "Content-Type": "application/zip",
-                        "Content-Disposition": 'attachment; filename="personal-operator-export.zip"',
+                        "Content-Disposition": 'attachment; filename="personal-operator-portable-v2.zip"',
                     },
                 )
                 response["isBase64Encoded"] = True
@@ -527,39 +527,63 @@ class WebApplication:
 
             if method == "POST" and path == "/api/import/plan":
                 identity = self._identity(headers, mutate=True)
-                body = _json_body(event)
+                body = _json_body(event, max_bytes=MAX_IMPORT_BODY_BYTES)
                 if set(body) != {"bundle"}:
                     raise ValueError("import plan request fields are invalid")
                 bundle = _portable_bundle(body["bundle"])
-                plan = self._importer.build_plan(bundle)
-                return self._response(
-                    200,
-                    {
-                        "bundleHash": plan.bundle_hash,
-                        "counts": plan.counts,
-                        "landing": plan.landing,
-                        "ownerClaim": plan.owner_claim,
-                        "rejections": list(plan.rejections),
-                    },
+                plan = self._importer.build_plan(
+                    bundle,
+                    target_user_id=identity.user_id,
                 )
+                return self._response(200, plan.to_mapping())
 
             if method == "POST" and path == "/api/import/activate":
                 identity = self._identity(headers, mutate=True)
-                body = _json_body(event)
-                if set(body) != {"bundle", "bundleHash", "confirm"}:
+                body = _json_body(event, max_bytes=MAX_IMPORT_BODY_BYTES)
+                if set(body) != {
+                    "bundle",
+                    "bundleHash",
+                    "planId",
+                    "baseGeneration",
+                    "confirm",
+                }:
                     raise ValueError("import activation request fields are invalid")
                 if body.get("confirm") is not True:
                     raise ValueError("import activation must be explicitly confirmed")
                 bundle_hash = body.get("bundleHash")
-                if not isinstance(bundle_hash, str):
-                    raise ValueError("import activation bundle hash is invalid")
+                plan_id = body.get("planId")
+                base_generation = body.get("baseGeneration")
+                if not all(
+                    isinstance(value, str)
+                    for value in (bundle_hash, plan_id, base_generation)
+                ):
+                    raise ValueError("import activation plan is invalid")
                 bundle = _portable_bundle(body["bundle"])
-                result = self._importer.activate(
+                prepared = self._importer.prepare_activation(
+                    bundle,
+                    target_user_id=identity.user_id,
+                    approved_bundle_hash=bundle_hash,
+                    approved_plan_id=plan_id,
+                    approved_base_generation=base_generation,
+                )
+                if (
+                    prepared.bundle_hash != bundle_hash
+                    or prepared.plan_id != plan_id
+                    or prepared.base_generation != base_generation
+                ):
+                    raise ImportUncertain(
+                        "portable activation preparation is inconsistent"
+                    )
+                receipt = self._importer.activate(
                     bundle,
                     approved_bundle_hash=bundle_hash,
+                    approved_plan_id=plan_id,
+                    approved_base_generation=base_generation,
                     target_user_id=identity.user_id,
+                    activation_approval=prepared.activation_approval,
+                    expected_generation=prepared.expected_generation,
                 )
-                return self._response(200, result)
+                return self._response(200, receipt.to_mapping())
 
             known_paths = {
                 "/api/session/connect",

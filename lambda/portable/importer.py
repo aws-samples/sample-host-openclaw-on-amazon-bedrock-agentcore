@@ -17,25 +17,40 @@ Landing invariants that can never be relaxed:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import base64
+from dataclasses import dataclass
+import hashlib
 import io
-import json
+import re
+import time
 import zipfile
 from typing import Mapping
 
+from capabilities.contracts import (
+    ContractValidationError,
+    ImportPlanV1,
+    ImportReceiptV1,
+    PortableStateManifestV2,
+)
+
 from .manifest import (
+    EXCLUDED_CLASSES,
     FORMAT,
     RECORD_CATEGORIES,
+    TYPE_CATEGORIES,
     BundleIntegrityError,
     ImportRejected,
     ImportUncertain,
     canonical_json,
     complete_bundle_hash,
+    default_landing,
     object_sha256,
     safe_path,
     scan_for_secrets,
+    strict_json_loads,
     user_id as _user_id,
 )
+from .records import retarget_records, validate_bundle_records
 
 
 MAX_BUNDLE_BYTES = 50 * 1024 * 1024
@@ -71,17 +86,58 @@ _TOMBSTONE_RECORD_TYPES = frozenset(
 _FORBIDDEN_RECORD_TYPES = frozenset(
     {"GMAIL_CONNECTION_FENCE"} | _TOMBSTONE_RECORD_TYPES
 )
+_BASE_GENERATION = re.compile(r"generation_([0-9]{20})")
+
+
+def _generation_id(value: object) -> str:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= 9_007_199_254_740_991
+    ):
+        raise ImportRejected("portable base generation is invalid")
+    return f"generation_{value:020d}"
+
+
+def _generation_number(value: object) -> int:
+    if not isinstance(value, str):
+        raise ImportRejected("portable base generation is invalid")
+    matched = _BASE_GENERATION.fullmatch(value)
+    if matched is None:
+        raise ImportRejected("portable base generation is invalid")
+    number = int(matched.group(1))
+    if _generation_id(number) != value:
+        raise ImportRejected("portable base generation is invalid")
+    return number
+
+
+def _plan_id(user_id: str, bundle_hash: str, base_generation: str) -> str:
+    digest = hashlib.sha256(b"personal-operator.import-plan.v1\0")
+    for value in (user_id, bundle_hash, base_generation):
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\0")
+    return f"importplan_{digest.hexdigest()}"
 
 
 @dataclass(frozen=True, slots=True)
-class ImportPlanV1:
-    """Typed DRY-RUN summary of a validated bundle.  No mutation implied."""
+class PreparedActivationV1:
+    """One canonical plan plus its durable exact activation approval."""
 
-    bundle_hash: str
-    counts: dict
-    landing: dict
-    owner_claim: str
-    rejections: tuple = field(default_factory=tuple)
+    plan: ImportPlanV1
+    activation_approval: str
+    expected_generation: int
+
+    @property
+    def bundle_hash(self) -> str:
+        return self.plan.bundle_hash
+
+    @property
+    def plan_id(self) -> str:
+        return self.plan.plan_id
+
+    @property
+    def base_generation(self) -> str:
+        return self.plan.base_generation
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,12 +149,19 @@ class _ParsedBundle:
 
 
 class PortableImporter:
-    def __init__(self, *, staging) -> None:
-        if not callable(getattr(staging, "swap", None)) or not callable(
-            getattr(staging, "load_generation", None)
-        ):
+    def __init__(self, *, staging, now=None) -> None:
+        required = {
+            "activate_once",
+            "load_generation",
+            "load_live",
+            "prepare_activation",
+        }
+        if any(not callable(getattr(staging, method, None)) for method in required):
             raise TypeError("staged-generation store is invalid")
+        if now is not None and not callable(now):
+            raise TypeError("portable import clock is invalid")
         self._staging = staging
+        self._now = now or (lambda: int(time.time()))
 
     # -- parsing / integrity ------------------------------------------------
 
@@ -137,8 +200,13 @@ class PortableImporter:
             # cannot inflate past the per-entry bound during decompression.
             payloads = {}
             for name in names:
-                with archive.open(name) as stream:
-                    payload = stream.read(MAX_ENTRY_UNCOMPRESSED_BYTES + 1)
+                try:
+                    with archive.open(name) as stream:
+                        payload = stream.read(MAX_ENTRY_UNCOMPRESSED_BYTES + 1)
+                except Exception as error:
+                    raise BundleIntegrityError(
+                        "portable bundle entry could not be read"
+                    ) from error
                 if len(payload) > MAX_ENTRY_UNCOMPRESSED_BYTES:
                     raise BundleIntegrityError(
                         "portable bundle entry exceeds its uncompressed size limit"
@@ -147,7 +215,7 @@ class PortableImporter:
 
         manifest_bytes = payloads["manifest.json"]
         try:
-            manifest = json.loads(manifest_bytes)
+            manifest = strict_json_loads(manifest_bytes)
         except (ValueError, TypeError) as error:
             raise BundleIntegrityError("portable manifest is not JSON") from error
         if not isinstance(manifest, Mapping):
@@ -156,37 +224,35 @@ class PortableImporter:
         # canonical re-serialization of its parsed content.
         if canonical_json(manifest) != manifest_bytes:
             raise BundleIntegrityError("portable manifest is not canonical")
-        if manifest.get("format") != FORMAT:
-            raise BundleIntegrityError("portable bundle format tag is invalid")
+        try:
+            manifest = PortableStateManifestV2.from_mapping(manifest).to_mapping()
+        except ContractValidationError as error:
+            raise BundleIntegrityError("portable manifest fields are invalid") from error
+        if manifest["bundleHash"] != complete_bundle_hash(manifest):
+            raise BundleIntegrityError("portable manifest bundle hash is invalid")
 
-        owner = manifest.get("userId")
-        if not isinstance(owner, str):
-            raise BundleIntegrityError("portable manifest owner is invalid")
-        landing = manifest.get("landing")
-        if not isinstance(landing, Mapping):
-            raise BundleIntegrityError("portable manifest landing is invalid")
-
-        objects = manifest.get("objects")
-        if not isinstance(objects, list):
-            raise BundleIntegrityError("portable manifest objects are invalid")
+        objects = manifest["objects"]
 
         declared_paths: set[str] = set()
         records: dict[str, object] = {}
         workspace: dict[str, bytes] = {}
         for entry in objects:
-            self._verify_descriptor(entry, payloads, declared_paths)
+            category = self._verify_descriptor(entry, payloads, declared_paths)
             path = entry["path"]
-            category = entry["category"]
             payload = payloads[path]
             if category in RECORD_CATEGORIES:
                 try:
-                    records[category] = json.loads(payload)
+                    records[category] = strict_json_loads(payload)
                 except (ValueError, TypeError) as error:
                     raise BundleIntegrityError(
                         "portable record object is not JSON"
                     ) from error
+                if canonical_json(records[category]) != payload:
+                    raise BundleIntegrityError(
+                        "portable record object is not canonical"
+                    )
             else:  # workspace
-                workspace[path[len("workspace/") :]] = payload
+                workspace[path[len("files/") :]] = payload
 
         # Every non-manifest zip entry must be declared (no extra/missing).
         zip_objects = set(payloads) - {"manifest.json"}
@@ -194,39 +260,41 @@ class PortableImporter:
             raise BundleIntegrityError(
                 "portable bundle entries do not match the manifest"
             )
+        if set(records) != RECORD_CATEGORIES:
+            raise BundleIntegrityError("portable record categories are invalid")
 
         return _ParsedBundle(
             manifest=dict(manifest),
-            bundle_hash=complete_bundle_hash(manifest),
+            bundle_hash=manifest["bundleHash"],
             records=records,
             workspace=workspace,
         )
 
     @staticmethod
-    def _verify_descriptor(entry, payloads, declared_paths) -> None:
+    def _verify_descriptor(entry, payloads, declared_paths) -> str:
         if not isinstance(entry, Mapping) or set(entry) != {
             "path",
-            "category",
             "type",
             "size",
             "sha256",
         }:
             raise BundleIntegrityError("portable object descriptor is invalid")
         path = entry["path"]
-        category = entry["category"]
+        object_type = entry["type"]
         if not isinstance(path, str):
             raise BundleIntegrityError("portable object path is invalid")
         if path in declared_paths:
             raise BundleIntegrityError("portable bundle declares a duplicate path")
         # Category and prefix must agree, and the path must be traversal-safe.
+        category = TYPE_CATEGORIES.get(object_type)
         if category in RECORD_CATEGORIES:
             if path != f"records/{category}.json":
                 raise BundleIntegrityError("portable record path is invalid")
         elif category == "workspace":
-            if not path.startswith("workspace/"):
+            if not path.startswith("files/"):
                 raise BundleIntegrityError("portable workspace path is invalid")
             try:
-                safe_path(path[len("workspace/") :])
+                safe_path(path[len("files/") :])
             except Exception as error:
                 raise BundleIntegrityError(
                     "portable workspace path is unsafe"
@@ -243,125 +311,235 @@ class PortableImporter:
         if not isinstance(sha, str) or sha != object_sha256(payload):
             raise BundleIntegrityError("portable object hash does not match")
         declared_paths.add(path)
+        return category
 
     # -- policy -------------------------------------------------------------
 
     @staticmethod
     def _enforce_policy(bundle: _ParsedBundle) -> None:
-        landing = bundle.manifest["landing"]
-        receipts_landing = landing.get("receipts")
-        if (
-            not isinstance(receipts_landing, Mapping)
-            or receipts_landing.get("replayable") is not False
-        ):
-            raise ImportRejected("imported receipts must land non-replayable")
-        if landing.get("schedules") != "DISABLED":
-            raise ImportRejected("imported schedules must land disabled")
-        if landing.get("connectors") != "DISCONNECTED":
-            raise ImportRejected("imported connectors must land disconnected")
+        if not set(EXCLUDED_CLASSES).issubset(bundle.manifest["excludedClasses"]):
+            raise ImportRejected("portable excluded classes are incomplete")
+        validate_bundle_records(bundle.records)
 
         for category, payload in bundle.records.items():
-            rows = payload if isinstance(payload, list) else [payload]
-            for row in rows:
+            if not isinstance(payload, list) or any(
+                not isinstance(row, Mapping) for row in payload
+            ):
+                raise ImportRejected(
+                    "portable live state requires structured record rows"
+                )
+            for row in payload:
                 scan_for_secrets(row)
-                if not isinstance(row, Mapping):
-                    continue
                 record_type = row.get("recordType")
                 if isinstance(record_type, str) and (
-                    record_type in _FORBIDDEN_RECORD_TYPES
-                    or record_type.upper() in _TOMBSTONE_RECORD_TYPES
+                    record_type.upper() in _FORBIDDEN_RECORD_TYPES
                 ):
                     raise ImportRejected("portable bundle carries a forbidden record")
-                if "deletionStatus" in row:
+                normalized_keys = {
+                    re.sub(r"[^a-z0-9]", "", key.casefold())
+                    for key in row
+                    if isinstance(key, str)
+                }
+                if "deletionstatus" in normalized_keys:
                     raise ImportRejected("portable bundle carries a deletion tombstone")
                 status = row.get("status")
-                if isinstance(status, str) and status in _ACTIVE_AUTHORITY_MARKERS:
+                if (
+                    isinstance(status, str)
+                    and status.upper() in _ACTIVE_AUTHORITY_MARKERS
+                ):
                     raise ImportRejected("portable bundle carries live authority")
-                if "connectionEnvelope" in row or "refreshToken" in row:
+                if "connectionenvelope" in normalized_keys:
                     raise ImportRejected("portable bundle carries live authority")
                 state = row.get("state")
-                if isinstance(state, str) and state in _PENDING_STATES:
+                if isinstance(state, str) and state.upper() in _PENDING_STATES:
                     raise ImportRejected("portable bundle carries a pending effect")
 
     # -- public API ---------------------------------------------------------
 
-    def build_plan(self, bundle_bytes: object) -> ImportPlanV1:
-        bundle = self._parse(bundle_bytes)
-        self._enforce_policy(bundle)
-        counts = {
-            category: (
-                len(payload) if isinstance(payload, list) else 1
-            )
-            for category, payload in bundle.records.items()
-        }
-        for category in RECORD_CATEGORIES:
-            counts.setdefault(category, 0)
-        counts["workspace"] = len(bundle.workspace)
-        return ImportPlanV1(
-            bundle_hash=bundle.bundle_hash,
-            counts=counts,
-            landing=dict(bundle.manifest["landing"]),
-            owner_claim=bundle.manifest["userId"],
-            rejections=(),
+    @staticmethod
+    def _plan(
+        bundle: _ParsedBundle,
+        *,
+        target_user_id: str,
+        base_generation: int,
+    ) -> ImportPlanV1:
+        base = _generation_id(base_generation)
+        return ImportPlanV1.from_mapping(
+            {
+                "schema": ImportPlanV1.SCHEMA,
+                "planId": _plan_id(target_user_id, bundle.bundle_hash, base),
+                "userId": target_user_id,
+                "bundleHash": bundle.bundle_hash,
+                "baseGeneration": base,
+                "objectCount": len(bundle.manifest["objects"]),
+                "totalBytes": sum(
+                    descriptor["size"] for descriptor in bundle.manifest["objects"]
+                ),
+                "schedulesDisabled": True,
+                "connectorsDisconnected": True,
+                "effectsReplayable": False,
+            }
         )
 
-    def _staged_payload(self, bundle: _ParsedBundle) -> dict:
-        schedules = []
-        for row in bundle.records.get("schedules", []) or []:
-            if isinstance(row, Mapping):
-                landed = {
-                    key: value
-                    for key, value in row.items()
-                    if key not in {"nextRunAt", "nextRun"}
-                }
-                landed["state"] = "DISABLED"
-                schedules.append(landed)
-            else:
-                schedules.append(row)
-        records = {
-            category: payload
-            for category, payload in bundle.records.items()
-            if category != "schedules"
-        }
-        records["schedules"] = schedules
-        # Connectors are never materialized as an envelope.
-        records.pop("connections", None)
+    def build_plan(
+        self,
+        bundle_bytes: object,
+        *,
+        target_user_id: object,
+    ) -> ImportPlanV1:
+        caller = _user_id(target_user_id)
+        bundle = self._parse(bundle_bytes)
+        self._enforce_policy(bundle)
+        base_generation = self._staging.load_generation(caller)
+        return self._plan(
+            bundle,
+            target_user_id=caller,
+            base_generation=base_generation,
+        )
+
+    def _approved_plan(
+        self,
+        bundle: _ParsedBundle,
+        *,
+        target_user_id: str,
+        approved_bundle_hash: object,
+        approved_plan_id: object,
+        approved_base_generation: object,
+    ) -> tuple[ImportPlanV1, int]:
+        expected_generation = _generation_number(approved_base_generation)
+        plan = self._plan(
+            bundle,
+            target_user_id=target_user_id,
+            base_generation=expected_generation,
+        )
+        if (
+            approved_bundle_hash != plan.bundle_hash
+            or approved_plan_id != plan.plan_id
+            or approved_base_generation != plan.base_generation
+        ):
+            raise ImportRejected("approved import plan does not match the bundle")
+        return plan, expected_generation
+
+    def _staged_payload(self, bundle: _ParsedBundle, *, target_user_id: str) -> dict:
+        records = retarget_records(
+            bundle.records,
+            target_user_id=target_user_id,
+        )
         return {
             "format": FORMAT,
             "records": records,
-            "workspace": dict(bundle.workspace),
-            "landing": dict(bundle.manifest["landing"]),
+            "workspace": {
+                path: {
+                    "encoding": "base64",
+                    "data": base64.b64encode(payload).decode("ascii"),
+                    "sha256": object_sha256(payload),
+                }
+                for path, payload in bundle.workspace.items()
+            },
+            "landing": default_landing(),
         }
+
+    def prepare_activation(
+        self,
+        bundle_bytes: object,
+        *,
+        target_user_id: object,
+        approved_bundle_hash: object,
+        approved_plan_id: object,
+        approved_base_generation: object,
+    ) -> PreparedActivationV1:
+        """Prepare one durable approval without changing the live generation."""
+
+        caller = _user_id(target_user_id)
+        bundle = self._parse(bundle_bytes)
+        self._enforce_policy(bundle)
+        plan, expected_generation = self._approved_plan(
+            bundle,
+            target_user_id=caller,
+            approved_bundle_hash=approved_bundle_hash,
+            approved_plan_id=approved_plan_id,
+            approved_base_generation=approved_base_generation,
+        )
+        approval = self._staging.prepare_activation(
+            caller,
+            bundle_hash=bundle.bundle_hash,
+            expected_generation=expected_generation,
+            staged=self._staged_payload(bundle, target_user_id=caller),
+        )
+        if (
+            not isinstance(approval, Mapping)
+            or set(approval)
+            != {"activationApproval", "bundleHash", "expectedGeneration"}
+            or not isinstance(approval.get("activationApproval"), str)
+            or not 8 <= len(approval["activationApproval"]) <= 128
+            or approval.get("bundleHash") != bundle.bundle_hash
+            or approval.get("expectedGeneration") != expected_generation
+        ):
+            raise ImportUncertain("portable activation approval is invalid")
+        return PreparedActivationV1(
+            plan=plan,
+            activation_approval=approval["activationApproval"],
+            expected_generation=expected_generation,
+        )
 
     def activate(
         self,
         bundle_bytes: object,
         *,
         approved_bundle_hash: object,
+        approved_plan_id: object,
+        approved_base_generation: object,
         target_user_id: object,
-        expected_generation: object = None,
-    ) -> dict:
+        activation_approval: object,
+        expected_generation: object,
+    ) -> ImportReceiptV1:
         caller = _user_id(target_user_id)
         bundle = self._parse(bundle_bytes)
         self._enforce_policy(bundle)
-        # Bind activation to the EXACT complete-bundle hash the caller approved.
-        if (
-            not isinstance(approved_bundle_hash, str)
-            or approved_bundle_hash != bundle.bundle_hash
-        ):
-            raise ImportRejected("approved bundle hash does not match the bundle")
+        plan, plan_generation = self._approved_plan(
+            bundle,
+            target_user_id=caller,
+            approved_bundle_hash=approved_bundle_hash,
+            approved_plan_id=approved_plan_id,
+            approved_base_generation=approved_base_generation,
+        )
 
-        if expected_generation is None:
-            expected_generation = self._staging.load_generation(caller)
-        if isinstance(expected_generation, bool) or not isinstance(
-            expected_generation, int
+        if (
+            not isinstance(activation_approval, str)
+            or not 8 <= len(activation_approval) <= 128
+        ):
+            raise ImportRejected("portable activation approval is invalid")
+        if (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation != plan_generation
         ):
             raise ImportRejected("staged generation is invalid")
 
-        staged = self._staged_payload(bundle)
+        imported_at = self._now()
         try:
-            generation = self._staging.swap(
+            receipt = ImportReceiptV1.from_mapping(
+                {
+                    "schema": ImportReceiptV1.SCHEMA,
+                    "planId": plan.plan_id,
+                    "userId": caller,
+                    "bundleHash": plan.bundle_hash,
+                    "state": "ACTIVATED",
+                    "activatedGeneration": _generation_id(
+                        expected_generation + 1
+                    ),
+                    "importedAt": imported_at,
+                }
+            )
+        except (ContractValidationError, ImportRejected) as error:
+            raise ImportUncertain("portable import receipt is invalid") from error
+
+        staged = self._staged_payload(bundle, target_user_id=caller)
+        try:
+            generation = self._staging.activate_once(
                 caller,
+                bundle_hash=bundle.bundle_hash,
+                activation_approval=activation_approval,
                 expected_generation=expected_generation,
                 staged=staged,
             )
@@ -372,11 +550,6 @@ class PortableImporter:
             # partial activation happened.  The single-CAS swap guarantees no
             # partial state exists regardless of this outcome.
             raise ImportUncertain("staged activation is uncertain") from error
-        if isinstance(generation, bool) or not isinstance(generation, int):
-            raise ImportRejected("staged activation returned an invalid generation")
-        return {
-            "status": "activated",
-            "userId": caller,
-            "generation": generation,
-            "bundleHash": bundle.bundle_hash,
-        }
+        if generation != expected_generation + 1:
+            raise ImportUncertain("staged activation returned an invalid generation")
+        return receipt

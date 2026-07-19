@@ -9,6 +9,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from portable import FORMAT
+
 from . import composition
 
 
@@ -282,6 +284,7 @@ def base_env(monkeypatch):
         "AWS_REGION": REGION,
         "CONTROL_TABLE_NAME": "control-table",
         "RUNTIME_STATE_TABLE_NAME": "runtime-table",
+        "CAPABILITY_STATE_TABLE_NAME": "capability-state-table",
         "IDENTITY_TABLE_NAME": "identity-table",
         "MESSAGE_LEDGER_TABLE_NAME": "message-ledger-table",
         "USER_FILES_BUCKET_NAME": "workspace-bucket",
@@ -881,6 +884,17 @@ def test_production_builder_reads_only_web_auth_secret_and_defers_provider_paths
     application = composition.build_production_application()
 
     assert application is not None
+    from portable.exporter import PortableExporter
+
+    assert isinstance(application._exporter, PortableExporter)
+    assert (
+        application._importer._staging
+        is application._workspace._workspace._portable._store
+    )
+    assert (
+        application._exporter._source._records._installation_table.name
+        == "capability-state-table"
+    )
     assert application._retention._action_maintenance is not None
     assert isinstance(
         application._deletion._connections,
@@ -913,6 +927,96 @@ def test_production_builder_reads_only_web_auth_secret_and_defers_provider_paths
             ),
         )
     assert secrets.calls == ["web-auth", "google-readonly"]
+
+
+def test_export_source_strong_reads_and_merges_active_portable_generation():
+    class Records:
+        def records_for_user(self, user_id):
+            assert user_id == "founder-1"
+            return {
+                "memory": [{"native": True}],
+                "schedules": [],
+                "installed_packs": [],
+                "connectors": [],
+                "compute_receipts": [],
+                "receipts": [],
+            }
+
+    class Workspace:
+        def workspace_files(self, user_id):
+            assert user_id == "founder-1"
+            return {"native.md": b"native", "shared.md": b"newer-native"}
+
+    class Portable:
+        def __init__(self):
+            self.reads = []
+
+        def load_live(self, user_id):
+            self.reads.append(user_id)
+            return {
+                "userId": user_id,
+                "generation": 1,
+                "bundleHash": "a" * 64,
+                "staged": {
+                    "format": FORMAT,
+                    "records": {
+                        "memory": [{"imported": True}],
+                        "schedules": [
+                            {
+                                "name": "weekly",
+                                "state": "DISABLED",
+                                "userId": user_id,
+                            }
+                        ],
+                        "installed_packs": [],
+                        "connectors": [],
+                        "compute_receipts": [],
+                        "receipts": [],
+                    },
+                    "workspace": {
+                        "imported.md": {
+                            "encoding": "base64",
+                            "data": "aW1wb3J0ZWQ=",
+                            "sha256": "5f54227b74fbba7743c47cd286b4873f2e17331518d56facfc03e34cde4a0950",
+                        },
+                        "shared.md": {
+                            "encoding": "base64",
+                            "data": "b2xkZXItaW1wb3J0",
+                            "sha256": "c4e7bb6d36c1e3ab374bb2c886e7a60b93905fd006fd997deb720aaafa85defc",
+                        },
+                    },
+                    "landing": {
+                        "schedules": "DISABLED",
+                        "installedPacks": "PAUSED",
+                        "connectors": "DISCONNECTED",
+                        "computeReceipts": {"replayable": False},
+                        "receipts": {"replayable": False},
+                    },
+                },
+            }
+
+    portable = Portable()
+    source = composition._ExportSource(
+        records=Records(), workspace=Workspace(), portable=portable
+    )
+
+    records = source.records_for_user("founder-1")
+    files = source.workspace_files("founder-1")
+
+    assert records["memory"] == [{"imported": True}, {"native": True}]
+    assert records["schedules"] == [
+        {"name": "weekly", "state": "DISABLED", "userId": "founder-1"}
+    ]
+    assert records["installed_packs"] == []
+    assert records["connectors"] == []
+    assert records["compute_receipts"] == []
+    assert records["receipts"] == []
+    assert files == {
+        "imported.md": b"imported",
+        "shared.md": b"newer-native",
+        "native.md": b"native",
+    }
+    assert portable.reads == ["founder-1", "founder-1"]
 
 
 def test_source_has_no_top_level_google_or_openai_provider_imports():

@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from collections import Counter
+from decimal import Decimal
 import hashlib
+import math
 import re
 import time
 from typing import Mapping
 
 from actions.models import EffectReceipt
+from capabilities.contracts import (
+    CapabilityInstallationV1,
+    ComputeReceiptV1,
+    ContractValidationError,
+    FROZEN_CATALOG_PACKS_V1,
+)
+from portable.manifest import strict_json_loads
 
 
 _USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
@@ -28,6 +37,10 @@ _CHANNEL_RECORD = re.compile(r"CHANNEL#(?:telegram|slack|feishu):[^\x00-\x1f]{1,
 _BIND_RECORD = re.compile(r"BIND#[A-F0-9]{8}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _IDENTITY_TABLE = re.compile(r"[A-Za-z0-9_.-]{3,255}")
+_CONNECTOR_ID = re.compile(r"[a-z][a-z0-9.-]{1,127}")
+_PORTABLE_PACK_IDS = tuple(
+    sorted(pack["packId"] for pack in FROZEN_CATALOG_PACKS_V1)
+)
 
 
 class DataAdapterError(RuntimeError):
@@ -51,6 +64,37 @@ def _user(value: object) -> str:
     if not isinstance(value, str) or _USER.fullmatch(value) is None:
         raise ValueError("user identity is invalid")
     return value
+
+
+def _portable_json_value(value: object, *, _depth: int = 0) -> object:
+    """Translate boto3 Dynamo values to the portable JSON data model."""
+
+    if _depth > 64:
+        raise DataAdapterError("user record nesting is invalid")
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise DataAdapterError("user record number is invalid")
+        if value != value.to_integral_value():
+            raise DataAdapterError("user record number is not exactly portable")
+        return int(value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise DataAdapterError("user record number is invalid")
+        return value
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise DataAdapterError("user record map is invalid")
+        return {
+            key: _portable_json_value(nested, _depth=_depth + 1)
+            for key, nested in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _portable_json_value(nested, _depth=_depth + 1) for nested in value
+        ]
+    raise DataAdapterError("user record value is not portable JSON")
 
 
 class S3WorkspaceStore:
@@ -337,9 +381,64 @@ class S3WorkspaceStore:
 
 
 class DynamoUserDataStore:
-    def __init__(self, table, *, now=None) -> None:
+    def __init__(self, table, *, installation_table=None, now=None) -> None:
+        if installation_table is not None and not callable(
+            getattr(installation_table, "get_item", None)
+        ):
+            raise TypeError("capability installation table is invalid")
         self._table = table
+        self._installation_table = installation_table
         self._now = now or (lambda: int(time.time()))
+
+    def _installed_packs(self, user_id: str) -> list[dict]:
+        if self._installation_table is None:
+            return []
+        result = []
+        for pack_id in _PORTABLE_PACK_IDS:
+            key = {"PK": f"USER#{user_id}", "SK": f"INSTALL#{pack_id}"}
+            try:
+                response = self._installation_table.get_item(
+                    Key=key,
+                    ConsistentRead=True,
+                )
+            except Exception as error:
+                raise DataAdapterError(
+                    "capability installation read failed"
+                ) from error
+            if not isinstance(response, Mapping):
+                raise DataAdapterError(
+                    "capability installation read returned invalid data"
+                )
+            item = response.get("Item")
+            if item is None:
+                continue
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != {"PK", "SK", "recordJson", "version"}
+                or item.get("PK") != key["PK"]
+                or item.get("SK") != key["SK"]
+            ):
+                raise DataAdapterError("capability installation record is invalid")
+            version = _portable_json_value(item.get("version"))
+            if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+                raise DataAdapterError("capability installation record is invalid")
+            try:
+                parsed = strict_json_loads(item.get("recordJson"))
+                installation = CapabilityInstallationV1.from_mapping(parsed)
+            except (ContractValidationError, TypeError, ValueError) as error:
+                raise DataAdapterError(
+                    "capability installation record is invalid"
+                ) from error
+            if installation.user_id != user_id or installation.pack_id != pack_id:
+                raise DataAdapterError("capability installation binding is invalid")
+            inert = installation.to_mapping()
+            inert.update(
+                state="PAUSED",
+                connectionRefs=[],
+                killSwitch=True,
+            )
+            result.append(CapabilityInstallationV1.from_mapping(inert).to_mapping())
+        return result
 
     def _epoch(self) -> int:
         value = self._now()
@@ -479,21 +578,62 @@ class DynamoUserDataStore:
     def records_for_user(self, user_id: str) -> dict[str, list[object]]:
         user_id = _user(user_id)
         now = self._epoch()
-        records = {"memory": [], "schedules": [], "receipts": []}
+        records = {
+            "memory": [],
+            "schedules": [],
+            "installed_packs": self._installed_packs(user_id),
+            "connectors": [],
+            "compute_receipts": [],
+            "receipts": [],
+        }
         for item in self._items(user_id):
             sk = item.get("SK")
             if not isinstance(sk, str):
                 raise DataAdapterError("user record key is invalid")
             ttl = item.get("ttl")
             if ttl is not None:
+                ttl = _portable_json_value(ttl)
                 if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
                     raise DataAdapterError("user record TTL is invalid")
                 if ttl <= now:
                     continue
             if sk.startswith("MEMORY#"):
-                records["memory"].append({key: value for key, value in item.items() if key not in {"PK", "SK"}})
+                records["memory"].append(
+                    _portable_json_value(
+                        {
+                            key: value
+                            for key, value in item.items()
+                            if key not in {"PK", "SK"}
+                        }
+                    )
+                )
             elif sk.startswith("SCHEDULE#"):
-                records["schedules"].append({key: value for key, value in item.items() if key not in {"PK", "SK"}})
+                records["schedules"].append(
+                    _portable_json_value(
+                        {
+                            key: value
+                            for key, value in item.items()
+                            if key not in {"PK", "SK"}
+                        }
+                    )
+                )
+            elif sk.startswith("CONNECTION#"):
+                connector_id = sk[len("CONNECTION#") :]
+                if _CONNECTOR_ID.fullmatch(connector_id) is None:
+                    raise DataAdapterError("connector descriptor is invalid")
+                records["connectors"].append(
+                    {"connectorId": connector_id, "state": "DISCONNECTED"}
+                )
+            elif sk.startswith("COMPUTE_RECEIPT#"):
+                try:
+                    receipt = ComputeReceiptV1.from_mapping(
+                        _portable_json_value(item.get("computeReceipt"))
+                    )
+                except (ContractValidationError, TypeError, ValueError) as error:
+                    raise DataAdapterError("compute receipt is invalid") from error
+                if sk != f"COMPUTE_RECEIPT#{receipt.job_id}":
+                    raise DataAdapterError("compute receipt binding is invalid")
+                records["compute_receipts"].append(receipt.to_mapping())
             elif sk.startswith("ACTION#") and item.get("state") == "CONFIRMED":
                 try:
                     action_id = item.get("actionId")

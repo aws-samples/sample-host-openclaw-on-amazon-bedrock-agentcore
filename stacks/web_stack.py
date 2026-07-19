@@ -67,6 +67,7 @@ class WebStack(Stack):
         *,
         cmk_arn: str,
         runtime_state_table: dynamodb.ITable,
+        capability_state_table: dynamodb.ITable,
         identity_table: dynamodb.ITable | None = None,
         message_ledger_table: dynamodb.ITable | None = None,
         user_files_bucket: s3.IBucket,
@@ -118,12 +119,13 @@ class WebStack(Stack):
             )
         if (
             runtime_state_table is None
+            or capability_state_table is None
             or identity_table is None
             or message_ledger_table is None
             or user_files_bucket is None
         ):
             raise ValueError(
-                "runtime, identity, message-ledger, and user-files stores are required"
+                "runtime, capability, identity, message-ledger, and user-files stores are required"
             )
         if not isinstance(cmk_arn, str) or not cmk_arn:
             raise ValueError("cmk_arn is required")
@@ -396,6 +398,7 @@ class WebStack(Stack):
             "AWS_REGION_LOCK": REQUIRED_REGION,
             "CONTROL_TABLE_NAME": self.control_table.table_name,
             "RUNTIME_STATE_TABLE_NAME": runtime_state_table.table_name,
+            "CAPABILITY_STATE_TABLE_NAME": capability_state_table.table_name,
             "IDENTITY_TABLE_NAME": identity_table.table_name,
             "MESSAGE_LEDGER_TABLE_NAME": message_ledger_table.table_name,
             "USER_FILES_BUCKET_NAME": user_files_bucket.bucket_name,
@@ -543,6 +546,8 @@ class WebStack(Stack):
             ("/api/workspace", apigwv2.HttpMethod.GET),
             ("/api/overview", apigwv2.HttpMethod.GET),
             ("/api/export", apigwv2.HttpMethod.GET),
+            ("/api/import/plan", apigwv2.HttpMethod.POST),
+            ("/api/import/activate", apigwv2.HttpMethod.POST),
             ("/api/delete", apigwv2.HttpMethod.POST),
             (
                 "/api/connections/google-gmail-readonly/disconnect",
@@ -772,6 +777,12 @@ class WebStack(Stack):
         # never invoke an AgentCore runtime.
         self.web_fn.add_to_role_policy(
             iam.PolicyStatement(
+                actions=["dynamodb:GetItem"],
+                resources=[capability_state_table.table_arn],
+            )
+        )
+        self.web_fn.add_to_role_policy(
+            iam.PolicyStatement(
                 actions=[
                     "dynamodb:GetItem",
                     "dynamodb:PutItem",
@@ -859,6 +870,28 @@ class WebStack(Stack):
                     "s3:AbortMultipartUpload",
                 ],
                 resources=[user_files_bucket.arn_for_objects("*")],
+            )
+        )
+        self.web_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[
+                    user_files_bucket.arn_for_objects(
+                        "*/.system/portable/v2/*"
+                    )
+                ],
+            )
+        )
+        self.web_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["kms:GenerateDataKey"],
+                resources=[cmk_arn],
+                conditions={
+                    "StringEquals": {
+                        "kms:CallerAccount": account,
+                        "kms:ViaService": f"s3.{region}.amazonaws.com",
+                    }
+                },
             )
         )
         self.web_fn.add_to_role_policy(

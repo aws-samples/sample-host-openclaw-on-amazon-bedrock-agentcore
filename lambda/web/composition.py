@@ -47,7 +47,10 @@ from workflows.gmail.oauth import (
 from workflows.gmail.repository import DynamoGmailRepository
 
 from portable.importer import PortableImporter
-from portable.staging import DynamoStagedImportStore
+from portable.exporter import PortableExporter
+from portable.live import PortableLiveProjection
+from portable.manifest import RECORD_CATEGORIES
+from portable.staging import DynamoStagedImportStore, S3PortableBlobStore
 
 from .adapters import (
     MAX_WORKSPACE_ENTRY_BYTES,
@@ -64,7 +67,7 @@ from .gmail_workspace import GmailWorkspaceService
 from .index import WebApplication
 from .measurements import DynamoScanMeasurements
 from .overview import DynamoConnectionLifecycle, PilotOverviewService
-from .retention import DeletionCoordinator, UserExporter
+from .retention import DeletionCoordinator
 from .services import ApprovalWebService, RetentionSweepService, WorkspaceService
 from .stores import DynamoOAuthStateStore, DynamoWebStore
 
@@ -385,15 +388,59 @@ class LazyApprovalPort(_LazyPort):
 
 
 class _ExportSource:
-    def __init__(self, *, records, workspace) -> None:
+    """Strong-read native plus active portable state for web/export surfaces."""
+
+    def __init__(self, *, records, workspace, portable=None) -> None:
         self._records = records
         self._workspace = workspace
+        self._portable = (
+            None if portable is None else PortableLiveProjection(portable)
+        )
+
+    def _live(self, user_id: str) -> tuple[dict[str, list], dict[str, bytes]]:
+        if self._portable is None:
+            return ({category: [] for category in RECORD_CATEGORIES}, {})
+        snapshot = self._portable.snapshot_for_user(user_id)
+        return snapshot.records, snapshot.workspace
 
     def records_for_user(self, user_id: str):
-        return self._records.records_for_user(user_id)
+        native = self._records.records_for_user(user_id)
+        imported, _workspace = self._live(user_id)
+        return self._merge_records(native, imported)
+
+    @staticmethod
+    def _merge_records(native, imported):
+        if not isinstance(native, Mapping) or set(native) != RECORD_CATEGORIES:
+            raise DataAdapterError("native export records are invalid")
+        result = {}
+        for category in RECORD_CATEGORIES:
+            rows = native.get(category)
+            if not isinstance(rows, list):
+                raise DataAdapterError("native export records are invalid")
+            result[category] = [*imported[category], *rows]
+        return result
 
     def workspace_files(self, user_id: str):
-        return self._workspace.workspace_files(user_id)
+        native = self._workspace.workspace_files(user_id)
+        _records, imported = self._live(user_id)
+        return self._merge_workspace(native, imported)
+
+    @staticmethod
+    def _merge_workspace(native, imported):
+        if not isinstance(native, Mapping):
+            raise DataAdapterError("native workspace is invalid")
+        return {**imported, **native}
+
+    def snapshot_for_user(self, user_id: str):
+        """Capture one portable generation for both halves of one export."""
+
+        native_records = self._records.records_for_user(user_id)
+        native_workspace = self._workspace.workspace_files(user_id)
+        imported_records, imported_workspace = self._live(user_id)
+        return (
+            self._merge_records(native_records, imported_records),
+            self._merge_workspace(native_workspace, imported_workspace),
+        )
 
 
 class S3UserFilesStore:
@@ -790,6 +837,7 @@ def build_production_application() -> WebApplication:
 
     control_table = dynamodb.Table(_required("CONTROL_TABLE_NAME"))
     runtime_table = dynamodb.Table(_required("RUNTIME_STATE_TABLE_NAME"))
+    capability_table = dynamodb.Table(_required("CAPABILITY_STATE_TABLE_NAME"))
     identity_table = dynamodb.Table(_required("IDENTITY_TABLE_NAME"))
     message_ledger_table = dynamodb.Table(_required("MESSAGE_LEDGER_TABLE_NAME"))
     web_store = DynamoWebStore(control_table)
@@ -829,7 +877,17 @@ def build_production_application() -> WebApplication:
     authored_files_store = S3UserFilesStore(
         s3, bucket_name=_required("USER_FILES_BUCKET_NAME")
     )
-    record_store = DynamoUserDataStore(control_table)
+    record_store = DynamoUserDataStore(
+        control_table,
+        installation_table=capability_table,
+    )
+    portable_store = DynamoStagedImportStore(
+        control_table,
+        blobs=S3PortableBlobStore(
+            s3,
+            bucket_name=_required("USER_FILES_BUCKET_NAME"),
+        ),
+    )
     gmail_repository = DynamoGmailRepository(control_table)
     action_repository = DynamoActionRepository(control_table)
     action_machine = ActionStateMachine(action_repository)
@@ -943,8 +1001,13 @@ def build_production_application() -> WebApplication:
             message_ledger_table=message_ledger_table,
         ),
     )
+    portable_source = _ExportSource(
+        records=record_store,
+        workspace=authored_files_store,
+        portable=portable_store,
+    )
     workspace = WorkspaceService(
-        workspace_store=authored_files_store,
+        workspace_store=portable_source,
         runtime_driver=runtime_driver,
     )
     gmail_workspace = GmailWorkspaceService(
@@ -970,11 +1033,9 @@ def build_production_application() -> WebApplication:
         approvals=LazyApprovalPort(approvals_factory),
         workspace=workspace,
         gmail_workspace=gmail_workspace,
-        exporter=UserExporter(
-            _ExportSource(records=record_store, workspace=authored_files_store)
-        ),
+        exporter=PortableExporter(portable_source),
         importer=PortableImporter(
-            staging=DynamoStagedImportStore(control_table)
+            staging=portable_store
         ),
         deletion=deletion,
         retention=RetentionSweepService(

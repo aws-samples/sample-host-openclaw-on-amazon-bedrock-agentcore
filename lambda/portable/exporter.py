@@ -17,15 +17,16 @@ import zipfile
 
 from .manifest import (
     RECORD_CATEGORIES,
+    CATEGORY_TYPES,
     PortableError,
     build_manifest,
     canonical_json,
     complete_bundle_hash,
-    default_landing,
     descriptor,
     safe_path,
     user_id as _user_id,
 )
+from .records import normalize_export_records
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,12 +57,25 @@ class PortableExporter:
 
     def build(self, user_id: str) -> ExportBundleV2:
         owner_id = _user_id(user_id)
-        records = self._source.records_for_user(owner_id)
-        files = self._source.workspace_files(owner_id)
+        snapshot = getattr(self._source, "snapshot_for_user", None)
+        if callable(snapshot):
+            captured = snapshot(owner_id)
+            if not isinstance(captured, tuple) or len(captured) != 2:
+                raise PortableError("export source returned an invalid snapshot")
+            records, files = captured
+        else:
+            records = self._source.records_for_user(owner_id)
+            files = self._source.workspace_files(owner_id)
         if not isinstance(records, Mapping) or not isinstance(files, Mapping):
             raise PortableError("export source returned invalid data")
-        if not set(records).issubset(RECORD_CATEGORIES):
+        if set(records) != RECORD_CATEGORIES:
             raise PortableError("record category is not exportable")
+        try:
+            records = normalize_export_records(records, owner_id=owner_id)
+        except PortableError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise PortableError("record export is invalid") from error
 
         entries: dict[str, bytes] = {}
         objects: list[dict] = []
@@ -73,22 +87,18 @@ class PortableExporter:
                 raise PortableError("record export is not JSON") from error
             path = f"records/{category}.json"
             entries[path] = payload
-            objects.append(descriptor(path, category, "json", payload))
+            objects.append(descriptor(path, CATEGORY_TYPES[category], payload))
 
         for raw_path, content in files.items():
             safe = safe_path(raw_path)
             if not isinstance(content, (bytes, bytearray)):
                 raise PortableError("workspace export content must be bytes")
             payload = bytes(content)
-            path = f"workspace/{safe}"
+            path = f"files/{safe}"
             entries[path] = payload
-            objects.append(descriptor(path, "workspace", "file", payload))
+            objects.append(descriptor(path, CATEGORY_TYPES["workspace"], payload))
 
-        manifest = build_manifest(
-            owner_id=owner_id,
-            objects=objects,
-            landing=default_landing(),
-        )
+        manifest = build_manifest(objects=objects)
         manifest_bytes = canonical_json(manifest)
         entries["manifest.json"] = manifest_bytes
 
@@ -124,3 +134,8 @@ class PortableExporter:
             bundle_hash=complete_bundle_hash(manifest),
             manifest=manifest,
         )
+
+    def build_zip(self, user_id: str) -> bytes:
+        """Implement the trusted web export port with portable-v2 bytes."""
+
+        return self.build(user_id).zip_bytes

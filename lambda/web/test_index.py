@@ -6,6 +6,9 @@ from urllib.parse import urlencode
 
 import pytest
 
+from capabilities.contracts import ImportPlanV1, ImportReceiptV1
+from portable.manifest import ImportRejected
+
 from .auth import OpaqueSessionManager, SignedConnectTickets
 from .index import WebApplication
 from .test_auth import Clock, DeterministicRandom, OneTimeStore, SessionStore
@@ -95,40 +98,101 @@ class Importer:
 
     def __init__(self):
         self.calls = []
-        self.plan = type(
-            "Plan",
-            (),
+        self.plan = ImportPlanV1.from_mapping(
             {
-                "bundle_hash": "a" * 64,
-                "counts": {"memory": 1, "schedules": 0, "receipts": 0, "workspace": 0},
-                "landing": {
-                    "schedules": "DISABLED",
-                    "connectors": "DISCONNECTED",
-                    "receipts": {"replayable": False},
-                },
-                "owner_claim": "user_exporter",
-                "rejections": (),
-            },
-        )()
-        self.activate_result = {"status": "activated"}
+                "schema": ImportPlanV1.SCHEMA,
+                "planId": "importplan_" + "b" * 64,
+                "userId": USER,
+                "bundleHash": "a" * 64,
+                "baseGeneration": "generation_00000000000000000000",
+                "objectCount": 7,
+                "totalBytes": 1024,
+                "schedulesDisabled": True,
+                "connectorsDisconnected": True,
+                "effectsReplayable": False,
+            }
+        )
         self.activate_error = None
 
-    def build_plan(self, bundle):
-        self.calls.append(("build_plan", bundle))
+    def build_plan(self, bundle, *, target_user_id):
+        self.calls.append(("build_plan", bundle, target_user_id))
+        assert target_user_id == self.plan.user_id
         return self.plan
 
-    def activate(self, bundle, *, approved_bundle_hash, target_user_id):
+    def prepare_activation(
+        self,
+        bundle,
+        *,
+        target_user_id,
+        approved_bundle_hash,
+        approved_plan_id,
+        approved_base_generation,
+    ):
         self.calls.append(
-            ("activate", bundle, approved_bundle_hash, target_user_id)
+            (
+                "prepare_activation",
+                bundle,
+                target_user_id,
+                approved_bundle_hash,
+                approved_plan_id,
+                approved_base_generation,
+            )
+        )
+        if (
+            target_user_id != self.plan.user_id
+            or approved_bundle_hash != self.plan.bundle_hash
+            or approved_plan_id != self.plan.plan_id
+            or approved_base_generation != self.plan.base_generation
+        ):
+            raise ImportRejected("approved import plan does not match the bundle")
+        return type(
+            "Prepared",
+            (),
+            {
+                "bundle_hash": self.plan.bundle_hash,
+                "plan_id": self.plan.plan_id,
+                "base_generation": self.plan.base_generation,
+                "activation_approval": "pia_" + "c" * 64,
+                "expected_generation": 0,
+            },
+        )()
+
+    def activate(
+        self,
+        bundle,
+        *,
+        approved_bundle_hash,
+        approved_plan_id,
+        approved_base_generation,
+        target_user_id,
+        activation_approval,
+        expected_generation,
+    ):
+        self.calls.append(
+            (
+                "activate",
+                bundle,
+                approved_bundle_hash,
+                approved_plan_id,
+                approved_base_generation,
+                target_user_id,
+                activation_approval,
+                expected_generation,
+            )
         )
         if self.activate_error is not None:
             raise self.activate_error
-        return {
-            "status": "activated",
-            "userId": target_user_id,
-            "generation": 1,
-            "bundleHash": approved_bundle_hash,
-        }
+        return ImportReceiptV1.from_mapping(
+            {
+                "schema": ImportReceiptV1.SCHEMA,
+                "planId": approved_plan_id,
+                "userId": target_user_id,
+                "bundleHash": approved_bundle_hash,
+                "state": "ACTIVATED",
+                "activatedGeneration": "generation_00000000000000000001",
+                "importedAt": 1_800_000_100,
+            }
+        )
 
 
 class Deletion:
@@ -831,11 +895,37 @@ def test_import_plan_requires_csrf_and_returns_dry_run(monkeypatch):
     assert accepted["statusCode"] == 200
     payload = json.loads(accepted["body"])
     assert payload["bundleHash"] == "a" * 64
-    assert payload["landing"]["schedules"] == "DISABLED"
-    assert payload["landing"]["connectors"] == "DISCONNECTED"
+    assert payload["planId"] == "importplan_" + "b" * 64
+    assert payload["baseGeneration"] == "generation_00000000000000000000"
+    assert "activationApproval" not in payload
+    assert "expectedGeneration" not in payload
+    assert payload["schedulesDisabled"] is True
+    assert payload["connectorsDisconnected"] is True
+    assert payload["effectsReplayable"] is False
     # A plan never activates anything.
     assert [name for name, *_ in importer.calls] == ["build_plan"]
     assert importer.calls[0][1] == b"PK\x03\x04portable-bundle"
+
+
+def test_import_plan_accepts_every_bundle_the_sync_export_route_can_return():
+    app, tickets, *_ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+    importer = app._test_importer
+    # Above the ordinary 64 KiB JSON request ceiling, but well below the
+    # portable route's 4 MiB decoded archive ceiling.
+    raw = b"P" * (96 * 1024)
+    response = app.handle(
+        event(
+            "POST",
+            "/api/import/plan",
+            cookie=cookie,
+            csrf=csrf,
+            body={"bundle": base64.b64encode(raw).decode("ascii")},
+        )
+    )
+
+    assert response["statusCode"] == 200
+    assert importer.calls[-1][1] == raw
 
 
 def test_import_activate_binds_hash_and_maps_status_codes():
@@ -852,15 +942,29 @@ def test_import_activate_binds_hash_and_maps_status_codes():
             "/api/import/activate",
             cookie=cookie,
             csrf=csrf,
-            body={"bundle": bundle_b64, "bundleHash": "a" * 64, "confirm": True},
+            body={
+                "bundle": bundle_b64,
+                "bundleHash": "a" * 64,
+                "planId": importer.plan.plan_id,
+                "baseGeneration": importer.plan.base_generation,
+                "confirm": True,
+            },
         )
     )
     assert ok["statusCode"] == 200
-    assert json.loads(ok["body"])["status"] == "activated"
+    assert json.loads(ok["body"])["state"] == "ACTIVATED"
+    assert [name for name, *_ in importer.calls[-2:]] == [
+        "prepare_activation",
+        "activate",
+    ]
     activate_call = importer.calls[-1]
     assert activate_call[0] == "activate"
     assert activate_call[2] == "a" * 64  # approved_bundle_hash
-    assert activate_call[3] == USER  # bound to the caller identity
+    assert activate_call[3] == importer.plan.plan_id
+    assert activate_call[4] == importer.plan.base_generation
+    assert activate_call[5] == USER  # bound to the caller identity
+    assert activate_call[6] == "pia_" + "c" * 64
+    assert activate_call[7] == 0
 
     # An unconfirmed activation never reaches the importer.
     unconfirmed = app.handle(
@@ -869,7 +973,13 @@ def test_import_activate_binds_hash_and_maps_status_codes():
             "/api/import/activate",
             cookie=cookie,
             csrf=csrf,
-            body={"bundle": bundle_b64, "bundleHash": "a" * 64, "confirm": False},
+            body={
+                "bundle": bundle_b64,
+                "bundleHash": "a" * 64,
+                "planId": importer.plan.plan_id,
+                "baseGeneration": importer.plan.base_generation,
+                "confirm": False,
+            },
         )
     )
     assert unconfirmed["statusCode"] == 400
@@ -881,7 +991,13 @@ def test_import_activate_binds_hash_and_maps_status_codes():
             "/api/import/activate",
             cookie=cookie,
             csrf=csrf,
-            body={"bundle": bundle_b64, "bundleHash": "b" * 64, "confirm": True},
+            body={
+                "bundle": bundle_b64,
+                "bundleHash": "b" * 64,
+                "planId": importer.plan.plan_id,
+                "baseGeneration": importer.plan.base_generation,
+                "confirm": True,
+            },
         )
     )
     assert rejected["statusCode"] == 400
@@ -893,7 +1009,13 @@ def test_import_activate_binds_hash_and_maps_status_codes():
             "/api/import/activate",
             cookie=cookie,
             csrf=csrf,
-            body={"bundle": bundle_b64, "bundleHash": "a" * 64, "confirm": True},
+            body={
+                "bundle": bundle_b64,
+                "bundleHash": "a" * 64,
+                "planId": importer.plan.plan_id,
+                "baseGeneration": importer.plan.base_generation,
+                "confirm": True,
+            },
         )
     )
     assert uncertain["statusCode"] == 409

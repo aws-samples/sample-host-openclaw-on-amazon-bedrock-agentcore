@@ -316,18 +316,28 @@ describe("consumer control surface", () => {
     history.replaceState({}, "", "/import");
     sessionStorage.setItem("personal-operator.csrf", "c".repeat(43));
     const bundleHash = "a".repeat(64);
+    const planId = `importplan_${"b".repeat(64)}`;
+    const baseGeneration = "generation_00000000000000000000";
     fetch.mockImplementation((path) => {
       if (path === "/api/import/plan") {
         return response({
           bundleHash,
-          counts: { memory: 2, schedules: 1, receipts: 3, workspace: 4 },
-          landing: { schedules: "DISABLED", connectors: "DISCONNECTED", receipts: { replayable: false } },
-          ownerClaim: "user_exporter",
-          rejections: [],
+          planId,
+          baseGeneration,
+          objectCount: 7,
+          totalBytes: 1024,
+          schedulesDisabled: true,
+          connectorsDisconnected: true,
+          effectsReplayable: false,
         });
       }
       if (path === "/api/import/activate") {
-        return response({ status: "activated", generation: 1, bundleHash });
+        return response({
+          state: "ACTIVATED",
+          activatedGeneration: "generation_00000000000000000001",
+          bundleHash,
+          planId,
+        });
       }
       throw new Error(`unexpected request: ${path}`);
     });
@@ -345,9 +355,11 @@ describe("consumer control surface", () => {
 
     await screen.findByText(/Dry-run plan/i);
     expect(screen.getAllByText(bundleHash, { exact: false }).length).toBeGreaterThan(0);
-    expect(screen.getByText(/Schedules: 1/)).toBeInTheDocument();
-    expect(screen.getByText(/Receipts: 3/)).toBeInTheDocument();
-    expect(screen.getByText(/Connectors: land/)).toBeInTheDocument();
+    expect(screen.getByText(/Portable objects: 7/)).toBeInTheDocument();
+    expect(screen.getByText(/Total content: 1.0 KB/)).toBeInTheDocument();
+    expect(screen.getByText(/Schedules land/i, { selector: "li" })).toHaveTextContent("DISABLED");
+    expect(screen.getByText(/Connector descriptors land/i, { selector: "li" })).toHaveTextContent("DISCONNECTED");
+    expect(screen.getByText(/Past effects land/i, { selector: "li" })).toHaveTextContent("non-replayable");
 
     const activate = screen.getByRole("button", { name: "Activate import" });
     expect(activate).toBeDisabled();
@@ -363,6 +375,8 @@ describe("consumer control surface", () => {
     expect(JSON.parse(activateCall[1].body)).toEqual({
       bundle: btoa(String.fromCharCode(80, 75, 3, 4, 9, 9)),
       bundleHash,
+      planId,
+      baseGeneration,
       confirm: true,
     });
   });

@@ -46,8 +46,8 @@ run_check "Python unit tests" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
   PYTHONPATH="$ROOT_DIR/lambda/router:$ROOT_DIR/lambda" \
   "$PYTHON" -m pytest lambda/router lambda/worker lambda/workflows \
-  lambda/actions lambda/capabilities lambda/control lambda/web lambda/cron \
-  lambda/compute lambda/connectors lambda/browser lambda/scheduler \
+  lambda/actions lambda/capabilities lambda/control lambda/portable lambda/web \
+  lambda/cron lambda/compute lambda/connectors lambda/browser lambda/scheduler \
   lambda/workspace_broker \
   tests/test_capability_stack.py \
   tests/test_compute_stack.py \

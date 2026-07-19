@@ -122,6 +122,19 @@ def _synth_web_template(
             name="eventId", type=dynamodb.AttributeType.STRING
         ),
     )
+    capability_state_table = dynamodb.Table(
+        resources,
+        "CapabilityState",
+        table_name="personal-operator-capability-state",
+        partition_key=dynamodb.Attribute(
+            name="PK", type=dynamodb.AttributeType.STRING
+        ),
+        sort_key=dynamodb.Attribute(
+            name="SK", type=dynamodb.AttributeType.STRING
+        ),
+        encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+        encryption_key=cmk,
+    )
     user_files_bucket = s3.Bucket(
         resources,
         "UserFiles",
@@ -133,6 +146,7 @@ def _synth_web_template(
         "PersonalOperatorWeb",
         cmk_arn=cmk.key_arn,
         runtime_state_table=runtime_table,
+        capability_state_table=capability_state_table,
         identity_table=identity_table,
         message_ledger_table=message_ledger_table,
         user_files_bucket=user_files_bucket,
@@ -169,6 +183,7 @@ def test_web_stack_rejects_every_region_except_eu_west_1() -> None:
             "WrongRegionWeb",
             cmk_arn=cmk.key_arn,
             runtime_state_table=table,
+            capability_state_table=table,
             user_files_bucket=bucket,
             runtime_arn=RUNTIME_ARN,
             runtime_iam_arn=RUNTIME_IAM_ARN,
@@ -177,6 +192,26 @@ def test_web_stack_rejects_every_region_except_eu_west_1() -> None:
             web_asset_root="tests/fixtures/web-dist",
             env=cdk.Environment(account="123456789012", region="us-east-1"),
         )
+
+
+def test_web_export_reads_capability_installations_without_write_authority() -> None:
+    template = _synth_web_template()
+    web_function = next(
+        resource
+        for resource in _resources(template, "AWS::Lambda::Function")
+        if resource["Properties"].get("FunctionName")
+        == "personal-operator-web-api"
+    )
+    environment = web_function["Properties"]["Environment"]["Variables"]
+    assert environment["CAPABILITY_STATE_TABLE_NAME"]
+
+    capability_statements = [
+        statement
+        for statement in _web_statements(template)
+        if "CapabilityState" in repr(statement.get("Resource"))
+    ]
+    assert len(capability_statements) == 1
+    assert capability_statements[0]["Action"] == "dynamodb:GetItem"
 
 
 def test_static_site_is_private_encrypted_and_cloudfront_only() -> None:
@@ -351,7 +386,7 @@ def test_synthesis_reads_the_explicit_web_asset_root_not_an_untracked_build() ->
     assert 'Path("web/dist/index.html")' not in source
 
 
-def test_http_api_exposes_only_the_fifteen_trusted_control_routes() -> None:
+def test_http_api_exposes_only_the_seventeen_trusted_control_routes() -> None:
     template = _synth_web_template()
     routes = {
         route["Properties"]["RouteKey"]
@@ -371,6 +406,8 @@ def test_http_api_exposes_only_the_fifteen_trusted_control_routes() -> None:
         "GET /api/workspace",
         "GET /api/overview",
         "GET /api/export",
+        "POST /api/import/plan",
+        "POST /api/import/activate",
         "POST /api/delete",
         "POST /api/connections/google-gmail-readonly/disconnect",
         "POST /api/scans/{scan}/feedback",
@@ -714,6 +751,7 @@ def test_web_lambda_has_only_control_plane_authority() -> None:
         "s3:GetObject",
         "s3:DeleteObject",
         "s3:AbortMultipartUpload",
+        "s3:PutObject",
         "secretsmanager:GetSecretValue",
         "kms:Decrypt",
         "kms:GenerateDataKey",
@@ -725,7 +763,6 @@ def test_web_lambda_has_only_control_plane_authority() -> None:
         "sqs:SendMessage",
         "ses:SendEmail",
         "ses:SendRawEmail",
-        "s3:PutObject",
     }.isdisjoint(actions)
     footprint = [
         statement
@@ -792,6 +829,33 @@ def test_web_lambda_has_only_control_plane_authority() -> None:
         "s3:AbortMultipartUpload",
     }
     assert workspace_object_statement["Resource"] != "*"
+    portable_write = [
+        statement
+        for statement in statements
+        if "s3:PutObject" in (
+            statement["Action"]
+            if isinstance(statement.get("Action"), list)
+            else [statement.get("Action")]
+        )
+    ]
+    assert len(portable_write) == 1
+    assert portable_write[0]["Action"] == "s3:PutObject"
+    assert "/.system/portable/v2/" in str(portable_write[0]["Resource"])
+
+    portable_blob_kms = [
+        statement
+        for statement in statements
+        if statement.get("Action") == "kms:GenerateDataKey"
+        and statement.get("Condition")
+        == {
+            "StringEquals": {
+                "kms:CallerAccount": "123456789012",
+                "kms:ViaService": "s3.eu-west-1.amazonaws.com",
+            }
+        }
+    ]
+    assert len(portable_blob_kms) == 1
+    assert portable_blob_kms[0]["Resource"] != "*"
     for statement in statements:
         if set(
             [statement["Action"]]
@@ -920,6 +984,7 @@ def test_app_wires_existing_runtime_state_bucket_and_cmk_into_web_stack() -> Non
     assert '"PersonalOperatorWeb"' in source
     assert "cmk_arn=security_stack.cmk.key_arn" in source
     assert "runtime_state_table=router_stack.runtime_state_table" in source
+    assert "capability_state_table=capability_stack.state_table" in source
     assert "user_files_bucket=agentcore_stack.user_files_bucket" in source
     assert "runtime_arn=agentcore_stack.runtime_arn" in source
     assert "runtime_iam_arn=agentcore_stack.runtime_iam_arn" in source

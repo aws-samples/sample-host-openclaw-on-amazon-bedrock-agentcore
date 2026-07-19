@@ -331,6 +331,9 @@ class UnusedImporter:
     def build_plan(self, *_args, **_kwargs):
         raise AssertionError("founder journey does not stage a portable import")
 
+    def prepare_activation(self, *_args, **_kwargs):
+        raise AssertionError("founder journey does not prepare a portable import")
+
     def activate(self, *_args, **_kwargs):
         raise AssertionError("founder journey does not activate a portable import")
 

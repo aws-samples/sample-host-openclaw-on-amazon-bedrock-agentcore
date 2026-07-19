@@ -423,6 +423,15 @@ def test_local_aggregate_executes_every_phase5_python_and_stack_suite() -> None:
         assert suite in script, f"local aggregate omits {suite}"
 
 
+def test_local_gate_inventory_includes_portable_v2_unit_suite() -> None:
+    script = (ROOT / "scripts/test-local.sh").read_text(encoding="utf-8")
+    python_units = script.split(
+        'run_check "Python unit tests"', 1
+    )[1].split('run_check "E2E session-control unit tests"', 1)[0]
+
+    assert "lambda/portable" in python_units
+
+
 def test_runtime_role_is_separated_from_workspace_and_legacy_cron_authority() -> None:
     agentcore = (ROOT / "stacks/agentcore_stack.py").read_text(encoding="utf-8")
     cron = (ROOT / "stacks/cron_stack.py").read_text(encoding="utf-8")

@@ -10,6 +10,12 @@ export and rejected on import; imported history can never replay a past effect.
 
 from __future__ import annotations
 
+from capabilities.contracts import (
+    ImportPlanV1,
+    ImportReceiptV1,
+    PortableStateManifestV2,
+)
+
 from .manifest import (
     EXCLUDE_CATEGORIES,
     FORMAT,
@@ -24,7 +30,8 @@ from .manifest import (
     safe_path,
 )
 from .exporter import ExportBundleV2, PortableExporter
-from .importer import ImportPlanV1, PortableImporter
+from .importer import PortableImporter, PreparedActivationV1
+from .live import PortableLiveProjection, PortableLiveSnapshot
 
 __all__ = [
     "EXCLUDE_CATEGORIES",
@@ -41,5 +48,10 @@ __all__ = [
     "ExportBundleV2",
     "PortableExporter",
     "ImportPlanV1",
+    "ImportReceiptV1",
+    "PortableStateManifestV2",
+    "PreparedActivationV1",
     "PortableImporter",
+    "PortableLiveProjection",
+    "PortableLiveSnapshot",
 ]

@@ -185,7 +185,7 @@ function OverviewPage() {
           <article className="summary-card">
             <p className="card-kicker">Portability</p>
             <h2>Deterministic export</h2>
-            <p>Unencrypted ZIP · workspace, memory, schedules, and receipts</p>
+            <p>Unencrypted ZIP · workspace, memory, inert capability metadata, and receipt history</p>
             <a className="text-link" href="/export">Review export</a>
           </article>
           <article className="summary-card">
@@ -465,7 +465,7 @@ function ExportPage() {
       const url = URL.createObjectURL(await response.blob());
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = "personal-operator-export.zip";
+      anchor.download = "personal-operator-portable-v2.zip";
       anchor.click();
       URL.revokeObjectURL(url);
       setState("done");
@@ -475,7 +475,7 @@ function ExportPage() {
   }
   return (
     <Shell eyebrow="Portability" title="Take your operator with you.">
-      <p className="lede">Create a deterministic, unencrypted ZIP containing your authored files, memory, schedules, and receipts. Credentials are never included; store the download securely.</p>
+      <p className="lede">Create a deterministic, unencrypted ZIP containing your authored files, memory, disabled schedules, paused pack metadata, disconnected connector descriptors, and receipt history. Credentials are never included; store the download securely.</p>
       <button className="button primary" disabled={state === "loading"} onClick={download}>Create unencrypted ZIP</button>
       {state === "loading" && <p role="status">Building export…</p>}
       {state === "done" && <p className="success" role="status">Export created.</p>}
@@ -570,7 +570,13 @@ function ImportPage() {
     try {
       await api("/api/import/activate", {
         method: "POST",
-        body: { bundle, bundleHash: plan.bundleHash, confirm: true },
+        body: {
+          bundle,
+          bundleHash: plan.bundleHash,
+          planId: plan.planId,
+          baseGeneration: plan.baseGeneration,
+          confirm: true,
+        },
         csrf: true,
       });
       setState("done");
@@ -582,20 +588,20 @@ function ImportPage() {
 
   return (
     <Shell eyebrow="Portability" title="Bring your operator here.">
-      <p className="lede">Import is a two-step, dry-run-first transfer. Nothing changes until you confirm the exact bundle hash. Schedules land disabled, connectors land disconnected, and past receipts are never replayable.</p>
+      <p className="lede">Import is a two-step, dry-run-first transfer. Live state does not change until you confirm the exact bundle hash. Schedules land disabled, connectors land disconnected, and past receipts are never replayable.</p>
       <label htmlFor="bundle">Choose a portable bundle (.zip)</label>
       <input id="bundle" type="file" accept=".zip,application/zip" onChange={chooseFile} />
       <button className="button" disabled={!bundle || state === "loading"} onClick={preview}>Preview import (dry run)</button>
       {plan && (
         <div className="import-plan">
           <h2>Dry-run plan</h2>
-          <p>This bundle mutates nothing until you activate it.</p>
+          <p>This bundle changes no live workspace state until you activate it.</p>
           <ul>
-            <li>Memory records: {plan.counts.memory}</li>
-            <li>Schedules: {plan.counts.schedules} (land <strong>DISABLED</strong>)</li>
-            <li>Receipts: {plan.counts.receipts} (land <strong>non-replayable</strong>)</li>
-            <li>Workspace files: {plan.counts.workspace}</li>
-            <li>Connectors: land <strong>DISCONNECTED</strong></li>
+            <li>Portable objects: {plan.objectCount}</li>
+            <li>Total content: {formatBytes(plan.totalBytes)}</li>
+            <li>Schedules land <strong>DISABLED</strong></li>
+            <li>Connector descriptors land <strong>DISCONNECTED</strong></li>
+            <li>Past effects land <strong>non-replayable</strong></li>
           </ul>
           <p className="bundle-hash">Bundle hash <code>{plan.bundleHash}</code></p>
           <label>

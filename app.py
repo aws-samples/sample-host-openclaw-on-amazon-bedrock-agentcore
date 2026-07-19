@@ -194,6 +194,7 @@ web_stack = WebStack(
     "PersonalOperatorWeb",
     cmk_arn=security_stack.cmk.key_arn,
     runtime_state_table=router_stack.runtime_state_table,
+    capability_state_table=capability_stack.state_table,
     identity_table=router_stack.identity_table,
     message_ledger_table=router_stack.message_ledger_table,
     user_files_bucket=agentcore_stack.user_files_bucket,
