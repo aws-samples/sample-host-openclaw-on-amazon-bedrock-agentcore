@@ -90,6 +90,47 @@ class Exporter:
         return b"PK\x03\x04synthetic"
 
 
+class Importer:
+    """Records calls and returns typed shapes without touching real storage."""
+
+    def __init__(self):
+        self.calls = []
+        self.plan = type(
+            "Plan",
+            (),
+            {
+                "bundle_hash": "a" * 64,
+                "counts": {"memory": 1, "schedules": 0, "receipts": 0, "workspace": 0},
+                "landing": {
+                    "schedules": "DISABLED",
+                    "connectors": "DISCONNECTED",
+                    "receipts": {"replayable": False},
+                },
+                "owner_claim": "user_exporter",
+                "rejections": (),
+            },
+        )()
+        self.activate_result = {"status": "activated"}
+        self.activate_error = None
+
+    def build_plan(self, bundle):
+        self.calls.append(("build_plan", bundle))
+        return self.plan
+
+    def activate(self, bundle, *, approved_bundle_hash, target_user_id):
+        self.calls.append(
+            ("activate", bundle, approved_bundle_hash, target_user_id)
+        )
+        if self.activate_error is not None:
+            raise self.activate_error
+        return {
+            "status": "activated",
+            "userId": target_user_id,
+            "generation": 1,
+            "bundleHash": approved_bundle_hash,
+        }
+
+
 class Deletion:
     def __init__(self):
         self.calls = []
@@ -189,6 +230,7 @@ def setup_app():
     overview = Overview()
     connections = Connections()
     scans = Scans()
+    importer = Importer()
     app = WebApplication(
         tickets=tickets,
         sessions=sessions,
@@ -197,6 +239,7 @@ def setup_app():
         workspace=Workspace(),
         gmail_workspace=gmail_workspace,
         exporter=Exporter(),
+        importer=importer,
         deletion=deletion,
         retention=retention,
         overview=overview,
@@ -205,6 +248,7 @@ def setup_app():
         web_origin=ORIGIN,
         google_redirect_uri=f"{ORIGIN}/oauth/google/callback",
     )
+    app._test_importer = importer
     return app, tickets, oauth, approvals, deletion, gmail_workspace, retention
 
 
@@ -510,6 +554,7 @@ def test_logout_still_clears_cookie_after_applied_but_response_lost_revocation()
         workspace=Workspace(),
         gmail_workspace=GmailWorkspace(),
         exporter=Exporter(),
+        importer=Importer(),
         deletion=Deletion(),
         retention=Retention(),
         overview=Overview(),
@@ -759,6 +804,99 @@ def test_reject_export_workspace_and_confirmed_delete_are_session_scoped():
     )
     assert deleted["statusCode"] == 200
     assert deletion.calls == [USER]
+
+
+def test_import_plan_requires_csrf_and_returns_dry_run(monkeypatch):
+    app, tickets, *_ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+    importer = app._test_importer
+    bundle_b64 = base64.b64encode(b"PK\x03\x04portable-bundle").decode()
+
+    # Missing CSRF is rejected before any importer call.
+    denied = app.handle(
+        event("POST", "/api/import/plan", cookie=cookie, body={"bundle": bundle_b64})
+    )
+    assert denied["statusCode"] == 401
+    assert importer.calls == []
+
+    accepted = app.handle(
+        event(
+            "POST",
+            "/api/import/plan",
+            cookie=cookie,
+            csrf=csrf,
+            body={"bundle": bundle_b64},
+        )
+    )
+    assert accepted["statusCode"] == 200
+    payload = json.loads(accepted["body"])
+    assert payload["bundleHash"] == "a" * 64
+    assert payload["landing"]["schedules"] == "DISABLED"
+    assert payload["landing"]["connectors"] == "DISCONNECTED"
+    # A plan never activates anything.
+    assert [name for name, *_ in importer.calls] == ["build_plan"]
+    assert importer.calls[0][1] == b"PK\x03\x04portable-bundle"
+
+
+def test_import_activate_binds_hash_and_maps_status_codes():
+    from portable.manifest import ImportRejected, ImportUncertain
+
+    app, tickets, *_ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+    importer = app._test_importer
+    bundle_b64 = base64.b64encode(b"PK\x03\x04portable-bundle").decode()
+
+    ok = app.handle(
+        event(
+            "POST",
+            "/api/import/activate",
+            cookie=cookie,
+            csrf=csrf,
+            body={"bundle": bundle_b64, "bundleHash": "a" * 64, "confirm": True},
+        )
+    )
+    assert ok["statusCode"] == 200
+    assert json.loads(ok["body"])["status"] == "activated"
+    activate_call = importer.calls[-1]
+    assert activate_call[0] == "activate"
+    assert activate_call[2] == "a" * 64  # approved_bundle_hash
+    assert activate_call[3] == USER  # bound to the caller identity
+
+    # An unconfirmed activation never reaches the importer.
+    unconfirmed = app.handle(
+        event(
+            "POST",
+            "/api/import/activate",
+            cookie=cookie,
+            csrf=csrf,
+            body={"bundle": bundle_b64, "bundleHash": "a" * 64, "confirm": False},
+        )
+    )
+    assert unconfirmed["statusCode"] == 400
+
+    importer.activate_error = ImportRejected("approved bundle hash does not match")
+    rejected = app.handle(
+        event(
+            "POST",
+            "/api/import/activate",
+            cookie=cookie,
+            csrf=csrf,
+            body={"bundle": bundle_b64, "bundleHash": "b" * 64, "confirm": True},
+        )
+    )
+    assert rejected["statusCode"] == 400
+
+    importer.activate_error = ImportUncertain("staged activation is uncertain")
+    uncertain = app.handle(
+        event(
+            "POST",
+            "/api/import/activate",
+            cookie=cookie,
+            csrf=csrf,
+            body={"bundle": bundle_b64, "bundleHash": "a" * 64, "confirm": True},
+        )
+    )
+    assert uncertain["statusCode"] == 409
 
 
 def test_origin_body_shape_method_and_unknown_routes_fail_closed():

@@ -45,6 +45,9 @@ from workflows.gmail.oauth import (
 )
 from workflows.gmail.repository import DynamoGmailRepository
 
+from portable.importer import PortableImporter
+from portable.staging import DynamoStagedImportStore
+
 from .adapters import (
     MAX_WORKSPACE_ENTRY_BYTES,
     MAX_WORKSPACE_FILES,
@@ -928,6 +931,9 @@ def build_production_application() -> WebApplication:
         gmail_workspace=gmail_workspace,
         exporter=UserExporter(
             _ExportSource(records=record_store, workspace=authored_files_store)
+        ),
+        importer=PortableImporter(
+            staging=DynamoStagedImportStore(control_table)
         ),
         deletion=deletion,
         retention=RetentionSweepService(

@@ -34,6 +34,7 @@ function Shell({ eyebrow, title, children, authenticated = true }) {
             <a href="/connections">Connections</a>
             <a href="/workspace">Workspace</a>
             <a href="/export">Export</a>
+            <a href="/import">Import</a>
             <a href="/delete">Delete</a>
             <LogoutButton />
           </div>
@@ -57,7 +58,7 @@ function Status({ state, children }) {
   return children;
 }
 
-const STATIC_RETURN_PATHS = new Set(["/", "/connections", "/workspace", "/export", "/delete"]);
+const STATIC_RETURN_PATHS = new Set(["/", "/connections", "/workspace", "/export", "/import", "/delete"]);
 
 function validReturnPath(value) {
   return typeof value === "string" && (
@@ -512,11 +513,111 @@ function DeletePage() {
   );
 }
 
+async function readBundleBase64(file) {
+  const buffer = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let index = 0; index < buffer.length; index += 1) {
+    binary += String.fromCharCode(buffer[index]);
+  }
+  return btoa(binary);
+}
+
+function ImportPage() {
+  const [bundle, setBundle] = useState("");
+  const [plan, setPlan] = useState(null);
+  const [confirmed, setConfirmed] = useState(false);
+  const [state, setState] = useState("ready");
+  const [error, setError] = useState("");
+
+  async function chooseFile(event) {
+    const file = event.target.files?.[0];
+    setPlan(null);
+    setConfirmed(false);
+    setState("ready");
+    setError("");
+    if (!file) {
+      setBundle("");
+      return;
+    }
+    try {
+      setBundle(await readBundleBase64(file));
+    } catch {
+      setBundle("");
+      setError("That file could not be read.");
+      setState("error");
+    }
+  }
+
+  async function preview() {
+    setState("loading");
+    setError("");
+    try {
+      const { payload } = await api("/api/import/plan", {
+        method: "POST", body: { bundle }, csrf: true,
+      });
+      setPlan(payload);
+      setConfirmed(false);
+      setState("planned");
+    } catch (issue) {
+      setError(issue.message);
+      setState("error");
+    }
+  }
+
+  async function activate() {
+    setState("loading");
+    setError("");
+    try {
+      await api("/api/import/activate", {
+        method: "POST",
+        body: { bundle, bundleHash: plan.bundleHash, confirm: true },
+        csrf: true,
+      });
+      setState("done");
+    } catch (issue) {
+      setError(issue.message);
+      setState("error");
+    }
+  }
+
+  return (
+    <Shell eyebrow="Portability" title="Bring your operator here.">
+      <p className="lede">Import is a two-step, dry-run-first transfer. Nothing changes until you confirm the exact bundle hash. Schedules land disabled, connectors land disconnected, and past receipts are never replayable.</p>
+      <label htmlFor="bundle">Choose a portable bundle (.zip)</label>
+      <input id="bundle" type="file" accept=".zip,application/zip" onChange={chooseFile} />
+      <button className="button" disabled={!bundle || state === "loading"} onClick={preview}>Preview import (dry run)</button>
+      {plan && (
+        <div className="import-plan">
+          <h2>Dry-run plan</h2>
+          <p>This bundle mutates nothing until you activate it.</p>
+          <ul>
+            <li>Memory records: {plan.counts.memory}</li>
+            <li>Schedules: {plan.counts.schedules} (land <strong>DISABLED</strong>)</li>
+            <li>Receipts: {plan.counts.receipts} (land <strong>non-replayable</strong>)</li>
+            <li>Workspace files: {plan.counts.workspace}</li>
+            <li>Connectors: land <strong>DISCONNECTED</strong></li>
+          </ul>
+          <p className="bundle-hash">Bundle hash <code>{plan.bundleHash}</code></p>
+          <label>
+            <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
+            I confirm activating the bundle with hash {plan.bundleHash}
+          </label>
+          <button className="button primary" disabled={!confirmed || state === "loading" || state === "done"} onClick={activate}>Activate import</button>
+        </div>
+      )}
+      {state === "loading" && <p role="status">Working…</p>}
+      {state === "done" && <p className="success" role="status">Import activated.</p>}
+      {state === "error" && <p className="error" role="alert">{error || "Import could not be completed."}</p>}
+    </Shell>
+  );
+}
+
 function Route({ path }) {
   if (path.startsWith("/approve/")) return <ApprovalPage token={decodeURIComponent(path.slice(9))} />;
   if (path === "/connections") return <ConnectionsPage />;
   if (path === "/workspace") return <WorkspacePage />;
   if (path === "/export") return <ExportPage />;
+  if (path === "/import") return <ImportPage />;
   if (path === "/delete") return <DeletePage />;
   return <OverviewPage />;
 }

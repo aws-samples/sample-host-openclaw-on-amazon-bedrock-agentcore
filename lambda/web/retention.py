@@ -6,11 +6,12 @@ from dataclasses import dataclass
 from decimal import Decimal
 import io
 import json
-from pathlib import PurePosixPath
 import re
 import time
 from typing import Mapping
 import zipfile
+
+from portable.manifest import PortableError, safe_path as _portable_safe_path
 
 
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
@@ -709,17 +710,13 @@ class DeletionCoordinator:
 
 
 def _safe_path(value: object) -> str:
-    if not isinstance(value, str) or not value or len(value) > 512 or "\\" in value:
-        raise ExportBoundaryError("workspace path is invalid")
-    path = PurePosixPath(value)
-    parts = path.parts
-    if (
-        path.is_absolute()
-        or any(part in {"", ".", ".."} or part.startswith(".") for part in parts)
-        or not parts
-    ):
-        raise ExportBoundaryError("workspace path is invalid")
-    return path.as_posix()
+    # The portable module owns the single canonical workspace path validator.
+    # The v1 export boundary preserves its historical error type by wrapping
+    # the shared validator's rejection, keeping behavior identical.
+    try:
+        return _portable_safe_path(value)
+    except PortableError as error:
+        raise ExportBoundaryError("workspace path is invalid") from error
 
 
 class UserExporter:
