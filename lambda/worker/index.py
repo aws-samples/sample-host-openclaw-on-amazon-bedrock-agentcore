@@ -60,6 +60,30 @@ except ImportError:  # focused tests add lambda/capabilities directly to sys.pat
 
 logger = logging.getLogger(__name__)
 
+_LOG_SCHEMA = "personal-operator.log.v1"
+_LOG_WARNING_EVENTS = frozenset(
+    {"callback_acknowledgement_failed", "fifo_record_failed"}
+)
+
+
+def _log_warning(event: str) -> None:
+    """Emit one closed metadata record without source or exception data."""
+
+    if event not in _LOG_WARNING_EVENTS:
+        raise ValueError("worker log event is not allowlisted")
+    logger.warning(
+        json.dumps(
+            {
+                "component": "worker",
+                "event": event,
+                "level": "WARNING",
+                "schema": _LOG_SCHEMA,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
 MAX_RUNTIME_RESPONSE_CHARS = 3_500
 MAX_TELEGRAM_HTML_CHARS = TELEGRAM_MAX_HTML_CHARS
 MAX_SQS_BATCH_SIZE = 10
@@ -504,11 +528,8 @@ def process_envelope(envelope: QueueEnvelope, dependencies: WorkerDependencies) 
                     "acknowledge_callback",
                 )
                 acknowledge(callback_query_id=callback_query_id)
-            except Exception as error:
-                logger.warning(
-                    "Telegram callback acknowledgement failed: error_type=%s",
-                    type(error).__name__,
-                )
+            except Exception:
+                _log_warning("callback_acknowledgement_failed")
 
     # The durable control intent is the first deletion authority and can exist
     # even when runtime purge failed. Check it synchronously through the exact
@@ -682,12 +703,8 @@ def process_sqs_event(
     for index, record in enumerate(records):
         try:
             process_envelope(_envelope_from_sqs_record(record), dependencies)
-        except Exception as error:  # AWS needs a partial-batch response for all retryable failures.
-            logger.warning(
-                "Telegram FIFO record failed: message_id=%s error_type=%s",
-                _record_identifier(record, index),
-                type(error).__name__,
-            )
+        except Exception:  # AWS needs a partial-batch response for all retryable failures.
+            _log_warning("fifo_record_failed")
             failures.extend(
                 {"itemIdentifier": _record_identifier(item, later_index)}
                 for later_index, item in enumerate(records[index:], start=index)

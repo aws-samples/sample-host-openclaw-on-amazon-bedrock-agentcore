@@ -330,9 +330,10 @@ def test_callback_routes_to_control_and_new_update_replay_cannot_repeat_effect()
     ]
 
 
-def test_callback_acknowledgement_failure_never_blocks_business_processing():
+def test_callback_acknowledgement_failure_never_blocks_or_leaks(caplog):
+    provider_error_sentinel = "Telegram acknowledgement source-private error"
     delivery = FakeDelivery(
-        acknowledgement_error=TimeoutError("Telegram acknowledgement lost")
+        acknowledgement_error=TimeoutError(provider_error_sentinel)
     )
     commands = FakeCommandHandler()
     item = make_envelope(
@@ -354,6 +355,17 @@ def test_callback_acknowledgement_failure_never_blocks_business_processing():
     assert delivery.acknowledgements == ["telegram_callback_query_202"]
     assert len(commands.calls) == 1
     assert len(delivery.calls) == 1
+    assert provider_error_sentinel not in caplog.text
+    assert [json.loads(record.getMessage()) for record in caplog.records] == [
+        {
+            "component": "worker",
+            "event": "callback_acknowledgement_failed",
+            "level": "WARNING",
+            "schema": "personal-operator.log.v1",
+        }
+    ]
+    assert all(record.args == () for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_durable_account_tombstone_is_checked_before_ledger_claim():
@@ -575,10 +587,11 @@ def test_queue_record_group_and_deduplication_attributes_are_verified():
     assert wrong_dedupe == {"batchItemFailures": [{"itemIdentifier": "sqs-100"}]}
 
 
-def test_malformed_record_is_failed_without_leaking_body_content():
+def test_malformed_record_is_failed_without_leaking_body_or_trace_identifier(caplog):
     deps = dependencies()
+    trace_sentinel = "source-private-trace-sentinel"
     record = {
-        "messageId": "malformed-1",
+        "messageId": trace_sentinel,
         "body": "{not-json",
         "attributes": {"MessageGroupId": "user_a1", "MessageDeduplicationId": "x"},
         "eventSource": "aws:sqs",
@@ -586,7 +599,18 @@ def test_malformed_record_is_failed_without_leaking_body_content():
 
     result = worker.process_sqs_event({"Records": [record]}, deps)
 
-    assert result == {"batchItemFailures": [{"itemIdentifier": "malformed-1"}]}
+    assert result == {"batchItemFailures": [{"itemIdentifier": trace_sentinel}]}
+    assert trace_sentinel not in caplog.text
+    assert [json.loads(record.getMessage()) for record in caplog.records] == [
+        {
+            "component": "worker",
+            "event": "fifo_record_failed",
+            "level": "WARNING",
+            "schema": "personal-operator.log.v1",
+        }
+    ]
+    assert all(record.args == () for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_runtime_cannot_claim_it_streamed_directly_to_telegram():
