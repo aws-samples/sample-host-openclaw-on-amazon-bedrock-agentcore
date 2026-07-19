@@ -683,6 +683,9 @@ class AgentCoreStack(Stack):
                     self.node.try_get_context("default_model_id")
                     or BEDROCK_INFERENCE_PROFILE_ID
                 ),
+                "CAPABILITY_GATEWAY_FUNCTION_ARN": (
+                    capability_gateway_function_arn
+                ),
                 "S3_USER_FILES_BUCKET": self.user_files_bucket.bucket_name,
                 "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
                     workspace_broker_function_name

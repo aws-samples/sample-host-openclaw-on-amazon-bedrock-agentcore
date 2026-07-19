@@ -47,6 +47,11 @@ RUNTIME_ENVIRONMENT = {
     "AWS_DEFAULT_REGION": REGION,
     "AWS_REGION": REGION,
     "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+    "CAPABILITY_GATEWAY_FUNCTION_ARN": (
+        f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:"
+        "personal-operator-capability-gateway"
+    ),
+    "DISABLE_ADOT_OBSERVABILITY": "true",
     "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
     "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": "workspace-credential-broker",
     "WORKSPACE_SYNC_INTERVAL_MS": "300000",
@@ -354,6 +359,33 @@ def test_production_observation_config_is_canonical_digest_bound_and_derives_rol
         (
             lambda value: value["runtimeEnvironmentVariables"].update(  # type: ignore[index]
                 AWS_REGION="us-east-1"
+            ),
+            "environment",
+        ),
+        (
+            lambda value: value["runtimeEnvironmentVariables"].update(  # type: ignore[index]
+                DISABLE_ADOT_OBSERVABILITY="false"
+            ),
+            "observability",
+        ),
+        (
+            lambda value: value["runtimeEnvironmentVariables"].pop(  # type: ignore[index]
+                "DISABLE_ADOT_OBSERVABILITY"
+            ),
+            "environment",
+        ),
+        (
+            lambda value: value["runtimeEnvironmentVariables"].update(  # type: ignore[index]
+                CAPABILITY_GATEWAY_FUNCTION_ARN=(
+                    "arn:aws:lambda:eu-west-1:999999999999:function:"
+                    "personal-operator-capability-gateway"
+                )
+            ),
+            "gateway",
+        ),
+        (
+            lambda value: value["runtimeEnvironmentVariables"].pop(  # type: ignore[index]
+                "CAPABILITY_GATEWAY_FUNCTION_ARN"
             ),
             "environment",
         ),

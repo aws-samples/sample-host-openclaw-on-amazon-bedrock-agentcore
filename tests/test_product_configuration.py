@@ -76,6 +76,11 @@ def _create_e2e_script_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Pa
             "AWS_DEFAULT_REGION": "eu-west-1",
             "AWS_REGION": "eu-west-1",
             "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+            "CAPABILITY_GATEWAY_FUNCTION_ARN": (
+                "arn:aws:lambda:eu-west-1:123456789012:function:"
+                "personal-operator-capability-gateway"
+            ),
+            "DISABLE_ADOT_OBSERVABILITY": "true",
             "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
             "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
                 "workspace-credential-broker"
@@ -262,6 +267,24 @@ def test_bridge_runtime_versions_are_frozen() -> None:
     assert "COPY --from=builder /opt/openclaw /opt/openclaw" in dockerfile
     assert "ln -s /opt/openclaw/openclaw.mjs /usr/local/bin/openclaw" in dockerfile
     assert "npm install -g openclaw@" not in dockerfile
+
+
+def test_bridge_image_installs_tls_roots_in_builder_and_runtime() -> None:
+    dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
+    builder_stage, runtime_stage = dockerfile.split(
+        "FROM --platform=linux/arm64", maxsplit=2
+    )[1:]
+
+    assert re.search(
+        r"apt-get install -y --no-install-recommends "
+        r"ca-certificates git python3(?:\s|&&)",
+        builder_stage,
+    )
+    assert re.search(
+        r"apt-get install -y --no-install-recommends "
+        r"ca-certificates python3(?:\s|&&)",
+        runtime_stage,
+    )
 
 
 def test_bridge_runtime_uses_an_unprivileged_user_and_ephemeral_writes() -> None:
@@ -1510,6 +1533,9 @@ def test_guardrail_iam_and_runtime_bind_exact_subject_and_version() -> None:
         if resource["Type"] == "AWS::BedrockAgentCore::Runtime"
     )
     environment = runtime["Properties"]["EnvironmentVariables"]
+    assert environment["CAPABILITY_GATEWAY_FUNCTION_ARN"] == (
+        TEST_CAPABILITY_GATEWAY_ARN
+    )
     assert environment["BEDROCK_GUARDRAIL_ID"] == guardrail_id
     assert environment["BEDROCK_GUARDRAIL_VERSION"] == guardrail_version
     assert environment["DISABLE_ADOT_OBSERVABILITY"] == "true"

@@ -52,6 +52,8 @@ _REQUIRED_RUNTIME_ENVIRONMENT = frozenset(
         "AWS_DEFAULT_REGION",
         "AWS_REGION",
         "BEDROCK_MODEL_ID",
+        "CAPABILITY_GATEWAY_FUNCTION_ARN",
+        "DISABLE_ADOT_OBSERVABILITY",
         "S3_USER_FILES_BUCKET",
         "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME",
         "WORKSPACE_SYNC_INTERVAL_MS",
@@ -276,8 +278,11 @@ class RuntimeConfigurationV1:
         raw: Mapping[str, Any],
         *,
         runtime_image_uri: str,
+        account: str,
         region: str,
     ) -> "RuntimeConfigurationV1":
+        account = _account(account)
+        region = _region(region)
         value = _exact_object(raw, cls.FIELDS, label="runtime configuration")
 
         artifact = _exact_object(
@@ -341,6 +346,14 @@ class RuntimeConfigurationV1:
             or environment["AWS_DEFAULT_REGION"] != region
         ):
             raise ContractError("runtime environment region is not release-bound")
+        if environment["DISABLE_ADOT_OBSERVABILITY"] != "true":
+            raise ContractError("runtime observability suppression is not enabled")
+        expected_gateway_arn = (
+            f"arn:aws:lambda:{region}:{account}:function:"
+            "personal-operator-capability-gateway"
+        )
+        if environment["CAPABILITY_GATEWAY_FUNCTION_ARN"] != expected_gateway_arn:
+            raise ContractError("runtime capability gateway crosses its exact subject")
         if re.fullmatch(r"[1-9][0-9]*", environment["WORKSPACE_SYNC_INTERVAL_MS"]) is None:
             raise ContractError("runtime environment sync interval is invalid")
         guardrail_fields = {
@@ -578,6 +591,7 @@ class ProductionObservationConfigV1:
                 "requestHeaderConfiguration": {},
             },
             runtime_image_uri=runtime_image_uri,
+            account=account,
             region=region,
         )
         foundation_stack_digests = _exact_digest_inventory(
@@ -769,6 +783,7 @@ class RuntimeContextV3:
         configuration = RuntimeConfigurationV1.from_mapping(
             value["runtimeConfiguration"],
             runtime_image_uri=image_uri,
+            account=account,
             region=region,
         )
         configuration_sha256 = _text(

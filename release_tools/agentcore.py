@@ -355,6 +355,7 @@ class AgentCoreEvidenceAdapter:
                     "requestHeaderConfiguration": {},
                 },
                 runtime_image_uri=runtime_image_uri,
+                account=account,
                 region=region,
             )
         except (ContractError, TypeError) as error:
@@ -390,6 +391,7 @@ class AgentCoreEvidenceAdapter:
             live_configuration = RuntimeConfigurationV1.from_mapping(
                 _sorted_runtime_configuration(runtime),
                 runtime_image_uri=runtime_image_uri,
+                account=account,
                 region=region,
             )
         except ContractError as error:

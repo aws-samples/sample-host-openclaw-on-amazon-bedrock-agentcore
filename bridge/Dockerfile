@@ -5,7 +5,7 @@ FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim@sha2
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git python3 && \
+    apt-get install -y --no-install-recommends ca-certificates git python3 && \
     rm -rf /var/lib/apt/lists/*
 
 # The approved 2026.7.2 runtime is an unreleased source snapshot. Fetch the
@@ -56,7 +56,7 @@ FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.15.0-slim@sha2
 
 # Install only runtime system dependencies (no git, no pip, no build tools)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 && \
+    apt-get install -y --no-install-recommends ca-certificates python3 && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the verified source build and expose its CLI without a mutable registry

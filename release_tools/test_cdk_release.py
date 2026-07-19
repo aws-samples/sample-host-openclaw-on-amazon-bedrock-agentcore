@@ -270,6 +270,10 @@ def test_release_synth_owns_digest_bound_runtime_and_retained_endpoint() -> None
         "AWS_DEFAULT_REGION": REGION,
         "AWS_REGION": REGION,
         "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-6",
+        "CAPABILITY_GATEWAY_FUNCTION_ARN": (
+            f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:"
+            "personal-operator-capability-gateway"
+        ),
         "DISABLE_ADOT_OBSERVABILITY": "true",
         "S3_USER_FILES_BUCKET": {
             "Ref": "UserFilesBucketCFDFD8C0"

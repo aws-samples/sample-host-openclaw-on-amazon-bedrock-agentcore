@@ -184,6 +184,11 @@ if observed:
             "AWS_DEFAULT_REGION": region,
             "AWS_REGION": region,
             "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+            "CAPABILITY_GATEWAY_FUNCTION_ARN": (
+                f"arn:aws:lambda:{region}:123456789012:function:"
+                "personal-operator-capability-gateway"
+            ),
+            "DISABLE_ADOT_OBSERVABILITY": "true",
             "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
             "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
                 "workspace-credential-broker"
