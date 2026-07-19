@@ -278,7 +278,6 @@ def _observation_config(fixture: dict[str, object]) -> ProductionObservationConf
                     "OpenClawSecurity",
                     "OpenClawGuardrails",
                     "PersonalOperatorCapabilities",
-                    "PersonalOperatorCompute",
                     "OpenClawAgentCore",
                     "OpenClawObservability",
                 )
@@ -311,7 +310,6 @@ def _observation_config(fixture: dict[str, object]) -> ProductionObservationConf
                     "OpenClawSecurity",
                     "OpenClawGuardrails",
                     "PersonalOperatorCapabilities",
-                    "PersonalOperatorCompute",
                     "OpenClawAgentCore",
                     "OpenClawObservability",
                 )

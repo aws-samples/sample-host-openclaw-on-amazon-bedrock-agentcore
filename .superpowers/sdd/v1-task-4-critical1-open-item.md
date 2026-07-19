@@ -1,12 +1,16 @@
-# Task 4 Critical #1 — implemented, awaiting independent review
+# Task 4 Critical #1 — closed by independently reviewed implementation
 
 ## Status
 
 The initial remediation commit `de4d1e9` was **REJECTED** by independent hostile
-review. Every Critical/Important review finding now has a separate RED-first
-follow-up implementation, but Critical #1 remains **OPEN pending independent
-re-review of the follow-up commit**. External Docker/AWS/deploy/provider gates
-remain open, and no local result is deployment evidence.
+review. Every Critical/Important review finding received a separate RED-first
+follow-up implementation. Independent hostile fresh-clone re-review then
+**ACCEPTED** exact commit `8cbe70cb51ebc7bfa57ba2ae38ad8f44e5e3c204`,
+tree `d66b5bdb29844875f669664fefd512c41b57f92b`, with no unresolved
+Critical or Important finding. Its focused gate passed 302 tests plus
+compileall, Bash syntax, diff, and executable-bit checks. The accepted content
+is integrated as `f0390f4`. External Docker/AWS/deploy/provider gates remain
+open, and no local result is deployment evidence.
 
 ## Findings disposition
 
@@ -93,9 +97,8 @@ crash-safety and immutable-subject invariants.
 
 ## Gate posture
 
-External Docker/AWS/signing/scan/runtime/deploy gates remain OPEN. Do not deploy
-until this implementation has passed independent hostile review and the
-reviewed commit has passed the required local gates. A later authorized AWS
-run must also ensure the mutation driver creates every consumer change set
-under the exact deterministic name `release-<40-sha>` expected by the live
-authority.
+Critical #1 is closed at the exact independently accepted subject recorded
+above. External Docker/AWS/signing/scan/runtime/deploy gates remain OPEN. A
+later authorized AWS run must still ensure the mutation driver creates every
+consumer change set under the exact deterministic name `release-<40-sha>`
+expected by the live authority.

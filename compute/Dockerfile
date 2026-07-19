@@ -8,10 +8,12 @@
 #   - read-only root filesystem at runtime (enforced by the task definition)
 #   - NO package installer, NO credentials, NO network route, NO live mount
 #   - ARM64 only
-#   - the reviewed compute.runner entrypoint that fences all egress
+#   - the reviewed compute.runner reference entrypoint; same-interpreter fences
+#     are defense in depth and do not establish production isolation
 #
-# The base digest below is an illustrative placeholder; the release pipeline
-# replaces it with the exact reviewed distroless digest before any build.
+# The base digest below is an illustrative placeholder. A future reviewed
+# compute release would have to replace it before any build; the active release
+# pipeline does not build this image.
 
 # hadolint ignore=DL3006
 FROM --platform=linux/arm64 gcr.io/distroless/python3-debian12@sha256:0000000000000000000000000000000000000000000000000000000000000000 AS runtime

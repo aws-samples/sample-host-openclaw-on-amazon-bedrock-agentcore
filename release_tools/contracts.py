@@ -23,7 +23,6 @@ FOUNDATION_RELEASE_STACKS = (
     "OpenClawSecurity",
     "OpenClawGuardrails",
     "PersonalOperatorCapabilities",
-    "PersonalOperatorCompute",
     "OpenClawAgentCore",
     "OpenClawObservability",
 )

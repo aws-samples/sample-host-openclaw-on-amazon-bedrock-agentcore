@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 
+from release_tools.contracts import FOUNDATION_RELEASE_STACKS
+
 
 ROOT = Path(__file__).resolve().parents[2]
 REGION = "eu-west-1"
@@ -137,6 +139,10 @@ def test_active_composition_has_no_compute_launcher_or_context_wiring() -> None:
     assert "import compute" not in composition_source
 
 
+def test_active_release_contract_does_not_observe_or_deploy_compute() -> None:
+    assert "PersonalOperatorCompute" not in FOUNDATION_RELEASE_STACKS
+
+
 def test_compute_harness_and_product_docs_do_not_claim_isolation_or_completion() -> None:
     runner = (ROOT / "lambda" / "compute" / "runner.py").read_text(
         encoding="utf-8"
@@ -150,6 +156,7 @@ def test_compute_harness_and_product_docs_do_not_claim_isolation_or_completion()
     task_report = (ROOT / ".superpowers/sdd/v1-task-8-report.md").read_text(
         encoding="utf-8"
     )
+    operations = (ROOT / "docs/OPERATIONS.md").read_text(encoding="utf-8")
 
     normalized_runner = " ".join(runner.split()).casefold()
     assert "defense in depth, not a security or isolation boundary" in normalized_runner
@@ -157,3 +164,7 @@ def test_compute_harness_and_product_docs_do_not_claim_isolation_or_completion()
         normalized = " ".join(document.split())
         assert "ADAPTER_DISABLED" in normalized
         assert "Task 8 operational completion remains OPEN" in normalized
+    normalized_operations = " ".join(operations.split())
+    assert "Production compute is not an active release stack" in normalized_operations
+    assert "ADAPTER_DISABLED" in normalized_operations
+    assert "Task 8 operational completion remains OPEN" in normalized_operations

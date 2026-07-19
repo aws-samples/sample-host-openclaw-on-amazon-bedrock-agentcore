@@ -244,11 +244,14 @@ exact-account check and uses those already-retained clients. SDK endpoint
 overrides and ambient proxy settings are disabled. Attestation downloads use a
 separate proxy-free HTTPS opener and a TLS context built from the same
 authenticated CA, ignoring `HTTPS_PROXY` and `ALL_PROXY`. The composer, not the
-driver, reads and reconciles every phase:
+driver, reads and reconciles every phase. Production compute is not an active
+release stack: production composition returns `ADAPTER_DISABLED`, and Task 8
+operational completion remains OPEN until a separately reviewed transport,
+launcher, image, and live isolation proof exist.
 
-- foundation: all seven exact foundation stacks exist in a complete state,
+- foundation: all six exact foundation stacks exist in a complete state,
   each processed template/parameter and request/security digest matches the
-  reviewed config, and each has no nonempty stack policy, or all seven are
+  reviewed config, and each has no nonempty stack policy, or all six are
   absent;
 - image: the exact immutable image has strict SBOM, provenance, scan, and
   signature evidence;
