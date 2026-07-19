@@ -190,7 +190,21 @@ class ScheduleControlRepository(Protocol):
 
     def list_enabled_schedules(self, user_id: str) -> Sequence[ScheduleSpecV1]: ...
 
-    def put_occurrence_if_absent(self, occurrence: ScheduleOccurrenceV1) -> bool: ...
+    def put_occurrence_if_absent(
+        self,
+        spec: ScheduleSpecV1,
+        occurrence: ScheduleOccurrenceV1,
+        delivery_target: Mapping[str, Any],
+    ) -> bool: ...
+
+    def complete_occurrence(
+        self,
+        spec: ScheduleSpecV1,
+        occurrence: ScheduleOccurrenceV1,
+        *,
+        now: int,
+        delivery_state: str,
+    ) -> bool: ...
 
 
 class EventBridgeScheduler(Protocol):
@@ -469,6 +483,29 @@ class SchedulerService:
         return spec
 
     # --- fire path -----------------------------------------------------
+    def _complete_occurrence(
+        self,
+        spec: ScheduleSpecV1,
+        occurrence: ScheduleOccurrenceV1,
+        *,
+        delivery_state: str,
+    ) -> None:
+        try:
+            completed = self._repository.complete_occurrence(
+                spec,
+                occurrence,
+                now=self._now(),
+                delivery_state=delivery_state,
+            )
+        except self._uncertain as error:
+            raise SchedulerUncertain(
+                "occurrence completion persistence is uncertain"
+            ) from error
+        if not completed:
+            raise SchedulerUncertain(
+                "occurrence completion persistence is uncertain"
+            )
+
     def fire(self, payload: SchedulePayloadV1) -> SchedulerOutcome:
         """Strong-read, generation-fence, then enqueue exactly one occurrence."""
 
@@ -489,16 +526,21 @@ class SchedulerService:
             schedule_id=payload.schedule_id,
             generation=payload.generation,
             occurrence_time=payload.fire_time,
-            status="QUEUED",
+            status="CLAIMED",
         )
-        # Idempotent conditional-put: a duplicate fire at the same
-        # generation+time is a no-op before any enqueue.
-        if not self._repository.put_occurrence_if_absent(occurrence):
-            return SchedulerOutcome(status="DUPLICATE")
-
         delivery = self._repository.read_delivery_target(payload.schedule_id)
         if not isinstance(delivery, Mapping):
             raise SchedulerError("schedule delivery target is unavailable")
+        # Atomically bind the exact live generation and delivery target to the
+        # idempotent occurrence claim before any queue effect.
+        if not self._repository.put_occurrence_if_absent(
+            spec, occurrence, delivery
+        ):
+            self._complete_occurrence(
+                spec, occurrence, delivery_state="UNCERTAIN"
+            )
+            return SchedulerOutcome(status="DUPLICATE")
+
         body = self._occurrence_body(spec, occurrence, delivery)
         try:
             self._queue.send_occurrence(
@@ -507,9 +549,15 @@ class SchedulerService:
                 body=body,
             )
         except self._uncertain as error:
+            self._complete_occurrence(
+                spec, occurrence, delivery_state="UNCERTAIN"
+            )
             raise SchedulerUncertain(
                 "occurrence enqueue persistence is uncertain"
             ) from error
+        self._complete_occurrence(
+            spec, occurrence, delivery_state="ENQUEUED"
+        )
         return SchedulerOutcome(status="ENQUEUED")
 
     def _occurrence_body(

@@ -29,6 +29,9 @@ class FakeControlRepository:
         self.proposals: dict[str, dict[str, Any]] = {}
         self.schedules: dict[str, dict[str, Any]] = {}
         self.occurrences: set[str] = set()
+        self.completed_occurrences: list[str] = []
+        self.occurrence_delivery_states: dict[str, str] = {}
+        self.occurrence_statuses: dict[str, str] = {}
         self.trace: list[str] = []
 
     # --- proposals -----------------------------------------------------
@@ -96,11 +99,51 @@ class FakeControlRepository:
         ]
 
     # --- occurrences ---------------------------------------------------
-    def put_occurrence_if_absent(self, occurrence) -> bool:
+    def put_occurrence_if_absent(
+        self, spec, occurrence, delivery_target
+    ) -> bool:
         self.trace.append("put_occurrence_if_absent")
+        current = self.schedules.get(spec.schedule_id)
+        if (
+            current is None
+            or current["spec"] != spec
+            or current["deliveryTarget"] != dict(delivery_target)
+        ):
+            return False
         if occurrence.occurrence_id in self.occurrences:
             return False
         self.occurrences.add(occurrence.occurrence_id)
+        self.occurrence_delivery_states[occurrence.occurrence_id] = "PENDING"
+        self.occurrence_statuses[occurrence.occurrence_id] = occurrence.status
+        return True
+
+    def complete_occurrence(self, spec, occurrence, *, now, delivery_state):
+        from scheduler.models import build_schedule_spec
+
+        self.trace.append("complete_occurrence")
+        current = self.schedules.get(spec.schedule_id)
+        if (
+            current is None
+            or current["spec"] != spec
+            or self.occurrence_delivery_states.get(occurrence.occurrence_id)
+            != "PENDING"
+            or delivery_state not in {"ENQUEUED", "UNCERTAIN"}
+        ):
+            return False
+        current["spec"] = build_schedule_spec(
+            schedule_id=spec.schedule_id,
+            user_id=spec.user_id,
+            task_type=spec.task_type,
+            definition=spec.definition,
+            revision=spec.revision + 1,
+            state="PAUSED",
+            next_run_at=None,
+        )
+        self.completed_occurrences.append(occurrence.occurrence_id)
+        self.occurrence_delivery_states[occurrence.occurrence_id] = delivery_state
+        self.occurrence_statuses[occurrence.occurrence_id] = (
+            "QUEUED" if delivery_state == "ENQUEUED" else "FAILED"
+        )
         return True
 
 

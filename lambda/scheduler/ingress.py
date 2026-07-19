@@ -15,11 +15,11 @@ import time
 from typing import Any, Callable, Mapping
 
 try:  # package import
-    from scheduler.models import SchedulePayloadV1
+    from scheduler.models import SchedulePayloadV1, build_schedule_spec
     from scheduler.service import SchedulerOutcome, SchedulerService
     from capabilities.contracts import ScheduleOccurrenceV1, ScheduleSpecV1
 except ImportError:  # direct Lambda asset / focused tests
-    from models import SchedulePayloadV1  # type: ignore[no-redef]
+    from models import SchedulePayloadV1, build_schedule_spec  # type: ignore[no-redef]
     from service import SchedulerOutcome, SchedulerService  # type: ignore[no-redef]
     from contracts import (  # type: ignore[no-redef]
         ScheduleOccurrenceV1,
@@ -32,6 +32,7 @@ _TABLE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,255}")
 _QUEUE_URL = re.compile(
     r"https://sqs\.eu-west-1\.amazonaws\.com/[0-9]{12}/[A-Za-z0-9_-]+\.fifo"
 )
+_RETENTION_SECONDS = 90 * 24 * 60 * 60
 
 _service_factory: Callable[[], SchedulerService] | None = None
 _production_service: SchedulerService | None = None
@@ -58,12 +59,23 @@ def _string_attribute(item: Mapping[str, Any], name: str) -> str:
     return text
 
 
+def _integer_attribute(item: Mapping[str, Any], name: str) -> int:
+    value = item.get(name)
+    if not isinstance(value, Mapping) or set(value) != {"N"}:
+        raise RuntimeError("scheduler control record is invalid")
+    raw = value.get("N")
+    if not isinstance(raw, str) or re.fullmatch(r"0|[1-9][0-9]*", raw) is None:
+        raise RuntimeError("scheduler control record is invalid")
+    return int(raw)
+
+
 class DynamoIngressScheduleRepository:
     """Strong-read and idempotent occurrence subset used by the ingress."""
 
     def __init__(self, *, client, table_name: str) -> None:
-        if not callable(getattr(client, "get_item", None)) or not callable(
-            getattr(client, "put_item", None)
+        if any(
+            not callable(getattr(client, method, None))
+            for method in ("get_item", "transact_write_items")
         ):
             raise TypeError("scheduler ingress requires a DynamoDB client")
         if not isinstance(table_name, str) or _TABLE_NAME.fullmatch(table_name) is None:
@@ -86,7 +98,7 @@ class DynamoIngressScheduleRepository:
         item = response.get("Item")
         if item is None:
             return None
-        if not isinstance(item, Mapping) or set(item) != {
+        required = {
             "PK",
             "SK",
             "userId",
@@ -94,7 +106,11 @@ class DynamoIngressScheduleRepository:
             "scheduleSortKey",
             "recordJson",
             "deliveryJson",
-        }:
+        }
+        if not isinstance(item, Mapping) or set(item) not in (
+            required,
+            required | {"ttl"},
+        ):
             raise RuntimeError("scheduler control record is invalid")
         if (
             _string_attribute(item, "PK") != f"SCHEDULE#{schedule_id}"
@@ -103,6 +119,8 @@ class DynamoIngressScheduleRepository:
             != f"SCHEDULE#{schedule_id}"
         ):
             raise RuntimeError("scheduler control record crossed a schedule boundary")
+        if "ttl" in item:
+            _integer_attribute(item, "ttl")
         return item
 
     def strong_read_schedule(self, schedule_id: str) -> ScheduleSpecV1 | None:
@@ -133,36 +151,227 @@ class DynamoIngressScheduleRepository:
             not isinstance(delivery, Mapping)
             or set(delivery) != {"chatId", "actorId"}
             or not all(isinstance(delivery[name], str) for name in delivery)
+            or delivery["actorId"] != f"telegram:{delivery['chatId']}"
         ):
             raise RuntimeError("scheduler delivery target is invalid")
         return dict(delivery)
 
-    def put_occurrence_if_absent(self, occurrence: ScheduleOccurrenceV1) -> bool:
-        if not isinstance(occurrence, ScheduleOccurrenceV1):
-            raise TypeError("scheduler occurrence must be typed")
+    def put_occurrence_if_absent(
+        self,
+        spec: ScheduleSpecV1,
+        occurrence: ScheduleOccurrenceV1,
+        delivery_target: Mapping[str, Any],
+    ) -> bool:
+        if (
+            not isinstance(spec, ScheduleSpecV1)
+            or not isinstance(occurrence, ScheduleOccurrenceV1)
+            or spec.state != "ENABLED"
+            or spec.schedule_id != occurrence.schedule_id
+            or spec.revision != occurrence.generation
+            or spec.next_run_at != occurrence.occurrence_time
+            or not isinstance(delivery_target, Mapping)
+            or set(delivery_target) != {"chatId", "actorId"}
+            or not all(
+                isinstance(delivery_target[name], str)
+                for name in ("chatId", "actorId")
+            )
+            or delivery_target["actorId"]
+            != f"telegram:{delivery_target['chatId']}"
+        ):
+            raise TypeError("scheduler occurrence claim must be exactly typed")
+        canonical_spec = json.dumps(
+            spec.to_mapping(),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        canonical_delivery = json.dumps(
+            dict(delivery_target),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        occurrence_item = {
+            "PK": {"S": f"SCHEDULE#{occurrence.schedule_id}"},
+            "SK": {"S": f"OCCURRENCE#{occurrence.occurrence_id}"},
+            "recordJson": {
+                "S": json.dumps(
+                    occurrence.to_mapping(),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+            "ttl": {
+                "N": str(occurrence.occurrence_time + _RETENTION_SECONDS)
+            },
+            "deliveryState": {"S": "PENDING"},
+            "terminal": {"BOOL": False},
+        }
         try:
-            self._client.put_item(
-                TableName=self._table_name,
-                Item={
-                    "PK": {"S": f"SCHEDULE#{occurrence.schedule_id}"},
-                    "SK": {"S": f"OCCURRENCE#{occurrence.occurrence_id}"},
-                    "recordJson": {
-                        "S": json.dumps(
-                            occurrence.to_mapping(),
-                            ensure_ascii=True,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "ConditionCheck": {
+                            "TableName": self._table_name,
+                            "Key": self._key(spec.schedule_id),
+                            "ConditionExpression": (
+                                "recordJson = :record AND "
+                                "deliveryJson = :delivery AND "
+                                "userId = :user AND scheduleUserId = :user AND "
+                                "scheduleSortKey = :sort"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":record": {"S": canonical_spec},
+                                ":delivery": {"S": canonical_delivery},
+                                ":user": {"S": spec.user_id},
+                                ":sort": {
+                                    "S": f"SCHEDULE#{spec.schedule_id}"
+                                },
+                            },
+                        }
                     },
-                },
-                ConditionExpression=(
-                    "attribute_not_exists(PK) AND attribute_not_exists(SK)"
-                ),
+                    {
+                        "Put": {
+                            "TableName": self._table_name,
+                            "Item": occurrence_item,
+                            "ConditionExpression": (
+                                "attribute_not_exists(PK) AND "
+                                "attribute_not_exists(SK)"
+                            ),
+                        }
+                    },
+                ]
             )
             return True
         except Exception as error:
             code = getattr(error, "response", {}).get("Error", {}).get("Code")
-            if code == "ConditionalCheckFailedException":
+            if code in {
+                "ConditionalCheckFailedException",
+                "TransactionCanceledException",
+            }:
+                return False
+            raise
+
+    def complete_occurrence(
+        self,
+        spec: ScheduleSpecV1,
+        occurrence: ScheduleOccurrenceV1,
+        *,
+        now: int,
+        delivery_state: str,
+    ) -> bool:
+        if (
+            not isinstance(spec, ScheduleSpecV1)
+            or not isinstance(occurrence, ScheduleOccurrenceV1)
+            or spec.state != "ENABLED"
+            or spec.schedule_id != occurrence.schedule_id
+            or spec.revision != occurrence.generation
+            or spec.next_run_at != occurrence.occurrence_time
+            or isinstance(now, bool)
+            or not isinstance(now, int)
+            or now < 0
+            or delivery_state not in {"ENQUEUED", "UNCERTAIN"}
+        ):
+            raise ValueError("scheduler occurrence completion binding is invalid")
+        paused = build_schedule_spec(
+            schedule_id=spec.schedule_id,
+            user_id=spec.user_id,
+            task_type=spec.task_type,
+            definition=spec.definition,
+            revision=spec.revision + 1,
+            state="PAUSED",
+            next_run_at=None,
+        )
+        terminal_occurrence = ScheduleOccurrenceV1.from_mapping(
+            {
+                **occurrence.to_mapping(),
+                "status": "QUEUED" if delivery_state == "ENQUEUED" else "FAILED",
+            }
+        )
+        canonical = lambda value: json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        ttl = occurrence.occurrence_time + _RETENTION_SECONDS
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self._table_name,
+                            "Key": self._key(spec.schedule_id),
+                            "UpdateExpression": "SET recordJson = :paused, ttl = :ttl",
+                            "ConditionExpression": (
+                                "recordJson = :current AND userId = :user"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":current": {"S": canonical(spec.to_mapping())},
+                                ":paused": {"S": canonical(paused.to_mapping())},
+                                ":ttl": {"N": str(ttl)},
+                                ":user": {"S": spec.user_id},
+                            },
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": self._table_name,
+                            "Key": {
+                                "PK": {"S": f"SCHEDULE#{occurrence.schedule_id}"},
+                                "SK": {
+                                    "S": f"OCCURRENCE#{occurrence.occurrence_id}"
+                                },
+                            },
+                            "UpdateExpression": (
+                                "SET recordJson = :terminalRecord, "
+                                "deliveryState = :delivery, terminal = :terminal"
+                            ),
+                            "ConditionExpression": (
+                                "recordJson = :record AND deliveryState = :pending "
+                                "AND terminal = :notTerminal"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":record": {
+                                    "S": canonical(occurrence.to_mapping())
+                                },
+                                ":terminalRecord": {
+                                    "S": canonical(terminal_occurrence.to_mapping())
+                                },
+                                ":pending": {"S": "PENDING"},
+                                ":delivery": {"S": delivery_state},
+                                ":notTerminal": {"BOOL": False},
+                                ":terminal": {"BOOL": True},
+                            },
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": self._table_name,
+                            "Key": {
+                                "PK": {"S": f"USER#{spec.user_id}"},
+                                "SK": {"S": "CONTROL#SCHEDULE_COUNT"},
+                            },
+                            "UpdateExpression": "SET liveCount = liveCount - :one",
+                            "ConditionExpression": (
+                                "recordType = :counter AND userId = :user "
+                                "AND liveCount > :zero"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":one": {"N": "1"},
+                                ":zero": {"N": "0"},
+                                ":counter": {"S": "SCHEDULE_COUNTER"},
+                                ":user": {"S": spec.user_id},
+                            },
+                        }
+                    },
+                ]
+            )
+            return True
+        except Exception as error:
+            code = getattr(error, "response", {}).get("Error", {}).get("Code")
+            if code in {"ConditionalCheckFailedException", "TransactionCanceledException"}:
                 return False
             raise
 

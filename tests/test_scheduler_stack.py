@@ -114,7 +114,7 @@ def test_ingress_role_has_only_control_table_read_fifo_send_and_scoped_kms():
     # Strong-read on the control table + FIFO send + scoped KMS + log writes.
     assert actions == {
         "dynamodb:GetItem",
-        "dynamodb:PutItem",
+        "dynamodb:TransactWriteItems",
         "sqs:SendMessage",
         "kms:Decrypt",
         "kms:DescribeKey",
@@ -213,6 +213,20 @@ def test_control_role_has_exact_schedule_apply_authority_and_passrole_condition(
     assert "schedule-group/personal-operator-v1" in serialized
     assert "schedule/personal-operator-v1/po-*" in serialized
     assert CAPABILITY_TABLE_ARN in serialized
+    capability_transaction = next(
+        statement
+        for statement in statements
+        if CAPABILITY_TABLE_ARN in str(statement.get("Resource"))
+        and "dynamodb:TransactWriteItems"
+        in ([statement.get("Action")] if isinstance(statement.get("Action"), str) else statement.get("Action", []))
+    )
+    transaction_resources = capability_transaction["Resource"]
+    assert isinstance(transaction_resources, list) and len(transaction_resources) == 2
+    assert CAPABILITY_TABLE_ARN in transaction_resources
+    assert any(
+        isinstance(resource, dict) and "Fn::GetAtt" in resource
+        for resource in transaction_resources
+    )
     for forbidden in (
         "bedrock-agentcore",
         "secretsmanager:",

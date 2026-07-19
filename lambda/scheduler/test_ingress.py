@@ -104,6 +104,50 @@ def test_ingress_lambda_handler_uses_injected_factory_without_touching_aws(servi
         ingress.configure_service_factory(None)
 
 
+def test_dynamo_ingress_rejects_cross_tenant_delivery_binding_before_claim(service):
+    spec = _confirmed(service)
+
+    class Dynamo:
+        @staticmethod
+        def get_item(**_kwargs):
+            return {
+                "Item": {
+                    "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+                    "SK": {"S": "STATE"},
+                    "userId": {"S": spec.user_id},
+                    "scheduleUserId": {"S": spec.user_id},
+                    "scheduleSortKey": {
+                        "S": f"SCHEDULE#{spec.schedule_id}"
+                    },
+                    "recordJson": {
+                        "S": json.dumps(
+                            spec.to_mapping(),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    },
+                    "deliveryJson": {
+                        "S": json.dumps(
+                            {"chatId": "42", "actorId": "telegram:other"},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    },
+                }
+            }
+
+        @staticmethod
+        def transact_write_items(**_kwargs):
+            raise AssertionError("poisoned delivery must make zero claims")
+
+    repository = ingress.DynamoIngressScheduleRepository(
+        client=Dynamo(), table_name="scheduler-control"
+    )
+
+    with pytest.raises(RuntimeError, match="delivery target is invalid"):
+        repository.read_delivery_target(spec.schedule_id)
+
+
 def test_packaged_production_handler_strong_reads_and_enqueues_with_injected_aws_clients(
     service, monkeypatch
 ):
@@ -118,6 +162,7 @@ def test_packaged_production_handler_strong_reads_and_enqueues_with_injected_aws
         def __init__(self):
             self.get_calls = []
             self.put_calls = []
+            self.transact_calls = []
 
         def get_item(self, **kwargs):
             self.get_calls.append(kwargs)
@@ -151,6 +196,10 @@ def test_packaged_production_handler_strong_reads_and_enqueues_with_injected_aws
             self.put_calls.append(kwargs)
             return {}
 
+        def transact_write_items(self, **kwargs):
+            self.transact_calls.append(kwargs)
+            return {}
+
     class Sqs:
         def __init__(self):
             self.calls = []
@@ -179,9 +228,76 @@ def test_packaged_production_handler_strong_reads_and_enqueues_with_injected_aws
 
     assert result == {"status": "ENQUEUED"}
     assert dynamo.get_calls[0]["ConsistentRead"] is True
-    assert dynamo.put_calls[0]["ConditionExpression"] == (
+    assert dynamo.put_calls == []
+    claim = dynamo.transact_calls[0]["TransactItems"]
+    assert [set(write) for write in claim] == [
+        {"ConditionCheck"},
+        {"Put"},
+    ]
+    assert claim[0]["ConditionCheck"]["Key"] == {
+        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+        "SK": {"S": "STATE"},
+    }
+    assert claim[0]["ConditionCheck"]["ExpressionAttributeValues"] == {
+        ":record": {
+            "S": json.dumps(
+                spec.to_mapping(), sort_keys=True, separators=(",", ":")
+            )
+        },
+        ":delivery": {
+            "S": json.dumps(
+                DELIVERY_TARGET, sort_keys=True, separators=(",", ":")
+            )
+        },
+        ":user": {"S": spec.user_id},
+        ":sort": {"S": f"SCHEDULE#{spec.schedule_id}"},
+    }
+    assert "deliveryJson = :delivery" in claim[0]["ConditionCheck"][
+        "ConditionExpression"
+    ]
+    occurrence_put = claim[1]["Put"]
+    assert occurrence_put["ConditionExpression"] == (
         "attribute_not_exists(PK) AND attribute_not_exists(SK)"
     )
+    assert occurrence_put["Item"]["ttl"] == {
+        "N": str(spec.next_run_at + 90 * 24 * 60 * 60)
+    }
+    assert occurrence_put["Item"]["deliveryState"] == {"S": "PENDING"}
+    assert occurrence_put["Item"]["terminal"] == {"BOOL": False}
+    assert json.loads(occurrence_put["Item"]["recordJson"]["S"])[
+        "status"
+    ] == "CLAIMED"
+    writes = dynamo.transact_calls[1]["TransactItems"]
+    assert [set(write) for write in writes] == [
+        {"Update"},
+        {"Update"},
+        {"Update"},
+    ]
+    assert writes[0]["Update"]["Key"] == {
+        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+        "SK": {"S": "STATE"},
+    }
+    assert "ttl = :ttl" in writes[0]["Update"]["UpdateExpression"]
+    occurrence_id = json.loads(
+        occurrence_put["Item"]["recordJson"]["S"]
+    )["occurrenceId"]
+    assert writes[1]["Update"]["Key"] == {
+        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+        "SK": {"S": f"OCCURRENCE#{occurrence_id}"},
+    }
+    assert writes[1]["Update"]["ExpressionAttributeValues"][":delivery"] == {
+        "S": "ENQUEUED"
+    }
+    assert writes[1]["Update"]["ExpressionAttributeValues"][":terminal"] == {
+        "BOOL": True
+    }
+    assert json.loads(
+        writes[1]["Update"]["ExpressionAttributeValues"][":terminalRecord"]["S"]
+    )["status"] == "QUEUED"
+    assert writes[2]["Update"]["Key"] == {
+        "PK": {"S": f"USER#{spec.user_id}"},
+        "SK": {"S": "CONTROL#SCHEDULE_COUNT"},
+    }
     assert len(sqs.calls) == 1
     assert sqs.calls[0]["MessageGroupId"] == spec.user_id
     assert sqs.calls[0]["MessageBody"].find('"externalEffects":false') >= 0

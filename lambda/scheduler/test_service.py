@@ -203,6 +203,13 @@ def test_fire_strong_reads_then_enqueues_exactly_one_occurrence_into_per_user_fi
 
     expected_occ = derive_occurrence_id(spec.schedule_id, 1, spec.next_run_at)
     assert send["MessageDeduplicationId"] == expected_occ
+    completed = repository.schedules[spec.schedule_id]["spec"]
+    assert completed.state == "PAUSED"
+    assert completed.revision == 2
+    assert completed.next_run_at is None
+    assert repository.completed_occurrences == [expected_occ]
+    assert repository.occurrence_delivery_states[expected_occ] == "ENQUEUED"
+    assert repository.occurrence_statuses[expected_occ] == "QUEUED"
 
 
 def test_duplicate_fire_same_generation_and_time_is_idempotent_noop(
@@ -217,9 +224,39 @@ def test_duplicate_fire_same_generation_and_time_is_idempotent_noop(
     second = service.fire(payload)
 
     assert first.status == "ENQUEUED"
-    assert second.status == "DUPLICATE"
+    assert second.status == "STALE"
     # Only one occurrence enqueued despite two fires.
     assert len(occurrence_queue.sends) == 1
+
+
+def test_retry_after_preexisting_occurrence_never_reenqueues_and_terminals_uncertain(
+    service, repository, occurrence_queue
+):
+    _, spec = _propose_confirm(service)
+    payload = SchedulePayloadV1(
+        schedule_id=spec.schedule_id, generation=1, fire_time=spec.next_run_at
+    )
+    from scheduler.models import make_occurrence
+
+    occurrence = make_occurrence(
+        schedule_id=spec.schedule_id,
+        generation=1,
+        occurrence_time=spec.next_run_at,
+        status="CLAIMED",
+    )
+    assert repository.put_occurrence_if_absent(
+        spec, occurrence, DELIVERY_TARGET
+    ) is True
+
+    result = service.fire(payload)
+
+    assert result.status == "DUPLICATE"
+    assert occurrence_queue.sends == []
+    assert repository.occurrence_delivery_states[occurrence.occurrence_id] == (
+        "UNCERTAIN"
+    )
+    assert repository.occurrence_statuses[occurrence.occurrence_id] == "FAILED"
+    assert repository.schedules[spec.schedule_id]["spec"].state == "PAUSED"
 
 
 def test_stale_generation_fire_is_noop_and_enqueues_nothing(
@@ -343,6 +380,11 @@ def test_sqs_uncertain_persistence_on_fire_is_UNCERTAIN_and_never_auto_acts(
             )
         )
     assert queue_uncertain.sends == []
+    assert len(repository.completed_occurrences) == 1
+    assert repository.schedules[spec.schedule_id]["spec"].state == "PAUSED"
+    occurrence_id = repository.completed_occurrences[0]
+    assert repository.occurrence_delivery_states[occurrence_id] == "UNCERTAIN"
+    assert repository.occurrence_statuses[occurrence_id] == "FAILED"
 
 
 def test_deletion_fence_deletes_live_schedules_before_completion(

@@ -28,6 +28,11 @@ from capabilities.contracts import (
     canonical_json_bytes,
 )
 from capabilities.durable import DynamoAdmissionRepository
+from capabilities.retention import (
+    DELETION_FENCE_SCHEMA,
+    derive_deletion_subject_binding,
+    subject_partition_key,
+)
 from scheduler.models import SchedulePayloadV1, build_schedule_spec
 from scheduler.proposals import (
     PHYSICAL_RETENTION_SECONDS,
@@ -53,6 +58,8 @@ _ROLE_ARN = re.compile(
     r"personal-operator-scheduler-invoke-eu-west-1"
 )
 REQUIRED_REGION = "eu-west-1"
+_MAX_LIVE_SCHEDULES = 256
+_COUNTER_SK = "CONTROL#SCHEDULE_COUNT"
 
 
 class ScheduleControlError(RuntimeError):
@@ -186,6 +193,16 @@ class ScheduleControlRepository(Protocol):
         now: int,
     ) -> bool: ...
 
+    def stale_after_claim(
+        self,
+        snapshot: ProposalSnapshot,
+        claimed: ScheduleSnapshot,
+        *,
+        outcome: ControlOutcome,
+        now: int,
+        remove_schedule: bool,
+    ) -> bool: ...
+
     def reject_proposal(
         self,
         snapshot: ProposalSnapshot,
@@ -195,6 +212,10 @@ class ScheduleControlRepository(Protocol):
     ) -> bool: ...
 
     def list_user_schedules(self, user_id: str) -> tuple[ScheduleSnapshot, ...]: ...
+
+    def list_user_schedule_orphans(self, user_id: str) -> tuple[str, ...]: ...
+
+    def delete_orphan_owner(self, *, user_id: str, schedule_id: str) -> bool: ...
 
     def fence_schedule_for_purge(
         self, current: ScheduleSnapshot, *, now: int
@@ -407,6 +428,10 @@ class ScheduleControlService:
                     args_hash=args_hash,
                 )
             applied_revision = spec.revision
+            claimed = ScheduleSnapshot(
+                spec=spec, delivery_target=record.delivery_target
+            )
+            remove_claimed_schedule = True
             provider_call = lambda: self._provider.create_one_time_schedule(
                 spec=spec,
                 payload=SchedulePayloadV1(
@@ -443,9 +468,35 @@ class ScheduleControlService:
                     args_hash=args_hash,
                 )
             applied_revision = cancelled.revision
+            claimed = ScheduleSnapshot(
+                spec=cancelled, delivery_target=current.delivery_target
+            )
+            remove_claimed_schedule = False
             provider_call = lambda: self._provider.delete_schedule(
                 schedule_id=record.schedule_id
             )
+
+        post_claim_now = now
+        try:
+            self._authority_guard(user_id, record.proposal.operation_id)
+            post_claim_now = self._now()
+            if post_claim_now >= record.expires_at:
+                raise ScheduleControlError("schedule proposal expired after claim")
+        except Exception:
+            outcome = self._outcome(
+                snapshot, status="STALE", revision=applied_revision
+            )
+            if not self._repository.stale_after_claim(
+                snapshot,
+                claimed,
+                outcome=outcome,
+                now=post_claim_now,
+                remove_schedule=remove_claimed_schedule,
+            ):
+                raise ScheduleControlError(
+                    "stale schedule claim could not be durably fenced"
+                )
+            return outcome
 
         try:
             provider_call()
@@ -582,7 +633,7 @@ class ScheduleControlService:
             schedules = self._repository.list_user_schedules(user_id)
         except Exception as error:
             raise ScheduleControlError("schedule purge inventory is unavailable") from error
-        if not isinstance(schedules, tuple) or len(schedules) > 256:
+        if not isinstance(schedules, tuple):
             raise ScheduleControlError("schedule purge inventory is invalid")
         remaining = 0
         for current in schedules:
@@ -607,6 +658,31 @@ class ScheduleControlService:
                 remaining += 1
                 continue
             if not self._repository.delete_schedule_partition(fenced):
+                remaining += 1
+        try:
+            orphans = self._repository.list_user_schedule_orphans(user_id)
+        except Exception as error:
+            raise ScheduleControlError(
+                "schedule orphan inventory is unavailable"
+            ) from error
+        if (
+            not isinstance(orphans, tuple)
+            or any(
+                not isinstance(schedule_id, str)
+                or _OPAQUE.fullmatch(schedule_id) is None
+                for schedule_id in orphans
+            )
+        ):
+            raise ScheduleControlError("schedule orphan inventory is invalid")
+        for schedule_id in orphans:
+            try:
+                self._provider.delete_schedule(schedule_id=schedule_id)
+            except self._uncertain:
+                remaining += 1
+                continue
+            if not self._repository.delete_orphan_owner(
+                user_id=user_id, schedule_id=schedule_id
+            ):
                 remaining += 1
         if remaining:
             return remaining
@@ -649,7 +725,13 @@ def _conditional(error: ClientError) -> bool:
 class DynamoScheduleControlRepository:
     """Strong-read exact proposal/schedule records and atomic local intents."""
 
-    def __init__(self, *, client: Any, table_name: str) -> None:
+    def __init__(
+        self,
+        *,
+        client: Any,
+        table_name: str,
+        capability_table_name: str,
+    ) -> None:
         if any(
             not callable(getattr(client, method, None))
             for method in (
@@ -663,8 +745,14 @@ class DynamoScheduleControlRepository:
             raise TypeError("scheduler control requires exact DynamoDB methods")
         if not isinstance(table_name, str) or _TABLE.fullmatch(table_name) is None:
             raise ValueError("scheduler control table name is invalid")
+        if (
+            not isinstance(capability_table_name, str)
+            or _TABLE.fullmatch(capability_table_name) is None
+        ):
+            raise ValueError("scheduler capability table name is invalid")
         self._client = client
         self._table_name = table_name
+        self._capability_table_name = capability_table_name
 
     @staticmethod
     def _proposal_key(user_id: str, proposal_ref: str) -> dict[str, Any]:
@@ -760,7 +848,7 @@ class DynamoScheduleControlRepository:
         item = response.get("Item")
         if item is None:
             return None
-        if not isinstance(item, Mapping) or set(item) != {
+        required = {
             "PK",
             "SK",
             "userId",
@@ -768,7 +856,11 @@ class DynamoScheduleControlRepository:
             "scheduleSortKey",
             "recordJson",
             "deliveryJson",
-        }:
+        }
+        if not isinstance(item, Mapping) or set(item) not in (
+            required,
+            required | {"ttl"},
+        ):
             raise RuntimeError("scheduler state record is invalid")
         try:
             spec = ScheduleSpecV1.from_mapping(
@@ -788,6 +880,10 @@ class DynamoScheduleControlRepository:
             or spec.schedule_id != schedule_id
         ):
             raise RuntimeError("scheduler state record binding is invalid")
+        if "ttl" in item and (
+            spec.state == "ENABLED" or _attribute_integer(item, "ttl") < 1
+        ):
+            raise RuntimeError("scheduler state retention is invalid")
         return snapshot
 
     @staticmethod
@@ -807,8 +903,44 @@ class DynamoScheduleControlRepository:
             },
         }
 
+    def _deletion_fence_condition(
+        self, user_id: str, *, enabled: bool
+    ) -> dict[str, Any]:
+        binding = derive_deletion_subject_binding(user_id)
+        return {
+            "TableName": self._capability_table_name,
+            "Key": {
+                "PK": {"S": subject_partition_key(user_id)},
+                "SK": {"S": "DELETION"},
+            },
+            "ConditionExpression": "#owner = :owner AND #record = :record",
+            "ExpressionAttributeNames": {
+                "#owner": "ownerBinding",
+                "#record": "recordJson",
+            },
+            "ExpressionAttributeValues": {
+                ":owner": {"S": binding},
+                ":record": {
+                    "S": _canonical_json(
+                        {
+                            "schema": DELETION_FENCE_SCHEMA,
+                            "enabled": enabled,
+                            "subjectBinding": binding,
+                        }
+                    )
+                },
+            },
+        }
+
+    def _deletion_condition(self, user_id: str) -> dict[str, Any]:
+        return self._deletion_fence_condition(user_id, enabled=False)
+
+    def _active_deletion_condition(self, user_id: str) -> dict[str, Any]:
+        return self._deletion_fence_condition(user_id, enabled=True)
+
     @staticmethod
-    def _proposal_claim(snapshot: ProposalSnapshot) -> dict[str, Any]:
+    def _proposal_claim(snapshot: ProposalSnapshot, *, now: int) -> dict[str, Any]:
+        lifetime = snapshot.record.expires_at - snapshot.record.created_at
         return {
             "TableName": "",  # filled by the repository instance
             "Key": DynamoScheduleControlRepository._proposal_key(
@@ -817,7 +949,7 @@ class DynamoScheduleControlRepository:
             "UpdateExpression": "SET #state = :applying, #version = :next",
             "ConditionExpression": (
                 "#state = :pending AND #version = :expected "
-                "AND recordJson = :record"
+                "AND recordJson = :record AND ttl > :liveAfter"
             ),
             "ExpressionAttributeNames": {
                 "#state": "state",
@@ -831,6 +963,55 @@ class DynamoScheduleControlRepository:
                 ":record": {
                     "S": _canonical_json(snapshot.record.to_mapping())
                 },
+                ":liveAfter": {
+                    "N": str(now + PHYSICAL_RETENTION_SECONDS - lifetime)
+                },
+            },
+        }
+
+    def _counter_increment(self, user_id: str) -> dict[str, Any]:
+        return {
+            "TableName": self._table_name,
+            "Key": {
+                "PK": {"S": f"USER#{user_id}"},
+                "SK": {"S": _COUNTER_SK},
+            },
+            "UpdateExpression": (
+                "SET liveCount = if_not_exists(liveCount, :zero) + :one, "
+                "recordType = if_not_exists(recordType, :counter), "
+                "userId = if_not_exists(userId, :user)"
+            ),
+            "ConditionExpression": (
+                "(attribute_not_exists(liveCount) OR liveCount < :max) AND "
+                "(attribute_not_exists(recordType) OR recordType = :counter) AND "
+                "(attribute_not_exists(userId) OR userId = :user)"
+            ),
+            "ExpressionAttributeValues": {
+                ":zero": {"N": "0"},
+                ":one": {"N": "1"},
+                ":max": {"N": str(_MAX_LIVE_SCHEDULES)},
+                ":counter": {"S": "SCHEDULE_COUNTER"},
+                ":user": {"S": user_id},
+            },
+        }
+
+    def _counter_decrement(self, user_id: str) -> dict[str, Any]:
+        return {
+            "TableName": self._table_name,
+            "Key": {
+                "PK": {"S": f"USER#{user_id}"},
+                "SK": {"S": _COUNTER_SK},
+            },
+            "UpdateExpression": "SET liveCount = liveCount - :one",
+            "ConditionExpression": (
+                "recordType = :counter AND userId = :user "
+                "AND liveCount > :zero"
+            ),
+            "ExpressionAttributeValues": {
+                ":one": {"N": "1"},
+                ":zero": {"N": "0"},
+                ":counter": {"S": "SCHEDULE_COUNTER"},
+                ":user": {"S": user_id},
             },
         }
 
@@ -844,11 +1025,12 @@ class DynamoScheduleControlRepository:
     ) -> bool:
         if snapshot.state != "PENDING" or spec.user_id != snapshot.record.user_id:
             raise ValueError("schedule create claim binding is invalid")
-        claim = self._proposal_claim(snapshot)
+        claim = self._proposal_claim(snapshot, now=now)
         claim["TableName"] = self._table_name
         try:
             self._client.transact_write_items(
                 TransactItems=[
+                    {"ConditionCheck": self._deletion_condition(spec.user_id)},
                     {"Update": claim},
                     {
                         "Put": {
@@ -873,6 +1055,7 @@ class DynamoScheduleControlRepository:
                             ),
                         }
                     },
+                    {"Update": self._counter_increment(spec.user_id)},
                 ]
             )
             return True
@@ -899,32 +1082,38 @@ class DynamoScheduleControlRepository:
             or cancelled.revision != current.spec.revision + 1
         ):
             raise ValueError("schedule cancellation claim binding is invalid")
-        claim = self._proposal_claim(snapshot)
+        claim = self._proposal_claim(snapshot, now=now)
         claim["TableName"] = self._table_name
+        ttl = now + PHYSICAL_RETENTION_SECONDS
+        writes = [
+            {"ConditionCheck": self._deletion_condition(current.spec.user_id)},
+            {"Update": claim},
+            {
+                "Update": {
+                    "TableName": self._table_name,
+                    "Key": self._schedule_key(current.spec.schedule_id),
+                    "UpdateExpression": "SET recordJson = :cancelled, ttl = :ttl",
+                    "ConditionExpression": (
+                        "recordJson = :current AND userId = :user"
+                    ),
+                    "ExpressionAttributeValues": {
+                        ":current": {
+                            "S": _canonical_json(current.spec.to_mapping())
+                        },
+                        ":cancelled": {
+                            "S": _canonical_json(cancelled.to_mapping())
+                        },
+                        ":ttl": {"N": str(ttl)},
+                        ":user": {"S": current.spec.user_id},
+                    },
+                }
+            },
+        ]
+        if current.spec.state == "ENABLED":
+            writes.append({"Update": self._counter_decrement(current.spec.user_id)})
         try:
             self._client.transact_write_items(
-                TransactItems=[
-                    {"Update": claim},
-                    {
-                        "Update": {
-                            "TableName": self._table_name,
-                            "Key": self._schedule_key(current.spec.schedule_id),
-                            "UpdateExpression": "SET recordJson = :cancelled",
-                            "ConditionExpression": (
-                                "recordJson = :current AND userId = :user"
-                            ),
-                            "ExpressionAttributeValues": {
-                                ":current": {
-                                    "S": _canonical_json(current.spec.to_mapping())
-                                },
-                                ":cancelled": {
-                                    "S": _canonical_json(cancelled.to_mapping())
-                                },
-                                ":user": {"S": current.spec.user_id},
-                            },
-                        }
-                    },
-                ]
+                TransactItems=writes
             )
             return True
         except ClientError as error:
@@ -957,6 +1146,105 @@ class DynamoScheduleControlRepository:
             status=status,
             outcome=outcome,
         )
+
+    def stale_after_claim(
+        self,
+        snapshot: ProposalSnapshot,
+        claimed: ScheduleSnapshot,
+        *,
+        outcome: ControlOutcome,
+        now: int,
+        remove_schedule: bool,
+    ) -> bool:
+        if (
+            snapshot.state != "PENDING"
+            or not isinstance(claimed, ScheduleSnapshot)
+            or claimed.spec.schedule_id != snapshot.record.schedule_id
+            or claimed.spec.user_id != snapshot.record.user_id
+            or outcome.status != "STALE"
+            or outcome.proposal_ref != snapshot.record.proposal_id
+            or outcome.schedule_id != claimed.spec.schedule_id
+            or isinstance(now, bool)
+            or not isinstance(now, int)
+            or now < 0
+        ):
+            raise ValueError("stale schedule claim binding is invalid")
+        if not remove_schedule:
+            return self._terminal_update(
+                snapshot,
+                expected_state="APPLYING",
+                expected_version=snapshot.version + 1,
+                status="STALE",
+                outcome=outcome,
+            )
+        proposal_update = {
+            "TableName": self._table_name,
+            "Key": self._proposal_key(
+                snapshot.record.user_id, snapshot.record.proposal_id
+            ),
+            "UpdateExpression": (
+                "SET #state = :stale, #version = :next, outcomeJson = :outcome"
+            ),
+            "ConditionExpression": (
+                "#state = :applying AND #version = :expected "
+                "AND recordJson = :record"
+            ),
+            "ExpressionAttributeNames": {
+                "#state": "state",
+                "#version": "version",
+            },
+            "ExpressionAttributeValues": {
+                ":stale": {"S": "STALE"},
+                ":applying": {"S": "APPLYING"},
+                ":expected": {"N": str(snapshot.version + 1)},
+                ":next": {"N": str(snapshot.version + 2)},
+                ":record": {"S": _canonical_json(snapshot.record.to_mapping())},
+                ":outcome": {"S": _canonical_json(outcome.to_mapping())},
+            },
+        }
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {"Update": proposal_update},
+                    {
+                        "Delete": {
+                            "TableName": self._table_name,
+                            "Key": self._schedule_key(claimed.spec.schedule_id),
+                            "ConditionExpression": (
+                                "recordJson = :record AND userId = :user"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":record": {
+                                    "S": _canonical_json(claimed.spec.to_mapping())
+                                },
+                                ":user": {"S": claimed.spec.user_id},
+                            },
+                        }
+                    },
+                    {
+                        "Delete": {
+                            "TableName": self._table_name,
+                            "Key": {
+                                "PK": {"S": f"USER#{claimed.spec.user_id}"},
+                                "SK": {"S": f"SCHEDULE#{claimed.spec.schedule_id}"},
+                            },
+                            "ConditionExpression": (
+                                "recordType = :owner AND scheduleId = :schedule"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":owner": {"S": "SCHEDULE_OWNER"},
+                                ":schedule": {"S": claimed.spec.schedule_id},
+                            },
+                        }
+                    },
+                    {"Update": self._counter_decrement(claimed.spec.user_id)},
+                ]
+            )
+            return True
+        except ClientError as error:
+            if _conditional(error):
+                return False
+            raise
 
     def reject_proposal(
         self,
@@ -1018,55 +1306,160 @@ class DynamoScheduleControlRepository:
                 return False
             raise
 
-    def list_user_schedules(self, user_id: str) -> tuple[ScheduleSnapshot, ...]:
+    def _user_schedule_ids(self, user_id: str) -> tuple[str, ...]:
         if not isinstance(user_id, str) or _USER.fullmatch(user_id) is None:
             raise ValueError("schedule inventory user is invalid")
-        response = self._client.query(
-            TableName=self._table_name,
-            KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
-            ExpressionAttributeValues={
-                ":pk": {"S": f"USER#{user_id}"},
-                ":prefix": {"S": "SCHEDULE#"},
-            },
-            ProjectionExpression="PK, SK, recordType, scheduleId",
-            ConsistentRead=True,
-            Limit=257,
-        )
-        items = response.get("Items") if isinstance(response, Mapping) else None
-        if (
-            not isinstance(items, list)
-            or response.get("LastEvaluatedKey") is not None
-            or len(items) > 256
-        ):
-            raise RuntimeError("schedule inventory exceeds its bound")
-        snapshots: list[ScheduleSnapshot] = []
         seen: set[str] = set()
-        for item in items:
-            if not isinstance(item, Mapping) or set(item) != {
-                "PK",
-                "SK",
-                "recordType",
-                "scheduleId",
-            }:
-                raise RuntimeError("schedule inventory record is invalid")
-            pk = _attribute_string(item, "PK")
-            sk = _attribute_string(item, "SK")
-            schedule_id = _attribute_string(item, "scheduleId")
-            if (
-                pk != f"USER#{user_id}"
-                or sk != f"SCHEDULE#{schedule_id}"
-                or _attribute_string(item, "recordType") != "SCHEDULE_OWNER"
-                or _OPAQUE.fullmatch(schedule_id) is None
-            ):
-                raise RuntimeError("schedule inventory crossed its binding")
-            if schedule_id in seen:
-                raise RuntimeError("schedule inventory contains a duplicate")
+        start_key = None
+        seen_pages: set[str] = set()
+        while True:
+            request = {
+                "TableName": self._table_name,
+                "KeyConditionExpression": "PK = :pk AND begins_with(SK, :prefix)",
+                "ExpressionAttributeValues": {
+                    ":pk": {"S": f"USER#{user_id}"},
+                    ":prefix": {"S": "SCHEDULE#"},
+                },
+                "ProjectionExpression": "PK, SK, recordType, scheduleId",
+                "ConsistentRead": True,
+                "Limit": 1000,
+            }
+            if start_key is not None:
+                request["ExclusiveStartKey"] = start_key
+            response = self._client.query(**request)
+            items = response.get("Items") if isinstance(response, Mapping) else None
+            if not isinstance(items, list):
+                raise RuntimeError("schedule inventory page is invalid")
+            for item in items:
+                if not isinstance(item, Mapping) or set(item) != {
+                    "PK",
+                    "SK",
+                    "recordType",
+                    "scheduleId",
+                }:
+                    raise RuntimeError("schedule inventory record is invalid")
+                pk = _attribute_string(item, "PK")
+                sk = _attribute_string(item, "SK")
+                schedule_id = _attribute_string(item, "scheduleId")
+                if (
+                    pk != f"USER#{user_id}"
+                    or sk != f"SCHEDULE#{schedule_id}"
+                    or _attribute_string(item, "recordType") != "SCHEDULE_OWNER"
+                    or _OPAQUE.fullmatch(schedule_id) is None
+                ):
+                    raise RuntimeError("schedule inventory crossed its binding")
+                if schedule_id in seen:
+                    raise RuntimeError("schedule inventory contains a duplicate")
+                seen.add(schedule_id)
+            start_key = response.get("LastEvaluatedKey")
+            if start_key is None:
+                break
+            marker = json.dumps(start_key, sort_keys=True, separators=(",", ":"))
+            if marker in seen_pages:
+                raise RuntimeError("schedule inventory pagination repeated")
+            seen_pages.add(marker)
+        return tuple(sorted(seen))
+
+    def list_user_schedules(self, user_id: str) -> tuple[ScheduleSnapshot, ...]:
+        snapshots: list[ScheduleSnapshot] = []
+        for schedule_id in self._user_schedule_ids(user_id):
             snapshot = self.strong_read_schedule(schedule_id)
-            if snapshot is None or snapshot.spec.user_id != user_id:
+            if snapshot is None:
+                continue
+            if snapshot.spec.user_id != user_id:
                 raise RuntimeError("schedule inventory authority changed")
-            seen.add(schedule_id)
             snapshots.append(snapshot)
         return tuple(sorted(snapshots, key=lambda value: value.spec.schedule_id))
+
+    def list_user_schedule_orphans(self, user_id: str) -> tuple[str, ...]:
+        orphans = []
+        for schedule_id in self._user_schedule_ids(user_id):
+            snapshot = self.strong_read_schedule(schedule_id)
+            if snapshot is None:
+                orphans.append(schedule_id)
+            elif snapshot.spec.user_id != user_id:
+                raise RuntimeError("schedule orphan inventory crossed its binding")
+        return tuple(orphans)
+
+    def delete_orphan_owner(self, *, user_id: str, schedule_id: str) -> bool:
+        if (
+            not isinstance(user_id, str)
+            or _USER.fullmatch(user_id) is None
+            or not isinstance(schedule_id, str)
+            or _OPAQUE.fullmatch(schedule_id) is None
+        ):
+            raise ValueError("schedule orphan binding is invalid")
+        pk = f"SCHEDULE#{schedule_id}"
+        start_key = None
+        seen_pages: set[str] = set()
+        while True:
+            request = {
+                "TableName": self._table_name,
+                "KeyConditionExpression": "PK = :pk",
+                "ExpressionAttributeValues": {":pk": {"S": pk}},
+                "ProjectionExpression": "PK, SK",
+                "ConsistentRead": True,
+                "Limit": 1000,
+            }
+            if start_key is not None:
+                request["ExclusiveStartKey"] = start_key
+            response = self._client.query(**request)
+            items = response.get("Items") if isinstance(response, Mapping) else None
+            if not isinstance(items, list):
+                return False
+            occurrence_keys = []
+            for item in items:
+                if not isinstance(item, Mapping) or set(item) != {"PK", "SK"}:
+                    return False
+                item_pk = _attribute_string(item, "PK")
+                item_sk = _attribute_string(item, "SK")
+                if item_pk != pk or not item_sk.startswith("OCCURRENCE#"):
+                    return False
+                occurrence_keys.append(
+                    {"PK": {"S": item_pk}, "SK": {"S": item_sk}}
+                )
+            if occurrence_keys and not self._delete_keys(occurrence_keys):
+                return False
+            start_key = response.get("LastEvaluatedKey")
+            if start_key is None:
+                break
+            marker = json.dumps(start_key, sort_keys=True, separators=(",", ":"))
+            if marker in seen_pages:
+                return False
+            seen_pages.add(marker)
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "ConditionCheck": {
+                            "TableName": self._table_name,
+                            "Key": self._schedule_key(schedule_id),
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                        }
+                    },
+                    {
+                        "Delete": {
+                            "TableName": self._table_name,
+                            "Key": {
+                                "PK": {"S": f"USER#{user_id}"},
+                                "SK": {"S": f"SCHEDULE#{schedule_id}"},
+                            },
+                            "ConditionExpression": (
+                                "recordType = :owner AND scheduleId = :schedule"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":owner": {"S": "SCHEDULE_OWNER"},
+                                ":schedule": {"S": schedule_id},
+                            },
+                        }
+                    },
+                ]
+            )
+            return True
+        except ClientError as error:
+            if _conditional(error):
+                return False
+            raise
 
     def fence_schedule_for_purge(
         self, current: ScheduleSnapshot, *, now: int
@@ -1084,17 +1477,34 @@ class DynamoScheduleControlRepository:
             state="CANCELLED",
             next_run_at=None,
         )
+        ttl = now + PHYSICAL_RETENTION_SECONDS
         try:
-            self._client.update_item(
-                TableName=self._table_name,
-                Key=self._schedule_key(current.spec.schedule_id),
-                UpdateExpression="SET recordJson = :cancelled",
-                ConditionExpression="recordJson = :current AND userId = :user",
-                ExpressionAttributeValues={
-                    ":current": {"S": _canonical_json(current.spec.to_mapping())},
-                    ":cancelled": {"S": _canonical_json(cancelled.to_mapping())},
-                    ":user": {"S": current.spec.user_id},
-                },
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self._table_name,
+                            "Key": self._schedule_key(current.spec.schedule_id),
+                            "UpdateExpression": (
+                                "SET recordJson = :cancelled, ttl = :ttl"
+                            ),
+                            "ConditionExpression": (
+                                "recordJson = :current AND userId = :user"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":current": {
+                                    "S": _canonical_json(current.spec.to_mapping())
+                                },
+                                ":cancelled": {
+                                    "S": _canonical_json(cancelled.to_mapping())
+                                },
+                                ":ttl": {"N": str(ttl)},
+                                ":user": {"S": current.spec.user_id},
+                            },
+                        }
+                    },
+                    {"Update": self._counter_decrement(current.spec.user_id)},
+                ]
             )
         except ClientError as error:
             if _conditional(error):
@@ -1115,87 +1525,168 @@ class DynamoScheduleControlRepository:
                     ]
                 }
             )
-            if (
-                not isinstance(response, Mapping)
-                or response.get("UnprocessedItems") not in ({}, None)
-            ):
+            if not isinstance(response, Mapping):
                 return False
+            unprocessed = response.get("UnprocessedItems")
+            if unprocessed not in ({}, None):
+                if not isinstance(unprocessed, Mapping) or any(
+                    not isinstance(items, list) or items for items in unprocessed.values()
+                ):
+                    return False
         return True
 
     def delete_schedule_partition(self, current: ScheduleSnapshot) -> bool:
         if not isinstance(current, ScheduleSnapshot):
             raise TypeError("schedule purge requires a snapshot")
         pk = f"SCHEDULE#{current.spec.schedule_id}"
-        response = self._client.query(
-            TableName=self._table_name,
-            KeyConditionExpression="PK = :pk",
-            ExpressionAttributeValues={":pk": {"S": pk}},
-            ProjectionExpression="PK, SK",
-            ConsistentRead=True,
-            Limit=1001,
-        )
-        items = response.get("Items") if isinstance(response, Mapping) else None
-        if (
-            not isinstance(items, list)
-            or response.get("LastEvaluatedKey") is not None
-            or len(items) > 1000
-        ):
-            return False
-        keys: list[dict[str, Any]] = []
         has_state = False
-        for item in items:
-            if not isinstance(item, Mapping) or set(item) != {"PK", "SK"}:
-                return False
-            item_pk = _attribute_string(item, "PK")
-            item_sk = _attribute_string(item, "SK")
-            if item_pk != pk or (
-                item_sk != "STATE" and not item_sk.startswith("OCCURRENCE#")
-            ):
-                return False
-            has_state = has_state or item_sk == "STATE"
-            keys.append({"PK": {"S": item_pk}, "SK": {"S": item_sk}})
-        keys.append(
-            {
-                "PK": {"S": f"USER#{current.spec.user_id}"},
-                "SK": {"S": f"SCHEDULE#{current.spec.schedule_id}"},
+        start_key = None
+        seen_pages: set[str] = set()
+        while True:
+            request = {
+                "TableName": self._table_name,
+                "KeyConditionExpression": "PK = :pk",
+                "ExpressionAttributeValues": {":pk": {"S": pk}},
+                "ProjectionExpression": "PK, SK",
+                "ConsistentRead": True,
+                "Limit": 1000,
             }
-        )
-        return has_state and self._delete_keys(keys)
+            if start_key is not None:
+                request["ExclusiveStartKey"] = start_key
+            response = self._client.query(**request)
+            items = response.get("Items") if isinstance(response, Mapping) else None
+            if not isinstance(items, list):
+                return False
+            occurrence_keys = []
+            for item in items:
+                if not isinstance(item, Mapping) or set(item) != {"PK", "SK"}:
+                    return False
+                item_pk = _attribute_string(item, "PK")
+                item_sk = _attribute_string(item, "SK")
+                if item_pk != pk or (
+                    item_sk != "STATE" and not item_sk.startswith("OCCURRENCE#")
+                ):
+                    return False
+                if item_sk == "STATE":
+                    has_state = True
+                else:
+                    occurrence_keys.append(
+                        {"PK": {"S": item_pk}, "SK": {"S": item_sk}}
+                    )
+            if occurrence_keys and not self._delete_keys(occurrence_keys):
+                return False
+            start_key = response.get("LastEvaluatedKey")
+            if start_key is None:
+                break
+            marker = json.dumps(start_key, sort_keys=True, separators=(",", ":"))
+            if marker in seen_pages:
+                return False
+            seen_pages.add(marker)
+        if not has_state:
+            return False
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Delete": {
+                            "TableName": self._table_name,
+                            "Key": self._schedule_key(current.spec.schedule_id),
+                            "ConditionExpression": (
+                                "recordJson = :record AND userId = :user"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":record": {
+                                    "S": _canonical_json(current.spec.to_mapping())
+                                },
+                                ":user": {"S": current.spec.user_id},
+                            },
+                        }
+                    },
+                    {
+                        "Delete": {
+                            "TableName": self._table_name,
+                            "Key": {
+                                "PK": {"S": f"USER#{current.spec.user_id}"},
+                                "SK": {"S": f"SCHEDULE#{current.spec.schedule_id}"},
+                            },
+                            "ConditionExpression": (
+                                "recordType = :owner AND scheduleId = :schedule"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":owner": {"S": "SCHEDULE_OWNER"},
+                                ":schedule": {"S": current.spec.schedule_id},
+                            },
+                        }
+                    },
+                ]
+            )
+            return True
+        except ClientError as error:
+            if _conditional(error):
+                return False
+            raise
 
     def delete_user_proposals(self, user_id: str) -> bool:
         if not isinstance(user_id, str) or _USER.fullmatch(user_id) is None:
             raise ValueError("proposal purge user is invalid")
-        response = self._client.query(
-            TableName=self._table_name,
-            KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
-            ExpressionAttributeValues={
-                ":pk": {"S": f"USER#{user_id}"},
-                ":prefix": {"S": "PROPOSAL#"},
-            },
-            ProjectionExpression="PK, SK",
-            ConsistentRead=True,
-            Limit=1001,
-        )
-        items = response.get("Items") if isinstance(response, Mapping) else None
-        if (
-            not isinstance(items, list)
-            or response.get("LastEvaluatedKey") is not None
-            or len(items) > 1000
-        ):
-            return False
-        keys: list[dict[str, Any]] = []
-        for item in items:
-            if not isinstance(item, Mapping) or set(item) != {"PK", "SK"}:
+        start_key = None
+        seen_pages: set[str] = set()
+        while True:
+            request = {
+                "TableName": self._table_name,
+                "KeyConditionExpression": "PK = :pk AND begins_with(SK, :prefix)",
+                "ExpressionAttributeValues": {
+                    ":pk": {"S": f"USER#{user_id}"},
+                    ":prefix": {"S": "PROPOSAL#"},
+                },
+                "ProjectionExpression": "PK, SK",
+                "ConsistentRead": True,
+                "Limit": 1000,
+            }
+            if start_key is not None:
+                request["ExclusiveStartKey"] = start_key
+            response = self._client.query(**request)
+            items = response.get("Items") if isinstance(response, Mapping) else None
+            if not isinstance(items, list):
                 return False
-            pk = _attribute_string(item, "PK")
-            sk = _attribute_string(item, "SK")
-            if (
-                pk != f"USER#{user_id}"
-                or not sk.startswith("PROPOSAL#")
-            ):
+            keys: list[dict[str, Any]] = []
+            for item in items:
+                if not isinstance(item, Mapping) or set(item) != {"PK", "SK"}:
+                    return False
+                pk = _attribute_string(item, "PK")
+                sk = _attribute_string(item, "SK")
+                if pk != f"USER#{user_id}" or not sk.startswith("PROPOSAL#"):
+                    return False
+                keys.append({"PK": {"S": pk}, "SK": {"S": sk}})
+            if keys and not self._delete_keys(keys):
                 return False
-            keys.append({"PK": {"S": pk}, "SK": {"S": sk}})
-        return self._delete_keys(keys)
+            start_key = response.get("LastEvaluatedKey")
+            if start_key is None:
+                break
+            marker = json.dumps(start_key, sort_keys=True, separators=(",", ":"))
+            if marker in seen_pages:
+                return False
+            seen_pages.add(marker)
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {"ConditionCheck": self._active_deletion_condition(user_id)},
+                    {
+                        "Delete": {
+                            "TableName": self._table_name,
+                            "Key": {
+                                "PK": {"S": f"USER#{user_id}"},
+                                "SK": {"S": _COUNTER_SK},
+                            },
+                        }
+                    }
+                ]
+            )
+            return True
+        except ClientError as error:
+            if _conditional(error):
+                return False
+            raise
 
 
 class DynamoScheduleApprovalAuthority:
@@ -1391,9 +1882,15 @@ class EventBridgeSchedulerAdapter:
             response.get("Name") != name
             or response.get("GroupName") != self._group_name
             or not isinstance(target, Mapping)
+            or set(target) != {"Arn", "RoleArn", "Input", "RetryPolicy"}
             or target.get("Arn") != self.ingress_function_arn
             or target.get("RoleArn") != self.invoke_role_arn
             or not isinstance(target.get("Input"), str)
+            or target.get("RetryPolicy")
+            != {
+                "MaximumEventAgeInSeconds": 60,
+                "MaximumRetryAttempts": 0,
+            }
         ):
             return "UNKNOWN"
         try:
@@ -1401,6 +1898,17 @@ class EventBridgeSchedulerAdapter:
         except (TypeError, ValueError):
             return "UNKNOWN"
         if payload.schedule_id != schedule_id:
+            return "UNKNOWN"
+        timestamp = datetime.fromtimestamp(
+            payload.fire_time, tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+        if (
+            response.get("ScheduleExpression") != f"at({timestamp})"
+            or response.get("ScheduleExpressionTimezone") != "UTC"
+            or response.get("FlexibleTimeWindow") != {"Mode": "OFF"}
+            or response.get("State") != "ENABLED"
+            or response.get("ActionAfterCompletion") != "DELETE"
+        ):
             return "UNKNOWN"
         if expected_payload is not None and payload.to_json() != expected_payload.to_json():
             return "UNKNOWN"
@@ -1447,14 +1955,16 @@ def build_control_service(
         raise RuntimeError("schedule control requires exact eu-west-1 region")
     dynamodb_client = _aws_client("dynamodb")
     catalog_digest = _required_env(env, "CAPABILITY_CATALOG_DIGEST")
+    capability_table_name = _required_env(env, "CAPABILITY_STATE_TABLE_NAME")
     repository = DynamoScheduleControlRepository(
         client=dynamodb_client,
         table_name=_required_env(env, "SCHEDULER_CONTROL_TABLE_NAME"),
+        capability_table_name=capability_table_name,
     )
     authority = DynamoScheduleApprovalAuthority(
         repository=DynamoAdmissionRepository(
             client=dynamodb_client,
-            table_name=_required_env(env, "CAPABILITY_STATE_TABLE_NAME"),
+            table_name=capability_table_name,
         ),
         catalog_digest=catalog_digest,
     )

@@ -200,7 +200,7 @@ class SchedulerStack(Stack):
             iam.PolicyStatement(
                 actions=[
                     "dynamodb:GetItem",
-                    "dynamodb:PutItem",
+                    "dynamodb:TransactWriteItems",
                 ],
                 resources=[self.control_table.table_arn],
             )
@@ -305,12 +305,20 @@ class SchedulerStack(Stack):
         )
         control_role.add_to_policy(
             iam.PolicyStatement(
+                actions=["dynamodb:TransactWriteItems"],
+                resources=[
+                    capability_state_table_arn,
+                    self.control_table.table_arn,
+                ],
+            )
+        )
+        control_role.add_to_policy(
+            iam.PolicyStatement(
                 actions=[
                     "dynamodb:GetItem",
                     "dynamodb:UpdateItem",
                     "dynamodb:Query",
                     "dynamodb:BatchWriteItem",
-                    "dynamodb:TransactWriteItems",
                 ],
                 resources=[self.control_table.table_arn],
             )

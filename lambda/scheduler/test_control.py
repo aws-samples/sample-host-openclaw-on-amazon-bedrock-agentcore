@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 
 import pytest
 from botocore.exceptions import ClientError
 
+from capabilities.retention import (
+    DELETION_FENCE_SCHEMA,
+    derive_deletion_subject_binding,
+    subject_partition_key,
+)
 from scheduler.conftest import DELIVERY_TARGET, reminder_definition
 from scheduler.models import SchedulePayloadV1, build_schedule_spec, derive_schedule_id
 from scheduler.proposals import (
+    PHYSICAL_RETENTION_SECONDS,
     ScheduleProposalRecordV1,
     build_cancel_schedule_proposal,
     build_create_schedule_proposal,
@@ -47,6 +54,7 @@ class MemoryControlRepository:
             for record in records
         }
         self.schedules = {}
+        self.orphan_schedule_ids = set()
         self.fail_next_finish = False
 
     def strong_read_proposal(self, *, user_id, proposal_ref):
@@ -95,6 +103,18 @@ class MemoryControlRepository:
         schedule["spec"] = cancelled
         return True
 
+    def stale_after_claim(self, snapshot, claimed, *, outcome, now, remove_schedule):
+        row = self.proposals[snapshot.record.proposal_id]
+        if row["state"] != "APPLYING" or row["version"] != snapshot.version + 1:
+            return False
+        if remove_schedule:
+            schedule = self.schedules.get(claimed.spec.schedule_id)
+            if schedule is None or schedule["spec"] != claimed.spec:
+                return False
+            del self.schedules[claimed.spec.schedule_id]
+        row.update(state="STALE", version=row["version"] + 1, outcome=outcome)
+        return True
+
     def finish_proposal(self, snapshot, *, status, outcome, now):
         if self.fail_next_finish:
             self.fail_next_finish = False
@@ -121,6 +141,16 @@ class MemoryControlRepository:
             for row in self.schedules.values()
             if row["spec"].user_id == user_id
         )
+
+    def list_user_schedule_orphans(self, user_id):
+        assert user_id == "user_a1"
+        return tuple(sorted(self.orphan_schedule_ids))
+
+    def delete_orphan_owner(self, *, user_id, schedule_id):
+        if user_id != "user_a1" or schedule_id not in self.orphan_schedule_ids:
+            return False
+        self.orphan_schedule_ids.remove(schedule_id)
+        return True
 
     def fence_schedule_for_purge(self, current, *, now):
         row = self.schedules.get(current.spec.schedule_id)
@@ -174,7 +204,10 @@ class ObservedProvider:
 
     def delete_schedule(self, *, schedule_id):
         # Cancellation generation fence must precede provider deletion.
-        assert self.repository.schedules[schedule_id]["spec"].state == "CANCELLED"
+        if schedule_id in self.repository.schedules:
+            assert self.repository.schedules[schedule_id]["spec"].state == "CANCELLED"
+        else:
+            assert schedule_id in self.repository.orphan_schedule_ids
         self.deleted.append(schedule_id)
         if self.delete_error is not None:
             raise self.delete_error
@@ -473,6 +506,37 @@ def test_live_authority_is_rechecked_immediately_before_schedule_effect():
     assert provider.created == provider.deleted == []
 
 
+@pytest.mark.parametrize("race", ["authority", "expiry"])
+def test_authority_or_expiry_race_after_claim_is_durably_stale_without_provider_call(
+    race,
+):
+    record = create_record()
+    calls = {"authority": 0, "clock": 0}
+
+    def authority(_user_id, _operation_id):
+        calls["authority"] += 1
+        if race == "authority" and calls["authority"] == 2:
+            raise RuntimeError("deletion fence became active")
+
+    def clock():
+        calls["clock"] += 1
+        if race == "expiry" and calls["clock"] >= 2:
+            return record.expires_at
+        return NOW
+
+    service, repository, provider = service_for(
+        record, clock=clock, authority_guard=authority
+    )
+
+    outcome = approve(service, record)
+
+    assert outcome.status == "STALE"
+    assert repository.proposals[record.proposal_id]["state"] == "STALE"
+    assert repository.schedules == {}
+    assert provider.created == provider.deleted == []
+    assert calls["authority"] == 2
+
+
 def test_account_purge_fences_live_schedules_then_deletes_all_user_records():
     record = create_record()
     service, repository, provider = service_for(record)
@@ -515,6 +579,17 @@ def test_account_purge_keeps_records_and_reports_remaining_on_uncertain_delete()
 
     assert repository.schedules[record.schedule_id]["spec"].state == "CANCELLED"
     assert record.proposal_id in repository.proposals
+
+
+def test_account_purge_observes_provider_absence_before_removing_orphan_owner():
+    record = create_record()
+    service, repository, provider = service_for(record)
+    repository.orphan_schedule_ids.add(record.schedule_id)
+
+    assert service.purge_user_schedules("user_a1") == 0
+
+    assert provider.deleted == [record.schedule_id]
+    assert repository.orphan_schedule_ids == set()
 
 
 def _proposal_item(record, *, state="PENDING", version=1, outcome=None):
@@ -593,7 +668,9 @@ def test_dynamo_repository_strong_reads_exact_shared_proposal_and_transacts_inte
     record = create_record()
     client = RecordingDynamo(_proposal_item(record))
     repository = DynamoScheduleControlRepository(
-        client=client, table_name="scheduler-control"
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
     )
 
     snapshot = repository.strong_read_proposal(
@@ -623,22 +700,122 @@ def test_dynamo_repository_strong_reads_exact_shared_proposal_and_transacts_inte
     ]
     writes = client.transactions[0]["TransactItems"]
     assert [set(write) for write in writes] == [
+        {"ConditionCheck"},
         {"Update"},
         {"Put"},
         {"Put"},
+        {"Update"},
     ]
-    assert writes[1]["Put"]["Item"]["recordJson"]["S"] == json.dumps(
+    deletion = writes[0]["ConditionCheck"]
+    deletion_binding = derive_deletion_subject_binding("user_a1")
+    assert deletion["TableName"] == "capability-state"
+    assert deletion["Key"] == {
+        "PK": {"S": subject_partition_key("user_a1")},
+        "SK": {"S": "DELETION"},
+    }
+    assert deletion["ConditionExpression"] == (
+        "#owner = :owner AND #record = :record"
+    )
+    assert deletion["ExpressionAttributeNames"] == {
+        "#owner": "ownerBinding",
+        "#record": "recordJson",
+    }
+    assert deletion["ExpressionAttributeValues"] == {
+        ":owner": {"S": deletion_binding},
+        ":record": {
+            "S": json.dumps(
+                {
+                    "schema": DELETION_FENCE_SCHEMA,
+                    "enabled": False,
+                    "subjectBinding": deletion_binding,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        },
+    }
+    claim = writes[1]["Update"]
+    assert "ttl > :liveAfter" in claim["ConditionExpression"]
+    assert claim["ExpressionAttributeValues"][":liveAfter"] == {
+        "N": str(
+            NOW
+            + PHYSICAL_RETENTION_SECONDS
+            - (record.expires_at - record.created_at)
+        )
+    }
+    assert writes[2]["Put"]["Item"]["recordJson"]["S"] == json.dumps(
         spec.to_mapping(), sort_keys=True, separators=(",", ":")
     )
-    assert writes[1]["Put"]["ConditionExpression"] == (
+    assert writes[2]["Put"]["ConditionExpression"] == (
         "attribute_not_exists(PK) AND attribute_not_exists(SK)"
     )
-    assert writes[2]["Put"]["Item"] == {
+    assert writes[3]["Put"]["Item"] == {
         "PK": {"S": "USER#user_a1"},
         "SK": {"S": f"SCHEDULE#{spec.schedule_id}"},
         "recordType": {"S": "SCHEDULE_OWNER"},
         "scheduleId": {"S": spec.schedule_id},
     }
+    counter = writes[4]["Update"]
+    assert counter["Key"] == {
+        "PK": {"S": "USER#user_a1"},
+        "SK": {"S": "CONTROL#SCHEDULE_COUNT"},
+    }
+    assert counter["ExpressionAttributeValues"][":max"] == {"N": "256"}
+    assert "liveCount < :max" in counter["ConditionExpression"]
+
+
+def test_dynamo_cancel_claim_atomically_checks_deletion_expires_and_decrements_live_count():
+    create = create_record()
+    record = cancel_record(create.schedule_id)
+    client = RecordingDynamo()
+    repository = DynamoScheduleControlRepository(
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
+    )
+    snapshot = ProposalSnapshot(record=record, state="PENDING", version=1, outcome=None)
+    current = ScheduleSnapshot(
+        spec=build_schedule_spec(
+            schedule_id=record.schedule_id,
+            user_id=record.user_id,
+            task_type="REMINDER",
+            definition=reminder_definition(),
+            revision=1,
+            state="ENABLED",
+        ),
+        delivery_target=DELIVERY_TARGET,
+    )
+    cancelled = ScheduleSnapshot(
+        spec=build_schedule_spec(
+            schedule_id=record.schedule_id,
+            user_id=record.user_id,
+            task_type="REMINDER",
+            definition=reminder_definition(),
+            revision=2,
+            state="CANCELLED",
+            next_run_at=None,
+        ),
+        delivery_target=DELIVERY_TARGET,
+    )
+
+    assert repository.claim_cancel(
+        snapshot, current, cancelled.spec, now=NOW
+    ) is True
+
+    writes = client.transactions[0]["TransactItems"]
+    assert [set(write) for write in writes] == [
+        {"ConditionCheck"},
+        {"Update"},
+        {"Update"},
+        {"Update"},
+    ]
+    assert writes[0]["ConditionCheck"]["TableName"] == "capability-state"
+    assert "ttl > :liveAfter" in writes[1]["Update"]["ConditionExpression"]
+    assert "ttl = :ttl" in writes[2]["Update"]["UpdateExpression"]
+    assert writes[3]["Update"]["Key"]["SK"] == {
+        "S": "CONTROL#SCHEDULE_COUNT"
+    }
+    assert "liveCount > :zero" in writes[3]["Update"]["ConditionExpression"]
 
 
 def test_dynamo_repository_rejects_extra_or_cross_tenant_proposal_fields():
@@ -646,7 +823,9 @@ def test_dynamo_repository_rejects_extra_or_cross_tenant_proposal_fields():
     poisoned = _proposal_item(record)
     poisoned["credential"] = {"S": "forbidden"}
     repository = DynamoScheduleControlRepository(
-        client=RecordingDynamo(poisoned), table_name="scheduler-control"
+        client=RecordingDynamo(poisoned),
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
     )
 
     with pytest.raises(Exception, match="proposal.*invalid"):
@@ -721,7 +900,9 @@ def test_dynamo_purge_uses_both_sparse_indexes_and_deletes_exact_partitions():
 
     client = PurgeDynamo()
     repository = DynamoScheduleControlRepository(
-        client=client, table_name="scheduler-control"
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
     )
 
     schedules = repository.list_user_schedules("user_a1")
@@ -740,11 +921,245 @@ def test_dynamo_purge_uses_both_sparse_indexes_and_deletes_exact_partitions():
     assert {
         (key["PK"]["S"], key["SK"]["S"]) for key in deleted_keys
     } == {
-        (f"SCHEDULE#{spec.schedule_id}", "STATE"),
         (f"SCHEDULE#{spec.schedule_id}", "OCCURRENCE#occ_12345678"),
-        ("USER#user_a1", f"SCHEDULE#{spec.schedule_id}"),
         ("USER#user_a1", f"PROPOSAL#{record.proposal_id}"),
     }
+    cleanup = client.transactions[0]["TransactItems"]
+    assert [set(item) for item in cleanup] == [{"Delete"}, {"Delete"}]
+    assert {
+        (
+            item["Delete"]["Key"]["PK"]["S"],
+            item["Delete"]["Key"]["SK"]["S"],
+        )
+        for item in cleanup
+    } == {
+        (f"SCHEDULE#{spec.schedule_id}", "STATE"),
+        ("USER#user_a1", f"SCHEDULE#{spec.schedule_id}"),
+    }
+    counter_cleanup = client.transactions[1]["TransactItems"]
+    assert [set(item) for item in counter_cleanup] == [
+        {"ConditionCheck"},
+        {"Delete"},
+    ]
+    active_deletion = counter_cleanup[0]["ConditionCheck"]
+    deletion_binding = derive_deletion_subject_binding("user_a1")
+    assert active_deletion["TableName"] == "capability-state"
+    assert active_deletion["Key"] == {
+        "PK": {"S": subject_partition_key("user_a1")},
+        "SK": {"S": "DELETION"},
+    }
+    assert active_deletion["ConditionExpression"] == (
+        "#owner = :owner AND #record = :record"
+    )
+    assert active_deletion["ExpressionAttributeNames"] == {
+        "#owner": "ownerBinding",
+        "#record": "recordJson",
+    }
+    assert active_deletion["ExpressionAttributeValues"] == {
+        ":owner": {"S": deletion_binding},
+        ":record": {
+            "S": json.dumps(
+                {
+                    "schema": DELETION_FENCE_SCHEMA,
+                    "enabled": True,
+                    "subjectBinding": deletion_binding,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        },
+    }
+    assert counter_cleanup[1]["Delete"]["Key"] == {
+        "PK": {"S": "USER#user_a1"},
+        "SK": {"S": "CONTROL#SCHEDULE_COUNT"},
+    }
+
+
+def test_dynamo_schedule_cleanup_never_deletes_state_or_owner_when_occurrence_batch_is_partial():
+    record = create_record()
+    spec = build_schedule_spec(
+        schedule_id=record.schedule_id,
+        user_id=record.user_id,
+        task_type="REMINDER",
+        definition=reminder_definition(),
+        revision=2,
+        state="CANCELLED",
+        next_run_at=None,
+    )
+
+    class PartialDynamo(RecordingDynamo):
+        def query(self, **_kwargs):
+            return {
+                "Items": [
+                    {
+                        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+                        "SK": {"S": "STATE"},
+                    },
+                    {
+                        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+                        "SK": {"S": "OCCURRENCE#occ_12345678"},
+                    },
+                ]
+            }
+
+        def batch_write_item(self, **kwargs):
+            request = kwargs["RequestItems"]["scheduler-control"]
+            return {"UnprocessedItems": {"scheduler-control": request}}
+
+    client = PartialDynamo()
+    repository = DynamoScheduleControlRepository(
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
+    )
+
+    assert repository.delete_schedule_partition(
+        ScheduleSnapshot(spec=spec, delivery_target=DELIVERY_TARGET)
+    ) is False
+    assert client.transactions == []
+
+
+def test_dynamo_orphan_cleanup_deletes_all_occurrences_before_owner():
+    schedule_id = "schedule_orphan_12345678"
+
+    class OrphanDynamo(RecordingDynamo):
+        def __init__(self):
+            super().__init__()
+            self.queries = []
+            self.batches = []
+
+        def query(self, **kwargs):
+            self.queries.append(kwargs)
+            return {
+                "Items": [
+                    {
+                        "PK": {"S": f"SCHEDULE#{schedule_id}"},
+                        "SK": {"S": "OCCURRENCE#occ_orphan_12345678"},
+                    }
+                ]
+            }
+
+        def batch_write_item(self, **kwargs):
+            self.batches.append(kwargs)
+            return {"UnprocessedItems": {}}
+
+    client = OrphanDynamo()
+    repository = DynamoScheduleControlRepository(
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
+    )
+
+    assert repository.delete_orphan_owner(
+        user_id="user_a1", schedule_id=schedule_id
+    ) is True
+
+    assert client.queries[0]["ConsistentRead"] is True
+    assert client.queries[0]["ExpressionAttributeValues"] == {
+        ":pk": {"S": f"SCHEDULE#{schedule_id}"}
+    }
+    assert client.batches[0]["RequestItems"]["scheduler-control"] == [
+        {
+            "DeleteRequest": {
+                "Key": {
+                    "PK": {"S": f"SCHEDULE#{schedule_id}"},
+                    "SK": {"S": "OCCURRENCE#occ_orphan_12345678"},
+                }
+            }
+        }
+    ]
+    writes = client.transactions[0]["TransactItems"]
+    assert writes[0]["ConditionCheck"]["ConditionExpression"] == (
+        "attribute_not_exists(PK)"
+    )
+    assert writes[1]["Delete"]["Key"] == {
+        "PK": {"S": "USER#user_a1"},
+        "SK": {"S": f"SCHEDULE#{schedule_id}"},
+    }
+
+
+def test_dynamo_orphan_cleanup_retains_owner_when_occurrence_batch_is_partial():
+    schedule_id = "schedule_orphan_12345678"
+
+    class PartialOrphanDynamo(RecordingDynamo):
+        def query(self, **_kwargs):
+            return {
+                "Items": [
+                    {
+                        "PK": {"S": f"SCHEDULE#{schedule_id}"},
+                        "SK": {"S": "OCCURRENCE#occ_orphan_12345678"},
+                    }
+                ]
+            }
+
+        def batch_write_item(self, **kwargs):
+            requests = kwargs["RequestItems"]["scheduler-control"]
+            return {"UnprocessedItems": {"scheduler-control": requests}}
+
+    client = PartialOrphanDynamo()
+    repository = DynamoScheduleControlRepository(
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
+    )
+
+    assert repository.delete_orphan_owner(
+        user_id="user_a1", schedule_id=schedule_id
+    ) is False
+    assert client.transactions == []
+
+
+def test_dynamo_proposal_purge_paginates_without_a_total_record_bound():
+    class PaginatedDynamo(RecordingDynamo):
+        def __init__(self):
+            super().__init__()
+            self.queries = []
+            self.batches = []
+
+        def query(self, **kwargs):
+            self.queries.append(kwargs)
+            page = len(self.queries)
+            item = {
+                "PK": {"S": "USER#user_a1"},
+                "SK": {"S": f"PROPOSAL#proposal_page_{page:08d}"},
+            }
+            if page == 1:
+                return {
+                    "Items": [item],
+                    "LastEvaluatedKey": {
+                        "PK": {"S": "USER#user_a1"},
+                        "SK": item["SK"],
+                    },
+                }
+            return {"Items": [item]}
+
+        def batch_write_item(self, **kwargs):
+            self.batches.append(kwargs)
+            return {"UnprocessedItems": {}}
+
+    client = PaginatedDynamo()
+    repository = DynamoScheduleControlRepository(
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
+    )
+
+    assert repository.delete_user_proposals("user_a1") is True
+
+    assert len(client.queries) == 2
+    assert client.queries[1]["ExclusiveStartKey"] == {
+        "PK": {"S": "USER#user_a1"},
+        "SK": {"S": "PROPOSAL#proposal_page_00000001"},
+    }
+    deleted = [
+        request["DeleteRequest"]["Key"]["SK"]["S"]
+        for batch in client.batches
+        for request in batch["RequestItems"]["scheduler-control"]
+    ]
+    assert deleted == [
+        "PROPOSAL#proposal_page_00000001",
+        "PROPOSAL#proposal_page_00000002",
+    ]
 
 
 class RecordingSchedulerClient:
@@ -832,6 +1247,11 @@ def test_eventbridge_observation_requires_matching_opaque_target_or_not_found():
     client.get_response = {
         "Name": name,
         "GroupName": "personal-operator-v1",
+        "ScheduleExpression": "at(2027-01-15T08:10:00)",
+        "ScheduleExpressionTimezone": "UTC",
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "State": "ENABLED",
+        "ActionAfterCompletion": "DELETE",
         "Target": {
             "Arn": adapter.ingress_function_arn,
             "RoleArn": adapter.invoke_role_arn,
@@ -840,6 +1260,10 @@ def test_eventbridge_observation_requires_matching_opaque_target_or_not_found():
                 generation=1,
                 fire_time=NOW + 600,
             ).to_json(),
+            "RetryPolicy": {
+                "MaximumEventAgeInSeconds": 60,
+                "MaximumRetryAttempts": 0,
+            },
         },
     }
     expected = SchedulePayloadV1(
@@ -850,6 +1274,31 @@ def test_eventbridge_observation_requires_matching_opaque_target_or_not_found():
     assert adapter.observe_schedule(
         schedule_id=record.schedule_id, expected_payload=expected
     ) == "PRESENT"
+
+    valid = deepcopy(client.get_response)
+    poisoned = []
+    for path, value in (
+        (("ScheduleExpression",), "rate(1 minute)"),
+        (("ScheduleExpressionTimezone",), "Europe/London"),
+        (("FlexibleTimeWindow",), {"Mode": "FLEXIBLE", "MaximumWindowInMinutes": 1}),
+        (("State",), "DISABLED"),
+        (("ActionAfterCompletion",), "NONE"),
+        (("Target", "RetryPolicy", "MaximumEventAgeInSeconds"), 61),
+        (("Target", "RetryPolicy", "MaximumRetryAttempts"), 1),
+    ):
+        candidate = deepcopy(valid)
+        cursor = candidate
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = value
+        poisoned.append(candidate)
+    for candidate in poisoned:
+        client.get_response = candidate
+        assert adapter.observe_schedule(
+            schedule_id=record.schedule_id, expected_payload=expected
+        ) == "UNKNOWN"
+
+    client.get_response = deepcopy(valid)
     client.get_response["Target"]["Input"] = SchedulePayloadV1(
         schedule_id=record.schedule_id,
         generation=2,
