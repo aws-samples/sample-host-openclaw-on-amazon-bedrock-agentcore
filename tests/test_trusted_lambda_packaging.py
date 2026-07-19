@@ -128,7 +128,12 @@ def _packaging_subprocess_fixture(
     (repository / "release_tools").mkdir()
     (repository / "scripts" / SCRIPT.name).write_bytes(SCRIPT.read_bytes())
     (repository / "scripts" / SCRIPT.name).chmod(0o755)
-    for name in ("__init__.py", "contracts.py", "lambda_asset.py"):
+    for name in (
+        "__init__.py",
+        "contracts.py",
+        "lambda_asset.py",
+        "lambda_image.py",
+    ):
         source = ROOT / "release_tools" / name
         (repository / "release_tools" / name).write_bytes(source.read_bytes())
     (repository / "lambda" / "requirements.txt").write_bytes(
@@ -324,6 +329,44 @@ raise SystemExit(0)
     return repository, environment, log
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "ID=amzn\nVERSION_ID=2023\n",
+        'NAME="Amazon Linux"\nID="amzn"\nVERSION_ID="2023"\n',
+    ],
+)
+def test_lambda_builder_os_release_parser_accepts_only_exact_amazon_linux_2023(
+    metadata: str,
+) -> None:
+    from release_tools.lambda_image import validate_amazon_linux_2023
+
+    assert validate_amazon_linux_2023(metadata) is None
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "ID=ubuntu\nVERSION_ID=2023\n",
+        "ID=amzn\nVERSION_ID=2022\n",
+        "ID=amzn\nID=amzn\nVERSION_ID=2023\n",
+        'ID="amzn\nVERSION_ID=2023\n',
+        'ID=amzn\nVERSION_ID=2023"\n',
+        'ID=""amzn""\nVERSION_ID=2023\n',
+        "ID=amzn\n",
+        "VERSION_ID=2023\n",
+    ],
+)
+def test_lambda_builder_os_release_parser_rejects_malformed_or_wrong_metadata(
+    metadata: str,
+) -> None:
+    from release_tools.lambda_image import LambdaImageValidationError
+    from release_tools.lambda_image import validate_amazon_linux_2023
+
+    with pytest.raises(LambdaImageValidationError):
+        validate_amazon_linux_2023(metadata)
+
+
 def _run_packaging_build(
     repository: pathlib.Path, environment: dict[str, str]
 ) -> subprocess.CompletedProcess[str]:
@@ -361,17 +404,20 @@ def test_build_executes_only_the_immutable_lambda_313_arm64_boundary(
         record
         for record in records
         if record["argv"][:1] == ["run"]
-        and "os_fields" in " ".join(str(value) for value in record["argv"])
+        and "validate_lambda_builder_environment"
+        in " ".join(str(value) for value in record["argv"])
     )
     assert "--platform" in platform_probe["argv"]
     assert platform_probe["argv"][platform_probe["argv"].index("--platform") + 1] == (
         "linux/arm64"
     )
     probe_program = " ".join(str(value) for value in platform_probe["argv"])
-    assert "sys.version_info[:2] == (3, 13)" in probe_program
-    assert 'os_fields.get("ID") == "amzn"' in probe_program
-    assert 'os_fields.get("VERSION_ID") == "2023"' in probe_program
-    assert ".strip(chr(34))" in probe_program
+    assert "validate_lambda_builder_environment" in probe_program
+    assert any(
+        str(value).endswith(":/workspace:ro")
+        for value in platform_probe["argv"]
+    )
+    assert "PYTHONPATH=/workspace" in platform_probe["argv"]
 
 
 def test_container_commands_do_not_forward_credentials_or_invoke_deploy(

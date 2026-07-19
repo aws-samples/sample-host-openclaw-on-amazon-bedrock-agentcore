@@ -75,21 +75,12 @@ pull_and_validate_image() {
     --env AWS_REGION=eu-west-1 \
     --env IDENTITY_TABLE_NAME=packaging-placeholder \
     --env HOME=/tmp \
+    --env PYTHONPATH=/workspace \
+    --volume "${REPO_ROOT}:/workspace:ro" \
     --entrypoint /var/lang/bin/python3.13 \
     "${image_ref}" -c \
-    'import pathlib, platform, sys
-assert sys.version_info[:2] == (3, 13), sys.version
-assert platform.machine() in {"aarch64", "arm64"}, platform.machine()
-os_release = pathlib.Path("/etc/os-release").read_text(encoding="utf-8")
-os_fields = {}
-for raw in os_release.splitlines():
-    key, separator, value = raw.partition("=")
-    if not separator:
-        continue
-    assert key and key not in os_fields, os_release
-    os_fields[key] = value.strip().strip(chr(34))
-assert os_fields.get("ID") == "amzn", os_release
-assert os_fields.get("VERSION_ID") == "2023", os_release' \
+    'from release_tools.lambda_image import validate_lambda_builder_environment
+validate_lambda_builder_environment()' \
     >/dev/null || die "Docker cannot execute the required Lambda ARM64 platform"
 }
 
