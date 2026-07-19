@@ -139,7 +139,9 @@ The shim rejects `PYTHON` overrides and group/world-writable interpreters,
 pins `PATH` before resolving its own location, starts that checkout-local
 interpreter with `-I`, and the Python entrypoint refuses non-isolated startup.
 The integration worktree does not create this environment automatically; it
-is an explicit predeploy prerequisite. Invoke a real evidence run through
+is an explicit predeploy prerequisite. `requirements.txt` pins Boto3 with its
+CRT extra because the SDK `aws login` provider requires that dependency.
+Invoke a real evidence run through
 `/usr/bin/env -u BASH_ENV ./scripts/deploy.sh ...` so noninteractive Bash does
 not load an ambient startup file before the shim can enforce its checks. The
 CLI surface is:

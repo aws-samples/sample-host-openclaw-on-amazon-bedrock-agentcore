@@ -412,6 +412,12 @@ def test_deploy_shim_pins_path_before_resolving_its_own_location(
     assert "python environment is missing" in completed.stderr.casefold()
 
 
+def test_release_environment_declares_login_capable_boto3() -> None:
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+    assert "boto3[crt]==1.43.50" in requirements.splitlines()
+
+
 def test_cli_preflight_executes_exact_git_identity_checks_without_aws(
     tmp_path: Path,
 ) -> None:

@@ -101,14 +101,14 @@ The inventory was generated twice into independent temporary directories:
 The two trees were byte-identical and contained no repository or home-directory
 absolute path.
 
-- CycloneDX 1.5 components: 220
+- CycloneDX 1.5 components: 221
 - npm lock records: 177
-- Python records: 43
-- license `NOASSERTION`: 43, all Python records
+- Python records: 44
+- license `NOASSERTION`: 44, all Python records
 - `personal-operator.cdx.json` SHA-256:
-  `d659119fba053a6e0bc2b433b097c66205f52dd419bc281feca190ec2644b621`
+  `577c8d76b4a41b588686978f9f68b58c3e6225769df470a9fcaa3ee966dbe28e`
 - `dependency-licenses.csv` SHA-256:
-  `2fa2efb09245e447cf2145d74011422109e6dc5fd54293039b3a3390f494b656`
+  `d3f0bd8765c5573ef80e73328d114609e1f9d9dcbe7f08942faeb4751da5a000`
 
 This is a source/lock inventory, not a final runtime-image SBOM. It covers the
 hash-locked Lambda Python dependency tree and npm lock records. The separate v2

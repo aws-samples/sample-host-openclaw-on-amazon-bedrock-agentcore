@@ -75,8 +75,8 @@ crash-safety and immutable-subject invariants.
   `GIT_*` redirection.
 - Account discovery, the mutation child, and the SDK observer use one exact
   sanitized credential environment. Fixed login-user AWS config and login
-  cache paths support a prior user-run `aws login` without accepting ambient
-  alternate credential paths.
+  cache paths plus the declared Boto3 CRT dependency support a prior user-run
+  `aws login` without accepting ambient alternate credential paths.
 - SDK endpoint overrides and ambient SDK proxies are disabled. Artifact reads
   use an explicit proxy-free HTTPS opener/context, and account discovery uses a
   validated absolute AWS CLI path rather than ambient `PATH`.
