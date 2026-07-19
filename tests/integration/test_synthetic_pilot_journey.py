@@ -797,6 +797,25 @@ class NoApprovals:
     reject = preview
 
 
+class NoScheduleControl:
+    def preview(self, **_request):
+        raise AssertionError("this synthetic journey has no schedule proposal")
+
+    approve = preview
+    reject = preview
+    reconcile = preview
+
+    @staticmethod
+    def purge_user_schedules(_user_id):
+        return 0
+
+
+class SyntheticDeletionAuthority:
+    @staticmethod
+    def establish_deletion_fence(_user_id):
+        return True
+
+
 class NoRetention:
     def sweep(self):
         raise AssertionError("synthetic journey does not run retention")
@@ -1324,13 +1343,16 @@ def test_three_isolated_pilots_complete_provider_free_read_only_journey(
         gmail_workspace=gmail_workspace,
         scans=measurements,
     )
+    schedule_control = NoScheduleControl()
     deletion = DeletionCoordinator(
         session_store=store,
+        authority_fence=SyntheticDeletionAuthority(),
         connection_store=connections,
         runtime_driver=SyntheticRuntime(state),
         workspace_store=workspace,
         record_store=measurements,
         footprint_store=SyntheticPurgePort(state, "footprint"),
+        schedule_store=schedule_control,
         clock_ms=lambda: store.now_ms,
     )
     web = WebApplication(
@@ -1347,6 +1369,7 @@ def test_three_isolated_pilots_complete_provider_free_read_only_journey(
         overview=overview,
         connections=connections,
         scans=measurements,
+        schedule_control=schedule_control,
         web_origin=ORIGIN,
         google_redirect_uri=f"{ORIGIN}/oauth/google/callback",
     )

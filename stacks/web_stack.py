@@ -74,6 +74,7 @@ class WebStack(Stack):
         runtime_arn: str,
         runtime_iam_arn: str,
         runtime_endpoint_name: str,
+        scheduler_control_function_arn: str,
         trusted_code_asset_root: str,
         trusted_code_asset_hash: str | None = None,
         web_asset_root: str,
@@ -129,6 +130,22 @@ class WebStack(Stack):
             )
         if not isinstance(cmk_arn, str) or not cmk_arn:
             raise ValueError("cmk_arn is required")
+        scheduler_control_pattern = (
+            rf"arn:aws:lambda:{re.escape(region)}:{re.escape(account)}:"
+            r"function:personal-operator-scheduler-control"
+        )
+        if (
+            not isinstance(scheduler_control_function_arn, str)
+            or not scheduler_control_function_arn
+            or (
+                not Token.is_unresolved(scheduler_control_function_arn)
+                and re.fullmatch(
+                    scheduler_control_pattern, scheduler_control_function_arn
+                )
+                is None
+            )
+        ):
+            raise ValueError("scheduler control function ARN is invalid")
         runtime_values = (runtime_arn, runtime_iam_arn, runtime_endpoint_name)
         if runtime_values == ("PLACEHOLDER", "PLACEHOLDER", "PLACEHOLDER"):
             pass
@@ -399,6 +416,7 @@ class WebStack(Stack):
             "CONTROL_TABLE_NAME": self.control_table.table_name,
             "RUNTIME_STATE_TABLE_NAME": runtime_state_table.table_name,
             "CAPABILITY_STATE_TABLE_NAME": capability_state_table.table_name,
+            "SCHEDULER_CONTROL_FUNCTION_ARN": scheduler_control_function_arn,
             "IDENTITY_TABLE_NAME": identity_table.table_name,
             "MESSAGE_LEDGER_TABLE_NAME": message_ledger_table.table_name,
             "USER_FILES_BUCKET_NAME": user_files_bucket.bucket_name,
@@ -554,6 +572,19 @@ class WebStack(Stack):
                 apigwv2.HttpMethod.POST,
             ),
             ("/api/scans/{scan}/feedback", apigwv2.HttpMethod.POST),
+            ("/api/schedule-proposals/{proposal}", apigwv2.HttpMethod.GET),
+            (
+                "/api/schedule-proposals/{proposal}/approve",
+                apigwv2.HttpMethod.POST,
+            ),
+            (
+                "/api/schedule-proposals/{proposal}/reject",
+                apigwv2.HttpMethod.POST,
+            ),
+            (
+                "/api/schedule-proposals/{proposal}/reconcile",
+                apigwv2.HttpMethod.POST,
+            ),
         )
         for route_path, method in route_contract:
             self.http_api.add_routes(
@@ -777,8 +808,20 @@ class WebStack(Stack):
         # never invoke an AgentCore runtime.
         self.web_fn.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["dynamodb:GetItem"],
+                actions=[
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:Query",
+                    "dynamodb:TransactWriteItems",
+                    "dynamodb:UpdateItem",
+                ],
                 resources=[capability_state_table.table_arn],
+            )
+        )
+        self.web_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["lambda:InvokeFunction"],
+                resources=[scheduler_control_function_arn],
             )
         )
         self.web_fn.add_to_role_policy(

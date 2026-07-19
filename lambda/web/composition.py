@@ -29,6 +29,7 @@ from actions.models import CapabilityDenied
 from actions.reconcile import GmailEffectReconciler
 from actions.repository import DynamoActionRepository
 from actions.state_machine import ActionStateMachine, ApprovalService, ApprovalTokenCodec
+from capabilities.retention import DynamoCapabilityDeletionAdapter
 from router.runtime_driver import (
     AgentCoreAdapter,
     NoWorkspaceCapabilitySigner,
@@ -68,6 +69,7 @@ from .index import WebApplication
 from .measurements import DynamoScanMeasurements
 from .overview import DynamoConnectionLifecycle, PilotOverviewService
 from .retention import DeletionCoordinator
+from .schedule_control import LambdaScheduleControlClient
 from .services import ApprovalWebService, RetentionSweepService, WorkspaceService
 from .stores import DynamoOAuthStateStore, DynamoWebStore
 
@@ -820,6 +822,10 @@ def build_production_application() -> WebApplication:
 
     no_retries = Config(retries={"max_attempts": 0})
     dynamodb = boto3.resource("dynamodb", region_name=region, config=no_retries)
+    dynamodb_client = boto3.client(
+        "dynamodb", region_name=region, config=no_retries
+    )
+    lambda_client = boto3.client("lambda", region_name=region, config=no_retries)
     secrets = boto3.client(
         "secretsmanager", region_name=region, config=no_retries
     )
@@ -986,20 +992,34 @@ def build_production_application() -> WebApplication:
         control_table,
         identity_key=web_secret,
     )
+    schedule_control = LambdaScheduleControlClient(
+        client=lambda_client,
+        function_arn=_required("SCHEDULER_CONTROL_FUNCTION_ARN"),
+    )
+    capability_deletion = DynamoCapabilityDeletionAdapter(
+        client=dynamodb_client,
+        table_name=_required("CAPABILITY_STATE_TABLE_NAME"),
+    )
     deletion = DeletionCoordinator(
         session_store=web_store,
+        authority_fence=capability_deletion,
         connection_store=CompositeConnectionRevoker(
             KernelConnectionRevoker(gmail_control_kernel),
             record_store,
         ),
         runtime_driver=runtime_driver,
         workspace_store=deletion_workspace_store,
-        record_store=CompositeUserRecordDeleter(record_store, scans),
+        record_store=CompositeUserRecordDeleter(
+            record_store,
+            scans,
+            capability_deletion,
+        ),
         footprint_store=DynamoUserFootprintStore(
             control_table=control_table,
             identity_table=identity_table,
             message_ledger_table=message_ledger_table,
         ),
+        schedule_store=schedule_control,
     )
     portable_source = _ExportSource(
         records=record_store,
@@ -1047,6 +1067,7 @@ def build_production_application() -> WebApplication:
         overview=overview,
         connections=connections,
         scans=scans,
+        schedule_control=schedule_control,
         web_origin=web_origin,
         google_redirect_uri=redirect_uri,
     )

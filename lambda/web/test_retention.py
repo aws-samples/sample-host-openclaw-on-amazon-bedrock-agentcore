@@ -68,6 +68,18 @@ class Recorder:
         return called
 
 
+class SilentDeletionAuthority:
+    @staticmethod
+    def establish_deletion_fence(_user_id):
+        return True
+
+
+class SilentScheduleStore:
+    @staticmethod
+    def purge_user_schedules(_user_id):
+        return 0
+
+
 class DeletionSessionRecorder:
     def __init__(self, events, clock):
         self.events = events
@@ -356,6 +368,7 @@ def test_deletion_persists_intent_then_revokes_authority_before_runtime_and_data
     clock = [1_000_000]
     coordinator = DeletionCoordinator(
         session_store=DeletionSessionRecorder(events, clock),
+        authority_fence=Recorder(events, "authority", result=True),
         connection_store=Recorder(events, "connections"),
         runtime_driver=Recorder(
             events,
@@ -370,6 +383,7 @@ def test_deletion_persists_intent_then_revokes_authority_before_runtime_and_data
         workspace_store=Recorder(events, "workspace"),
         record_store=Recorder(events, "records"),
         footprint_store=Recorder(events, "footprint"),
+        schedule_store=Recorder(events, "schedules", result=0),
         clock_ms=lambda: clock[0],
     )
 
@@ -378,8 +392,10 @@ def test_deletion_persists_intent_then_revokes_authority_before_runtime_and_data
 
     assert [(name, method) for name, method, _, _ in events] == [
         ("sessions", "begin_deletion"),
+        ("authority", "establish_deletion_fence"),
         ("sessions", "revoke_all"),
         ("connections", "revoke_all"),
+        ("schedules", "purge_user_schedules"),
         ("runtime", "purge"),
         ("workspace", "delete_namespace"),
         ("records", "delete_user_records"),
@@ -391,14 +407,66 @@ def test_deletion_persists_intent_then_revokes_authority_before_runtime_and_data
     result = coordinator.reconcile(USER)
 
     assert result == {"status": "deleted", "userId": USER}
-    assert [(name, method) for name, method, _, _ in events][-7:] == [
+    assert [(name, method) for name, method, _, _ in events][-9:] == [
+        ("authority", "establish_deletion_fence"),
         ("sessions", "revoke_all"),
         ("connections", "revoke_all"),
+        ("schedules", "purge_user_schedules"),
         ("runtime", "purge"),
         ("workspace", "delete_namespace"),
         ("records", "delete_user_records"),
         ("footprint", "delete_user_records"),
         ("sessions", "complete_deletion"),
+    ]
+
+
+def test_unproven_capability_deletion_fence_blocks_every_other_revocation_and_purge():
+    events = []
+    coordinator = DeletionCoordinator(
+        session_store=DeletionSessionRecorder(events, [1_000_000]),
+        authority_fence=Recorder(
+            events,
+            "authority",
+            error=TimeoutError("fence response was lost"),
+        ),
+        connection_store=Recorder(events, "connections"),
+        runtime_driver=Recorder(events, "runtime"),
+        workspace_store=Recorder(events, "workspace"),
+        record_store=Recorder(events, "records"),
+        footprint_store=Recorder(events, "footprint"),
+        schedule_store=Recorder(events, "schedules", result=0),
+        clock_ms=lambda: 1_000_000,
+    )
+
+    with pytest.raises(DeletionPending):
+        coordinator.delete(USER)
+
+    assert [(name, method) for name, method, _, _ in events] == [
+        ("sessions", "begin_deletion"),
+        ("authority", "establish_deletion_fence"),
+    ]
+
+
+def test_capability_deletion_fence_requires_an_exact_positive_proof():
+    events = []
+    coordinator = DeletionCoordinator(
+        session_store=DeletionSessionRecorder(events, [1_000_000]),
+        authority_fence=Recorder(events, "authority", result=False),
+        connection_store=Recorder(events, "connections"),
+        runtime_driver=Recorder(events, "runtime"),
+        workspace_store=Recorder(events, "workspace"),
+        record_store=Recorder(events, "records"),
+        footprint_store=Recorder(events, "footprint"),
+        schedule_store=Recorder(events, "schedules", result=0),
+        clock_ms=lambda: 1_000_000,
+    )
+
+    with pytest.raises(DeletionPending):
+        coordinator.delete(USER)
+
+    assert [(name, method) for name, method, _, _ in events] == [
+        ("sessions", "begin_deletion"),
+        ("authority", "establish_deletion_fence"),
     ]
 
 
@@ -414,11 +482,13 @@ def test_uncertain_runtime_purge_keeps_workspace_and_records_for_reconciliation(
     clock = [1_000_000]
     coordinator = DeletionCoordinator(
         session_store=DeletionSessionRecorder(events, clock),
+        authority_fence=SilentDeletionAuthority(),
         connection_store=Recorder(events, "connections"),
         runtime_driver=Recorder(events, "runtime", error=TimeoutError("unknown")),
         workspace_store=Recorder(events, "workspace"),
         record_store=Recorder(events, "records"),
         footprint_store=Recorder(events, "footprint"),
+        schedule_store=SilentScheduleStore(),
         clock_ms=lambda: clock[0],
     )
 
@@ -462,11 +532,13 @@ def test_deletion_intent_precedes_and_survives_first_fallible_revocation_failure
 
     coordinator = DeletionCoordinator(
         session_store=IntentThenFail(),
+        authority_fence=SilentDeletionAuthority(),
         connection_store=Recorder(events, "connections"),
         runtime_driver=Recorder(events, "runtime"),
         workspace_store=Recorder(events, "workspace"),
         record_store=Recorder(events, "records"),
         footprint_store=Recorder(events, "footprint"),
+        schedule_store=SilentScheduleStore(),
         clock_ms=lambda: 1_000_000,
     )
 
@@ -495,6 +567,7 @@ def test_finalization_removes_a_write_that_lands_after_the_first_purge():
     footprint = Records()
     coordinator = DeletionCoordinator(
         session_store=sessions,
+        authority_fence=SilentDeletionAuthority(),
         connection_store=Recorder(events, "connections"),
         runtime_driver=Recorder(
             events,
@@ -509,6 +582,7 @@ def test_finalization_removes_a_write_that_lands_after_the_first_purge():
         workspace_store=Recorder(events, "workspace"),
         record_store=records,
         footprint_store=footprint,
+        schedule_store=SilentScheduleStore(),
         clock_ms=lambda: clock[0],
     )
 
@@ -562,11 +636,13 @@ def test_inactive_expiry_deletes_only_workspace_then_resets_runtime_for_return()
 
     coordinator = DeletionCoordinator(
         session_store=Recorder(events, "sessions"),
+        authority_fence=SilentDeletionAuthority(),
         connection_store=Recorder(events, "connections"),
         runtime_driver=RuntimeExpiry(),
         workspace_store=Recorder(events, "workspace"),
         record_store=Recorder(events, "records"),
         footprint_store=Recorder(events, "footprint"),
+        schedule_store=SilentScheduleStore(),
     )
 
     result = coordinator.delete_inactive(
@@ -594,11 +670,13 @@ def test_inactive_deletion_race_preserves_all_authority_and_data():
     events = []
     coordinator = DeletionCoordinator(
         session_store=Recorder(events, "sessions"),
+        authority_fence=SilentDeletionAuthority(),
         connection_store=Recorder(events, "connections"),
         runtime_driver=Recorder(events, "runtime", result=None),
         workspace_store=Recorder(events, "workspace"),
         record_store=Recorder(events, "records"),
         footprint_store=Recorder(events, "footprint"),
+        schedule_store=SilentScheduleStore(),
     )
 
     result = coordinator.delete_inactive(

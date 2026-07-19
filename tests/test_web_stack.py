@@ -26,6 +26,10 @@ RUNTIME_IAM_ARN = (
     "runtime/personal_operator-0123456789"
 )
 RELEASE_ENDPOINT = "release_" + "a" * 40
+SCHEDULER_CONTROL_ARN = (
+    "arn:aws:lambda:eu-west-1:123456789012:function:"
+    "personal-operator-scheduler-control"
+)
 
 
 def _resources(template: dict, resource_type: str) -> list[dict]:
@@ -153,6 +157,7 @@ def _synth_web_template(
         runtime_arn=RUNTIME_ARN,
         runtime_iam_arn=RUNTIME_IAM_ARN,
         runtime_endpoint_name=RELEASE_ENDPOINT,
+        scheduler_control_function_arn=SCHEDULER_CONTROL_ARN,
         trusted_code_asset_root="lambda",
         web_asset_root="tests/fixtures/web-dist",
         founder_user_ids=founder_user_ids,
@@ -188,13 +193,14 @@ def test_web_stack_rejects_every_region_except_eu_west_1() -> None:
             runtime_arn=RUNTIME_ARN,
             runtime_iam_arn=RUNTIME_IAM_ARN,
             runtime_endpoint_name=RELEASE_ENDPOINT,
+            scheduler_control_function_arn=SCHEDULER_CONTROL_ARN,
             trusted_code_asset_root="lambda",
             web_asset_root="tests/fixtures/web-dist",
             env=cdk.Environment(account="123456789012", region="us-east-1"),
         )
 
 
-def test_web_export_reads_capability_installations_without_write_authority() -> None:
+def test_web_capability_deletion_has_only_exact_table_authority() -> None:
     template = _synth_web_template()
     web_function = next(
         resource
@@ -204,6 +210,7 @@ def test_web_export_reads_capability_installations_without_write_authority() -> 
     )
     environment = web_function["Properties"]["Environment"]["Variables"]
     assert environment["CAPABILITY_STATE_TABLE_NAME"]
+    assert environment["SCHEDULER_CONTROL_FUNCTION_ARN"] == SCHEDULER_CONTROL_ARN
 
     capability_statements = [
         statement
@@ -211,7 +218,13 @@ def test_web_export_reads_capability_installations_without_write_authority() -> 
         if "CapabilityState" in repr(statement.get("Resource"))
     ]
     assert len(capability_statements) == 1
-    assert capability_statements[0]["Action"] == "dynamodb:GetItem"
+    assert set(capability_statements[0]["Action"]) == {
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:Query",
+        "dynamodb:TransactWriteItems",
+        "dynamodb:UpdateItem",
+    }
 
 
 def test_static_site_is_private_encrypted_and_cloudfront_only() -> None:
@@ -386,7 +399,7 @@ def test_synthesis_reads_the_explicit_web_asset_root_not_an_untracked_build() ->
     assert 'Path("web/dist/index.html")' not in source
 
 
-def test_http_api_exposes_only_the_seventeen_trusted_control_routes() -> None:
+def test_http_api_exposes_only_the_twenty_one_trusted_control_routes() -> None:
     template = _synth_web_template()
     routes = {
         route["Properties"]["RouteKey"]
@@ -411,6 +424,10 @@ def test_http_api_exposes_only_the_seventeen_trusted_control_routes() -> None:
         "POST /api/delete",
         "POST /api/connections/google-gmail-readonly/disconnect",
         "POST /api/scans/{scan}/feedback",
+        "GET /api/schedule-proposals/{proposal}",
+        "POST /api/schedule-proposals/{proposal}/approve",
+        "POST /api/schedule-proposals/{proposal}/reject",
+        "POST /api/schedule-proposals/{proposal}/reconcile",
     }
     assert not any("openclaw" in route.casefold() for route in routes)
     assert not any("agentcore" in route.casefold() for route in routes)
@@ -759,11 +776,17 @@ def test_web_lambda_has_only_control_plane_authority() -> None:
     }.issubset(actions)
     assert {
         "bedrock-agentcore:InvokeAgentRuntime",
-        "lambda:InvokeFunction",
         "sqs:SendMessage",
         "ses:SendEmail",
         "ses:SendRawEmail",
     }.isdisjoint(actions)
+    scheduler_invoke = [
+        statement
+        for statement in statements
+        if statement.get("Action") == "lambda:InvokeFunction"
+    ]
+    assert len(scheduler_invoke) == 1
+    assert scheduler_invoke[0]["Resource"] == SCHEDULER_CONTROL_ARN
     footprint = [
         statement
         for statement in statements

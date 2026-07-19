@@ -168,6 +168,18 @@ class ActiveDeletionFence:
         return False
 
 
+class PermanentDeletionAuthority:
+    @staticmethod
+    def establish_deletion_fence(_user_id):
+        return True
+
+
+class EmptyScheduleStore:
+    @staticmethod
+    def purge_user_schedules(_user_id):
+        return 0
+
+
 def test_one_hundred_worker_replays_execute_and_deliver_exactly_once() -> None:
     trace = derive_event_trace("telegram", "pilot_alpha", "918273")
     envelope = QueueEnvelope(
@@ -336,11 +348,13 @@ def test_deletion_revokes_authority_before_bytes_and_retains_bytes_if_purge_is_u
     )
     coordinator = DeletionCoordinator(
         session_store=sessions,
+        authority_fence=PermanentDeletionAuthority(),
         connection_store=OrderedDeletionDependency("connections", events),
         runtime_driver=OrderedDeletionDependency("runtime", events),
         workspace_store=OrderedDeletionDependency("workspace", events),
         record_store=OrderedDeletionDependency("records", events),
         footprint_store=OrderedDeletionDependency("footprint", events),
+        schedule_store=EmptyScheduleStore(),
         clock_ms=lambda: clock[0],
     )
     with pytest.raises(DeletionPending):
@@ -375,11 +389,13 @@ def test_deletion_revokes_authority_before_bytes_and_retains_bytes_if_purge_is_u
         session_store=OrderedDeletionDependency(
             "sessions", pending_events, clock=lambda: clock[0]
         ),
+        authority_fence=PermanentDeletionAuthority(),
         connection_store=OrderedDeletionDependency("connections", pending_events),
         runtime_driver=OrderedDeletionDependency("runtime", pending_events, fail=True),
         workspace_store=OrderedDeletionDependency("workspace", pending_events),
         record_store=OrderedDeletionDependency("records", pending_events),
         footprint_store=OrderedDeletionDependency("footprint", pending_events),
+        schedule_store=EmptyScheduleStore(),
         clock_ms=lambda: clock[0],
     )
     with pytest.raises(DeletionPending):

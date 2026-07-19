@@ -22,7 +22,7 @@ import cdk_nag
 from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
-from stacks.capability_stack import CapabilityStack
+from stacks.capability_stack import CapabilityStack, STATE_TABLE_NAME
 from stacks.compute_stack import ComputeStack
 from stacks.router_stack import RouterStack
 from stacks.web_stack import WebStack
@@ -61,6 +61,10 @@ env = cdk.Environment(
 
 configured_account = app.node.try_get_context("account") or os.environ.get(
     "CDK_DEFAULT_ACCOUNT"
+)
+capability_state_table_arn = (
+    f"arn:aws:dynamodb:{REQUIRED_REGION}:{configured_account}:table/"
+    f"{STATE_TABLE_NAME}"
 )
 trusted_lambda_asset = resolve_trusted_lambda_asset_metadata(
     repository_root,
@@ -159,8 +163,8 @@ router_stack = RouterStack(
     runtime_arn=agentcore_stack.runtime_arn,
     runtime_iam_arn=agentcore_stack.runtime_iam_arn,
     runtime_endpoint_name=agentcore_stack.runtime_endpoint_name,
-    capability_state_table_name=capability_stack.state_table.table_name,
-    capability_state_table_arn=capability_stack.state_table.table_arn,
+    capability_state_table_name=STATE_TABLE_NAME,
+    capability_state_table_arn=capability_state_table_arn,
     capability_release_commit=capability_release_commit,
     capability_catalog_digest=capability_catalog.catalog_digest,
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
@@ -183,6 +187,26 @@ router_stack = RouterStack(
     env=env,
 )
 
+# --- Trusted read-only scheduler (Task 7) ---
+# A governed control table + ingress Lambda whose EventBridge Scheduler role
+# can only invoke the ingress function and whose ingress role can only
+# strong-read control state and enqueue a read-only occurrence into the
+# existing per-user FIFO. No connector/browser/provider authority exists on
+# either role.
+scheduler_stack = SchedulerStack(
+    app,
+    "PersonalOperatorScheduler",
+    trusted_code_asset_root=trusted_lambda_asset.path,
+    cmk_arn=security_stack.cmk.key_arn,
+    update_queue_arn=router_stack.update_queue.queue_arn,
+    update_queue_url=router_stack.update_queue.queue_url,
+    catalog_digest=capability_catalog.catalog_digest,
+    capability_state_table_name=STATE_TABLE_NAME,
+    capability_state_table_arn=capability_state_table_arn,
+    env=env,
+)
+scheduler_stack.add_dependency(router_stack)
+
 # --- Trusted consumer web control surface ---
 # The stack creates its composite control table and consumes domain-separated
 # secrets owned by SecurityStack. Provider credentials remain invalid,
@@ -201,6 +225,9 @@ web_stack = WebStack(
     runtime_arn=agentcore_stack.runtime_arn,
     runtime_iam_arn=agentcore_stack.runtime_iam_arn,
     runtime_endpoint_name=agentcore_stack.runtime_endpoint_name,
+    scheduler_control_function_arn=(
+        scheduler_stack.control_function.function_arn
+    ),
     trusted_code_asset_root=trusted_lambda_asset.path,
     trusted_code_asset_hash=trusted_lambda_asset.asset_hash,
     web_asset_root=str(repository_root / "web" / "dist"),
@@ -224,26 +251,6 @@ web_stack = WebStack(
 # Same-ID tombstone deployment removes any legacy Scheduler/Lambda/IAM
 # resources from an existing OpenClawCron CloudFormation stack.
 cron_stack = CronStack(app, "OpenClawCron", env=env)
-
-# --- Trusted read-only scheduler (Task 7) ---
-# Supersedes the CronStack tombstone: a governed control table + ingress Lambda
-# whose EventBridge Scheduler role can only invoke the ingress function and
-# whose ingress role can only strong-read control state and enqueue a read-only
-# occurrence into the existing per-user FIFO. No connector/browser/provider
-# authority exists on either role.
-scheduler_stack = SchedulerStack(
-    app,
-    "PersonalOperatorScheduler",
-    trusted_code_asset_root=trusted_lambda_asset.path,
-    cmk_arn=security_stack.cmk.key_arn,
-    update_queue_arn=router_stack.update_queue.queue_arn,
-    update_queue_url=router_stack.update_queue.queue_url,
-    catalog_digest=capability_catalog.catalog_digest,
-    capability_state_table_name=capability_stack.state_table.table_name,
-    capability_state_table_arn=capability_stack.state_table.table_arn,
-    env=env,
-)
-scheduler_stack.add_dependency(router_stack)
 
 # --- Observability (metadata-only dashboards + alarms; no model payloads) ---
 observability_stack = ObservabilityStack(

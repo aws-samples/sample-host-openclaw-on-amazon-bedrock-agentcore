@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "lambda"))
 
 from actions.gmail_send import EffectUncertain, GmailSendExecutor
+from actions.connectors import GenericConnectorKernel, GmailConnectorAdapter
 from actions.models import ActionState, canonical_args_hash, gmail_resource
 from actions.state_machine import (
     ActionStateMachine,
@@ -349,6 +350,25 @@ class UnusedPilotPorts:
         raise AssertionError(f"founder journey does not record {response} feedback")
 
 
+class UnusedScheduleControl:
+    def preview(self, **_request):
+        raise AssertionError("founder journey does not use schedule proposals")
+
+    approve = preview
+    reject = preview
+    reconcile = preview
+
+    @staticmethod
+    def purge_user_schedules(_user_id):
+        return 0
+
+
+class SyntheticDeletionAuthority:
+    @staticmethod
+    def establish_deletion_fence(_user_id):
+        return True
+
+
 class DeletionDependency:
     def __init__(self, name: str, events: list[str]) -> None:
         self.name = name
@@ -444,7 +464,7 @@ def test_complete_synthetic_founder_connect_approve_receipt_export_delete_journe
     provider = EvidenceProvider()
 
     def executor_factory(_pending):
-        return GmailSendExecutor(
+        executor = GmailSendExecutor(
             state_machine=machine,
             provider=provider,
             founder_user_ids={USER},
@@ -453,6 +473,12 @@ def test_complete_synthetic_founder_connect_approve_receipt_export_delete_journe
             sender_address=ACCOUNT,
             deletion_blocked=lambda _user_id: False,
             now=lambda: NOW,
+        )
+        return GenericConnectorKernel(
+            GmailConnectorAdapter(
+                executor=executor,
+                connection_revoker=DeletionDependency("gmail", events),
+            )
         )
 
     control = ControlApplication(
@@ -470,13 +496,16 @@ def test_complete_synthetic_founder_connect_approve_receipt_export_delete_journe
     connect_url = next(line for line in connect["text"].splitlines() if line.startswith("https://"))
     ticket = parse_qs(urlparse(connect_url).query)["ticket"][0]
 
+    schedule_control = UnusedScheduleControl()
     deletion = DeletionCoordinator(
         session_store=store,
+        authority_fence=SyntheticDeletionAuthority(),
         connection_store=DeletionDependency("connections", events),
         runtime_driver=DeletionDependency("runtime", events),
         workspace_store=DeletionDependency("workspace", events),
         record_store=DeletionDependency("records", events),
         footprint_store=DeletionDependency("footprint", events),
+        schedule_store=schedule_control,
         clock_ms=lambda: store.now_ms,
     )
     web = WebApplication(
@@ -499,6 +528,7 @@ def test_complete_synthetic_founder_connect_approve_receipt_export_delete_journe
         overview=UnusedPilotPorts(),
         connections=UnusedPilotPorts(),
         scans=UnusedPilotPorts(),
+        schedule_control=schedule_control,
         web_origin=ORIGIN,
         google_redirect_uri=f"{ORIGIN}/oauth/google/callback",
     )

@@ -40,6 +40,10 @@ _GMAIL_DRAFT_ROUTE = re.compile(
 _SCAN_FEEDBACK_ROUTE = re.compile(
     r"/api/scans/(?P<scan>scan_[0-9]{20}_[A-Za-z0-9_-]{32})/feedback"
 )
+_SCHEDULE_PROPOSAL_ROUTE = re.compile(
+    r"/api/schedule-proposals/(?P<proposal>[A-Za-z0-9][A-Za-z0-9_-]{7,127})"
+    r"(?:/(?P<verb>approve|reject|reconcile))?"
+)
 _APPROVAL_PREVIEW = re.compile(r"/approve/(?P<token>[A-Za-z0-9_.-]{1,4096})")
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _ORIGIN_HEADER = "x-personal-operator-origin-verify"
@@ -227,6 +231,7 @@ class WebApplication:
         overview,
         connections,
         scans,
+        schedule_control,
         web_origin: str,
         google_redirect_uri: str,
     ) -> None:
@@ -255,9 +260,15 @@ class WebApplication:
             raise TypeError("connection lifecycle is invalid")
         if not callable(getattr(scans, "feedback", None)):
             raise TypeError("scan measurement store is invalid")
+        if any(
+            not callable(getattr(schedule_control, method, None))
+            for method in ("preview", "approve", "reject", "reconcile")
+        ):
+            raise TypeError("schedule control client is invalid")
         self._overview = overview
         self._connections = connections
         self._scans = scans
+        self._schedule_control = schedule_control
         self._origin = web_origin.rstrip("/")
         self._redirect = google_redirect_uri
 
@@ -400,6 +411,42 @@ class WebApplication:
                         acting_user_id=identity.user_id,
                     )
                 return self._response(200, result)
+
+            schedule_proposal = _SCHEDULE_PROPOSAL_ROUTE.fullmatch(path or "")
+            if schedule_proposal:
+                proposal_ref = schedule_proposal.group("proposal")
+                verb = schedule_proposal.group("verb")
+                if method == "GET" and verb is None:
+                    identity = self._identity(headers)
+                    return self._response(
+                        200,
+                        self._schedule_control.preview(
+                            user_id=identity.user_id,
+                            proposal_ref=proposal_ref,
+                        ),
+                    )
+                if method == "POST" and verb is not None:
+                    identity = self._identity(headers, mutate=True)
+                    body = _json_body(event)
+                    if verb == "reconcile":
+                        if body != {}:
+                            raise ValueError(
+                                "schedule reconciliation fields are invalid"
+                            )
+                        result = self._schedule_control.reconcile(
+                            user_id=identity.user_id,
+                            proposal_ref=proposal_ref,
+                        )
+                    else:
+                        if set(body) != {"revision", "argsHash"}:
+                            raise ValueError("schedule decision fields are invalid")
+                        result = getattr(self._schedule_control, verb)(
+                            user_id=identity.user_id,
+                            proposal_ref=proposal_ref,
+                            revision=body["revision"],
+                            args_hash=body["argsHash"],
+                        )
+                    return self._response(200, result)
 
             if method == "GET" and path == "/api/workspace":
                 identity = self._identity(headers)
@@ -599,7 +646,14 @@ class WebApplication:
                 f"/api/connections/{READONLY_PROVIDER}/disconnect",
                 "/api/session/logout",
             }
-            if path in known_paths or action or preview or gmail_draft or scan_feedback:
+            if (
+                path in known_paths
+                or action
+                or preview
+                or gmail_draft
+                or scan_feedback
+                or schedule_proposal
+            ):
                 return self._response(405, {"error": "method not allowed"})
             return self._response(404, {"error": "not found"})
         except (AuthenticationError,) as error:

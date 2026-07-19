@@ -285,6 +285,10 @@ def base_env(monkeypatch):
         "CONTROL_TABLE_NAME": "control-table",
         "RUNTIME_STATE_TABLE_NAME": "runtime-table",
         "CAPABILITY_STATE_TABLE_NAME": "capability-state-table",
+        "SCHEDULER_CONTROL_FUNCTION_ARN": (
+            "arn:aws:lambda:eu-west-1:123456789012:function:"
+            "personal-operator-scheduler-control"
+        ),
         "IDENTITY_TABLE_NAME": "identity-table",
         "MESSAGE_LEDGER_TABLE_NAME": "message-ledger-table",
         "USER_FILES_BUCKET_NAME": "workspace-bucket",
@@ -813,6 +817,28 @@ class FakeKms:
     pass
 
 
+class FakeDynamoClient:
+    def get_item(self, **_kwargs):
+        raise AssertionError("capability deletion fence was unexpectedly called")
+
+    def put_item(self, **_kwargs):
+        raise AssertionError("capability deletion fence was unexpectedly called")
+
+    def update_item(self, **_kwargs):
+        raise AssertionError("capability deletion fence was unexpectedly called")
+
+    def query(self, **_kwargs):
+        raise AssertionError("capability deletion fence was unexpectedly called")
+
+    def transact_write_items(self, **_kwargs):
+        raise AssertionError("capability deletion fence was unexpectedly called")
+
+
+class FakeLambda:
+    def invoke(self, **_kwargs):
+        raise AssertionError("schedule control was unexpectedly called")
+
+
 def install_fake_aws(monkeypatch, secret_client):
     dynamo = FakeDynamoResource()
 
@@ -833,6 +859,8 @@ def install_fake_aws(monkeypatch, secret_client):
                 "kms": FakeKms(),
                 "s3": FakeS3(),
                 "bedrock-agentcore": FakeAgentCore(),
+                "dynamodb": FakeDynamoClient(),
+                "lambda": FakeLambda(),
             }[name]
 
     class Config:
@@ -903,13 +931,23 @@ def test_production_builder_reads_only_web_auth_secret_and_defers_provider_paths
     provider_revoker, local_revoker = application._deletion._connections._revokers
     assert isinstance(
         provider_revoker,
+        composition.KernelConnectionRevoker,
+    )
+    founder_revoker = provider_revoker._kernel._adapter._connection_revoker
+    assert isinstance(
+        founder_revoker,
         composition.SecretsManagerFounderConnectionRevoker,
     )
-    assert provider_revoker._secret_id == "google-send"
-    assert provider_revoker._founder_user_id == "founder-1"
-    records, scans = application._deletion._records._deleters
+    assert founder_revoker._secret_id == "google-send"
+    assert founder_revoker._founder_user_id == "founder-1"
+    records, scans, capability_deletion = application._deletion._records._deleters
     assert local_revoker is records
     assert scans is application._scans
+    assert isinstance(
+        capability_deletion,
+        composition.DynamoCapabilityDeletionAdapter,
+    )
+    assert application._deletion._authority_fence is capability_deletion
     assert (
         application._connections._repository
         is application._gmail_workspace._repository

@@ -454,12 +454,13 @@ class DeletionCoordinator:
         self,
         *,
         session_store,
+        authority_fence,
         connection_store,
         runtime_driver,
         workspace_store,
         record_store,
         footprint_store,
-        schedule_store=None,
+        schedule_store,
         clock_ms=None,
         finalization_grace_ms: int = FINALIZATION_GRACE_MS,
     ) -> None:
@@ -470,6 +471,11 @@ class DeletionCoordinator:
         ):
             raise ValueError("deletion finalization grace is below the safety bound")
         self._sessions = session_store
+        if not callable(
+            getattr(authority_fence, "establish_deletion_fence", None)
+        ):
+            raise TypeError("account deletion authority fence is invalid")
+        self._authority_fence = authority_fence
         self._connections = connection_store
         self._runtime = runtime_driver
         self._workspace = workspace_store
@@ -477,10 +483,10 @@ class DeletionCoordinator:
         if not callable(getattr(footprint_store, "delete_user_records", None)):
             raise TypeError("external user footprint store is invalid")
         self._footprint = footprint_store
-        # Optional trusted scheduler purge. When present it must delete every
-        # live EventBridge schedule and report the count still ENABLED, so the
-        # deletion path cannot complete while any live schedule remains.
-        if schedule_store is not None and not callable(
+        # The trusted scheduler purge must delete every live EventBridge
+        # schedule and report the count still ENABLED, so deletion cannot
+        # complete while any live schedule remains.
+        if not callable(
             getattr(schedule_store, "purge_user_schedules", None)
         ):
             raise TypeError("schedule store is invalid")
@@ -569,15 +575,24 @@ class DeletionCoordinator:
         """Repeatable exact authority revocation and user-byte removal."""
 
         try:
+            # This strong, monotonic capability-plane fence is the first
+            # fallible action after the durable deletion intent. No session,
+            # connector, scheduler, runtime, or data revocation may begin
+            # until the capability authority is proven denied.
+            if self._authority_fence.establish_deletion_fence(user_id) is not True:
+                raise RuntimeError("capability deletion fence was not proven")
             self._sessions.revoke_all(user_id)
             self._connections.revoke_all(user_id)
             # Delete live schedules before any completion can be claimed. This is
             # idempotent/repeatable and must leave zero ENABLED schedules or the
             # deletion stays pending.
-            if self._schedules is not None:
-                remaining = self._schedules.purge_user_schedules(user_id)
-                if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining != 0:
-                    raise RuntimeError("live schedules remain before deletion completion")
+            remaining = self._schedules.purge_user_schedules(user_id)
+            if (
+                isinstance(remaining, bool)
+                or not isinstance(remaining, int)
+                or remaining != 0
+            ):
+                raise RuntimeError("live schedules remain before deletion completion")
             runtime = self._runtime.purge(user_id)
             if (
                 not isinstance(runtime, Mapping)

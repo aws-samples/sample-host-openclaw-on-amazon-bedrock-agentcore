@@ -252,6 +252,51 @@ class Scans:
         }
 
 
+class ScheduleControl:
+    def __init__(self):
+        self.calls = []
+
+    def preview(self, **kwargs):
+        self.calls.append(("preview", kwargs))
+        return {
+            "proposalRef": kwargs["proposal_ref"],
+            "operationId": "schedule.propose",
+            "scheduleId": "schedule_12345678",
+            "revision": 3,
+            "argsHash": "a" * 64,
+            "arguments": {"taskType": "REMINDER", "definition": {"runAt": 2_000_000_000}},
+            "expiresAt": 2_000_000_100,
+            "state": "PENDING",
+        }
+
+    def approve(self, **kwargs):
+        self.calls.append(("approve", kwargs))
+        return {
+            "status": "SUCCEEDED",
+            "proposalRef": kwargs["proposal_ref"],
+            "scheduleId": "schedule_12345678",
+            "revision": 1,
+        }
+
+    def reject(self, **kwargs):
+        self.calls.append(("reject", kwargs))
+        return {
+            "status": "REJECTED",
+            "proposalRef": kwargs["proposal_ref"],
+            "scheduleId": "schedule_12345678",
+            "revision": kwargs["revision"],
+        }
+
+    def reconcile(self, **kwargs):
+        self.calls.append(("reconcile", kwargs))
+        return {
+            "status": "UNCERTAIN",
+            "proposalRef": kwargs["proposal_ref"],
+            "scheduleId": "schedule_12345678",
+            "revision": 1,
+        }
+
+
 def event(method, path, *, body=None, cookie=None, csrf=None, query=None, origin=ORIGIN):
     headers = {"origin": origin} if origin is not None else {}
     if cookie:
@@ -294,6 +339,7 @@ def setup_app():
     overview = Overview()
     connections = Connections()
     scans = Scans()
+    schedules = ScheduleControl()
     importer = Importer()
     app = WebApplication(
         tickets=tickets,
@@ -309,10 +355,12 @@ def setup_app():
         overview=overview,
         connections=connections,
         scans=scans,
+        schedule_control=schedules,
         web_origin=ORIGIN,
         google_redirect_uri=f"{ORIGIN}/oauth/google/callback",
     )
     app._test_importer = importer
+    app._test_schedule_control = schedules
     return app, tickets, oauth, approvals, deletion, gmail_workspace, retention
 
 
@@ -338,6 +386,102 @@ def test_connect_bootstrap_consumes_ticket_and_returns_secure_session_once():
     assert app.handle(
         event("POST", "/api/session/connect", body={"ticket": token})
     )["statusCode"] == 400
+
+
+def test_schedule_proposal_preview_and_decisions_are_session_and_exact_csrf_bound():
+    app, tickets, *_ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+    proposal = "proposal_12345678"
+
+    preview = app.handle(
+        event("GET", f"/api/schedule-proposals/{proposal}", cookie=cookie)
+    )
+    assert preview["statusCode"] == 200
+    assert json.loads(preview["body"])["proposalRef"] == proposal
+
+    approval = app.handle(
+        event(
+            "POST",
+            f"/api/schedule-proposals/{proposal}/approve",
+            cookie=cookie,
+            csrf=csrf,
+            body={"revision": 3, "argsHash": "a" * 64},
+        )
+    )
+    assert approval["statusCode"] == 200
+    assert json.loads(approval["body"])["status"] == "SUCCEEDED"
+
+    rejection = app.handle(
+        event(
+            "POST",
+            f"/api/schedule-proposals/{proposal}/reject",
+            cookie=cookie,
+            csrf=csrf,
+            body={"revision": 3, "argsHash": "a" * 64},
+        )
+    )
+    assert rejection["statusCode"] == 200
+    assert json.loads(rejection["body"])["status"] == "REJECTED"
+
+    reconciliation = app.handle(
+        event(
+            "POST",
+            f"/api/schedule-proposals/{proposal}/reconcile",
+            cookie=cookie,
+            csrf=csrf,
+            body={},
+        )
+    )
+    assert reconciliation["statusCode"] == 200
+    assert json.loads(reconciliation["body"])["status"] == "UNCERTAIN"
+    assert app._test_schedule_control.calls == [
+        ("preview", {"user_id": USER, "proposal_ref": proposal}),
+        (
+            "approve",
+            {
+                "user_id": USER,
+                "proposal_ref": proposal,
+                "revision": 3,
+                "args_hash": "a" * 64,
+            },
+        ),
+        (
+            "reject",
+            {
+                "user_id": USER,
+                "proposal_ref": proposal,
+                "revision": 3,
+                "args_hash": "a" * 64,
+            },
+        ),
+        ("reconcile", {"user_id": USER, "proposal_ref": proposal}),
+    ]
+
+
+def test_schedule_proposal_mutations_reject_missing_csrf_and_shape_drift():
+    app, tickets, *_ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+    proposal = "proposal_12345678"
+    path = f"/api/schedule-proposals/{proposal}/approve"
+
+    assert app.handle(
+        event(
+            "POST",
+            path,
+            cookie=cookie,
+            body={"revision": 3, "argsHash": "a" * 64},
+        )
+    )["statusCode"] == 401
+    assert app.handle(
+        event(
+            "POST",
+            path,
+            cookie=cookie,
+            csrf=csrf,
+            body={"revision": 3, "argsHash": "a" * 64, "extra": True},
+        )
+    )["statusCode"] == 400
+    assert app._test_schedule_control.calls == []
 
 
 def test_connect_ticket_cannot_replace_a_different_users_live_session():
@@ -624,6 +768,7 @@ def test_logout_still_clears_cookie_after_applied_but_response_lost_revocation()
         overview=Overview(),
         connections=Connections(),
         scans=Scans(),
+        schedule_control=ScheduleControl(),
         web_origin=ORIGIN,
         google_redirect_uri=f"{ORIGIN}/oauth/google/callback",
     )
