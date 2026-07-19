@@ -11,16 +11,14 @@ export OPENCLAW_CONFIG_PATH="/run/personal-operator/openclaw.json"
 export OPENCLAW_STATE_DIR="/mnt/workspace/live"
 export OPENCLAW_WORKSPACE_DIR="/mnt/workspace/live/workspace"
 
-echo "[openclaw-agentcore] Starting OpenClaw on AgentCore Runtime (per-user session mode)..."
-echo "[openclaw-agentcore] Node: $(node --version 2>&1 || echo 'not found')"
-echo "[openclaw-agentcore] AWS_REGION=${AWS_REGION:-not set}"
+echo '{"version":1,"event":"RUNTIME_ENTRYPOINT","level":"INFO","status":"INITIALIZING"}'
 
 # --- V8 Compile Cache (Node.js 22+) ---
 # Caches compiled bytecode so modules load faster on subsequent runs.
 # Pre-warmed at Docker build time with AWS SDK modules.
 if [ -d /app/.compile-cache ]; then
     export NODE_COMPILE_CACHE=/app/.compile-cache
-    echo "[openclaw-agentcore] V8 compile cache enabled: /app/.compile-cache"
+    echo '{"version":1,"event":"COMPILE_CACHE","level":"INFO","status":"READY"}'
 fi
 
 # --- Force IPv4 for Node.js 22 VPC compatibility ---
@@ -29,14 +27,13 @@ export NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselect
 # Disable IPv6 at the OS level if writable (best-effort)
 if [ -w /proc/sys/net/ipv6/conf/all/disable_ipv6 ]; then
     echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || true
-    echo "[openclaw-agentcore] IPv6 disabled at OS level"
+    echo '{"version":1,"event":"IPV6_POLICY","level":"INFO","status":"READY"}'
 else
-    echo "[openclaw-agentcore] WARNING: Cannot disable IPv6 (no write access to /proc/sys)"
+    echo '{"version":1,"event":"IPV6_POLICY","level":"WARN","status":"DENIED"}'
 fi
 
 # --- Start the AgentCore contract server (port 8080) ---
 # Must be the first thing to start — AgentCore health-checks /ping very quickly.
 # Lightweight agent handles messages after scoped init while OpenClaw starts.
-echo "[openclaw-agentcore] Starting AgentCore contract server on port 8080..."
-echo "[openclaw-agentcore] Hybrid mode: lightweight agent (~10s) -> OpenClaw handoff (~1-2min)"
+echo '{"version":1,"event":"CONTRACT_SERVER","level":"INFO","status":"INITIALIZING"}'
 exec node /app/agentcore-contract.js

@@ -17,6 +17,10 @@
  * Runs on port 8080 (required by AgentCore Runtime).
  */
 
+const cwLogger = require("./cloudwatch-logger");
+cwLogger.installConsoleHooks();
+cwLogger.installProcessFailureHooks();
+
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -24,7 +28,6 @@ const { randomUUID } = require("crypto");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
 const workspaceSync = require("./workspace-sync");
-const cwLogger = require("./cloudwatch-logger");
 const scopedCreds = require("./scoped-credentials");
 const runtimePolicy = require("./runtime-policy");
 const gatewayInvocation = require("./gateway-invocation");
@@ -94,9 +97,7 @@ const WORKSPACE_GENERATION_PATTERN =
   /^g-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
-// OpenClaw process diagnostics (last N lines of stdout/stderr)
-const OPENCLAW_LOG_LIMIT = 50;
-let openclawLogs = [];
+// Child output is sensitive by construction. Only discarded byte counts survive.
 let openclawExitCode = null;
 let lastOpenClawEnv = null;
 
@@ -607,23 +608,8 @@ function scheduleOpenClawRestart(namespace) {
       ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
       { stdio: ["ignore", "pipe", "pipe"], env: lastOpenClawEnv },
     );
-    const captureLog2 = (stream, label) => {
-      let buf = "";
-      stream.on("data", (chunk) => {
-        buf += chunk.toString();
-        const lines = buf.split("\n");
-        buf = lines.pop();
-        for (const line of lines) {
-          if (line.trim()) {
-            console.log(`[openclaw:${label}] ${line}`);
-            openclawLogs.push(`[${label}] ${line}`);
-            if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
-          }
-        }
-      });
-    };
-    captureLog2(openclawProcess.stdout, "out");
-    captureLog2(openclawProcess.stderr, "err");
+    cwLogger.drainChildOutput(openclawProcess.stdout, "OPENCLAW_STDOUT");
+    cwLogger.drainChildOutput(openclawProcess.stderr, "OPENCLAW_STDERR");
     openclawProcess.on("exit", (code2) => {
       console.log(
         `[contract] OpenClaw (restart #${openclawRestartCount}) exited with code ${code2}`,
@@ -768,7 +754,7 @@ async function init(
     };
     currentInternalUserId = internalUserId;
     currentNamespace = namespace;
-    await cwLogger.init(`${namespace}-${Date.now()}`);
+    await cwLogger.init();
     console.log(`[contract] Init for internalUserId=${internalUserId}`);
 
     const snapshotStore = new workspaceSync.WorkspaceSnapshotStore({
@@ -832,12 +818,8 @@ async function init(
       env: proxyEnv,
       stdio: ["inherit", "pipe", "pipe"],
     });
-    proxyProcess.stdout.on("data", (d) => {
-      d.toString().split("\n").filter(Boolean).forEach(line => console.log(`[proxy:out] ${line}`));
-    });
-    proxyProcess.stderr.on("data", (d) => {
-      d.toString().split("\n").filter(Boolean).forEach(line => console.error(`[proxy:err] ${line}`));
-    });
+    cwLogger.drainChildOutput(proxyProcess.stdout, "PROXY_STDOUT");
+    cwLogger.drainChildOutput(proxyProcess.stderr, "PROXY_STDERR");
     const handleProxyExit = createUnexpectedChildExitHandler({
       label: "Bedrock proxy",
       code: "BEDROCK_PROXY_EXITED",
@@ -872,24 +854,8 @@ async function init(
     );
     lastOpenClawEnv = openclawEnv;
     openclawRestartCount = 0;
-    // Capture OpenClaw stdout/stderr for diagnostics
-    const captureLog = (stream, label) => {
-      let buf = "";
-      stream.on("data", (chunk) => {
-        buf += chunk.toString();
-        const lines = buf.split("\n");
-        buf = lines.pop(); // keep incomplete line in buffer
-        for (const line of lines) {
-          if (line.trim()) {
-            console.log(`[openclaw:${label}] ${line}`);
-            openclawLogs.push(`[${label}] ${line}`);
-            if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
-          }
-        }
-      });
-    };
-    captureLog(openclawProcess.stdout, "out");
-    captureLog(openclawProcess.stderr, "err");
+    cwLogger.drainChildOutput(openclawProcess.stdout, "OPENCLAW_STDOUT");
+    cwLogger.drainChildOutput(openclawProcess.stderr, "OPENCLAW_STDERR");
     openclawProcess.on("exit", (code) => {
       console.log(`[contract] OpenClaw exited with code ${code}`);
       openclawExitCode = code;
@@ -1168,7 +1134,7 @@ const server = http.createServer(async (req, res) => {
             proxyReady,
             openclawExitCode,
             openclawPid: openclawProcess?.pid || null,
-            openclawLogs: openclawLogs.slice(-20),
+            discardedChildOutputBytes: cwLogger.childOutputCounts(),
             totalRequestCount: proxyHealth?.total_requests ?? null,
             activeTaskCount: activeTaskTracker.count,
             pingStatus:

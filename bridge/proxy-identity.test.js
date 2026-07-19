@@ -75,7 +75,13 @@ describe("proxy module process boundary", () => {
       },
     );
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /eu-west-1|region/i);
+    assert.deepEqual(JSON.parse(result.stderr), {
+      version: 1,
+      event: "RUNTIME_STATE",
+      level: "ERROR",
+      status: "FAILED",
+    });
+    assert.doesNotMatch(result.stderr, /eu-west-1|us-west-2|region/i);
   });
 });
 

@@ -6,6 +6,10 @@
  * hosted on AgentCore Runtime.
  */
 
+const runtimeLogger = require("./cloudwatch-logger");
+runtimeLogger.installConsoleHooks();
+runtimeLogger.installProcessFailureHooks();
+
 const http = require("http");
 const crypto = require("crypto");
 const fs = require("node:fs");
@@ -32,8 +36,6 @@ if (guardrailConfig) {
   console.log(`[proxy] Bedrock Guardrails enabled: ${GUARDRAIL_ID} v${GUARDRAIL_VERSION}`);
 }
 
-// Diagnostic state — exposed via /health for observability (container stdout not in CloudWatch)
-let lastIdentityDiag = null;
 let chatRequestCount = 0;
 let subagentRequestCount = 0;
 
@@ -489,10 +491,6 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
 
       const response = await client.send(new ConverseCommand(params));
 
-      // Log guardrail trace if present
-      if (response?.trace?.guardrail) {
-        console.debug("[guardrail] trace:", JSON.stringify(response.trace.guardrail));
-      }
       // Handle guardrail intervention
       if (response?.stopReason === "guardrail_intervened") {
         console.warn("[guardrail] intervention on non-streaming response");
@@ -694,10 +692,7 @@ async function invokeBedrockStreaming(
           outputTokens = event.metadata.usage.outputTokens || 0;
         }
 
-        // Log guardrail trace/intervention from streaming events
-        if (event.metadata?.trace?.guardrail) {
-          console.debug("[guardrail] stream trace:", JSON.stringify(event.metadata.trace.guardrail));
-        }
+        // Guardrail traces can include request-derived content and are never logged.
         if (event.messageStop?.stopReason === "guardrail_intervened") {
           console.warn("[guardrail] intervention on streaming response");
         }
@@ -743,7 +738,7 @@ async function invokeBedrockStreaming(
     res.end(
       JSON.stringify({
         error: {
-          message: "Bedrock streaming failed: " + lastError.message,
+          message: "Provider invocation failed",
           type: "proxy_error",
         },
       }),
@@ -832,16 +827,6 @@ const server = http.createServer(async (req, res) => {
             `[proxy] Subagent request #${subagentRequestCount}: model=${parsed.model}, messages=${messages.length}`,
           );
         }
-
-        // Store identity diagnostic (visible via /health since container stdout not in CloudWatch)
-        lastIdentityDiag = {
-          internalUserId: RUNTIME_IDENTITY.internalUserId,
-          namespace: RUNTIME_IDENTITY.namespace,
-          idSource: "server-environment",
-          msgCount: messages.length,
-          toolCount: parsed.tools ? parsed.tools.length : 0,
-          timestamp: new Date().toISOString(),
-        };
 
         // --- Convert OpenAI tools to Bedrock toolConfig ---
         const toolConfig = convertTools(parsed.tools);
@@ -950,7 +935,7 @@ const server = http.createServer(async (req, res) => {
           res.end(
             JSON.stringify({
               error: {
-                message: "Invocation failed: " + err.message,
+                message: "Provider invocation failed",
                 type: "proxy_error",
               },
             }),
