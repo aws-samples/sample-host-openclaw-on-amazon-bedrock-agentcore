@@ -137,7 +137,10 @@ def test_scheduled_grant_contains_only_catalog_derived_read_and_propose_operatio
         user_id="user_alpha",
         session_id="session_12345678",
         invocation_id="invocation_12345678",
-        message_text="",
+        # A scheduled prompt is persisted content, not a fresh authenticated
+        # user request. Even when it contains a public URL it cannot mint
+        # CURRENT_REQUEST_TARGET_GRANT authority for that stored target.
+        message_text="read https://example.com/exact from the stored schedule",
         scheduled_read_only=True,
     )
 
@@ -145,10 +148,12 @@ def test_scheduled_grant_contains_only_catalog_derived_read_and_propose_operatio
         "schedule.cancel.propose",
         "schedule.list",
         "schedule.propose",
-        "web.exact.read",
         "workspace.file.list",
         "workspace.file.read",
     ]
+    assert grant["targetGrantHashes"] == []
+    _persisted_grant, persisted_targets, _delivery = repository.calls[0]
+    assert persisted_targets == ()
     assert "compute.status" not in grant["allowedOperationIds"]
     assert "workspace.file.write" not in grant["allowedOperationIds"]
 

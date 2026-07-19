@@ -546,6 +546,63 @@ def test_previous_turn_url_yields_no_grant():
     assert connect.connections == []
 
 
+def test_stored_scheduled_url_mints_no_target_and_never_reaches_web_adapter():
+    """A stored schedule prompt is never a fresh target-grant authority source."""
+
+    from capabilities.issuer import TurnCapabilityIssuer
+
+    catalog = _catalog()
+
+    class ScheduledTurnRepository:
+        def __init__(self):
+            self.grant = None
+            self.targets = None
+
+        def strong_read_enabled_pack_ids(self, *, user_id, issued_at):
+            assert user_id == "user_alpha"
+            assert issued_at == NOW
+            return tuple(sorted(pack["packId"] for pack in catalog.packs))
+
+        def prepare_turn(self, *, grant, targets, delivery_context=None):
+            self.grant = grant
+            self.targets = tuple(targets)
+            assert delivery_context is None
+
+    authority = ScheduledTurnRepository()
+    issued = TurnCapabilityIssuer(
+        catalog=catalog,
+        authority_repository=authority,
+        runtime_arn=RUNTIME_ARN,
+        runtime_qualifier=RUNTIME_QUALIFIER,
+        clock=lambda: NOW,
+        nonce_factory=lambda: "nonce_scheduled_12345678",
+    ).mint(
+        user_id="user_alpha",
+        session_id="session_12345678",
+        invocation_id="invocation_12345678",
+        message_text="read https://example.com/exact from the persisted prompt",
+        scheduled_read_only=True,
+    )
+
+    assert issued["targetGrantHashes"] == []
+    assert "web.exact.read" not in issued["allowedOperationIds"]
+    assert authority.targets == ()
+
+    resolver = FakeResolver([[PUBLIC_IP]])
+    connect = FakeSocketFactory(FakeResponse(body_chunks=(b"must not fetch",)))
+    _, repository, gateway = _build_gateway(resolver=resolver, connect=connect)
+    repository.turn_grant = dict(issued)
+
+    result = gateway.invoke(
+        _call(catalog, "https://example.com/exact"),
+        {"callerArn": CALLER_ARN, "turnGrant": dict(issued)},
+    )
+
+    assert result.status == "DENIED"
+    assert resolver.calls == []
+    assert connect.connections == []
+
+
 def test_prior_turn_request_id_binding_makes_hash_unusable():
     from capabilities.target_grants import derive_target_grants
 

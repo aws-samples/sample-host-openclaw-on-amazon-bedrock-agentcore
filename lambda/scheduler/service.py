@@ -69,13 +69,13 @@ class ScheduledEffectDenied(RuntimeError):
 
 
 # The load-bearing runtime-path invariant. A scheduled READ_ONLY_AGENT_TURN may
-# only reach operations that are pure reads (approval NONE / target-grant read)
-# or proposal-only (EXACT_ONE_TIME_PROPOSAL, which prepares but never
-# dispatches). Every dispatch/mutation class operation is structurally excluded,
-# and the networkless compute boundary is out of the scheduled surface entirely.
-_SCHEDULED_READ_APPROVAL_MODES = frozenset(
-    {"NONE", "CURRENT_REQUEST_TARGET_GRANT"}
-)
+# only reach operations that are pure local reads (approval NONE) or
+# proposal-only (EXACT_ONE_TIME_PROPOSAL, which prepares but never dispatches).
+# CURRENT_REQUEST_TARGET_GRANT is deliberately excluded because persisted
+# schedule text is not a fresh authenticated request. Every dispatch/mutation
+# class operation is structurally excluded, and the networkless compute
+# boundary is out of the scheduled surface entirely.
+_SCHEDULED_READ_APPROVAL_MODES = frozenset({"NONE"})
 _SCHEDULED_PROPOSAL_APPROVAL_MODE = "EXACT_ONE_TIME_PROPOSAL"
 # Mutations that persist a durable effect are excluded even though a read may be
 # approval-mode NONE, because a scheduled turn must never mutate state.

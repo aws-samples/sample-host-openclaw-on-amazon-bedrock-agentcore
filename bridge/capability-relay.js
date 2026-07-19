@@ -220,10 +220,7 @@ function validateGrant(input) {
   return deepFreeze(value);
 }
 
-const SCHEDULED_READ_APPROVAL_MODES = new Set([
-  "NONE",
-  "CURRENT_REQUEST_TARGET_GRANT",
-]);
+const SCHEDULED_READ_APPROVAL_MODES = new Set(["NONE"]);
 const SCHEDULED_PROPOSAL_APPROVAL_MODE = "EXACT_ONE_TIME_PROPOSAL";
 const SCHEDULED_EXCLUDED_RISK_CLASSES = new Set([
   "LOCAL_MUTATION",
@@ -237,6 +234,12 @@ const SCHEDULED_EXCLUDED_CREDENTIAL_BOUNDARIES = new Set([
 
 function validateScheduledGrant(input) {
   const value = validateGrant(input);
+  if (value.targetGrantHashes.length !== 0) {
+    fail(
+      "CAPABILITY_SCHEDULED_EFFECT_DENIED",
+      "Scheduled capability grant cannot carry current-request target authority",
+    );
+  }
   const allowedPackIds = new Set(value.allowedPackIds);
   const operationPackIds = new Set();
   for (const operationId of value.allowedOperationIds) {

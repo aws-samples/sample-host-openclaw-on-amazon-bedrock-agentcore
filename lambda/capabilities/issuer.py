@@ -31,7 +31,7 @@ class TurnAuthorityRepository(Protocol):
     ) -> None: ...
 
 
-_SCHEDULED_READ_APPROVALS = frozenset({"NONE", "CURRENT_REQUEST_TARGET_GRANT"})
+_SCHEDULED_READ_APPROVALS = frozenset({"NONE"})
 _SCHEDULED_EXCLUDED_RISKS = frozenset(
     {"LOCAL_MUTATION", "DURABLE_MUTATION", "EXTERNAL_EFFECT", "IRREVERSIBLE_EFFECT"}
 )
@@ -122,12 +122,19 @@ class TurnCapabilityIssuer:
             raise RuntimeError("turn has no enabled capability installation")
         operations = sorted(pack["operations"][0]["operationId"] for pack in packs)
         pack_ids = sorted(pack["packId"] for pack in packs)
-        targets = derive_target_grants(
-            message_text,
-            tenant_id=user_id,
-            current_request_id=invocation_id,
-            now=now,
-            ttl_seconds=self._ttl_seconds,
+        # A scheduled prompt is persisted data, not a fresh authenticated user
+        # request. It therefore cannot be a source of CURRENT_REQUEST target
+        # authority even if the stored text contains an otherwise valid URL.
+        targets = (
+            []
+            if scheduled_read_only
+            else derive_target_grants(
+                message_text,
+                tenant_id=user_id,
+                current_request_id=invocation_id,
+                now=now,
+                ttl_seconds=self._ttl_seconds,
+            )
         )
         grant = TurnCapabilityGrantV1.from_mapping(
             {

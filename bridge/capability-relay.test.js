@@ -171,13 +171,53 @@ describe("trusted capability relay", () => {
     });
     for (const [allowedPackIds, allowedOperationIds] of [
       [["workspace.file-list", "workspace.file-read"], ["workspace.file.list", "workspace.file.read"]],
-      [["web.exact-read"], ["web.exact.read"]],
       [["schedule.list", "schedule.propose"], ["schedule.list", "schedule.propose"]],
       [["schedule.cancel-propose"], ["schedule.cancel.propose"]],
     ]) {
-      relay.bind_scheduled_turn(grant({ allowedPackIds, allowedOperationIds }));
+      relay.bind_scheduled_turn(grant({
+        allowedPackIds,
+        allowedOperationIds,
+        targetGrantHashes: [],
+      }));
       relay.clear_turn();
     }
+  });
+
+  it("rejects scheduled target grants and exact-target reads before transport", async () => {
+    const relayModule = loadRelay();
+    let transportCalls = 0;
+    const relay = new relayModule.CapabilityRelay({
+      now: () => 1_800_000_100,
+      gatewayTransport: async () => {
+        transportCalls += 1;
+        assert.fail("scheduled target authority must not dispatch");
+      },
+    });
+
+    for (const scheduledGrant of [
+      grant({
+        allowedPackIds: ["web.exact-read"],
+        allowedOperationIds: ["web.exact.read"],
+        targetGrantHashes: [],
+      }),
+      grant({
+        allowedPackIds: ["schedule.list"],
+        allowedOperationIds: ["schedule.list"],
+      }),
+    ]) {
+      assert.throws(
+        () => relay.bind_scheduled_turn(scheduledGrant),
+        (error) => error.code === "CAPABILITY_SCHEDULED_EFFECT_DENIED",
+      );
+    }
+
+    await assert.rejects(
+      relay.call("tooluse_12345678", "po_web_read", {
+        url: "https://example.com/exact",
+      }),
+      /No capability turn is bound/,
+    );
+    assert.equal(transportCalls, 0);
   });
 
   it("fails closed before binding any scheduled mutation, compute, or effect grant", async () => {
@@ -193,7 +233,11 @@ describe("trusted capability relay", () => {
       [["compute.status"], ["compute.status"]],
     ]) {
       assert.throws(
-        () => relay.bind_scheduled_turn(grant({ allowedPackIds, allowedOperationIds })),
+        () => relay.bind_scheduled_turn(grant({
+          allowedPackIds,
+          allowedOperationIds,
+          targetGrantHashes: [],
+        })),
         (error) => {
           assert.equal(error.code, "CAPABILITY_SCHEDULED_EFFECT_DENIED");
           return true;

@@ -24,11 +24,13 @@ READ_OR_PROPOSE = {
     "schedule.list",
     "workspace.file.list",
     "workspace.file.read",
-    "web.exact.read",
     "schedule.propose",
     "schedule.cancel.propose",
 }
-DISPATCH_OR_MUTATION = {
+FORBIDDEN_SCHEDULED_OPERATIONS = {
+    # A persisted scheduled prompt is not a current authenticated request and
+    # therefore cannot authorize an exact-target network read.
+    "web.exact.read",
     "workspace.file.write",
     "workspace.file.delete",
     "compute.run",
@@ -42,7 +44,7 @@ def test_scheduled_read_only_operation_set_is_exactly_read_and_propose():
 def test_scheduled_read_only_turn_cannot_dispatch_connector_or_browser_effect():
     # A scheduled turn attempting a dispatch/mutation operation is denied, and
     # the denial itself makes zero effect calls (it is a pure structural check).
-    for operation_id in DISPATCH_OR_MUTATION:
+    for operation_id in FORBIDDEN_SCHEDULED_OPERATIONS:
         with pytest.raises(ScheduledEffectDenied):
             assert_scheduled_turn_operation_allowed(
                 operation_id, external_effects=False
