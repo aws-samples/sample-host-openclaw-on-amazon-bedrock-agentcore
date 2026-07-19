@@ -177,6 +177,7 @@ function loadPinnedArtifacts(capabilityDir = DEFAULT_CAPABILITY_DIR) {
       outputSchema: schemas[sourceOperation.outputSchema],
       riskClass: sourcePack.riskClass,
       approvalPolicy: sourcePack.approvalPolicy,
+      credentialBoundary: sourcePack.credentialBoundary,
       retryPolicy: sourcePack.retryPolicy,
       quotaPolicy: sourcePack.quotaPolicy,
       adapterEnabled: false,

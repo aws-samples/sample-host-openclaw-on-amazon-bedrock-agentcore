@@ -163,6 +163,49 @@ describe("trusted capability relay", () => {
     assert.equal(typeof relayModule.createLoopbackRelayClient, "function");
   });
 
+  it("binds scheduled turns only to the catalog-derived read/propose surface", () => {
+    const relayModule = loadRelay();
+    const relay = new relayModule.CapabilityRelay({
+      now: () => 1_800_000_100,
+      gatewayTransport: async () => assert.fail("must not dispatch"),
+    });
+    for (const [allowedPackIds, allowedOperationIds] of [
+      [["workspace.file-list", "workspace.file-read"], ["workspace.file.list", "workspace.file.read"]],
+      [["web.exact-read"], ["web.exact.read"]],
+      [["schedule.list", "schedule.propose"], ["schedule.list", "schedule.propose"]],
+      [["schedule.cancel-propose"], ["schedule.cancel.propose"]],
+    ]) {
+      relay.bind_scheduled_turn(grant({ allowedPackIds, allowedOperationIds }));
+      relay.clear_turn();
+    }
+  });
+
+  it("fails closed before binding any scheduled mutation, compute, or effect grant", async () => {
+    const relayModule = loadRelay();
+    const relay = new relayModule.CapabilityRelay({
+      now: () => 1_800_000_100,
+      gatewayTransport: async () => assert.fail("must not dispatch"),
+    });
+    for (const [allowedPackIds, allowedOperationIds] of [
+      [["workspace.file-write"], ["workspace.file.write"]],
+      [["workspace.file-delete"], ["workspace.file.delete"]],
+      [["compute.run"], ["compute.run"]],
+      [["compute.status"], ["compute.status"]],
+    ]) {
+      assert.throws(
+        () => relay.bind_scheduled_turn(grant({ allowedPackIds, allowedOperationIds })),
+        (error) => {
+          assert.equal(error.code, "CAPABILITY_SCHEDULED_EFFECT_DENIED");
+          return true;
+        },
+      );
+      await assert.rejects(
+        relay.call("tooluse_12345678", "po_web_read", { url: "https://example.com/exact" }),
+        /No capability turn is bound/,
+      );
+    }
+  });
+
   it("derives the Python-compatible deterministic call and injects only server authority", async () => {
     const relayModule = loadRelay();
     const envelopes = [];

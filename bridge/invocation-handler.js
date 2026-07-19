@@ -100,6 +100,14 @@ function snapshotTurnCapabilityGrant(value) {
   return snapshot;
 }
 
+function snapshotExternalEffects(value) {
+  if (value === undefined) return undefined;
+  if (value !== false) {
+    throw new TypeError("external effects authority may only be explicitly disabled");
+  }
+  return false;
+}
+
 function createInvocationHandler({ sessionBinding, handlers = {} } = {}) {
   if (!sessionBinding || typeof sessionBinding.bindOrAssert !== "function") {
     throw new TypeError("sessionBinding with bindOrAssert is required");
@@ -132,9 +140,11 @@ function createInvocationHandler({ sessionBinding, handlers = {} } = {}) {
       const turnCapabilityGrant = snapshotTurnCapabilityGrant(
         payload.turnCapabilityGrant,
       );
+      const externalEffects = snapshotExternalEffects(payload.externalEffects);
       const authority = Object.freeze({
         ...(workspaceCapability === undefined ? {} : { workspaceCapability }),
         ...(turnCapabilityGrant === undefined ? {} : { turnCapabilityGrant }),
+        ...(externalEffects === undefined ? {} : { externalEffects }),
       });
 
       const actorId = snapshotOptionalString(payload.actorId, "actorId");

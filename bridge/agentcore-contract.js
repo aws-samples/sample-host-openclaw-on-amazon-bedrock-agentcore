@@ -320,12 +320,18 @@ function createActiveTaskTracker() {
   });
 }
 
-async function withCapabilityTurn({ grant, task } = {}) {
+async function withCapabilityTurn({ grant, externalEffects, task } = {}) {
   if (typeof task !== "function") {
     throw new TypeError("Capability turn requires an exact task callback");
   }
   capabilityRelay.clear_turn();
-  if (grant !== undefined) capabilityRelay.bind_turn(grant);
+  if (grant !== undefined) {
+    if (externalEffects === false) {
+      capabilityRelay.bind_scheduled_turn(grant);
+    } else {
+      capabilityRelay.bind_turn(grant);
+    }
+  }
   try {
     return await task();
   } finally {
@@ -1379,6 +1385,7 @@ const server = http.createServer(async (req, res) => {
                 return capabilityTurnExecutor.submit(() =>
                   withCapabilityTurn({
                     grant: authority.turnCapabilityGrant,
+                    externalEffects: authority.externalEffects,
                     task: () => activeTaskTracker.run(async () => {
                       try {
                         if (openclawReady) {

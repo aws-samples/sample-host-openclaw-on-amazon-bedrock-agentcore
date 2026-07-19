@@ -220,6 +220,58 @@ function validateGrant(input) {
   return deepFreeze(value);
 }
 
+const SCHEDULED_READ_APPROVAL_MODES = new Set([
+  "NONE",
+  "CURRENT_REQUEST_TARGET_GRANT",
+]);
+const SCHEDULED_PROPOSAL_APPROVAL_MODE = "EXACT_ONE_TIME_PROPOSAL";
+const SCHEDULED_EXCLUDED_RISK_CLASSES = new Set([
+  "LOCAL_MUTATION",
+  "DURABLE_MUTATION",
+  "EXTERNAL_EFFECT",
+  "IRREVERSIBLE_EFFECT",
+]);
+const SCHEDULED_EXCLUDED_CREDENTIAL_BOUNDARIES = new Set([
+  "NETWORKLESS_COMPUTE",
+]);
+
+function validateScheduledGrant(input) {
+  const value = validateGrant(input);
+  const allowedPackIds = new Set(value.allowedPackIds);
+  const operationPackIds = new Set();
+  for (const operationId of value.allowedOperationIds) {
+    const operation = GATEWAY_OPERATION_REGISTRY[operationId];
+    const approvalMode = operation?.approvalPolicy?.mode;
+    const isProposal = approvalMode === SCHEDULED_PROPOSAL_APPROVAL_MODE;
+    const isRead =
+      SCHEDULED_READ_APPROVAL_MODES.has(approvalMode) &&
+      !SCHEDULED_EXCLUDED_RISK_CLASSES.has(operation?.riskClass);
+    if (
+      !operation ||
+      !allowedPackIds.has(operation.packId) ||
+      SCHEDULED_EXCLUDED_CREDENTIAL_BOUNDARIES.has(
+        operation.credentialBoundary,
+      ) ||
+      (!isProposal && !isRead)
+    ) {
+      fail(
+        "CAPABILITY_SCHEDULED_EFFECT_DENIED",
+        "Scheduled capability grant exceeds the read/propose surface",
+      );
+    }
+    operationPackIds.add(operation.packId);
+  }
+  if (
+    value.allowedPackIds.some((packId) => !operationPackIds.has(packId))
+  ) {
+    fail(
+      "CAPABILITY_SCHEDULED_EFFECT_DENIED",
+      "Scheduled capability grant contains an unbound capability pack",
+    );
+  }
+  return value;
+}
+
 function schemaAccepts(schema, value) {
   if (schema.oneOf) {
     let matches = 0;
@@ -572,6 +624,19 @@ class CapabilityRelay {
       fail("CAPABILITY_TURN_BUSY", "Cannot replace an active capability turn");
     }
     this.#grant = validateGrant(grant);
+    this.#calls = new Map();
+    this.#logicalCalls = new Map();
+    this.#sensitiveValues = [
+      this.#grant.nonce,
+      ...this.#grant.targetGrantHashes,
+    ];
+  }
+
+  bind_scheduled_turn(grant) {
+    if (this.#inflight !== 0) {
+      fail("CAPABILITY_TURN_BUSY", "Cannot replace an active capability turn");
+    }
+    this.#grant = validateScheduledGrant(grant);
     this.#calls = new Map();
     this.#logicalCalls = new Map();
     this.#sensitiveValues = [

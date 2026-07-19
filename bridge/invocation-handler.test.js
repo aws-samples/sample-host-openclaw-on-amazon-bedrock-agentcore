@@ -232,6 +232,40 @@ describe("trusted invocation admission", () => {
     assert.doesNotMatch(JSON.stringify(observed.request), /nonce_secret/);
   });
 
+  it("retains the scheduled read-only marker only as trusted authority", () => {
+    let observed;
+    const handler = createInvocationHandler({
+      sessionBinding: new SessionBinding(),
+      handlers: {
+        chat: (context) => {
+          observed = context;
+        },
+      },
+    });
+
+    handler.handle(payload("chat", { externalEffects: false }));
+
+    assert.equal(observed.authority.externalEffects, false);
+    assert.equal(Object.isFrozen(observed.authority), true);
+    assert.equal("externalEffects" in observed.request, false);
+  });
+
+  it("rejects every non-false external-effects marker before dispatch", () => {
+    for (const externalEffects of [true, null, 0, "false", {}, []]) {
+      const trace = [];
+      const handler = createInvocationHandler({
+        sessionBinding: new SessionBinding(),
+        handlers: { chat: () => trace.push("dispatch") },
+      });
+
+      assert.throws(
+        () => handler.handle(payload("chat", { externalEffects })),
+        /external effects/i,
+      );
+      assert.deepEqual(trace, []);
+    }
+  });
+
   it("rejects a missing or malformed workspace capability before dispatch", () => {
     for (const workspaceCapability of [undefined, "", "x".repeat(2049), "bad-💥"]) {
       const trace = [];
