@@ -141,9 +141,9 @@ Python package. The CLI surface is:
   run only the legal next phase after an exact mutation confirmation;
 - `--resume <journal>`: resume only a stable journal;
 - `--resume <journal> --reconcile --driver <reviewed-operation>`:
-  run the exact operation's phase-specific read-only live observation for an
-  `UNCERTAIN` journal. The observer, never the operator, proves `PERSISTED` or
-  `ABSENT`;
+  recompute the exact reviewed-operation digest for an `UNCERTAIN` journal,
+  then let the in-package read-only live authority prove `PERSISTED` or
+  `ABSENT`. The supplied executable is not invoked during observation;
 - `--status <journal>`: print the canonical journal without credentials;
 - `--rollback <verified-transaction-id>`: write rollback intent before dispatch
   and accept only the journal's exact rollback reference. It never retargets a
@@ -163,49 +163,72 @@ JOURNAL="$PWD/build/releases/release_${PERSONAL_OPERATOR_RELEASE_COMMIT}.json"
 ./scripts/deploy.sh --status "$JOURNAL"
 ```
 
-Do not supply an operation or mutation confirmation during preflight. A real
-phase requires one self-contained reviewed executable. The CLI hashes and
-copies its exact bytes into a private file retained for that invocation, then
-requires the exact
+Do not supply an operation or mutation confirmation during preflight. Before a
+real phase, create one canonical
+`personal-operator.production-observation-config.v1` file. Pass it with
+`--observation-config`, or place it at
+`<journal>.production-observation.json`. It binds the exact commit, tree,
+account, `eu-west-1`, image build inputs and builder identity, and the reviewed
+AgentCore subnet, security-group, environment, and lifecycle configuration.
+The CLI rejects a missing, noncanonical, or journal-mismatched config before
+write-ahead intent or credential discovery.
+
+A real phase also requires one self-contained reviewed mutation executable.
+The CLI frames and hashes its exact bytes together with the canonical
+observation-config bytes as one reviewed-operation digest, copies the
+executable into a private file retained for that invocation, then requires the
+exact
 confirmation
 `mutate:release_<40-sha>:<phase>:sha256:<operation-hex>`. The journal records
 that operation digest while `UNCERTAIN`. For the first cloud phase it also
 requires the exact commit/account/region/digest-bound rollback reference.
 
-Immediately before each dispatch or observation, the CLI rejects conflicting
-`CDK_DEFAULT_REGION`, `AWS_REGION`, or `AWS_DEFAULT_REGION`, authenticates the
-exact account, and pins all three child variables to `eu-west-1`. Mutation must
-return only `{"dispatched":true}`. It is never treated as persistence proof:
-the same retained executable is called in read-only observation mode and must
-return one canonical, identity-bound `personal-operator.phase-observation.v1`
-record. A `PERSISTED` record contains only the evidence owned by that phase; an
-`ABSENT` record contains none. The CLI then performs the matching journal
-transition.
+Immediately before mutation and again before live observation, the CLI rejects
+conflicting `CDK_DEFAULT_REGION`, `AWS_REGION`, or `AWS_DEFAULT_REGION`,
+authenticates the exact account, and pins all three child variables to
+`eu-west-1`. Mutation must return only `{"dispatched":true}`. It is never
+treated as persistence proof: the executable is invoked only with
+`--mode mutate`, and its STDOUT can never choose a journal outcome or provide
+release evidence.
 
-The image phase cannot stabilize from a driver-provided digest alone. Its
-observation contains a complete strict `RuntimeImageEvidence`, including the
-exact commit/tree, immutable image subject, authenticated SBOM and provenance,
-scan, and signature evidence. Endpoint and context observations contain a
-complete strict `RuntimeContextV3`; an endpoint can never stabilize on `{}`.
-The context phase additionally supplies the SHA-256 of those exact canonical
-context bytes. All three artifacts are cross-checked against the journal before
-its phase-owned fields are derived.
+After the second exact-account check, the CLI constructs the in-package
+`ProductionEvidenceComposer` with regional ECR, AgentCore control, and
+CloudFormation clients. SDK endpoint overrides and ambient proxy settings are
+disabled. The composer, not the driver, reads and reconciles every phase:
 
-Reviewed observation implementations use
-`release_tools.production_observation.compose_production_evidence`. It wires
-the exact ECR and AgentCore validators from already-authorized injected clients
-without constructing a session or touching credentials at import or
-construction time. A release operation must not replace that composition with
-self-asserted cloud outcomes.
+- foundation: all seven exact foundation stacks exist in a complete state, or
+  none exist;
+- image: the exact immutable image has strict SBOM, provenance, scan, and
+  signature evidence;
+- runtime: CloudFormation outputs and the READY AgentCore runtime agree on the
+  exact runtime ID, version, image, role, network, environment, storage, and
+  lifecycle configuration;
+- endpoint and context: AgentCore returns the exact READY endpoint and strict
+  canonical `RuntimeContextV3`;
+- consumer changesets: all four exact account/region change sets named
+  `release-<40-sha>` are complete, available, and hashed from their content;
+- consumers: those exact change sets are executed and the four complete live
+  stack templates, parameters, outputs, capabilities, and roles are hashed;
+- verify: image, context, foundation, consumer application, and journal
+  digests are recomposed from live evidence;
+- rollback: the complete live stack snapshot must hash to the exact rollback
+  reference.
+
+For a grouped phase, all exact subjects must be absent before the composer may
+return `ABSENT`. Partial presence, malformed responses, wrong identity,
+timeouts, SDK failures, or conflicting evidence remain ambiguous and leave the
+journal `UNCERTAIN`.
 
 After a crash or ambiguous result, use the same exact operation bytes and the
 confirmation
 `reconcile:release_<40-sha>:<phase>:sha256:<operation-hex>`. There is no
 operator `persisted|absent` switch and no local evidence-file override. A
-changed operation, timeout, noncanonical observation, account/region mismatch,
-unknown outcome, or wrong subject leaves the journal `UNCERTAIN` and blocks
-every later phase. Rollback follows the same write-ahead mutation plus
-authoritative observation rule, with
+changed operation or observation config, timeout, unavailable live authority,
+account/region mismatch, ambiguity, or wrong subject leaves the journal
+`UNCERTAIN` and blocks every later phase. Reconciliation supplies the same
+driver only to recompute the bound operation digest; it never executes the
+driver in an observation mode. Rollback follows the same write-ahead mutation
+plus in-package authoritative observation rule, with
 `rollback:release_<40-sha>:sha256:<operation-hex>`.
 
 The CDK foundation owns exactly one private retained

@@ -57,6 +57,10 @@ class EcrEvidenceError(RuntimeError):
     """ECR evidence disproves or cannot satisfy the release contract."""
 
 
+class EcrEvidenceAbsent(EcrEvidenceError):
+    """The exact repository or commit-tagged image is authoritatively absent."""
+
+
 class EcrEvidenceIncomplete(EcrEvidenceError):
     """A bounded asynchronous evidence step has not completed."""
 
@@ -117,6 +121,20 @@ class EcrEvidenceAdapter:
         except (TimeoutError, ConnectionError) as error:
             raise EcrEvidenceAmbiguous(
                 f"{method_name} ended without authoritative evidence"
+            ) from error
+        except Exception as error:
+            response = getattr(error, "response", None)
+            body = response.get("Error") if isinstance(response, dict) else None
+            code = body.get("Code") if isinstance(body, dict) else None
+            if method_name in {"describe_repositories", "describe_images"} and code in {
+                "RepositoryNotFoundException",
+                "ImageNotFoundException",
+            }:
+                raise EcrEvidenceAbsent(
+                    f"{method_name} exact subject is absent"
+                ) from error
+            raise EcrEvidenceError(
+                f"{method_name} failed without authoritative evidence"
             ) from error
 
     @staticmethod

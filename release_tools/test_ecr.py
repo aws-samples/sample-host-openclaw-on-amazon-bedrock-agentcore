@@ -8,6 +8,7 @@ import pytest
 
 from release_tools.ecr import (
     EcrEvidenceAdapter,
+    EcrEvidenceAbsent,
     EcrEvidenceAmbiguous,
     EcrEvidenceError,
     EcrEvidenceIncomplete,
@@ -354,6 +355,18 @@ def _collect(fake: FakeEcr, blob_reader: FakeBlobReader | None = None):
         builder_id=BUILDER_ID,
         builder_inputs=(BUILDER_INPUT,),
     )
+
+
+def test_missing_exact_image_is_authoritative_absence() -> None:
+    class ImageNotFound(Exception):
+        response = {"Error": {"Code": "ImageNotFoundException"}}
+
+    class MissingImageEcr(FakeEcr):
+        def describe_images(self, **kwargs):
+            raise ImageNotFound("missing")
+
+    with pytest.raises(EcrEvidenceAbsent, match="absent"):
+        _collect(MissingImageEcr())
 
 
 def _replace_provenance(

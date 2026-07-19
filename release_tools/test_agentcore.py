@@ -6,6 +6,7 @@ import pytest
 
 from release_tools.agentcore import (
     AgentCoreEvidenceAdapter,
+    AgentCoreEvidenceAbsent,
     AgentCoreEvidenceAmbiguous,
     AgentCoreEvidenceError,
     AgentCoreEvidenceIncomplete,
@@ -163,6 +164,47 @@ def test_collects_one_ready_digest_bound_runtime_context() -> None:
             {"agentRuntimeId": RUNTIME_ID, "endpointName": ENDPOINT_NAME},
         ),
     ]
+
+
+def test_collects_runtime_identity_without_requiring_an_endpoint() -> None:
+    fake = FakeAgentCore()
+    adapter = AgentCoreEvidenceAdapter(fake)
+
+    identity = adapter.collect_runtime_identity(
+        source_commit=COMMIT,
+        account=ACCOUNT,
+        region=REGION,
+        runtime_id=RUNTIME_ID,
+        runtime_version=VERSION,
+        runtime_image_uri=IMAGE_URI,
+        expected_subnet_ids=SUBNET_IDS,
+        expected_security_group_ids=SECURITY_GROUP_IDS,
+        expected_environment_variables=ENVIRONMENT,
+        expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
+        expected_max_lifetime=MAX_LIFETIME,
+    )
+
+    assert identity == (RUNTIME_ID, VERSION)
+    assert fake.calls == [
+        (
+            "get_agent_runtime",
+            {
+                "agentRuntimeId": RUNTIME_ID,
+                "agentRuntimeVersion": VERSION,
+            },
+        )
+    ]
+
+
+def test_missing_exact_runtime_is_authoritative_absence() -> None:
+    class ResourceNotFound(Exception):
+        response = {"Error": {"Code": "ResourceNotFoundException"}}
+
+    fake = FakeAgentCore()
+    fake.failure = ResourceNotFound("missing")
+
+    with pytest.raises(AgentCoreEvidenceAbsent, match="absent"):
+        _collect(AgentCoreEvidenceAdapter(fake))
 
 
 def test_endpoint_name_must_be_unused_before_the_create_mutation() -> None:

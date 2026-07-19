@@ -37,6 +37,10 @@ class AgentCoreEvidenceError(RuntimeError):
     """Live AgentCore state disproves the release contract."""
 
 
+class AgentCoreEvidenceAbsent(AgentCoreEvidenceError):
+    """The exact runtime or endpoint is authoritatively absent."""
+
+
 class AgentCoreEvidenceIncomplete(AgentCoreEvidenceError):
     """A known asynchronous AgentCore operation has not completed."""
 
@@ -139,6 +143,17 @@ class AgentCoreEvidenceAdapter:
             raise AgentCoreEvidenceAmbiguous(
                 f"{method_name} ended without authoritative evidence"
             ) from error
+        except Exception as error:
+            response = getattr(error, "response", None)
+            body = response.get("Error") if isinstance(response, dict) else None
+            code = body.get("Code") if isinstance(body, dict) else None
+            if code == "ResourceNotFoundException":
+                raise AgentCoreEvidenceAbsent(
+                    f"{method_name} exact subject is absent"
+                ) from error
+            raise AgentCoreEvidenceError(
+                f"{method_name} failed without authoritative evidence"
+            ) from error
 
     def assert_endpoint_name_available(
         self,
@@ -183,7 +198,7 @@ class AgentCoreEvidenceAdapter:
                 f"release endpoint name collision: {endpoint_name}"
             )
 
-    def collect_context(
+    def _collect_runtime(
         self,
         *,
         source_commit: str,
@@ -197,9 +212,7 @@ class AgentCoreEvidenceAdapter:
         expected_environment_variables: Mapping[str, str],
         expected_idle_runtime_session_timeout: int,
         expected_max_lifetime: int,
-    ) -> RuntimeContextV3:
-        """Collect the canonical v3 context only from exact READY resources."""
-
+    ) -> tuple[dict[str, Any], RuntimeConfigurationV1]:
         _identity(
             source_commit=source_commit,
             account=account,
@@ -242,7 +255,6 @@ class AgentCoreEvidenceAdapter:
             raise AgentCoreEvidenceError(
                 f"expected runtime configuration is invalid: {error}"
             ) from error
-        expected_endpoint_name = f"release_{source_commit}"
         runtime = self._call(
             "get_agent_runtime",
             agentRuntimeId=runtime_id,
@@ -255,7 +267,6 @@ class AgentCoreEvidenceAdapter:
             raise AgentCoreEvidenceError("runtime name is not stable")
         if runtime.get("agentRuntimeVersion") != runtime_version:
             raise AgentCoreEvidenceError("runtime version differs from the request")
-        runtime_arn = runtime.get("agentRuntimeArn")
         if runtime.get("roleArn") != execution_role_arn:
             raise AgentCoreEvidenceError("runtime role differs from the release role")
         try:
@@ -272,6 +283,77 @@ class AgentCoreEvidenceAdapter:
             raise AgentCoreEvidenceError(
                 "live runtime configuration differs from reviewed release configuration"
             )
+        return runtime, live_configuration
+
+    def collect_runtime_identity(
+        self,
+        *,
+        source_commit: str,
+        account: str,
+        region: str,
+        runtime_id: str,
+        runtime_version: str,
+        runtime_image_uri: str,
+        expected_subnet_ids: Sequence[str],
+        expected_security_group_ids: Sequence[str],
+        expected_environment_variables: Mapping[str, str],
+        expected_idle_runtime_session_timeout: int,
+        expected_max_lifetime: int,
+    ) -> tuple[str, str]:
+        """Prove one READY runtime without requiring its later endpoint."""
+
+        self._collect_runtime(
+            source_commit=source_commit,
+            account=account,
+            region=region,
+            runtime_id=runtime_id,
+            runtime_version=runtime_version,
+            runtime_image_uri=runtime_image_uri,
+            expected_subnet_ids=expected_subnet_ids,
+            expected_security_group_ids=expected_security_group_ids,
+            expected_environment_variables=expected_environment_variables,
+            expected_idle_runtime_session_timeout=(
+                expected_idle_runtime_session_timeout
+            ),
+            expected_max_lifetime=expected_max_lifetime,
+        )
+        return runtime_id, runtime_version
+
+    def collect_context(
+        self,
+        *,
+        source_commit: str,
+        account: str,
+        region: str,
+        runtime_id: str,
+        runtime_version: str,
+        runtime_image_uri: str,
+        expected_subnet_ids: Sequence[str],
+        expected_security_group_ids: Sequence[str],
+        expected_environment_variables: Mapping[str, str],
+        expected_idle_runtime_session_timeout: int,
+        expected_max_lifetime: int,
+    ) -> RuntimeContextV3:
+        """Collect the canonical v3 context only from exact READY resources."""
+
+        runtime, live_configuration = self._collect_runtime(
+            source_commit=source_commit,
+            account=account,
+            region=region,
+            runtime_id=runtime_id,
+            runtime_version=runtime_version,
+            runtime_image_uri=runtime_image_uri,
+            expected_subnet_ids=expected_subnet_ids,
+            expected_security_group_ids=expected_security_group_ids,
+            expected_environment_variables=expected_environment_variables,
+            expected_idle_runtime_session_timeout=(
+                expected_idle_runtime_session_timeout
+            ),
+            expected_max_lifetime=expected_max_lifetime,
+        )
+        execution_role_arn = expected_execution_role_arn(account, region)
+        expected_endpoint_name = f"release_{source_commit}"
+        runtime_arn = runtime.get("agentRuntimeArn")
 
         endpoint = self._call(
             "get_agent_runtime_endpoint",

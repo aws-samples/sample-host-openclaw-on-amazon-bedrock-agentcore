@@ -1,13 +1,11 @@
-# Task 4 Critical #1 — OPEN deploy-gate item
+# Task 4 Critical #1 — implemented, awaiting independent review
 
 ## Status
 
-Task 4 remediation is **4 of 5 findings fixed** at takeover-branch fork
-`0095d2b` (branch `codex/po-v1-infra-takeover`, forked from the prior writer's
-`codex/po-v1-infra`). The remaining **Critical #1** is intentionally deferred as
-an OPEN external-deploy gate, consistent with the standing mandate that
-Docker/AWS/deploy/provider gates remain open and that no partial is promoted
-into a completion claim.
+The code remediation is implemented locally with RED-first tests on the exact
+integration parent, but Critical #1 remains **OPEN pending an independent
+hostile review**. External Docker/AWS/deploy/provider gates remain open, and no
+local result is deployment evidence.
 
 ## Findings disposition
 
@@ -28,46 +26,45 @@ Independent assessment (workflow `wf_b0028e5c-881`, assess phase) confirmed at
   immutable `eu-west-1` staging CLI; `git grep "require-approval never"` clean
   in those two files).
 
-## The open Critical #1
+## Original Critical #1
 
-**Defect:** In `release_tools/cli.py` the operator-supplied `--driver`
-executable is invoked twice per phase — `mode="mutate"` (legitimate cloud
-mutation) and `mode="observe"`. The `observe` invocation's STDOUT is parsed by
+**Original defect:** Before this remediation, the operator-supplied `--driver`
+executable was invoked twice per phase — `mode="mutate"` (legitimate cloud
+mutation) and `mode="observe"`. The `observe` invocation's STDOUT was parsed by
 `_observation()` / `_phase_evidence()` and trusted as authoritative live
-evidence, then fed to `journal.reconcile()`. An operator can therefore choose
+evidence, then fed to `journal.reconcile()`. An operator could therefore choose
 the outcome (`PERSISTED`/`ABSENT`) and forge `RuntimeImageEvidence` /
-`RuntimeContextV3` via a driver they control, defeating the `UNCERTAIN`
+`RuntimeContextV3` via a controlled driver, defeating the `UNCERTAIN`
 crash-safety and immutable-subject invariants.
 
-The strict, correct live-evidence reader — `ProductionEvidenceComposer` /
-`compose_production_evidence` in `release_tools/production_observation.py` —
-already exists and is fully unit-tested (`release_tools/test_production_observation.py`),
-but has **zero callers on the release path** (`grep -n
-"production_observation\|compose_production_evidence" release_tools/cli.py`
-returns nothing).
+## Implemented remediation
 
-**Why deferred, not faked green:** the release CLI is only exercised at a real
-AWS deploy, which is explicitly gated until after Integration Gate A and an
-authorized deployment decision. Closing Critical #1 correctly is a
-release-state-machine change, because the composer today covers only 3 of the 8
-transaction phases (image/endpoint/context) and has no absent-outcome
-semantics; foundation/runtime/consumer-changesets/consumers/verify/rollback all
-need an in-package observation authority too. This must be hand-implemented with
-strict TDD and an independent hostile review immediately before any real deploy.
-
-**Required fix (scoped for the pre-deploy implementation):**
-- Move the authoritative observation off driver STDOUT onto an in-package
-  authority resolved after account discovery, pinned `eu-west-1`, credential-lazy
-  (production builds boto3 ECR/AgentCore clients + `ArtifactBlobReader` and calls
-  `compose_production_evidence`; a test seam injects a fake).
-- Cover every phase, not only the 3 the composer currently exposes.
-- Preserve UNCERTAIN on ambiguity; never accept an operator-chosen
-  `PERSISTED`/`ABSENT`; fail closed if the live authority is unavailable.
-- Re-point the `observe`-path tests in `release_tools/test_cli.py` and add a
-  RED-first test proving a forged-driver `observe` STDOUT cannot advance the
-  journal.
+- `release_tools/cli.py` invokes the reviewed executable only for mutation.
+  After a second exact-account check it calls the in-package
+  `ProductionEvidenceComposer`; operator STDOUT has no observation path.
+- A strict `personal-operator.production-observation-config.v1` is required
+  before mutation. Its canonical bytes and the exact executable bytes are
+  jointly bound into the journal operation digest.
+- The composer resolves all eight forward phases plus rollback from injected
+  ECR, AgentCore, and CloudFormation clients. It validates exact account,
+  `eu-west-1`, commit, tree, immutable artifacts, runtime configuration, stack
+  identity/state/content, and deterministic `release-<40-sha>` consumer change
+  sets.
+- Authoritative total absence may reconcile to `ABSENT`; partial presence,
+  service errors, malformed or conflicting evidence, and rollback mismatch
+  fail closed and leave the journal `UNCERTAIN`.
+- SDK endpoint overrides and ambient proxy settings are disabled for the live
+  authority.
+- RED-first regression tests prove forged driver observations are ignored,
+  all phases use live authority, observation config mutation changes the
+  operation digest, missing config stops before write-ahead, and hostile
+  ECR/AgentCore/CloudFormation responses cannot select persistence.
 
 ## Gate posture
 
 External Docker/AWS/signing/scan/runtime/deploy gates remain OPEN. Do not deploy
-until Critical #1 is closed and independently re-reviewed.
+until this implementation has passed independent hostile review and the
+reviewed commit has passed the required local gates. A later authorized AWS
+run must also ensure the mutation driver creates every consumer change set
+under the exact deterministic name `release-<40-sha>` expected by the live
+authority.

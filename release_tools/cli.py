@@ -13,14 +13,19 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
 from release_tools.contracts import (
     ContractError,
-    RuntimeContextV3,
-    RuntimeImageEvidence,
+    ProductionObservationConfigV1,
     StagingTransactionV1,
     parse_canonical_object,
+    read_regular_bytes,
+)
+from release_tools.production_observation import (
+    HttpsArtifactBlobReader,
+    ProductionObservationError,
+    compose_production_evidence,
 )
 from release_tools.transaction import TransactionError, TransactionJournal
 
@@ -37,20 +42,46 @@ PHASE_TO_STATE = {
     "verify": "VERIFIED",
 }
 STATE_TO_PHASE = {state: phase for phase, state in PHASE_TO_STATE.items()}
-PHASE_EVIDENCE_FIELDS = {
-    "foundation": set(),
-    "runtime": {"runtime_id", "runtime_version"},
-    "consumer-changesets": set(),
-    "consumers": set(),
-    "verify": set(),
-}
-
 _ACCOUNT = re.compile(r"[0-9]{12}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
 class ReleaseCliError(RuntimeError):
     """The requested release operation is unsafe or incomplete."""
+
+
+class EvidenceComposer(Protocol):
+    def observe_phase(
+        self,
+        phase: str,
+        transaction: StagingTransactionV1,
+    ) -> tuple[bool, Mapping[str, str]]: ...
+
+
+EvidenceComposerFactory = Callable[
+    [ProductionObservationConfigV1], EvidenceComposer
+]
+
+
+def _reviewed_operation_sha256(
+    driver: bytes,
+    observation_config: ProductionObservationConfigV1,
+) -> str:
+    """Bind the executable and reviewed live-observation inputs as one operation."""
+
+    if not isinstance(driver, bytes) or not driver:
+        raise ReleaseCliError("release operation bytes are invalid")
+    config = observation_config.to_bytes()
+    framed = b"".join(
+        (
+            b"personal-operator.release-operation.v2\0",
+            len(driver).to_bytes(8, "big"),
+            driver,
+            len(config).to_bytes(8, "big"),
+            config,
+        )
+    )
+    return "sha256:" + hashlib.sha256(framed).hexdigest()
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -124,6 +155,81 @@ def _check_requested_identity(
         raise ReleaseCliError("requested commit differs from the journal")
     if args.tree and args.tree != current.source_tree:
         raise ReleaseCliError("requested tree differs from the journal")
+
+
+def _load_observation_config(
+    args: argparse.Namespace,
+    journal: TransactionJournal,
+) -> ProductionObservationConfigV1:
+    configured = getattr(args, "observation_config", None)
+    path = (
+        Path(configured)
+        if configured is not None
+        else Path(str(journal.path) + ".production-observation.json")
+    )
+    try:
+        config = ProductionObservationConfigV1.from_bytes(read_regular_bytes(path))
+    except (ContractError, OSError) as error:
+        raise ReleaseCliError(
+            "exact production observation config is required before mutation"
+        ) from error
+    current = journal.current
+    if (
+        config.source_commit,
+        config.source_tree,
+        config.account,
+        config.region,
+    ) != (
+        current.source_commit,
+        current.source_tree,
+        current.account,
+        current.region,
+    ):
+        raise ReleaseCliError(
+            "production observation config differs from the release journal"
+        )
+    return config
+
+
+def _production_composer(
+    config: ProductionObservationConfigV1,
+) -> EvidenceComposer:
+    """Construct regional SDK clients only after live account discovery."""
+
+    try:
+        import boto3
+        from botocore.config import Config
+
+        client_config = Config(
+            region_name=config.region,
+            ignore_configured_endpoint_urls=True,
+            proxies={},
+            retries={"mode": "standard", "max_attempts": 3},
+        )
+        session = boto3.Session(region_name=config.region)
+        return compose_production_evidence(
+            ecr_client=session.client(
+                "ecr",
+                region_name=config.region,
+                config=client_config,
+            ),
+            artifact_blob_reader=HttpsArtifactBlobReader(),
+            agentcore_client=session.client(
+                "bedrock-agentcore-control",
+                region_name=config.region,
+                config=client_config,
+            ),
+            cloudformation_client=session.client(
+                "cloudformation",
+                region_name=config.region,
+                config=client_config,
+            ),
+            config=config,
+        )
+    except (ImportError, OSError, ValueError) as error:
+        raise ReleaseCliError(
+            "production observation authority is unavailable"
+        ) from error
 
 
 @contextmanager
@@ -235,18 +341,18 @@ def _discover_account(
         )
 
 
-def _invoke_driver(
+def _invoke_mutation_driver(
     driver: bytes,
     *,
-    mode: str,
     phase: str,
     journal: TransactionJournal,
     operation_sha256: str,
+    driver_sha256: str,
     environment: Mapping[str, str],
 ) -> dict[str, Any]:
     current = journal.current
     expected_digest = "sha256:" + hashlib.sha256(driver).hexdigest()
-    if expected_digest != operation_sha256:
+    if expected_digest != driver_sha256:
         raise ReleaseCliError("release operation bytes differ from the journal digest")
     with tempfile.TemporaryDirectory(
         prefix="personal-operator-operation-"
@@ -278,7 +384,7 @@ def _invoke_driver(
             [
                 str(retained),
                 "--mode",
-                mode,
+                "mutate",
                 "--phase",
                 phase,
                 "--journal",
@@ -314,111 +420,16 @@ def _invoke_driver(
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         raise ReleaseCliError(
-            f"{phase} {mode} did not return authoritative evidence"
+            f"{phase} mutation driver did not acknowledge dispatch"
             + (f": {detail}" if detail else "")
         )
     try:
         evidence = parse_canonical_object(completed.stdout)
     except ContractError as error:
         raise ReleaseCliError(
-            f"{phase} {mode} returned noncanonical evidence"
+            f"{phase} mutation driver returned noncanonical acknowledgement"
         ) from error
     return evidence
-
-
-def _runtime_image_evidence(
-    raw: Mapping[str, Any], *, journal: TransactionJournal
-) -> dict[str, str]:
-    if set(raw) != {"runtime_image_evidence"} or not isinstance(
-        raw.get("runtime_image_evidence"), Mapping
-    ):
-        raise ReleaseCliError(
-            "image observation must contain one exact RuntimeImageEvidence"
-        )
-    try:
-        evidence = RuntimeImageEvidence.from_mapping(raw["runtime_image_evidence"])
-    except ContractError as error:
-        raise ReleaseCliError(
-            "image observation contains invalid RuntimeImageEvidence"
-        ) from error
-    current = journal.current
-    if (
-        evidence.source_commit != current.source_commit
-        or evidence.source_tree != current.source_tree
-        or evidence.account != current.account
-        or evidence.region != current.region
-    ):
-        raise ReleaseCliError(
-            "RuntimeImageEvidence differs from the release identity"
-        )
-    return {"runtime_image_digest": evidence.image_digest}
-
-
-def _runtime_context_evidence(
-    phase: str,
-    raw: Mapping[str, Any],
-    *,
-    journal: TransactionJournal,
-) -> dict[str, str]:
-    expected_fields = (
-        {"runtime_context"}
-        if phase == "endpoint"
-        else {"runtime_context", "runtime_context_sha256"}
-    )
-    if set(raw) != expected_fields or not isinstance(
-        raw.get("runtime_context"), Mapping
-    ):
-        raise ReleaseCliError(
-            f"{phase} observation must contain one exact RuntimeContextV3"
-        )
-    try:
-        context = RuntimeContextV3.from_mapping(raw["runtime_context"])
-    except ContractError as error:
-        raise ReleaseCliError(
-            f"{phase} observation contains invalid RuntimeContextV3"
-        ) from error
-    current = journal.current
-    expected_image_uri = (
-        f"{current.account}.dkr.ecr.{current.region}.amazonaws.com/"
-        f"personal-operator/bridge@{current.runtime_image_digest}"
-    )
-    if (
-        context.source_commit != current.source_commit
-        or context.account != current.account
-        or context.region != current.region
-        or context.runtime_id != current.runtime_id
-        or context.runtime_version != current.runtime_version
-        or context.runtime_endpoint_name != current.runtime_endpoint_name
-        or context.runtime_image_uri != expected_image_uri
-    ):
-        raise ReleaseCliError("RuntimeContextV3 differs from the release journal")
-    if phase == "endpoint":
-        return {}
-    digest = raw.get("runtime_context_sha256")
-    expected_digest = hashlib.sha256(context.to_bytes()).hexdigest()
-    if digest != expected_digest:
-        raise ReleaseCliError("RuntimeContextV3 digest differs from its exact bytes")
-    return {"runtime_context_sha256": expected_digest}
-
-
-def _phase_evidence(
-    phase: str,
-    raw: Mapping[str, Any],
-    *,
-    journal: TransactionJournal,
-) -> dict[str, str]:
-    if phase == "image":
-        return _runtime_image_evidence(raw, journal=journal)
-    if phase in {"endpoint", "context"}:
-        return _runtime_context_evidence(phase, raw, journal=journal)
-    expected = PHASE_EVIDENCE_FIELDS[phase]
-    if set(raw) != expected:
-        raise ReleaseCliError(
-            f"{phase} driver evidence has the wrong fields"
-        )
-    if any(not isinstance(value, str) for value in raw.values()):
-        raise ReleaseCliError(f"{phase} driver evidence must contain strings")
-    return dict(raw)
 
 
 def _mutation_acknowledgement(phase: str, raw: Mapping[str, Any]) -> None:
@@ -426,68 +437,14 @@ def _mutation_acknowledgement(phase: str, raw: Mapping[str, Any]) -> None:
         raise ReleaseCliError(f"{phase} mutation acknowledgement is not exact")
 
 
-def _observation(
-    phase: str,
-    raw: Mapping[str, Any],
-    *,
-    journal: TransactionJournal,
-    operation_sha256: str,
-) -> tuple[bool, dict[str, str]]:
-    expected_fields = {
-        "account",
-        "evidence",
-        "operationSha256",
-        "outcome",
-        "phase",
-        "region",
-        "schema",
-        "sourceCommit",
-        "sourceTree",
-        "transactionId",
-    }
-    if set(raw) != expected_fields:
-        raise ReleaseCliError(f"{phase} observation has the wrong fields")
-    expected_identity = {
-        "account": journal.current.account,
-        "operationSha256": operation_sha256,
-        "phase": phase,
-        "region": journal.current.region,
-        "schema": "personal-operator.phase-observation.v1",
-        "sourceCommit": journal.current.source_commit,
-        "sourceTree": journal.current.source_tree,
-        "transactionId": journal.current.transaction_id,
-    }
-    if any(raw.get(name) != value for name, value in expected_identity.items()):
-        raise ReleaseCliError(
-            f"{phase} observation differs from the release identity"
-        )
-    outcome = raw.get("outcome")
-    evidence = raw.get("evidence")
-    if outcome not in {"PERSISTED", "ABSENT"} or not isinstance(evidence, Mapping):
-        raise ReleaseCliError(f"{phase} observation outcome is invalid")
-    if outcome == "ABSENT":
-        if evidence:
-            raise ReleaseCliError(
-                f"{phase} absent observation must contain no evidence"
-            )
-        return False, {}
-    if phase == "rollback":
-        expected = {"rollback_reference": journal.current.rollback_reference}
-        if dict(evidence) != expected:
-            raise ReleaseCliError(
-                "rollback observation differs from the journal"
-            )
-        return True, {}
-    return True, _phase_evidence(phase, evidence, journal=journal)
-
-
 def _observe_and_reconcile(
     journal: TransactionJournal,
     *,
     phase: str,
-    driver: bytes,
     operation_sha256: str,
     environment: Mapping[str, str],
+    observation_config: ProductionObservationConfigV1,
+    composer_factory: EvidenceComposerFactory,
 ) -> StagingTransactionV1:
     _validate_region(journal.current.region)
     _discover_account(
@@ -495,20 +452,13 @@ def _observe_and_reconcile(
         journal.current.region,
         environment=environment,
     )
-    raw = _invoke_driver(
-        driver,
-        mode="observe",
-        phase=phase,
-        journal=journal,
-        operation_sha256=operation_sha256,
-        environment=environment,
-    )
-    persisted, evidence = _observation(
-        phase,
-        raw,
-        journal=journal,
-        operation_sha256=operation_sha256,
-    )
+    composer = composer_factory(observation_config)
+    persisted, raw_evidence = composer.observe_phase(phase, journal.current)
+    if not isinstance(persisted, bool) or not isinstance(raw_evidence, Mapping):
+        raise ReleaseCliError(
+            f"{phase} live observation authority returned an invalid result"
+        )
+    evidence = dict(raw_evidence)
     if phase == "rollback":
         return journal.reconcile_rollback(
             persisted=persisted,
@@ -540,6 +490,9 @@ def _run_phase(
     journal: TransactionJournal,
     phase: str,
     args: argparse.Namespace,
+    *,
+    observation_config: ProductionObservationConfigV1,
+    composer_factory: EvidenceComposerFactory,
 ) -> StagingTransactionV1:
     _validate_region(journal.current.region)
     target = PHASE_TO_STATE[phase]
@@ -547,7 +500,11 @@ def _run_phase(
         raise ReleaseCliError(
             f"{phase} is not the one legal next transaction phase"
         )
-    with _driver(args) as (driver, operation_sha256):
+    with _driver(args) as (driver, driver_sha256):
+        operation_sha256 = _reviewed_operation_sha256(
+            driver,
+            observation_config,
+        )
         expected_confirmation = (
             f"mutate:{journal.current.transaction_id}:{phase}:"
             f"{operation_sha256}"
@@ -571,21 +528,22 @@ def _run_phase(
             journal.current.region,
             environment=environment,
         )
-        raw = _invoke_driver(
+        raw = _invoke_mutation_driver(
             driver,
-            mode="mutate",
             phase=phase,
             journal=journal,
             operation_sha256=operation_sha256,
+            driver_sha256=driver_sha256,
             environment=environment,
         )
         _mutation_acknowledgement(phase, raw)
         return _observe_and_reconcile(
             journal,
             phase=phase,
-            driver=driver,
             operation_sha256=operation_sha256,
             environment=environment,
+            observation_config=observation_config,
+            composer_factory=composer_factory,
         )
 
 
@@ -630,7 +588,12 @@ def _resume(args: argparse.Namespace) -> StagingTransactionV1:
             if journal.current.uncertain_phase == "ROLLBACK"
             else STATE_TO_PHASE[journal.current.uncertain_phase]
         )
-        with _driver(args) as (driver, operation_sha256):
+        observation_config = _load_observation_config(args, journal)
+        with _driver(args) as (driver, _driver_sha256):
+            operation_sha256 = _reviewed_operation_sha256(
+                driver,
+                observation_config,
+            )
             if operation_sha256 != journal.current.uncertain_operation_sha256:
                 raise ReleaseCliError(
                     "reconciliation driver digest differs from the journal"
@@ -651,9 +614,10 @@ def _resume(args: argparse.Namespace) -> StagingTransactionV1:
             return _observe_and_reconcile(
                 journal,
                 phase=phase,
-                driver=driver,
                 operation_sha256=operation_sha256,
                 environment=environment,
+                observation_config=observation_config,
+                composer_factory=args.composer_factory,
             )
     if journal.current.state == "UNCERTAIN":
         raise ReleaseCliError(
@@ -662,7 +626,13 @@ def _resume(args: argparse.Namespace) -> StagingTransactionV1:
     target = journal.resume_target()
     if target is None:
         raise ReleaseCliError("transaction has no resumable phase")
-    return _run_phase(journal, STATE_TO_PHASE[target], args)
+    return _run_phase(
+        journal,
+        STATE_TO_PHASE[target],
+        args,
+        observation_config=_load_observation_config(args, journal),
+        composer_factory=args.composer_factory,
+    )
 
 
 def _rollback(args: argparse.Namespace) -> StagingTransactionV1:
@@ -674,7 +644,12 @@ def _rollback(args: argparse.Namespace) -> StagingTransactionV1:
         raise ReleaseCliError("rollback transaction ID differs from the journal")
     if journal.current.state != "VERIFIED":
         raise ReleaseCliError("rollback requires a VERIFIED transaction")
-    with _driver(args) as (driver, operation_sha256):
+    observation_config = _load_observation_config(args, journal)
+    with _driver(args) as (driver, driver_sha256):
+        operation_sha256 = _reviewed_operation_sha256(
+            driver,
+            observation_config,
+        )
         expected_confirmation = (
             f"rollback:{transaction_id}:{operation_sha256}"
         )
@@ -696,21 +671,22 @@ def _rollback(args: argparse.Namespace) -> StagingTransactionV1:
             journal.current.region,
             environment=environment,
         )
-        raw = _invoke_driver(
+        raw = _invoke_mutation_driver(
             driver,
-            mode="mutate",
             phase="rollback",
             journal=journal,
             operation_sha256=operation_sha256,
+            driver_sha256=driver_sha256,
             environment=environment,
         )
         _mutation_acknowledgement("rollback", raw)
         return _observe_and_reconcile(
             journal,
             phase="rollback",
-            driver=driver,
             operation_sha256=operation_sha256,
             environment=environment,
+            observation_config=observation_config,
+            composer_factory=args.composer_factory,
         )
 
 
@@ -744,6 +720,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollback-reference", default="")
     parser.add_argument("--driver", type=Path)
     parser.add_argument(
+        "--observation-config",
+        type=Path,
+        help=(
+            "reviewed canonical live-observation config; defaults beside the journal"
+        ),
+    )
+    parser.add_argument(
         "--reconcile",
         action="store_true",
         help="authoritatively observe and reconcile one UNCERTAIN phase",
@@ -751,8 +734,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    composer_factory: EvidenceComposerFactory | None = None,
+) -> int:
     args = _parser().parse_args(argv)
+    args.composer_factory = composer_factory or _production_composer
     try:
         if args.status:
             if args.reconcile:
@@ -763,7 +751,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.phase:
             journal = TransactionJournal.load(_journal_path(args))
             _check_requested_identity(journal.current, args)
-            current = _run_phase(journal, args.phase, args)
+            current = _run_phase(
+                journal,
+                args.phase,
+                args,
+                observation_config=_load_observation_config(args, journal),
+                composer_factory=args.composer_factory,
+            )
         elif args.resume:
             current = _resume(args)
         elif args.rollback:
@@ -774,6 +768,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ContractError,
         OSError,
         ReleaseCliError,
+        ProductionObservationError,
         subprocess.SubprocessError,
         TransactionError,
     ) as error:

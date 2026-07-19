@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from release_tools.contracts import (
+    ProductionObservationConfigV1,
     StagingTransactionV1,
     canonical_json_bytes,
     write_new_contract,
 )
+from release_tools import cli as release_cli
 from release_tools.transaction import TransactionJournal
 
 
@@ -23,17 +27,98 @@ ACCOUNT = "123456789012"
 REGION = "eu-west-1"
 
 
+def test_production_observation_clients_ignore_operator_endpoint_and_proxy_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[tuple[str, object]] = []
+
+    class FakeSession:
+        def __init__(self, *, region_name: str) -> None:
+            assert region_name == REGION
+
+        def client(self, service: str, **kwargs: object) -> object:
+            assert kwargs["region_name"] == REGION
+            clients.append((service, kwargs["config"]))
+            return object()
+
+    sentinel = object()
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(Session=FakeSession))
+    monkeypatch.setattr(
+        release_cli,
+        "compose_production_evidence",
+        lambda **kwargs: sentinel,
+    )
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8")
+    config = _observation_config(
+        {"commit": "a" * 40, "tree": "b" * 40}
+    )
+
+    assert release_cli._production_composer(config) is sentinel
+    assert [service for service, _ in clients] == [
+        "ecr",
+        "bedrock-agentcore-control",
+        "cloudformation",
+    ]
+    for _, client_config in clients:
+        assert client_config.ignore_configured_endpoint_urls is True
+        assert client_config.proxies == {}
+
+
+def _observation_config(fixture: dict[str, object]) -> ProductionObservationConfigV1:
+    return ProductionObservationConfigV1.from_mapping(
+        {
+            "schema": ProductionObservationConfigV1.SCHEMA,
+            "sourceCommit": fixture["commit"],
+            "sourceTree": fixture["tree"],
+            "account": ACCOUNT,
+            "region": REGION,
+            "buildContext": "bridge",
+            "builderId": "https://personal-operator.invalid/builders/bridge-v1",
+            "builderInputs": ["sha256:" + "f" * 64],
+            "runtimeSubnetIds": [
+                "subnet-00000000000000001",
+                "subnet-00000000000000002",
+            ],
+            "runtimeSecurityGroupIds": ["sg-00000000000000001"],
+            "runtimeEnvironmentVariables": {
+                "AWS_DEFAULT_REGION": REGION,
+                "AWS_REGION": REGION,
+                "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+                "S3_USER_FILES_BUCKET": "personal-operator-user-files-123456789012",
+                "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME": (
+                    "workspace-credential-broker"
+                ),
+                "WORKSPACE_SYNC_INTERVAL_MS": "300000",
+            },
+            "runtimeIdleSessionTimeout": 1800,
+            "runtimeMaxLifetime": 28800,
+        }
+    )
+
+
 def _write_executable(path: Path, source: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(source, encoding="utf-8")
     path.chmod(0o755)
 
 
-def _sha256(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+def _operation_sha256(fixture: dict[str, object]) -> str:
+    config_path = Path(
+        str(fixture["journal"]) + ".production-observation.json"
+    )
+    config = ProductionObservationConfigV1.from_bytes(config_path.read_bytes())
+    return release_cli._reviewed_operation_sha256(
+        fixture["driver"].read_bytes(),
+        config,
+    )
 
 
-def _fixture(tmp_path: Path) -> dict[str, object]:
+def _fixture(
+    tmp_path: Path,
+    *,
+    include_observation_config: bool = True,
+) -> dict[str, object]:
     repository = tmp_path / "repo"
     repository.mkdir(parents=True)
     (repository / "README.md").write_text("fixture\n", encoding="utf-8")
@@ -209,7 +294,7 @@ print(json.dumps(observation, separators=(",", ":"), sort_keys=True))
         "AWS_ROLE_ARN": f"arn:aws:iam::{ACCOUNT}:role/poison",
         "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:9/poison",
     }
-    return {
+    fixture = {
         "repo": repository,
         "commit": commit,
         "tree": tree,
@@ -219,6 +304,61 @@ print(json.dumps(observation, separators=(",", ":"), sort_keys=True))
         "rollback": rollback,
         "env": env,
     }
+    if include_observation_config:
+        config_path = Path(str(journal) + ".production-observation.json")
+        config_path.write_bytes(_observation_config(fixture).to_bytes())
+    wrapper = tmp_path / "staging-release-test-entrypoint.py"
+    wrapper.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, {str(ROOT)!r})
+from release_tools.cli import main
+from release_tools.production_observation import ProductionObservationError
+
+
+class LiveAuthority:
+    def observe_phase(self, phase, transaction):
+        control = json.loads(
+            Path(os.environ["PERSONAL_OPERATOR_TEST_CONTROL"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        if control.get("RELEASE_FAIL_OBSERVE_PHASE") == phase:
+            raise ProductionObservationError(
+                f"{{phase}} live observation authority is unavailable"
+            )
+        if control.get("RELEASE_OBSERVE_OUTCOME") == "ABSENT":
+            return False, {{}}
+        if phase in {{"foundation", "endpoint", "rollback"}}:
+            return True, {{}}
+        if phase == "image":
+            return True, {{"runtime_image_digest": "sha256:" + "0" * 64}}
+        if phase == "runtime":
+            return True, {{
+                "runtime_id": "Runtime-ABCDEFGHIJ",
+                "runtime_version": "7",
+            }}
+        if phase == "context":
+            return True, {{"runtime_context_sha256": "1" * 64}}
+        if phase == "consumer-changesets":
+            return True, {{"consumer_changesets_sha256": "2" * 64}}
+        if phase == "consumers":
+            return True, {{"consumer_application_sha256": "3" * 64}}
+        if phase == "verify":
+            return True, {{"verification_sha256": "4" * 64}}
+        raise ProductionObservationError(f"unknown test phase {{phase}}")
+
+
+raise SystemExit(main(composer_factory=lambda config: LiveAuthority()))
+""",
+        encoding="utf-8",
+    )
+    fixture["script"] = wrapper
+    return fixture
 
 
 def _run(
@@ -235,6 +375,7 @@ def _run(
     control_path.write_text(json.dumps(controls, sort_keys=True), encoding="utf-8")
     env = {
         **fixture["env"],
+        "PERSONAL_OPERATOR_TEST_CONTROL": str(control_path),
         **{
             name: value
             for name, value in environment.items()
@@ -244,7 +385,7 @@ def _run(
     return subprocess.run(
         [
             sys.executable,
-            str(SCRIPT),
+            str(fixture["script"]),
             "--root",
             str(fixture["repo"]),
             "--account",
@@ -280,7 +421,7 @@ def _phase(
     **environment: str,
 ) -> subprocess.CompletedProcess[str]:
     transaction_id = f"release_{fixture['commit']}"
-    operation_sha256 = _sha256(fixture["driver"])
+    operation_sha256 = _operation_sha256(fixture)
     args = [
         "--journal",
         str(fixture["journal"]),
@@ -357,6 +498,32 @@ def test_mutation_requires_exact_confirmation_before_credentials_or_driver(
     assert TransactionJournal.load(fixture["journal"]).current.state == "PREFLIGHTED"
 
 
+def test_mutation_requires_exact_observation_config_before_write_ahead(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, include_observation_config=False)
+    assert _preflight(fixture).returncode == 0
+
+    completed = _run(
+        fixture,
+        "--journal",
+        str(fixture["journal"]),
+        "--phase",
+        "foundation",
+        "--driver",
+        str(fixture["driver"]),
+        "--rollback-reference",
+        str(fixture["rollback"]),
+        "--confirm",
+        "mutate:unreachable",
+    )
+
+    assert completed.returncode != 0
+    assert "observation config" in completed.stderr.casefold()
+    assert not fixture["log"].exists()
+    assert TransactionJournal.load(fixture["journal"]).current.state == "PREFLIGHTED"
+
+
 def test_mutation_rejects_a_symlinked_driver_before_write_ahead_or_credentials(
     tmp_path: Path,
 ) -> None:
@@ -378,7 +545,7 @@ def test_mutation_rejects_a_symlinked_driver_before_write_ahead_or_credentials(
         "--confirm",
         (
             f"mutate:release_{fixture['commit']}:foundation:"
-            f"{_sha256(fixture['driver'])}"
+            f"{_operation_sha256(fixture)}"
         ),
     )
 
@@ -417,7 +584,7 @@ else:
     assert "operation bytes changed" in completed.stderr.casefold()
     current = TransactionJournal.load(fixture["journal"]).current
     assert current.state == "UNCERTAIN"
-    assert current.uncertain_operation_sha256 == _sha256(fixture["driver"])
+    assert current.uncertain_operation_sha256 == _operation_sha256(fixture)
 
 
 def test_driver_cannot_import_mutable_operator_helper_from_pythonpath(
@@ -550,11 +717,107 @@ def test_confirmed_phase_discovers_exact_account_immediately_before_driver(
         "aws <sts get-caller-identity --query Account --output text --region eu-west-1>",
         "driver mutate <foundation> region=<eu-west-1>/<eu-west-1>/<eu-west-1>",
         "aws <sts get-caller-identity --query Account --output text --region eu-west-1>",
-        "driver observe <foundation> region=<eu-west-1>/<eu-west-1>/<eu-west-1>",
     ]
     assert TransactionJournal.load(fixture["journal"]).current.state == (
         "FOUNDATION_READY"
     )
+
+
+def test_forged_driver_observation_cannot_advance_the_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+    journal = TransactionJournal.load(fixture["journal"])
+    config = _observation_config(fixture)
+    operation_sha256 = release_cli._reviewed_operation_sha256(
+        fixture["driver"].read_bytes(),
+        config,
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "driver": fixture["driver"],
+            "confirm": (
+                f"mutate:{journal.current.transaction_id}:foundation:"
+                f"{operation_sha256}"
+            ),
+            "rollback_reference": fixture["rollback"],
+        },
+    )()
+
+    class LiveAuthority:
+        def observe_phase(self, phase, transaction):
+            assert phase == "foundation"
+            assert transaction.state == "UNCERTAIN"
+            return False, {}
+
+    monkeypatch.setattr(release_cli, "_discover_account", lambda *args, **kwargs: None)
+
+    current = release_cli._run_phase(
+        journal,
+        "foundation",
+        args,
+        observation_config=config,
+        composer_factory=lambda config: LiveAuthority(),
+    )
+
+    assert current.state == "PREFLIGHTED"
+    assert fixture["log"].read_text(encoding="utf-8").splitlines() == [
+        "driver mutate <foundation> region=<eu-west-1>/<eu-west-1>/<eu-west-1>"
+    ]
+
+
+def test_uncertain_operation_digest_binds_the_observation_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+    journal = TransactionJournal.load(fixture["journal"])
+    config = _observation_config(fixture)
+    operation_sha256 = release_cli._reviewed_operation_sha256(
+        fixture["driver"].read_bytes(),
+        config,
+    )
+    changed = replace(config, builder_inputs=("sha256:" + "e" * 64,))
+    changed_sha256 = release_cli._reviewed_operation_sha256(
+        fixture["driver"].read_bytes(),
+        changed,
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "driver": fixture["driver"],
+            "confirm": (
+                f"mutate:{journal.current.transaction_id}:foundation:"
+                f"{operation_sha256}"
+            ),
+            "rollback_reference": fixture["rollback"],
+        },
+    )()
+
+    class UnavailableAuthority:
+        def observe_phase(self, phase, transaction):
+            raise RuntimeError("live authority unavailable")
+
+    monkeypatch.setattr(release_cli, "_discover_account", lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        release_cli._run_phase(
+            journal,
+            "foundation",
+            args,
+            observation_config=config,
+            composer_factory=lambda config: UnavailableAuthority(),
+        )
+
+    current = TransactionJournal.load(fixture["journal"]).current
+    assert current.state == "UNCERTAIN"
+    assert current.uncertain_operation_sha256 == operation_sha256
+    assert changed_sha256 != operation_sha256
 
 
 def test_phase_revalidates_region_before_write_ahead_or_credentials(
@@ -596,7 +859,7 @@ def test_mutation_requires_typed_ack_and_authoritative_observation(
     )
 
     assert ambiguous.returncode != 0
-    assert "observe" in ambiguous.stderr
+    assert "live observation authority" in ambiguous.stderr
     assert TransactionJournal.load(no_observation["journal"]).current.state == (
         "UNCERTAIN"
     )
@@ -632,7 +895,7 @@ def test_post_dispatch_failure_stays_uncertain_and_blocks_later_phases(
     assert "<runtime>" not in fixture["log"].read_text(encoding="utf-8")
 
 
-def test_image_cannot_stabilize_on_a_bare_driver_asserted_digest(
+def test_image_driver_observation_is_ignored_in_favor_of_live_authority(
     tmp_path: Path,
 ) -> None:
     fixture = _fixture(tmp_path)
@@ -641,14 +904,14 @@ def test_image_cannot_stabilize_on_a_bare_driver_asserted_digest(
 
     completed = _phase(fixture, "image", RELEASE_LEGACY_IMAGE="1")
 
-    assert completed.returncode != 0
-    assert "RuntimeImageEvidence" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
     current = TransactionJournal.load(fixture["journal"]).current
-    assert current.state == "UNCERTAIN"
-    assert current.last_stable_state == "FOUNDATION_READY"
+    assert current.state == "IMAGE_PUBLISHED"
+    assert current.runtime_image_digest == "sha256:" + "0" * 64
+    assert "driver observe" not in fixture["log"].read_text(encoding="utf-8")
 
 
-def test_endpoint_cannot_stabilize_without_a_typed_live_runtime_context(
+def test_endpoint_driver_observation_is_ignored_in_favor_of_live_authority(
     tmp_path: Path,
 ) -> None:
     fixture = _fixture(tmp_path)
@@ -659,11 +922,10 @@ def test_endpoint_cannot_stabilize_without_a_typed_live_runtime_context(
 
     completed = _phase(fixture, "endpoint", RELEASE_EMPTY_ENDPOINT="1")
 
-    assert completed.returncode != 0
-    assert "RuntimeContextV3" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
     current = TransactionJournal.load(fixture["journal"]).current
-    assert current.state == "UNCERTAIN"
-    assert current.last_stable_state == "RUNTIME_READY"
+    assert current.state == "ENDPOINT_READY"
+    assert "driver observe" not in fixture["log"].read_text(encoding="utf-8")
 
 
 def test_explicit_absent_reconciliation_allows_safe_resume(
@@ -684,7 +946,7 @@ def test_explicit_absent_reconciliation_allows_safe_resume(
         "--confirm",
         (
             f"reconcile:release_{fixture['commit']}:image:"
-            f"{_sha256(fixture['driver'])}"
+            f"{_operation_sha256(fixture)}"
         ),
         RELEASE_OBSERVE_OUTCOME="ABSENT",
     )
@@ -718,7 +980,7 @@ def test_reconciliation_rejects_operator_outcome_and_changed_driver(
         encoding="utf-8",
     )
     fixture["driver"].chmod(0o755)
-    changed_digest = _sha256(fixture["driver"])
+    changed_digest = _operation_sha256(fixture)
     replaced = _run(
         fixture,
         "--resume",
@@ -759,7 +1021,7 @@ def test_reconciliation_revalidates_region_before_live_observation(
         "--confirm",
         (
             f"reconcile:release_{fixture['commit']}:image:"
-            f"{_sha256(fixture['driver'])}"
+            f"{_operation_sha256(fixture)}"
         ),
         AWS_DEFAULT_REGION="us-east-1",
     )
@@ -800,7 +1062,7 @@ def test_verified_rollback_is_write_ahead_and_never_exposes_endpoint_retarget(
     )
     write_new_contract(fixture["journal"], verified)
     transaction_id = f"release_{fixture['commit']}"
-    operation_sha256 = _sha256(fixture["driver"])
+    operation_sha256 = _operation_sha256(fixture)
 
     poisoned = _run(
         fixture,
@@ -835,9 +1097,10 @@ def test_verified_rollback_is_write_ahead_and_never_exposes_endpoint_retarget(
     current = TransactionJournal.load(fixture["journal"]).current
     assert current.state == "ROLLED_BACK"
     assert current.runtime_endpoint_name == f"release_{fixture['commit']}"
-    assert fixture["log"].read_text(encoding="utf-8").splitlines()[-2:] == [
+    assert fixture["log"].read_text(encoding="utf-8").splitlines()[-3:] == [
         "aws <sts get-caller-identity --query Account --output text --region eu-west-1>",
-        "driver observe <rollback> region=<eu-west-1>/<eu-west-1>/<eu-west-1>",
+        "driver mutate <rollback> region=<eu-west-1>/<eu-west-1>/<eu-west-1>",
+        "aws <sts get-caller-identity --query Account --output text --region eu-west-1>",
     ]
 
 
