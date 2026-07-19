@@ -206,6 +206,7 @@ class ComputeStack(Stack):
         self.task_definition = ecs.CfnTaskDefinition(
             self,
             "ComputeJobTaskDefinition",
+            family="personal-operator-compute",
             cpu="256",
             memory="512",
             network_mode="awsvpc",

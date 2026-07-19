@@ -57,6 +57,7 @@ def test_compute_stack_has_an_isolated_networkless_job_runner():
     # An ECS task definition running the pinned image as the job runner.
     task_defs = _resources(template, "AWS::ECS::TaskDefinition")
     assert len(task_defs) == 1
+    assert task_defs[0]["Properties"]["Family"] == "personal-operator-compute"
     # The runner exposes a pinned image digest to the gateway environment.
     assert stack.image_digest == IMAGE_DIGEST
 
