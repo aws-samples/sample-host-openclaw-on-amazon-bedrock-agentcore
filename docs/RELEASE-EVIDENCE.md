@@ -90,6 +90,52 @@ The suite includes the following hostile cases:
   subprocess tests inspect the executed boundary, and failed republication
   preserves the prior artifact rather than deleting it.
 
+## Task 11 local operational evidence
+
+The credential-free v1 harness executes three synthetic participant journeys
+and constructs the cohort report from events emitted only after each associated
+assertion succeeds. It covers invite, connect, read-only connector, scan, card,
+feedback, draft/workspace, proposal-only/read-only schedule, compute denial,
+portable export/import, inert landing, identical replay denial, and both
+deletion passes. Production-shaped compute returns `ADAPTER_DISABLED`; this is
+containment evidence, not successful compute-isolation evidence.
+
+The connect, feedback, and workspace rows causally depend on the production
+`GoogleReadonlyOAuthFlow.start/complete`,
+`DynamoScanMeasurements.feedback`, and
+`GmailWorkspaceService.get/edit_draft` methods. Their external dependencies are
+local injected state, token client/vault, Dynamo-shaped tables, Gmail input,
+repository, and a fail-closed approval superseder; no provider adapter is
+substituted for those production methods. Hostile monkeypatch tests prove that
+blocking any named method prevents a successful run. Raw
+`socket.socket.connect`, `connect_ex`, `sendto`, and every available send method
+are patched, actively probed, and denied in addition to the higher-level
+network/provider boundaries.
+
+```bash
+PYTHONPATH=lambda ./.venv/bin/python -m pytest -q \
+  tests/integration/test_synthetic_pilot_v1.py
+PYTHONPATH=lambda ./.venv/bin/python scripts/run-synthetic-pilot.py
+```
+
+The standalone runner executes the journey twice and emits output only when
+the canonical report bytes are identical and both external-call ledgers are
+empty. The report schema is `personal-operator.cohort-report.v1`; its only
+payload is a participant count plus sorted, aggregated operational events.
+Tests reject participant IDs, invite bearers, source/thread/message values,
+addresses, subjects, excerpts, draft/workspace content, and provider canaries
+from those bytes.
+
+This remains local synthetic development evidence. No remote AWS API,
+AgentCore, Telegram, Google/Gmail provider endpoint, model provider, connector
+server, or browser provider was invoked. No cloud resource, remote account,
+real pilot, or external effect was created. Only the DLQ and native maintenance
+heartbeat currently have truthful live metric producers; uncertain effect,
+scan failure, aged deletion, connector drift, and compute isolation are
+template/synthetic alarms only. Live observability, Task 8 compute completion,
+Task 10 connector/browser approval enforcement, and the moderated-pilot gate
+all remain **OPEN**.
+
 ## Dependency and license inventory
 
 The inventory was generated twice into independent temporary directories:

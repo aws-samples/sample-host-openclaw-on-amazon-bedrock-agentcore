@@ -10,6 +10,7 @@ from aws_cdk import App, Environment
 from aws_cdk.assertions import Template
 
 from stacks.observability_stack import ObservabilityStack
+from tests.test_product_configuration import _synth_router_template
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +21,14 @@ CMK_ARN = f"arn:aws:kms:{REGION}:{ACCOUNT}:key/test-key"
 
 def _rendered(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _resources(template: dict, resource_type: str) -> list[dict]:
+    return [
+        resource
+        for resource in template["Resources"].values()
+        if resource["Type"] == resource_type
+    ]
 
 
 def test_observability_template_keeps_metrics_without_model_payload_logging() -> None:
@@ -41,6 +50,115 @@ def test_observability_template_keeps_metrics_without_model_payload_logging() ->
     assert "textDataDeliveryEnabled" not in rendered
     assert "imageDataDeliveryEnabled" not in rendered
     assert "/aws/bedrock/invocation-logs" not in rendered
+
+
+def test_private_pilot_alarm_set_is_complete_without_duplicate_dlq_or_publishers() -> None:
+    app = App()
+    stack = ObservabilityStack(
+        app,
+        "ObservabilityAlarms",
+        cmk_arn=CMK_ARN,
+        env=Environment(account=ACCOUNT, region=REGION),
+    )
+    template = Template.from_stack(stack).to_json()
+    alarms = {
+        alarm["Properties"]["AlarmName"]: alarm["Properties"]
+        for alarm in _resources(template, "AWS::CloudWatch::Alarm")
+    }
+
+    expected_custom = {
+        "personal-operator-uncertain-effect": (
+            "action_kernel",
+            "uncertain_effect",
+            "uncertain",
+            1,
+        ),
+        "personal-operator-repeated-scan-failure": (
+            "scan",
+            "scan",
+            "failed",
+            3,
+        ),
+        "personal-operator-aged-deletion": (
+            "portable",
+            "deletion",
+            "aged",
+            1,
+        ),
+        "personal-operator-connector-drift": (
+            "connector",
+            "connector_drift",
+            "drifted",
+            1,
+        ),
+        "personal-operator-compute-isolation-failure": (
+            "compute",
+            "compute_isolation",
+            "failed",
+            1,
+        ),
+    }
+    assert set(expected_custom).issubset(alarms)
+    assert "personal-operator-missing-maintenance-heartbeat" in alarms
+    assert "personal-operator-telegram-dlq-visible" not in alarms
+
+    for name, (component, operation, outcome, threshold) in expected_custom.items():
+        properties = alarms[name]
+        assert properties["Namespace"] == "PersonalOperator/Pilot"
+        assert properties["MetricName"] == "EventCount"
+        assert properties["Threshold"] == threshold
+        assert properties["TreatMissingData"] == "notBreaching"
+        assert properties["Dimensions"] == [
+            {"Name": "Component", "Value": component},
+            {"Name": "Environment", "Value": "preproduction"},
+            {"Name": "Operation", "Value": operation},
+            {"Name": "Outcome", "Value": outcome},
+        ]
+
+    heartbeat = alarms["personal-operator-missing-maintenance-heartbeat"]
+    assert heartbeat["Namespace"] == "AWS/Lambda"
+    assert heartbeat["MetricName"] == "Invocations"
+    assert heartbeat["Dimensions"] == [
+        {"Name": "FunctionName", "Value": "personal-operator-maintenance"}
+    ]
+    assert heartbeat["TreatMissingData"] == "breaching"
+
+    resource_types = {resource["Type"] for resource in template["Resources"].values()}
+    assert "AWS::Lambda::Function" not in resource_types
+    assert "AWS::IAM::Role" not in resource_types
+    assert "AWS::IAM::Policy" not in resource_types
+    assert "AWS::Logs::MetricFilter" not in resource_types
+
+
+def test_existing_router_dlq_alarm_remains_the_single_exact_live_alarm() -> None:
+    router = _synth_router_template()
+    matches = [
+        alarm["Properties"]
+        for alarm in _resources(router, "AWS::CloudWatch::Alarm")
+        if alarm["Properties"].get("AlarmName")
+        == "personal-operator-telegram-dlq-visible"
+    ]
+
+    assert len(matches) == 1
+    assert matches[0] == {
+        "AlarmName": "personal-operator-telegram-dlq-visible",
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "Dimensions": [
+            {
+                "Name": "QueueName",
+                "Value": {
+                    "Fn::GetAtt": ["TelegramDeadLetterQueue94187138", "QueueName"]
+                },
+            }
+        ],
+        "EvaluationPeriods": 1,
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Namespace": "AWS/SQS",
+        "Period": 60,
+        "Statistic": "Maximum",
+        "Threshold": 1,
+        "TreatMissingData": "notBreaching",
+    }
 
 
 def test_active_app_synth_has_no_payload_logging_or_legacy_token_monitoring(

@@ -48,7 +48,7 @@ run_check "Python unit tests" \
   "$PYTHON" -m pytest lambda/router lambda/worker lambda/workflows \
   lambda/actions lambda/capabilities lambda/control lambda/portable lambda/web \
   lambda/cron lambda/compute lambda/connectors lambda/browser lambda/scheduler \
-  lambda/workspace_broker \
+  lambda/workspace_broker lambda/observability \
   tests/test_capability_stack.py \
   tests/test_compute_stack.py \
   tests/test_browser_stack.py \

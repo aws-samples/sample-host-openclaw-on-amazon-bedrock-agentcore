@@ -354,6 +354,110 @@ Rotating the CloudFront origin-verification secret also requires a Web stack
 update: CloudFront resolves the value during deployment while the web Lambda
 loads it from Secrets Manager. Treat the pair as one coordinated rotation.
 
+## Credential-free moderated-pilot rehearsal
+
+The v1 pilot harness is a local operational rehearsal, not a staging pilot and
+not AWS or provider evidence. It uses three synthetic participants and invokes
+the real `GoogleReadonlyOAuthFlow.start/complete`,
+`DynamoScanMeasurements.feedback`, and
+`GmailWorkspaceService.get/edit_draft` methods with local state, tables, token
+client/vault, Gmail input, repository, and fail-closed approval superseder. It
+also installs and actively probes fail-closed sentinels on raw socket
+`connect`, `connect_ex`, `sendto`, and available send methods, plus DNS, HTTP,
+Requests, Boto3/Botocore, Google-provider, model-provider, Telegram, and
+AgentCore boundaries. It asserts each successful step before adding its
+bounded event to the cohort report. Run it with the reviewed Python
+environment:
+
+```bash
+PYTHONPATH=lambda ./.venv/bin/python -m pytest -q \
+  tests/integration/test_synthetic_pilot_v1.py
+PYTHONPATH=lambda ./.venv/bin/python scripts/run-synthetic-pilot.py
+```
+
+The runner executes the complete journey twice, requires byte-identical output
+and an empty external-call ledger, then writes only one canonical
+`personal-operator.cohort-report.v1` JSON document to stdout. The journey
+covers invite, browser connect, a read-only connector, bounded scan, card,
+feedback, draft/workspace, a proposal-only read-only schedule, production-
+shaped compute returning `ADAPTER_DISABLED`, portable export/import with inert
+landing and identical-replay denial, and the two-pass deletion drain. The
+report contains only bounded aggregate event dimensions and counts; it carries
+no participant, invitation, source, provider, or workspace values.
+
+### Alarm-evidence boundary
+
+The queue DLQ alarm and the native maintenance-heartbeat alarm have truthful
+live AWS metric producers in the current templates. The other five required
+alarms—uncertain effect, repeated scan failure, aged deletion, connector drift,
+and compute-isolation failure—are template/synthetic contracts only; their live
+application metric producers and end-to-end alarm transitions have not been
+observed. Live observability therefore remains **OPEN**. Never interpret a
+locally generated cohort row or synthesized alarm as a live signal.
+
+Task 8 compute operational completion remains **OPEN**. Production composition
+has no compute transport or adapter and must continue returning
+`ADAPTER_DISABLED`; a launcher, pinned image, result collector, kill switch,
+and live zero-egress/isolation proof require a separate review before use.
+Task 10's connector/browser before-enabling gate also remains **OPEN**: the
+synthetic MCP dispatch path does not yet enforce exact approval, one-time use,
+and expiry. Keep the connector plane and Browser Gateway disabled until that
+enforcement is implemented and independently reviewed.
+
+### Pause and shutdown sequence
+
+1. **Pause the cohort.** Stop issuing invitations and revoke every unused
+   invitation only when its retained raw `poi1_...` bearer is available to the
+   `revoke` operation. A stored invitation digest cannot revoke an invitation
+   or recover that bearer; there is no digest-input or cohort-wide revoke
+   control in v1. Keep the bearer out of operational evidence, and do not
+   invalidate the evidence needed to reconcile work already in flight.
+2. **Preserve the structural connector stop.** The connector plane is disabled
+   by the empty production connector registry, and Browser Gateway remains
+   disabled. There is no mutable connector kill switch or OAuth pause control
+   in v1. For this unreleased build, keep the registry empty, provider
+   credentials absent, and every deployment/pilot gate open. If a future
+   reviewed staging deployment unexpectedly exposes connector or OAuth entry,
+   revoke the remote provider grant, keep that cohort out of service, and
+   resume only after a reviewed redeployment whose exact composition proves
+   the registry remains empty and the unwanted entry is unreachable. Never
+   test containment with a real send.
+3. **Inspect the DLQ without redrive.** Read only bounded envelope metadata and
+   the durable ledger/action state for the exact event. Do not copy message
+   content into the incident record. Never bulk-redrive the queue, and never
+   redrive an item whose effect or delivery is `UNCERTAIN`; reconcile exact
+   provider evidence first. A reviewed, read-only item may be replayed only
+   when its durable idempotency contract proves that replay safe.
+4. **Preserve schedule containment.**
+   There is no mutable operator schedule kill switch in v1 and no cohort-wide
+   schedule pause. Stop accepting new schedule proposals and stop issuing new
+   participant authority. The only supported schedule mutation for containment
+   is the trusted scheduler control plane's exact per-user `PURGE_USER`
+   operation; it requires that participant's exact canonical user identifier
+   and is not a cohort-wide pause. Keep scheduled runtime turns restricted to
+   `externalEffects=false` and read/propose operations. Do not edit an
+   EventBridge schedule or target directly, and do not inject or derive a user
+   identifier manually.
+5. **Keep compute disabled.** The present kill switch is the absent production
+   adapter. Treat any outcome other than `ADAPTER_DISABLED` as a stop event.
+   If compute is enabled in a later release, disable both capability
+   installation and launcher before investigating an isolation signal.
+6. **Run deletion through both phases.** Persist the authority fence, perform
+   the first complete purge, wait at least the 30-minute credential/invocation
+   drain, and let the singleton maintenance path repeat the purge before
+   marking completion. Never skip or shorten the drain.
+
+### Pilot stop criteria
+
+Pause immediately and keep all external effects disabled on any nonzero DLQ,
+`UNCERTAIN` effect, repeated scan failure, missing maintenance heartbeat, aged
+deletion, connector-manifest drift, compute-isolation failure, cross-tenant
+observation, unexpected provider/external sentinel call, report/log content
+canary, or commit/catalog/runtime identity mismatch. Resume only after the
+exact subject is reconciled, every affected gate is rerun, and a separate
+review accepts the evidence. Cost, latency, or error-rate limits for a real
+cohort are still unset because no authorized AWS/provider pilot was run.
+
 ## Incident procedures
 
 ### Gmail action is `UNCERTAIN`

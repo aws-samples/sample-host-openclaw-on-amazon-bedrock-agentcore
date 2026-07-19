@@ -199,6 +199,102 @@ class ObservabilityStack(Stack):
             treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
         ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
 
+        # Private-pilot custom metrics are declarations only. This stack does
+        # not create a publisher or grant PutMetricData. Until a reviewed live
+        # publisher exists, these five alarms can be exercised only with
+        # bounded synthetic evidence.
+        def pilot_event_metric(
+            component: str, operation: str, outcome: str
+        ) -> cw.Metric:
+            return cw.Metric(
+                namespace="PersonalOperator/Pilot",
+                metric_name="EventCount",
+                dimensions_map={
+                    "Environment": "preproduction",
+                    "Component": component,
+                    "Operation": operation,
+                    "Outcome": outcome,
+                },
+                period=Duration.minutes(5),
+                statistic="Sum",
+            )
+
+        for alarm_id, alarm_name, component, operation, outcome, threshold in (
+            (
+                "UncertainEffectAlarm",
+                "personal-operator-uncertain-effect",
+                "action_kernel",
+                "uncertain_effect",
+                "uncertain",
+                1,
+            ),
+            (
+                "RepeatedScanFailureAlarm",
+                "personal-operator-repeated-scan-failure",
+                "scan",
+                "scan",
+                "failed",
+                3,
+            ),
+            (
+                "AgedDeletionAlarm",
+                "personal-operator-aged-deletion",
+                "portable",
+                "deletion",
+                "aged",
+                1,
+            ),
+            (
+                "ConnectorDriftAlarm",
+                "personal-operator-connector-drift",
+                "connector",
+                "connector_drift",
+                "drifted",
+                1,
+            ),
+            (
+                "ComputeIsolationFailureAlarm",
+                "personal-operator-compute-isolation-failure",
+                "compute",
+                "compute_isolation",
+                "failed",
+                1,
+            ),
+        ):
+            cw.Alarm(
+                self,
+                alarm_id,
+                alarm_name=alarm_name,
+                metric=pilot_event_metric(component, operation, outcome),
+                threshold=threshold,
+                evaluation_periods=1,
+                comparison_operator=(
+                    cw.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD
+                ),
+                treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+            ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
+
+        # This is the only new live alarm: the existing hourly maintenance
+        # Lambda already publishes native AWS/Lambda Invocations. Missing data
+        # must therefore fail closed instead of being treated as healthy.
+        maintenance_invocations = cw.Metric(
+            namespace="AWS/Lambda",
+            metric_name="Invocations",
+            dimensions_map={"FunctionName": "personal-operator-maintenance"},
+            period=Duration.hours(1),
+            statistic="Sum",
+        )
+        cw.Alarm(
+            self,
+            "MissingMaintenanceHeartbeatAlarm",
+            alarm_name="personal-operator-missing-maintenance-heartbeat",
+            metric=maintenance_invocations,
+            threshold=1,
+            evaluation_periods=2,
+            comparison_operator=cw.ComparisonOperator.LESS_THAN_THRESHOLD,
+            treat_missing_data=cw.TreatMissingData.BREACHING,
+        ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
+
         CfnOutput(
             self,
             "AlarmTopicArn",

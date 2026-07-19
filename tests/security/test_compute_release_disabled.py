@@ -10,11 +10,36 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 from release_tools.contracts import FOUNDATION_RELEASE_STACKS
 
 
 ROOT = Path(__file__).resolve().parents[2]
 REGION = "eu-west-1"
+COMPUTE_ISOLATION_ALARM_NAME = "personal-operator-compute-isolation-failure"
+FORBIDDEN_COMPUTE_IDENTIFIERS = (
+    "personal-operator-compute",
+    "ComputeInputBucket",
+    "ComputeOutputBucket",
+    "ComputeJobExecutionRole",
+    "ComputeJobTaskDefinition",
+    "ComputeWorkloadSecurityGroup",
+    "personal-operator-compute-exec-",
+    "personal-operator-compute-inputs",
+    "personal-operator-compute-outputs",
+    "/personal-operator/compute/job-runner",
+    "/personal-operator-compute",
+)
+FORBIDDEN_COMPUTE_RESOURCE_TYPES = frozenset(
+    {
+        "AWS::Batch::ComputeEnvironment",
+        "AWS::Batch::JobDefinition",
+        "AWS::ECS::Cluster",
+        "AWS::ECS::Service",
+        "AWS::ECS::TaskDefinition",
+    }
+)
 
 
 def _synth_active_application(tmp_path: Path) -> tuple[dict, list[dict]]:
@@ -81,31 +106,137 @@ def _synth_active_application(tmp_path: Path) -> tuple[dict, list[dict]]:
     return artifacts, templates
 
 
+def _assert_no_incomplete_compute_resources(
+    resources: list[tuple[str, str, dict]],
+) -> None:
+    alarm_candidates = [
+        entry
+        for entry in resources
+        if entry[2].get("Properties", {}).get("AlarmName")
+        == COMPUTE_ISOLATION_ALARM_NAME
+    ]
+    assert len(alarm_candidates) == 1, (
+        "expected one exact compute-isolation alarm, found "
+        f"{len(alarm_candidates)}"
+    )
+    alarm_stack, alarm_logical_id, alarm = alarm_candidates[0]
+    alarm_properties = alarm.get("Properties", {})
+    alarm_actions = alarm_properties.get("AlarmActions")
+    assert alarm_actions is not None and len(alarm_actions) == 1
+    action_ref = alarm_actions[0].get("Ref")
+    assert isinstance(action_ref, str) and action_ref
+    expected_alarm_properties = {
+        "AlarmActions": [{"Ref": action_ref}],
+        "AlarmName": COMPUTE_ISOLATION_ALARM_NAME,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "Dimensions": [
+            {"Name": "Component", "Value": "compute"},
+            {"Name": "Environment", "Value": "preproduction"},
+            {"Name": "Operation", "Value": "compute_isolation"},
+            {"Name": "Outcome", "Value": "failed"},
+        ],
+        "EvaluationPeriods": 1,
+        "MetricName": "EventCount",
+        "Namespace": "PersonalOperator/Pilot",
+        "Period": 300,
+        "Statistic": "Sum",
+        "Threshold": 1,
+        "TreatMissingData": "notBreaching",
+    }
+    assert alarm == {
+        "Type": "AWS::CloudWatch::Alarm",
+        "Properties": expected_alarm_properties,
+    }
+    action_targets = [
+        resource
+        for stack_name, logical_id, resource in resources
+        if stack_name == alarm_stack and logical_id == action_ref
+    ]
+    assert len(action_targets) == 1
+    assert action_targets[0].get("Type") == "AWS::SNS::Topic"
+    assert action_targets[0].get("Properties", {}).get("TopicName") == (
+        "openclaw-alarms"
+    )
+
+    for stack_name, logical_id, resource in resources:
+        if (stack_name, logical_id) == (alarm_stack, alarm_logical_id):
+            continue
+        assert resource.get("Type") not in FORBIDDEN_COMPUTE_RESOURCE_TYPES, (
+            f"{logical_id} has forbidden compute resource type "
+            f"{resource.get('Type')}"
+        )
+        rendered = json.dumps(
+            {"logicalId": logical_id, "resource": resource},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for forbidden in FORBIDDEN_COMPUTE_IDENTIFIERS:
+            assert forbidden not in rendered, (
+                f"{logical_id} contains forbidden compute identifier {forbidden}"
+            )
+
+
+def test_compute_identifier_guard_rejects_non_alarm_resource_mutation() -> None:
+    mutated_resources = [
+        (
+            "mutant-stack",
+            "AlarmTopic",
+            {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": "openclaw-alarms"},
+            },
+        ),
+        (
+            "mutant-stack",
+            "ComputeIsolationFailureAlarm",
+            {
+                "Type": "AWS::CloudWatch::Alarm",
+                "Properties": {
+                    "AlarmActions": [{"Ref": "AlarmTopic"}],
+                    "AlarmName": COMPUTE_ISOLATION_ALARM_NAME,
+                    "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+                    "Dimensions": [
+                        {"Name": "Component", "Value": "compute"},
+                        {"Name": "Environment", "Value": "preproduction"},
+                        {"Name": "Operation", "Value": "compute_isolation"},
+                        {"Name": "Outcome", "Value": "failed"},
+                    ],
+                    "EvaluationPeriods": 1,
+                    "MetricName": "EventCount",
+                    "Namespace": "PersonalOperator/Pilot",
+                    "Period": 300,
+                    "Statistic": "Sum",
+                    "Threshold": 1,
+                    "TreatMissingData": "notBreaching",
+                },
+            },
+        ),
+        (
+            "mutant-stack",
+            "NonAlarmComputeMutation",
+            {
+                "Type": "AWS::CloudWatch::Dashboard",
+                "Properties": {"DashboardName": "personal-operator-compute"},
+            },
+        )
+    ]
+
+    with pytest.raises(AssertionError, match="NonAlarmComputeMutation"):
+        _assert_no_incomplete_compute_resources(mutated_resources)
+
+
 def test_active_synth_has_no_incomplete_compute_resources_or_authority(
     tmp_path: Path,
 ) -> None:
     artifacts, templates = _synth_active_application(tmp_path)
     resources = [
-        resource
-        for template in templates
-        for resource in template.get("Resources", {}).values()
+        (str(stack_index), logical_id, resource)
+        for stack_index, template in enumerate(templates)
+        for logical_id, resource in template.get("Resources", {}).items()
     ]
-    rendered = json.dumps(templates, sort_keys=True, separators=(",", ":"))
 
     assert "PersonalOperatorCompute" not in artifacts
-    assert not any(
-        resource["Type"] in {"AWS::ECS::Cluster", "AWS::ECS::TaskDefinition"}
-        for resource in resources
-    )
-    for forbidden in (
-        "personal-operator-compute",
-        "ComputeInputBucket",
-        "ComputeOutputBucket",
-        "ComputeJobExecutionRole",
-        "ComputeJobTaskDefinition",
-        "ComputeWorkloadSecurityGroup",
-    ):
-        assert forbidden not in rendered
+    _assert_no_incomplete_compute_resources(resources)
 
     reports = sorted((tmp_path / "cdk.out").glob("AwsSolutions--*-NagReport.csv"))
     assert reports

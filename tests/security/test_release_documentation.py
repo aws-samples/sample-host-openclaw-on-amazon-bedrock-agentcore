@@ -53,3 +53,22 @@ def test_release_docs_count_the_shared_lambda_asset_surface_correctly() -> None:
     assert expected in operations
     assert expected in evidence
     assert "all four Lambda handlers" not in operations
+
+
+def test_pause_runbook_names_missing_controls_and_only_supported_containment() -> None:
+    operations = (ROOT / "docs/OPERATIONS.md").read_text(encoding="utf-8")
+
+    assert "retained raw `poi1_...` bearer" in operations
+    assert "A stored invitation digest cannot revoke an invitation" in operations
+    assert "empty production connector registry" in operations
+    assert "no mutable connector kill switch or OAuth pause control" in operations
+    assert "reviewed redeployment" in operations
+    assert "no mutable operator schedule kill switch" in operations
+    assert "exact per-user `PURGE_USER`" in operations
+    assert "not a cohort-wide pause" in operations
+
+    assert "revoke every unused invitation digest" not in operations
+    assert "Set the connector control-plane kill switch" not in operations
+    assert "block new OAuth starts" not in operations
+    assert "Apply the schedule kill switch" not in operations
+    assert "disable live EventBridge schedules" not in operations
