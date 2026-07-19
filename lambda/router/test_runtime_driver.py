@@ -1140,6 +1140,7 @@ def test_runtime_driver_grant_reaches_all_six_gateway_capabilities_with_exact_bi
         "CAPABILITY_RELEASE_COMMIT": SOURCE_COMMIT,
         "CAPABILITY_CATALOG_DIGEST": catalog.catalog_digest,
         "CAPABILITY_ALLOWED_CALLER_ARN": caller_arn,
+        "PORTABLE_STATE_TABLE_NAME": "personal-operator-control",
         "SCHEDULER_CONTROL_TABLE_NAME": "personal-operator-scheduler-control",
     }
     class SchedulePort:

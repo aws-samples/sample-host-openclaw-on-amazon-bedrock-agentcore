@@ -6,6 +6,7 @@ import json
 import pytest
 
 from capabilities.schedule_port import (
+    DynamoPortableScheduleProjectionReader,
     DynamoScheduleCapabilityPort,
     DynamoScheduleDefinitionReader,
 )
@@ -154,6 +155,101 @@ def _spec(user_id="user_alpha"):
         revision=1,
         state="ENABLED",
     )
+
+
+def _portable_projection_item(*, user_id="user_alpha", schedules=None):
+    projection = {
+        "schema": "personal-operator.portable-schedule-projection.v1",
+        "userId": user_id,
+        "generation": 1,
+        "bundleHash": "a" * 64,
+        "schedules": schedules
+        if schedules is not None
+        else [
+            {
+                "scheduleId": "schedule_imported_12345678",
+                "userId": user_id,
+                "taskType": "READ_ONLY_AGENT_TURN",
+                "state": "DISABLED",
+            }
+        ],
+    }
+    return {
+        "PK": {"S": f"USER#{user_id}"},
+        "SK": {"S": "PORTABLE#LIVE_STATE"},
+        "recordType": {"S": "PORTABLE_LIVE_STATE_V2"},
+        "userId": {"S": user_id},
+        "generation": {"N": "1"},
+        "liveBundleHash": {"S": "a" * 64},
+        "liveScheduleProjectionJson": {
+            "S": json.dumps(projection, sort_keys=True, separators=(",", ":"))
+        },
+    }
+
+
+def test_portable_projection_reader_is_strong_content_free_and_subject_bound():
+    client = MemorySchedulerClient()
+    client.items[("USER#user_alpha", "PORTABLE#LIVE_STATE")] = (
+        _portable_projection_item()
+    )
+    reader = DynamoPortableScheduleProjectionReader(
+        client=client,
+        table_name="personal-operator-control",
+    )
+
+    assert reader.disabled_schedule_views("user_alpha") == [
+        {
+            "scheduleId": "schedule_imported_12345678",
+            "userId": "user_alpha",
+            "taskType": "READ_ONLY_AGENT_TURN",
+            "state": "DISABLED",
+        }
+    ]
+    assert client.get_calls == [
+        {
+            "TableName": "personal-operator-control",
+            "Key": {
+                "PK": {"S": "USER#user_alpha"},
+                "SK": {"S": "PORTABLE#LIVE_STATE"},
+            },
+            "ProjectionExpression": (
+                "PK, SK, #recordType, #userId, #generation, "
+                "liveBundleHash, liveScheduleProjectionJson"
+            ),
+            "ExpressionAttributeNames": {
+                "#recordType": "recordType",
+                "#userId": "userId",
+                "#generation": "generation",
+            },
+            "ConsistentRead": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda item: item.update(extra={"S": "x"}),
+        lambda item: item["generation"].update(N="2"),
+        lambda item: item["liveBundleHash"].update(S="b" * 64),
+        lambda item: item["userId"].update(S="user_beta"),
+        lambda item: item["liveScheduleProjectionJson"].update(
+            S=item["liveScheduleProjectionJson"]["S"] + " "
+        ),
+    ],
+)
+def test_portable_projection_reader_rejects_malformed_or_unbound_state(mutate):
+    client = MemorySchedulerClient()
+    item = _portable_projection_item()
+    mutate(item)
+    client.items[("USER#user_alpha", "PORTABLE#LIVE_STATE")] = item
+    reader = DynamoPortableScheduleProjectionReader(
+        client=client,
+        table_name="personal-operator-control",
+    )
+
+    with pytest.raises(RuntimeError, match="portable schedule projection"):
+        reader.disabled_schedule_views("user_alpha")
 
 
 def test_lists_only_strong_read_tenant_bound_schedule_views():

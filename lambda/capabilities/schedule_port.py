@@ -26,6 +26,9 @@ _INVOCATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{7,127}")
 _TELEGRAM_CHAT = re.compile(r"[1-9][0-9]{0,19}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_SCHEDULES = 256
+_PORTABLE_PROJECTION_SCHEMA = (
+    "personal-operator.portable-schedule-projection.v1"
+)
 
 
 def _string_attribute(item: Mapping[str, Any], name: str) -> str:
@@ -36,6 +39,116 @@ def _string_attribute(item: Mapping[str, Any], name: str) -> str:
     if not isinstance(text, str):
         raise RuntimeError("scheduler control record is invalid")
     return text
+
+
+def _positive_number_attribute(item: Mapping[str, Any], name: str) -> int:
+    value = item.get(name)
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"N"}
+        or not isinstance(value.get("N"), str)
+        or not value["N"].isdigit()
+        or int(value["N"]) < 1
+    ):
+        raise RuntimeError("portable schedule projection is invalid")
+    return int(value["N"])
+
+
+class DynamoPortableScheduleProjectionReader:
+    """Read only the content-free projection atomically stored at activation."""
+
+    _FIELDS = {
+        "PK",
+        "SK",
+        "recordType",
+        "userId",
+        "generation",
+        "liveBundleHash",
+        "liveScheduleProjectionJson",
+    }
+
+    def __init__(self, *, client: Any, table_name: str) -> None:
+        if not callable(getattr(client, "get_item", None)):
+            raise TypeError("portable schedule reader requires exact Dynamo reads")
+        if not isinstance(table_name, str) or _TABLE.fullmatch(table_name) is None:
+            raise ValueError("portable schedule table name is invalid")
+        self._client = client
+        self._table_name = table_name
+
+    def disabled_schedule_views(self, user_id: str) -> list[dict[str, str]]:
+        if not isinstance(user_id, str) or _USER.fullmatch(user_id) is None:
+            raise ValueError("schedule capability user is invalid")
+        response = self._client.get_item(
+            TableName=self._table_name,
+            Key={
+                "PK": {"S": f"USER#{user_id}"},
+                "SK": {"S": "PORTABLE#LIVE_STATE"},
+            },
+            ProjectionExpression=(
+                "PK, SK, #recordType, #userId, #generation, "
+                "liveBundleHash, liveScheduleProjectionJson"
+            ),
+            ExpressionAttributeNames={
+                "#recordType": "recordType",
+                "#userId": "userId",
+                "#generation": "generation",
+            },
+            ConsistentRead=True,
+        )
+        if not isinstance(response, Mapping):
+            raise RuntimeError("portable schedule projection read is invalid")
+        raw = response.get("Item")
+        if raw is None:
+            return []
+        if not isinstance(raw, Mapping) or set(raw) != self._FIELDS:
+            raise RuntimeError("portable schedule projection is invalid")
+        generation = _positive_number_attribute(raw, "generation")
+        bundle_hash = _string_attribute(raw, "liveBundleHash")
+        projection_json = _string_attribute(raw, "liveScheduleProjectionJson")
+        if (
+            _string_attribute(raw, "PK") != f"USER#{user_id}"
+            or _string_attribute(raw, "SK") != "PORTABLE#LIVE_STATE"
+            or _string_attribute(raw, "recordType") != "PORTABLE_LIVE_STATE_V2"
+            or _string_attribute(raw, "userId") != user_id
+            or _SHA256.fullmatch(bundle_hash) is None
+        ):
+            raise RuntimeError("portable schedule projection is invalid")
+        try:
+            projection = json.loads(projection_json)
+            if canonical_json_bytes(projection).decode("utf-8") != projection_json:
+                raise ValueError("noncanonical projection")
+        except (TypeError, ValueError):
+            raise RuntimeError("portable schedule projection is invalid") from None
+        if (
+            not isinstance(projection, Mapping)
+            or set(projection)
+            != {"schema", "userId", "generation", "bundleHash", "schedules"}
+            or projection.get("schema") != _PORTABLE_PROJECTION_SCHEMA
+            or projection.get("userId") != user_id
+            or projection.get("generation") != generation
+            or projection.get("bundleHash") != bundle_hash
+            or not isinstance(projection.get("schedules"), list)
+            or len(projection["schedules"]) > _MAX_SCHEDULES
+        ):
+            raise RuntimeError("portable schedule projection is invalid")
+        result: list[dict[str, str]] = []
+        prior_id: str | None = None
+        for row in projection["schedules"]:
+            if (
+                not isinstance(row, Mapping)
+                or set(row) != {"scheduleId", "userId", "taskType", "state"}
+                or not isinstance(row.get("scheduleId"), str)
+                or _SCHEDULE.fullmatch(row["scheduleId"]) is None
+                or row.get("userId") != user_id
+                or row.get("taskType")
+                not in {"REMINDER", "READ_ONLY_AGENT_TURN"}
+                or row.get("state") != "DISABLED"
+                or (prior_id is not None and row["scheduleId"] <= prior_id)
+            ):
+                raise RuntimeError("portable schedule projection is invalid")
+            prior_id = row["scheduleId"]
+            result.append(dict(row))
+        return result
 
 
 class DynamoScheduleDefinitionReader:
@@ -236,8 +349,9 @@ class DynamoScheduleCapabilityPort:
             raise ValueError("schedule capability catalog digest is invalid")
         if not callable(clock) or not callable(nonce_factory):
             raise TypeError("schedule capability port requires trusted time and nonce")
-        if imported_schedules is not None and not callable(
-            getattr(imported_schedules, "disabled_schedules", None)
+        if imported_schedules is not None and not any(
+            callable(getattr(imported_schedules, method, None))
+            for method in ("disabled_schedule_views", "disabled_schedules")
         ):
             raise TypeError("imported schedule projection is invalid")
         self._client = client
@@ -352,11 +466,50 @@ class DynamoScheduleCapabilityPort:
         ]
         seen = {item["scheduleId"] for item in schedules}
         if self._imported_schedules is not None:
-            imported = self._imported_schedules.disabled_schedules(user_id)
-            if not isinstance(imported, list) or len(imported) > _MAX_SCHEDULES:
+            view_reader = getattr(
+                self._imported_schedules,
+                "disabled_schedule_views",
+                None,
+            )
+            if callable(view_reader):
+                imported_views = view_reader(user_id)
+                if (
+                    not isinstance(imported_views, list)
+                    or len(imported_views) > _MAX_SCHEDULES
+                ):
+                    raise RuntimeError("imported schedule listing is invalid")
+                for raw in imported_views:
+                    if (
+                        not isinstance(raw, Mapping)
+                        or set(raw)
+                        != {"scheduleId", "userId", "taskType", "state"}
+                        or raw.get("userId") != user_id
+                        or raw.get("state") != "DISABLED"
+                        or not isinstance(raw.get("scheduleId"), str)
+                        or _SCHEDULE.fullmatch(raw["scheduleId"]) is None
+                        or raw.get("taskType")
+                        not in {"REMINDER", "READ_ONLY_AGENT_TURN"}
+                        or raw["scheduleId"] in seen
+                    ):
+                        raise RuntimeError("imported schedule listing is invalid")
+                    seen.add(raw["scheduleId"])
+                    schedules.append(
+                        {
+                            "scheduleId": raw["scheduleId"],
+                            "taskType": raw["taskType"],
+                            "state": "PAUSED",
+                            "nextRunAt": None,
+                        }
+                    )
+                imported = None
+            else:
+                imported = self._imported_schedules.disabled_schedules(user_id)
+            if imported is not None and (
+                not isinstance(imported, list) or len(imported) > _MAX_SCHEDULES
+            ):
                 raise RuntimeError("imported schedule listing is invalid")
             expected = set(ScheduleSpecV1.FIELDS) - {"schema", "nextRunAt"}
-            for raw in imported:
+            for raw in imported or []:
                 if not isinstance(raw, Mapping):
                     raise RuntimeError("imported schedule listing is invalid")
                 # Portable-v2 historically admitted other inert schedule
@@ -495,4 +648,8 @@ class DynamoScheduleCapabilityPort:
         )
 
 
-__all__ = ["DynamoScheduleCapabilityPort", "DynamoScheduleDefinitionReader"]
+__all__ = [
+    "DynamoPortableScheduleProjectionReader",
+    "DynamoScheduleCapabilityPort",
+    "DynamoScheduleDefinitionReader",
+]

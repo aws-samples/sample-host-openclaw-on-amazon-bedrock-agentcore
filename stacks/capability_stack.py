@@ -22,6 +22,7 @@ REQUIRED_REGION = "eu-west-1"
 GATEWAY_FUNCTION_NAME = "personal-operator-capability-gateway"
 STATE_TABLE_NAME = "personal-operator-capability-state"
 SCHEDULER_CONTROL_TABLE_NAME = "personal-operator-scheduler-control"
+PORTABLE_STATE_TABLE_NAME = "personal-operator-control"
 _RELEASE_COMMIT = re.compile(r"[0-9a-f]{40}")
 _CATALOG_DIGEST = re.compile(r"[0-9a-f]{64}")
 
@@ -136,6 +137,32 @@ class CapabilityStack(Stack):
                 ],
             )
         )
+        portable_table_arn = (
+            f"arn:aws:dynamodb:{region}:{account}:table/"
+            f"{PORTABLE_STATE_TABLE_NAME}"
+        )
+        execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:GetItem"],
+                resources=[portable_table_arn],
+                conditions={
+                    "ForAllValues:StringEquals": {
+                        "dynamodb:Attributes": [
+                            "PK",
+                            "SK",
+                            "recordType",
+                            "userId",
+                            "generation",
+                            "liveBundleHash",
+                            "liveScheduleProjectionJson",
+                        ]
+                    },
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": ["USER#*"],
+                    },
+                },
+            )
+        )
         execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
@@ -188,6 +215,7 @@ class CapabilityStack(Stack):
                 "CAPABILITY_CATALOG_DIGEST": catalog_digest,
                 "CAPABILITY_RELEASE_COMMIT": release_commit,
                 "CAPABILITY_STATE_TABLE_NAME": STATE_TABLE_NAME,
+                "PORTABLE_STATE_TABLE_NAME": PORTABLE_STATE_TABLE_NAME,
                 "SCHEDULER_CONTROL_TABLE_NAME": SCHEDULER_CONTROL_TABLE_NAME,
             },
         )

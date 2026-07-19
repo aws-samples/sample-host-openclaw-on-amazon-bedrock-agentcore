@@ -68,6 +68,7 @@ class MemoryDynamoClient:
 
     def __init__(self):
         self.items = {}
+        self.table_items = {}
         self.get_calls = []
         self.transact_calls = []
         self.update_calls = []
@@ -81,9 +82,19 @@ class MemoryDynamoClient:
     def put(self, pk, sk, **values):
         self.items[(pk, sk)] = {"PK": pk, "SK": sk, **deepcopy(values)}
 
+    def put_table(self, table_name, pk, sk, **values):
+        self.table_items[(table_name, pk, sk)] = {
+            "PK": pk,
+            "SK": sk,
+            **deepcopy(values),
+        }
+
     def get_item(self, **kwargs):
         self.get_calls.append(deepcopy(kwargs))
-        item = self.items.get(self._key(kwargs["Key"]))
+        pk, sk = self._key(kwargs["Key"])
+        item = self.table_items.get((kwargs["TableName"], pk, sk))
+        if item is None:
+            item = self.items.get((pk, sk))
         return {} if item is None else {"Item": _serialize(deepcopy(item))}
 
     def query(self, **kwargs):
@@ -97,6 +108,11 @@ class MemoryDynamoClient:
             for (pk, _), item in sorted(self.items.items())
             if pk == partition
         ]
+        matching.extend(
+            deepcopy(item)
+            for (table_name, pk, _), item in sorted(self.table_items.items())
+            if table_name == kwargs["TableName"] and pk == partition
+        )
         limit = kwargs.get("Limit", len(matching))
         page = matching[:limit]
         response = {"Items": [_serialize(item) for item in page]}
@@ -222,6 +238,7 @@ def _environment(catalog_digest: str) -> dict[str, str]:
         "CAPABILITY_CATALOG_DIGEST": catalog_digest,
         "CAPABILITY_ALLOWED_CALLER_ARN": CALLER_ARN,
         "SCHEDULER_CONTROL_TABLE_NAME": "personal-operator-scheduler-control",
+        "PORTABLE_STATE_TABLE_NAME": "personal-operator-control",
     }
 
 
@@ -497,6 +514,33 @@ def test_offline_handler_composes_strong_dynamo_state_and_binds_safe_adapters(
     catalog = _catalog()
     client = MemoryDynamoClient()
     _seed_authority(client, catalog)
+    client.put_table(
+        "personal-operator-control",
+        "USER#user_alpha",
+        "PORTABLE#LIVE_STATE",
+        recordType="PORTABLE_LIVE_STATE_V2",
+        userId="user_alpha",
+        generation=1,
+        liveBundleHash="a" * 64,
+        liveScheduleProjectionJson=json.dumps(
+            {
+                "schema": "personal-operator.portable-schedule-projection.v1",
+                "userId": "user_alpha",
+                "generation": 1,
+                "bundleHash": "a" * 64,
+                "schedules": [
+                    {
+                        "scheduleId": "schedule_imported_12345678",
+                        "userId": "user_alpha",
+                        "taskType": "READ_ONLY_AGENT_TURN",
+                        "state": "DISABLED",
+                    }
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
     production = composition.build_production_composition(
         env=_environment(catalog.catalog_digest),
         artifact_root=artifacts,
@@ -520,7 +564,16 @@ def test_offline_handler_composes_strong_dynamo_state_and_binds_safe_adapters(
     assert isinstance(production.repository, DynamoAdmissionRepository)
     assert isinstance(production.ledger, DynamoCapabilityLedger)
     assert result["status"] == "SUCCEEDED"
-    assert result["data"] == {"schedules": []}
+    assert result["data"] == {
+        "schedules": [
+            {
+                "scheduleId": "schedule_imported_12345678",
+                "taskType": "READ_ONLY_AGENT_TURN",
+                "state": "PAUSED",
+                "nextRunAt": None,
+            }
+        ]
+    }
     assert set(production.gateway._adapters) == {
         "web.exact.read",
         "schedule.list",

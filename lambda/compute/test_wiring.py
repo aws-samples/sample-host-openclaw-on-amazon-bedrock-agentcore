@@ -209,6 +209,7 @@ def test_composition_seam_only_accepts_compute_adapters(tmp_path):
         "CAPABILITY_RELEASE_COMMIT": RELEASE_COMMIT,
         "CAPABILITY_CATALOG_DIGEST": catalog.catalog_digest,
         "CAPABILITY_ALLOWED_CALLER_ARN": CALLER_ARN,
+        "PORTABLE_STATE_TABLE_NAME": "personal-operator-control",
         "SCHEDULER_CONTROL_TABLE_NAME": (
             "personal-operator-scheduler-control"
         ),

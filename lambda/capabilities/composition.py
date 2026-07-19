@@ -17,7 +17,10 @@ from .catalog import compile_catalog
 from .contracts import CapabilityCallV1, CapabilityCatalogV1, CapabilityResultV1
 from .durable import DynamoAdmissionRepository, DynamoCapabilityLedger
 from .gateway import AdapterOutcome, CapabilityGateway, build_schedule_adapters
-from .schedule_port import DynamoScheduleCapabilityPort
+from .schedule_port import (
+    DynamoPortableScheduleProjectionReader,
+    DynamoScheduleCapabilityPort,
+)
 from .web_reader import build_production_web_read_adapter
 
 REQUIRED_REGION = "eu-west-1"
@@ -29,6 +32,7 @@ _CALLER = re.compile(
     r"arn:aws:iam::[0-9]{12}:role/" r"openclaw-agentcore-execution-role-eu-west-1"
 )
 _SCHEDULER_TABLE = "personal-operator-scheduler-control"
+_PORTABLE_TABLE = "personal-operator-control"
 
 
 class _ComputeReleaseGateAdapter:
@@ -109,6 +113,7 @@ def build_production_composition(
     catalog = load_packaged_catalog(env, artifact_root=artifact_root)
     table_name = _required_env(env, "CAPABILITY_STATE_TABLE_NAME")
     scheduler_table_name = _required_env(env, "SCHEDULER_CONTROL_TABLE_NAME")
+    portable_table_name = _required_env(env, "PORTABLE_STATE_TABLE_NAME")
     caller_arn = _required_env(env, "CAPABILITY_ALLOWED_CALLER_ARN")
     if _TABLE.fullmatch(table_name) is None:
         raise RuntimeError("capability state table name is invalid")
@@ -116,6 +121,8 @@ def build_production_composition(
         raise RuntimeError("capability caller ARN is invalid")
     if scheduler_table_name != _SCHEDULER_TABLE:
         raise RuntimeError("scheduler control table name is invalid")
+    if portable_table_name != _PORTABLE_TABLE:
+        raise RuntimeError("portable state table name is invalid")
     trusted_clock = clock or (lambda: int(time.time()))
     if not callable(trusted_clock):
         raise TypeError("capability composition clock must be callable")
@@ -141,6 +148,10 @@ def build_production_composition(
             catalog_digest=catalog.catalog_digest,
             clock=trusted_clock,
             nonce_factory=lambda: secrets.token_urlsafe(24),
+            imported_schedules=DynamoPortableScheduleProjectionReader(
+                client=client,
+                table_name=portable_table_name,
+            ),
         )
         if schedule_port is None
         else schedule_port

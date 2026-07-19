@@ -86,6 +86,7 @@ def test_production_composition_wires_connector_registry_empty():
             "CAPABILITY_RELEASE_COMMIT": RELEASE_COMMIT,
             "CAPABILITY_CATALOG_DIGEST": catalog.catalog_digest,
             "CAPABILITY_STATE_TABLE_NAME": "synthetic-capability-state",
+            "PORTABLE_STATE_TABLE_NAME": "personal-operator-control",
             "SCHEDULER_CONTROL_TABLE_NAME": (
                 "personal-operator-scheduler-control"
             ),

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import json
 import pytest
 
+from capabilities.contracts import canonical_sha256
 from portable.manifest import FORMAT, ImportRejected, ImportUncertain
 from portable.staging import DynamoStagedImportStore, S3PortableBlobStore
 
@@ -93,6 +95,10 @@ class FakeTable:
                     "generation": ExpressionAttributeValues[":nextGeneration"],
                 }
             )
+            if ":scheduleProjectionJson" in ExpressionAttributeValues:
+                item["liveScheduleProjectionJson"] = (
+                    ExpressionAttributeValues[":scheduleProjectionJson"]
+                )
             item.pop("activationApproval", None)
             item.pop("approvalBundleHash", None)
             item.pop("approvalGeneration", None)
@@ -159,6 +165,37 @@ def _staged():
     return {"format": FORMAT, "records": {}, "workspace": {}}
 
 
+def _staged_with_schedule():
+    definition = {
+        "prompt": "private imported schedule content",
+        "runAt": 1_800_007_200,
+        "timezone": "Europe/Tallinn",
+    }
+    return {
+        "format": FORMAT,
+        "records": {
+            "memory": [],
+            "schedules": [
+                {
+                    "scheduleId": "schedule_imported_12345678",
+                    "userId": USER,
+                    "taskType": "READ_ONLY_AGENT_TURN",
+                    "definition": definition,
+                    "definitionHash": canonical_sha256(definition),
+                    "revision": 1,
+                    "state": "DISABLED",
+                    "timezone": "Europe/Tallinn",
+                }
+            ],
+            "installed_packs": [],
+            "connectors": [],
+            "compute_receipts": [],
+            "receipts": [],
+        },
+        "workspace": {},
+    }
+
+
 def test_s3_blob_store_is_immutable_idempotent_and_hash_verified():
     client = FakeS3()
     blobs = S3PortableBlobStore(client, bucket_name="synthetic-user-files")
@@ -217,6 +254,45 @@ def test_first_activation_advances_from_zero():
     live = store.load_live(USER)
     assert live["bundleHash"] == "a" * 64
     assert live["staged"] == _staged()
+
+
+def test_activation_atomically_persists_content_free_schedule_projection():
+    table = FakeTable()
+    store = DynamoStagedImportStore(table, blobs=FakeBlobs())
+    staged = _staged_with_schedule()
+    approval = store.prepare_activation(
+        USER,
+        bundle_hash="a" * 64,
+        expected_generation=0,
+        staged=staged,
+    )
+
+    store.activate_once(
+        USER,
+        bundle_hash="a" * 64,
+        activation_approval=approval["activationApproval"],
+        expected_generation=0,
+        staged=staged,
+    )
+
+    projection_json = table.items[(f"USER#{USER}", "PORTABLE#LIVE_STATE")][
+        "liveScheduleProjectionJson"
+    ]
+    assert "private imported schedule content" not in projection_json
+    assert json.loads(projection_json) == {
+        "schema": "personal-operator.portable-schedule-projection.v1",
+        "userId": USER,
+        "generation": 1,
+        "bundleHash": "a" * 64,
+        "schedules": [
+            {
+                "scheduleId": "schedule_imported_12345678",
+                "userId": USER,
+                "taskType": "READ_ONLY_AGENT_TURN",
+                "state": "DISABLED",
+            }
+        ],
+    }
 
 
 def test_stale_generation_is_rejected_without_partial_write():

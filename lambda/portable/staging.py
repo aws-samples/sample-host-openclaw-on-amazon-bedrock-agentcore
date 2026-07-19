@@ -19,13 +19,17 @@ import hashlib
 import re
 from typing import Mapping
 
+from capabilities.contracts import ContractValidationError, ScheduleSpecV1
+
 from .manifest import (
     ImportRejected,
     ImportUncertain,
+    RECORD_CATEGORIES,
     canonical_json,
     strict_json_loads,
     user_id as _user_id,
 )
+from .records import validate_bundle_records
 
 
 _RECORD_TYPE = "PORTABLE_LIVE_STATE_V2"
@@ -33,6 +37,14 @@ _MAX_STAGED_BYTES = 70 * 1024 * 1024
 _MAX_ACTIVATED_BUNDLES = 128
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _APPROVAL = re.compile(r"pia_[0-9a-f]{64}")
+_SCHEDULE_PROJECTION_SCHEMA = (
+    "personal-operator.portable-schedule-projection.v1"
+)
+_MAX_PROJECTED_SCHEDULES = 256
+_GOVERNED_PORTABLE_SCHEDULE_FIELDS = frozenset(ScheduleSpecV1.FIELDS) - {
+    "schema",
+    "nextRunAt",
+}
 
 
 def _live_key(user_id: str) -> dict[str, str]:
@@ -92,6 +104,94 @@ def _staged_payload(value: object) -> dict:
     if not isinstance(parsed, dict):
         raise ImportRejected("portable staged state is invalid")
     return parsed
+
+
+def _schedule_projection_json(
+    staged: Mapping,
+    *,
+    target_user_id: str,
+    generation: int,
+    bundle_hash: str,
+) -> str:
+    """Build the only portable schedule data visible to the capability plane.
+
+    The activation item stores this content-free projection in the same atomic
+    update as its live bundle pointer. The capability gateway therefore needs
+    neither S3 authority nor access to imported schedule definitions.
+    """
+
+    raw_records = staged.get("records")
+    try:
+        if (
+            not isinstance(raw_records, Mapping)
+            or not set(raw_records).issubset(RECORD_CATEGORIES)
+        ):
+            raise ImportRejected("portable record categories are invalid")
+        # Staging-store unit fixtures may exercise the CAS with only a subset
+        # of empty categories. Production PortableImporter always supplies the
+        # complete set. Completing absent categories here preserves the store's
+        # existing narrow contract without weakening row validation.
+        completed_records = {
+            category: raw_records.get(category, [])
+            for category in RECORD_CATEGORIES
+        }
+        schedule_rows = validate_bundle_records(completed_records)["schedules"]
+    except (ImportRejected, TypeError, ValueError) as error:
+        raise ImportUncertain(
+            "portable schedule projection is invalid"
+        ) from error
+    if len(schedule_rows) > _MAX_PROJECTED_SCHEDULES:
+        raise ImportUncertain("portable schedule projection exceeds its bound")
+
+    projected: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw in schedule_rows:
+        # Historical inert descriptors remain portable history but are not
+        # promoted into the governed operational schedule view.
+        if set(raw) != _GOVERNED_PORTABLE_SCHEDULE_FIELDS:
+            if {
+                "scheduleId",
+                "userId",
+                "taskType",
+                "definition",
+                "definitionHash",
+                "revision",
+            }.issubset(raw):
+                raise ImportUncertain("portable schedule projection is invalid")
+            continue
+        candidate = dict(raw)
+        candidate.update(
+            schema=ScheduleSpecV1.SCHEMA,
+            state="PAUSED",
+            nextRunAt=None,
+        )
+        try:
+            spec = ScheduleSpecV1.from_mapping(candidate)
+        except (ContractValidationError, TypeError, ValueError) as error:
+            raise ImportUncertain(
+                "portable schedule projection is invalid"
+            ) from error
+        if spec.user_id != target_user_id or spec.schedule_id in seen:
+            raise ImportUncertain("portable schedule projection is invalid")
+        seen.add(spec.schedule_id)
+        projected.append(
+            {
+                "scheduleId": spec.schedule_id,
+                "userId": spec.user_id,
+                "taskType": spec.task_type,
+                "state": "DISABLED",
+            }
+        )
+    projected.sort(key=lambda item: str(item["scheduleId"]))
+    return canonical_json(
+        {
+            "schema": _SCHEDULE_PROJECTION_SCHEMA,
+            "userId": target_user_id,
+            "generation": generation,
+            "bundleHash": bundle_hash,
+            "schedules": projected,
+        }
+    ).decode("utf-8")
 
 
 class S3PortableBlobStore:
@@ -505,6 +605,12 @@ class DynamoStagedImportStore:
             raise ImportRejected("portable activation blob is not approved")
 
         next_generation = expected + 1
+        schedule_projection_json = _schedule_projection_json(
+            staged,
+            target_user_id=user_id,
+            generation=next_generation,
+            bundle_hash=bundle_hash,
+        )
         values = {
             ":recordType": _RECORD_TYPE,
             ":userId": user_id,
@@ -515,13 +621,15 @@ class DynamoStagedImportStore:
             ":bundleHashSet": {bundle_hash},
             ":blobKey": blob["blobKey"],
             ":blobSha256": blob["blobSha256"],
+            ":scheduleProjectionJson": schedule_projection_json,
         }
         try:
             response = self._table.update_item(
                 Key=_live_key(user_id),
                 UpdateExpression=(
                     "SET #liveBundleHash=:bundleHash, #liveBlobKey=:blobKey, "
-                    "#liveBlobSha256=:blobSha256, #generation=:nextGeneration "
+                    "#liveBlobSha256=:blobSha256, #generation=:nextGeneration, "
+                    "#liveScheduleProjectionJson=:scheduleProjectionJson "
                     "REMOVE #activationApproval, #approvalBundleHash, "
                     "#approvalGeneration, #approvalBlobKey, #approvalBlobSha256 "
                     "ADD #activatedBundleHashes :bundleHashSet"
@@ -549,6 +657,7 @@ class DynamoStagedImportStore:
                     "#liveBundleHash": "liveBundleHash",
                     "#liveBlobKey": "liveBlobKey",
                     "#liveBlobSha256": "liveBlobSha256",
+                    "#liveScheduleProjectionJson": "liveScheduleProjectionJson",
                 },
                 ExpressionAttributeValues=values,
                 ReturnValues="ALL_NEW",
@@ -565,6 +674,7 @@ class DynamoStagedImportStore:
                 next_generation=next_generation,
                 bundle_hash=bundle_hash,
                 blob=blob,
+                schedule_projection_json=schedule_projection_json,
             ):
                 return next_generation
             raise ImportUncertain("portable activation write failed") from error
@@ -573,6 +683,7 @@ class DynamoStagedImportStore:
             next_generation=next_generation,
             bundle_hash=bundle_hash,
             blob=blob,
+            schedule_projection_json=schedule_projection_json,
         ):
             reconciled = self._read(user_id)
             if not self._activated_matches(
@@ -580,6 +691,7 @@ class DynamoStagedImportStore:
                 next_generation=next_generation,
                 bundle_hash=bundle_hash,
                 blob=blob,
+                schedule_projection_json=schedule_projection_json,
             ):
                 raise ImportUncertain("portable activation write was ambiguous")
         return next_generation
@@ -591,6 +703,7 @@ class DynamoStagedImportStore:
         next_generation: int,
         bundle_hash: str,
         blob: Mapping,
+        schedule_projection_json: str,
     ) -> bool:
         try:
             return bool(
@@ -599,6 +712,8 @@ class DynamoStagedImportStore:
                 and record.get("liveBundleHash") == bundle_hash
                 and record.get("liveBlobKey") == blob["blobKey"]
                 and record.get("liveBlobSha256") == blob["blobSha256"]
+                and record.get("liveScheduleProjectionJson")
+                == schedule_projection_json
                 and bundle_hash in self._history(record)
                 and "activationApproval" not in record
             )

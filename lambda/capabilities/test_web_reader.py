@@ -990,6 +990,7 @@ def test_production_composition_binds_web_read_without_cold_start_io():
         "CAPABILITY_CATALOG_DIGEST": catalog.catalog_digest,
         "CAPABILITY_STATE_TABLE_NAME": "personal-operator-state",
         "CAPABILITY_ALLOWED_CALLER_ARN": CALLER_ARN,
+        "PORTABLE_STATE_TABLE_NAME": "personal-operator-control",
         "SCHEDULER_CONTROL_TABLE_NAME": "personal-operator-scheduler-control",
     }
 

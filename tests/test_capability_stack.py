@@ -24,6 +24,10 @@ SCHEDULER_TABLE_NAME = "personal-operator-scheduler-control"
 SCHEDULER_TABLE_ARN = (
     f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{SCHEDULER_TABLE_NAME}"
 )
+PORTABLE_TABLE_NAME = "personal-operator-control"
+PORTABLE_TABLE_ARN = (
+    f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{PORTABLE_TABLE_NAME}"
+)
 
 
 def _synth_capability_stack(region: str = REGION):
@@ -112,6 +116,7 @@ def test_capability_stack_is_one_fail_closed_gateway_with_exact_identity():
                 "CAPABILITY_CATALOG_DIGEST": CATALOG_DIGEST,
                 "CAPABILITY_RELEASE_COMMIT": RELEASE_COMMIT,
                 "CAPABILITY_STATE_TABLE_NAME": TABLE_NAME,
+                "PORTABLE_STATE_TABLE_NAME": PORTABLE_TABLE_NAME,
                 "SCHEDULER_CONTROL_TABLE_NAME": SCHEDULER_TABLE_NAME,
             }
         },
@@ -141,7 +146,7 @@ def test_gateway_role_has_only_exact_logs_dynamo_and_kms_authority():
         "logs:CreateLogStream",
         "logs:PutLogEvents",
     }
-    assert len(statements) == 5
+    assert len(statements) == 6
     tables = _resources(template, "AWS::DynamoDB::Table")
     assert len(tables) == 1
     assert tables[0]["Properties"] == {
@@ -242,6 +247,29 @@ def test_gateway_dynamo_and_kms_statements_are_resource_and_condition_bounded():
         == {"dynamodb:GetItem", "dynamodb:PutItem"}
     )
     assert schedule_records["Resource"] == SCHEDULER_TABLE_ARN
+
+    portable_projection = next(
+        statement
+        for statement in statements
+        if statement.get("Action") == "dynamodb:GetItem"
+        and statement.get("Resource") == PORTABLE_TABLE_ARN
+    )
+    assert portable_projection["Condition"] == {
+        "ForAllValues:StringEquals": {
+            "dynamodb:Attributes": [
+                "PK",
+                "SK",
+                "recordType",
+                "userId",
+                "generation",
+                "liveBundleHash",
+                "liveScheduleProjectionJson",
+            ]
+        },
+        "ForAllValues:StringLike": {
+            "dynamodb:LeadingKeys": ["USER#*"],
+        },
+    }
 
 
 def test_gateway_cmk_actions_match_cdk_dynamodb_data_plane_reference():
