@@ -34,6 +34,11 @@ TRUSTED_CONNECTOR_BROWSER_SCHEMAS = (
     "connectors/schemas/synthetic-notes-read-list-output.json",
 )
 
+REQUIRED_SCHEDULER_HANDLERS = (
+    "scheduler/control.py",
+    "scheduler/ingress.py",
+)
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build-trusted-lambda-asset.sh"
@@ -138,6 +143,7 @@ def _packaging_subprocess_fixture(
         "web/index.py",
         "control/index.py",
         "workspace_broker/index.py",
+        *REQUIRED_SCHEDULER_HANDLERS,
         "capabilities/gateway.py",
         "capabilities/composition.py",
         "capabilities/durable.py",
@@ -421,12 +427,16 @@ def test_verification_container_is_offline_and_executes_exact_import_gate(
         "control.index",
         "control.composition",
         "router.index",
+        "scheduler.control",
+        "scheduler.ingress",
         "web.index",
         "web.composition",
         "worker.index",
         "workspace_broker.index",
     ):
         assert f"import {import_name}" in program
+    for handler in REQUIRED_SCHEDULER_HANDLERS:
+        assert f'pathlib.Path("{handler}").is_file()' in program
     assert "-m pip check" in program
 
 
@@ -453,6 +463,7 @@ def _write_source_and_payload(root: pathlib.Path) -> tuple[pathlib.Path, pathlib
         "web/index.py",
         "control/index.py",
         "workspace_broker/index.py",
+        *REQUIRED_SCHEDULER_HANDLERS,
         "capabilities/gateway.py",
         "capabilities/composition.py",
         "capabilities/durable.py",
@@ -550,9 +561,11 @@ def test_lambda_zip_is_byte_identical_across_independent_builds(
     assert first_manifest.archive_name == "trusted-lambda.zip"
     source_inventory = {item.path for item in first_manifest.source_files}
     assert set(TRUSTED_CONNECTOR_BROWSER_SCHEMAS).issubset(source_inventory)
+    assert set(REQUIRED_SCHEDULER_HANDLERS).issubset(source_inventory)
     with __import__("zipfile").ZipFile(first / "trusted-lambda.zip") as archive:
         names = archive.namelist()
     assert names == sorted(names)
+    assert set(REQUIRED_SCHEDULER_HANDLERS).issubset(names)
     assert {"MANIFEST.json", "ASSET.sha256", "SHA256SUMS"}.isdisjoint(names)
 
 
@@ -681,6 +694,34 @@ def test_verifier_rejects_a_missing_capability_gateway_handler(
     source, payload = _write_source_and_payload(tmp_path)
     for root in (source, payload):
         (root / "capabilities" / "gateway.py").unlink()
+    output = tmp_path / "asset"
+    build_trusted_lambda_artifacts(
+        payload,
+        source,
+        output,
+        source_commit="a" * 40,
+        source_tree="b" * 40,
+        builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+        builder_image_id="sha256:" + "3" * 64,
+    )
+
+    with pytest.raises(ContractError, match="missing a handler"):
+        verify_trusted_lambda_artifact(
+            output,
+            source,
+            expected_commit="a" * 40,
+            expected_tree="b" * 40,
+        )
+
+
+@pytest.mark.parametrize("missing_handler", REQUIRED_SCHEDULER_HANDLERS)
+def test_verifier_rejects_each_missing_scheduler_handler(
+    tmp_path: pathlib.Path,
+    missing_handler: str,
+) -> None:
+    source, payload = _write_source_and_payload(tmp_path)
+    for root in (source, payload):
+        (root / missing_handler).unlink()
     output = tmp_path / "asset"
     build_trusted_lambda_artifacts(
         payload,

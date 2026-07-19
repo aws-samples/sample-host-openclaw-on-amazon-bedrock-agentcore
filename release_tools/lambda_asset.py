@@ -38,6 +38,8 @@ _REQUIRED_HANDLERS = {
     "web/index.py",
     "control/index.py",
     "workspace_broker/index.py",
+    "scheduler/control.py",
+    "scheduler/ingress.py",
     "capabilities/gateway.py",
     "capabilities/composition.py",
     "capabilities/durable.py",

@@ -192,6 +192,8 @@ import sys
 assert sys.version_info[:2] == (3, 13), sys.version
 assert platform.machine() in {"aarch64", "arm64"}, platform.machine()
 assert pathlib.Path("workspace_broker/index.py").is_file()
+assert pathlib.Path("scheduler/control.py").is_file()
+assert pathlib.Path("scheduler/ingress.py").is_file()
 # The authoritative external-manifest, source-inventory, capability-artifact,
 # and deterministic-ZIP verification is performed by release_tools.lambda_asset
 # (v2); this in-image step only confirms the extracted payload imports.
@@ -210,6 +212,8 @@ if "bedrock-agentcore" not in boto3.Session().get_available_services():
 import control.index  # noqa: F401,E402
 import control.composition  # noqa: F401,E402
 import router.index  # noqa: F401,E402
+import scheduler.control  # noqa: F401,E402
+import scheduler.ingress  # noqa: F401,E402
 import web.index  # noqa: F401,E402
 import web.composition  # noqa: F401,E402
 import worker.index  # noqa: F401,E402
