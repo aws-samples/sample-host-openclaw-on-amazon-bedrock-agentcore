@@ -13,6 +13,7 @@ from botocore.exceptions import ClientError
 
 
 DELETION_FENCE_SCHEMA = "personal-operator.capability-deletion-fence.v1"
+CAPABILITY_BOOTSTRAP_SCHEMA = "personal-operator.user-authority-bootstrap.v2"
 _SUBJECT_DOMAIN = b"personal-operator.capability-deletion-subject.v1\0"
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
 _SUBJECT_BINDING = re.compile(r"[0-9a-f]{64}")
@@ -251,6 +252,33 @@ class DynamoCapabilityDeletionAdapter:
                 pk=pk,
             )
             return sk
+        if sk == "BOOTSTRAP":
+            expected_fields = {"PK", "SK", "ownerBinding", "recordJson", "version"}
+            if set(item) != expected_fields:
+                raise RuntimeError("capability deletion bootstrap is malformed")
+            if (
+                item.get("ownerBinding") != binding
+                or isinstance(item.get("version"), bool)
+                or not isinstance(item.get("version"), int)
+                or item["version"] < 1
+            ):
+                raise RuntimeError("capability deletion bootstrap binding is invalid")
+            try:
+                record = json.loads(item["recordJson"])
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    "capability deletion bootstrap record is invalid"
+                ) from None
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"schema", "subjectBinding", "catalogDigest"}
+                or record.get("schema") != CAPABILITY_BOOTSTRAP_SCHEMA
+                or record.get("subjectBinding") != binding
+                or not isinstance(record.get("catalogDigest"), str)
+                or _SUBJECT_BINDING.fullmatch(record["catalogDigest"]) is None
+            ):
+                raise RuntimeError("capability deletion bootstrap record is invalid")
+            return sk
         if item.get("ownerBinding") != binding:
             raise RuntimeError("capability deletion inventory owner is invalid")
         ttl = item.get("ttl")
@@ -344,6 +372,7 @@ class DynamoCapabilityDeletionAdapter:
 
 
 __all__ = [
+    "CAPABILITY_BOOTSTRAP_SCHEMA",
     "DELETION_FENCE_SCHEMA",
     "DynamoCapabilityDeletionAdapter",
     "derive_deletion_subject_binding",

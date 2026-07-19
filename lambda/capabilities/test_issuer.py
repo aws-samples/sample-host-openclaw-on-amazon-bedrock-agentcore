@@ -274,6 +274,119 @@ def test_durable_authority_rows_are_hashed_owned_and_ttl_bounded():
     assert target["ttl"] == minted["exp"]
 
 
+def test_actual_issuer_rows_are_all_purged_after_deletion_fence_activates():
+    client = MemoryDynamoClient()
+    _durable_issuer(client).mint(
+        user_id="user_alpha",
+        session_id="session_12345678",
+        invocation_id="invocation_12345678",
+        message_text="read https://example.com/exact",
+        scheduled_read_only=False,
+        channel="telegram",
+        actor_id="telegram:42",
+    )
+    deletion = DynamoCapabilityDeletionAdapter(
+        client=client,
+        table_name="capability-state",
+    )
+
+    assert deletion.establish_deletion_fence("user_alpha") is True
+    assert deletion.delete_user_records("user_alpha") is None
+
+    pk = subject_partition_key("user_alpha")
+    assert [key for key in client.items if key[0] == pk] == [(pk, "DELETION")]
+    assert client.items[(pk, "DELETION")]["recordJson"] == json.dumps(
+        {
+            "enabled": True,
+            "schema": "personal-operator.capability-deletion-fence.v1",
+            "subjectBinding": derive_deletion_subject_binding("user_alpha"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert "user_alpha" not in repr(
+        [item for (item_pk, _), item in client.items.items() if item_pk == pk]
+    )
+
+
+@pytest.mark.parametrize(
+    ("authority_sk", "expired_ttl"),
+    [
+        ("AUTHORITY#PROFILE", NOW - 1),
+        ("AUTHORITY#PROFILE", NOW),
+        ("AUTHORITY#INSTALL#schedule.list", NOW - 1),
+        ("AUTHORITY#INSTALL#schedule.list", NOW),
+    ],
+)
+def test_durable_issuer_never_refreshes_or_mints_from_expired_authority(
+    authority_sk,
+    expired_ttl,
+):
+    client = MemoryDynamoClient()
+    _durable_issuer(client).mint(
+        user_id="user_alpha",
+        session_id="session_12345678",
+        invocation_id="invocation_12345678",
+        message_text="hello",
+        scheduled_read_only=False,
+    )
+    pk = subject_partition_key("user_alpha")
+    authority_key = (pk, authority_sk)
+    client.items[authority_key]["ttl"] = expired_ttl
+
+    with pytest.raises(RuntimeError, match="expired"):
+        _durable_issuer(client, nonce="nonce_87654321").mint(
+            user_id="user_alpha",
+            session_id="session_12345678",
+            invocation_id="invocation_87654321",
+            message_text="hello",
+            scheduled_read_only=False,
+        )
+
+    assert client.items[authority_key]["ttl"] == expired_ttl
+    assert (pk, "TURN#invocation_87654321") not in client.items
+
+
+def test_authority_refresh_ttl_race_fails_closed_without_minting_a_turn():
+    class TtlRaceClient(MemoryDynamoClient):
+        race_key = None
+
+        def transact_write_items(self, **kwargs):
+            has_authority_refresh = any(
+                "Update" in action
+                and self._key(action["Update"]["Key"])[1].startswith("AUTHORITY#")
+                for action in kwargs["TransactItems"]
+            )
+            if self.race_key is not None and has_authority_refresh:
+                self.items[self.race_key]["ttl"] = NOW
+                self.race_key = None
+            return super().transact_write_items(**kwargs)
+
+    client = TtlRaceClient()
+    _durable_issuer(client).mint(
+        user_id="user_alpha",
+        session_id="session_12345678",
+        invocation_id="invocation_12345678",
+        message_text="hello",
+        scheduled_read_only=False,
+    )
+    pk = subject_partition_key("user_alpha")
+    authority_key = (pk, "AUTHORITY#INSTALL#schedule.list")
+    client.race_key = authority_key
+
+    with pytest.raises(RuntimeError, match="changed concurrently"):
+        _durable_issuer(client, nonce="nonce_87654321").mint(
+            user_id="user_alpha",
+            session_id="session_12345678",
+            invocation_id="invocation_87654321",
+            message_text="hello",
+            scheduled_read_only=False,
+        )
+
+    assert client.items[authority_key]["ttl"] == NOW
+    assert (pk, "TURN#invocation_87654321") not in client.items
+
+
 def test_durable_issuer_preserves_other_enabled_packs_when_one_is_paused_or_killed():
     client = MemoryDynamoClient()
     first = _durable_issuer(client).mint(

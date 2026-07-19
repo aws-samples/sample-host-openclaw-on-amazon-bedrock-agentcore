@@ -30,6 +30,7 @@ from .ledger import (
     derive_tenant_binding,
 )
 from .retention import (
+    CAPABILITY_BOOTSTRAP_SCHEMA,
     DELETION_FENCE_SCHEMA,
     derive_deletion_subject_binding,
     subject_partition_key,
@@ -498,7 +499,7 @@ class DynamoTurnAuthorityRepository:
     """Create bounded hashed-subject authority without restoring revocation."""
 
     _ROOT_MARKER = {"schema": "personal-operator.authority-root.v1"}
-    _BOOTSTRAP_SCHEMA = "personal-operator.user-authority-bootstrap.v2"
+    _BOOTSTRAP_SCHEMA = CAPABILITY_BOOTSTRAP_SCHEMA
 
     def __init__(
         self,
@@ -827,6 +828,8 @@ class DynamoTurnAuthorityRepository:
                 owner_binding=binding,
                 ttl_required=True,
             )
+            if item["ttl"] <= issued_at:
+                raise RuntimeError(f"{label} authority is expired")
             raw = _json_mapping(item["recordJson"], label)
             if sk == "AUTHORITY#PROFILE":
                 if canonical_json_bytes(raw) != canonical_json_bytes(expected_default):
@@ -852,7 +855,7 @@ class DynamoTurnAuthorityRepository:
                         "UpdateExpression": "SET #ttl = :ttl, #version = :next",
                         "ConditionExpression": (
                             "#owner = :owner AND #record = :record "
-                            "AND #version = :expected"
+                            "AND #ttl = :prior_ttl AND #version = :expected"
                         ),
                         "ExpressionAttributeNames": {
                             "#owner": "ownerBinding",
@@ -864,6 +867,7 @@ class DynamoTurnAuthorityRepository:
                             {
                                 ":owner": binding,
                                 ":record": item["recordJson"],
+                                ":prior_ttl": item["ttl"],
                                 ":ttl": authority_ttl,
                                 ":next": item["version"] + 1,
                                 ":expected": item["version"],

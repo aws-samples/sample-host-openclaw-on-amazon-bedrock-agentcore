@@ -204,6 +204,62 @@ def test_delete_user_records_purges_full_subject_inventory_and_only_keeps_fence(
         assert forbidden not in retained
 
 
+@pytest.mark.parametrize(
+    "bootstrap_record",
+    [
+        {
+            "schema": "personal-operator.user-authority-bootstrap.v1",
+            "subjectBinding": derive_deletion_subject_binding(USER_ALPHA),
+            "catalogDigest": "a" * 64,
+        },
+        {
+            "schema": "personal-operator.user-authority-bootstrap.v2",
+            "subjectBinding": derive_deletion_subject_binding(USER_BETA),
+            "catalogDigest": "a" * 64,
+        },
+        {
+            "schema": "personal-operator.user-authority-bootstrap.v2",
+            "subjectBinding": derive_deletion_subject_binding(USER_ALPHA),
+            "catalogDigest": "not-a-digest",
+        },
+        {
+            "schema": "personal-operator.user-authority-bootstrap.v2",
+            "subjectBinding": derive_deletion_subject_binding(USER_ALPHA),
+            "catalogDigest": "a" * 64,
+            "unexpected": True,
+        },
+    ],
+)
+def test_delete_user_records_rejects_noncanonical_ttl_free_bootstrap(
+    bootstrap_record,
+):
+    client = MemoryDynamoClient()
+    adapter = DynamoCapabilityDeletionAdapter(
+        client=client,
+        table_name="capability-state",
+    )
+    adapter.establish_deletion_fence(USER_ALPHA)
+    binding = derive_deletion_subject_binding(USER_ALPHA)
+    pk = subject_partition_key(USER_ALPHA)
+    client.put(
+        pk,
+        "BOOTSTRAP",
+        ownerBinding=binding,
+        recordJson=json.dumps(
+            bootstrap_record,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        version=1,
+    )
+    before = dict(client.items)
+
+    with pytest.raises(RuntimeError, match="bootstrap"):
+        adapter.delete_user_records(USER_ALPHA)
+
+    assert client.items == before
+
+
 def test_delete_user_records_fails_before_deleting_page_with_cross_owner_row():
     client = MemoryDynamoClient()
     adapter = DynamoCapabilityDeletionAdapter(
