@@ -77,8 +77,17 @@ class ApprovalProducer:
         self.token = token
         self.calls = []
 
-    def prepare(self, *, user_id, opportunity):
-        self.calls.append((user_id, opportunity))
+    def prepare(
+        self,
+        *,
+        user_id,
+        opportunity,
+        draft=None,
+        expected_generation=None,
+    ):
+        self.calls.append(
+            (user_id, opportunity, draft, expected_generation)
+        )
         if self.token is None:
             return None
         return type(
@@ -432,6 +441,7 @@ def test_prepare_callback_surfaces_founder_approval_without_sending():
     )
     assert producer.calls[0][0] == USER
     assert producer.calls[0][1].title == "Reply to Ada"
+    assert producer.calls[0][2].action_id == "draft_1234567890abcdef"
     assert drafts.calls[0][1].title == "Reply to Ada"
     assert len(result["text"]) <= 3_500
 

@@ -447,6 +447,7 @@ class WebStack(Stack):
             ),
             "GOOGLE_READONLY_OAUTH_SECRET_ID": self.google_readonly_oauth_secret.secret_name,
             "GOOGLE_SEND_OAUTH_SECRET_ID": self.google_send_oauth_secret.secret_name,
+            "GMAIL_SEND_CONNECTION_ID": gmail_send_connection_id,
             "OAUTH_KMS_KEY_ID": cmk_arn,
             "FOUNDER_USER_IDS": founder_user_id,
             "DERIVED_RECORD_TTL_DAYS": "14",

@@ -373,7 +373,12 @@ class ControlApplication:
             prepare = getattr(self._approval_producer, "prepare", None)
             if not callable(prepare):
                 raise TypeError("approval producer is invalid")
-            approval = prepare(user_id=user_id, opportunity=opportunity)
+            approval = prepare(
+                user_id=user_id,
+                opportunity=opportunity,
+                draft=prepared_draft,
+                expected_generation=connection_generation,
+            )
             if approval is not None:
                 _, token = self._validated_prepared(
                     approval,

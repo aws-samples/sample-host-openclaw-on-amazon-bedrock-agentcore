@@ -75,6 +75,28 @@ _PROTECTED = frozenset(
         "lastTransitionId",
     }
 )
+_ADVANCED_AUTHORITY_FIELDS = frozenset(
+    {
+        "approvedActionId",
+        "approvedDraftRevision",
+        "approvedArgsHash",
+        "approvedAt",
+        "messageId",
+        "dispatchOperationId",
+        "dispatchDraftRevision",
+        "effectReceipt",
+        "waitingForReply",
+        "confirmationMethod",
+        "confirmedAt",
+        "uncertainAt",
+        "uncertaintyReason",
+        "uncertainDraftRevision",
+        "rejectedAt",
+        "expiredAt",
+        "cancelledAt",
+        "cancellationReason",
+    }
+)
 _TRANSITION_FIELDS: dict[tuple[ActionState, ActionState], frozenset[str]] = {
     (ActionState.PREPARED, ActionState.APPROVAL_PENDING): frozenset(
         {
@@ -384,6 +406,165 @@ class DynamoActionRepository:
     def get(self, *, action_id: str, user_id: str) -> dict[str, object] | None:
         return self._read(action_id=action_id, user_id=user_id)
 
+    def _reprepare_stale(
+        self,
+        *,
+        current: Mapping[str, object],
+        item: Mapping[str, object],
+        draft: DraftRevision,
+        original_error: Exception,
+    ) -> dict[str, object]:
+        """Conditionally replace one exact stale generation with the next."""
+
+        try:
+            current_revision = _revision(current.get("revision"), "revision")
+            stale_draft_revision = _revision(
+                current.get("staleDraftRevision"),
+                "staleDraftRevision",
+            )
+            superseding_revision = _revision(
+                current.get("supersededByDraftRevision"),
+                "supersededByDraftRevision",
+            )
+            old_draft_revision = _revision(
+                current.get("draftRevision"),
+                "draftRevision",
+            )
+            current_ttl = _revision(current.get("ttl"), "ttl")
+            last_transition_id = _operation_id(
+                current.get("lastTransitionId"),
+                "lastTransitionId",
+            )
+        except (TypeError, ValueError):
+            raise ConcurrentActionUpdate(
+                "stale action generation is invalid"
+            ) from original_error
+        now_epoch = int(_utc(self._now(), "now").timestamp())
+        if (
+            current.get("state") != ActionState.STALE.value
+            or any(field in current for field in _ADVANCED_AUTHORITY_FIELDS)
+            or current.get("staleReason") != "newer-draft-revision"
+            or stale_draft_revision != old_draft_revision
+            or superseding_revision != draft.draft_revision
+            or draft.draft_revision <= old_draft_revision
+            or current_ttl <= now_epoch
+            or current.get("connectionId") != draft.connection_id
+            or current.get("accountEmail") != draft.account_email
+            or current.get("senderAddress") != draft.sender_address
+            or current.get("capability") != "gmail.send"
+            or current.get("resource") != item.get("resource")
+        ):
+            raise ConcurrentActionUpdate(
+                "stale action does not bind the exact current draft"
+            ) from original_error
+
+        transition_id = "reprepare_" + str(item["creationId"])[:32]
+        expected = {
+            **dict(item),
+            "revision": current_revision + 1,
+            "lastTransitionId": transition_id,
+        }
+        set_fields = tuple(
+            name
+            for name in expected
+            if name not in {"PK", "SK", "actionId", "userId"}
+        )
+        remove_fields = (
+            "approvalId",
+            "approvalActionId",
+            "approvalDraftRevision",
+            "approvalArgsHash",
+            "approvalExpiresAt",
+            "approvalRequestedAt",
+            "staleAt",
+            "staleReason",
+            "staleDraftRevision",
+            "supersededByDraftRevision",
+        )
+        names = {
+            "#actionId": "actionId",
+            "#userId": "userId",
+            "#state": "state",
+            "#revision": "revision",
+            "#draftRevision": "draftRevision",
+            "#staleReason": "staleReason",
+            "#staleDraftRevision": "staleDraftRevision",
+            "#supersededByDraftRevision": "supersededByDraftRevision",
+            "#lastTransitionId": "lastTransitionId",
+            "#ttl": "ttl",
+        }
+        values: dict[str, object] = {
+            ":actionId": draft.action_id,
+            ":userId": draft.user_id,
+            ":staleState": ActionState.STALE.value,
+            ":expectedRevision": current_revision,
+            ":oldDraftRevision": old_draft_revision,
+            ":staleReason": "newer-draft-revision",
+            ":currentDraftRevision": draft.draft_revision,
+            ":lastTransitionId": last_transition_id,
+            ":nowEpoch": now_epoch,
+        }
+        advanced_absence_terms = []
+        for index, field in enumerate(sorted(_ADVANCED_AUTHORITY_FIELDS)):
+            token = f"#advanced{index}"
+            names[token] = field
+            advanced_absence_terms.append(f"attribute_not_exists({token})")
+        assignments = []
+        for index, name in enumerate(set_fields):
+            name_token = f"#set{index}"
+            value_token = f":set{index}"
+            names[name_token] = name
+            values[value_token] = expected[name]
+            assignments.append(f"{name_token}={value_token}")
+        removals = []
+        for index, name in enumerate(remove_fields):
+            token = f"#remove{index}"
+            names[token] = name
+            removals.append(token)
+        try:
+            response = self._table.update_item(
+                Key=_key(action_id=draft.action_id, user_id=draft.user_id),
+                UpdateExpression=(
+                    "SET "
+                    + ", ".join(assignments)
+                    + " REMOVE "
+                    + ", ".join(removals)
+                ),
+                ConditionExpression=(
+                    "#actionId=:actionId AND #userId=:userId AND "
+                    "#state=:staleState AND #revision=:expectedRevision AND "
+                    "#draftRevision=:oldDraftRevision AND "
+                    "#staleReason=:staleReason AND "
+                    "#staleDraftRevision=:oldDraftRevision AND "
+                    "#supersededByDraftRevision=:currentDraftRevision AND "
+                    "#lastTransitionId=:lastTransitionId AND #ttl>:nowEpoch AND "
+                    + " AND ".join(advanced_absence_terms)
+                ),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+                ReturnValues="ALL_NEW",
+            )
+            attributes = (
+                response.get("Attributes")
+                if isinstance(response, Mapping)
+                else None
+            )
+            if not isinstance(attributes, Mapping) or dict(attributes) != expected:
+                raise ActionRepositoryError(
+                    "DynamoDB returned an unexpected reprepared action"
+                )
+            return dict(attributes)
+        except Exception as error:
+            reconciled = self._read(
+                action_id=draft.action_id,
+                user_id=draft.user_id,
+            )
+            if isinstance(reconciled, Mapping) and dict(reconciled) == expected:
+                return dict(reconciled)
+            raise ConcurrentActionUpdate(
+                "stale action reprepare lost its exact generation fence"
+            ) from error
+
     def create_prepared(
         self,
         *,
@@ -451,6 +632,14 @@ class DynamoActionRepository:
             current = self._read(action_id=action_id, user_id=user_id)
             if (
                 current is not None
+                and current.get("state")
+                in {
+                    ActionState.PREPARED.value,
+                    ActionState.APPROVAL_PENDING.value,
+                }
+                and not any(
+                    field in current for field in _ADVANCED_AUTHORITY_FIELDS
+                )
                 and current.get("creationId") == creation_id
                 and current.get("payloadHash") == payload_hash
                 and current.get("draftRevision") == draft.draft_revision
@@ -464,6 +653,16 @@ class DynamoActionRepository:
                 and current.get("ttl") == item["ttl"]
             ):
                 return current
+            if (
+                isinstance(current, Mapping)
+                and current.get("state") == ActionState.STALE.value
+            ):
+                return self._reprepare_stale(
+                    current=current,
+                    item=item,
+                    draft=draft,
+                    original_error=error,
+                )
             raise ConcurrentActionUpdate(
                 "action creation lost a conditional race or is unresolved"
             ) from error

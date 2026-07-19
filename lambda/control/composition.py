@@ -15,7 +15,10 @@ from .telegram_cards import DynamoTelegramCardActions, ReadOnlyGmailDraftPrepare
 from web.auth import SignedConnectTickets
 from web.measurements import DynamoScanMeasurements
 from web.stores import DynamoWebStore
-from workflows.founder_approval import FounderApprovalProducer
+from workflows.founder_approval import (
+    FounderApprovalProducer,
+    founder_draft_revision,
+)
 from workflows.gmail.oauth import CryptographyAesGcm, GoogleOAuthTokenClient, KmsEnvelopeTokenVault
 from workflows.gmail.ranker import GmailOpportunityRanker
 from workflows.gmail.repository import DynamoGmailRepository
@@ -67,7 +70,14 @@ class LazyFounderApprovalProducer:
         self._factory = factory
         self._producer = None
 
-    def prepare(self, *, user_id: str, opportunity):
+    def prepare(
+        self,
+        *,
+        user_id: str,
+        opportunity,
+        draft=None,
+        expected_generation=None,
+    ):
         if user_id != self._founder:
             return None
         if self._producer is None:
@@ -75,7 +85,12 @@ class LazyFounderApprovalProducer:
             if not callable(getattr(candidate, "prepare", None)):
                 raise TypeError("founder approval producer factory returned an invalid value")
             self._producer = candidate
-        return self._producer.prepare(user_id=user_id, opportunity=opportunity)
+        request = {"user_id": user_id, "opportunity": opportunity}
+        if draft is not None:
+            request["draft"] = draft
+        if expected_generation is not None:
+            request["expected_generation"] = expected_generation
+        return self._producer.prepare(**request)
 
 
 def _required(name: str) -> str:
@@ -396,7 +411,20 @@ def build_production_application() -> ControlApplication:
                 token_codec=ApprovalTokenCodec(signing_secret),
                 founder_user_ids={founder_user_id},
             ),
+            draft_reader=repository,
             founder_user_id=founder_user_id,
+            connection_id=founder_connection_id,
+            account_email=founder_account_email,
+        )
+
+    def founder_displayed_draft(*, user_id, opportunity):
+        if founder_binding is None or user_id != founder_user_id:
+            return None
+        assert founder_connection_id is not None
+        assert founder_account_email is not None
+        return founder_draft_revision(
+            user_id=user_id,
+            opportunity=opportunity,
             connection_id=founder_connection_id,
             account_email=founder_account_email,
         )
@@ -422,7 +450,14 @@ def build_production_application() -> ControlApplication:
             table,
             connection_fence=repository,
         ),
-        draft_preparer=ReadOnlyGmailDraftPreparer(repository),
+        draft_preparer=ReadOnlyGmailDraftPreparer(
+            repository,
+            draft_factory=(
+                founder_displayed_draft
+                if founder_binding is not None
+                else None
+            ),
+        ),
         scan_measurements=DynamoScanMeasurements(
             table,
             identity_key=web_secret,

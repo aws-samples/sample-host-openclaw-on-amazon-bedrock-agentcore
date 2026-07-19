@@ -3,6 +3,7 @@ from decimal import Decimal
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
 from types import SimpleNamespace
 
@@ -185,15 +186,58 @@ class FakeTable:
                         "ExpressionAttributeValues"
                     ].items()
                 }
-                if (
+                if ":expectedState" in values:
+                    if (
+                        item is None
+                        or item.get("actionId") != values[":actionId"]
+                        or item.get("userId") != values[":userId"]
+                        or item.get("state") != values[":expectedState"]
+                        or item.get("revision") != values[":expectedRevision"]
+                        or item.get("draftRevision")
+                        != values[":actionDraftRevision"]
+                        or item.get("ttl", 0) <= values[":nowEpoch"]
+                        or (
+                            values[":expectedState"] == "STALE"
+                            and (
+                                item.get("staleReason")
+                                != values[":staleReason"]
+                                or item.get("staleDraftRevision")
+                                != values[":staleDraftRevision"]
+                                or item.get("supersededByDraftRevision")
+                                != values[":expectedDraftRevision"]
+                            )
+                        )
+                    ):
+                        raise ConditionalFailure(
+                            "action transition rejected"
+                        )
+                    item.update(
+                        {
+                            "state": values[":staleState"],
+                            "revision": values[":nextRevision"],
+                            "updatedAt": values[":updatedAt"],
+                            "lastTransitionId": values[":transitionId"],
+                            "staleAt": values[":updatedAt"],
+                            "staleReason": values[":staleReason"],
+                            "staleDraftRevision": values[
+                                ":staleDraftRevision"
+                            ],
+                            "supersededByDraftRevision": values[
+                                ":currentDraftRevision"
+                            ],
+                            "ttl": values[":retentionTtl"],
+                        }
+                    )
+                elif (
                     item is None
                     or item.get("generation") != values[":generation"]
                     or item.get("status")
                     not in {values[":disconnected"], values[":connected"]}
                 ):
                     raise ConditionalFailure("transaction update rejected")
-                item["status"] = values[":connected"]
-                item["updatedAt"] = values[":now"]
+                else:
+                    item["status"] = values[":connected"]
+                    item["updatedAt"] = values[":now"]
             elif "Delete" in operation:
                 delete = operation["Delete"]
                 key = self._key(self._decode_item(delete["Key"]))
@@ -375,6 +419,392 @@ def test_derived_opportunities_and_drafts_have_exact_fourteen_day_ttl():
     assert draft_put["ConditionExpression"] == (
         "attribute_not_exists(PK) AND attribute_not_exists(SK)"
     )
+
+
+def test_latest_draft_strongly_reads_the_highest_live_exact_revision():
+    class QueryTable(FakeTable):
+        def query(self, **kwargs):
+            self.calls.append(("query", kwargs))
+            values = kwargs["ExpressionAttributeValues"]
+            items = sorted(
+                (
+                    dict(item)
+                    for (pk, sk), item in self.items.items()
+                    if pk == values[":pk"] and sk.startswith(values[":sk"])
+                ),
+                key=lambda item: item["SK"],
+                reverse=kwargs["ScanIndexForward"] is False,
+            )
+            return {"Items": items[: kwargs["Limit"]]}
+
+    table = QueryTable()
+    repo, _ = repository(table)
+    first = models.DraftRevision.create(
+        action_id="action_12345678",
+        revision=1,
+        to="person@example.net",
+        subject="First",
+        body="First body",
+    )
+    latest = models.DraftRevision.create(
+        action_id=first.action_id,
+        revision=2,
+        to=first.to,
+        subject="Edited",
+        body="Edited body",
+    )
+    repo.save_draft(user_id="user-1", draft=first, expires_at=DERIVED_TTL)
+    repo.save_draft(user_id="user-1", draft=latest, expires_at=DERIVED_TTL)
+
+    assert repo.latest_draft(
+        user_id="user-1",
+        action_id=first.action_id,
+    ) == latest
+    query = [call for name, call in table.calls if name == "query"][-1]
+    assert query == {
+        "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk)",
+        "ExpressionAttributeValues": {
+            ":pk": "USER#user-1",
+            ":sk": "GMAIL#DRAFT#action_12345678#",
+        },
+        "ConsistentRead": True,
+        "ScanIndexForward": False,
+        "Limit": 1,
+    }
+
+
+def _action_record(*, state="PREPARED", revision=1):
+    return {
+        "PK": "USER#user-1",
+        "SK": "ACTION#action_12345678",
+        "actionId": "action_12345678",
+        "userId": "user-1",
+        "state": state,
+        "revision": revision,
+        "draftRevision": 1,
+        "ttl": int((NOW + timedelta(days=14)).timestamp()),
+    }
+
+
+def _edited_draft(*, revision=2):
+    return models.DraftRevision.create(
+        action_id="action_12345678",
+        revision=revision,
+        to="person@example.net",
+        subject=f"Edited {revision}",
+        body=f"Edited body {revision}",
+    )
+
+
+def test_atomic_edit_stales_prepared_action_and_persists_revision_together():
+    repo, table = repository()
+    action = _action_record()
+    table.items[(action["PK"], action["SK"])] = action
+    table.items[("USER#user-1", "GMAIL#CONNECTION_FENCE")] = {
+        "PK": "USER#user-1",
+        "SK": "GMAIL#CONNECTION_FENCE",
+        "recordType": "GMAIL_CONNECTION_FENCE",
+        "userId": "user-1",
+        "generation": 6,
+        "status": "CONNECTED",
+        "updatedAt": int(NOW.timestamp()),
+    }
+    draft = _edited_draft()
+
+    outcome = repo.save_superseding_draft(
+        user_id="user-1",
+        action_id=draft.action_id,
+        draft=draft,
+        expected_draft_revision=1,
+        current_draft_revision=2,
+        expires_at=DERIVED_TTL,
+        expected_generation=6,
+    )
+
+    assert outcome == {
+        "draftPersisted": True,
+        "actionId": draft.action_id,
+        "userId": "user-1",
+        "draftRevision": 2,
+        "payloadHash": draft.payload_hash,
+    }
+    stored_action = table.items[(action["PK"], action["SK"])]
+    assert stored_action["state"] == "STALE"
+    assert stored_action["staleDraftRevision"] == 1
+    assert stored_action["supersededByDraftRevision"] == 2
+    stored_draft = table.items[
+        ("USER#user-1", "GMAIL#DRAFT#action_12345678#0000000002")
+    ]
+    assert stored_draft["draft"]["payloadHash"] == draft.payload_hash
+    assert stored_draft["connectionGeneration"] == 6
+
+
+@pytest.mark.parametrize("state", ["PREPARED", "APPROVAL_PENDING", "STALE"])
+def test_atomic_edit_emits_no_unused_dynamodb_expression_values(state):
+    repo, table = repository()
+    action = _action_record(state=state, revision=2)
+    expected_revision = 1
+    current_revision = 2
+    if state == "STALE":
+        action.update(
+            {
+                "staleReason": "newer-draft-revision",
+                "staleDraftRevision": 1,
+                "supersededByDraftRevision": 2,
+            }
+        )
+        expected_revision = 2
+        current_revision = 3
+    table.items[(action["PK"], action["SK"])] = action
+
+    repo.save_superseding_draft(
+        user_id="user-1",
+        action_id="action_12345678",
+        draft=_edited_draft(revision=current_revision),
+        expected_draft_revision=expected_revision,
+        current_draft_revision=current_revision,
+        expires_at=DERIVED_TTL,
+    )
+
+    transaction = next(
+        call for name, call in table.calls if name == "transact_write_items"
+    )
+    for operation in transaction["TransactItems"]:
+        subject = next(iter(operation.values()))
+        supplied = set(subject.get("ExpressionAttributeValues", {}))
+        expressions = " ".join(
+            str(subject.get(field, ""))
+            for field in ("ConditionExpression", "UpdateExpression")
+        )
+        used = set(re.findall(r":[A-Za-z][A-Za-z0-9]*", expressions))
+        assert supplied == used
+
+
+def test_atomic_edit_writes_nothing_when_action_appears_after_absent_read():
+    class ApprovalWinsAbsentGap(FakeTable):
+        def _before_transaction(self, _operations):
+            action = _action_record(state="APPROVAL_PENDING", revision=2)
+            self.items[(action["PK"], action["SK"])] = action
+
+    repo, table = repository(ApprovalWinsAbsentGap())
+    draft = _edited_draft()
+
+    with pytest.raises(
+        repository_module.DraftRevisionConflictError,
+        match="action authority fence",
+    ):
+        repo.save_superseding_draft(
+            user_id="user-1",
+            action_id=draft.action_id,
+            draft=draft,
+            expected_draft_revision=1,
+            current_draft_revision=2,
+            expires_at=DERIVED_TTL,
+        )
+
+    assert table.items[
+        ("USER#user-1", "ACTION#action_12345678")
+    ]["state"] == "APPROVAL_PENDING"
+    assert (
+        "USER#user-1",
+        "GMAIL#DRAFT#action_12345678#0000000002",
+    ) not in table.items
+
+
+def test_atomic_edit_writes_nothing_when_approval_transition_wins():
+    class ApprovalWinsPreparedRace(FakeTable):
+        def _before_transaction(self, _operations):
+            action = self.items[
+                ("USER#user-1", "ACTION#action_12345678")
+            ]
+            action["state"] = "APPROVAL_PENDING"
+            action["revision"] = 2
+
+    table = ApprovalWinsPreparedRace()
+    action = _action_record()
+    table.items[(action["PK"], action["SK"])] = action
+    repo, _ = repository(table)
+    draft = _edited_draft()
+
+    with pytest.raises(
+        repository_module.DraftRevisionConflictError,
+        match="action authority fence",
+    ):
+        repo.save_superseding_draft(
+            user_id="user-1",
+            action_id=draft.action_id,
+            draft=draft,
+            expected_draft_revision=1,
+            current_draft_revision=2,
+            expires_at=DERIVED_TTL,
+        )
+
+    assert table.items[(action["PK"], action["SK"])]["state"] == (
+        "APPROVAL_PENDING"
+    )
+    assert (
+        "USER#user-1",
+        "GMAIL#DRAFT#action_12345678#0000000002",
+    ) not in table.items
+
+
+def test_atomic_edit_advances_an_exact_stale_draft_chain_without_reopening():
+    repo, table = repository()
+    action = {
+        **_action_record(state="STALE", revision=3),
+        "staleReason": "newer-draft-revision",
+        "staleDraftRevision": 1,
+        "supersededByDraftRevision": 2,
+    }
+    table.items[(action["PK"], action["SK"])] = action
+    draft = _edited_draft(revision=3)
+
+    repo.save_superseding_draft(
+        user_id="user-1",
+        action_id=draft.action_id,
+        draft=draft,
+        expected_draft_revision=2,
+        current_draft_revision=3,
+        expires_at=DERIVED_TTL,
+    )
+
+    stored = table.items[(action["PK"], action["SK"])]
+    assert stored["state"] == "STALE"
+    assert stored["revision"] == 4
+    assert stored["staleDraftRevision"] == 1
+    assert stored["supersededByDraftRevision"] == 3
+
+
+def test_atomic_stale_chain_edit_loses_cleanly_when_reprepare_wins():
+    class ReprepareWinsStaleRace(FakeTable):
+        def _before_transaction(self, _operations):
+            action = self.items[
+                ("USER#user-1", "ACTION#action_12345678")
+            ]
+            action["state"] = "PREPARED"
+            action["revision"] = 4
+            action["draftRevision"] = 2
+            for field in {
+                "staleReason",
+                "staleDraftRevision",
+                "supersededByDraftRevision",
+            }:
+                action.pop(field, None)
+
+    table = ReprepareWinsStaleRace()
+    action = {
+        **_action_record(state="STALE", revision=3),
+        "staleReason": "newer-draft-revision",
+        "staleDraftRevision": 1,
+        "supersededByDraftRevision": 2,
+    }
+    table.items[(action["PK"], action["SK"])] = action
+    repo, _ = repository(table)
+
+    with pytest.raises(
+        repository_module.DraftRevisionConflictError,
+        match="action authority fence",
+    ):
+        repo.save_superseding_draft(
+            user_id="user-1",
+            action_id="action_12345678",
+            draft=_edited_draft(revision=3),
+            expected_draft_revision=2,
+            current_draft_revision=3,
+            expires_at=DERIVED_TTL,
+        )
+
+    assert table.items[
+        ("USER#user-1", "ACTION#action_12345678")
+    ]["state"] == "PREPARED"
+    assert (
+        "USER#user-1",
+        "GMAIL#DRAFT#action_12345678#0000000003",
+    ) not in table.items
+
+
+@pytest.mark.parametrize("state", ["APPROVED", "DISPATCHING", "UNCERTAIN"])
+def test_atomic_edit_refuses_advanced_or_uncertain_authority_without_a_put(
+    state,
+):
+    repo, table = repository()
+    action = _action_record(state=state, revision=3)
+    table.items[(action["PK"], action["SK"])] = action
+
+    with pytest.raises(
+        repository_module.DraftRevisionConflictError,
+        match="authority advanced",
+    ):
+        repo.save_superseding_draft(
+            user_id="user-1",
+            action_id="action_12345678",
+            draft=_edited_draft(),
+            expected_draft_revision=1,
+            current_draft_revision=2,
+            expires_at=DERIVED_TTL,
+        )
+
+    assert not any(name == "transact_write_items" for name, _ in table.calls)
+    assert (
+        "USER#user-1",
+        "GMAIL#DRAFT#action_12345678#0000000002",
+    ) not in table.items
+
+
+def test_atomic_edit_never_reconciles_from_the_draft_record_alone():
+    class DraftWithoutProvenActionOutcome(FakeTable):
+        def _before_transaction(self, operations):
+            put = next(operation["Put"] for operation in operations if "Put" in operation)
+            draft_item = self._decode_item(put["Item"])
+            self.items[self._key(draft_item)] = draft_item
+            action = _action_record(state="APPROVAL_PENDING", revision=2)
+            self.items[(action["PK"], action["SK"])] = action
+            raise AmbiguousWrite("transaction response lost")
+
+    repo, table = repository(DraftWithoutProvenActionOutcome())
+
+    with pytest.raises(
+        repository_module.RepositoryRecordError,
+        match="outcome is unproven",
+    ):
+        repo.save_superseding_draft(
+            user_id="user-1",
+            action_id="action_12345678",
+            draft=_edited_draft(),
+            expected_draft_revision=1,
+            current_draft_revision=2,
+            expires_at=DERIVED_TTL,
+        )
+
+    assert table.items[
+        ("USER#user-1", "ACTION#action_12345678")
+    ]["state"] == "APPROVAL_PENDING"
+
+
+@pytest.mark.parametrize(
+    ("action_id", "current_revision"),
+    [("action_other_456", 2), ("action_12345678", 999)],
+)
+def test_atomic_edit_repository_rejects_declared_draft_binding_mismatch(
+    action_id,
+    current_revision,
+):
+    repo, table = repository()
+
+    with pytest.raises(
+        repository_module.RepositoryRecordError,
+        match="exact draft binding",
+    ):
+        repo.save_superseding_draft(
+            user_id="user-1",
+            action_id=action_id,
+            draft=_edited_draft(),
+            expected_draft_revision=1,
+            current_draft_revision=current_revision,
+            expires_at=DERIVED_TTL,
+        )
+
+    assert not any(name == "transact_write_items" for name, _ in table.calls)
 
 
 def test_generation_guard_atomically_rejects_a_write_that_loses_to_disconnect():

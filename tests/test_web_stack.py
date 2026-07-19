@@ -566,6 +566,27 @@ def test_versioned_control_lambda_is_the_only_telegram_command_target() -> None:
     }.isdisjoint(actions)
 
 
+def test_web_deletion_binding_receives_only_the_nonsecret_connection_ref() -> None:
+    template = _synth_web_template(
+        founder_user_ids="founder-1",
+        gmail_send_connection_id="google_conn_1234",
+        gmail_send_account_email="founder@example.com",
+    )
+
+    for function_name in {
+        "personal-operator-web-api",
+        "personal-operator-maintenance",
+    }:
+        function = next(
+            resource
+            for resource in _resources(template, "AWS::Lambda::Function")
+            if resource["Properties"].get("FunctionName") == function_name
+        )
+        variables = function["Properties"]["Environment"]["Variables"]
+        assert variables["GMAIL_SEND_CONNECTION_ID"] == "google_conn_1234"
+        assert "GMAIL_SEND_ACCOUNT_EMAIL" not in variables
+
+
 def test_control_founder_approval_binding_is_exact_and_has_no_send_credential() -> None:
     template = _synth_web_template(
         founder_user_ids="founder-1",

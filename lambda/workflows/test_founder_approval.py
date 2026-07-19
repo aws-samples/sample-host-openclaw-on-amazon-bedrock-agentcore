@@ -6,7 +6,11 @@ import pytest
 
 from actions.models import ActionState, DraftRevision
 from actions.state_machine import ConcurrentActionUpdate
-from workflows.founder_approval import FounderApprovalProducer
+from workflows.founder_approval import (
+    FounderApprovalProducer,
+    founder_draft_revision,
+)
+from workflows.gmail.models import DraftRevision as LocalDraftRevision
 from workflows.gmail.models import Opportunity, SourceEvidence
 
 
@@ -57,6 +61,7 @@ class Approvals:
         self.race = race
         self.requests = []
         self.recoveries = []
+        self.stales = []
 
     def request_approval(self, **kwargs):
         self.requests.append(kwargs)
@@ -68,11 +73,30 @@ class Approvals:
         self.recoveries.append(kwargs)
         return "durable.pending.token"
 
+    def mark_stale(self, **kwargs):
+        self.stales.append(kwargs)
 
-def producer(repository, approvals):
+
+class DraftReader:
+    def __init__(self, current=None):
+        self.current = current
+        self.calls = []
+
+    def latest_draft(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.current or founder_draft_revision(
+            user_id=kwargs["user_id"],
+            opportunity=opportunity(user_id=kwargs["user_id"]),
+            connection_id="google_conn_1234",
+            account_email="founder@example.com",
+        )
+
+
+def producer(repository, approvals, *, draft_reader=None):
     return FounderApprovalProducer(
         action_repository=repository,
         approval_service=approvals,
+        draft_reader=draft_reader or DraftReader(),
         founder_user_id=FOUNDER,
         connection_id="google_conn_1234",
         account_email="founder@example.com",
@@ -158,6 +182,89 @@ def test_repeat_or_lost_race_recovers_the_same_durable_pending_token(
         "acting_user_id": FOUNDER,
     }
     assert len(approvals.requests) == (0 if pending_initially else 1)
+
+
+def test_newer_displayed_draft_between_create_and_approval_stales_prepared():
+    initial = founder_draft_revision(
+        user_id=FOUNDER,
+        opportunity=opportunity(),
+        connection_id="google_conn_1234",
+        account_email="founder@example.com",
+    )
+    newer = LocalDraftRevision.create(
+        action_id=initial.action_id,
+        revision=2,
+        to=initial.to,
+        subject="Edited subject",
+        body="Edited body",
+    )
+    repository = Repository()
+    approvals = Approvals()
+
+    class ChangesAfterPrepared:
+        def __init__(self):
+            self.calls = []
+
+        def latest_draft(self, **kwargs):
+            self.calls.append(kwargs)
+            return initial if len(self.calls) == 1 else newer
+
+    service = producer(
+        repository,
+        approvals,
+        draft_reader=ChangesAfterPrepared(),
+    )
+
+    with pytest.raises(ConcurrentActionUpdate, match="displayed draft changed"):
+        service.prepare(
+            user_id=FOUNDER,
+            opportunity=opportunity(),
+            draft=initial,
+        )
+
+    assert approvals.requests == []
+    assert approvals.stales == [
+        {
+            "action_id": initial.action_id,
+            "revision": 1,
+            "user_id": FOUNDER,
+            "expected_draft_revision": 1,
+            "current_draft_revision": 2,
+        }
+    ]
+
+
+def test_newer_displayed_draft_before_create_never_reprepares_old_revision():
+    initial = founder_draft_revision(
+        user_id=FOUNDER,
+        opportunity=opportunity(),
+        connection_id="google_conn_1234",
+        account_email="founder@example.com",
+    )
+    newer = LocalDraftRevision.create(
+        action_id=initial.action_id,
+        revision=2,
+        to=initial.to,
+        subject="Edited subject",
+        body="Edited body",
+    )
+    repository = Repository()
+    approvals = Approvals()
+
+    with pytest.raises(ConcurrentActionUpdate, match="before approval"):
+        producer(
+            repository,
+            approvals,
+            draft_reader=DraftReader(newer),
+        ).prepare(
+            user_id=FOUNDER,
+            opportunity=opportunity(),
+            draft=initial,
+        )
+
+    assert repository.drafts == []
+    assert approvals.requests == []
+    assert approvals.stales == []
 
 
 def test_unexpected_existing_action_state_fails_closed():

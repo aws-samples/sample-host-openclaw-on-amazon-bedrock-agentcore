@@ -57,11 +57,14 @@ NOW = gmail_fixtures.NOW
 
 
 class Revoker:
-    def __init__(self):
+    def __init__(self, error=None):
         self.calls = []
+        self.error = error
 
     def revoke_all(self, connection_ref):
         self.calls.append(connection_ref)
+        if self.error is not None:
+            raise self.error
 
 
 def build_adapter(
@@ -385,3 +388,78 @@ def test_kernel_revocation_cannot_succeed_without_revoking_exact_authority():
     kernel.revoke("google_conn_1234")
 
     assert revoker.calls == ["google_conn_1234"]
+
+
+@pytest.mark.parametrize("connection_ref", [None, "", "wrong ref", "x" * 129])
+def test_kernel_revocation_rejects_invalid_connection_identity(connection_ref):
+    revoker = Revoker()
+    kernel = connectors_module.GenericConnectorKernel(
+        GmailConnectorAdapter(
+            executor=object(),
+            connection_revoker=revoker,
+        )
+    )
+
+    with pytest.raises(ValueError, match="connection_ref"):
+        kernel.revoke(connection_ref)
+
+    assert revoker.calls == []
+
+
+def test_kernel_revocation_propagates_authority_revoker_failure_once():
+    error = RuntimeError("authority revocation outcome is unproven")
+    revoker = Revoker(error)
+    kernel = connectors_module.GenericConnectorKernel(
+        GmailConnectorAdapter(
+            executor=object(),
+            connection_revoker=revoker,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="outcome is unproven") as raised:
+        kernel.revoke("google_conn_1234")
+
+    assert raised.value is error
+    assert revoker.calls == ["google_conn_1234"]
+
+
+@pytest.mark.parametrize(
+    ("action_id", "current_revision"),
+    [("action_other_456", 2), ("action_target_123", 999)],
+)
+def test_atomic_draft_supersession_rejects_declared_binding_mismatch(
+    action_id,
+    current_revision,
+):
+    class Editor:
+        def __init__(self):
+            self.calls = []
+
+        def save_superseding_draft(self, **kwargs):
+            self.calls.append(kwargs)
+
+    draft = type(
+        "LocalDraft",
+        (),
+        {"action_id": "action_target_123", "revision": 2},
+    )()
+    editor = Editor()
+    kernel = connectors_module.GenericConnectorKernel(
+        GmailConnectorAdapter(
+            executor=object(),
+            connection_revoker=Revoker(),
+            draft_editor=editor,
+        )
+    )
+
+    with pytest.raises(ValueError, match="exact draft binding"):
+        kernel.supersede_pending(
+            action_id=action_id,
+            user_id="founder-1",
+            expected_draft_revision=1,
+            current_draft_revision=current_revision,
+            draft=draft,
+            expires_at=1_800_000_000,
+        )
+
+    assert editor.calls == []

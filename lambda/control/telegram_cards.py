@@ -10,7 +10,7 @@ import re
 import secrets
 from typing import Callable, Mapping, Sequence
 
-from workflows.gmail.models import Opportunity, SourceEvidence
+from workflows.gmail.models import DraftRevision, Opportunity, SourceEvidence
 from workflows.index import GmailPilotWorkflow
 
 
@@ -436,8 +436,17 @@ class DynamoTelegramCardActions:
 class ReadOnlyGmailDraftPreparer:
     """Persist a deterministic local draft; it has no Gmail effect capability."""
 
-    def __init__(self, repository, *, now: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        repository,
+        *,
+        draft_factory: Callable[..., DraftRevision | None] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        if draft_factory is not None and not callable(draft_factory):
+            raise TypeError("draft factory is invalid")
         self._repository = repository
+        self._draft_factory = draft_factory
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     def prepare(
@@ -450,34 +459,63 @@ class ReadOnlyGmailDraftPreparer:
         user_id = _identity(user_id, _USER_ID, "user identity")
         if not isinstance(opportunity, Opportunity) or opportunity.user_id != user_id:
             raise TypeError("draft requires a user-bound Opportunity")
-        identity = hashlib.sha256(
-            (
-                "personal-operator-readonly-draft-v1\0"
-                + user_id
-                + "\0"
-                + opportunity.id
-                + "\0"
-                + opportunity.source.source_id
-            ).encode("utf-8")
-        ).hexdigest()[:32]
-        topic = opportunity.source.subject or opportunity.title
-        subject = ("Re: " + topic)[:200]
-        body = (
-            "Hello,\n\n"
-            f"Following up on my previous email about {topic[:120]}.\n\n"
-            "Best,"
+        draft = (
+            self._draft_factory(user_id=user_id, opportunity=opportunity)
+            if self._draft_factory is not None
+            else None
         )
-        return GmailPilotWorkflow(
+        if draft is not None:
+            if not isinstance(draft, DraftRevision):
+                raise TypeError("draft factory returned an invalid revision")
+            if draft.revision != 1 or draft.to != opportunity.source.correspondent:
+                raise ValueError("draft factory returned a mismatched revision")
+        else:
+            identity = hashlib.sha256(
+                (
+                    "personal-operator-readonly-draft-v1\0"
+                    + user_id
+                    + "\0"
+                    + opportunity.id
+                    + "\0"
+                    + opportunity.source.source_id
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+            topic = opportunity.source.subject or opportunity.title
+            draft = DraftRevision.create(
+                action_id=f"draft_{identity}",
+                revision=1,
+                to=opportunity.source.correspondent,
+                subject=("Re: " + topic)[:200],
+                body=(
+                    "Hello,\n\n"
+                    f"Following up on my previous email about {topic[:120]}.\n\n"
+                    "Best,"
+                ),
+            )
+        prepared = GmailPilotWorkflow(
             scanner=None,
             ranker=None,
             repository=self._repository,
             now=self._now,
         ).prepare_draft(
             user_id=user_id,
-            action_id=f"draft_{identity}",
-            revision=1,
-            to=opportunity.source.correspondent,
-            subject=subject,
-            body=body,
+            action_id=draft.action_id,
+            revision=draft.revision,
+            to=draft.to,
+            subject=draft.subject,
+            body=draft.body,
             expected_generation=connection_generation,
         )
+        latest = getattr(self._repository, "latest_draft", None)
+        if not callable(latest):
+            return prepared
+        current = latest(
+            user_id=user_id,
+            action_id=draft.action_id,
+            expected_generation=connection_generation,
+        )
+        if not isinstance(current, DraftRevision):
+            raise CardActionStoreError(
+                "prepared draft is not the current displayed revision"
+            )
+        return current

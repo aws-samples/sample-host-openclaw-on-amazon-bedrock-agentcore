@@ -22,6 +22,7 @@ v0; it simply forwards to the concrete adapter.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Mapping, Optional, Protocol, runtime_checkable
 
 try:
@@ -30,6 +31,15 @@ try:
 except ImportError:  # pragma: no cover - bare-module load path (action_connectors)
     from action_proposals import ActionProposalV1
     from action_receipts import EffectReceiptV1
+
+
+_CONNECTION_REF = re.compile(r"[A-Za-z0-9_-]{8,128}")
+
+
+def _connection_ref(value: object) -> str:
+    if not isinstance(value, str) or _CONNECTION_REF.fullmatch(value) is None:
+        raise ValueError("connection_ref is invalid")
+    return value
 
 
 @runtime_checkable
@@ -133,6 +143,7 @@ class GmailConnectorAdapter:
         approval_service=None,
         provider=None,
         connection_revoker=None,
+        draft_editor=None,
         state_machine=None,
         now=None,
     ) -> None:
@@ -146,6 +157,7 @@ class GmailConnectorAdapter:
         self._approvals = approval_service
         self._provider = provider
         self._connection_revoker = connection_revoker
+        self._draft_editor = draft_editor
         self._state_machine = state_machine
         self._now = now or (lambda: datetime.now(timezone.utc))
 
@@ -209,7 +221,7 @@ class GmailConnectorAdapter:
 
     # --- revoke: kernel never holds provider creds ----------------------
     def revoke(self, connection_ref: str) -> None:
-        self._connection_revoker.revoke_all(connection_ref)
+        self._connection_revoker.revoke_all(_connection_ref(connection_ref))
 
     # --- property 7: a newer draft atomically stales a pending approval -
     def supersede_pending(
@@ -220,13 +232,38 @@ class GmailConnectorAdapter:
         revision: int | None = None,
         expected_draft_revision: int,
         current_draft_revision: int,
+        draft=None,
+        expires_at: int | None = None,
+        expected_generation: int | None = None,
     ):
         """Route a newer draft revision through ApprovalService.mark_stale.
 
-        This closes the Task-5-deferred gap: a local draft edit that bumps the
-        draft revision must atomically STALE the old pending founder approval,
-        under the repository's conditional draft-fence.
+        When ``draft`` is supplied, the injected trusted editor commits the
+        immutable next revision and either the exact active-action -> STALE
+        transition or an exact action-absence check in one DynamoDB
+        transaction. Approval transitions update that same ACTION item, so an
+        edit and approval cannot both win. The legacy state-only branch remains
+        for non-workspace callers that do not persist a draft here.
         """
+        if draft is not None:
+            if (
+                getattr(draft, "action_id", None) != action_id
+                or getattr(draft, "revision", None)
+                != current_draft_revision
+            ):
+                raise ValueError("atomic edit requires an exact draft binding")
+            save = getattr(self._draft_editor, "save_superseding_draft", None)
+            if not callable(save):
+                raise ValueError("atomic draft edit boundary is unavailable")
+            return save(
+                user_id=user_id,
+                action_id=action_id,
+                draft=draft,
+                expected_draft_revision=expected_draft_revision,
+                current_draft_revision=current_draft_revision,
+                expires_at=expires_at,
+                expected_generation=expected_generation,
+            )
         if revision is None:
             if self._repository is None:
                 raise ValueError("supersede requires an action repository")

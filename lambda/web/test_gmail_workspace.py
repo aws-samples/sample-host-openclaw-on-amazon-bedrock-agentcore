@@ -5,7 +5,19 @@ from decimal import Decimal
 
 import pytest
 
+from actions.connectors import GenericConnectorKernel, GmailConnectorAdapter
+from actions.models import ActionState, CapabilityDenied, gmail_resource
+from actions.state_machine import (
+    ActionStateMachine,
+    ApprovalService,
+    ApprovalTokenCodec,
+)
+from control.telegram_cards import ReadOnlyGmailDraftPreparer
+from workflows import founder_approval as founder_approval_module
+from workflows.founder_approval import FounderApprovalProducer
 from workflows.gmail.models import DraftRevision
+from workflows.gmail.models import Opportunity, SourceEvidence
+from workflows.gmail.repository import DynamoGmailRepository
 
 from .gmail_workspace import (
     DraftEditConflict,
@@ -133,13 +145,18 @@ def opportunity_item(*, user=USER, ttl=None):
 
 
 def service(table):
-    return GmailWorkspaceService(table, now=lambda: NOW)
+    return GmailWorkspaceService(
+        table,
+        approval_superseder=ApprovalSuperseder(),
+        now=lambda: NOW,
+    )
 
 
 class ConnectionFence:
-    def __init__(self, *, generation=6, connected=True):
+    def __init__(self, *, generation=6, connected=True, save_error=None):
         self.generation = generation
         self.connected = connected
+        self.save_error = save_error
         self.saved = []
 
     def connected_generation(self, user_id):
@@ -154,6 +171,8 @@ class ConnectionFence:
             raise RuntimeError("stale")
 
     def save_draft(self, **kwargs):
+        if self.save_error is not None:
+            raise self.save_error
         self.saved.append(kwargs)
 
 
@@ -161,11 +180,20 @@ class ApprovalSuperseder:
     def __init__(self, error=None):
         self.calls = []
         self.error = error
+        self.state = "APPROVAL_PENDING"
 
     def supersede_pending(self, **kwargs):
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
+        self.state = "STALE"
+        return {
+            "draftPersisted": True,
+            "actionId": kwargs["action_id"],
+            "userId": kwargs["user_id"],
+            "draftRevision": kwargs["current_draft_revision"],
+            "payloadHash": kwargs["draft"].payload_hash,
+        }
 
 
 def test_get_returns_only_live_derived_opportunities_and_latest_draft_per_action():
@@ -244,6 +272,7 @@ def test_disconnected_workspace_hides_all_gmail_derived_content():
     workspace = GmailWorkspaceService(
         table,
         repository=fence,
+        approval_superseder=ApprovalSuperseder(),
         enforce_connection_fence=True,
         now=lambda: NOW,
     )
@@ -298,6 +327,7 @@ def test_fenced_edit_forwards_the_generation_captured_before_reading():
     workspace = GmailWorkspaceService(
         table,
         repository=fence,
+        approval_superseder=ApprovalSuperseder(),
         enforce_connection_fence=True,
         now=lambda: NOW,
     )
@@ -335,14 +365,14 @@ def test_edit_stales_pending_approval_before_persisting_new_draft_revision():
         body="Updated body",
     )
 
-    assert superseder.calls == [
-        {
-            "action_id": ACTION,
-            "user_id": USER,
-            "expected_draft_revision": 1,
-            "current_draft_revision": 2,
-        }
-    ]
+    assert len(superseder.calls) == 1
+    call = superseder.calls[0]
+    assert call["action_id"] == ACTION
+    assert call["user_id"] == USER
+    assert call["expected_draft_revision"] == 1
+    assert call["current_draft_revision"] == 2
+    assert call["draft"].revision == 2
+    assert call["expected_generation"] == 6
     assert len(fence.saved) == 1
 
 
@@ -369,6 +399,110 @@ def test_edit_fails_closed_without_saving_when_approval_staling_fails():
             body="Updated body",
         )
 
+    assert fence.saved == []
+    assert superseder.state == "APPROVAL_PENDING"
+
+
+def test_edit_refuses_to_write_without_the_approval_supersession_boundary():
+    item = draft_item()
+    item["connectionGeneration"] = 6
+    table = Table([item])
+    fence = ConnectionFence()
+    workspace = GmailWorkspaceService(
+        table,
+        repository=fence,
+        enforce_connection_fence=True,
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(DraftEditConflict, match="supersession.*unavailable"):
+        workspace.edit_draft(
+            user_id=USER,
+            action_id=ACTION,
+            revision=1,
+            subject="Updated subject",
+            body="Updated body",
+        )
+
+    assert fence.saved == []
+
+
+def test_edit_save_failure_keeps_old_authority_stale_without_new_revision():
+    item = draft_item()
+    item["connectionGeneration"] = 6
+    table = Table([item])
+    error = RuntimeError("draft persistence unavailable")
+    fence = ConnectionFence(save_error=error)
+    superseder = ApprovalSuperseder()
+    workspace = GmailWorkspaceService(
+        table,
+        repository=fence,
+        approval_superseder=superseder,
+        enforce_connection_fence=True,
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="persistence unavailable") as raised:
+        workspace.edit_draft(
+            user_id=USER,
+            action_id=ACTION,
+            revision=1,
+            subject="Updated subject",
+            body="Updated body",
+        )
+
+    assert raised.value is error
+    assert superseder.state == "STALE"
+    assert fence.saved == []
+    assert set(table.items) == {
+        (f"USER#{USER}", f"GMAIL#DRAFT#{ACTION}#0000000001")
+    }
+
+
+def test_edit_fences_action_creation_inside_the_draft_save_gap():
+    item = draft_item()
+    item["connectionGeneration"] = 6
+    table = Table([item])
+
+    class AbsentThenPreparing:
+        def __init__(self):
+            self.state = None
+
+        def supersede_pending(self, **_kwargs):
+            # The competing approval wins the shared ACTION-item condition.
+            # A production atomic editor reports no successful draft outcome.
+            self.state = "APPROVAL_PENDING"
+            return None
+
+    superseder = AbsentThenPreparing()
+
+    class PrepareInsideSave(ConnectionFence):
+        def save_draft(self, **kwargs):
+            # Deterministic inverse interleaving: the edit already observed no
+            # action, then revision 1 gains approval authority immediately
+            # before the immutable revision-2 write.
+            superseder.state = "APPROVAL_PENDING"
+            super().save_draft(**kwargs)
+
+    fence = PrepareInsideSave()
+    workspace = GmailWorkspaceService(
+        table,
+        repository=fence,
+        approval_superseder=superseder,
+        enforce_connection_fence=True,
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(DraftEditConflict, match="atomic draft edit"):
+        workspace.edit_draft(
+            user_id=USER,
+            action_id=ACTION,
+            revision=1,
+            subject="Updated subject",
+            body="Updated body",
+        )
+
+    assert superseder.state == "APPROVAL_PENDING"
     assert fence.saved == []
 
 
@@ -430,3 +564,286 @@ def test_corrupt_or_cross_tenant_records_fail_closed():
     bad_draft["draft"]["to"] = "attacker@example.com"
     with pytest.raises(GmailWorkspaceRecordError):
         service(Table([bad_draft])).get(USER)
+
+
+def test_displayed_founder_draft_edit_stales_the_real_pending_action():
+    founder = "founder-1"
+    connection_ref = "google_conn_1234"
+    account_email = "founder@example.com"
+    source = SourceEvidence(
+        source_id="gmail:thread1:message1",
+        thread_id="thread1",
+        deep_link="https://mail.google.com/mail/u/0/#inbox/thread1",
+        correspondent="person@example.net",
+        subject="Quarterly plan",
+        excerpt="A bounded derived excerpt",
+        waiting_since=NOW - timedelta(days=8),
+    )
+    opportunity = Opportunity(
+        id="opp_12345678",
+        user_id=founder,
+        source=source,
+        waiting_since=source.waiting_since,
+        title="Follow up with person",
+        reason="They have not replied",
+        confidence=0.9,
+    )
+
+    class ActionRepository:
+        def __init__(self):
+            self.record = None
+
+        def create_prepared(self, *, draft):
+            if self.record is None:
+                self.record = {
+                    "actionId": draft.action_id,
+                    "userId": draft.user_id,
+                    "state": ActionState.PREPARED.value,
+                    "revision": 1,
+                    "draftRevision": draft.draft_revision,
+                    "connectionId": draft.connection_id,
+                    "accountEmail": draft.account_email,
+                    "senderAddress": draft.sender_address,
+                    "capability": "gmail.send",
+                    "resource": gmail_resource(
+                        connection_id=draft.connection_id,
+                        account_email=draft.account_email,
+                    ),
+                    "args": dict(draft.args),
+                    "payloadHash": draft.payload_hash,
+                    "ttl": int((NOW + timedelta(days=14)).timestamp()),
+                }
+            elif (
+                self.record["state"] == ActionState.STALE.value
+                and self.record["supersededByDraftRevision"]
+                == draft.draft_revision
+            ):
+                for stale_or_approval in {
+                    "approvalId",
+                    "approvalActionId",
+                    "approvalDraftRevision",
+                    "approvalArgsHash",
+                    "approvalExpiresAt",
+                    "approvalRequestedAt",
+                    "staleAt",
+                    "staleReason",
+                    "staleDraftRevision",
+                    "supersededByDraftRevision",
+                }:
+                    self.record.pop(stale_or_approval, None)
+                self.record.update(
+                    {
+                        "state": ActionState.PREPARED.value,
+                        "revision": self.record["revision"] + 1,
+                        "draftRevision": draft.draft_revision,
+                        "args": dict(draft.args),
+                        "payloadHash": draft.payload_hash,
+                        "ttl": int((NOW + timedelta(days=14)).timestamp()),
+                    }
+                )
+            return dict(self.record)
+
+        def get(self, *, action_id, user_id):
+            if self.record is None:
+                return None
+            if (
+                self.record["actionId"] != action_id
+                or self.record["userId"] != user_id
+            ):
+                return None
+            return dict(self.record)
+
+        def transition(
+            self,
+            *,
+            action_id,
+            user_id,
+            expected_state,
+            target_state,
+            expected_revision,
+            transition_id,
+            updates,
+        ):
+            assert self.record is not None
+            if (
+                self.record["actionId"] != action_id
+                or self.record["userId"] != user_id
+                or self.record["state"] != expected_state.value
+                or self.record["revision"] != expected_revision
+            ):
+                raise RuntimeError("action transition lost its exact fence")
+            self.record.update(updates)
+            self.record["state"] = target_state.value
+            self.record["revision"] = expected_revision + 1
+            self.record["lastTransitionId"] = transition_id
+            return dict(self.record)
+
+    table = Table()
+    gmail_repository = DynamoGmailRepository(table, now=lambda: NOW)
+    displayed = ReadOnlyGmailDraftPreparer(
+        gmail_repository,
+        draft_factory=lambda **request: founder_approval_module.founder_draft_revision(
+            user_id=request["user_id"],
+            opportunity=request["opportunity"],
+            connection_id=connection_ref,
+            account_email=account_email,
+        ),
+        now=lambda: NOW,
+    ).prepare(user_id=founder, opportunity=opportunity)
+
+    actions = ActionRepository()
+    machine = ActionStateMachine(actions)
+    approvals = ApprovalService(
+        state_machine=machine,
+        token_codec=ApprovalTokenCodec(b"a" * 32),
+        founder_user_ids={founder},
+        now=lambda: NOW,
+        approval_id_factory=lambda: "approval_123456789",
+    )
+    class UnusedConnectionRevoker:
+        @staticmethod
+        def revoke_all(_connection_ref):
+            raise AssertionError("draft edit must not revoke the connection")
+
+    class LocalAtomicDraftEditor:
+        def save_superseding_draft(self, **kwargs):
+            draft = kwargs["draft"]
+            record = actions.get(
+                action_id=draft.action_id,
+                user_id=kwargs["user_id"],
+            )
+            if record is not None:
+                machine.stale_for_new_draft(
+                    action_id=draft.action_id,
+                    user_id=kwargs["user_id"],
+                    revision=record["revision"],
+                    expected_draft_revision=kwargs[
+                        "expected_draft_revision"
+                    ],
+                    current_draft_revision=draft.revision,
+                    now=NOW,
+                )
+            gmail_repository.save_draft(
+                user_id=kwargs["user_id"],
+                draft=draft,
+                expires_at=kwargs["expires_at"],
+            )
+            return {
+                "draftPersisted": True,
+                "actionId": draft.action_id,
+                "userId": kwargs["user_id"],
+                "draftRevision": draft.revision,
+                "payloadHash": draft.payload_hash,
+            }
+
+    kernel = GenericConnectorKernel(
+        GmailConnectorAdapter(
+            executor=object(),
+            repository=actions,
+            draft_editor=LocalAtomicDraftEditor(),
+            state_machine=machine,
+            connection_revoker=UnusedConnectionRevoker(),
+            now=lambda: NOW,
+        )
+    )
+    workspace = GmailWorkspaceService(
+        table,
+        repository=gmail_repository,
+        approval_superseder=kernel,
+        now=lambda: NOW,
+    )
+    first_edit = workspace.edit_draft(
+        user_id=founder,
+        action_id=displayed.action_id,
+        revision=displayed.revision,
+        subject="Updated subject",
+        body="Updated body",
+    )["draft"]
+    assert first_edit["revision"] == 2
+    assert actions.record is None
+
+    current_displayed = ReadOnlyGmailDraftPreparer(
+        gmail_repository,
+        draft_factory=lambda **request: founder_approval_module.founder_draft_revision(
+            user_id=request["user_id"],
+            opportunity=request["opportunity"],
+            connection_id=connection_ref,
+            account_email=account_email,
+        ),
+        now=lambda: NOW,
+    ).prepare(user_id=founder, opportunity=opportunity)
+    assert current_displayed.revision == 2
+    producer = FounderApprovalProducer(
+        action_repository=actions,
+        approval_service=approvals,
+        draft_reader=gmail_repository,
+        founder_user_id=founder,
+        connection_id=connection_ref,
+        account_email=account_email,
+        now=lambda: NOW,
+    )
+    pending = producer.prepare(
+        user_id=founder,
+        opportunity=opportunity,
+        draft=current_displayed,
+    )
+    assert pending is not None
+    assert pending.action_id == displayed.action_id
+    assert actions.record["state"] == ActionState.APPROVAL_PENDING.value
+
+    visible = workspace.get(founder)["drafts"][0]
+    assert visible["actionId"] == pending.action_id
+    assert visible["revision"] == actions.record["draftRevision"]
+    assert {
+        "to": visible["to"],
+        "subject": visible["subject"],
+        "body": visible["body"],
+    } == actions.record["args"]
+    assert visible["payloadHash"] == actions.record["payloadHash"]
+
+    revised = workspace.edit_draft(
+        user_id=founder,
+        action_id=visible["actionId"],
+        revision=visible["revision"],
+        subject="Updated again",
+        body="Updated body again",
+    )
+
+    assert revised["draft"]["revision"] == 3
+    assert actions.record["state"] == ActionState.STALE.value
+    assert actions.record["staleDraftRevision"] == 2
+    assert actions.record["supersededByDraftRevision"] == 3
+
+    latest = gmail_repository.latest_draft(
+        user_id=founder,
+        action_id=displayed.action_id,
+    )
+    assert latest is not None and latest.revision == 3
+    replacement = producer.prepare(
+        user_id=founder,
+        opportunity=opportunity,
+        draft=latest,
+    )
+
+    assert replacement is not None
+    assert replacement.token != pending.token
+    assert actions.record["state"] == ActionState.APPROVAL_PENDING.value
+    assert actions.record["draftRevision"] == 3
+    assert actions.record["revision"] > 3
+    with pytest.raises(CapabilityDenied):
+        approvals.approve(
+            action_id=replacement.action_id,
+            revision=actions.record["revision"],
+            acting_user_id=founder,
+            token=pending.token,
+            args=actions.record["args"],
+        )
+    approved = approvals.approve(
+        action_id=replacement.action_id,
+        revision=actions.record["revision"],
+        acting_user_id=founder,
+        token=replacement.token,
+        args=actions.record["args"],
+    )
+    assert approved["state"] == ActionState.APPROVED.value
+    assert approved["approvedDraftRevision"] == 3

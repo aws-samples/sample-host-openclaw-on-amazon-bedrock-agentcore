@@ -9,9 +9,9 @@ import json
 import re
 from typing import Callable, Mapping
 
-from actions.models import ActionState, DraftRevision, gmail_resource
+from actions.models import ActionState, DraftRevision as ActionDraftRevision, gmail_resource
 from actions.state_machine import ConcurrentActionUpdate
-from .gmail.models import Opportunity
+from .gmail.models import DraftRevision as LocalDraftRevision, Opportunity
 
 
 APPROVAL_TTL = timedelta(minutes=15)
@@ -26,7 +26,7 @@ def _utc(value: object, label: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _action_id(
+def founder_action_id(
     *,
     user_id: str,
     opportunity: Opportunity,
@@ -49,6 +49,36 @@ def _action_id(
     return "gmail_fu_" + hashlib.sha256(identity).hexdigest()[:32]
 
 
+def founder_draft_revision(
+    *,
+    user_id: str,
+    opportunity: Opportunity,
+    connection_id: str,
+    account_email: str,
+) -> LocalDraftRevision:
+    """Build the one exact revision displayed locally and governed for send."""
+
+    if not isinstance(opportunity, Opportunity) or opportunity.user_id != user_id:
+        raise TypeError("founder draft requires a bound Opportunity")
+    action_id = founder_action_id(
+        user_id=user_id,
+        opportunity=opportunity,
+        connection_id=connection_id,
+        account_email=account_email,
+    )
+    return LocalDraftRevision.create(
+        action_id=action_id,
+        revision=1,
+        to=opportunity.source.correspondent,
+        subject="Following up",
+        body=(
+            "Hello,\n\n"
+            "Just following up on my previous email.\n\n"
+            "Best,"
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedApproval:
     action_id: str
@@ -69,6 +99,7 @@ class FounderApprovalProducer:
         *,
         action_repository,
         approval_service,
+        draft_reader,
         founder_user_id: str,
         connection_id: str,
         account_email: str,
@@ -85,8 +116,11 @@ class FounderApprovalProducer:
             connection_id=connection_id,
             account_email=account_email,
         )
+        if not callable(getattr(draft_reader, "latest_draft", None)):
+            raise ValueError("founder draft reader is required")
         self._actions = action_repository
         self._approvals = approval_service
+        self._drafts = draft_reader
         self._founder = founder_user_id
         self._connection_id = connection_id
         self._account_email = account_email
@@ -96,7 +130,7 @@ class FounderApprovalProducer:
     def _record(
         value: object,
         *,
-        draft: DraftRevision,
+        draft: ActionDraftRevision,
     ) -> tuple[str, int]:
         if not isinstance(value, Mapping):
             raise ConcurrentActionUpdate("prepared action persistence returned invalid data")
@@ -126,6 +160,8 @@ class FounderApprovalProducer:
         *,
         user_id: str,
         opportunity: Opportunity,
+        draft: LocalDraftRevision | None = None,
+        expected_generation: int | None = None,
     ) -> PreparedApproval | None:
         # The authority check is intentionally first: external pilot scans do
         # not parse, persist, sign, or otherwise touch the effect pipeline.
@@ -133,34 +169,83 @@ class FounderApprovalProducer:
             return None
         if not isinstance(opportunity, Opportunity) or opportunity.user_id != user_id:
             raise TypeError("founder approval requires a bound Opportunity")
-        action_id = _action_id(
+        expected_action_id = founder_action_id(
             user_id=user_id,
             opportunity=opportunity,
             connection_id=self._connection_id,
             account_email=self._account_email,
         )
-        draft = DraftRevision(
-            action_id=action_id,
+        if draft is None:
+            local_draft = founder_draft_revision(
+                user_id=user_id,
+                opportunity=opportunity,
+                connection_id=self._connection_id,
+                account_email=self._account_email,
+            )
+        elif (
+            not isinstance(draft, LocalDraftRevision)
+            or draft.action_id != expected_action_id
+            or draft.to != opportunity.source.correspondent
+        ):
+            raise ConcurrentActionUpdate(
+                "displayed draft does not match the founder action binding"
+            )
+        else:
+            local_draft = draft
+        action_id = local_draft.action_id
+        draft = ActionDraftRevision(
+            action_id=local_draft.action_id,
             user_id=user_id,
-            draft_revision=1,
+            draft_revision=local_draft.revision,
             connection_id=self._connection_id,
             account_email=self._account_email,
             sender_address=self._account_email,
             args={
-                "to": opportunity.source.correspondent,
-                "subject": "Following up",
-                "body": (
-                    "Hello,\n\n"
-                    "Just following up on my previous email.\n\n"
-                    "Best,"
-                ),
+                "to": local_draft.to,
+                "subject": local_draft.subject,
+                "body": local_draft.body,
             },
             # A source-derived timestamp makes retries byte-identical while the
             # action ID and payload remain bound to this exact opportunity.
             created_at=opportunity.waiting_since,
         )
+        before = self._drafts.latest_draft(
+            user_id=user_id,
+            action_id=action_id,
+            expected_generation=expected_generation,
+        )
+        if before != local_draft:
+            raise ConcurrentActionUpdate(
+                "displayed draft changed before approval preparation"
+            )
         record = self._actions.create_prepared(draft=draft)
         state, revision = self._record(record, draft=draft)
+        current = self._drafts.latest_draft(
+            user_id=user_id,
+            action_id=action_id,
+            expected_generation=expected_generation,
+        )
+        if current != local_draft:
+            if (
+                isinstance(current, LocalDraftRevision)
+                and current.action_id == action_id
+                and current.revision > local_draft.revision
+            ):
+                try:
+                    self._approvals.mark_stale(
+                        action_id=action_id,
+                        revision=revision,
+                        user_id=user_id,
+                        expected_draft_revision=local_draft.revision,
+                        current_draft_revision=current.revision,
+                    )
+                except Exception:
+                    raise ConcurrentActionUpdate(
+                        "displayed draft changed while approval was prepared"
+                    ) from None
+            raise ConcurrentActionUpdate(
+                "displayed draft changed while approval was prepared"
+            )
         if state == ActionState.APPROVAL_PENDING.value:
             token = self._approvals.pending_token(
                 action_id=action_id,

@@ -81,6 +81,7 @@ GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 FOUNDER_GMAIL_SCOPES = frozenset({GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE})
 MAX_TOKEN_RESPONSE_BYTES = 64 * 1024
 _USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}")
+_CONNECTION_REF = re.compile(r"[A-Za-z0-9_-]{8,128}")
 
 
 class ProductionConfigurationError(RuntimeError):
@@ -315,16 +316,79 @@ class CompositeConnectionRevoker:
             revoker.revoke_all(user_id)
 
 
-class KernelConnectionRevoker:
-    """Expose account-deletion revocation only through the connector kernel."""
+class BoundConnectionAuthorityRevoker:
+    """Bind one connector reference to its exact user-scoped authority."""
 
-    def __init__(self, kernel) -> None:
-        if not callable(getattr(kernel, "revoke", None)):
-            raise ValueError("connector revocation kernel is invalid")
-        self._kernel = kernel
+    def __init__(
+        self,
+        *,
+        authority_revoker,
+        connection_ref: str,
+        user_id: str,
+    ) -> None:
+        if not callable(getattr(authority_revoker, "revoke_all", None)):
+            raise ValueError("connection authority revoker is invalid")
+        if (
+            not isinstance(connection_ref, str)
+            or _CONNECTION_REF.fullmatch(connection_ref) is None
+        ):
+            raise ValueError("connection revocation binding is invalid")
+        if not isinstance(user_id, str) or _USER_ID.fullmatch(user_id) is None:
+            raise ValueError("connection user binding is invalid")
+        self._authority_revoker = authority_revoker
+        self._connection_ref = connection_ref
+        self._user_id = user_id
 
     def revoke_all(self, connection_ref: str) -> None:
-        self._kernel.revoke(connection_ref)
+        if (
+            not isinstance(connection_ref, str)
+            or _CONNECTION_REF.fullmatch(connection_ref) is None
+            or connection_ref != self._connection_ref
+        ):
+            raise CapabilityDenied("connection revocation binding mismatch")
+        self._authority_revoker.revoke_all(self._user_id)
+
+
+class FounderKernelDeletionRevoker:
+    """Map account deletion to one exactly bound connector-kernel revoke."""
+
+    def __init__(
+        self,
+        *,
+        kernel,
+        founder_user_id: str | None,
+        connection_ref: str | None,
+    ) -> None:
+        if (founder_user_id is None) != (connection_ref is None):
+            raise ValueError("founder deletion connection binding is incomplete")
+        if founder_user_id is not None:
+            if not callable(getattr(kernel, "revoke", None)):
+                raise ValueError("founder deletion kernel is invalid")
+            if _USER_ID.fullmatch(founder_user_id) is None:
+                raise ValueError("founder deletion user binding is invalid")
+            if _CONNECTION_REF.fullmatch(connection_ref or "") is None:
+                raise ValueError("founder deletion connection binding is invalid")
+        self._kernel = kernel
+        self._founder_user_id = founder_user_id
+        self._connection_ref = connection_ref
+
+    def revoke_all(self, user_id: str) -> None:
+        if not isinstance(user_id, str) or _USER_ID.fullmatch(user_id) is None:
+            raise ValueError("user identity is invalid")
+        if self._founder_user_id is None or user_id != self._founder_user_id:
+            return
+        assert self._connection_ref is not None
+        self._kernel.revoke(self._connection_ref)
+
+
+class _UnavailableConnectionAuthorityRevoker:
+    """Fail closed on the control-only adapter, which has no bound connection."""
+
+    @staticmethod
+    def revoke_all(_connection_ref: str) -> None:
+        raise ProductionConfigurationError(
+            "control-only Gmail adapter has no connection revocation binding"
+        )
 
 
 class _UnavailableGmailExecutor:
@@ -773,7 +837,7 @@ class ProductionGmailExecutorFactory:
 
     def __call__(self, action: Mapping[str, object]):
         self._assert_deletion_allows(action)
-        provider, connection_id, account_email, _user_id = self._provider(action)
+        provider, connection_id, account_email, user_id = self._provider(action)
         executor = GmailSendExecutor(
             state_machine=self._machine,
             provider=provider,
@@ -787,7 +851,11 @@ class ProductionGmailExecutorFactory:
             GmailConnectorAdapter(
                 executor=executor,
                 provider=provider,
-                connection_revoker=self._connection_revoker,
+                connection_revoker=BoundConnectionAuthorityRevoker(
+                    authority_revoker=self._connection_revoker,
+                    connection_ref=connection_id,
+                    user_id=user_id,
+                ),
             )
         )
 
@@ -799,6 +867,29 @@ class _NoopGmailReconciler:
     def reconcile(*, action_id: str, user_id: str):
         del action_id, user_id
         return None
+
+
+class KernelGmailReconciler:
+    """Adapt maintenance's exact IDs to one kernel-bound action observation."""
+
+    def __init__(self, *, kernel, action: Mapping[str, object]) -> None:
+        if not callable(getattr(kernel, "reconcile", None)):
+            raise ValueError("Gmail reconciliation kernel is invalid")
+        if not isinstance(action, Mapping):
+            raise TypeError("reconciliation action must be a mapping")
+        action_id = action.get("actionId")
+        user_id = action.get("userId")
+        if not isinstance(action_id, str) or not isinstance(user_id, str):
+            raise CapabilityDenied("reconciliation action binding is invalid")
+        self._kernel = kernel
+        self._action = dict(action)
+        self._action_id = action_id
+        self._user_id = user_id
+
+    def reconcile(self, *, action_id: str, user_id: str):
+        if action_id != self._action_id or user_id != self._user_id:
+            raise CapabilityDenied("reconciliation action binding mismatch")
+        return self._kernel.reconcile(dict(self._action))
 
 
 class ProductionGmailReconcilerFactory:
@@ -826,10 +917,10 @@ class ProductionGmailReconcilerFactory:
             self._providers._assert_deletion_allows(action)
         except AccountDeletionBlocked:
             return _NoopGmailReconciler()
-        provider, connection_id, account_email, _user_id = self._providers._provider(
+        provider, connection_id, account_email, user_id = self._providers._provider(
             action
         )
-        return GmailEffectReconciler(
+        reconciler = GmailEffectReconciler(
             state_machine=self._machine,
             repository=self._repository,
             provider=provider,
@@ -839,6 +930,19 @@ class ProductionGmailReconcilerFactory:
             founder_user_ids=self._founders,
             deletion_blocked=self._providers._deletion_blocked,
         )
+        kernel = GenericConnectorKernel(
+            GmailConnectorAdapter(
+                executor=_UnavailableGmailExecutor(),
+                reconciler=reconciler,
+                provider=provider,
+                connection_revoker=BoundConnectionAuthorityRevoker(
+                    authority_revoker=self._providers._connection_revoker,
+                    connection_ref=connection_id,
+                    user_id=user_id,
+                ),
+            )
+        )
+        return KernelGmailReconciler(kernel=kernel, action=action)
 
 
 def build_production_application() -> WebApplication:
@@ -923,6 +1027,12 @@ def build_production_application() -> WebApplication:
     gmail_repository = DynamoGmailRepository(control_table)
     action_repository = DynamoActionRepository(control_table)
     action_machine = ActionStateMachine(action_repository)
+    founder_user_id = next(iter(founders), None)
+    founder_connection_ref = (
+        _required("GMAIL_SEND_CONNECTION_ID")
+        if founder_user_id is not None
+        else None
+    )
     send_secret_id = (
         _required("GOOGLE_SEND_OAUTH_SECRET_ID")
         if founders
@@ -931,7 +1041,7 @@ def build_production_application() -> WebApplication:
     founder_connection_revoker = SecretsManagerFounderConnectionRevoker(
         secret_client=secrets,
         secret_id=send_secret_id,
-        founder_user_id=next(iter(founders), None),
+        founder_user_id=founder_user_id,
     )
     gmail_provider_factory = ProductionGmailExecutorFactory(
         secret_client=secrets,
@@ -947,9 +1057,24 @@ def build_production_application() -> WebApplication:
         GmailConnectorAdapter(
             executor=_UnavailableGmailExecutor(),
             repository=action_repository,
+            draft_editor=gmail_repository,
             state_machine=action_machine,
-            connection_revoker=founder_connection_revoker,
+            connection_revoker=(
+                BoundConnectionAuthorityRevoker(
+                    authority_revoker=founder_connection_revoker,
+                    connection_ref=founder_connection_ref,
+                    user_id=founder_user_id,
+                )
+                if founder_connection_ref is not None
+                and founder_user_id is not None
+                else _UnavailableConnectionAuthorityRevoker()
+            ),
         )
+    )
+    founder_deletion_revoker = FounderKernelDeletionRevoker(
+        kernel=gmail_control_kernel,
+        founder_user_id=founder_user_id,
+        connection_ref=founder_connection_ref,
     )
 
     def oauth_factory():
@@ -1030,7 +1155,7 @@ def build_production_application() -> WebApplication:
         session_store=web_store,
         authority_fence=capability_deletion,
         connection_store=CompositeConnectionRevoker(
-            KernelConnectionRevoker(gmail_control_kernel),
+            founder_deletion_revoker,
             record_store,
         ),
         runtime_driver=runtime_driver,

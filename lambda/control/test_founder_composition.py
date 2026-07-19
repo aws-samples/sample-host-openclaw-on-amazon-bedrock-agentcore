@@ -261,6 +261,7 @@ def test_production_composition_wires_the_lazy_producer_without_a_send_secret(
         application._approval_producer,
         LazyFounderApprovalProducer,
     )
+    assert callable(application._draft_preparer._draft_factory)
     assert application._approval_producer.prepare(
         user_id="pilot-1",
         opportunity=object(),

@@ -449,6 +449,10 @@ class GmailWorkspaceService:
         user_id = _identifier(user_id, label="user_id", pattern=_USER_ID)
         action_id = _identifier(action_id, label="action_id", pattern=_ACTION_ID)
         revision = _request_revision(revision)
+        if self._approval_superseder is None:
+            raise DraftEditConflict(
+                "draft approval supersession boundary is unavailable"
+            )
         # Validate all caller-controlled content before making a storage read.
         try:
             preliminary = DraftRevision.create(
@@ -486,14 +490,34 @@ class GmailWorkspaceService:
             body=preliminary.body,
         )
         expires_at = int((now + DERIVED_RECORD_TTL).timestamp())
-        if self._approval_superseder is not None:
-            self._approval_superseder.supersede_pending(
-                action_id=action_id,
-                user_id=user_id,
-                expected_draft_revision=revision,
-                current_draft_revision=revised.revision,
-            )
+        # The kernel-owned boundary must atomically persist this immutable
+        # revision with either an exact active-action -> STALE transition or an
+        # exact proof that the action item is still absent.  This closes both
+        # create-before-edit and edit-before-create interleavings on the same
+        # DynamoDB ACTION item used by approval transitions.
+        outcome = self._approval_superseder.supersede_pending(
+            action_id=action_id,
+            user_id=user_id,
+            expected_draft_revision=revision,
+            current_draft_revision=revised.revision,
+            draft=revised,
+            expires_at=expires_at,
+            expected_generation=generation,
+        )
+        if not isinstance(outcome, Mapping) or dict(outcome) != {
+            "draftPersisted": True,
+            "actionId": action_id,
+            "userId": user_id,
+            "draftRevision": revised.revision,
+            "payloadHash": revised.payload_hash,
+        }:
+            raise DraftEditConflict("atomic draft edit outcome is unproven")
         try:
+            # Reconcile through the ordinary immutable-write port as a second
+            # exact, idempotent proof.  Production has already committed this
+            # byte-identical record inside the atomic authority transaction;
+            # this call cannot create a different revision or restore action
+            # authority.
             arguments = {
                 "user_id": user_id,
                 "draft": revised,

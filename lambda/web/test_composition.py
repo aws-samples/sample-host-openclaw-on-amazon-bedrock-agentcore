@@ -80,6 +80,105 @@ class LocalConnectionRevoker:
         self.events.append(("local", user_id))
 
 
+def test_founder_deletion_maps_exact_user_to_kernel_connection_once():
+    class Kernel:
+        def __init__(self):
+            self.calls = []
+
+        def revoke(self, connection_ref):
+            self.calls.append(connection_ref)
+
+    kernel = Kernel()
+    revoker = composition.FounderKernelDeletionRevoker(
+        kernel=kernel,
+        founder_user_id="founder-1",
+        connection_ref="google_conn_1234",
+    )
+
+    revoker.revoke_all("founder-1")
+    revoker.revoke_all("pilot-1")
+
+    assert kernel.calls == ["google_conn_1234"]
+
+
+def test_founder_deletion_without_exact_binding_never_invokes_kernel():
+    class Kernel:
+        @staticmethod
+        def revoke(_connection_ref):
+            raise AssertionError("unbound deletion must not revoke a connector")
+
+    revoker = composition.FounderKernelDeletionRevoker(
+        kernel=Kernel(),
+        founder_user_id=None,
+        connection_ref=None,
+    )
+
+    revoker.revoke_all("pilot-1")
+
+    with pytest.raises(ValueError, match="connection"):
+        composition.FounderKernelDeletionRevoker(
+            kernel=Kernel(),
+            founder_user_id="founder-1",
+            connection_ref="wrong ref",
+        )
+
+
+def test_founder_deletion_credential_effect_crosses_generic_kernel_once(
+    monkeypatch,
+):
+    local_events = []
+    secrets = DeletionSecretClient(
+        descriptions=[live_send_secret()],
+        deletion=accepted_send_secret_deletion(),
+    )
+    authority = composition.SecretsManagerFounderConnectionRevoker(
+        secret_client=secrets,
+        secret_id="google-send",
+        founder_user_id="founder-1",
+    )
+    kernel = composition.GenericConnectorKernel(
+        composition.GmailConnectorAdapter(
+            executor=object(),
+            connection_revoker=composition.BoundConnectionAuthorityRevoker(
+                authority_revoker=authority,
+                connection_ref="google_conn_1234",
+                user_id="founder-1",
+            ),
+        )
+    )
+    calls = []
+    original = kernel.revoke
+
+    def traced(connection_ref):
+        calls.append(connection_ref)
+        return original(connection_ref)
+
+    monkeypatch.setattr(kernel, "revoke", traced)
+    revoker = composition.CompositeConnectionRevoker(
+        composition.FounderKernelDeletionRevoker(
+            kernel=kernel,
+            founder_user_id="founder-1",
+            connection_ref="google_conn_1234",
+        ),
+        LocalConnectionRevoker(local_events),
+    )
+
+    revoker.revoke_all("founder-1")
+
+    assert calls == ["google_conn_1234"]
+    assert secrets.calls == [
+        ("describe", "google-send"),
+        (
+            "delete",
+            {"SecretId": "google-send", "RecoveryWindowInDays": 7},
+        ),
+    ]
+    assert local_events == [("local", "founder-1")]
+    with pytest.raises(composition.CapabilityDenied, match="binding"):
+        kernel.revoke("google_conn_other")
+    assert secrets.calls[-1][0] == "delete"
+
+
 def test_account_record_deletion_includes_pseudonymous_scan_measurements():
     events = []
 
@@ -298,6 +397,7 @@ def base_env(monkeypatch):
         "APPROVAL_SIGNING_SECRET_ID": "approval-signing",
         "GOOGLE_READONLY_OAUTH_SECRET_ID": "google-readonly",
         "GOOGLE_SEND_OAUTH_SECRET_ID": "google-send",
+        "GMAIL_SEND_CONNECTION_ID": "google_conn_1234",
         "OAUTH_KMS_KEY_ID": "arn:aws:kms:eu-west-1:123456789012:key/1234",
         "FOUNDER_USER_IDS": "founder-1",
         "WEB_ORIGIN": "https://app.personal-operator.example",
@@ -399,8 +499,11 @@ def test_production_gmail_factory_requires_revocation_and_returns_kernel_dispatc
     monkeypatch,
 ):
     class Revoker:
-        def revoke_all(self, _connection_ref):
-            pass
+        def __init__(self):
+            self.calls = []
+
+        def revoke_all(self, user_id):
+            self.calls.append(user_id)
 
     with pytest.raises((TypeError, ValueError)):
         composition.ProductionGmailExecutorFactory(
@@ -411,13 +514,14 @@ def test_production_gmail_factory_requires_revocation_and_returns_kernel_dispatc
             deletion_blocked=lambda _user_id: False,
         )
 
+    revoker = Revoker()
     factory = composition.ProductionGmailExecutorFactory(
         secret_client=object(),
         secret_id="send",
         state_machine=object(),
         founder_user_ids={"founder-1"},
         deletion_blocked=lambda _user_id: False,
-        connection_revoker=Revoker(),
+        connection_revoker=revoker,
     )
     monkeypatch.setattr(factory, "_assert_deletion_allows", lambda action: action["userId"])
     monkeypatch.setattr(
@@ -440,6 +544,60 @@ def test_production_gmail_factory_requires_revocation_and_returns_kernel_dispatc
 
     assert isinstance(dispatcher, GenericConnectorKernel)
     assert callable(dispatcher.dispatch)
+    dispatcher.revoke("google_conn_1234")
+    assert revoker.calls == ["founder-1"]
+    with pytest.raises(composition.CapabilityDenied, match="binding"):
+        dispatcher.revoke("google_conn_other")
+    assert revoker.calls == ["founder-1"]
+
+
+def test_bound_connection_revoker_delegates_once_and_propagates_failure():
+    class Revoker:
+        def __init__(self, error=None):
+            self.calls = []
+            self.error = error
+
+        def revoke_all(self, user_id):
+            self.calls.append(user_id)
+            if self.error is not None:
+                raise self.error
+
+    delegate = Revoker()
+    bound = composition.BoundConnectionAuthorityRevoker(
+        authority_revoker=delegate,
+        connection_ref="google_conn_1234",
+        user_id="founder-1",
+    )
+
+    bound.revoke_all("google_conn_1234")
+
+    assert delegate.calls == ["founder-1"]
+
+    error = RuntimeError("authority revocation failed")
+    failing_delegate = Revoker(error)
+    failing = composition.BoundConnectionAuthorityRevoker(
+        authority_revoker=failing_delegate,
+        connection_ref="google_conn_1234",
+        user_id="founder-1",
+    )
+    with pytest.raises(RuntimeError, match="revocation failed") as raised:
+        failing.revoke_all("google_conn_1234")
+    assert raised.value is error
+    assert failing_delegate.calls == ["founder-1"]
+
+
+def test_bound_connection_revoker_denies_wrong_connection_before_authority():
+    delegate = LocalConnectionRevoker([])
+    bound = composition.BoundConnectionAuthorityRevoker(
+        authority_revoker=delegate,
+        connection_ref="google_conn_1234",
+        user_id="founder-1",
+    )
+
+    with pytest.raises(composition.CapabilityDenied, match="binding"):
+        bound.revoke_all("google_conn_other")
+
+    assert delegate.events == []
 
 
 @pytest.mark.parametrize("reconciliation", [False, True])
@@ -543,6 +701,75 @@ def test_uncertain_deletion_read_blocks_reconciliation_before_secret_or_oauth():
     assert raised.value.__cause__ is None
     assert secrets.calls == []
     assert tokens.calls == []
+
+
+def test_production_reconciliation_crosses_generic_connector_kernel_once(
+    monkeypatch,
+):
+    calls = []
+
+    class AuthorityRevoker:
+        @staticmethod
+        def revoke_all(_user_id):
+            raise AssertionError("reconciliation must not revoke authority")
+
+    class Providers:
+        _connection_revoker = AuthorityRevoker()
+        _deletion_blocked = staticmethod(lambda _user_id: False)
+
+        @staticmethod
+        def _assert_deletion_allows(action):
+            return action["userId"]
+
+        @staticmethod
+        def _provider(action):
+            return (
+                object(),
+                action["connectionId"],
+                action["accountEmail"],
+                action["userId"],
+            )
+
+    class ConcreteReconciler:
+        def __init__(self, **_kwargs):
+            pass
+
+        def reconcile(self, *, action_id, user_id):
+            calls.append((action_id, user_id))
+            return "observed"
+
+    monkeypatch.setattr(
+        composition,
+        "GmailEffectReconciler",
+        ConcreteReconciler,
+    )
+    action = {
+        "actionId": "action_12345678",
+        "userId": "founder-1",
+        "connectionId": "google_conn_1234",
+        "accountEmail": "founder@example.com",
+        "senderAddress": "founder@example.com",
+    }
+    observer = composition.ProductionGmailReconcilerFactory(
+        provider_factory=Providers(),
+        repository=object(),
+        state_machine=object(),
+        founder_user_ids={"founder-1"},
+    )(action)
+
+    assert isinstance(observer._kernel, composition.GenericConnectorKernel)
+    assert observer.reconcile(
+        action_id="action_12345678",
+        user_id="founder-1",
+    ) == "observed"
+    assert calls == [("action_12345678", "founder-1")]
+
+    with pytest.raises(composition.CapabilityDenied, match="binding"):
+        observer.reconcile(
+            action_id="action_other_456",
+            user_id="founder-1",
+        )
+    assert calls == [("action_12345678", "founder-1")]
 
 
 def test_send_executor_rejects_cross_founder_secret_before_token_refresh():
@@ -959,15 +1186,37 @@ def test_production_builder_reads_only_web_auth_secret_and_defers_provider_paths
     provider_revoker, local_revoker = application._deletion._connections._revokers
     assert isinstance(
         provider_revoker,
-        composition.KernelConnectionRevoker,
+        composition.FounderKernelDeletionRevoker,
     )
-    founder_revoker = provider_revoker._kernel._adapter._connection_revoker
+    assert (
+        provider_revoker._kernel
+        is application._gmail_workspace._approval_superseder
+    )
+    assert provider_revoker._connection_ref == "google_conn_1234"
+    assert provider_revoker._founder_user_id == "founder-1"
+    control_revoker = (
+        application._gmail_workspace._approval_superseder
+        ._adapter._connection_revoker
+    )
+    assert (
+        application._gmail_workspace._approval_superseder._adapter._draft_editor
+        is application._gmail_workspace._repository
+    )
     assert isinstance(
-        founder_revoker,
+        control_revoker,
+        composition.BoundConnectionAuthorityRevoker,
+    )
+    assert control_revoker._connection_ref == "google_conn_1234"
+    assert control_revoker._user_id == "founder-1"
+    assert isinstance(
+        control_revoker._authority_revoker,
         composition.SecretsManagerFounderConnectionRevoker,
     )
-    assert founder_revoker._secret_id == "google-send"
-    assert founder_revoker._founder_user_id == "founder-1"
+    assert control_revoker._authority_revoker._secret_id == "google-send"
+    with pytest.raises(composition.CapabilityDenied, match="binding"):
+        application._gmail_workspace._approval_superseder.revoke(
+            "google_conn_other"
+        )
     records, scans, capability_deletion = application._deletion._records._deleters
     assert local_revoker is records
     assert scans is application._scans

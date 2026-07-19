@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import re
 from typing import Mapping, Sequence
 
@@ -21,10 +22,12 @@ except ImportError:  # direct file loading in Lambda/unit tests
 
 READONLY_PROVIDER = "google-gmail-readonly"
 DERIVED_RECORD_TTL = timedelta(days=14)
+_ACTION_TERMINAL_RETENTION_SECONDS = 90 * 24 * 60 * 60
 _STATE_KEY = re.compile(r"^[0-9a-f]{64}$")
 _CALLBACK_SK = re.compile(r"^TELEGRAM_CALLBACK#[0-9a-f]{64}$")
 _SOURCE_ID = re.compile(r"^gmail:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_-]{1,128}$")
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
+_ACTION_ID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _ENVELOPE_FIELDS = {
     "format",
     "binding",
@@ -1063,3 +1066,429 @@ class DynamoGmailRepository:
                     "draft revision already contains another payload"
                 ) from None
             raise
+
+    def save_superseding_draft(
+        self,
+        *,
+        user_id: str,
+        action_id: str,
+        draft: DraftRevision,
+        expected_draft_revision: int,
+        current_draft_revision: int,
+        expires_at: int,
+        expected_generation: int | None = None,
+    ) -> dict[str, object]:
+        """Atomically persist an edit and remove or exclude old authority.
+
+        The immutable revision Put and the exact action-item fence share one
+        DynamoDB transaction.  If no action exists, the transaction proves it
+        is still absent.  If PREPARED or APPROVAL_PENDING exists, that same
+        transaction moves it to STALE.  Approval creation/transition therefore
+        contends on the identical ACTION item and cannot occupy the old gap
+        between supersession and draft persistence.
+        """
+
+        user_id = _identifier(user_id, "user_id")
+        if not isinstance(action_id, str) or _ACTION_ID.fullmatch(action_id) is None:
+            raise RepositoryRecordError("action_id is invalid")
+        expected_draft_revision = _generation(expected_draft_revision)
+        current_draft_revision = _generation(current_draft_revision)
+        if expected_draft_revision < 1:
+            raise RepositoryRecordError("expected draft revision is invalid")
+        if (
+            not isinstance(draft, DraftRevision)
+            or draft.action_id != action_id
+            or draft.revision != current_draft_revision
+            or current_draft_revision != expected_draft_revision + 1
+        ):
+            raise RepositoryRecordError("atomic edit requires an exact draft binding")
+        expires_at = self._derived_expiry(expires_at)
+        if expected_generation is not None:
+            expected_generation = _generation(expected_generation)
+
+        action_key = {
+            "PK": f"USER#{user_id}",
+            "SK": f"ACTION#{action_id}",
+        }
+        try:
+            action = self._read_item(action_key)
+        except Exception as error:
+            raise RepositoryRecordError(
+                "draft authority state is unavailable"
+            ) from error
+
+        now_epoch = self._now_epoch()
+        operations: list[Mapping[str, object]] = []
+        if expected_generation is not None:
+            fence = self._fence(user_id)
+            if not self._fence_allows(
+                fence, expected_generation, ("CONNECTED",)
+            ):
+                raise ConnectionFenceError("connection generation changed")
+            if fence is None:
+                if self._read_item(self._connection_key(user_id)) is None:
+                    raise ConnectionFenceError("Gmail connection is not active")
+                connection_condition: dict[str, object] = {
+                    "TableName": self._table_name,
+                    "Key": _dynamo_item(self._fence_key(user_id)),
+                    "ConditionExpression": (
+                        "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+                    ),
+                }
+            else:
+                connection_condition = {
+                    "TableName": self._table_name,
+                    "Key": _dynamo_item(self._fence_key(user_id)),
+                    "ConditionExpression": (
+                        "generation=:generation AND #status=:status"
+                    ),
+                    "ExpressionAttributeNames": {"#status": "status"},
+                    "ExpressionAttributeValues": {
+                        ":generation": _dynamo_value(expected_generation),
+                        ":status": _dynamo_value("CONNECTED"),
+                    },
+                }
+            operations.append({"ConditionCheck": connection_condition})
+
+        transition_id = (
+            "draftedit_"
+            + hashlib.sha256(
+                (
+                    user_id
+                    + "\0"
+                    + draft.action_id
+                    + "\0"
+                    + str(expected_draft_revision)
+                    + "\0"
+                    + str(draft.revision)
+                    + "\0"
+                    + draft.payload_hash
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+        )
+        transition_time = self._now()
+        if not isinstance(transition_time, datetime) or transition_time.tzinfo is None:
+            raise RepositoryRecordError("repository clock must be timezone-aware")
+        transition_iso = transition_time.astimezone(timezone.utc).isoformat()
+        stale_ttl = now_epoch + _ACTION_TERMINAL_RETENTION_SECONDS
+
+        initial_action_state = None
+        initial_action_revision = None
+        expected_stale_action = None
+        if action is None:
+            operations.append(
+                {
+                    "ConditionCheck": {
+                        "TableName": self._table_name,
+                        "Key": _dynamo_item(action_key),
+                        "ConditionExpression": (
+                            "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+                        ),
+                    }
+                }
+            )
+        else:
+            if (
+                action.get("PK") != action_key["PK"]
+                or action.get("SK") != action_key["SK"]
+                or action.get("actionId") != draft.action_id
+                or action.get("userId") != user_id
+            ):
+                raise RepositoryRecordError("stored action binding is invalid")
+            initial_action_state = action.get("state")
+            if initial_action_state not in {
+                "PREPARED",
+                "APPROVAL_PENDING",
+                "STALE",
+            }:
+                raise DraftRevisionConflictError(
+                    "draft cannot change after approval authority advanced"
+                )
+            initial_action_revision = _generation(action.get("revision"))
+            action_draft_revision = _generation(action.get("draftRevision"))
+            action_ttl = _generation(action.get("ttl"))
+            if (
+                initial_action_revision < 1
+                or action_ttl <= now_epoch
+            ):
+                raise DraftRevisionConflictError(
+                    "draft action authority no longer matches this revision"
+                )
+            stale_draft_revision = expected_draft_revision
+            stale_chain_condition = ""
+            if initial_action_state == "STALE":
+                stored_stale_revision = _generation(
+                    action.get("staleDraftRevision")
+                )
+                stored_superseding_revision = _generation(
+                    action.get("supersededByDraftRevision")
+                )
+                if (
+                    action.get("staleReason") != "newer-draft-revision"
+                    or stored_stale_revision != action_draft_revision
+                    or stored_superseding_revision != expected_draft_revision
+                ):
+                    raise DraftRevisionConflictError(
+                        "stale draft chain no longer matches this revision"
+                    )
+                stale_draft_revision = stored_stale_revision
+                stale_chain_condition = (
+                    " AND #staleReason=:staleReason AND "
+                    "#staleDraftRevision=:staleDraftRevision AND "
+                    "#supersededByDraftRevision=:expectedDraftRevision"
+                )
+            elif action_draft_revision != expected_draft_revision:
+                raise DraftRevisionConflictError(
+                    "draft action authority no longer matches this revision"
+                )
+            action_names = {
+                "#actionId": "actionId",
+                "#userId": "userId",
+                "#state": "state",
+                "#revision": "revision",
+                "#draftRevision": "draftRevision",
+                "#ttl": "ttl",
+                "#updatedAt": "updatedAt",
+                "#lastTransitionId": "lastTransitionId",
+                "#staleAt": "staleAt",
+                "#staleReason": "staleReason",
+                "#staleDraftRevision": "staleDraftRevision",
+                "#supersededByDraftRevision": "supersededByDraftRevision",
+            }
+            action_values = {
+                ":actionId": draft.action_id,
+                ":userId": user_id,
+                ":expectedState": initial_action_state,
+                ":staleState": "STALE",
+                ":expectedRevision": initial_action_revision,
+                ":nextRevision": initial_action_revision + 1,
+                ":actionDraftRevision": action_draft_revision,
+                ":staleDraftRevision": stale_draft_revision,
+                ":currentDraftRevision": draft.revision,
+                ":nowEpoch": now_epoch,
+                ":updatedAt": transition_iso,
+                ":transitionId": transition_id,
+                ":staleReason": "newer-draft-revision",
+                ":retentionTtl": stale_ttl,
+            }
+            if initial_action_state == "STALE":
+                action_values[":expectedDraftRevision"] = (
+                    expected_draft_revision
+                )
+            expected_stale_action = {
+                **dict(action),
+                "state": "STALE",
+                "revision": initial_action_revision + 1,
+                "updatedAt": transition_iso,
+                "lastTransitionId": transition_id,
+                "staleAt": transition_iso,
+                "staleReason": "newer-draft-revision",
+                "staleDraftRevision": stale_draft_revision,
+                "supersededByDraftRevision": draft.revision,
+                "ttl": stale_ttl,
+            }
+            operations.append(
+                {
+                    "Update": {
+                        "TableName": self._table_name,
+                        "Key": _dynamo_item(action_key),
+                        "UpdateExpression": (
+                            "SET #state=:staleState, #revision=:nextRevision, "
+                            "#updatedAt=:updatedAt, "
+                            "#lastTransitionId=:transitionId, "
+                            "#staleAt=:updatedAt, #staleReason=:staleReason, "
+                            "#staleDraftRevision=:staleDraftRevision, "
+                            "#supersededByDraftRevision=:currentDraftRevision, "
+                            "#ttl=:retentionTtl"
+                        ),
+                        "ConditionExpression": (
+                            "#actionId=:actionId AND #userId=:userId AND "
+                            "#state=:expectedState AND "
+                            "#revision=:expectedRevision AND "
+                            "#draftRevision=:actionDraftRevision AND "
+                            "#ttl>:nowEpoch"
+                            + stale_chain_condition
+                        ),
+                        "ExpressionAttributeNames": action_names,
+                        "ExpressionAttributeValues": {
+                            name: _dynamo_value(value)
+                            for name, value in action_values.items()
+                        },
+                    }
+                }
+            )
+
+        exact_draft = {
+            "actionId": draft.action_id,
+            "revision": draft.revision,
+            "to": draft.to,
+            "subject": draft.subject,
+            "body": draft.body,
+            "payloadHash": draft.payload_hash,
+        }
+        draft_item: dict[str, object] = {
+            "PK": f"USER#{user_id}",
+            "SK": f"GMAIL#DRAFT#{draft.action_id}#{draft.revision:010d}",
+            "draft": exact_draft,
+            "ttl": expires_at,
+        }
+        if expected_generation is not None:
+            draft_item["connectionGeneration"] = expected_generation
+        operations.append(
+            {
+                "Put": {
+                    "TableName": self._table_name,
+                    "Item": _dynamo_item(draft_item),
+                    "ConditionExpression": (
+                        "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+                    ),
+                }
+            }
+        )
+        outcome = {
+            "draftPersisted": True,
+            "actionId": draft.action_id,
+            "userId": user_id,
+            "draftRevision": draft.revision,
+            "payloadHash": draft.payload_hash,
+        }
+        try:
+            self._transact(operations)
+            return outcome
+        except Exception as error:
+            try:
+                stored_draft = self._read_item(
+                    {"PK": str(draft_item["PK"]), "SK": str(draft_item["SK"])}
+                )
+                current_action = self._read_item(action_key)
+            except Exception:
+                raise RepositoryRecordError(
+                    "atomic draft edit outcome is unproven"
+                ) from error
+            draft_proven = (
+                isinstance(stored_draft, Mapping)
+                and dict(stored_draft) == draft_item
+            )
+            if initial_action_state is None:
+                action_proven = current_action is None
+            else:
+                action_proven = (
+                    isinstance(current_action, Mapping)
+                    and expected_stale_action is not None
+                    and dict(current_action) == expected_stale_action
+                )
+            if draft_proven and action_proven:
+                return outcome
+            if expected_generation is not None:
+                try:
+                    self.assert_generation(
+                        user_id,
+                        expected_generation,
+                        require_connected=True,
+                    )
+                except Exception:
+                    raise ConnectionFenceError(
+                        "connection write lost to disconnect"
+                    ) from None
+            if draft_proven:
+                raise RepositoryRecordError(
+                    "atomic draft edit outcome is unproven"
+                ) from error
+            if isinstance(error, self._conditional_failure_types) or _is_conditional_failure(
+                error
+            ):
+                raise DraftRevisionConflictError(
+                    "draft edit lost its action authority fence"
+                ) from None
+            raise RepositoryRecordError(
+                "atomic draft edit outcome is unproven"
+            ) from error
+
+    def latest_draft(
+        self,
+        *,
+        user_id: str,
+        action_id: str,
+        expected_generation: int | None = None,
+    ) -> DraftRevision | None:
+        """Strongly read the latest live immutable revision for one action."""
+
+        user_id = _identifier(user_id, "user_id")
+        if not isinstance(action_id, str) or _ACTION_ID.fullmatch(action_id) is None:
+            raise RepositoryRecordError("action_id is invalid")
+        if expected_generation is not None:
+            expected_generation = _generation(expected_generation)
+        prefix = f"GMAIL#DRAFT#{action_id}#"
+        try:
+            response = self._table.query(
+                KeyConditionExpression="PK = :pk AND begins_with(SK, :sk)",
+                ExpressionAttributeValues={
+                    ":pk": f"USER#{user_id}",
+                    ":sk": prefix,
+                },
+                ConsistentRead=True,
+                ScanIndexForward=False,
+                Limit=1,
+            )
+        except Exception as error:
+            raise RepositoryRecordError("latest draft read is unavailable") from error
+        items = response.get("Items") if isinstance(response, Mapping) else None
+        if not isinstance(items, list) or len(items) > 1:
+            raise RepositoryRecordError("latest draft read returned an invalid result")
+        if not items:
+            return None
+        item = items[0]
+        fields = {"PK", "SK", "draft", "ttl"}
+        if (
+            not isinstance(item, Mapping)
+            or set(item)
+            not in {
+                frozenset(fields),
+                frozenset({*fields, "connectionGeneration"}),
+            }
+            or item.get("PK") != f"USER#{user_id}"
+        ):
+            raise RepositoryRecordError("stored draft record is invalid")
+        stored = item.get("draft")
+        if not isinstance(stored, Mapping) or set(stored) != {
+            "actionId",
+            "revision",
+            "to",
+            "subject",
+            "body",
+            "payloadHash",
+        }:
+            raise RepositoryRecordError("stored draft payload is invalid")
+        revision = _generation(stored.get("revision"))
+        if revision < 1 or item.get("SK") != f"{prefix}{revision:010d}":
+            raise RepositoryRecordError("stored draft key is invalid")
+        if stored.get("actionId") != action_id:
+            raise RepositoryRecordError("stored draft action binding is invalid")
+        ttl = _generation(item.get("ttl"))
+        if ttl <= self._now_epoch():
+            return None
+        if expected_generation is not None:
+            stored_generation = item.get("connectionGeneration")
+            if (
+                stored_generation is None
+                or _generation(stored_generation) != expected_generation
+            ):
+                raise ConnectionFenceError("connection generation changed")
+        try:
+            draft = DraftRevision(
+                action_id=stored["actionId"],
+                revision=revision,
+                to=stored["to"],
+                subject=stored["subject"],
+                body=stored["body"],
+                payload_hash=stored["payloadHash"],
+            )
+        except (TypeError, ValueError):
+            raise RepositoryRecordError("stored draft payload is invalid") from None
+        if expected_generation is not None:
+            self.assert_generation(
+                user_id,
+                expected_generation,
+                require_connected=True,
+            )
+        return draft

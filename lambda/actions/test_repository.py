@@ -149,6 +149,192 @@ def test_create_rejects_same_key_for_different_draft_revision():
         repository(table).create_prepared(draft=draft())
 
 
+def replacement_draft():
+    return models.DraftRevision(
+        action_id="action_12345678",
+        user_id="founder-1",
+        draft_revision=5,
+        connection_id="google_conn_1234",
+        account_email="founder@example.com",
+        sender_address="founder@example.com",
+        args={
+            "to": "person@example.net",
+            "subject": "Edited follow up",
+            "body": "Exact edited body",
+        },
+        created_at=NOW,
+    )
+
+
+def stale_record():
+    return {
+        **prepared_record(),
+        **approval_updates(),
+        "state": "STALE",
+        "revision": 3,
+        "lastTransitionId": "stale_transition_123456",
+        "staleAt": NOW.isoformat(),
+        "staleReason": "newer-draft-revision",
+        "staleDraftRevision": 4,
+        "supersededByDraftRevision": 5,
+        "ttl": int((NOW + timedelta(days=90)).timestamp()),
+    }
+
+
+def applied_reprepare_response(base):
+    def apply(**kwargs):
+        names = kwargs["ExpressionAttributeNames"]
+        values = kwargs["ExpressionAttributeValues"]
+        updated = dict(base)
+        for token, name in names.items():
+            if token.startswith("#set"):
+                updated[name] = values[token.replace("#", ":")]
+            elif token.startswith("#remove"):
+                updated.pop(name, None)
+        return {"Attributes": updated}
+
+    return apply
+
+
+def test_exact_stale_chain_reprepares_new_draft_with_monotonic_generation():
+    table = MagicMock()
+    table.put_item.side_effect = AwsError()
+    table.get_item.return_value = {"Item": stale_record()}
+
+    table.update_item.side_effect = applied_reprepare_response(stale_record())
+
+    prepared = repository(table).create_prepared(draft=replacement_draft())
+
+    assert prepared["state"] == "PREPARED"
+    assert prepared["revision"] == 4
+    assert prepared["draftRevision"] == 5
+    assert prepared["args"] == dict(replacement_draft().args)
+    assert prepared["payloadHash"] == replacement_draft().payload_hash
+    assert prepared["ttl"] == int((NOW + timedelta(days=14)).timestamp())
+    for stale_or_old_approval in {
+        "approvalId",
+        "approvalActionId",
+        "approvalDraftRevision",
+        "approvalArgsHash",
+        "approvalExpiresAt",
+        "approvalRequestedAt",
+        "staleAt",
+        "staleReason",
+        "staleDraftRevision",
+        "supersededByDraftRevision",
+    }:
+        assert stale_or_old_approval not in prepared
+    request = table.update_item.call_args.kwargs
+    condition = request["ConditionExpression"]
+    names = request["ExpressionAttributeNames"]
+    for token, field in names.items():
+        if field in repository_module._ADVANCED_AUTHORITY_FIELDS:
+            assert f"attribute_not_exists({token})" in condition
+
+
+def test_ambiguous_stale_reprepare_reconciles_only_the_exact_new_generation():
+    table = MagicMock()
+    table.put_item.side_effect = AwsError()
+    reads = [stale_record()]
+    table.get_item.side_effect = lambda **_kwargs: {"Item": dict(reads[-1])}
+
+    def response_lost(**kwargs):
+        applied = applied_reprepare_response(stale_record())(**kwargs)
+        reads.append(applied["Attributes"])
+        raise TimeoutError("response lost")
+
+    table.update_item.side_effect = response_lost
+
+    prepared = repository(table).create_prepared(draft=replacement_draft())
+
+    assert prepared == reads[-1]
+    assert prepared["state"] == "PREPARED"
+    assert prepared["revision"] == 4
+    assert prepared["draftRevision"] == 5
+
+
+def test_approved_provenance_stale_generation_never_reprepares():
+    table = MagicMock()
+    table.put_item.side_effect = AwsError()
+    approved_stale = {
+        **stale_record(),
+        "approvedActionId": "action_12345678",
+        "approvedDraftRevision": 4,
+        "approvedArgsHash": "a" * 64,
+        "approvedAt": NOW.isoformat(),
+    }
+    table.get_item.return_value = {"Item": approved_stale}
+
+    with pytest.raises(
+        machine_module.ConcurrentActionUpdate,
+        match="stale action does not bind",
+    ):
+        repository(table).create_prepared(draft=replacement_draft())
+
+    table.update_item.assert_not_called()
+
+
+def test_corrupt_prepared_retry_with_approved_provenance_is_not_idempotent():
+    table = MagicMock()
+    attempted = {}
+
+    def lose_create(**kwargs):
+        attempted.update(kwargs["Item"])
+        raise AwsError()
+
+    table.put_item.side_effect = lose_create
+    table.get_item.side_effect = lambda **_kwargs: {
+        "Item": {
+            **attempted,
+            "approvedActionId": "action_12345678",
+            "approvedDraftRevision": 5,
+            "approvedArgsHash": "a" * 64,
+            "approvedAt": NOW.isoformat(),
+        }
+    }
+
+    with pytest.raises(machine_module.ConcurrentActionUpdate):
+        repository(table).create_prepared(draft=replacement_draft())
+
+    table.update_item.assert_not_called()
+
+
+def test_stale_reprepare_loses_to_a_newer_exact_edit_generation():
+    table = MagicMock()
+    table.put_item.side_effect = AwsError()
+    newer = {
+        **stale_record(),
+        "revision": 4,
+        "lastTransitionId": "stale_transition_654321",
+        "supersededByDraftRevision": 6,
+    }
+    table.get_item.side_effect = [
+        {"Item": stale_record()},
+        {"Item": newer},
+    ]
+    table.update_item.side_effect = AwsError()
+
+    with pytest.raises(
+        machine_module.ConcurrentActionUpdate,
+        match="generation fence",
+    ):
+        repository(table).create_prepared(draft=replacement_draft())
+
+
+@pytest.mark.parametrize("state", ["APPROVED", "DISPATCHING", "UNCERTAIN"])
+def test_advanced_or_uncertain_action_generation_never_reprepares(state):
+    table = MagicMock()
+    table.put_item.side_effect = AwsError()
+    table.get_item.return_value = {
+        "Item": {**stale_record(), "state": state}
+    }
+
+    with pytest.raises(machine_module.ConcurrentActionUpdate):
+        repository(table).create_prepared(draft=replacement_draft())
+
+    table.update_item.assert_not_called()
+
+
 def test_transition_fences_binding_state_revision_draft_and_unique_operation():
     table = MagicMock()
     table.update_item.side_effect = applied_response(prepared_record())
