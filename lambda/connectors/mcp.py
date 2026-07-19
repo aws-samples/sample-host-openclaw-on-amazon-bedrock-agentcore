@@ -233,6 +233,15 @@ class SyntheticMcpConnectorAdapter:
         live = tuple(self._server.list_tools())
         locked = tuple(op["operationId"] for op in self._manifest.operations)
         if tuple(live) != locked:
+            # Drift is a latched connection-state transition, not a transient
+            # per-call error. Restoring the live list cannot reactivate this
+            # adapter; a trusted reconnect must provide a fresh CONNECTED
+            # record and construct a new adapter boundary.
+            connection = self._connection
+            if connection is not None and connection.state == "CONNECTED":
+                drifted = connection.to_mapping()
+                drifted["state"] = "DRIFTED"
+                self._connection = ConnectorConnectionV1.from_mapping(drifted)
             raise ManifestDrift("server tool list diverged from the locked manifest")
 
     def _operation(self, operation: str, expected_mode: str) -> None:

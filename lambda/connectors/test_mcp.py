@@ -100,6 +100,37 @@ def test_tool_list_drift_refuses_to_act(tool_list):
     assert server.effect_calls == 0
 
 
+def test_detected_tool_list_drift_latches_connection_until_explicit_reconnect():
+    server = synthetic_module.SyntheticMcpServer()
+    store = mcp_module.InMemoryPreparedStore()
+    adapter = _adapter(server=server, store=store)
+
+    # Prepare while the live list still matches, then drift before dispatch.
+    proposal = adapter.prepare(
+        _context(), "synthetic.notes.append", {"text": "must stay inert"}
+    )
+    persisted = store.get(proposal.data["proposalId"])
+    server._tool_list = ("synthetic.notes.read-list",)
+
+    with pytest.raises(mcp_module.ManifestDrift):
+        GenericConnectorKernel(adapter).dispatch(persisted)
+    assert adapter._connection.state == "DRIFTED"
+    assert server.effect_calls == 0
+
+    # Merely restoring the server list cannot reactivate the latched adapter.
+    server._tool_list = tuple(
+        operation["operationId"] for operation in _manifest().operations
+    )
+    with pytest.raises(ContractValidationError, match="not active"):
+        adapter.read(_context(), "synthetic.notes.read-list", {})
+    assert server.read_calls == 0
+    assert server.effect_calls == 0
+
+    # Supplying a fresh trusted CONNECTED record is the explicit reconnect.
+    reconnected = _adapter(server=server, connection=_connection())
+    assert reconnected.read(_context(), "synthetic.notes.read-list", {})["notes"]
+
+
 # --- unknown / undeclared tool --------------------------------------------
 def test_unknown_operation_rejected_before_server_contact():
     server = synthetic_module.SyntheticMcpServer()
