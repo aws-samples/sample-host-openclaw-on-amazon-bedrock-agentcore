@@ -20,6 +20,12 @@ UPDATE_QUEUE_URL = (
     "personal-operator-telegram-updates.fifo"
 )
 INGRESS_FUNCTION_NAME = "personal-operator-scheduler-ingress"
+CONTROL_FUNCTION_NAME = "personal-operator-scheduler-control"
+CATALOG_DIGEST = "a" * 64
+CAPABILITY_TABLE_NAME = "personal-operator-capability-state"
+CAPABILITY_TABLE_ARN = (
+    f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{CAPABILITY_TABLE_NAME}"
+)
 
 
 def _synth(region: str = REGION):
@@ -33,6 +39,9 @@ def _synth(region: str = REGION):
         cmk_arn=CMK_ARN,
         update_queue_arn=UPDATE_QUEUE_ARN,
         update_queue_url=UPDATE_QUEUE_URL,
+        catalog_digest=CATALOG_DIGEST,
+        capability_state_table_name=CAPABILITY_TABLE_NAME,
+        capability_state_table_arn=CAPABILITY_TABLE_ARN,
         env=cdk.Environment(account=ACCOUNT, region=region),
     )
     return stack, Template.from_stack(stack).to_json()
@@ -106,8 +115,6 @@ def test_ingress_role_has_only_control_table_read_fifo_send_and_scoped_kms():
     assert actions == {
         "dynamodb:GetItem",
         "dynamodb:PutItem",
-        "dynamodb:Query",
-        "dynamodb:UpdateItem",
         "sqs:SendMessage",
         "kms:Decrypt",
         "kms:DescribeKey",
@@ -131,6 +138,13 @@ def test_scheduler_control_table_is_cmk_pitr_and_retained():
         "PointInTimeRecoveryEnabled": True
     }
     assert props["SSESpecification"]["KMSMasterKeyId"] == CMK_ARN
+    assert props["TimeToLiveSpecification"] == {
+        "AttributeName": "ttl",
+        "Enabled": True,
+    }
+    assert {
+        index["IndexName"] for index in props["GlobalSecondaryIndexes"]
+    } == {"schedule-user-index-v1", "proposal-user-index-v1"}
     assert tables[0]["DeletionPolicy"] == "Retain"
     assert tables[0]["UpdateReplacePolicy"] == "Retain"
 
@@ -140,11 +154,94 @@ def test_scheduler_stack_creates_no_static_schedule_or_forbidden_resource():
     # Live schedules are created at runtime by the trusted service, not baked
     # into the template.
     assert _resources(template, "AWS::Scheduler::Schedule") == []
+    groups = _resources(template, "AWS::Scheduler::ScheduleGroup")
+    assert len(groups) == 1
+    assert groups[0]["Properties"]["Name"] == "personal-operator-v1"
     assert _resources(template, "AWS::SecretsManager::Secret") == []
     assert _resources(template, "AWS::BedrockAgentCore::BrowserCustom") == []
     functions = _resources(template, "AWS::Lambda::Function")
-    assert len(functions) == 1
-    assert functions[0]["Properties"]["Handler"] == "scheduler.ingress.lambda_handler"
+    assert len(functions) == 2
+    assert {function["Properties"]["Handler"] for function in functions} == {
+        "scheduler.ingress.lambda_handler",
+        "scheduler.control.lambda_handler",
+    }
+
+
+def test_control_role_has_exact_schedule_apply_authority_and_passrole_condition():
+    _, template = _synth()
+    control_role = _role_logical_id(template, "scheduler-control")
+    actions = _role_actions(template, control_role)
+
+    assert actions == {
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:BatchWriteItem",
+        "dynamodb:TransactWriteItems",
+        "scheduler:CreateSchedule",
+        "scheduler:GetSchedule",
+        "scheduler:DeleteSchedule",
+        "iam:PassRole",
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:Encrypt",
+        "kms:GenerateDataKey*",
+        "kms:ReEncrypt*",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+    }
+    policies = _resources(template, "AWS::IAM::Policy")
+    statements = [
+        statement
+        for policy in policies
+        if {ref.get("Ref") for ref in policy["Properties"].get("Roles", [])}
+        == {control_role}
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    passrole = next(
+        statement
+        for statement in statements
+        if statement.get("Action") == "iam:PassRole"
+        or "iam:PassRole" in statement.get("Action", [])
+    )
+    assert passrole["Condition"] == {
+        "StringEquals": {"iam:PassedToService": "scheduler.amazonaws.com"}
+    }
+    scheduler_role = _role_logical_id(template, "scheduler-invoke")
+    assert passrole["Resource"] == {"Fn::GetAtt": [scheduler_role, "Arn"]}
+    serialized = str(statements)
+    assert "schedule-group/personal-operator-v1" in serialized
+    assert "schedule/personal-operator-v1/po-*" in serialized
+    assert CAPABILITY_TABLE_ARN in serialized
+    for forbidden in (
+        "bedrock-agentcore",
+        "secretsmanager:",
+        "execute-api:",
+        "browser",
+        "gmail",
+        "sqs:",
+    ):
+        assert forbidden not in serialized.casefold()
+
+
+def test_control_lambda_environment_binds_catalog_table_group_and_exact_target():
+    _, template = _synth()
+    function = next(
+        function
+        for function in _resources(template, "AWS::Lambda::Function")
+        if function["Properties"]["FunctionName"] == CONTROL_FUNCTION_NAME
+    )
+    environment = function["Properties"]["Environment"]["Variables"]
+    assert environment["AWS_REGION_LOCK"] == REGION
+    assert environment["CAPABILITY_CATALOG_DIGEST"] == CATALOG_DIGEST
+    assert environment["CAPABILITY_STATE_TABLE_NAME"] == CAPABILITY_TABLE_NAME
+    assert environment["SCHEDULER_CONTROL_TABLE_NAME"] == (
+        "personal-operator-scheduler-control"
+    )
+    assert environment["SCHEDULER_GROUP_NAME"] == "personal-operator-v1"
+    assert environment["SCHEDULER_INGRESS_FUNCTION_ARN"].endswith(
+        f":function:{INGRESS_FUNCTION_NAME}"
+    )
 
 
 def test_scheduler_stack_synthesizes_in_eu_west_1_and_passes_cdk_nag():
@@ -160,6 +257,9 @@ def test_scheduler_stack_synthesizes_in_eu_west_1_and_passes_cdk_nag():
         cmk_arn=CMK_ARN,
         update_queue_arn=UPDATE_QUEUE_ARN,
         update_queue_url=UPDATE_QUEUE_URL,
+        catalog_digest=CATALOG_DIGEST,
+        capability_state_table_name=CAPABILITY_TABLE_NAME,
+        capability_state_table_arn=CAPABILITY_TABLE_ARN,
         env=cdk.Environment(account=ACCOUNT, region=REGION),
     )
     cdk.Aspects.of(app).add(cdk_nag.AwsSolutionsChecks(verbose=True))

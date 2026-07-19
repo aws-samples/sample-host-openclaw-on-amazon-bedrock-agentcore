@@ -655,6 +655,8 @@ class RuntimeDriver:
         invocation_id: str,
         message,
         scheduled_read_only: bool,
+        channel: str | None,
+        actor_id: str | None,
     ) -> dict | None:
         if self.turn_capability_issuer is None:
             return None
@@ -666,6 +668,8 @@ class RuntimeDriver:
                 invocation_id=invocation_id,
                 message_text=message_text,
                 scheduled_read_only=scheduled_read_only,
+                channel=channel,
+                actor_id=actor_id,
             )
             if not isinstance(grant, Mapping):
                 raise TypeError("turn issuer returned a non-object")
@@ -761,6 +765,8 @@ class RuntimeDriver:
             invocation_id=trace_id,
             message=request["message"],
             scheduled_read_only=scheduled_read_only,
+            channel=request.get("channel"),
+            actor_id=request.get("actorId"),
         )
         if turn_capability is not None:
             payload["turnCapabilityGrant"] = turn_capability

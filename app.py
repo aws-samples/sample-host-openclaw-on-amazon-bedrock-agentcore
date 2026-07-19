@@ -237,6 +237,9 @@ scheduler_stack = SchedulerStack(
     cmk_arn=security_stack.cmk.key_arn,
     update_queue_arn=router_stack.update_queue.queue_arn,
     update_queue_url=router_stack.update_queue.queue_url,
+    catalog_digest=capability_catalog.catalog_digest,
+    capability_state_table_name=capability_stack.state_table.table_name,
+    capability_state_table_arn=capability_stack.state_table.table_arn,
     env=env,
 )
 scheduler_stack.add_dependency(router_stack)

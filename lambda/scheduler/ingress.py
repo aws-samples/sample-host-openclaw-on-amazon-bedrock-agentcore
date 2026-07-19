@@ -89,6 +89,9 @@ class DynamoIngressScheduleRepository:
         if not isinstance(item, Mapping) or set(item) != {
             "PK",
             "SK",
+            "userId",
+            "scheduleUserId",
+            "scheduleSortKey",
             "recordJson",
             "deliveryJson",
         }:
@@ -96,6 +99,8 @@ class DynamoIngressScheduleRepository:
         if (
             _string_attribute(item, "PK") != f"SCHEDULE#{schedule_id}"
             or _string_attribute(item, "SK") != "STATE"
+            or _string_attribute(item, "scheduleSortKey")
+            != f"SCHEDULE#{schedule_id}"
         ):
             raise RuntimeError("scheduler control record crossed a schedule boundary")
         return item
@@ -106,9 +111,15 @@ class DynamoIngressScheduleRepository:
             return None
         try:
             record = json.loads(_string_attribute(item, "recordJson"))
-            return ScheduleSpecV1.from_mapping(record)
+            spec = ScheduleSpecV1.from_mapping(record)
         except (TypeError, ValueError):
             raise RuntimeError("scheduler control record is invalid") from None
+        if (
+            _string_attribute(item, "userId") != spec.user_id
+            or _string_attribute(item, "scheduleUserId") != spec.user_id
+        ):
+            raise RuntimeError("scheduler control record crossed a user boundary")
+        return spec
 
     def read_delivery_target(self, schedule_id: str) -> Mapping[str, Any] | None:
         item = self._schedule_item(schedule_id)

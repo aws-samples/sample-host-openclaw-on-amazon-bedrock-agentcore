@@ -72,6 +72,10 @@ class AdmissionRepository(Protocol):
         self, runtime_arn: str, runtime_qualifier: str, session_id: str
     ) -> Mapping[str, Any] | None: ...
 
+    def strong_read_turn_grant(
+        self, user_id: str, invocation_id: str
+    ) -> Mapping[str, Any] | None: ...
+
     def strong_read_installation(
         self, user_id: str, pack_id: str
     ) -> CapabilityInstallationV1 | Mapping[str, Any] | None: ...
@@ -195,6 +199,20 @@ class AdmissionGate:
             or call.invocation_id != grant.invocation_id
         ):
             _deny("CALL_GRANT_MISMATCH")
+
+        raw_issued_grant = self._strong(
+            self._repository.strong_read_turn_grant,
+            grant.sub,
+            grant.invocation_id,
+        )
+        try:
+            issued_grant = TurnCapabilityGrantV1.from_mapping(raw_issued_grant)
+        except (ContractValidationError, TypeError, ValueError):
+            _deny("GRANT_AUTHORITY_MISMATCH")
+        if canonical_json_bytes(issued_grant.to_mapping()) != canonical_json_bytes(
+            grant.to_mapping()
+        ):
+            _deny("GRANT_AUTHORITY_MISMATCH")
 
         now = self._clock()
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:

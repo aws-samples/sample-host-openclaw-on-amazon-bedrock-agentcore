@@ -1,10 +1,10 @@
 """Gateway-mediated exact-target public URL reader.
 
-The reader holds NO ambient network authority. Every network primitive is a
-constructor-injected seam; the production composition never wires a live seam,
-so the verifier stays offline and credential-free. The reader is reachable ONLY
-as a :class:`~capabilities.gateway.CapabilityAdapter` keyed by the frozen
-operationId ``web.exact.read``.
+The reader holds no provider credential or generic browser authority. Every
+network primitive is a constructor-injected seam; the trusted gateway's
+production composition binds only the pinned-TLS public reader. The reader is
+reachable only as a :class:`~capabilities.gateway.CapabilityAdapter` keyed by
+the frozen operationId ``web.exact.read``.
 
 Denials make ZERO network calls: the resolver is consulted at most once (only
 for adapter-stage denials), and a connection is opened only after every
@@ -14,7 +14,10 @@ resolved address passes the shared public-only IP classifier.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import re
+import socket
+import ssl
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, Sequence
 from urllib.parse import urlsplit
@@ -42,7 +45,7 @@ _DENY = "WEB_READ_TARGET_DENIED"
 
 
 # --------------------------------------------------------------------------- #
-# Injected seams (production defaults are fail-closed / networkless)
+# Injected seams (the value-object defaults remain fail-closed / networkless)
 # --------------------------------------------------------------------------- #
 
 
@@ -72,6 +75,79 @@ def _networkless_resolver(_host: str) -> Sequence[str]:
 
 def _networkless_connect(_ip: str, _port: int, _host: str) -> WebConnection:
     raise RuntimeError("web reader connect seam is not configured")
+
+
+def _production_resolver(host: str) -> Sequence[str]:
+    answers = socket.getaddrinfo(
+        host,
+        DEFAULT_PORT,
+        family=socket.AF_UNSPEC,
+        type=socket.SOCK_STREAM,
+        proto=socket.IPPROTO_TCP,
+    )
+    addresses = sorted({answer[4][0] for answer in answers})
+    if not addresses or len(addresses) > 64:
+        raise RuntimeError("web resolver result is unavailable or unbounded")
+    return addresses
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *, ip: str, port: int, host: str) -> None:
+        super().__init__(
+            host,
+            port=port,
+            timeout=5,
+            context=ssl.create_default_context(),
+        )
+        self._pinned_ip = ip
+
+    def connect(self) -> None:
+        if self._tunnel_host is not None:
+            raise RuntimeError("web reader proxies are forbidden")
+        raw = socket.create_connection(
+            (self._pinned_ip, self.port),
+            timeout=self.timeout,
+            source_address=self.source_address,
+        )
+        try:
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except Exception:
+            raw.close()
+            raise
+
+
+class _StdlibWebResponse:
+    def __init__(self, response: http.client.HTTPResponse) -> None:
+        self._response = response
+        self.status = response.status
+
+    def header(self, name: str) -> str | None:
+        return self._response.getheader(name)
+
+    def stream(self):
+        while True:
+            chunk = self._response.read(8192)
+            if not chunk:
+                return
+            yield chunk
+
+
+class _StdlibWebConnection:
+    def __init__(self, ip: str, port: int, host: str) -> None:
+        self._connection = _PinnedHTTPSConnection(ip=ip, port=port, host=host)
+
+    def request(
+        self, method: str, target: str, headers: dict[str, str]
+    ) -> WebResponse:
+        self._connection.request(method, target, headers=headers)
+        return _StdlibWebResponse(self._connection.getresponse())
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+def _production_connect(ip: str, port: int, host: str) -> WebConnection:
+    return _StdlibWebConnection(ip, port, host)
 
 
 class _WebReadDenied(Exception):
@@ -466,9 +542,9 @@ def build_web_read_adapter(
 ) -> WebReadAdapter:
     """Build a gateway adapter with explicit injected network seams.
 
-    Production callers do NOT invoke this; the production composition leaves the
-    ``web.exact.read`` operation adapter unwired so the verifier stays offline.
-    Only tests (and a future real Linux-isolated fetch path) pass live seams.
+    The production factory below invokes this with the public resolver and a
+    connection that pins the resolved IP while preserving TLS SNI and hostname
+    verification. Tests may inject deterministic networkless seams directly.
     """
 
     if max_redirects < 0 or max_redirects > 2:
@@ -484,7 +560,21 @@ def build_web_read_adapter(
     )
 
 
+def build_production_web_read_adapter(
+    *, clock: Callable[[], int]
+) -> WebReadAdapter:
+    """Bind public DNS and pinned TLS without exposing a generic browser."""
+
+    return build_web_read_adapter(
+        resolver=_production_resolver,
+        connect=_production_connect,
+        clock=clock,
+        max_redirects=0,
+    )
+
+
 __all__ = [
     "WebReadAdapter",
+    "build_production_web_read_adapter",
     "build_web_read_adapter",
 ]

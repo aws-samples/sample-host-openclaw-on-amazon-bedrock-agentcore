@@ -117,11 +117,16 @@ class SchedulePort(Protocol):
     def list_view(self, user_id: str) -> Mapping[str, Any]: ...
 
     def propose(
-        self, *, user_id: str, task_type: str, definition: Mapping[str, Any]
+        self,
+        *,
+        user_id: str,
+        invocation_id: str,
+        task_type: str,
+        definition: Mapping[str, Any],
     ) -> Mapping[str, Any]: ...
 
     def cancel_propose(
-        self, *, user_id: str, schedule_id: str
+        self, *, user_id: str, invocation_id: str, schedule_id: str
     ) -> Mapping[str, Any]: ...
 
 
@@ -148,6 +153,7 @@ class _ScheduleProposeAdapter:
         arguments = admitted.call.data["arguments"]
         proposal = self._port.propose(
             user_id=admitted.grant.sub,
+            invocation_id=admitted.grant.invocation_id,
             task_type=arguments["taskType"],
             definition=arguments["definition"],
         )
@@ -178,6 +184,7 @@ class _ScheduleCancelProposeAdapter(_ScheduleProposeAdapter):
         arguments = admitted.call.data["arguments"]
         proposal = self._port.cancel_propose(
             user_id=admitted.grant.sub,
+            invocation_id=admitted.grant.invocation_id,
             schedule_id=arguments["scheduleId"],
         )
         return self._proposal_outcome(admitted, proposal)

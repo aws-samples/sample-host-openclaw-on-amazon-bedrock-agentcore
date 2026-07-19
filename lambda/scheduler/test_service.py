@@ -22,11 +22,16 @@ def _propose_confirm(service, *, task_type="REMINDER", definition=None):
     definition = definition or reminder_definition()
     proposal = service.propose(
         user_id="user_a1",
+        invocation_id="invocation_12345678",
         task_type=task_type,
         definition=definition,
         delivery_target=DELIVERY_TARGET,
     )
-    spec = service.confirm(proposal.proposal_ref)
+    spec = service.confirm(
+        user_id="user_a1",
+        proposal_ref=proposal.proposal_ref,
+        args_hash=proposal.args_hash,
+    )
     return proposal, spec
 
 
@@ -35,6 +40,7 @@ def test_propose_creates_proposal_not_a_live_schedule(
 ):
     proposal = service.propose(
         user_id="user_a1",
+        invocation_id="invocation_12345678",
         task_type="REMINDER",
         definition=reminder_definition(),
         delivery_target=DELIVERY_TARGET,
@@ -118,6 +124,63 @@ def test_cancel_is_terminal_and_deletes_live_schedule(
     # Terminal: cannot be re-enabled/updated.
     with pytest.raises(Exception):
         service.update(spec.schedule_id, definition=reminder_definition())
+
+
+def test_cancel_requires_a_fresh_exact_one_time_proposal(
+    service, repository, eventbridge
+):
+    _, spec = _propose_confirm(service)
+    proposal = service.cancel_propose(
+        user_id="user_a1",
+        invocation_id="invocation_cancel_1234",
+        schedule_id=spec.schedule_id,
+        delivery_target=DELIVERY_TARGET,
+    )
+
+    cancelled = service.confirm(
+        user_id="user_a1",
+        proposal_ref=proposal.proposal_ref,
+        args_hash=proposal.args_hash,
+    )
+
+    assert cancelled.state == "CANCELLED"
+    assert cancelled.revision == spec.revision + 1
+    assert spec.schedule_id in eventbridge.deleted
+    with pytest.raises(Exception, match="proposal"):
+        service.confirm(
+            user_id="user_a1",
+            proposal_ref=proposal.proposal_ref,
+            args_hash=proposal.args_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    ("user_id", "args_hash"),
+    [
+        ("user_b2", None),
+        ("user_a1", "f" * 64),
+    ],
+)
+def test_confirmation_rejects_wrong_user_or_hash_before_any_schedule_effect(
+    service, repository, eventbridge, user_id, args_hash
+):
+    proposal = service.propose(
+        user_id="user_a1",
+        invocation_id="invocation_12345678",
+        task_type="REMINDER",
+        definition=reminder_definition(),
+        delivery_target=DELIVERY_TARGET,
+    )
+
+    with pytest.raises(Exception, match="proposal"):
+        service.confirm(
+            user_id=user_id,
+            proposal_ref=proposal.proposal_ref,
+            args_hash=args_hash or proposal.args_hash,
+        )
+
+    assert eventbridge.created == {}
+    assert repository.schedules == {}
 
 
 def test_fire_strong_reads_then_enqueues_exactly_one_occurrence_into_per_user_fifo(
@@ -223,17 +286,23 @@ def test_eventbridge_uncertain_persistence_on_confirm_is_UNCERTAIN_and_never_aut
         queue=occurrence_queue,
         clock=clock,
         nonce_factory=nonce_sequence,
+        catalog_digest="a" * 64,
         uncertain_errors=(ProviderUncertainError,),
     )
     proposal = service.propose(
         user_id="user_a1",
+        invocation_id="invocation_12345678",
         task_type="REMINDER",
         definition=reminder_definition(),
         delivery_target=DELIVERY_TARGET,
     )
 
     with pytest.raises(SchedulerUncertain):
-        service.confirm(proposal.proposal_ref)
+        service.confirm(
+            user_id="user_a1",
+            proposal_ref=proposal.proposal_ref,
+            args_hash=proposal.args_hash,
+        )
     # No auto-retry, no auto-act: nothing was created, nothing enqueued.
     assert ebridge_uncertain.created == {}
     assert occurrence_queue.sends == []
@@ -251,15 +320,21 @@ def test_sqs_uncertain_persistence_on_fire_is_UNCERTAIN_and_never_auto_acts(
         queue=queue_uncertain,
         clock=clock,
         nonce_factory=nonce_sequence,
+        catalog_digest="a" * 64,
         uncertain_errors=(ProviderUncertainError,),
     )
     proposal = service.propose(
         user_id="user_a1",
+        invocation_id="invocation_12345678",
         task_type="REMINDER",
         definition=reminder_definition(),
         delivery_target=DELIVERY_TARGET,
     )
-    spec = service.confirm(proposal.proposal_ref)
+    spec = service.confirm(
+        user_id="user_a1",
+        proposal_ref=proposal.proposal_ref,
+        args_hash=proposal.args_hash,
+    )
 
     with pytest.raises(SchedulerUncertain):
         service.fire(

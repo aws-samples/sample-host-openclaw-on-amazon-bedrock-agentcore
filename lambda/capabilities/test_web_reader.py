@@ -300,6 +300,10 @@ class FakeRepository:
                 grant=target_grant, uses=0
             )
         self.claimed_target_calls: dict[str, set[str]] = {}
+        self.turn_grant = {
+            **_turn_grant(catalog, target_grant=target_grant),
+            "sub": user_id,
+        }
 
     def strong_read_global_kill_switch(self) -> bool:
         self.trace.append("global_kill")
@@ -326,6 +330,15 @@ class FakeRepository:
         ) and runtime_qualifier == self.runtime.get("runtimeQualifier"):
             return self.runtime
         return None
+
+    def strong_read_turn_grant(self, user_id: str, invocation_id: str):
+        self.trace.append("turn_grant")
+        if (
+            user_id != self.turn_grant.get("sub")
+            or invocation_id != self.turn_grant.get("invocationId")
+        ):
+            return None
+        return dict(self.turn_grant)
 
     def strong_read_installation(self, user_id: str, pack_id: str):
         self.trace.append("installation")
@@ -477,6 +490,7 @@ def test_target_argument_mutation_same_tool_use_denied_zero_network():
             },
         ),
     }
+    repository.turn_grant = dict(iam["turnGrant"])
 
     first = gateway.invoke(_call(catalog, url_a), iam)
     assert first.status == "SUCCEEDED"
@@ -947,7 +961,7 @@ def test_same_host_redirect_uses_fresh_minimal_headers_no_cookies():
 
 
 # --------------------------------------------------------------------------- #
-# 12. Capability parity: only via gateway; disabled by default
+# 12. Capability parity: only via gateway; production uses pinned TLS
 # --------------------------------------------------------------------------- #
 
 
@@ -962,9 +976,7 @@ def test_web_read_disabled_when_no_adapter_registered():
     assert result.error_code == "ADAPTER_DISABLED"
 
 
-def test_production_composition_leaves_web_read_disabled():
-    # The production composition must never wire a live network seam for the
-    # reader: web.exact.read stays an unregistered (disabled) adapter.
+def test_production_composition_binds_web_read_without_cold_start_io():
     from capabilities.composition import build_production_composition
 
     catalog = _catalog()
@@ -974,6 +986,7 @@ def test_production_composition_leaves_web_read_disabled():
         "CAPABILITY_CATALOG_DIGEST": catalog.catalog_digest,
         "CAPABILITY_STATE_TABLE_NAME": "personal-operator-state",
         "CAPABILITY_ALLOWED_CALLER_ARN": CALLER_ARN,
+        "SCHEDULER_CONTROL_TABLE_NAME": "personal-operator-scheduler-control",
     }
 
     # A DynamoDB-shaped stub that never performs any I/O; construction only
@@ -991,7 +1004,68 @@ def test_production_composition_leaves_web_read_disabled():
         dynamodb_client=_StubClient(),
         clock=lambda: NOW,
     )
-    assert "web.exact.read" not in composition.gateway._adapters
+    assert "web.exact.read" in composition.gateway._adapters
+
+
+def test_production_resolver_returns_the_complete_bounded_address_set(monkeypatch):
+    from capabilities import web_reader
+
+    calls = []
+
+    def getaddrinfo(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [
+            (2, 1, 6, "", (PUBLIC_IP, 443)),
+            (2, 1, 6, "", (PRIVATE_IP, 443)),
+            (2, 1, 6, "", (PUBLIC_IP, 443)),
+        ]
+
+    monkeypatch.setattr(web_reader.socket, "getaddrinfo", getaddrinfo)
+
+    assert web_reader._production_resolver("example.com") == [
+        PRIVATE_IP,
+        PUBLIC_IP,
+    ]
+    assert len(calls) == 1
+
+
+def test_production_tls_connection_pins_ip_and_verifies_the_original_host(
+    monkeypatch,
+):
+    from capabilities import web_reader
+
+    calls = []
+
+    class RawSocket:
+        def close(self):
+            calls.append(("raw-close",))
+
+    class WrappedSocket:
+        def close(self):
+            calls.append(("wrapped-close",))
+
+    class Context:
+        def wrap_socket(self, raw, *, server_hostname):
+            assert isinstance(raw, RawSocket)
+            calls.append(("wrap", server_hostname))
+            return WrappedSocket()
+
+    def create_connection(target, **kwargs):
+        calls.append(("connect", target, kwargs))
+        return RawSocket()
+
+    monkeypatch.setattr(web_reader.ssl, "create_default_context", Context)
+    monkeypatch.setattr(web_reader.socket, "create_connection", create_connection)
+    connection = web_reader._PinnedHTTPSConnection(
+        ip=PUBLIC_IP,
+        port=443,
+        host="example.com",
+    )
+
+    connection.connect()
+
+    assert calls[0][0:2] == ("connect", (PUBLIC_IP, 443))
+    assert calls[1] == ("wrap", "example.com")
 
 
 # --------------------------------------------------------------------------- #

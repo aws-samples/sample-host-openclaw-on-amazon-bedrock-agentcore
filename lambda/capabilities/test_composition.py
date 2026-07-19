@@ -63,6 +63,7 @@ class MemoryDynamoClient:
         self.get_calls = []
         self.transact_calls = []
         self.update_calls = []
+        self.query_calls = []
 
     @staticmethod
     def _key(raw):
@@ -76,6 +77,10 @@ class MemoryDynamoClient:
         self.get_calls.append(deepcopy(kwargs))
         item = self.items.get(self._key(kwargs["Key"]))
         return {} if item is None else {"Item": _serialize(deepcopy(item))}
+
+    def query(self, **kwargs):
+        self.query_calls.append(deepcopy(kwargs))
+        return {"Items": []}
 
     def put_item(self, **kwargs):
         item = _deserialize(kwargs["Item"])
@@ -175,6 +180,7 @@ def _environment(catalog_digest: str) -> dict[str, str]:
         "CAPABILITY_RELEASE_COMMIT": RELEASE_COMMIT,
         "CAPABILITY_CATALOG_DIGEST": catalog_digest,
         "CAPABILITY_ALLOWED_CALLER_ARN": CALLER_ARN,
+        "SCHEDULER_CONTROL_TABLE_NAME": "personal-operator-scheduler-control",
     }
 
 
@@ -246,7 +252,27 @@ def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
             recordJson=json.dumps(payload, sort_keys=True, separators=(",", ":")),
             version=1,
         )
+    issued_grant = _turn_grant(catalog)
+    client.put(
+        f"USER#{user_id}",
+        f"TURN#{issued_grant['invocationId']}",
+        recordJson=json.dumps(
+            issued_grant,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        version=1,
+    )
     _seed_installation(client, catalog, "schedule.list")
+
+
+def _seed_turn_authority(client: MemoryDynamoClient, grant) -> None:
+    client.put(
+        f"USER#{grant['sub']}",
+        f"TURN#{grant['invocationId']}",
+        recordJson=json.dumps(grant, sort_keys=True, separators=(",", ":")),
+        version=1,
+    )
 
 
 class SequencedAdapter:
@@ -349,7 +375,7 @@ def test_cold_start_recompiles_packaged_catalog_and_rejects_one_byte_drift(
         load_packaged_catalog(env, artifact_root=artifacts)
 
 
-def test_offline_handler_composes_strong_dynamo_state_and_keeps_adapters_disabled(
+def test_offline_handler_composes_strong_dynamo_state_and_binds_safe_adapters(
     tmp_path, monkeypatch
 ):
     from capabilities import composition
@@ -385,12 +411,172 @@ def test_offline_handler_composes_strong_dynamo_state_and_keeps_adapters_disable
 
     assert isinstance(production.repository, DynamoAdmissionRepository)
     assert isinstance(production.ledger, DynamoCapabilityLedger)
-    assert result["status"] == "DENIED"
-    assert result["errorCode"] == "ADAPTER_DISABLED"
+    assert result["status"] == "SUCCEEDED"
+    assert result["data"] == {"schedules": []}
+    assert set(production.gateway._adapters) == {
+        "web.exact.read",
+        "schedule.list",
+        "schedule.propose",
+        "schedule.cancel.propose",
+        "compute.run",
+        "compute.status",
+    }
     assert client.get_calls
     assert all(call["ConsistentRead"] is True for call in client.get_calls)
     assert client.transact_calls
     assert "callerArn" not in event
+
+
+class TrustedWebAdapter:
+    def invoke(self, admitted):
+        from capabilities.gateway import AdapterOutcome
+
+        url = admitted.call.arguments["url"]
+        return AdapterOutcome(
+            status="SUCCEEDED",
+            data={
+                "canonicalUrl": url,
+                "contentDigest": "c" * 64,
+                "retrievedAt": NOW,
+                "sourceRef": "source_12345678",
+                "text": "reviewed public text",
+            },
+            provenance_refs=("source_12345678",),
+        )
+
+
+class TrustedSchedulePort:
+    def list_view(self, user_id):
+        assert user_id == "user_alpha"
+        return {"schedules": []}
+
+    def propose(self, *, user_id, invocation_id, task_type, definition):
+        assert user_id == "user_alpha"
+        assert invocation_id == "invocation_12345678"
+        assert task_type == "REMINDER"
+        assert definition["message"] == "review notes"
+        return {"proposalRef": "proposal_12345678", "expiresAt": NOW + 300}
+
+    def cancel_propose(self, *, user_id, invocation_id, schedule_id):
+        assert user_id == "user_alpha"
+        assert invocation_id == "invocation_12345678"
+        assert schedule_id == "schedule_12345678"
+        return {"proposalRef": "proposal_87654321", "expiresAt": NOW + 300}
+
+
+class TrustedComputeAdapter:
+    def invoke(self, admitted):
+        from capabilities.gateway import AdapterOutcome
+
+        if admitted.call.operation_id == "compute.run":
+            return AdapterOutcome(
+                status="SUCCEEDED",
+                data={"jobId": "job_12345678", "status": "QUEUED"},
+            )
+        return AdapterOutcome(
+            status="SUCCEEDED",
+            data={
+                "jobId": admitted.call.arguments["jobId"],
+                "outputs": [],
+                "status": "RUNNING",
+            },
+        )
+
+
+def test_production_root_can_bind_and_dispatch_all_six_v1_capabilities(
+    tmp_path,
+):
+    from capabilities.composition import build_production_composition
+
+    artifacts = _artifact_copy(tmp_path)
+    catalog = _catalog()
+    client = MemoryDynamoClient()
+    _seed_authority(client, catalog)
+    for pack in catalog.packs:
+        _seed_installation(client, catalog, pack["packId"])
+    target = _seed_web_target(client, catalog)
+    compute = TrustedComputeAdapter()
+    production = build_production_composition(
+        env=_environment(catalog.catalog_digest),
+        artifact_root=artifacts,
+        dynamodb_client=client,
+        clock=lambda: NOW,
+        web_read_adapter=TrustedWebAdapter(),
+        schedule_port=TrustedSchedulePort(),
+        compute_adapters={
+            "compute.run": compute,
+            "compute.status": compute,
+        },
+    )
+    cases = [
+        (
+            "web.exact.read",
+            {"url": "https://example.com/exact"},
+            "tooluse_web_1234",
+        ),
+        ("schedule.list", {}, "tooluse_list_1234"),
+        (
+            "schedule.propose",
+            {
+                "taskType": "REMINDER",
+                "definition": {
+                    "message": "review notes",
+                    "runAt": NOW + 3600,
+                    "timezone": "Europe/Tallinn",
+                },
+            },
+            "tooluse_propose1",
+        ),
+        (
+            "schedule.cancel.propose",
+            {"scheduleId": "schedule_12345678"},
+            "tooluse_cancel123",
+        ),
+        (
+            "compute.run",
+            {
+                "command": {"mode": "SCRIPT", "value": "print('safe')"},
+                "inputPaths": [],
+                "network": "NONE",
+                "resourceProfile": "SMALL",
+            },
+            "tooluse_compute1",
+        ),
+        (
+            "compute.status",
+            {"jobId": "job_12345678"},
+            "tooluse_status12",
+        ),
+    ]
+    grant = _turn_grant(catalog, target_grant=target)
+    _seed_turn_authority(client, grant)
+    results = []
+    for operation_id, arguments, tool_use_id in cases:
+        call = _call(
+            catalog,
+            operation_id,
+            arguments,
+            tool_use_id=tool_use_id,
+        )
+        results.append(
+            production.invoke(
+                {
+                    "schema": "personal-operator.capability-relay-envelope.v1",
+                    "grant": grant,
+                    "call": call.to_mapping(),
+                }
+            )
+        )
+
+    assert [result.status for result in results] == [
+        "SUCCEEDED",
+        "SUCCEEDED",
+        "PENDING_APPROVAL",
+        "PENDING_APPROVAL",
+        "SUCCEEDED",
+        "SUCCEEDED",
+    ]
+    assert all(result.error_code != "ADAPTER_DISABLED" for result in results)
 
 
 def test_composition_rejects_wrong_region_release_digest_and_event_shape(tmp_path):
@@ -427,6 +613,7 @@ def test_durable_target_claim_allows_exact_cached_response_loss_recovery_only():
         {"url": "https://example.com/exact"},
     )
     grant = _turn_grant(catalog, target_grant=target, max_calls=1)
+    _seed_turn_authority(client, grant)
     iam = {"callerArn": CALLER_ARN, "turnGrant": grant}
 
     ignored_response = gateway.invoke(call, iam)
@@ -456,7 +643,7 @@ def test_durable_target_claim_allows_exact_cached_response_loss_recovery_only():
     assert ignored_response.status == "SUCCEEDED"
     assert recovered.to_bytes() == ignored_response.to_bytes()
     assert wrong_grant.status == "DENIED"
-    assert wrong_grant.error_code == "CAPABILITY_GRANT_BINDING_MISMATCH"
+    assert wrong_grant.error_code == "GRANT_AUTHORITY_MISMATCH"
     assert fresh_call.status == "DENIED"
     assert fresh_call.error_code == "TARGET_GRANT_EXHAUSTED"
     assert adapter.calls == [call.call_id]
@@ -623,9 +810,11 @@ def test_durable_target_claim_allows_one_same_call_read_retry_without_recharge()
         "web.exact.read",
         {"url": "https://example.com/exact"},
     )
+    grant = _turn_grant(catalog, target_grant=target, max_calls=1)
+    _seed_turn_authority(client, grant)
     iam = {
         "callerArn": CALLER_ARN,
-        "turnGrant": _turn_grant(catalog, target_grant=target, max_calls=1),
+        "turnGrant": grant,
     }
 
     retryable = gateway.invoke(call, iam)
@@ -658,9 +847,11 @@ def test_durable_target_claim_preserves_retry_exhaustion_and_fresh_call_denial()
         "web.exact.read",
         {"url": "https://example.com/exact"},
     )
+    grant = _turn_grant(catalog, target_grant=target, max_calls=1)
+    _seed_turn_authority(client, grant)
     iam = {
         "callerArn": CALLER_ARN,
-        "turnGrant": _turn_grant(catalog, target_grant=target, max_calls=1),
+        "turnGrant": grant,
     }
 
     first = gateway.invoke(call, iam)

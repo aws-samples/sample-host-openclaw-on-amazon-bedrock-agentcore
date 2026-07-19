@@ -20,6 +20,10 @@ RELEASE_COMMIT = "a" * 40
 CATALOG_DIGEST = "b" * 64
 CMK_ARN = f"arn:aws:kms:{REGION}:{ACCOUNT}:key/test-capability-key"
 TABLE_NAME = "personal-operator-capability-state"
+SCHEDULER_TABLE_NAME = "personal-operator-scheduler-control"
+SCHEDULER_TABLE_ARN = (
+    f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{SCHEDULER_TABLE_NAME}"
+)
 
 
 def _synth_capability_stack(region: str = REGION):
@@ -108,6 +112,7 @@ def test_capability_stack_is_one_fail_closed_gateway_with_exact_identity():
                 "CAPABILITY_CATALOG_DIGEST": CATALOG_DIGEST,
                 "CAPABILITY_RELEASE_COMMIT": RELEASE_COMMIT,
                 "CAPABILITY_STATE_TABLE_NAME": TABLE_NAME,
+                "SCHEDULER_CONTROL_TABLE_NAME": SCHEDULER_TABLE_NAME,
             }
         },
     }
@@ -125,6 +130,7 @@ def test_gateway_role_has_only_exact_logs_dynamo_and_kms_authority():
     assert actions == {
         "dynamodb:GetItem",
         "dynamodb:PutItem",
+        "dynamodb:Query",
         "dynamodb:TransactWriteItems",
         "dynamodb:UpdateItem",
         "kms:Decrypt",
@@ -135,7 +141,7 @@ def test_gateway_role_has_only_exact_logs_dynamo_and_kms_authority():
         "logs:CreateLogStream",
         "logs:PutLogEvents",
     }
-    assert len(statements) == 3
+    assert len(statements) == 5
     tables = _resources(template, "AWS::DynamoDB::Table")
     assert len(tables) == 1
     assert tables[0]["Properties"] == {
@@ -186,7 +192,7 @@ def test_gateway_dynamo_and_kms_statements_are_resource_and_condition_bounded():
     dynamo = next(
         statement
         for statement in statements
-        if "dynamodb:GetItem" in statement.get("Action", [])
+        if "dynamodb:TransactWriteItems" in statement.get("Action", [])
     )
     kms = next(
         statement
@@ -211,6 +217,27 @@ def test_gateway_dynamo_and_kms_statements_are_resource_and_condition_bounded():
             "kms:ViaService": f"dynamodb.{REGION}.amazonaws.com",
         }
     }
+
+    schedule_query = next(
+        statement
+        for statement in statements
+        if "dynamodb:Query" in statement.get("Action", [])
+    )
+    assert schedule_query["Action"] == "dynamodb:Query"
+    assert schedule_query["Resource"] == (
+        f"{SCHEDULER_TABLE_ARN}/index/schedule-user-index-v1"
+    )
+    schedule_records = next(
+        statement
+        for statement in statements
+        if set(
+            statement.get("Action", [])
+            if isinstance(statement.get("Action"), list)
+            else [statement.get("Action")]
+        )
+        == {"dynamodb:GetItem", "dynamodb:PutItem"}
+    )
+    assert schedule_records["Resource"] == SCHEDULER_TABLE_ARN
 
 
 def test_gateway_cmk_actions_match_cdk_dynamodb_data_plane_reference():

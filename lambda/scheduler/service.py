@@ -9,8 +9,8 @@ a read-only turn or a reminder notification.
 
 from __future__ import annotations
 
-import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -18,8 +18,6 @@ try:  # package import
     from capabilities.contracts import (
         ScheduleOccurrenceV1,
         ScheduleSpecV1,
-        canonical_json_bytes,
-        canonical_sha256,
         derive_occurrence_id,
     )
     from scheduler.models import (
@@ -29,12 +27,15 @@ try:  # package import
         derive_schedule_id,
         make_occurrence,
     )
+    from scheduler.proposals import (
+        ScheduleProposalRecordV1,
+        build_cancel_schedule_proposal,
+        build_create_schedule_proposal,
+    )
 except ImportError:  # direct Lambda asset / focused tests
     from contracts import (  # type: ignore[no-redef]
         ScheduleOccurrenceV1,
         ScheduleSpecV1,
-        canonical_json_bytes,
-        canonical_sha256,
         derive_occurrence_id,
     )
     from models import (  # type: ignore[no-redef]
@@ -44,9 +45,13 @@ except ImportError:  # direct Lambda asset / focused tests
         derive_schedule_id,
         make_occurrence,
     )
+    from proposals import (  # type: ignore[no-redef]
+        ScheduleProposalRecordV1,
+        build_cancel_schedule_proposal,
+        build_create_schedule_proposal,
+    )
 
 
-PROPOSAL_TTL_SECONDS = 15 * 60
 _OUTCOME_STATUSES = frozenset({"ENQUEUED", "DUPLICATE", "STALE"})
 OCCURRENCE_BODY_SCHEMA = "personal-operator.schedule-occurrence-body.v1"
 
@@ -160,9 +165,16 @@ class SchedulerOutcome:
 class ScheduleControlRepository(Protocol):
     """Strong-read authority control table; never returns cached data."""
 
-    def put_proposal(self, proposal_ref: str, record: Mapping[str, Any]) -> None: ...
+    def put_proposal(self, record: ScheduleProposalRecordV1) -> None: ...
 
-    def read_proposal(self, proposal_ref: str) -> Mapping[str, Any] | None: ...
+    def claim_proposal(
+        self,
+        *,
+        user_id: str,
+        proposal_ref: str,
+        args_hash: str,
+        now: int,
+    ) -> ScheduleProposalRecordV1: ...
 
     def commit_schedule(
         self, spec: ScheduleSpecV1, delivery_target: Mapping[str, Any], *, expect_absent: bool
@@ -204,6 +216,7 @@ class SchedulerService:
         queue: OccurrenceQueue,
         clock: Callable[[], int],
         nonce_factory: Callable[[], str],
+        catalog_digest: str | None = None,
         uncertain_errors: tuple[type[BaseException], ...] = (),
     ) -> None:
         if not callable(clock):
@@ -215,6 +228,12 @@ class SchedulerService:
         self._queue = queue
         self._clock = clock
         self._nonce_factory = nonce_factory
+        if catalog_digest is not None and (
+            not isinstance(catalog_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", catalog_digest) is None
+        ):
+            raise TypeError("scheduler requires the frozen catalog digest")
+        self._catalog_digest = catalog_digest
         self._uncertain = tuple(uncertain_errors)
 
     # --- helpers -------------------------------------------------------
@@ -223,13 +242,6 @@ class SchedulerService:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise SchedulerError("scheduler clock is invalid")
         return value
-
-    def _proposal_ref(self, user_id: str, args_hash: str, nonce: str) -> str:
-        digest = hashlib.sha256(b"personal-operator.schedule-proposal.v1\0")
-        for component in (user_id, args_hash, nonce):
-            digest.update(component.encode("utf-8"))
-            digest.update(b"\0")
-        return f"prop_{digest.hexdigest()}"
 
     def _delivery_target(self, delivery_target: Mapping[str, Any]) -> dict[str, Any]:
         if (
@@ -280,6 +292,7 @@ class SchedulerService:
         self,
         *,
         user_id: str,
+        invocation_id: str,
         task_type: str,
         definition: Mapping[str, Any],
         delivery_target: Mapping[str, Any],
@@ -287,70 +300,91 @@ class SchedulerService:
         """Durably record a proposal. NEVER creates an EventBridge schedule."""
 
         delivery = self._delivery_target(delivery_target)
-        # Validate the definition/type through the frozen contract by building a
-        # provisional (never-live) spec identity.
-        schedule_id = derive_schedule_id(user_id, self._nonce_factory())
-        spec = build_schedule_spec(
-            schedule_id=schedule_id,
+        if self._catalog_digest is None:
+            raise SchedulerError("scheduler proposal catalog is unavailable")
+        record = build_create_schedule_proposal(
+            catalog_digest=self._catalog_digest,
             user_id=user_id,
+            invocation_id=invocation_id,
             task_type=task_type,
             definition=definition,
-            revision=1,
-            state="PAUSED",
-            next_run_at=None,
+            delivery_target=delivery,
+            now=self._now(),
+            nonce=self._nonce_factory(),
         )
-        args_hash = canonical_sha256(
-            {
-                "userId": user_id,
-                "taskType": task_type,
-                "definition": dict(definition),
-                "deliveryTarget": delivery,
-            }
-        )
-        now = self._now()
-        proposal_ref = self._proposal_ref(user_id, args_hash, self._nonce_factory())
-        self._repository.put_proposal(
-            proposal_ref,
-            {
-                "proposalRef": proposal_ref,
-                "scheduleId": schedule_id,
-                "userId": user_id,
-                "taskType": task_type,
-                "definition": dict(definition),
-                "definitionHash": spec.definition_hash,
-                "deliveryTarget": delivery,
-                "argsHash": args_hash,
-                "expiresAt": now + PROPOSAL_TTL_SECONDS,
-            },
-        )
+        self._repository.put_proposal(record)
         return SchedulerProposal(
-            proposal_ref=proposal_ref,
-            args_hash=args_hash,
-            expires_at=now + PROPOSAL_TTL_SECONDS,
+            proposal_ref=record.proposal_id,
+            args_hash=record.args_hash,
+            expires_at=record.expires_at,
         )
 
-    def confirm(self, proposal_ref: str) -> ScheduleSpecV1:
-        """Trusted control-plane transition to ENABLED at revision 1."""
-
-        record = self._repository.read_proposal(proposal_ref)
-        if not isinstance(record, Mapping):
-            raise SchedulerError("proposal does not exist")
-        now = self._now()
-        expires_at = record.get("expiresAt")
-        if not isinstance(expires_at, int) or expires_at < now:
-            raise SchedulerError("proposal has expired")
-        spec = build_schedule_spec(
-            schedule_id=record["scheduleId"],
-            user_id=record["userId"],
-            task_type=record["taskType"],
-            definition=record["definition"],
-            revision=1,
-            state="ENABLED",
+    def cancel_propose(
+        self,
+        *,
+        user_id: str,
+        invocation_id: str,
+        schedule_id: str,
+        delivery_target: Mapping[str, Any],
+    ) -> SchedulerProposal:
+        current = self._require_schedule(schedule_id)
+        if self._catalog_digest is None:
+            raise SchedulerError("scheduler proposal catalog is unavailable")
+        if current.user_id != user_id or current.state == "CANCELLED":
+            raise SchedulerError("schedule is unavailable for cancellation")
+        record = build_cancel_schedule_proposal(
+            catalog_digest=self._catalog_digest,
+            user_id=user_id,
+            invocation_id=invocation_id,
+            schedule_id=schedule_id,
+            revision=current.revision,
+            delivery_target=self._delivery_target(delivery_target),
+            now=self._now(),
+            nonce=self._nonce_factory(),
         )
-        delivery = self._delivery_target(record["deliveryTarget"])
-        self._repository.commit_schedule(spec, delivery, expect_absent=True)
-        self._create_live_schedule(spec)
-        return spec
+        self._repository.put_proposal(record)
+        return SchedulerProposal(
+            proposal_ref=record.proposal_id,
+            args_hash=record.args_hash,
+            expires_at=record.expires_at,
+        )
+
+    def confirm(
+        self, *, user_id: str, proposal_ref: str, args_hash: str
+    ) -> ScheduleSpecV1:
+        """Atomically consume one exact proposal before its provider effect."""
+
+        try:
+            record = self._repository.claim_proposal(
+                user_id=user_id,
+                proposal_ref=proposal_ref,
+                args_hash=args_hash,
+                now=self._now(),
+            )
+        except Exception as error:
+            raise SchedulerError("proposal is unavailable or unsafe") from error
+        proposal = record.proposal
+        if proposal.operation_id == "schedule.propose":
+            spec = build_schedule_spec(
+                schedule_id=record.schedule_id,
+                user_id=user_id,
+                task_type=proposal.arguments["taskType"],
+                definition=proposal.arguments["definition"],
+                revision=1,
+                state="ENABLED",
+            )
+            delivery = self._delivery_target(record.delivery_target)
+            self._repository.commit_schedule(spec, delivery, expect_absent=True)
+            self._create_live_schedule(spec)
+            return spec
+        current = self._require_schedule(record.schedule_id)
+        if (
+            current.user_id != user_id
+            or current.revision != proposal.revision
+            or current.state == "CANCELLED"
+        ):
+            raise SchedulerError("proposal schedule revision is stale")
+        return self.cancel(record.schedule_id)
 
     def update(
         self, schedule_id: str, *, definition: Mapping[str, Any]

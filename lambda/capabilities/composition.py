@@ -7,6 +7,7 @@ from functools import lru_cache
 import os
 from pathlib import Path
 import re
+import secrets
 import time
 from typing import Any, Callable, Mapping
 
@@ -15,7 +16,9 @@ import boto3
 from .catalog import compile_catalog
 from .contracts import CapabilityCallV1, CapabilityCatalogV1, CapabilityResultV1
 from .durable import DynamoAdmissionRepository, DynamoCapabilityLedger
-from .gateway import CapabilityGateway
+from .gateway import AdapterOutcome, CapabilityGateway, build_schedule_adapters
+from .schedule_port import DynamoScheduleCapabilityPort
+from .web_reader import build_production_web_read_adapter
 
 REQUIRED_REGION = "eu-west-1"
 DEFAULT_ARTIFACT_ROOT = Path(__file__).resolve().parent / "artifacts"
@@ -25,6 +28,15 @@ _TABLE = re.compile(r"[A-Za-z0-9_.-]{3,255}")
 _CALLER = re.compile(
     r"arn:aws:iam::[0-9]{12}:role/" r"openclaw-agentcore-execution-role-eu-west-1"
 )
+_SCHEDULER_TABLE = "personal-operator-scheduler-control"
+
+
+class _ComputeReleaseGateAdapter:
+    def invoke(self, _admitted) -> AdapterOutcome:
+        return AdapterOutcome(
+            status="DENIED",
+            error_code="COMPUTE_RELEASE_GATE_UNSATISFIED",
+        )
 
 
 def _required_env(env: Mapping[str, str], name: str) -> str:
@@ -87,23 +99,23 @@ def build_production_composition(
     artifact_root: Path = DEFAULT_ARTIFACT_ROOT,
     dynamodb_client: Any | None = None,
     clock: Callable[[], int] | None = None,
+    web_read_adapter: Any | None = None,
+    schedule_port: Any | None = None,
     compute_adapters: Mapping[str, Any] | None = None,
 ) -> ProductionCapabilityComposition:
     # The credential-free gateway Lambda holds no compute execution authority.
     # Compute wiring is an explicit, injected seam restricted to the two frozen
     # compute operations; reject any other operation before touching state.
-    adapters: dict[str, Any] = {}
-    if compute_adapters is not None:
-        if set(compute_adapters) - {"compute.run", "compute.status"}:
-            raise RuntimeError("only compute operations may be injected")
-        adapters.update(compute_adapters)
     catalog = load_packaged_catalog(env, artifact_root=artifact_root)
     table_name = _required_env(env, "CAPABILITY_STATE_TABLE_NAME")
+    scheduler_table_name = _required_env(env, "SCHEDULER_CONTROL_TABLE_NAME")
     caller_arn = _required_env(env, "CAPABILITY_ALLOWED_CALLER_ARN")
     if _TABLE.fullmatch(table_name) is None:
         raise RuntimeError("capability state table name is invalid")
     if _CALLER.fullmatch(caller_arn) is None:
         raise RuntimeError("capability caller ARN is invalid")
+    if scheduler_table_name != _SCHEDULER_TABLE:
+        raise RuntimeError("scheduler control table name is invalid")
     trusted_clock = clock or (lambda: int(time.time()))
     if not callable(trusted_clock):
         raise TypeError("capability composition clock must be callable")
@@ -111,6 +123,43 @@ def build_production_composition(
         "dynamodb",
         region_name=REQUIRED_REGION,
     )
+    adapters: dict[str, Any] = {}
+    selected_web_adapter = (
+        build_production_web_read_adapter(clock=lambda: int(time.time() * 1_000))
+        if web_read_adapter is None
+        else web_read_adapter
+    )
+    if not callable(getattr(selected_web_adapter, "invoke", None)):
+        raise TypeError("web reader adapter must implement invoke")
+    adapters["web.exact.read"] = selected_web_adapter
+
+    selected_schedule_port = (
+        DynamoScheduleCapabilityPort(
+            client=client,
+            table_name=scheduler_table_name,
+            authority_table_name=table_name,
+            catalog_digest=catalog.catalog_digest,
+            clock=trusted_clock,
+            nonce_factory=lambda: secrets.token_urlsafe(24),
+        )
+        if schedule_port is None
+        else schedule_port
+    )
+    required_schedule_methods = ("list_view", "propose", "cancel_propose")
+    if any(
+        not callable(getattr(selected_schedule_port, method, None))
+        for method in required_schedule_methods
+    ):
+        raise TypeError("schedule port lacks the exact proposal-only surface")
+    adapters.update(build_schedule_adapters(selected_schedule_port))
+
+    selected_compute = dict(compute_adapters or {})
+    if set(selected_compute) - {"compute.run", "compute.status"}:
+        raise RuntimeError("only compute operations may be injected")
+    for operation_id in ("compute.run", "compute.status"):
+        selected_compute.setdefault(operation_id, _ComputeReleaseGateAdapter())
+    adapters.update(selected_compute)
+
     repository = DynamoAdmissionRepository(client=client, table_name=table_name)
     ledger = DynamoCapabilityLedger(client=client, table_name=table_name)
     gateway = CapabilityGateway(

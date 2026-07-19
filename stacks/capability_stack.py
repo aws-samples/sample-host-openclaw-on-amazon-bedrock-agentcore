@@ -21,6 +21,7 @@ from constructs import Construct
 REQUIRED_REGION = "eu-west-1"
 GATEWAY_FUNCTION_NAME = "personal-operator-capability-gateway"
 STATE_TABLE_NAME = "personal-operator-capability-state"
+SCHEDULER_CONTROL_TABLE_NAME = "personal-operator-scheduler-control"
 _RELEASE_COMMIT = re.compile(r"[0-9a-f]{40}")
 _CATALOG_DIGEST = re.compile(r"[0-9a-f]{64}")
 
@@ -116,6 +117,24 @@ class CapabilityStack(Stack):
                 ],
             )
         )
+        scheduler_table_arn = (
+            f"arn:aws:dynamodb:{region}:{account}:table/"
+            f"{SCHEDULER_CONTROL_TABLE_NAME}"
+        )
+        execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:GetItem", "dynamodb:PutItem"],
+                resources=[scheduler_table_arn],
+            )
+        )
+        execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:Query"],
+                resources=[
+                    f"{scheduler_table_arn}/index/schedule-user-index-v1"
+                ],
+            )
+        )
         execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
@@ -168,6 +187,7 @@ class CapabilityStack(Stack):
                 "CAPABILITY_CATALOG_DIGEST": catalog_digest,
                 "CAPABILITY_RELEASE_COMMIT": release_commit,
                 "CAPABILITY_STATE_TABLE_NAME": STATE_TABLE_NAME,
+                "SCHEDULER_CONTROL_TABLE_NAME": SCHEDULER_CONTROL_TABLE_NAME,
             },
         )
         self.gateway_function_arn = (

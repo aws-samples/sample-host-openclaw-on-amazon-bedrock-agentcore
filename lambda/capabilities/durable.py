@@ -145,6 +145,11 @@ class DynamoAdmissionRepository:
             f"{runtime_qualifier}#SESSION#{session_id}",
         )
 
+    def strong_read_turn_grant(
+        self, user_id: str, invocation_id: str
+    ) -> Mapping[str, Any] | None:
+        return self._record(f"USER#{user_id}", f"TURN#{invocation_id}")
+
     def strong_read_installation(
         self, user_id: str, pack_id: str
     ) -> CapabilityInstallationV1 | Mapping[str, Any] | None:
@@ -533,6 +538,7 @@ class DynamoTurnAuthorityRepository:
         *,
         grant: TurnCapabilityGrantV1,
         targets: Sequence[LiveTargetGrant],
+        delivery_context: Mapping[str, str] | None = None,
     ) -> None:
         if not isinstance(grant, TurnCapabilityGrantV1):
             raise TypeError("turn authority requires a validated grant")
@@ -573,9 +579,59 @@ class DynamoTurnAuthorityRepository:
         ):
             raise ValueError("turn target authority inventory differs from grant")
 
+        delivery_record = None
+        if delivery_context is not None:
+            if (
+                not isinstance(delivery_context, Mapping)
+                or set(delivery_context) != {"channel", "actorId", "chatId"}
+                or delivery_context.get("channel") != "telegram"
+                or not isinstance(delivery_context.get("actorId"), str)
+                or not isinstance(delivery_context.get("chatId"), str)
+                or delivery_context["actorId"]
+                != f"telegram:{delivery_context['chatId']}"
+                or re.fullmatch(r"[1-9][0-9]{0,19}", delivery_context["chatId"])
+                is None
+            ):
+                raise ValueError("turn delivery context is invalid")
+            delivery_record = {
+                "schema": "personal-operator.turn-delivery-context.v1",
+                "userId": grant.sub,
+                "invocationId": grant.invocation_id,
+                "channel": "telegram",
+                "actorId": delivery_context["actorId"],
+                "chatId": delivery_context["chatId"],
+            }
+
         self._ensure_root_authority()
         self._ensure_user_authority(grant.sub)
+        grant_pk, grant_sk = (
+            f"USER#{grant.sub}",
+            f"TURN#{grant.invocation_id}",
+        )
+        self._put_record_if_absent(grant_pk, grant_sk, grant.to_mapping())
+        self._require_exact(
+            grant_pk,
+            grant_sk,
+            grant.to_mapping(),
+            "turn grant authority",
+        )
         self._ensure_turn_bindings(grant)
+        if delivery_record is not None:
+            delivery_pk, delivery_sk = (
+                f"TURN#{grant.invocation_id}",
+                "DELIVERY",
+            )
+            self._put_record_if_absent(
+                delivery_pk,
+                delivery_sk,
+                delivery_record,
+            )
+            self._require_exact(
+                delivery_pk,
+                delivery_sk,
+                delivery_record,
+                "turn delivery context",
+            )
         self._admission.persist_target_grants(
             tenant_id=grant.sub,
             current_request_id=grant.invocation_id,

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Callable, Protocol, Sequence
+import re
+from typing import Callable, Mapping, Protocol, Sequence
 
 from .admission import LiveTargetGrant
 from .contracts import CapabilityCatalogV1, TurnCapabilityGrantV1
@@ -19,6 +20,7 @@ class TurnAuthorityRepository(Protocol):
         *,
         grant: TurnCapabilityGrantV1,
         targets: Sequence[LiveTargetGrant],
+        delivery_context: Mapping[str, str] | None = None,
     ) -> None: ...
 
 
@@ -26,6 +28,7 @@ _SCHEDULED_READ_APPROVALS = frozenset({"NONE", "CURRENT_REQUEST_TARGET_GRANT"})
 _SCHEDULED_EXCLUDED_RISKS = frozenset(
     {"LOCAL_MUTATION", "DURABLE_MUTATION", "EXTERNAL_EFFECT", "IRREVERSIBLE_EFFECT"}
 )
+_TELEGRAM_ACTOR = re.compile(r"telegram:([1-9][0-9]{0,19})")
 
 
 def _scheduled_allowed(pack) -> bool:
@@ -82,6 +85,8 @@ class TurnCapabilityIssuer:
         invocation_id: str,
         message_text: str,
         scheduled_read_only: bool,
+        channel: str | None = None,
+        actor_id: str | None = None,
     ) -> dict:
         now = self._clock()
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:
@@ -120,7 +125,25 @@ class TurnCapabilityIssuer:
             }
         )
         live_targets = project_live_target_rows(targets)
-        self._repository.prepare_turn(grant=grant, targets=live_targets)
+        delivery_context = None
+        if channel == "telegram":
+            matched = (
+                _TELEGRAM_ACTOR.fullmatch(actor_id)
+                if isinstance(actor_id, str)
+                else None
+            )
+            if matched is None:
+                raise ValueError("Telegram turn delivery identity is invalid")
+            delivery_context = {
+                "channel": "telegram",
+                "actorId": actor_id,
+                "chatId": matched.group(1),
+            }
+        self._repository.prepare_turn(
+            grant=grant,
+            targets=live_targets,
+            delivery_context=delivery_context,
+        )
         return grant.to_mapping()
 
 

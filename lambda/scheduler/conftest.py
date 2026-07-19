@@ -32,13 +32,28 @@ class FakeControlRepository:
         self.trace: list[str] = []
 
     # --- proposals -----------------------------------------------------
-    def put_proposal(self, proposal_ref: str, record: Mapping[str, Any]) -> None:
-        self.proposals[proposal_ref] = dict(record)
+    def put_proposal(self, record) -> None:
+        if record.proposal_id in self.proposals:
+            raise RuntimeError("proposal already exists")
+        self.proposals[record.proposal_id] = {
+            "record": record,
+            "state": "PENDING",
+        }
 
-    def read_proposal(self, proposal_ref: str) -> Mapping[str, Any] | None:
-        self.trace.append("read_proposal")
-        record = self.proposals.get(proposal_ref)
-        return dict(record) if record is not None else None
+    def claim_proposal(self, *, user_id, proposal_ref, args_hash, now):
+        self.trace.append("claim_proposal")
+        row = self.proposals.get(proposal_ref)
+        if row is None or row["state"] != "PENDING":
+            raise RuntimeError("proposal is unavailable")
+        record = row["record"]
+        if (
+            record.user_id != user_id
+            or record.args_hash != args_hash
+            or now >= record.expires_at
+        ):
+            raise RuntimeError("proposal binding is invalid")
+        row["state"] = "CLAIMED"
+        return record
 
     # --- schedules -----------------------------------------------------
     def commit_schedule(self, spec, delivery_target, *, expect_absent: bool) -> None:
@@ -178,6 +193,7 @@ def service(repository, eventbridge, occurrence_queue, clock, nonce_sequence):
         queue=occurrence_queue,
         clock=clock,
         nonce_factory=nonce_sequence,
+        catalog_digest="a" * 64,
         uncertain_errors=(ProviderUncertainError,),
     )
 

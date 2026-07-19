@@ -23,6 +23,7 @@ from aws_cdk import (
     aws_kms as kms,
     aws_lambda as _lambda,
     aws_logs as logs,
+    aws_scheduler as scheduler,
 )
 import cdk_nag
 from constructs import Construct
@@ -30,8 +31,15 @@ from constructs import Construct
 
 REQUIRED_REGION = "eu-west-1"
 INGRESS_FUNCTION_NAME = "personal-operator-scheduler-ingress"
+CONTROL_FUNCTION_NAME = "personal-operator-scheduler-control"
 CONTROL_TABLE_NAME = "personal-operator-scheduler-control"
+SCHEDULE_GROUP_NAME = "personal-operator-v1"
 _QUEUE_ARN = re.compile(r"arn:aws:sqs:eu-west-1:[0-9]{12}:[A-Za-z0-9_-]+\.fifo")
+_CATALOG_DIGEST = re.compile(r"[0-9a-f]{64}")
+_TABLE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,255}")
+_TABLE_ARN = re.compile(
+    r"arn:aws:dynamodb:eu-west-1:[0-9]{12}:table/[A-Za-z0-9_.-]{3,255}"
+)
 
 
 class SchedulerStack(Stack):
@@ -44,6 +52,9 @@ class SchedulerStack(Stack):
         cmk_arn: str,
         update_queue_arn: str,
         update_queue_url: str,
+        catalog_digest: str,
+        capability_state_table_name: str,
+        capability_state_table_arn: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -58,6 +69,27 @@ class SchedulerStack(Stack):
             raise ValueError("SchedulerStack requires the trusted Lambda asset")
         if not isinstance(cmk_arn, str) or not cmk_arn:
             raise ValueError("SchedulerStack requires one exact CMK ARN")
+        if (
+            not isinstance(catalog_digest, str)
+            or _CATALOG_DIGEST.fullmatch(catalog_digest) is None
+        ):
+            raise ValueError("SchedulerStack requires the frozen catalog digest")
+        if (
+            not isinstance(capability_state_table_name, str)
+            or (
+                not Token.is_unresolved(capability_state_table_name)
+                and _TABLE_NAME.fullmatch(capability_state_table_name) is None
+            )
+        ):
+            raise ValueError("SchedulerStack requires the capability state table")
+        if (
+            not isinstance(capability_state_table_arn, str)
+            or (
+                not Token.is_unresolved(capability_state_table_arn)
+                and _TABLE_ARN.fullmatch(capability_state_table_arn) is None
+            )
+        ):
+            raise ValueError("SchedulerStack requires the capability state table ARN")
         # The FIFO ARN/URL arrive as CDK cross-stack tokens at synth time; only
         # concrete values are pattern-checked.
         if not isinstance(update_queue_arn, str) or (
@@ -77,6 +109,13 @@ class SchedulerStack(Stack):
         encryption_key = kms.Key.from_key_arn(
             self, "SchedulerControlEncryptionKey", cmk_arn
         )
+
+        self.schedule_group = scheduler.CfnScheduleGroup(
+            self,
+            "PersonalOperatorScheduleGroup",
+            name=SCHEDULE_GROUP_NAME,
+        )
+        self.schedule_group.apply_removal_policy(RemovalPolicy.RETAIN)
 
         # --- Control table (CMK, PITR, RETAIN) ---
         self.control_table = dynamodb.Table(
@@ -98,12 +137,26 @@ class SchedulerStack(Stack):
                 )
             ),
             deletion_protection=True,
+            time_to_live_attribute="ttl",
             removal_policy=RemovalPolicy.RETAIN,
         )
         self.control_table.add_global_secondary_index(
-            index_name="userId-index",
+            index_name="schedule-user-index-v1",
             partition_key=dynamodb.Attribute(
-                name="userId", type=dynamodb.AttributeType.STRING
+                name="scheduleUserId", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="scheduleSortKey", type=dynamodb.AttributeType.STRING
+            ),
+            projection_type=dynamodb.ProjectionType.KEYS_ONLY,
+        )
+        self.control_table.add_global_secondary_index(
+            index_name="proposal-user-index-v1",
+            partition_key=dynamodb.Attribute(
+                name="proposalUserId", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="proposalSortKey", type=dynamodb.AttributeType.STRING
             ),
             projection_type=dynamodb.ProjectionType.KEYS_ONLY,
         )
@@ -114,6 +167,13 @@ class SchedulerStack(Stack):
             log_group_name="/personal-operator/lambda/scheduler-ingress",
             retention=logs.RetentionDays.ONE_MONTH,
             removal_policy=RemovalPolicy.DESTROY,
+        )
+        control_log_group = logs.LogGroup(
+            self,
+            "SchedulerControlLogGroup",
+            log_group_name="/personal-operator/lambda/scheduler-control",
+            retention=logs.RetentionDays.ONE_MONTH,
+            removal_policy=RemovalPolicy.RETAIN,
         )
 
         # --- Ingress execution role: strong-read + FIFO send + scoped KMS ---
@@ -141,13 +201,8 @@ class SchedulerStack(Stack):
                 actions=[
                     "dynamodb:GetItem",
                     "dynamodb:PutItem",
-                    "dynamodb:UpdateItem",
-                    "dynamodb:Query",
                 ],
-                resources=[
-                    self.control_table.table_arn,
-                    f"{self.control_table.table_arn}/index/*",
-                ],
+                resources=[self.control_table.table_arn],
             )
         )
         ingress_role.add_to_policy(
@@ -222,6 +277,123 @@ class SchedulerStack(Stack):
             )
         )
 
+        # --- Approval/apply Lambda: exact local intent + exact Scheduler group ---
+        control_role = iam.Role(
+            self,
+            "SchedulerControlRole",
+            role_name=f"personal-operator-scheduler-control-{region}",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description=(
+                "Trusted exact one-time schedule approval boundary with no "
+                "runtime, external integration, secret, or queue authority"
+            ),
+        )
+        control_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                resources=[
+                    f"arn:aws:logs:{region}:{account}:log-group:"
+                    "/personal-operator/lambda/scheduler-control:*"
+                ],
+            )
+        )
+        control_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:GetItem"],
+                resources=[capability_state_table_arn],
+            )
+        )
+        control_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "dynamodb:GetItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:Query",
+                    "dynamodb:BatchWriteItem",
+                    "dynamodb:TransactWriteItems",
+                ],
+                resources=[self.control_table.table_arn],
+            )
+        )
+        schedule_group_arn = (
+            f"arn:aws:scheduler:{region}:{account}:"
+            f"schedule-group/{SCHEDULE_GROUP_NAME}"
+        )
+        schedule_arn = (
+            f"arn:aws:scheduler:{region}:{account}:"
+            f"schedule/{SCHEDULE_GROUP_NAME}/po-*"
+        )
+        control_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "scheduler:CreateSchedule",
+                    "scheduler:GetSchedule",
+                    "scheduler:DeleteSchedule",
+                ],
+                resources=[schedule_group_arn, schedule_arn],
+            )
+        )
+        control_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["iam:PassRole"],
+                resources=[self.scheduler_role.role_arn],
+                conditions={
+                    "StringEquals": {
+                        "iam:PassedToService": "scheduler.amazonaws.com"
+                    }
+                },
+            )
+        )
+        control_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "kms:Decrypt",
+                    "kms:DescribeKey",
+                    "kms:Encrypt",
+                    "kms:GenerateDataKey*",
+                    "kms:ReEncrypt*",
+                ],
+                resources=[cmk_arn],
+                conditions={
+                    "StringEquals": {"kms:CallerAccount": account},
+                    "ForAnyValue:StringEquals": {
+                        "kms:ViaService": [
+                            f"dynamodb.{region}.amazonaws.com",
+                            f"scheduler.{region}.amazonaws.com",
+                        ]
+                    },
+                },
+            )
+        )
+
+        self.control_function = _lambda.Function(
+            self,
+            "SchedulerControlFunction",
+            function_name=CONTROL_FUNCTION_NAME,
+            runtime=_lambda.Runtime.PYTHON_3_13,
+            architecture=_lambda.Architecture.ARM_64,
+            handler="scheduler.control.lambda_handler",
+            code=_lambda.Code.from_asset(trusted_code_asset_root),
+            role=control_role,
+            timeout=Duration.seconds(30),
+            memory_size=256,
+            reserved_concurrent_executions=10,
+            log_group=control_log_group,
+            environment={
+                "AWS_REGION_LOCK": REQUIRED_REGION,
+                "CAPABILITY_CATALOG_DIGEST": catalog_digest,
+                "CAPABILITY_STATE_TABLE_NAME": capability_state_table_name,
+                "SCHEDULER_CONTROL_TABLE_NAME": CONTROL_TABLE_NAME,
+                "SCHEDULER_GROUP_NAME": SCHEDULE_GROUP_NAME,
+                "SCHEDULER_INGRESS_FUNCTION_ARN": self.ingress_function_arn,
+                "SCHEDULER_INVOKE_ROLE_ARN": self.scheduler_role.role_arn,
+            },
+        )
+        self.control_function.node.add_dependency(self.schedule_group)
+        self.control_function_arn = (
+            f"arn:aws:lambda:{region}:{account}:function:{CONTROL_FUNCTION_NAME}"
+        )
+
         CfnOutput(
             self,
             "SchedulerIngressFunctionArn",
@@ -234,13 +406,18 @@ class SchedulerStack(Stack):
         )
         CfnOutput(
             self,
+            "SchedulerControlFunctionArn",
+            value=self.control_function_arn,
+        )
+        CfnOutput(
+            self,
             "SchedulerControlTableName",
             value=self.control_table.table_name,
         )
 
         # --- cdk-nag suppressions (mirroring router_stack style) ---
         cdk_nag.NagSuppressions.add_resource_suppressions(
-            self.ingress_function,
+            [self.ingress_function, self.control_function],
             [
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-L1",
@@ -258,8 +435,8 @@ class SchedulerStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason=(
                         "The only wildcards select streams beneath the one exact "
-                        "precreated scheduler-ingress log group and the control "
-                        "table's own KEYS_ONLY index; both are resource bound."
+                        "precreated scheduler-ingress log group; no other log "
+                        "group or data resource is reachable."
                     ),
                 ),
                 cdk_nag.NagPackSuppression(
@@ -269,6 +446,33 @@ class SchedulerStack(Stack):
                         "directions and both GenerateDataKey variants; these "
                         "actions remain restricted to the exact key, account, and "
                         "the DynamoDB/SQS via-service boundary."
+                    ),
+                    applies_to=[
+                        "Action::kms:GenerateDataKey*",
+                        "Action::kms:ReEncrypt*",
+                    ],
+                ),
+            ],
+            apply_to_children=True,
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            control_role,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason=(
+                        "Wildcards are limited to streams beneath one exact log "
+                        "group and opaque po-* schedules in one exact retained "
+                        "Scheduler group."
+                    ),
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason=(
+                        "DynamoDB and Scheduler CMK data access require both "
+                        "ReEncrypt directions and GenerateDataKey variants; the "
+                        "actions remain exact-key, exact-account, and via-service "
+                        "restricted."
                     ),
                     applies_to=[
                         "Action::kms:GenerateDataKey*",
@@ -298,7 +502,9 @@ class SchedulerStack(Stack):
 
 
 __all__ = [
+    "CONTROL_FUNCTION_NAME",
     "CONTROL_TABLE_NAME",
     "INGRESS_FUNCTION_NAME",
+    "SCHEDULE_GROUP_NAME",
     "SchedulerStack",
 ]

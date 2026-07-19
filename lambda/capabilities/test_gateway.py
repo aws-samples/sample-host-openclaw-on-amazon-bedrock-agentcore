@@ -187,6 +187,7 @@ class FakeRepository:
                 uses=0,
             )
         self.claimed_target_calls: dict[str, set[str]] = {}
+        self.turn_grant = _turn_grant(catalog, target_grant=target_grant)
 
     def strong_read_global_kill_switch(self) -> bool:
         self.trace.append("global_kill")
@@ -213,6 +214,15 @@ class FakeRepository:
         ) and runtime_qualifier == self.runtime.get("runtimeQualifier"):
             return self.runtime
         return None
+
+    def strong_read_turn_grant(self, user_id: str, invocation_id: str):
+        self.trace.append("turn_grant")
+        if (
+            user_id != self.turn_grant.get("sub")
+            or invocation_id != self.turn_grant.get("invocationId")
+        ):
+            return None
+        return dict(self.turn_grant)
 
     def strong_read_installation(self, user_id: str, pack_id: str):
         self.trace.append("installation")
@@ -311,6 +321,12 @@ def _rebind_repository(repository, *, user_id: str, session_id: str) -> None:
         )
         for pack_id, installation in repository.installations.items()
     }
+    repository.turn_grant = {
+        **repository.turn_grant,
+        "sub": user_id,
+        "sessionId": session_id,
+        "nonce": "nonce_876543210abcdef",
+    }
 
 
 class FailFirstCompletionLedger:
@@ -358,6 +374,64 @@ def test_gateway_modules_and_interfaces_exist():
     assert callable(Ledger)
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"allowedPackIds": sorted([*_turn_grant(_catalog())["allowedPackIds"], "synthetic.extra"])},
+        {
+            "allowedOperationIds": sorted(
+                [
+                    *_turn_grant(_catalog())["allowedOperationIds"],
+                    "synthetic.operation",
+                ]
+            )
+        },
+        {"iat": NOW - 30},
+        {"exp": NOW + 200},
+        {"maxCalls": 64},
+        {"nonce": "nonce_876543210abcdef"},
+    ],
+)
+def test_first_call_denies_any_runtime_mutation_of_the_issued_turn_grant(override):
+    catalog, _repository, adapter, gateway, _ = _gateway()
+
+    result = gateway.invoke(
+        _call(catalog, "schedule.list", {}),
+        _iam(catalog, grant_overrides=override),
+    )
+
+    assert result.status == "DENIED"
+    assert result.error_code == "GRANT_AUTHORITY_MISMATCH"
+    assert adapter.calls == []
+
+
+def test_scheduled_turn_cannot_expand_its_issued_pack_or_operation_inventory():
+    catalog, repository, adapter, gateway, _ = _gateway()
+    rows = _operation_rows(catalog)
+    scheduled_operations = [
+        "schedule.cancel.propose",
+        "schedule.list",
+        "schedule.propose",
+        "web.exact.read",
+        "workspace.file.list",
+        "workspace.file.read",
+    ]
+    repository.turn_grant = {
+        **repository.turn_grant,
+        "allowedOperationIds": scheduled_operations,
+        "allowedPackIds": sorted(rows[operation][0]["packId"] for operation in scheduled_operations),
+    }
+
+    result = gateway.invoke(
+        _call(catalog, "schedule.list", {}),
+        _iam(catalog),
+    )
+
+    assert result.status == "DENIED"
+    assert result.error_code == "GRANT_AUTHORITY_MISMATCH"
+    assert adapter.calls == []
+
+
 def test_happy_path_strong_reads_every_live_binding_and_rechecks_deletion_last():
     catalog, repository, adapter, gateway, _ = _gateway()
     call = _call(catalog, "schedule.list", {})
@@ -368,6 +442,7 @@ def test_happy_path_strong_reads_every_live_binding_and_rechecks_deletion_last()
     assert result.to_mapping()["data"] == {"schedules": []}
     assert len(adapter.calls) == 1
     assert repository.trace == [
+        "turn_grant",
         "deletion",
         "global_kill",
         "user",
@@ -387,7 +462,10 @@ def test_happy_path_strong_reads_every_live_binding_and_rechecks_deletion_last()
             ),
             "IAM_CALLER_DENIED",
         ),
-        (lambda repo, iam: iam["turnGrant"].update(sub="user_beta"), "USER_NOT_ACTIVE"),
+        (
+            lambda repo, iam: iam["turnGrant"].update(sub="user_beta"),
+            "GRANT_AUTHORITY_MISMATCH",
+        ),
         (
             lambda repo, iam: repo.session.update(userId="user_beta"),
             "SESSION_BINDING_MISMATCH",
@@ -418,7 +496,7 @@ def test_happy_path_strong_reads_every_live_binding_and_rechecks_deletion_last()
                 iat=NOW - 400,
                 exp=NOW,
             ),
-            "GRANT_EXPIRED",
+            "GRANT_AUTHORITY_MISMATCH",
         ),
         (
             lambda repo, iam: setattr(repo, "global_kill_switch", True),
@@ -580,7 +658,7 @@ def test_cached_call_rejects_a_different_exact_grant_before_returning_result():
 
     assert first.status == "SUCCEEDED"
     assert changed.status == "DENIED"
-    assert changed.error_code == "CAPABILITY_GRANT_BINDING_MISMATCH"
+    assert changed.error_code == "GRANT_AUTHORITY_MISMATCH"
     assert len(adapter.calls) == 1
 
 
@@ -696,7 +774,8 @@ def test_read_retry_is_bounded_and_fresh_tool_use_cannot_bypass_same_call_fence(
 
 
 def test_grant_and_pack_call_quotas_are_atomic_and_deny_before_second_dispatch():
-    catalog, _, adapter, gateway, _ = _gateway()
+    catalog, repository, adapter, gateway, _ = _gateway()
+    repository.turn_grant = {**repository.turn_grant, "maxCalls": 1}
     iam = _iam(catalog, grant_overrides={"maxCalls": 1})
 
     first = gateway.invoke(
@@ -883,15 +962,15 @@ class FakeSchedulePort:
     def list_view(self, user_id):
         return {"schedules": []}
 
-    def propose(self, *, user_id, task_type, definition):
-        self.proposals.append((user_id, task_type, definition))
+    def propose(self, *, user_id, invocation_id, task_type, definition):
+        self.proposals.append((user_id, invocation_id, task_type, definition))
         return {
             "proposalRef": "prop_" + "a" * 60,
             "expiresAt": NOW + 900,
         }
 
-    def cancel_propose(self, *, user_id, schedule_id):
-        self.cancels.append((user_id, schedule_id))
+    def cancel_propose(self, *, user_id, invocation_id, schedule_id):
+        self.cancels.append((user_id, invocation_id, schedule_id))
         return {
             "proposalRef": "prop_" + "b" * 60,
             "expiresAt": NOW + 900,
@@ -938,6 +1017,7 @@ def test_schedule_propose_adapter_returns_proposal_never_a_live_schedule():
     assert result.proposal_ref == data["proposalRef"]
     # A proposal was recorded; no live schedule and no receipt exist.
     assert len(port.proposals) == 1
+    assert port.proposals[0][1] == call.invocation_id
     assert result.to_mapping()["receiptRef"] is None
 
 

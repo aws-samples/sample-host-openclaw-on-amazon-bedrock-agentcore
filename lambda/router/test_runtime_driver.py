@@ -1095,11 +1095,215 @@ def test_runtime_driver_mints_and_delivers_server_owned_turn_authority():
             "invocation_id": TRACE,
             "message_text": "read https://example.com/exact",
             "scheduled_read_only": True,
+            "channel": None,
+            "actor_id": None,
         }
     ]
     payload = adapter.events[0][3]
     assert payload["turnCapabilityGrant"]["nonce"] == "nonce_12345678"
     assert payload["externalEffects"] is False
+
+
+def test_runtime_driver_grant_reaches_all_six_gateway_capabilities_with_exact_bindings():
+    from pathlib import Path
+
+    from capabilities.catalog import compile_catalog
+    from capabilities.composition import build_production_composition
+    from capabilities.contracts import (
+        CapabilityCallV1,
+        canonical_sha256,
+        derive_call_id,
+    )
+    from capabilities.durable import DynamoTurnAuthorityRepository
+    from capabilities.issuer import TurnCapabilityIssuer
+    from capabilities.test_composition import (
+        MemoryDynamoClient,
+        TrustedComputeAdapter,
+        TrustedWebAdapter,
+    )
+
+    now = 1_800_000_000
+    artifact_root = Path(__file__).resolve().parents[2] / "specs" / "capabilities"
+    _, catalog = compile_catalog(SOURCE_COMMIT, artifact_root / "schemas")
+    client = MemoryDynamoClient()
+    caller_arn = (
+        "arn:aws:iam::123456789012:role/"
+        "openclaw-agentcore-execution-role-eu-west-1"
+    )
+    runtime_iam_arn = (
+        "arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/"
+        "openclaw_agent-0123456789"
+    )
+    environment = {
+        "AWS_REGION": "eu-west-1",
+        "CAPABILITY_STATE_TABLE_NAME": "personal-operator-capability-state",
+        "CAPABILITY_RELEASE_COMMIT": SOURCE_COMMIT,
+        "CAPABILITY_CATALOG_DIGEST": catalog.catalog_digest,
+        "CAPABILITY_ALLOWED_CALLER_ARN": caller_arn,
+        "SCHEDULER_CONTROL_TABLE_NAME": "personal-operator-scheduler-control",
+    }
+    class SchedulePort:
+        def list_view(self, user_id):
+            assert user_id == USER
+            return {"schedules": []}
+
+        def propose(self, *, user_id, invocation_id, task_type, definition):
+            assert user_id == USER
+            assert invocation_id == TRACE
+            return {
+                "proposalRef": "proposal_12345678",
+                "expiresAt": now + 300,
+            }
+
+        def cancel_propose(self, *, user_id, invocation_id, schedule_id):
+            assert user_id == USER
+            assert invocation_id == TRACE
+            return {
+                "proposalRef": "proposal_87654321",
+                "expiresAt": now + 300,
+            }
+
+    compute = TrustedComputeAdapter()
+    production = build_production_composition(
+        env=environment,
+        artifact_root=artifact_root,
+        dynamodb_client=client,
+        clock=lambda: now,
+        web_read_adapter=TrustedWebAdapter(),
+        schedule_port=SchedulePort(),
+        compute_adapters={"compute.run": compute, "compute.status": compute},
+    )
+    rows = {
+        operation["operationId"]: operation
+        for pack in catalog.packs
+        for operation in pack["operations"]
+    }
+    cases = [
+        ("web.exact.read", {"url": "https://example.com/exact"}),
+        ("schedule.list", {}),
+        (
+            "schedule.propose",
+            {
+                "taskType": "REMINDER",
+                "definition": {
+                    "message": "review notes",
+                    "runAt": now + 3600,
+                    "timezone": "Europe/Tallinn",
+                },
+            },
+        ),
+        (
+            "schedule.cancel.propose",
+            {"scheduleId": "schedule_12345678"},
+        ),
+        (
+            "compute.run",
+            {
+                "command": {"mode": "SCRIPT", "value": "print('safe')"},
+                "inputPaths": [],
+                "network": "NONE",
+                "resourceProfile": "SMALL",
+            },
+        ),
+        ("compute.status", {"jobId": "job_12345678"}),
+    ]
+
+    class ExercisingAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.capability_results = []
+
+        def invoke(self, *, session_id, user_id, payload, trace_id):
+            grant = payload["turnCapabilityGrant"]
+            assert grant["sub"] == user_id == USER
+            assert grant["sessionId"] == session_id == SESSION
+            assert grant["invocationId"] == trace_id == TRACE
+            assert grant["runtimeArn"] == runtime_iam_arn
+            assert grant["releaseCommit"] == SOURCE_COMMIT
+            assert grant["catalogDigest"] == catalog.catalog_digest
+            for index, (operation_id, arguments) in enumerate(cases, start=1):
+                operation = rows[operation_id]
+                tool_use_id = f"tooluse_{index:08d}"
+                args_hash = canonical_sha256(arguments)
+                call = CapabilityCallV1.from_mapping(
+                    {
+                        "schema": CapabilityCallV1.SCHEMA,
+                        "callId": derive_call_id(
+                            trace_id,
+                            tool_use_id,
+                            catalog.catalog_digest,
+                            operation_id,
+                            operation["toolName"],
+                            args_hash,
+                        ),
+                        "invocationId": trace_id,
+                        "toolUseId": tool_use_id,
+                        "catalogDigest": catalog.catalog_digest,
+                        "operationId": operation_id,
+                        "toolName": operation["toolName"],
+                        "arguments": arguments,
+                        "argsHash": args_hash,
+                    }
+                )
+                self.capability_results.append(
+                    production.invoke(
+                        {
+                            "schema": (
+                                "personal-operator.capability-relay-envelope.v1"
+                            ),
+                            "grant": grant,
+                            "call": call.to_mapping(),
+                        }
+                    )
+                )
+            return self.response
+
+    adapter = ExercisingAdapter()
+    authority = DynamoTurnAuthorityRepository(
+        client=client,
+        table_name="personal-operator-capability-state",
+        catalog=catalog,
+    )
+    driver = RuntimeDriver(
+        repository=FakeRepository(),
+        adapter=adapter,
+        workspace_capability_signer=FakeWorkspaceCapabilitySigner(),
+        turn_capability_issuer=TurnCapabilityIssuer(
+            catalog=catalog,
+            authority_repository=authority,
+            runtime_arn=runtime_iam_arn,
+            runtime_qualifier=RELEASE_ENDPOINT,
+            clock=lambda: now,
+            nonce_factory=lambda: "nonce_12345678",
+        ),
+        owner_factory=lambda: "owner-a",
+        session_id_factory=lambda: NEW_SESSION,
+        lease_ms=30_000,
+        max_execution_ms=20_000,
+    )
+
+    driver.invoke(
+        USER,
+        {
+            "message": "read https://example.com/exact",
+            "actorId": "telegram:12345678",
+            "channel": "telegram",
+        },
+        TRACE,
+    )
+
+    assert [result.status for result in adapter.capability_results] == [
+        "SUCCEEDED",
+        "SUCCEEDED",
+        "PENDING_APPROVAL",
+        "PENDING_APPROVAL",
+        "SUCCEEDED",
+        "SUCCEEDED",
+    ]
+    assert all(
+        result.error_code != "ADAPTER_DISABLED"
+        for result in adapter.capability_results
+    )
 
 
 def test_driver_heartbeats_long_running_invocation_under_same_fence():

@@ -17,11 +17,16 @@ from scheduler import ingress
 def _confirmed(service):
     proposal = service.propose(
         user_id="user_a1",
+        invocation_id="invocation_12345678",
         task_type="REMINDER",
         definition=reminder_definition(),
         delivery_target=DELIVERY_TARGET,
     )
-    return service.confirm(proposal.proposal_ref)
+    return service.confirm(
+        user_id="user_a1",
+        proposal_ref=proposal.proposal_ref,
+        args_hash=proposal.args_hash,
+    )
 
 
 def test_ingress_delegates_valid_opaque_payload_to_service_fire(
@@ -120,6 +125,11 @@ def test_packaged_production_handler_strong_reads_and_enqueues_with_injected_aws
                 "Item": {
                     "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
                     "SK": {"S": "STATE"},
+                    "userId": {"S": spec.user_id},
+                    "scheduleUserId": {"S": spec.user_id},
+                    "scheduleSortKey": {
+                        "S": f"SCHEDULE#{spec.schedule_id}"
+                    },
                     "recordJson": {
                         "S": json.dumps(
                             spec.to_mapping(),

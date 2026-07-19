@@ -69,11 +69,16 @@ def test_scheduled_turn_can_read_or_prepare_a_fresh_proposal_only():
 def test_scheduled_agent_occurrence_body_marks_external_effects_false(service):
     proposal = service.propose(
         user_id="user_a1",
+        invocation_id="invocation_12345678",
         task_type="READ_ONLY_AGENT_TURN",
         definition=agent_turn_definition(),
         delivery_target=DELIVERY_TARGET,
     )
-    spec = service.confirm(proposal.proposal_ref)
+    spec = service.confirm(
+        user_id="user_a1",
+        proposal_ref=proposal.proposal_ref,
+        args_hash=proposal.args_hash,
+    )
     from scheduler.models import SchedulePayloadV1
 
     service.fire(

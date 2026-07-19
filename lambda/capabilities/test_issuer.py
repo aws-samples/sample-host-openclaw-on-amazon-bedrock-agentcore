@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from capabilities.contracts import (
@@ -23,8 +25,8 @@ class Repository:
         self.calls = []
         self.error = error
 
-    def prepare_turn(self, *, grant, targets):
-        self.calls.append((grant, tuple(targets)))
+    def prepare_turn(self, *, grant, targets, delivery_context=None):
+        self.calls.append((grant, tuple(targets), delivery_context))
         if self.error is not None:
             raise self.error
 
@@ -48,6 +50,8 @@ def test_mints_and_persists_exact_current_turn_and_target_authority():
         invocation_id="invocation_12345678",
         message_text="read https://example.com/exact",
         scheduled_read_only=False,
+        channel="telegram",
+        actor_id="telegram:42",
     )
 
     assert grant["sub"] == "user_alpha"
@@ -59,13 +63,18 @@ def test_mints_and_persists_exact_current_turn_and_target_authority():
     assert grant["exp"] == NOW + 300
     assert len(grant["allowedOperationIds"]) == 10
     assert len(grant["targetGrantHashes"]) == 1
-    persisted_grant, targets = repository.calls[0]
+    persisted_grant, targets, delivery_context = repository.calls[0]
     assert persisted_grant.to_mapping() == grant
     assert len(targets) == 1
     assert targets[0].grant.tenant_binding == derive_target_tenant_binding(
         "user_alpha"
     )
     assert targets[0].grant.current_request_id == "invocation_12345678"
+    assert delivery_context == {
+        "channel": "telegram",
+        "actorId": "telegram:42",
+        "chatId": "42",
+    }
 
 
 def test_scheduled_grant_contains_only_catalog_derived_read_and_propose_operations():
@@ -127,6 +136,8 @@ def test_durable_authority_bootstraps_once_then_missing_or_killed_state_fails_cl
         invocation_id="invocation_12345678",
         message_text="read https://example.com/exact",
         scheduled_read_only=False,
+        channel="telegram",
+        actor_id="telegram:42",
     )
 
     assert minted["allowedPackIds"]
@@ -136,6 +147,16 @@ def test_durable_authority_bootstraps_once_then_missing_or_killed_state_fails_cl
     assert all(
         ("USER#user_alpha", f"INSTALL#{pack_id}") in client.items
         for pack_id in minted["allowedPackIds"]
+    )
+    assert client.items[("USER#user_alpha", "TURN#invocation_12345678")][
+        "recordJson"
+    ] == json.dumps(minted, sort_keys=True, separators=(",", ":"))
+    delivery = client.items[("TURN#invocation_12345678", "DELIVERY")]
+    assert delivery["recordJson"] == (
+        '{"actorId":"telegram:42","channel":"telegram","chatId":"42",'
+        '"invocationId":"invocation_12345678",'
+        '"schema":"personal-operator.turn-delivery-context.v1",'
+        '"userId":"user_alpha"}'
     )
 
     client.items[("CONTROL", "GLOBAL")]["recordJson"] = '{"enabled":true}'
@@ -212,6 +233,6 @@ def test_durable_authority_rejects_operation_inventory_that_differs_from_packs()
     )
 
     with pytest.raises(ValueError, match="operation authority"):
-        repository.prepare_turn(grant=grant, targets=[])
+        repository.prepare_turn(grant=grant, targets=[], delivery_context=None)
 
     assert client.items == {}
