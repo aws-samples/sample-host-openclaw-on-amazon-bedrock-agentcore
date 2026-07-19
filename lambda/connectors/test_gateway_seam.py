@@ -66,8 +66,33 @@ def test_registry_refuses_connector_op_colliding_with_model_catalog():
 def test_production_composition_wires_connector_registry_empty():
     import capabilities.composition as composition
 
-    source = Path(composition.__file__).read_text(encoding="utf-8")
-    # The production gateway still wires model adapters empty; the connector
-    # plane is likewise disabled by default (never enabled in composition).
-    assert "adapters={}" in source
-    assert "ConnectorPlaneRegistry" not in source or "adapters={}" in source
+    class _DynamoClient:
+        @staticmethod
+        def get_item(**_kwargs):
+            return {}
+
+    catalog = _catalog()
+    production = composition.build_production_composition(
+        env={
+            "AWS_REGION": "eu-west-1",
+            "CAPABILITY_RELEASE_COMMIT": RELEASE_COMMIT,
+            "CAPABILITY_CATALOG_DIGEST": catalog.catalog_digest,
+            "CAPABILITY_STATE_TABLE_NAME": "synthetic-capability-state",
+            "CAPABILITY_ALLOWED_CALLER_ARN": (
+                "arn:aws:iam::123456789012:role/"
+                "openclaw-agentcore-execution-role-eu-west-1"
+            ),
+        },
+        artifact_root=Path(__file__).resolve().parents[2]
+        / "specs"
+        / "capabilities",
+        dynamodb_client=_DynamoClient(),
+        clock=lambda: 1_800_000_000,
+    )
+    connector_ops = {
+        operation["operationId"]
+        for manifest in manifest_module.build_curated_registry().values()
+        for operation in manifest.operations
+    }
+    enabled_model_ops = set(production.gateway._adapters)
+    assert connector_ops.isdisjoint(enabled_model_ops)

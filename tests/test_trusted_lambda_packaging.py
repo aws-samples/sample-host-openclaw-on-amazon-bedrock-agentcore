@@ -23,6 +23,17 @@ from stacks.trusted_lambda_asset import (
     resolve_trusted_lambda_asset_metadata,
 )
 
+TRUSTED_CONNECTOR_BROWSER_SCHEMAS = (
+    "browser/schemas/browser-action-input.json",
+    "browser/schemas/browser-action-output.json",
+    "browser/schemas/browser-observe-input.json",
+    "browser/schemas/browser-observe-output.json",
+    "connectors/schemas/synthetic-notes-append-input.json",
+    "connectors/schemas/synthetic-notes-append-output.json",
+    "connectors/schemas/synthetic-notes-read-list-input.json",
+    "connectors/schemas/synthetic-notes-read-list-output.json",
+)
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build-trusted-lambda-asset.sh"
@@ -134,6 +145,10 @@ def _packaging_subprocess_fixture(
         source = repository / "lambda" / relative
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text(f"# {relative}\n", encoding="utf-8")
+    for index, relative in enumerate(TRUSTED_CONNECTOR_BROWSER_SCHEMAS):
+        source = repository / "lambda" / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(f'{{"schema":"fixture-{index}"}}\n', encoding="utf-8")
     capability_specs = repository / "specs" / "capabilities"
     (capability_specs / "schemas").mkdir(parents=True, exist_ok=True)
     (capability_specs / "catalog-v1.json").write_text(
@@ -176,6 +191,8 @@ import os
 import pathlib
 import sys
 
+TRUSTED_CONNECTOR_BROWSER_SCHEMAS = {TRUSTED_CONNECTOR_BROWSER_SCHEMAS!r}
+
 args = sys.argv[1:]
 stdin = sys.stdin.read()
 with pathlib.Path(os.environ["FAKE_DOCKER_LOG"]).open("a", encoding="utf-8") as stream:
@@ -214,7 +231,11 @@ if "lambda_asset build" in stdin:
     payload = pathlib.Path(payload_mount.removesuffix(":/payload:rw"))
     output = output_parent / args[-1]
     source = workspace / "lambda"
-    for source_path in list(source.rglob("*.py")) + [source / "requirements.txt"]:
+    for source_path in (
+        list(source.rglob("*.py"))
+        + [source / "requirements.txt"]
+        + [source / relative for relative in TRUSTED_CONNECTOR_BROWSER_SCHEMAS]
+    ):
         target = payload / source_path.relative_to(source)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source_path.read_bytes())
@@ -443,6 +464,14 @@ def _write_source_and_payload(root: pathlib.Path) -> tuple[pathlib.Path, pathlib
         payload_path.parent.mkdir(parents=True, exist_ok=True)
         payload_path.write_bytes(source_path.read_bytes())
         payload_path.chmod(0o644)
+    for index, relative in enumerate(TRUSTED_CONNECTOR_BROWSER_SCHEMAS):
+        source_path = source / relative
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(f'{{"schema":"synthetic-{index}"}}\n', encoding="utf-8")
+        payload_path = payload / relative
+        payload_path.parent.mkdir(parents=True, exist_ok=True)
+        payload_path.write_bytes(source_path.read_bytes())
+        payload_path.chmod(0o644)
     # The immutable capability catalog and its exact 20-schema set live under
     # specs/capabilities beside the lambda source and are packaged into
     # capabilities/artifacts/ in the payload, matching the production builder.
@@ -519,10 +548,47 @@ def test_lambda_zip_is_byte_identical_across_independent_builds(
     assert first_manifest.platform == "linux/arm64"
     assert first_manifest.python == "3.13"
     assert first_manifest.archive_name == "trusted-lambda.zip"
+    source_inventory = {item.path for item in first_manifest.source_files}
+    assert set(TRUSTED_CONNECTOR_BROWSER_SCHEMAS).issubset(source_inventory)
     with __import__("zipfile").ZipFile(first / "trusted-lambda.zip") as archive:
         names = archive.namelist()
     assert names == sorted(names)
     assert {"MANIFEST.json", "ASSET.sha256", "SHA256SUMS"}.isdisjoint(names)
+
+
+@pytest.mark.parametrize("drift", ["missing", "extra", "substituted", "symlink"])
+def test_build_rejects_connector_browser_schema_inventory_or_byte_drift(
+    tmp_path: pathlib.Path,
+    drift: str,
+) -> None:
+    source, payload = _write_source_and_payload(tmp_path)
+    relative = TRUSTED_CONNECTOR_BROWSER_SCHEMAS[0]
+    if drift == "missing":
+        (source / relative).unlink()
+    elif drift == "extra":
+        (source / "browser" / "schemas" / "unreviewed.json").write_text(
+            '{}\n', encoding="utf-8"
+        )
+    elif drift == "substituted":
+        (payload / relative).write_text('{"schema":"attacker"}\n', encoding="utf-8")
+    else:
+        target = source / relative
+        target.unlink()
+        target.symlink_to(source / TRUSTED_CONNECTOR_BROWSER_SCHEMAS[1])
+
+    with pytest.raises(
+        ContractError,
+        match="connector/browser schema inventory|trusted Lambda source inventory|packaged source differs",
+    ):
+        build_trusted_lambda_artifacts(
+            payload,
+            source,
+            tmp_path / "asset",
+            source_commit="a" * 40,
+            source_tree="b" * 40,
+            builder_image="public.ecr.aws/lambda/python@sha256:" + "2" * 64,
+            builder_image_id="sha256:" + "3" * 64,
+        )
 
 
 @pytest.mark.parametrize("missing", ["handler", "dependency"])

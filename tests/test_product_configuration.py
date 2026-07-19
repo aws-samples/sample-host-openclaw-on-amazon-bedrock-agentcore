@@ -408,6 +408,21 @@ def test_cdk_nag_guard_rejects_missing_reports(tmp_path: Path) -> None:
     assert "No AwsSolutions NagReport CSV files found" in completed.stderr
 
 
+def test_local_aggregate_executes_every_phase5_python_and_stack_suite() -> None:
+    script = (ROOT / "scripts/test-local.sh").read_text(encoding="utf-8")
+    required = {
+        "lambda/compute",
+        "lambda/connectors",
+        "lambda/browser",
+        "lambda/scheduler",
+        "tests/test_compute_stack.py",
+        "tests/test_browser_stack.py",
+        "tests/test_scheduler_stack.py",
+    }
+    for suite in required:
+        assert suite in script, f"local aggregate omits {suite}"
+
+
 def test_runtime_role_is_separated_from_workspace_and_legacy_cron_authority() -> None:
     agentcore = (ROOT / "stacks/agentcore_stack.py").read_text(encoding="utf-8")
     cron = (ROOT / "stacks/cron_stack.py").read_text(encoding="utf-8")

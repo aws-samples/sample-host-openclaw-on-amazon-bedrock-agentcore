@@ -47,8 +47,12 @@ run_check "Python unit tests" \
   PYTHONPATH="$ROOT_DIR/lambda/router:$ROOT_DIR/lambda" \
   "$PYTHON" -m pytest lambda/router lambda/worker lambda/workflows \
   lambda/actions lambda/capabilities lambda/control lambda/web lambda/cron \
+  lambda/compute lambda/connectors lambda/browser lambda/scheduler \
   lambda/workspace_broker \
   tests/test_capability_stack.py \
+  tests/test_compute_stack.py \
+  tests/test_browser_stack.py \
+  tests/test_scheduler_stack.py \
   release_tools \
   tests/test_product_configuration.py \
   tests/test_telegram_queue_infrastructure.py \

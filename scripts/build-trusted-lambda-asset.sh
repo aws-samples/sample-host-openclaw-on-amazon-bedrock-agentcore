@@ -287,7 +287,16 @@ cp -R /workspace/specs/capabilities/schemas /payload/capabilities/artifacts/sche
 test "$(find /payload/capabilities/artifacts/schemas -type f -name '*.json' | wc -l | tr -d ' ')" = "20"
 if find /payload -type f ! -name '*.py' ! -name requirements.txt \
   ! -path '/payload/capabilities/artifacts/catalog-v1.json' \
-  ! -path '/payload/capabilities/artifacts/schemas/*.json' -print -quit | grep -q .; then
+  ! -path '/payload/capabilities/artifacts/schemas/*.json' \
+  ! -path '/payload/browser/schemas/browser-action-input.json' \
+  ! -path '/payload/browser/schemas/browser-action-output.json' \
+  ! -path '/payload/browser/schemas/browser-observe-input.json' \
+  ! -path '/payload/browser/schemas/browser-observe-output.json' \
+  ! -path '/payload/connectors/schemas/synthetic-notes-append-input.json' \
+  ! -path '/payload/connectors/schemas/synthetic-notes-append-output.json' \
+  ! -path '/payload/connectors/schemas/synthetic-notes-read-list-input.json' \
+  ! -path '/payload/connectors/schemas/synthetic-notes-read-list-output.json' \
+  -print -quit | grep -q .; then
   echo "unsupported non-source file found under lambda/" >&2
   exit 1
 fi

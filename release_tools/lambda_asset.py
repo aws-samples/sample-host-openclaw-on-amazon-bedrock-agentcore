@@ -49,6 +49,16 @@ _REQUIRED_HANDLERS = {
 _CAPABILITY_ARTIFACT_PREFIX = "capabilities/artifacts/"
 _CAPABILITY_SCHEMA_PREFIX = "capabilities/artifacts/schemas/"
 _REQUIRED_CAPABILITY_SCHEMA_COUNT = 20
+_TRUSTED_CONNECTOR_BROWSER_SCHEMAS = (
+    "browser/schemas/browser-action-input.json",
+    "browser/schemas/browser-action-output.json",
+    "browser/schemas/browser-observe-input.json",
+    "browser/schemas/browser-observe-output.json",
+    "connectors/schemas/synthetic-notes-append-input.json",
+    "connectors/schemas/synthetic-notes-append-output.json",
+    "connectors/schemas/synthetic-notes-read-list-input.json",
+    "connectors/schemas/synthetic-notes-read-list-output.json",
+)
 _REQUIRED_DEPENDENCIES = {
     "boto3",
     "cryptography",
@@ -109,6 +119,29 @@ def _capability_source_inputs(root: Path) -> list[tuple[Path, str]]:
     return inputs
 
 
+def _connector_browser_schema_inputs(root: Path) -> list[tuple[Path, str]]:
+    """Bind the exact disabled connector/browser schema inventory as source."""
+
+    expected = set(_TRUSTED_CONNECTOR_BROWSER_SCHEMAS)
+    actual: set[str] = set()
+    for directory in (root / "browser" / "schemas", root / "connectors" / "schemas"):
+        if not directory.is_dir() or directory.is_symlink():
+            raise ContractError(
+                "trusted Lambda connector/browser schema inventory is not exact"
+            )
+        for path in directory.iterdir():
+            if path.is_symlink() or not path.is_file():
+                raise ContractError(
+                    "trusted Lambda connector/browser schema inventory is not exact"
+                )
+            actual.add(path.relative_to(root).as_posix())
+    if actual != expected:
+        raise ContractError(
+            "trusted Lambda connector/browser schema inventory is not exact"
+        )
+    return [(root / relative, relative) for relative in sorted(expected)]
+
+
 def _source_files(root: Path) -> list[dict[str, object]]:
     inputs: list[tuple[Path, str]] = [
         (path, path.relative_to(root).as_posix())
@@ -118,6 +151,7 @@ def _source_files(root: Path) -> list[dict[str, object]]:
     ]
     inputs.append((root / "requirements.txt", "requirements.txt"))
     inputs.extend(_capability_source_inputs(root))
+    inputs.extend(_connector_browser_schema_inputs(root))
     result: list[dict[str, object]] = []
     for path, relative in sorted(inputs, key=lambda item: item[1]):
         if not path.is_file() or path.is_symlink():
