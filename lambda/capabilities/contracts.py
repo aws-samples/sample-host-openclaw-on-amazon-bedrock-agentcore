@@ -679,6 +679,84 @@ def _safe_path(value: Any, label: str = "path") -> str:
     return path
 
 
+def _ip_is_globally_routable(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    """Return True only for a globally routable public IP literal.
+
+    This is the single authoritative IP classification predicate shared by the
+    URL gate (``_public_https_url``) and the pinned web-reader adapter so that
+    DNS-resolved addresses are held to the exact same public-only bar. Private,
+    loopback, link-local, metadata (169.254.169.254), reserved, multicast,
+    unspecified, site-local, and IPv4-mapped IPv6 addresses are rejected.
+    """
+
+    if not isinstance(address, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return False
+    if (
+        not address.is_global
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_private
+        or getattr(address, "is_site_local", False)
+        or (
+            isinstance(address, ipaddress.IPv6Address)
+            and address.ipv4_mapped is not None
+        )
+    ):
+        return False
+    # IPv6 tunnel forms embed an IPv4 address that Python treats as globally
+    # routable regardless of the private/metadata IPv4 inside. Decode and
+    # re-classify the embedded IPv4 for 6to4 (2002::/16), NAT64 (64:ff9b::/96),
+    # and IPv4-compatible (::/96), rejecting any that wraps a non-global IPv4,
+    # so IPv6 encapsulation cannot smuggle 169.254.169.254 / 10.x / 127.x past
+    # this gate.
+    if isinstance(address, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(address)
+        if embedded is not None and not _ip_is_globally_routable(embedded):
+            return False
+    return True
+
+
+def _embedded_ipv4(
+    address: ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 embedded by a 6to4/NAT64/IPv4-compatible IPv6 address."""
+
+    packed = address.packed
+    if address in ipaddress.ip_network("2002::/16"):  # 6to4: 2002:V4::/48
+        return ipaddress.IPv4Address(packed[2:6])
+    if address in ipaddress.ip_network("64:ff9b::/96"):  # NAT64
+        return ipaddress.IPv4Address(packed[12:16])
+    if address in ipaddress.ip_network("::/96") and not address.is_unspecified:
+        # IPv4-compatible (deprecated) — the low 32 bits are an IPv4 literal.
+        return ipaddress.IPv4Address(packed[12:16])
+    return None
+
+
+def public_ip_or_none(
+    value: Any,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse ``value`` as an IP literal and return it only when public.
+
+    Returns ``None`` for anything that is not a syntactically valid IP address
+    or that fails the shared globally-routable predicate. Used by the web
+    reader to classify every DNS answer with the exact same rules the URL gate
+    applies to IP-literal hosts. Performs no network I/O.
+    """
+
+    if not isinstance(value, str):
+        return None
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return address if _ip_is_globally_routable(address) else None
+
+
 def _public_https_url(value: Any) -> str:
     target = _string(value, "normalizedTarget", maximum=2048)
     try:
@@ -747,20 +825,7 @@ def _public_https_url(value: Any) -> str:
             _fail("normalizedTarget hostname is not a canonical public name")
         canonical_authority = host
     else:
-        if (
-            not address.is_global
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_private
-            or getattr(address, "is_site_local", False)
-            or (
-                isinstance(address, ipaddress.IPv6Address)
-                and address.ipv4_mapped is not None
-            )
-        ):
+        if not _ip_is_globally_routable(address):
             _fail("normalizedTarget IP literal is not globally routable")
         if isinstance(address, ipaddress.IPv6Address):
             canonical_authority = f"[{address.compressed}]"
@@ -2470,4 +2535,5 @@ __all__ = [
     "derive_occurrence_id",
     "derive_target_hash",
     "parse_canonical_json",
+    "public_ip_or_none",
 ]
