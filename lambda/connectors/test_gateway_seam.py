@@ -71,6 +71,14 @@ def test_production_composition_wires_connector_registry_empty():
         def get_item(**_kwargs):
             return {}
 
+        @staticmethod
+        def query(**_kwargs):
+            return {"Items": []}
+
+        @staticmethod
+        def put_item(**_kwargs):
+            return {}
+
     catalog = _catalog()
     production = composition.build_production_composition(
         env={
@@ -78,6 +86,9 @@ def test_production_composition_wires_connector_registry_empty():
             "CAPABILITY_RELEASE_COMMIT": RELEASE_COMMIT,
             "CAPABILITY_CATALOG_DIGEST": catalog.catalog_digest,
             "CAPABILITY_STATE_TABLE_NAME": "synthetic-capability-state",
+            "SCHEDULER_CONTROL_TABLE_NAME": (
+                "personal-operator-scheduler-control"
+            ),
             "CAPABILITY_ALLOWED_CALLER_ARN": (
                 "arn:aws:iam::123456789012:role/"
                 "openclaw-agentcore-execution-role-eu-west-1"

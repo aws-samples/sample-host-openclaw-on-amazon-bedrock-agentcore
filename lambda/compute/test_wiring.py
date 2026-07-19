@@ -209,10 +209,23 @@ def test_composition_seam_only_accepts_compute_adapters(tmp_path):
         "CAPABILITY_RELEASE_COMMIT": RELEASE_COMMIT,
         "CAPABILITY_CATALOG_DIGEST": catalog.catalog_digest,
         "CAPABILITY_ALLOWED_CALLER_ARN": CALLER_ARN,
+        "SCHEDULER_CONTROL_TABLE_NAME": (
+            "personal-operator-scheduler-control"
+        ),
     }
 
     class _Client:
         pass
+
+    class _SchedulePort:
+        def list_view(self, *_args, **_kwargs):
+            raise AssertionError("compute seam test must not list schedules")
+
+        def propose(self, *_args, **_kwargs):
+            raise AssertionError("compute seam test must not propose schedules")
+
+        def cancel_propose(self, *_args, **_kwargs):
+            raise AssertionError("compute seam test must not cancel schedules")
 
     # A non-compute operation cannot be smuggled into the credential-free Lambda.
     with pytest.raises(RuntimeError, match="compute"):
@@ -221,6 +234,7 @@ def test_composition_seam_only_accepts_compute_adapters(tmp_path):
             artifact_root=artifacts,
             dynamodb_client=_Client(),
             clock=lambda: NOW,
+            schedule_port=_SchedulePort(),
             compute_adapters={"web.exact.read": object()},
         )
 
