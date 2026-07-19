@@ -2125,6 +2125,13 @@ def test_worker_stack_provisions_exact_runtime_state_boundary():
         ),
         runtime_iam_arn=runtime_iam_arn,
         runtime_endpoint_name=RELEASE_ENDPOINT,
+        capability_state_table_name="personal-operator-capability-state",
+        capability_state_table_arn=(
+            f"arn:aws:dynamodb:eu-west-1:{account}:table/"
+            "personal-operator-capability-state"
+        ),
+        capability_release_commit="a" * 40,
+        capability_catalog_digest="b" * 64,
         telegram_token_secret_name="openclaw/channels/telegram",
         slack_token_secret_name="openclaw/channels/slack",
         feishu_token_secret_name="openclaw/channels/feishu",

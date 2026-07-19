@@ -95,6 +95,7 @@ class TurnCapabilityIssuer:
         pack_ids = sorted(pack["packId"] for pack in packs)
         targets = derive_target_grants(
             message_text,
+            tenant_id=user_id,
             current_request_id=invocation_id,
             now=now,
             ttl_seconds=self._ttl_seconds,

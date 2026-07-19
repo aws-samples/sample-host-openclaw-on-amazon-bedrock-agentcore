@@ -77,6 +77,17 @@ class MemoryDynamoClient:
         item = self.items.get(self._key(kwargs["Key"]))
         return {} if item is None else {"Item": _serialize(deepcopy(item))}
 
+    def put_item(self, **kwargs):
+        item = _deserialize(kwargs["Item"])
+        key = item["PK"], item["SK"]
+        if not self._condition_matches(self.items.get(key), kwargs):
+            raise ClientError(
+                {"Error": {"Code": "ConditionalCheckFailedException"}},
+                "PutItem",
+            )
+        self.items[key] = deepcopy(item)
+        return {}
+
     @staticmethod
     def _condition_matches(item, action):
         condition = action.get("ConditionExpression")
@@ -216,7 +227,7 @@ def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
         ),
         (
             f"RUNTIME#{runtime_arn}",
-            runtime_qualifier,
+            f"{runtime_qualifier}#SESSION#{session_id}",
             {
                 "runtimeArn": runtime_arn,
                 "runtimeQualifier": runtime_qualifier,

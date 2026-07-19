@@ -317,7 +317,9 @@ class FakeRepository:
         self.trace.append("session")
         return self.session if session_id == self.session.get("sessionId") else None
 
-    def strong_read_runtime(self, runtime_arn: str, runtime_qualifier: str):
+    def strong_read_runtime(
+        self, runtime_arn: str, runtime_qualifier: str, session_id: str
+    ):
         self.trace.append("runtime")
         if runtime_arn == self.runtime.get(
             "runtimeArn"

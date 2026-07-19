@@ -13,6 +13,7 @@ from botocore.exceptions import ClientError
 from .admission import AdmissionDenied, LiveTargetGrant
 from .contracts import (
     CapabilityCallV1,
+    CapabilityCatalogV1,
     CapabilityInstallationV1,
     CapabilityResultV1,
     TargetGrantV1,
@@ -137,9 +138,12 @@ class DynamoAdmissionRepository:
         return self._record(f"SESSION#{session_id}", "PROFILE")
 
     def strong_read_runtime(
-        self, runtime_arn: str, runtime_qualifier: str
+        self, runtime_arn: str, runtime_qualifier: str, session_id: str
     ) -> Mapping[str, Any] | None:
-        return self._record(f"RUNTIME#{runtime_arn}", runtime_qualifier)
+        return self._record(
+            f"RUNTIME#{runtime_arn}",
+            f"{runtime_qualifier}#SESSION#{session_id}",
+        )
 
     def strong_read_installation(
         self, user_id: str, pack_id: str
@@ -336,6 +340,247 @@ class DynamoAdmissionRepository:
                 if not _is_conditional(error):
                     raise
         raise RuntimeError("target claim contention exceeded its bound")
+
+
+class DynamoTurnAuthorityRepository:
+    """Create immutable turn bindings without restoring revoked authority."""
+
+    _ROOT_MARKER = {"schema": "personal-operator.authority-root.v1"}
+
+    def __init__(
+        self,
+        *,
+        client: Any,
+        table_name: str,
+        catalog: CapabilityCatalogV1,
+    ) -> None:
+        if not isinstance(catalog, CapabilityCatalogV1):
+            raise TypeError("turn authority requires the frozen capability catalog")
+        if not callable(getattr(client, "put_item", None)) or not callable(
+            getattr(client, "transact_write_items", None)
+        ):
+            raise TypeError("turn authority requires exact Dynamo write methods")
+        self._client = client
+        self._table_name = table_name
+        self._catalog = catalog
+        self._admission = DynamoAdmissionRepository(
+            client=client,
+            table_name=table_name,
+        )
+
+    def _put_record_if_absent(
+        self,
+        pk: str,
+        sk: str,
+        record: Mapping[str, Any],
+    ) -> bool:
+        try:
+            self._client.put_item(
+                TableName=self._table_name,
+                Item=_serialize_item(
+                    {
+                        "PK": pk,
+                        "SK": sk,
+                        "recordJson": canonical_json_bytes(record).decode("utf-8"),
+                        "version": 1,
+                    }
+                ),
+                ConditionExpression="attribute_not_exists(PK)",
+            )
+            return True
+        except ClientError as error:
+            if _is_conditional(error):
+                return False
+            raise
+
+    def _require_exact(
+        self,
+        pk: str,
+        sk: str,
+        expected: Mapping[str, Any],
+        label: str,
+    ) -> None:
+        actual = self._admission._record(pk, sk)
+        if actual is None or canonical_json_bytes(actual) != canonical_json_bytes(
+            expected
+        ):
+            raise RuntimeError(f"{label} is unavailable or unsafe")
+
+    def _ensure_root_authority(self) -> None:
+        root = self._admission._record("CONTROL", "ROOT")
+        if root is None:
+            global_state = self._admission._record("CONTROL", "GLOBAL")
+            if global_state is None:
+                self._put_record_if_absent(
+                    "CONTROL",
+                    "GLOBAL",
+                    {"enabled": False},
+                )
+            else:
+                self._require_exact(
+                    "CONTROL",
+                    "GLOBAL",
+                    {"enabled": False},
+                    "global kill switch",
+                )
+            self._put_record_if_absent(
+                "CONTROL",
+                "ROOT",
+                self._ROOT_MARKER,
+            )
+        self._require_exact(
+            "CONTROL",
+            "ROOT",
+            self._ROOT_MARKER,
+            "authority root marker",
+        )
+        self._require_exact(
+            "CONTROL",
+            "GLOBAL",
+            {"enabled": False},
+            "global kill switch",
+        )
+
+    def _installation(self, user_id: str, pack_id: str) -> dict[str, Any]:
+        return CapabilityInstallationV1.from_mapping(
+            {
+                "schema": CapabilityInstallationV1.SCHEMA,
+                "userId": user_id,
+                "packId": pack_id,
+                "catalogDigest": self._catalog.catalog_digest,
+                "state": "ENABLED",
+                "policyRevision": 1,
+                "connectionRefs": [],
+                "killSwitch": False,
+            }
+        ).to_mapping()
+
+    def _ensure_user_authority(self, user_id: str) -> None:
+        pk = f"USER#{user_id}"
+        marker = {
+            "schema": "personal-operator.user-authority-bootstrap.v1",
+            "userId": user_id,
+            "catalogDigest": self._catalog.catalog_digest,
+        }
+        records: list[tuple[str, Mapping[str, Any], str]] = [
+            ("DELETION", {"enabled": False}, "deletion fence"),
+            (
+                "PROFILE",
+                {
+                    "userId": user_id,
+                    "state": "ACTIVE",
+                    "deletionFence": False,
+                },
+                "user authority",
+            ),
+        ]
+        records.extend(
+            (
+                f"INSTALL#{pack['packId']}",
+                self._installation(user_id, pack["packId"]),
+                f"installation {pack['packId']}",
+            )
+            for pack in self._catalog.packs
+        )
+        if self._admission._record(pk, "BOOTSTRAP") is None:
+            for sk, record, _ in records:
+                self._put_record_if_absent(pk, sk, record)
+            self._put_record_if_absent(pk, "BOOTSTRAP", marker)
+        self._require_exact(pk, "BOOTSTRAP", marker, "user authority marker")
+        for sk, record, label in records:
+            self._require_exact(pk, sk, record, label)
+
+    def _ensure_turn_bindings(self, grant: TurnCapabilityGrantV1) -> None:
+        session = {
+            "sessionId": grant.session_id,
+            "userId": grant.sub,
+            "runtimeArn": grant.runtime_arn,
+            "runtimeQualifier": grant.runtime_qualifier,
+            "state": "ACTIVE",
+        }
+        session_pk, session_sk = f"SESSION#{grant.session_id}", "PROFILE"
+        self._put_record_if_absent(session_pk, session_sk, session)
+        self._require_exact(
+            session_pk,
+            session_sk,
+            session,
+            "session authority",
+        )
+
+        runtime = {
+            "runtimeArn": grant.runtime_arn,
+            "runtimeQualifier": grant.runtime_qualifier,
+            "sessionId": grant.session_id,
+            "userId": grant.sub,
+            "releaseCommit": grant.release_commit,
+            "catalogDigest": grant.catalog_digest,
+            "state": "READY",
+        }
+        runtime_pk = f"RUNTIME#{grant.runtime_arn}"
+        runtime_sk = (
+            f"{grant.runtime_qualifier}#SESSION#{grant.session_id}"
+        )
+        self._put_record_if_absent(runtime_pk, runtime_sk, runtime)
+        self._require_exact(
+            runtime_pk,
+            runtime_sk,
+            runtime,
+            "runtime authority",
+        )
+
+    def prepare_turn(
+        self,
+        *,
+        grant: TurnCapabilityGrantV1,
+        targets: Sequence[LiveTargetGrant],
+    ) -> None:
+        if not isinstance(grant, TurnCapabilityGrantV1):
+            raise TypeError("turn authority requires a validated grant")
+        if grant.release_commit != self._catalog.release_commit or (
+            grant.catalog_digest != self._catalog.catalog_digest
+        ):
+            raise ValueError("turn authority grant differs from the frozen catalog")
+        catalog_pack_ids = {pack["packId"] for pack in self._catalog.packs}
+        if not set(grant.allowed_pack_ids).issubset(catalog_pack_ids):
+            raise ValueError("turn authority contains a non-catalogued pack")
+        catalog_operations = {
+            pack["packId"]: pack["operations"][0]["operationId"]
+            for pack in self._catalog.packs
+        }
+        expected_operations = sorted(
+            catalog_operations[pack_id] for pack_id in grant.allowed_pack_ids
+        )
+        if list(grant.allowed_operation_ids) != expected_operations:
+            raise ValueError("turn operation authority differs from its packs")
+        tenant_binding = derive_target_tenant_binding(grant.sub)
+        target_grants: list[TargetGrantV1] = []
+        for live in targets:
+            if (
+                not isinstance(live, LiveTargetGrant)
+                or live.uses != 0
+                or live.claimed_call_ids
+            ):
+                raise TypeError("turn authority requires fresh target grants")
+            target = live.grant
+            if (
+                target.tenant_binding != tenant_binding
+                or target.current_request_id != grant.invocation_id
+            ):
+                raise ValueError("turn target authority is not current")
+            target_grants.append(target)
+        if sorted(target.target_hash for target in target_grants) != list(
+            grant.target_grant_hashes
+        ):
+            raise ValueError("turn target authority inventory differs from grant")
+
+        self._ensure_root_authority()
+        self._ensure_user_authority(grant.sub)
+        self._ensure_turn_bindings(grant)
+        self._admission.persist_target_grants(
+            tenant_id=grant.sub,
+            current_request_id=grant.invocation_id,
+            grants=target_grants,
+        )
 
 
 class DynamoCapabilityLedger:
@@ -692,4 +937,8 @@ class DynamoCapabilityLedger:
         raise LedgerDenied("CAPABILITY_LEDGER_CONTENTION")
 
 
-__all__ = ["DynamoAdmissionRepository", "DynamoCapabilityLedger"]
+__all__ = [
+    "DynamoAdmissionRepository",
+    "DynamoCapabilityLedger",
+    "DynamoTurnAuthorityRepository",
+]

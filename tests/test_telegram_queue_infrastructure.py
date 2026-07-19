@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from tests.test_product_configuration import (
+    TEST_CAPABILITY_CATALOG_DIGEST,
+    TEST_CAPABILITY_STATE_TABLE_ARN,
+    TEST_CAPABILITY_STATE_TABLE_NAME,
     TEST_RUNTIME_ARN,
     TEST_RUNTIME_ENDPOINT_NAME,
+    TEST_RUNTIME_IAM_ARN,
+    TEST_SOURCE_COMMIT,
     _flatten_statement_actions,
     _synth_router_template,
 )
@@ -126,6 +131,38 @@ def test_trusted_workspace_broker_and_worker_capability_issuer_are_wired() -> No
     assert worker_environment["WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME"] == (
         "personal-operator-workspace-credential-broker"
     )
+    assert worker_environment["AGENTCORE_RUNTIME_IAM_ARN"] == TEST_RUNTIME_IAM_ARN
+    assert worker_environment["CAPABILITY_STATE_TABLE_NAME"] == (
+        TEST_CAPABILITY_STATE_TABLE_NAME
+    )
+    assert worker_environment["CAPABILITY_RELEASE_COMMIT"] == TEST_SOURCE_COMMIT
+    assert worker_environment["CAPABILITY_CATALOG_DIGEST"] == (
+        TEST_CAPABILITY_CATALOG_DIGEST
+    )
+
+
+def test_worker_has_exact_capability_authority_writer_permissions() -> None:
+    template = _synth_router_template()
+    statements = _statements_for_function(
+        template, "personal-operator-telegram-worker"
+    )
+    matches = [
+        statement
+        for statement in statements
+        if set(
+            statement["Action"]
+            if isinstance(statement.get("Action"), list)
+            else [statement.get("Action")]
+        )
+        == {
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:TransactWriteItems",
+        }
+    ]
+
+    assert len(matches) == 1
+    assert matches[0]["Resource"] == TEST_CAPABILITY_STATE_TABLE_ARN
 
 
 def test_router_and_worker_have_separate_exact_dynamodb_cmk_authority() -> None:

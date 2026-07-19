@@ -39,6 +39,10 @@ class RouterStack(Stack):
         runtime_arn: str,
         runtime_iam_arn: str,
         runtime_endpoint_name: str,
+        capability_state_table_name: str,
+        capability_state_table_arn: str,
+        capability_release_commit: str,
+        capability_catalog_digest: str,
         telegram_token_secret_name: str,
         slack_token_secret_name: str,
         feishu_token_secret_name: str,
@@ -62,6 +66,19 @@ class RouterStack(Stack):
             raise ValueError(
                 f"RouterStack must be deployed in {REQUIRED_REGION}; got {region}"
             )
+        expected_capability_table_name = "personal-operator-capability-state"
+        expected_capability_table_arn = (
+            f"arn:aws:dynamodb:{region}:{account}:table/"
+            f"{expected_capability_table_name}"
+        )
+        if capability_state_table_name != expected_capability_table_name:
+            raise ValueError("capability authority table name is not canonical")
+        if capability_state_table_arn != expected_capability_table_arn:
+            raise ValueError("capability authority table ARN is not canonical")
+        if re.fullmatch(r"[0-9a-f]{40}", capability_release_commit) is None:
+            raise ValueError("capability release commit is not canonical")
+        if re.fullmatch(r"[0-9a-f]{64}", capability_catalog_digest) is None:
+            raise ValueError("capability catalog digest is not canonical")
         expected_broker_function = (
             "personal-operator-workspace-credential-broker"
         )
@@ -317,7 +334,11 @@ class RouterStack(Stack):
             memory_size=worker_memory,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
+                "AGENTCORE_RUNTIME_IAM_ARN": runtime_iam_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,
+                "CAPABILITY_STATE_TABLE_NAME": capability_state_table_name,
+                "CAPABILITY_RELEASE_COMMIT": capability_release_commit,
+                "CAPABILITY_CATALOG_DIGEST": capability_catalog_digest,
                 "RUNTIME_STATE_TABLE_NAME": self.runtime_state_table.table_name,
                 "MESSAGE_LEDGER_TABLE_NAME": self.message_ledger_table.table_name,
                 "RUNTIME_LEASE_MS": str(runtime_lease_ms),
@@ -535,6 +556,16 @@ class RouterStack(Stack):
                     self.runtime_state_table.table_arn,
                     self.message_ledger_table.table_arn,
                 ],
+            )
+        )
+        self.worker_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:TransactWriteItems",
+                ],
+                resources=[capability_state_table_arn],
             )
         )
         self.worker_fn.add_to_role_policy(

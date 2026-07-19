@@ -766,6 +766,12 @@ TEST_CAPABILITY_GATEWAY_ARN = (
     "arn:aws:lambda:eu-west-1:123456789012:function:"
     "personal-operator-capability-gateway"
 )
+TEST_CAPABILITY_STATE_TABLE_NAME = "personal-operator-capability-state"
+TEST_CAPABILITY_STATE_TABLE_ARN = (
+    "arn:aws:dynamodb:eu-west-1:123456789012:table/"
+    + TEST_CAPABILITY_STATE_TABLE_NAME
+)
+TEST_CAPABILITY_CATALOG_DIGEST = "b" * 64
 
 
 def _build_agentcore_stack(
@@ -915,6 +921,10 @@ def _synth_router_template(
     runtime_iam_arn: str = TEST_RUNTIME_IAM_ARN,
     runtime_endpoint_name: str = TEST_RUNTIME_ENDPOINT_NAME,
     registration_open: str = "false",
+    capability_state_table_name: str = TEST_CAPABILITY_STATE_TABLE_NAME,
+    capability_state_table_arn: str = TEST_CAPABILITY_STATE_TABLE_ARN,
+    capability_release_commit: str = TEST_SOURCE_COMMIT,
+    capability_catalog_digest: str = TEST_CAPABILITY_CATALOG_DIGEST,
 ) -> dict:
     from aws_cdk import App, Environment
     from aws_cdk.assertions import Template
@@ -929,6 +939,10 @@ def _synth_router_template(
         runtime_arn=runtime_arn,
         runtime_iam_arn=runtime_iam_arn,
         runtime_endpoint_name=runtime_endpoint_name,
+        capability_state_table_name=capability_state_table_name,
+        capability_state_table_arn=capability_state_table_arn,
+        capability_release_commit=capability_release_commit,
+        capability_catalog_digest=capability_catalog_digest,
         telegram_token_secret_name="openclaw/channels/telegram",
         slack_token_secret_name="openclaw/channels/slack",
         feishu_token_secret_name="openclaw/channels/feishu",

@@ -69,7 +69,7 @@ class AdmissionRepository(Protocol):
     def strong_read_session(self, session_id: str) -> Mapping[str, Any] | None: ...
 
     def strong_read_runtime(
-        self, runtime_arn: str, runtime_qualifier: str
+        self, runtime_arn: str, runtime_qualifier: str, session_id: str
     ) -> Mapping[str, Any] | None: ...
 
     def strong_read_installation(
@@ -263,6 +263,7 @@ class AdmissionGate:
                 self._repository.strong_read_runtime,
                 grant.runtime_arn,
                 grant.runtime_qualifier,
+                grant.session_id,
             ),
             frozenset(
                 {

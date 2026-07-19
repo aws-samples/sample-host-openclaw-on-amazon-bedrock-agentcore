@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
@@ -721,7 +722,11 @@ def _build_production_dependencies() -> WorkerDependencies:
         name: os.environ.get(name, "")
         for name in (
             "AGENTCORE_RUNTIME_ARN",
+            "AGENTCORE_RUNTIME_IAM_ARN",
             "AGENTCORE_QUALIFIER",
+            "CAPABILITY_STATE_TABLE_NAME",
+            "CAPABILITY_RELEASE_COMMIT",
+            "CAPABILITY_CATALOG_DIGEST",
             "RUNTIME_STATE_TABLE_NAME",
             "MESSAGE_LEDGER_TABLE_NAME",
             "RUNTIME_LEASE_MS",
@@ -738,6 +743,9 @@ def _build_production_dependencies() -> WorkerDependencies:
 
     import boto3
     from botocore.config import Config
+    from capabilities.composition import load_packaged_catalog
+    from capabilities.durable import DynamoTurnAuthorityRepository
+    from capabilities.issuer import TurnCapabilityIssuer
     try:
         from router.runtime_driver import AgentCoreAdapter, RuntimeDriver
         from router.runtime_state import RuntimeStateRepository
@@ -830,6 +838,19 @@ def _build_production_dependencies() -> WorkerDependencies:
         control_lambda,
         function_name=required["CONTROL_FUNCTION_NAME"],
     )
+    capability_catalog = load_packaged_catalog(os.environ)
+    turn_capability_issuer = TurnCapabilityIssuer(
+        catalog=capability_catalog,
+        authority_repository=DynamoTurnAuthorityRepository(
+            client=dynamodb.meta.client,
+            table_name=required["CAPABILITY_STATE_TABLE_NAME"],
+            catalog=capability_catalog,
+        ),
+        runtime_arn=required["AGENTCORE_RUNTIME_IAM_ARN"],
+        runtime_qualifier=required["AGENTCORE_QUALIFIER"],
+        clock=lambda: int(time.time()),
+        nonce_factory=lambda: f"nonce_{uuid.uuid4().hex}",
+    )
     _production_dependencies = WorkerDependencies(
         runtime_driver=RuntimeDriver(
             repository=runtime_repository,
@@ -845,6 +866,7 @@ def _build_production_dependencies() -> WorkerDependencies:
                     "WORKSPACE_CREDENTIAL_BROKER_FUNCTION_NAME"
                 ],
             ),
+            turn_capability_issuer=turn_capability_issuer,
             lease_ms=lease_ms,
             max_execution_ms=maximum_execution_ms,
         ),
