@@ -4,6 +4,7 @@ from copy import deepcopy
 import hashlib
 import json
 
+from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
 import pytest
 
 from release_tools.agentcore import (
@@ -30,6 +31,12 @@ RUNTIME_ARN = (
 ENDPOINT_ARN = (
     f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:"
     "agentEndpoint/87654321-4321-4321-4321-cba987654321"
+)
+RUNTIME_RESOURCE_ARN = (
+    f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:runtime/{RUNTIME_ID}"
+)
+ENDPOINT_RESOURCE_ARN = (
+    f"{RUNTIME_RESOURCE_ARN}/runtime-endpoint/{ENDPOINT_ID}"
 )
 ROLE_ARN = (
     f"arn:aws:iam::{ACCOUNT}:role/"
@@ -115,8 +122,8 @@ class FakeAgentCore:
         self.calls: list[tuple[str, dict]] = []
         self.failure: Exception | None = None
         self.policies = {
-            RUNTIME_ARN: _command_deny_policy(RUNTIME_ARN),
-            ENDPOINT_ARN: _command_deny_policy(ENDPOINT_ARN),
+            RUNTIME_RESOURCE_ARN: _command_deny_policy(RUNTIME_RESOURCE_ARN),
+            ENDPOINT_RESOURCE_ARN: _command_deny_policy(ENDPOINT_RESOURCE_ARN),
         }
 
     def _respond(self, name: str, arguments: dict, value: dict) -> dict:
@@ -214,7 +221,7 @@ def test_collects_one_ready_digest_bound_runtime_context() -> None:
         ),
         (
             "get_resource_policy",
-            {"resourceArn": RUNTIME_ARN},
+            {"resourceArn": RUNTIME_RESOURCE_ARN},
         ),
         (
             "get_agent_runtime_endpoint",
@@ -222,7 +229,7 @@ def test_collects_one_ready_digest_bound_runtime_context() -> None:
         ),
         (
             "get_resource_policy",
-            {"resourceArn": ENDPOINT_ARN},
+            {"resourceArn": ENDPOINT_RESOURCE_ARN},
         ),
     ]
 
@@ -241,9 +248,9 @@ def test_collects_one_ready_digest_bound_runtime_context() -> None:
 )
 def test_rejects_any_runtime_command_policy_drift(mutation) -> None:
     fake = FakeAgentCore()
-    policy = json.loads(fake.policies[RUNTIME_ARN])
+    policy = json.loads(fake.policies[RUNTIME_RESOURCE_ARN])
     mutation(policy["Statement"][0])
-    fake.policies[RUNTIME_ARN] = json.dumps(policy)
+    fake.policies[RUNTIME_RESOURCE_ARN] = json.dumps(policy)
 
     with pytest.raises(AgentCoreEvidenceError, match="command.*policy"):
         _collect(AgentCoreEvidenceAdapter(fake))
@@ -252,7 +259,7 @@ def test_rejects_any_runtime_command_policy_drift(mutation) -> None:
 @pytest.mark.parametrize("value", [None, "", "not-json", "[]", "{}"])
 def test_rejects_missing_or_malformed_runtime_command_policy(value) -> None:
     fake = FakeAgentCore()
-    fake.policies[RUNTIME_ARN] = value
+    fake.policies[RUNTIME_RESOURCE_ARN] = value
 
     with pytest.raises(AgentCoreEvidenceError, match="command.*policy"):
         _collect(AgentCoreEvidenceAdapter(fake))
@@ -260,11 +267,11 @@ def test_rejects_missing_or_malformed_runtime_command_policy(value) -> None:
 
 def test_rejects_endpoint_command_policy_drift() -> None:
     fake = FakeAgentCore()
-    policy = json.loads(fake.policies[ENDPOINT_ARN])
+    policy = json.loads(fake.policies[ENDPOINT_RESOURCE_ARN])
     policy["Statement"][0]["Action"] = [
         "bedrock-agentcore:InvokeAgentRuntimeCommand"
     ]
-    fake.policies[ENDPOINT_ARN] = json.dumps(policy)
+    fake.policies[ENDPOINT_RESOURCE_ARN] = json.dumps(policy)
 
     with pytest.raises(AgentCoreEvidenceError, match="command.*policy"):
         _collect(AgentCoreEvidenceAdapter(fake))
@@ -283,14 +290,17 @@ def test_live_runtime_accepts_only_explicitly_disabled_service_s3_endpoint() -> 
     ]["networkModeConfig"]
 
 
-def test_missing_live_service_s3_endpoint_disposition_is_ambiguous() -> None:
+def test_missing_live_service_s3_endpoint_field_is_authoritatively_retired() -> None:
     fake = FakeAgentCore()
     del fake.runtime["networkConfiguration"]["networkModeConfig"][
         "requireServiceS3Endpoint"
     ]
 
-    with pytest.raises(AgentCoreEvidenceAmbiguous, match="S3 endpoint disposition"):
-        _collect(AgentCoreEvidenceAdapter(fake))
+    context = _collect(AgentCoreEvidenceAdapter(fake))
+
+    assert "requireServiceS3Endpoint" not in context.runtime_configuration.to_mapping()[
+        "networkConfiguration"
+    ]["networkModeConfig"]
 
 
 @pytest.mark.parametrize("value", [True, 0, 1, "false", None, [], {}])
@@ -333,8 +343,361 @@ def test_collects_runtime_identity_without_requiring_an_endpoint() -> None:
                 "agentRuntimeVersion": VERSION,
             },
         ),
-        ("get_resource_policy", {"resourceArn": RUNTIME_ARN}),
+        ("get_resource_policy", {"resourceArn": RUNTIME_RESOURCE_ARN}),
     ]
+
+
+def test_runtime_identity_rejects_a_mismatched_data_plane_arn() -> None:
+    fake = FakeAgentCore()
+    fake.runtime["agentRuntimeArn"] = RUNTIME_ARN.rsplit(":", 1)[0] + ":6"
+
+    with pytest.raises(AgentCoreEvidenceError, match="runtime ARN"):
+        AgentCoreEvidenceAdapter(fake).collect_runtime_identity(
+            **_hardening_arguments()
+        )
+
+
+def _hardening_arguments() -> dict:
+    return {
+        "source_commit": COMMIT,
+        "account": ACCOUNT,
+        "region": REGION,
+        "runtime_id": RUNTIME_ID,
+        "runtime_version": VERSION,
+        "runtime_image_uri": IMAGE_URI,
+        "expected_subnet_ids": SUBNET_IDS,
+        "expected_security_group_ids": SECURITY_GROUP_IDS,
+        "expected_environment_variables": ENVIRONMENT,
+        "expected_idle_runtime_session_timeout": IDLE_TIMEOUT,
+        "expected_max_lifetime": MAX_LIFETIME,
+    }
+
+
+def test_mmdsv2_hardening_is_a_noop_when_the_exact_version_is_already_hardened() -> None:
+    fake = FakeAgentCore()
+
+    identity = AgentCoreEvidenceAdapter(fake).harden_runtime_mmdsv2(
+        **_hardening_arguments()
+    )
+
+    assert identity.runtime_id == RUNTIME_ID
+    assert identity.runtime_version == VERSION
+    assert identity.runtime_arn == RUNTIME_ARN
+    assert fake.calls == [
+        (
+            "get_agent_runtime",
+            {
+                "agentRuntimeId": RUNTIME_ID,
+                "agentRuntimeVersion": VERSION,
+            },
+        ),
+        ("get_resource_policy", {"resourceArn": RUNTIME_RESOURCE_ARN}),
+    ]
+
+
+@pytest.mark.parametrize("value", [0, 1])
+def test_mmdsv2_hardening_requires_a_literal_boolean(value) -> None:
+    fake = FakeAgentCore()
+    fake.runtime["metadataConfiguration"] = {"requireMMDSV2": value}
+
+    with pytest.raises(AgentCoreEvidenceError, match="metadata"):
+        AgentCoreEvidenceAdapter(fake).harden_runtime_mmdsv2(
+            **_hardening_arguments()
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [None, {}, {"requireMMDSV2": False}, {"requireMMDSV2": None}],
+)
+def test_mmdsv2_hardening_updates_the_full_reviewed_config_and_waits_exact_version(
+    metadata,
+) -> None:
+    resulting_version = "8"
+    resulting_runtime_arn = RUNTIME_ARN.rsplit(":", 1)[0] + ":8"
+
+    class HardeningAgentCore(FakeAgentCore):
+        def __init__(self) -> None:
+            super().__init__()
+            if metadata is None:
+                self.runtime.pop("metadataConfiguration")
+            else:
+                self.runtime["metadataConfiguration"] = metadata
+            self.ready_observations = [
+                _runtime(
+                    agentRuntimeVersion=resulting_version,
+                    agentRuntimeArn=resulting_runtime_arn,
+                    status="UPDATING",
+                ),
+                _runtime(
+                    agentRuntimeVersion=resulting_version,
+                    agentRuntimeArn=resulting_runtime_arn,
+                ),
+            ]
+
+        def update_agent_runtime(self, **kwargs) -> dict:
+            return self._respond(
+                "update_agent_runtime",
+                kwargs,
+                {
+                    "agentRuntimeId": RUNTIME_ID,
+                    "agentRuntimeVersion": resulting_version,
+                    "agentRuntimeArn": resulting_runtime_arn,
+                    "status": "UPDATING",
+                },
+            )
+
+        def get_agent_runtime(self, **kwargs) -> dict:
+            if kwargs.get("agentRuntimeVersion") == resulting_version:
+                value = self.ready_observations.pop(0)
+                return self._respond("get_agent_runtime", kwargs, value)
+            return super().get_agent_runtime(**kwargs)
+
+    fake = HardeningAgentCore()
+    adapter = AgentCoreEvidenceAdapter(
+        fake,
+        sleep=lambda _: None,
+        runtime_ready_attempts=3,
+    )
+
+    identity = adapter.harden_runtime_mmdsv2(**_hardening_arguments())
+
+    assert identity.runtime_id == RUNTIME_ID
+    assert identity.runtime_version == resulting_version
+    assert identity.runtime_arn == resulting_runtime_arn
+    assert identity.to_mapping() == {
+        "runtimeId": RUNTIME_ID,
+        "runtimeVersion": resulting_version,
+        "runtimeArn": resulting_runtime_arn,
+    }
+    update_calls = [call for call in fake.calls if call[0] == "update_agent_runtime"]
+    assert len(update_calls) == 1
+    request = update_calls[0][1]
+    client_token = request.pop("clientToken")
+    assert client_token.startswith("mmdsv2-")
+    assert len(client_token) == len("mmdsv2-") + 64
+    assert request == {
+        "agentRuntimeId": RUNTIME_ID,
+        "agentRuntimeArtifact": {
+            "containerConfiguration": {"containerUri": IMAGE_URI}
+        },
+        "roleArn": ROLE_ARN,
+        "networkConfiguration": {
+            "networkMode": "VPC",
+            "networkModeConfig": {
+                "securityGroups": list(SECURITY_GROUP_IDS),
+                "subnets": list(SUBNET_IDS),
+            },
+        },
+        "description": (
+            "Personal Operator immutable bridge runtime at commit " + COMMIT
+        ),
+        "protocolConfiguration": {"serverProtocol": "HTTP"},
+        "lifecycleConfiguration": {
+            "idleRuntimeSessionTimeout": IDLE_TIMEOUT,
+            "maxLifetime": MAX_LIFETIME,
+        },
+        "metadataConfiguration": {"requireMMDSV2": True},
+        "environmentVariables": ENVIRONMENT,
+        "filesystemConfigurations": [
+            {"sessionStorage": {"mountPath": "/mnt/workspace"}}
+        ],
+    }
+    assert "requireServiceS3Endpoint" not in json.dumps(request)
+    ready_gets = [
+        arguments
+        for name, arguments in fake.calls
+        if name == "get_agent_runtime"
+        and arguments.get("agentRuntimeVersion") == resulting_version
+    ]
+    assert ready_gets == [
+        {
+            "agentRuntimeId": RUNTIME_ID,
+            "agentRuntimeVersion": resulting_version,
+        },
+        {
+            "agentRuntimeId": RUNTIME_ID,
+            "agentRuntimeVersion": resulting_version,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("service_s3_disposition", "expected_update_value"),
+    [(True, False), (False, None), ("absent", None)],
+)
+def test_runtime_hardening_sends_the_transitional_s3_field_only_to_disable_true(
+    service_s3_disposition,
+    expected_update_value,
+) -> None:
+    resulting_version = "8"
+    resulting_runtime_arn = RUNTIME_ARN.rsplit(":", 1)[0] + ":8"
+
+    class HardeningAgentCore(FakeAgentCore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runtime["metadataConfiguration"] = {"requireMMDSV2": False}
+            if service_s3_disposition == "absent":
+                del self.runtime["networkConfiguration"]["networkModeConfig"][
+                    "requireServiceS3Endpoint"
+                ]
+            else:
+                self.runtime["networkConfiguration"]["networkModeConfig"][
+                    "requireServiceS3Endpoint"
+                ] = service_s3_disposition
+            self.hardened = _runtime(
+                agentRuntimeVersion=resulting_version,
+                agentRuntimeArn=resulting_runtime_arn,
+            )
+            if service_s3_disposition == "absent":
+                del self.hardened["networkConfiguration"]["networkModeConfig"][
+                    "requireServiceS3Endpoint"
+                ]
+
+        def update_agent_runtime(self, **kwargs) -> dict:
+            return self._respond(
+                "update_agent_runtime",
+                kwargs,
+                {
+                    "agentRuntimeId": RUNTIME_ID,
+                    "agentRuntimeVersion": resulting_version,
+                    "agentRuntimeArn": resulting_runtime_arn,
+                    "status": "UPDATING",
+                },
+            )
+
+        def get_agent_runtime(self, **kwargs) -> dict:
+            if kwargs.get("agentRuntimeVersion") == resulting_version:
+                return self._respond("get_agent_runtime", kwargs, self.hardened)
+            return super().get_agent_runtime(**kwargs)
+
+    fake = HardeningAgentCore()
+
+    identity = AgentCoreEvidenceAdapter(fake).harden_runtime_mmdsv2(
+        **_hardening_arguments()
+    )
+
+    assert identity.runtime_arn == resulting_runtime_arn
+    request = next(
+        arguments
+        for name, arguments in fake.calls
+        if name == "update_agent_runtime"
+    )
+    network_mode = request["networkConfiguration"]["networkModeConfig"]
+    if expected_update_value is None:
+        assert "requireServiceS3Endpoint" not in network_mode
+    else:
+        assert network_mode["requireServiceS3Endpoint"] is expected_update_value
+
+
+def test_runtime_hardening_updates_when_only_service_s3_endpoint_is_true() -> None:
+    resulting_version = "8"
+    resulting_runtime_arn = RUNTIME_ARN.rsplit(":", 1)[0] + ":8"
+
+    class HardeningAgentCore(FakeAgentCore):
+        def update_agent_runtime(self, **kwargs) -> dict:
+            return self._respond(
+                "update_agent_runtime",
+                kwargs,
+                {
+                    "agentRuntimeId": RUNTIME_ID,
+                    "agentRuntimeVersion": resulting_version,
+                    "agentRuntimeArn": resulting_runtime_arn,
+                    "status": "UPDATING",
+                },
+            )
+
+        def get_agent_runtime(self, **kwargs) -> dict:
+            if kwargs.get("agentRuntimeVersion") == resulting_version:
+                return self._respond(
+                    "get_agent_runtime",
+                    kwargs,
+                    _runtime(
+                        agentRuntimeVersion=resulting_version,
+                        agentRuntimeArn=resulting_runtime_arn,
+                    ),
+                )
+            return super().get_agent_runtime(**kwargs)
+
+    fake = HardeningAgentCore()
+    fake.runtime["networkConfiguration"]["networkModeConfig"][
+        "requireServiceS3Endpoint"
+    ] = True
+
+    identity = AgentCoreEvidenceAdapter(fake).harden_runtime_mmdsv2(
+        **_hardening_arguments()
+    )
+
+    assert identity.runtime_version == resulting_version
+    request = next(
+        arguments
+        for name, arguments in fake.calls
+        if name == "update_agent_runtime"
+    )
+    assert request["networkConfiguration"]["networkModeConfig"][
+        "requireServiceS3Endpoint"
+    ] is False
+
+
+def test_mmdsv2_hardening_rejects_other_drift_before_mutation() -> None:
+    class HardeningAgentCore(FakeAgentCore):
+        def update_agent_runtime(self, **kwargs) -> dict:
+            return self._respond("update_agent_runtime", kwargs, {})
+
+    fake = HardeningAgentCore()
+    fake.runtime["metadataConfiguration"] = {"requireMMDSV2": False}
+    fake.runtime["environmentVariables"] = {
+        **ENVIRONMENT,
+        "AWS_REGION": "us-east-1",
+    }
+
+    with pytest.raises(AgentCoreEvidenceError, match="runtime configuration"):
+        AgentCoreEvidenceAdapter(fake).harden_runtime_mmdsv2(
+            **_hardening_arguments()
+        )
+
+    assert all(name != "update_agent_runtime" for name, _ in fake.calls)
+
+
+def test_mmdsv2_hardening_fails_closed_when_result_never_becomes_ready() -> None:
+    class HardeningAgentCore(FakeAgentCore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runtime["metadataConfiguration"] = {"requireMMDSV2": False}
+
+        def update_agent_runtime(self, **kwargs) -> dict:
+            return self._respond(
+                "update_agent_runtime",
+                kwargs,
+                {
+                    "agentRuntimeId": RUNTIME_ID,
+                    "agentRuntimeVersion": "8",
+                    "agentRuntimeArn": RUNTIME_ARN.rsplit(":", 1)[0] + ":8",
+                    "status": "UPDATING",
+                },
+            )
+
+        def get_agent_runtime(self, **kwargs) -> dict:
+            if kwargs.get("agentRuntimeVersion") == "8":
+                return self._respond(
+                    "get_agent_runtime",
+                    kwargs,
+                    _runtime(
+                        agentRuntimeVersion="8",
+                        agentRuntimeArn=RUNTIME_ARN.rsplit(":", 1)[0] + ":8",
+                        status="UPDATING",
+                    ),
+                )
+            return super().get_agent_runtime(**kwargs)
+
+    adapter = AgentCoreEvidenceAdapter(
+        HardeningAgentCore(),
+        sleep=lambda _: None,
+        runtime_ready_attempts=2,
+    )
+
+    with pytest.raises(AgentCoreEvidenceAmbiguous, match="did not become READY"):
+        adapter.harden_runtime_mmdsv2(**_hardening_arguments())
 
 
 def test_missing_exact_runtime_is_authoritative_absence() -> None:
@@ -663,6 +1026,100 @@ def test_timeout_after_dispatch_is_ambiguous() -> None:
 
     with pytest.raises(AgentCoreEvidenceAmbiguous, match="authoritative"):
         _collect(AgentCoreEvidenceAdapter(fake))
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        EndpointConnectionError(endpoint_url="https://agentcore.invalid"),
+        ReadTimeoutError(
+            endpoint_url="https://agentcore.invalid",
+            error=TimeoutError("response was not observed"),
+        ),
+        ClientError(
+            {
+                "Error": {
+                    "Code": "ThrottlingException",
+                    "Message": "rate exceeded",
+                },
+                "ResponseMetadata": {"HTTPStatusCode": 429},
+            },
+            "UpdateAgentRuntime",
+        ),
+        ClientError(
+            {
+                "Error": {
+                    "Code": "InternalServerException",
+                    "Message": "service unavailable",
+                },
+                "ResponseMetadata": {"HTTPStatusCode": 503},
+            },
+            "UpdateAgentRuntime",
+        ),
+    ],
+)
+def test_runtime_hardening_classifies_retryable_update_failures_as_unknown_effect(
+    failure,
+) -> None:
+    class FailingUpdateAgentCore(FakeAgentCore):
+        def update_agent_runtime(self, **kwargs) -> dict:
+            self.calls.append(("update_agent_runtime", kwargs))
+            raise failure
+
+    fake = FailingUpdateAgentCore()
+    fake.runtime["metadataConfiguration"] = {"requireMMDSV2": False}
+
+    with pytest.raises(AgentCoreEvidenceAmbiguous, match="unknown effect"):
+        AgentCoreEvidenceAdapter(fake).harden_runtime_mmdsv2(
+            **_hardening_arguments()
+        )
+
+    assert any(name == "update_agent_runtime" for name, _ in fake.calls)
+
+
+@pytest.mark.parametrize("response", [None, [], {}, {"agentRuntimeId": RUNTIME_ID}])
+def test_runtime_hardening_malformed_update_ack_is_unknown_effect(response) -> None:
+    class MalformedUpdateAgentCore(FakeAgentCore):
+        def update_agent_runtime(self, **kwargs):
+            self.calls.append(("update_agent_runtime", kwargs))
+            return response
+
+    fake = MalformedUpdateAgentCore()
+    fake.runtime["metadataConfiguration"] = {"requireMMDSV2": False}
+
+    with pytest.raises(AgentCoreEvidenceAmbiguous, match="unknown effect"):
+        AgentCoreEvidenceAdapter(fake).harden_runtime_mmdsv2(
+            **_hardening_arguments()
+        )
+
+    assert any(name == "update_agent_runtime" for name, _ in fake.calls)
+
+
+def test_runtime_hardening_keeps_nonretryable_update_rejection_terminal() -> None:
+    failure = ClientError(
+        {
+            "Error": {
+                "Code": "ValidationException",
+                "Message": "request is invalid",
+            },
+            "ResponseMetadata": {"HTTPStatusCode": 400},
+        },
+        "UpdateAgentRuntime",
+    )
+
+    class RejectedUpdateAgentCore(FakeAgentCore):
+        def update_agent_runtime(self, **kwargs) -> dict:
+            raise failure
+
+    fake = RejectedUpdateAgentCore()
+    fake.runtime["metadataConfiguration"] = {"requireMMDSV2": False}
+
+    with pytest.raises(AgentCoreEvidenceError) as captured:
+        AgentCoreEvidenceAdapter(fake).harden_runtime_mmdsv2(
+            **_hardening_arguments()
+        )
+
+    assert not isinstance(captured.value, AgentCoreEvidenceAmbiguous)
 
 
 def test_unreviewed_expected_environment_is_rejected_before_live_calls() -> None:
