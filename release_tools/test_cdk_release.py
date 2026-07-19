@@ -55,6 +55,7 @@ def _stack(context_overrides: dict[str, str] | None = None) -> AgentCoreStack:
         vpc=vpc,
         private_subnet_ids=["subnet-00000000000000001"],
         trusted_endpoint_security_group=trusted_endpoint_sg,
+        s3_prefix_list_id="pl-6da54004",
         workspace_capability_secret_name=(
             "personal-operator/workspace-capability"
         ),
@@ -178,7 +179,6 @@ def test_runtime_pull_role_is_scoped_to_the_exact_release_repository() -> None:
     pull_actions = {
         "ecr:GetDownloadUrlForLayer",
         "ecr:BatchGetImage",
-        "ecr:BatchCheckLayerAvailability",
     }
     pull = [
         statement
@@ -270,6 +270,7 @@ def test_release_synth_owns_digest_bound_runtime_and_retained_endpoint() -> None
         "AWS_DEFAULT_REGION": REGION,
         "AWS_REGION": REGION,
         "BEDROCK_MODEL_ID": "eu.anthropic.claude-sonnet-4-6",
+        "DISABLE_ADOT_OBSERVABILITY": "true",
         "S3_USER_FILES_BUCKET": {
             "Ref": "UserFilesBucketCFDFD8C0"
         },
@@ -278,6 +279,9 @@ def test_release_synth_owns_digest_bound_runtime_and_retained_endpoint() -> None
         ),
         "WORKSPACE_SYNC_INTERVAL_MS": "300000",
     }
+    assert not any(
+        name.startswith("OTEL_") for name in properties["EnvironmentVariables"]
+    )
 
     assert endpoint["Properties"] == {
         "AgentRuntimeId": {"Fn::GetAtt": [runtime_id, "AgentRuntimeId"]},
@@ -288,6 +292,40 @@ def test_release_synth_owns_digest_bound_runtime_and_retained_endpoint() -> None
     }
     assert endpoint["DeletionPolicy"] == "Retain"
     assert endpoint["UpdateReplacePolicy"] == "Retain"
+
+
+def test_release_synth_denies_both_command_apis_on_runtime_and_endpoint() -> None:
+    template = _release_template()
+    policies = [
+        resource
+        for resource in template["Resources"].values()
+        if resource["Type"] == "AWS::BedrockAgentCore::ResourcePolicy"
+    ]
+
+    assert len(policies) == 2
+    assert all(policy["DeletionPolicy"] == "Retain" for policy in policies)
+    assert all(policy["UpdateReplacePolicy"] == "Retain" for policy in policies)
+    for policy in policies:
+        subject = policy["Properties"]["ResourceArn"]
+        separator, fragments = policy["Properties"]["Policy"]["Fn::Join"]
+        assert separator == ""
+        assert fragments[1] == subject
+        rendered = json.loads(fragments[0] + "EXACT_SUBJECT" + fragments[2])
+        assert rendered == {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "DenyRuntimeCommandExecution",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": [
+                        "bedrock-agentcore:InvokeAgentRuntimeCommand",
+                        "bedrock-agentcore:InvokeAgentRuntimeCommandShell",
+                    ],
+                    "Resource": "EXACT_SUBJECT",
+                }
+            ],
+        }
 
 
 def test_release_stack_rejects_partial_or_mutable_runtime_inputs() -> None:

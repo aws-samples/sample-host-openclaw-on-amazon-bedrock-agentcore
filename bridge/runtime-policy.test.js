@@ -237,7 +237,7 @@ describe("OpenClaw child environment", () => {
 
     assert.deepEqual(childEnv, {
       PATH: "/usr/local/bin:/usr/bin:/bin",
-      HOME: "/root",
+      HOME: "/run/personal-operator/home",
       NODE_PATH: "/app/node_modules",
       NODE_OPTIONS:
         "--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js",
@@ -376,7 +376,7 @@ describe("Bedrock proxy child environment", () => {
 
     assert.deepEqual(result, {
       PATH: "/usr/local/bin:/usr/bin:/bin",
-      HOME: "/root",
+      HOME: "/run/personal-operator/home",
       NODE_PATH: "/app/node_modules",
       NODE_OPTIONS:
         "--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js",

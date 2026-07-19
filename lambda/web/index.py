@@ -27,6 +27,14 @@ from .retention import DeletionPending, ExportBoundaryError
 
 
 LOG = logging.getLogger(__name__)
+_LOG_SCHEMA = "personal-operator.log.v1"
+_LOG_WARNING_EVENTS = frozenset(
+    {
+        "application_unavailable",
+        "control_operation_failed",
+        "origin_verification_unavailable",
+    }
+)
 MAX_BODY_BYTES = 64 * 1024
 MAX_QUERY_BYTES = 16 * 1024
 MAX_IMPORT_BUNDLE_BYTES = 4 * 1024 * 1024
@@ -49,6 +57,25 @@ _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _ORIGIN_HEADER = "x-personal-operator-origin-verify"
 _ORIGIN_SECRET_CACHE_SECONDS = 300
 _origin_secret_cache: tuple[str, float] | None = None
+
+
+def _log_warning(event: str) -> None:
+    """Emit one closed metadata record without request or exception data."""
+
+    if event not in _LOG_WARNING_EVENTS:
+        raise ValueError("web log event is not allowlisted")
+    LOG.warning(
+        json.dumps(
+            {
+                "component": "web",
+                "event": event,
+                "level": "WARNING",
+                "schema": _LOG_SCHEMA,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 def _scheduled_retention_event(event: object) -> bool:
@@ -121,6 +148,20 @@ def _origin_gate_response(status: int) -> dict:
             "Content-Type": "application/json",
         },
         "body": json.dumps({"error": "request origin rejected"}, separators=(",", ":")),
+    }
+
+
+def _service_unavailable_response() -> dict:
+    return {
+        "statusCode": 503,
+        "headers": {
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Type": "application/json",
+        },
+        "body": json.dumps({"error": "service unavailable"}, separators=(",", ":")),
     }
 
 
@@ -670,9 +711,12 @@ class WebApplication:
             return self._response(403, {"error": str(error)})
         except DeletionPending:
             return self._response(202, {"status": "deletion_pending"})
-        except RuntimeError as error:
-            LOG.warning("Web control operation failed: error_type=%s", type(error).__name__)
+        except RuntimeError:
+            _log_warning("control_operation_failed")
             return self._response(409, {"error": "operation could not be completed"})
+        except Exception:
+            _log_warning("control_operation_failed")
+            return self._response(500, {"error": "operation could not be completed"})
 
 
 _application_factory: Callable[[], WebApplication] | None = None
@@ -706,12 +750,13 @@ def lambda_handler(event, context):
     if not _scheduled_retention_event(event):
         try:
             trusted = _trusted_cloudfront_request(event)
-        except RuntimeError as error:
-            LOG.warning(
-                "CloudFront origin verification unavailable: error_type=%s",
-                type(error).__name__,
-            )
+        except Exception:
+            _log_warning("origin_verification_unavailable")
             return _origin_gate_response(503)
         if not trusted:
             return _origin_gate_response(403)
-    return _application().handle(event)
+    try:
+        return _application().handle(event)
+    except Exception:
+        _log_warning("application_unavailable")
+        return _service_unavailable_response()

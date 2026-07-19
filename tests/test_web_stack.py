@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import aws_cdk as cdk
@@ -385,6 +386,63 @@ def test_origin_gate_rejects_direct_api_calls_before_application_construction(
     }
     assert web_index.lambda_handler(scheduled, None) == {"status": "ok"}
     assert handled[-1] == scheduled
+
+
+def test_origin_gate_outage_logs_only_closed_canonical_metadata(
+    monkeypatch,
+    caplog,
+) -> None:
+    import sys
+
+    sys.path.insert(0, str(ROOT / "lambda"))
+    from web import index as web_index
+
+    error_type = type("PRIVATE_ORIGIN_EXCEPTION_CLASS_CANARY", (RuntimeError,), {})
+    private_message = (
+        "PRIVATE_ORIGIN_EXCEPTION_MESSAGE_CANARY oauth-code /approve/private-token"
+    )
+
+    def unavailable():
+        raise error_type(private_message)
+
+    monkeypatch.setattr(web_index, "_origin_verification_secret", unavailable)
+    caplog.clear()
+
+    response = web_index.lambda_handler(
+        {
+            "requestContext": {
+                "http": {
+                    "method": "GET",
+                    "path": "/approve/PRIVATE_PATH_TOKEN_CANARY",
+                }
+            },
+            "headers": {},
+        },
+        None,
+    )
+
+    expected = json.dumps(
+        {
+            "component": "web",
+            "event": "origin_verification_unavailable",
+            "level": "WARNING",
+            "schema": "personal-operator.log.v1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert response["statusCode"] == 503
+    assert all(
+        canary not in caplog.text
+        for canary in (
+            "PRIVATE_ORIGIN_EXCEPTION_CLASS_CANARY",
+            "PRIVATE_ORIGIN_EXCEPTION_MESSAGE_CANARY",
+            "PRIVATE_PATH_TOKEN_CANARY",
+        )
+    )
+    assert [record.getMessage() for record in caplog.records] == [expected]
+    assert all(record.args == () for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_edge_router_serves_spa_routes_and_splits_approval_html_from_json() -> None:
@@ -979,9 +1037,13 @@ def test_api_has_access_logs_metrics_and_account_level_throttling() -> None:
     template = _synth_web_template()
     stage = _resources(template, "AWS::ApiGatewayV2::Stage")[0]["Properties"]
     assert stage["AccessLogSettings"]["DestinationArn"]
-    assert "requestId" in stage["AccessLogSettings"]["Format"]
-    assert "routeKey" in stage["AccessLogSettings"]["Format"]
-    assert "$context.path" not in stage["AccessLogSettings"]["Format"]
+    assert json.loads(stage["AccessLogSettings"]["Format"]) == {
+        "latency": "$context.responseLatency",
+        "method": "$context.httpMethod",
+        "responseLength": "$context.responseLength",
+        "route": "$context.routeKey",
+        "status": "$context.status",
+    }
     assert stage["DefaultRouteSettings"]["DetailedMetricsEnabled"] is True
     assert 1 <= stage["DefaultRouteSettings"]["ThrottlingRateLimit"] <= 20
     assert 1 <= stage["DefaultRouteSettings"]["ThrottlingBurstLimit"] <= 40

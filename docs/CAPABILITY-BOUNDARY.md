@@ -1,8 +1,10 @@
 # Personal Operator v1 Capability Boundary
 
-This document describes the frozen source contracts and release catalog. It is
-local implementation evidence only: it does not claim that the six v1 tools are
-installed in OpenClaw, admitted by a gateway, deployed, or production-ready.
+This document describes the frozen source contracts, exact ten-tool release
+catalog, runtime plugin, and trusted admission boundary. The integrated source
+contains exactly ten model-visible `po_*` tools and locally tested gateway
+adapters. This is local implementation evidence only; it does not prove an AWS
+deployment, live AgentCore authority, provider readiness, or production safety.
 
 ## Canonical contract rule
 
@@ -69,6 +71,13 @@ capability-call, plugin-install, and payment tools are absent. Catalog metadata
 is an admission contract, not an authority source by itself: later gateway and
 adapter code must strong-read live installation and deletion state at the last
 application-controlled point before execution.
+
+AgentCore also exposes platform-level one-shot command and interactive-shell
+APIs independently of the model catalog. The release stack attaches retained
+resource policies to both the runtime and immutable endpoint that explicitly
+deny both actions for every principal. Live context collection accepts only the
+exact deny documents; an absent, malformed, permissive, partial, or retargeted
+policy fails closed.
 
 The retained compute service, runner, transport protocols, Dockerfile, and
 standalone `ComputeStack` are inactive reference material. `app.py` does not

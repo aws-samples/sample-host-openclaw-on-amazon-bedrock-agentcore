@@ -49,7 +49,7 @@ const CAPABILITY_RELAY_PORT = 18791;
 
 const SESSION_STORAGE_MOUNT = "/mnt/workspace";
 const WORKSPACE_SEED_DIR = "/opt/personal-operator/seed";
-const OPENCLAW_HOME_LINK = "/root/.openclaw";
+const OPENCLAW_HOME_LINK = "/run/personal-operator/home/.openclaw";
 const OPENCLAW_CONFIG_PATH = runtimePolicy.OPENCLAW_CONFIG_PATH;
 const OPENCLAW_STATE_DIR = runtimePolicy.OPENCLAW_STATE_DIR;
 const OPENCLAW_WORKSPACE_DIR = runtimePolicy.OPENCLAW_WORKSPACE_DIR;

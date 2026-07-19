@@ -13,7 +13,7 @@ def test_release_docs_are_explicitly_preproduction_and_effect_free() -> None:
 
     assert "not authorization to deploy" in operations
     assert "prepare, do not deploy" in operations
-    boundary = "staging deployment path implemented and locally verified; not deployed"
+    boundary = "release transaction requires hardening before any deployment"
     assert boundary in operations
     assert boundary in evidence
     assert "never replay a write merely because a request timed out" in operations
@@ -38,6 +38,9 @@ def test_release_docs_keep_every_external_staging_gate_explicitly_open() -> None
         "CloudFormation change-set execution",
         "AgentCore runtime readiness",
         "consumer application",
+        "connector/provider effects",
+        "Browser Gateway",
+        "networkless compute",
         "moderated pilot",
     ):
         assert f"OPEN — {gate}" in combined

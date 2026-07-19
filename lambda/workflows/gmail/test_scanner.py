@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sys
 
@@ -372,18 +373,90 @@ def test_malformed_provider_records_fail_closed_without_leaking_body(caplog):
 
 
 def test_provider_listing_failure_is_redacted_and_fails_closed(caplog):
+    error_type = type("PRIVATE_LIST_EXCEPTION_CLASS_CANARY", (RuntimeError,), {})
+    private_message = (
+        "PRIVATE_LIST_EXCEPTION_MESSAGE_CANARY ACCESS-TOKEN raw email body"
+    )
+
     class FailingGmail:
         def list_threads(self, *, query, max_results):
-            raise RuntimeError("ACCESS-TOKEN raw email body SECRET-CONTENT")
+            raise error_type(private_message)
 
+    caplog.clear()
     assert scanner_module.GmailScanner(
         FailingGmail(),
         connected_address="me@example.com",
         now=lambda: NOW,
     ).scan() == []
-    assert "ACCESS-TOKEN" not in caplog.text
-    assert "SECRET-CONTENT" not in caplog.text
-    assert "RuntimeError" in caplog.text
+    expected = json.dumps(
+        {
+            "component": "gmail",
+            "event": "thread_listing_failed",
+            "level": "WARNING",
+            "schema": "personal-operator.log.v1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert all(
+        canary not in caplog.text
+        for canary in (
+            "PRIVATE_LIST_EXCEPTION_CLASS_CANARY",
+            "PRIVATE_LIST_EXCEPTION_MESSAGE_CANARY",
+            "ACCESS-TOKEN",
+            "raw email body",
+        )
+    )
+    assert [record.getMessage() for record in caplog.records] == [expected]
+    assert all(record.args == () for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_provider_thread_failure_logs_no_source_or_exception_content(caplog):
+    error_type = type("PRIVATE_THREAD_EXCEPTION_CLASS_CANARY", (RuntimeError,), {})
+    source_id = "PRIVATE_SOURCE_THREAD_ID_CANARY"
+    private_message = (
+        "PRIVATE_THREAD_EXCEPTION_MESSAGE_CANARY person@example.net raw body"
+    )
+
+    class FailingGmail:
+        def list_threads(self, *, query, max_results):
+            return [{"id": source_id}]
+
+        def get_thread(self, *, thread_id, format):
+            assert thread_id == source_id
+            assert format == "full"
+            raise error_type(private_message)
+
+    caplog.clear()
+    assert scanner_module.GmailScanner(
+        FailingGmail(),
+        connected_address="me@example.com",
+        now=lambda: NOW,
+    ).scan() == []
+    expected = json.dumps(
+        {
+            "component": "gmail",
+            "event": "thread_processing_failed",
+            "level": "WARNING",
+            "schema": "personal-operator.log.v1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert all(
+        canary not in caplog.text
+        for canary in (
+            "PRIVATE_THREAD_EXCEPTION_CLASS_CANARY",
+            "PRIVATE_THREAD_EXCEPTION_MESSAGE_CANARY",
+            "PRIVATE_SOURCE_THREAD_ID_CANARY",
+            "person@example.net",
+            "raw body",
+        )
+    )
+    assert [record.getMessage() for record in caplog.records] == [expected]
+    assert all(record.args == () for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_google_adapter_disables_library_level_retries_for_every_provider_read():

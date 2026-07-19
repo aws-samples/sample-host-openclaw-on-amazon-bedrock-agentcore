@@ -13,7 +13,7 @@ const MAX_SCOPED_CREDENTIAL_LIFETIME_MS = 15.5 * 60 * 1000;
 const FORWARDED_ENV_KEYS = Object.freeze(["S3_USER_FILES_BUCKET"]);
 const FIXED_CHILD_ENV = Object.freeze({
   PATH: "/usr/local/bin:/usr/bin:/bin",
-  HOME: "/root",
+  HOME: "/run/personal-operator/home",
   NODE_PATH: "/app/node_modules",
   NODE_OPTIONS:
     "--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js",

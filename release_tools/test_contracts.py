@@ -500,6 +500,12 @@ def test_runtime_context_rejects_extra_cross_boundary_or_mutable_values(
             "configuration digest",
         ),
         (
+            lambda value: value["runtimeConfiguration"][  # type: ignore[index]
+                "networkConfiguration"
+            ]["networkModeConfig"].update(requireServiceS3Endpoint=False),
+            "runtime VPC configuration",
+        ),
+        (
             lambda value: value.update(runtimeConfigurationSha256="0" * 64),
             "configuration digest",
         ),

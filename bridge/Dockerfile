@@ -116,19 +116,30 @@ COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
 
-# Copy the only reviewed OpenClaw plugin. No executable skill tree or mutable
-# marketplace content enters the image.
+# Copy the only repository-owned plugin into the registration path. The pinned
+# upstream checkout remains under /opt/openclaw; runtime policy disables its
+# bundled skills and every mutable marketplace/plugin discovery path.
 COPY plugins/personal-operator /app/plugins/personal-operator
 
 # Copy entrypoint
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && \
+    mkdir -p /run/personal-operator/home && \
+    chown 1000:1000 /run/personal-operator /run/personal-operator/home && \
+    chmod 0700 /run/personal-operator /run/personal-operator/home && \
+    chown -R 0:0 /home/node && \
+    chmod -R a-w /home/node /app /opt/openclaw /opt/personal-operator/seed && \
+    chmod a-w /var/tmp
+
+ENV HOME=/run/personal-operator/home TMPDIR=/tmp
 
 # AgentCore Runtime requires port 8080
 EXPOSE 8080
 
-# AgentCore Runtime uses /ping for health checks (not Docker HEALTHCHECK)
-# No HEALTHCHECK directive needed — AgentCore manages this via /ping endpoint
-# Note: container runs as root inside a per-user AgentCore microVM (already isolated).
+# AgentCore Runtime uses /ping for health checks (not Docker HEALTHCHECK).
+# Keep the image-owned application and reviewed upstream runtime root-owned and
+# immutable while the process writes only ephemeral state under /run, /tmp, and
+# the invocation-time /mnt/workspace mount.
+USER 1000:1000
 
 ENTRYPOINT ["/app/entrypoint.sh"]

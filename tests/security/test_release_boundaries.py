@@ -30,7 +30,14 @@ def _scan_production_credentials(root: Path) -> list[tuple[str, str, int]]:
     candidates = [
         path for path in (root / "app.py", root / "cdk.json") if path.is_file()
     ]
-    for directory in ("stacks", "lambda", "bridge", "web", "scripts"):
+    for directory in (
+        "stacks",
+        "lambda",
+        "bridge",
+        "web",
+        "scripts",
+        "release_tools",
+    ):
         path = root / directory
         if path.is_dir():
             candidates.extend(item for item in path.rglob("*") if item.is_file())
@@ -66,6 +73,19 @@ def _node_json(source: str) -> object:
     )
     assert completed.returncode == 0, completed.stderr
     return json.loads(completed.stdout)
+
+
+def test_credential_scanner_includes_trusted_release_tooling(tmp_path: Path) -> None:
+    release_tooling = tmp_path / "release_tools"
+    release_tooling.mkdir()
+    (release_tooling / "runtime.py").write_text(
+        'SYNTHETIC_CANARY = "AKIAABCDEFGHIJKLMNOP"\n',
+        encoding="utf-8",
+    )
+
+    assert _scan_production_credentials(tmp_path) == [
+        ("aws_access_key", "release_tools/runtime.py", 1)
+    ]
 
 
 def test_runtime_has_exact_curated_surface_loopback_gateway_and_no_provider_secrets() -> None:

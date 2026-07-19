@@ -13,9 +13,24 @@ from constructs import Construct
 from stacks import retention_days
 
 
+REQUIRED_REGION = "eu-west-1"
+S3_PREFIX_LIST_ID_EU_WEST_1 = "pl-6da54004"
+ECR_LAYER_BUCKET_ARN = (
+    "arn:aws:s3:::prod-eu-west-1-starport-layer-bucket/*"
+)
+AGENTCORE_SESSION_STORAGE_BUCKET_ARNS = (
+    "arn:aws:s3:::acr-storage-*-eu-west-1-an",
+    "arn:aws:s3:::acr-storage-*-eu-west-1-an/*",
+)
+
+
 class VpcStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+        if self.region != REQUIRED_REGION:
+            raise ValueError(
+                f"VpcStack must be deployed in {REQUIRED_REGION}; got {self.region}"
+            )
 
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
 
@@ -109,10 +124,6 @@ class VpcStack(Stack):
             "SecretsManager": ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
             "CwLogs": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS,
             "Monitoring": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_MONITORING,
-            # Workspace files and AgentCore session storage remain on private
-            # S3 connectivity; the runtime security group can target this same
-            # reviewed endpoint security group instead of a public prefix.
-            "S3Interface": ec2.InterfaceVpcEndpointAwsService.S3,
             # Workspace broker and capability gateway are the two trusted
             # mediators the runtime may invoke; exact function IAM remains in
             # AgentCoreStack while this endpoint removes generic internet egress.
@@ -128,11 +139,53 @@ class VpcStack(Stack):
                 private_dns_enabled=True,
             )
 
-        # S3 gateway endpoint (free, no SG needed)
+        # All in-VPC S3 names follow the gateway route. Its exact endpoint
+        # policy admits only AgentCore/ECR startup-layer reads plus the
+        # deterministic workspace bucket operations; identity and STS session
+        # policies narrow workspace access to one user namespace.
+        self.s3_prefix_list_id = S3_PREFIX_LIST_ID_EU_WEST_1
         self.s3_endpoint = self.vpc.add_gateway_endpoint(
             "S3Endpoint",
             service=ec2.GatewayVpcEndpointAwsService.S3,
             subnets=[private_subnets],
+        )
+        self.s3_endpoint.add_to_policy(
+            iam.PolicyStatement(
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:GetObject"],
+                resources=[ECR_LAYER_BUCKET_ARN],
+            )
+        )
+        workspace_bucket_arn = (
+            f"arn:aws:s3:::openclaw-user-files-{self.account}-{self.region}"
+        )
+        self.s3_endpoint.add_to_policy(
+            iam.PolicyStatement(
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:ListBucket"],
+                resources=[workspace_bucket_arn],
+            )
+        )
+        self.s3_endpoint.add_to_policy(
+            iam.PolicyStatement(
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                resources=[f"{workspace_bucket_arn}/*"],
+            )
+        )
+        self.s3_endpoint.add_to_policy(
+            iam.PolicyStatement(
+                principals=[iam.AnyPrincipal()],
+                actions=["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+                resources=list(AGENTCORE_SESSION_STORAGE_BUCKET_ARNS),
+                conditions={
+                    "StringEquals": {
+                        "aws:PrincipalServiceName": (
+                            "bedrock-agentcore.amazonaws.com"
+                        )
+                    }
+                },
+            )
         )
 
         # --- cdk-nag suppressions ---

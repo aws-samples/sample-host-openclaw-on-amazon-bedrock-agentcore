@@ -1,49 +1,46 @@
-# Personal Operator runtime boundary
+# Personal Operator v1 runtime boundary
 
-This directory contains the credential-bearing conversational runtime. Treat
-its tool surface as a frozen security contract, not an extensibility point.
+This directory is the unprivileged, provider-credential-free AgentCore/OpenClaw
+bridge. It is a frozen security boundary, not an extensibility point.
 
-OpenClaw runs with the `minimal` profile and exactly these allowed tools:
+The exact model-visible surface is:
 
 - `po_file_list`
 - `po_file_read`
 - `po_file_write`
 - `po_file_delete`
+- `po_web_read`
+- `po_schedule_list`
+- `po_schedule_propose`
+- `po_schedule_cancel_propose`
+- `po_compute_run`
+- `po_compute_status`
 
-The mutable upstream `session_status` built-in is explicitly denied because it
-can persist a model/provider override. The generated config exposes only the
-loopback `agentcore/bedrock-agentcore` model and has no fallback.
+OpenClaw uses the minimal profile, explicitly denies `session_status`, loads
+only `/app/plugins/personal-operator`, and has no fallback model/provider.
+Dynamic MCP, ClawHub, executable skills, arbitrary plugins, browser/computer
+tools, shell/process tools, and user-supplied credentials are forbidden.
+AgentCore's platform command and interactive-shell APIs are separately denied
+by retained policies on the runtime and release endpoint.
 
-The only enabled plugin is `personal-operator`, loaded from
-`/app/plugins/personal-operator`. Its four file tools derive the S3 prefix only
-from `PERSONAL_OPERATOR_WORKSPACE_PREFIX`; identity and namespace are never
-accepted as tool arguments.
+The runtime receives no Telegram, Google, connector, browser, approval, or
+durable provider credential. After trusted session admission, the broker may
+issue a short-lived AWS workspace session restricted to the exact
+server-derived namespace. The local plugin can consume it, but credentials
+must never reach model context, tool arguments/results, workspace content, or
+logs.
 
-URL retrieval and search are deferred. Do not expose model-selected network
-egress in the same runtime as workspace reads. A future reader must derive
-exact targets from the current authenticated user request in trusted code.
+`po_web_read` crosses a trusted current-request target grant; the runtime has no
+standing generic web egress. Schedule operations read or create proposals only,
+and scheduled turns require `externalEffects=false`. Compute operations remain
+catalogued but fail closed as `ADAPTER_DISABLED`.
 
-Do not add local command execution, process control, generic filesystem access,
-headless UI automation, scheduling, cross-session control, delegated workers,
-arbitrary plugin installation, arbitrary MCP servers, or user-provided
-credentials to this runtime. External effects belong behind typed control-plane
-capabilities and approval checks. A later isolated, credential-free sandbox can
-provide code execution.
-
-Channel delivery also stays outside this runtime. The contract returns response
-text to its caller; it never fetches a channel token or calls a channel API.
-
-`POST /invocations` accepts only `status`, `warmup`, `chat`, and `snapshot`
-after binding the exact internal identity and namespace. A chat that reaches
-the workspace commit returns a frozen `workspaceReceipt` containing only its
-committed `generation` and `manifestSha256`; the same trusted invocation replay
-returns the same receipt. Failed persistence returns no receipt and quarantines
-the workspace. `snapshot` performs one fair, exclusive manual commit and
-returns the same receipt shape without executing model work.
-
-For every behavior change, add a failing Node test first and run the bridge test
-suite serially under Node 24:
+For every behavior change, add a failing Node test first and run the serialized
+Node 24 suite:
 
 ```bash
 PATH="/opt/homebrew/opt/node@24/bin:$PATH" npm test
 ```
+
+See `../README.md` and `../docs/V1-IMPLEMENTATION-EVIDENCE.md` for the complete
+Personal Operator v1 boundary and current open gates.

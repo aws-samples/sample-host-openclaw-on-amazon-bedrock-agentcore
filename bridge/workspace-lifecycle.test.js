@@ -431,7 +431,7 @@ describe("WorkspaceLifecycle", () => {
         namespace: "user_01",
         seedDir: "/opt/personal-operator/seed",
         mountedDir: "/mnt/workspace",
-        homeLinkPath: "/root/.openclaw",
+        homeLinkPath: "/run/personal-operator/home/.openclaw",
         prepareWorkspace: prepare,
         stopOpenClaw: async () => calls.push("stop-openclaw"),
         stopSupportProcesses: async () => calls.push("stop-support"),

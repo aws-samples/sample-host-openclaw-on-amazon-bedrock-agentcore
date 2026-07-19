@@ -1,5 +1,6 @@
 """Trusted Telegram ingress, ordered work queue, and isolated worker plane."""
 
+import json
 import re
 
 from aws_cdk import (
@@ -454,7 +455,17 @@ class RouterStack(Stack):
             )
             cfn_stage.access_log_settings = apigwv2.CfnStage.AccessLogSettingsProperty(
                 destination_arn=access_log_group.log_group_arn,
-                format='{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength","latency":"$context.responseLatency","time":"$context.requestTime"}',
+                format=json.dumps(
+                    {
+                        "latency": "$context.responseLatency",
+                        "method": "$context.httpMethod",
+                        "responseLength": "$context.responseLength",
+                        "route": "$context.routeKey",
+                        "status": "$context.status",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             )
 
         # --- Split IAM permissions ---

@@ -11,6 +11,7 @@ from aws_cdk.assertions import Template
 
 from stacks.observability_stack import ObservabilityStack
 from tests.test_product_configuration import _synth_router_template
+from tests.test_web_stack import _synth_web_template
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +30,25 @@ def _resources(template: dict, resource_type: str) -> list[dict]:
         for resource in template["Resources"].values()
         if resource["Type"] == resource_type
     ]
+
+
+def test_all_api_access_logs_have_one_exact_closed_metadata_schema() -> None:
+    expected = {
+        "latency": "$context.responseLatency",
+        "method": "$context.httpMethod",
+        "responseLength": "$context.responseLength",
+        "route": "$context.routeKey",
+        "status": "$context.status",
+    }
+    observed = []
+    for template in (_synth_router_template(), _synth_web_template()):
+        stages = _resources(template, "AWS::ApiGatewayV2::Stage")
+        assert len(stages) == 1
+        settings = stages[0]["Properties"]["AccessLogSettings"]
+        assert settings["DestinationArn"]
+        observed.append(json.loads(settings["Format"]))
+
+    assert observed == [expected, expected]
 
 
 def test_observability_template_keeps_metrics_without_model_payload_logging() -> None:
@@ -50,6 +70,37 @@ def test_observability_template_keeps_metrics_without_model_payload_logging() ->
     assert "textDataDeliveryEnabled" not in rendered
     assert "imageDataDeliveryEnabled" not in rendered
     assert "/aws/bedrock/invocation-logs" not in rendered
+
+    dashboard = _resources(template, "AWS::CloudWatch::Dashboard")[0]
+    separator, fragments = dashboard["Properties"]["DashboardBody"]["Fn::Join"]
+    body = separator.join(
+        fragment if isinstance(fragment, str) else "REGION" for fragment in fragments
+    )
+    expected_agentcore_searches = {
+        "SEARCH('{AWS/Bedrock-AgentCore} "
+        f'MetricName="{metric_name}"\', \'{statistic}\', 300)'
+        for metric_name, statistic in {
+            "Invocations": "Sum",
+            "SystemErrors": "Sum",
+            "UserErrors": "Sum",
+            "Throttles": "Sum",
+            "Latency": "p99",
+        }.items()
+    }
+    dashboard_body = json.loads(body)
+    agentcore_searches = {
+        metric[0]["expression"]
+        for widget in dashboard_body["widgets"]
+        for metric in widget.get("properties", {}).get("metrics", [])
+        if isinstance(metric[0], dict)
+        and metric[0].get("label", "").startswith("AgentCore ")
+    }
+    assert agentcore_searches == expected_agentcore_searches
+    assert "AWS/BedrockAgentCore" not in body
+    assert "InvocationErrors" not in body
+    assert "InvocationLatency" not in body.split(
+        'title":"AgentCore Runtime Latency (p99)"', maxsplit=1
+    )[1]
 
 
 def test_private_pilot_alarm_set_is_complete_without_duplicate_dlq_or_publishers() -> None:
@@ -241,7 +292,13 @@ def test_current_boundary_docs_disclose_metadata_only_observability() -> None:
     for document in (privacy, operations, readme):
         normalized = " ".join(document.split())
         assert "model invocation text or image payload logging" in normalized
+        assert "DISABLE_ADOT_OBSERVABILITY=true" in normalized
+        assert "payload-rich AgentCore application observability" in normalized
         assert "legacy token-monitoring stack is not active" in normalized
+
+    normalized_privacy = " ".join(privacy.split())
+    assert "ordinary platform operational logs remain" in normalized_privacy
+    assert "live CloudWatch inspection remains OPEN" in normalized_privacy
 
 
 def test_privacy_boundary_retires_logs_as_an_application_data_transport() -> None:
@@ -249,6 +306,11 @@ def test_privacy_boundary_retires_logs_as_an_application_data_transport() -> Non
         (ROOT / "docs/PRIVACY-BOUNDARY.md").read_text(encoding="utf-8").split()
     )
 
-    assert "retained runtime and router logs contain only closed metadata" in privacy
+    assert (
+        "Application-emitted runtime and router message fields contain only closed "
+        "metadata" in privacy
+    )
+    assert "platform envelopes/system records still add operational" in privacy
+    assert "exact live retained-field inspection remains OPEN" in privacy
     assert "CloudWatch is not a response-inspection transport" in privacy
     assert "Safe operational fields are bounded internal user IDs" not in privacy

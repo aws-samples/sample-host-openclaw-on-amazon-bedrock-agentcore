@@ -49,7 +49,9 @@ messages. The local gates use synthetic data and require no cloud credentials.
   asynchronous delivery path.
 - Active dashboards and alarms consume aggregate AWS service metrics only.
   They do not enable model invocation text or image payload logging, and the
-  archived legacy token-monitoring stack is not active.
+  runtime sets `DISABLE_ADOT_OBSERVABILITY=true` so payload-rich AgentCore
+  application observability is disabled. The archived legacy token-monitoring
+  stack is not active.
 - For the exact configured founder, deletion schedules the dedicated send
   OAuth secret for deletion with a 7-day Secrets Manager recovery window
   before deleting local records. An ambiguous secret result is reconciled by
@@ -125,11 +127,14 @@ this gate remains unclosed; source-only synth does not substitute for it.
 
 ## Staging preflight: prepare, do not deploy
 
-The **staging deployment path implemented and locally verified; not deployed**
-boundary is exact. The repository now contains the strict contracts, durable
-journal, deterministic Lambda asset format, retained immutable ECR/signing
-resources, direct AgentCore CloudFormation L1 resources, injected evidence
-adapters, and phase CLI. No phase has been run against AWS.
+The **release transaction requires hardening before any deployment** boundary
+is exact. The repository contains strict contracts, a durable journal,
+deterministic Lambda asset format, retained ECR/signing templates, direct
+AgentCore CloudFormation L1 resources, and injected evidence adapters. The
+current phase CLI is not an accepted mutation path: its transaction shape
+cannot bootstrap a clean account serially, and its observer/composer handoff
+must be rewritten and independently reviewed before any cloud mutation. No
+phase has been run against AWS.
 
 `scripts/deploy.sh` is only a compatibility shim for
 `scripts/staging-release.py`. Validation and state transitions live in the
@@ -142,24 +147,23 @@ not isolated or that permits automatic site-package loading.
 The integration worktree does not create this environment automatically; it
 is an explicit predeploy prerequisite. `requirements.txt` pins Boto3 with its
 CRT extra because the SDK `aws login` provider requires that dependency.
-Invoke a real evidence run through
-`/usr/bin/env -u BASH_ENV ./scripts/deploy.sh ...` so noninteractive Bash does
-not load an ambient startup file before the shim can enforce its checks. The
-CLI surface is:
+Only credential-free `--preflight` and `--status` inspection are permitted at
+this boundary. Do not invoke `--phase`, `--resume --reconcile`, or `--rollback`
+until the release transaction is replaced and reviewed. The current local CLI
+surface, retained as an incomplete contract, is:
 
 - `--preflight`: validate one clean commit/tree/account/region and create the
   canonical journal without discovering credentials;
 - `--phase <foundation|image|runtime|endpoint|context|consumer-changesets|consumers|verify>`:
-  run only the legal next phase after an exact mutation confirmation;
+  incomplete and forbidden for deployment;
 - `--resume <journal>`: resume only a stable journal;
 - `--resume <journal> --reconcile --driver <reviewed-operation>`:
-  recompute the exact reviewed-operation digest for an `UNCERTAIN` journal,
-  then let the in-package read-only live authority prove `PERSISTED` or
-  `ABSENT`. The supplied executable is not invoked during observation;
+  incomplete and forbidden for deployment. The current caller can still trust
+  driver stdout as observation evidence; the in-package live composer exists
+  but is not wired into this path;
 - `--status <journal>`: print the canonical journal without credentials;
-- `--rollback <verified-transaction-id>`: write rollback intent before dispatch
-  and accept only the journal's exact rollback reference. It never retargets a
-  retained release endpoint.
+- `--rollback <verified-transaction-id>`: incomplete and forbidden for
+  deployment.
 
 Credential-free preflight example:
 
@@ -175,8 +179,12 @@ JOURNAL="$PWD/build/releases/release_${PERSONAL_OPERATOR_RELEASE_COMMIT}.json"
 ./scripts/deploy.sh --status "$JOURNAL"
 ```
 
-Do not supply an operation or mutation confirmation during preflight. Before a
-real phase, create one canonical
+Everything from here through the external-gate list describes requirements for
+the replacement release transaction. It is not an executable deployment
+procedure for the current CLI.
+
+Do not supply an operation or mutation confirmation during preflight. The
+intended replacement transaction will require one canonical
 `personal-operator.production-observation-config.v1` file. Pass it with
 `--observation-config`, or place it at
 `<journal>.production-observation.json`. It binds the exact commit, tree,
@@ -211,8 +219,8 @@ closed after the one live observation. A preloaded Boto3, Botocore, Certifi, or
 dependency module, a runtime-digest mismatch, or an unavailable frozen
 credential fails closed while the write-ahead journal remains `UNCERTAIN`.
 
-A real phase also requires one self-contained reviewed mutation executable.
-The CLI frames and hashes its exact bytes together with the canonical
+The intended design also requires one self-contained reviewed mutation
+executable. It frames and hashes its exact bytes together with the canonical
 observation-config bytes as one reviewed-operation digest, copies the
 executable into a private file retained for that invocation, then requires the
 exact
@@ -237,17 +245,16 @@ proof: the executable is invoked only with
 `--mode mutate`, and its STDOUT can never choose a journal outcome or provide
 release evidence.
 
-Before mutation, the CLI constructs the in-package
-`ProductionEvidenceComposer` with frozen-credential regional ECR, AgentCore
-control, and CloudFormation clients. After dispatch it performs the second
-exact-account check and uses those already-retained clients. SDK endpoint
-overrides and ambient proxy settings are disabled. Attestation downloads use a
-separate proxy-free HTTPS opener and a TLS context built from the same
-authenticated CA, ignoring `HTTPS_PROXY` and `ALL_PROXY`. The composer, not the
-driver, reads and reconciles every phase. Production compute is not an active
-release stack: production composition returns `ADAPTER_DISABLED`, and Task 8
-operational completion remains OPEN until a separately reviewed transport,
-launcher, image, and live isolation proof exist.
+The in-package `ProductionEvidenceComposer` can construct frozen-credential
+regional ECR, AgentCore control, and CloudFormation observations, but the
+current release transaction has no accepted caller that safely composes all
+mutating phases. Before deployment, every phase must be rewritten to use that
+composer, retain its exact operation/config/context inputs, preserve ambiguity
+as `UNCERTAIN`, and fail closed. The operator driver's stdout must never become
+live evidence. Production compute is not an active release stack: production
+composition returns `ADAPTER_DISABLED`, and Task 8 operational completion
+remains OPEN until a separately reviewed transport, launcher, image, and live
+isolation proof exist.
 
 - foundation: all six exact foundation stacks exist in a complete state,
   each processed template/parameter and request/security digest matches the
@@ -286,8 +293,8 @@ presence, malformed response, wrong identity, unread pagination, timeout, SDK
 failure, or conflicting evidence remains ambiguous and leaves the journal
 `UNCERTAIN`.
 
-After a crash or ambiguous result, use the same exact operation bytes and the
-confirmation
+After the required transaction rewrite, a crash or ambiguous result must use
+the same exact operation bytes and the confirmation
 `reconcile:release_<40-sha>:<phase>:sha256:<operation-hex>`. There is no
 operator `persisted|absent` switch and no local evidence-file override. A
 changed operation or observation config, timeout, unavailable live authority,
@@ -343,6 +350,9 @@ verified asset, so a failed rebuild cannot erase the prior release artifact.
 - OPEN — CloudFormation change-set execution
 - OPEN — AgentCore runtime readiness
 - OPEN — consumer application
+- OPEN — connector/provider effects
+- OPEN — Browser Gateway
+- OPEN — networkless compute
 - OPEN — moderated pilot
 
 Also open: the Docker-backed Lambda import proof, real account/region and IAM

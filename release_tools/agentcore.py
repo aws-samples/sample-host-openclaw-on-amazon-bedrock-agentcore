@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -34,6 +35,8 @@ class AgentCoreClient(Protocol):
     def list_agent_runtime_endpoints(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def get_agent_runtime_endpoint(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def get_resource_policy(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 class AgentCoreEvidenceError(RuntimeError):
@@ -128,6 +131,16 @@ def _sorted_runtime_configuration(runtime: Mapping[str, Any]) -> dict[str, Any]:
     vpc = network_copy.get("networkModeConfig")
     if isinstance(vpc, Mapping):
         vpc_copy = dict(vpc)
+        if "requireServiceS3Endpoint" not in vpc_copy:
+            raise AgentCoreEvidenceAmbiguous(
+                "live runtime does not prove the service-managed S3 endpoint "
+                "disposition"
+            )
+        if vpc_copy["requireServiceS3Endpoint"] is not False:
+            raise AgentCoreEvidenceError(
+                "runtime service-managed S3 endpoint is not explicitly disabled"
+            )
+        del vpc_copy["requireServiceS3Endpoint"]
         for field in ("securityGroups", "subnets"):
             identifiers = vpc_copy.get(field)
             if isinstance(identifiers, list) and all(
@@ -162,6 +175,10 @@ class AgentCoreEvidenceAdapter:
             body = response.get("Error") if isinstance(response, dict) else None
             code = body.get("Code") if isinstance(body, dict) else None
             if code == "ResourceNotFoundException":
+                if method_name == "get_resource_policy":
+                    raise AgentCoreEvidenceError(
+                        "required runtime command deny policy is absent"
+                    ) from error
                 absent = (
                     AgentCoreEndpointAbsent
                     if method_name == "get_agent_runtime_endpoint"
@@ -173,6 +190,43 @@ class AgentCoreEvidenceAdapter:
             raise AgentCoreEvidenceError(
                 f"{method_name} failed without authoritative evidence"
             ) from error
+
+    def _assert_command_deny_policy(self, resource_arn: Any) -> None:
+        if not isinstance(resource_arn, str) or not resource_arn:
+            raise AgentCoreEvidenceError(
+                "runtime command deny policy subject is malformed"
+            )
+        response = self._call("get_resource_policy", resourceArn=resource_arn)
+        encoded = response.get("policy")
+        if not isinstance(encoded, str) or not encoded:
+            raise AgentCoreEvidenceError(
+                "runtime command deny policy is missing or malformed"
+            )
+        try:
+            policy = json.loads(encoded)
+        except (TypeError, ValueError) as error:
+            raise AgentCoreEvidenceError(
+                "runtime command deny policy is missing or malformed"
+            ) from error
+        expected = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "DenyRuntimeCommandExecution",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": [
+                        "bedrock-agentcore:InvokeAgentRuntimeCommand",
+                        "bedrock-agentcore:InvokeAgentRuntimeCommandShell",
+                    ],
+                    "Resource": resource_arn,
+                }
+            ],
+        }
+        if policy != expected:
+            raise AgentCoreEvidenceError(
+                "runtime command deny policy differs from the reviewed boundary"
+            )
 
     def assert_endpoint_name_available(
         self,
@@ -331,6 +385,7 @@ class AgentCoreEvidenceAdapter:
             raise AgentCoreEvidenceError("runtime version differs from the request")
         if runtime.get("roleArn") != execution_role_arn:
             raise AgentCoreEvidenceError("runtime role differs from the release role")
+        self._assert_command_deny_policy(runtime.get("agentRuntimeArn"))
         try:
             live_configuration = RuntimeConfigurationV1.from_mapping(
                 _sorted_runtime_configuration(runtime),
@@ -434,6 +489,9 @@ class AgentCoreEvidenceAdapter:
             )
         if endpoint.get("agentRuntimeArn") != runtime_arn:
             raise AgentCoreEvidenceError("endpoint runtime ARN differs")
+        self._assert_command_deny_policy(
+            endpoint.get("agentRuntimeEndpointArn")
+        )
 
         try:
             return RuntimeContextV3.from_mapping(

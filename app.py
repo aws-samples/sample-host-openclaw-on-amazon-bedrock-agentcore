@@ -120,6 +120,7 @@ agentcore_stack = AgentCoreStack(
     vpc=vpc_stack.vpc,
     private_subnet_ids=[s.subnet_id for s in vpc_stack.vpc.private_subnets],
     trusted_endpoint_security_group=vpc_stack.vpce_sg,
+    s3_prefix_list_id=vpc_stack.s3_prefix_list_id,
     workspace_capability_secret_name=(
         security_stack.workspace_capability_secret.secret_name
     ),

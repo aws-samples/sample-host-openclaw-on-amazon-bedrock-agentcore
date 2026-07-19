@@ -9,6 +9,7 @@ import pytest
 from capabilities.contracts import ImportPlanV1, ImportReceiptV1
 from portable.manifest import ImportRejected
 
+from . import index as web_index
 from .auth import OpaqueSessionManager, SignedConnectTickets
 from .index import WebApplication
 from .test_auth import Clock, DeterministicRandom, OneTimeStore, SessionStore
@@ -541,14 +542,19 @@ def test_connect_ticket_recovers_from_an_expired_or_revoked_cookie(stale_kind):
     )
 
 
-def test_connect_ticket_preserves_store_outages_and_is_not_consumed():
+def test_connect_ticket_preserves_store_outages_and_is_not_consumed(caplog):
     app, tickets, *_ = setup_app()
     incumbent_cookie, _ = bootstrap(app, tickets)
     token = tickets.issue(user_id=USER, return_path="/export")
     original_get = app._sessions._store.get
-    app._sessions._store.get = lambda _key: (_ for _ in ()).throw(
-        RuntimeError("store unavailable")
+    error_type = type("PRIVATE_WEB_EXCEPTION_CLASS_CANARY", (RuntimeError,), {})
+    private_message = (
+        "PRIVATE_WEB_EXCEPTION_MESSAGE_CANARY access-token /workspace/private.txt"
     )
+    app._sessions._store.get = lambda _key: (_ for _ in ()).throw(
+        error_type(private_message)
+    )
+    caplog.clear()
 
     failed = app.handle(
         event(
@@ -560,12 +566,128 @@ def test_connect_ticket_preserves_store_outages_and_is_not_consumed():
     )
 
     assert failed["statusCode"] == 409
+    expected = json.dumps(
+        {
+            "component": "web",
+            "event": "control_operation_failed",
+            "level": "WARNING",
+            "schema": "personal-operator.log.v1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert all(
+        canary not in caplog.text
+        for canary in (
+            "PRIVATE_WEB_EXCEPTION_CLASS_CANARY",
+            "PRIVATE_WEB_EXCEPTION_MESSAGE_CANARY",
+            "/workspace/private.txt",
+        )
+    )
+    assert [record.getMessage() for record in caplog.records] == [expected]
+    assert all(record.args == () for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
     app._sessions._store.get = original_get
     retried = app.handle(
         event("POST", "/api/session/connect", body={"ticket": token})
     )
     assert retried["statusCode"] == 201
     assert json.loads(retried["body"])["returnPath"] == "/export"
+
+
+def test_plain_dependency_exception_is_contained_without_private_metadata(caplog):
+    app, tickets, *_ = setup_app()
+    cookie, _ = bootstrap(app, tickets)
+    error_type = type("PRIVATE_WEB_PLAIN_EXCEPTION_CLASS_CANARY", (Exception,), {})
+    private_message = (
+        "PRIVATE_WEB_PLAIN_EXCEPTION_MESSAGE_CANARY oauth-code "
+        "/workspace/private.txt"
+    )
+
+    def unavailable(_user_id):
+        raise error_type(private_message)
+
+    app._workspace.get = unavailable
+    caplog.clear()
+
+    response = app.handle(event("GET", "/api/workspace", cookie=cookie))
+
+    expected = json.dumps(
+        {
+            "component": "web",
+            "event": "control_operation_failed",
+            "level": "WARNING",
+            "schema": "personal-operator.log.v1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert response["statusCode"] == 500
+    assert json.loads(response["body"]) == {
+        "error": "operation could not be completed"
+    }
+    assert all(
+        canary not in caplog.text and canary not in str(response)
+        for canary in (
+            "PRIVATE_WEB_PLAIN_EXCEPTION_CLASS_CANARY",
+            "PRIVATE_WEB_PLAIN_EXCEPTION_MESSAGE_CANARY",
+            "/workspace/private.txt",
+        )
+    )
+    assert [record.getMessage() for record in caplog.records] == [expected]
+    assert all(record.args == () for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_lambda_handler_contains_plain_application_construction_exception(
+    monkeypatch,
+    caplog,
+):
+    error_type = type(
+        "PRIVATE_WEB_FACTORY_EXCEPTION_CLASS_CANARY", (Exception,), {}
+    )
+    private_message = (
+        "PRIVATE_WEB_FACTORY_EXCEPTION_MESSAGE_CANARY client-secret "
+        "/approve/private-token"
+    )
+
+    def unavailable():
+        raise error_type(private_message)
+
+    monkeypatch.setattr(web_index, "_application_factory", unavailable)
+    monkeypatch.setattr(web_index, "_production_application", None)
+    monkeypatch.setattr(web_index, "_trusted_cloudfront_request", lambda _event: True)
+    caplog.clear()
+
+    response = web_index.lambda_handler(
+        event("GET", "/approve/PRIVATE_WEB_PATH_CANARY"),
+        None,
+    )
+
+    expected = json.dumps(
+        {
+            "component": "web",
+            "event": "application_unavailable",
+            "level": "WARNING",
+            "schema": "personal-operator.log.v1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert response["statusCode"] == 503
+    assert json.loads(response["body"]) == {"error": "service unavailable"}
+    assert all(
+        canary not in caplog.text and canary not in str(response)
+        for canary in (
+            "PRIVATE_WEB_FACTORY_EXCEPTION_CLASS_CANARY",
+            "PRIVATE_WEB_FACTORY_EXCEPTION_MESSAGE_CANARY",
+            "PRIVATE_WEB_PATH_CANARY",
+            "/approve/private-token",
+        )
+    )
+    assert [record.getMessage() for record in caplog.records] == [expected]
+    assert all(record.args == () for record in caplog.records)
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_legacy_v1_connect_ticket_drain_returns_only_to_connections():

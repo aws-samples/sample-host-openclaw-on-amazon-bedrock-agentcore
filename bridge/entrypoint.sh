@@ -5,7 +5,7 @@ set -euo pipefail
 umask 077
 
 export PATH="/usr/local/bin:/usr/bin:/bin"
-export HOME="/root"
+export HOME="/run/personal-operator/home"
 export NODE_PATH="/app/node_modules"
 export OPENCLAW_CONFIG_PATH="/run/personal-operator/openclaw.json"
 export OPENCLAW_STATE_DIR="/mnt/workspace/live"
@@ -13,11 +13,29 @@ export OPENCLAW_WORKSPACE_DIR="/mnt/workspace/live/workspace"
 
 echo '{"version":1,"event":"RUNTIME_ENTRYPOINT","level":"INFO","status":"INITIALIZING"}'
 
+if [ "$(id -u)" != "1000" ] || [ "$(id -g)" != "1000" ]; then
+    echo '{"version":1,"event":"RUNTIME_IDENTITY","level":"ERROR","status":"REJECTED"}'
+    exit 1
+fi
+if [ ! -w /run/personal-operator ] || [ ! -w "$HOME" ]; then
+    echo '{"version":1,"event":"RUNTIME_WRITABLE_PATHS","level":"ERROR","status":"REJECTED"}'
+    exit 1
+fi
+for trusted_path in /app /opt/openclaw /opt/personal-operator/seed /home/node; do
+    if [ -w "$trusted_path" ]; then
+        echo '{"version":1,"event":"RUNTIME_IMMUTABILITY","level":"ERROR","status":"REJECTED"}'
+        exit 1
+    fi
+done
+
 # --- V8 Compile Cache (Node.js 22+) ---
 # Caches compiled bytecode so modules load faster on subsequent runs.
 # Pre-warmed at Docker build time with AWS SDK modules.
 if [ -d /app/.compile-cache ]; then
-    export NODE_COMPILE_CACHE=/app/.compile-cache
+    mkdir -p /tmp/personal-operator-compile-cache
+    chmod 0700 /tmp/personal-operator-compile-cache
+    cp -R /app/.compile-cache/. /tmp/personal-operator-compile-cache/
+    export NODE_COMPILE_CACHE=/tmp/personal-operator-compile-cache
     echo '{"version":1,"event":"COMPILE_CACHE","level":"INFO","status":"READY"}'
 fi
 

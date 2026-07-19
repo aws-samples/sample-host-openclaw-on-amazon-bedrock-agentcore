@@ -32,6 +32,7 @@ import cdk_nag
 from constructs import Construct
 
 REQUIRED_REGION = "eu-west-1"
+S3_PREFIX_LIST_ID_EU_WEST_1 = "pl-6da54004"
 BEDROCK_INFERENCE_PROFILE_ID = "eu.anthropic.claude-sonnet-4-6"
 BEDROCK_FOUNDATION_MODEL_ID = "anthropic.claude-sonnet-4-6"
 BEDROCK_DESTINATION_REGIONS = (
@@ -54,6 +55,7 @@ class AgentCoreStack(Stack):
         vpc: ec2.IVpc,
         private_subnet_ids: list[str],
         trusted_endpoint_security_group: ec2.ISecurityGroup,
+        s3_prefix_list_id: str,
         workspace_capability_secret_name: str,
         capability_gateway_function_arn: str,
         guardrail_id: str | None = None,
@@ -68,6 +70,10 @@ class AgentCoreStack(Stack):
         if region != REQUIRED_REGION:
             raise ValueError(
                 f"AgentCoreStack must be deployed in {REQUIRED_REGION}; got {region}"
+            )
+        if s3_prefix_list_id != S3_PREFIX_LIST_ID_EU_WEST_1:
+            raise ValueError(
+                "S3 prefix list must be the exact eu-west-1 AWS-managed subject"
             )
         if (
             not Token.is_unresolved(workspace_capability_secret_name)
@@ -112,10 +118,13 @@ class AgentCoreStack(Stack):
                 "Personal Operator runtime HTTPS to trusted AWS interface endpoints only"
             ),
         )
-        self.agent_sg.add_ingress_rule(
-            peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
+        self.agent_sg.add_egress_rule(
+            peer=ec2.Peer.prefix_list(s3_prefix_list_id),
             connection=ec2.Port.tcp(443),
-            description="HTTPS from VPC",
+            description=(
+                "Personal Operator runtime HTTPS to the exact eu-west-1 S3 "
+                "managed prefix list under the scoped gateway policy"
+            ),
         )
 
         # --- Execution Role (what the container can do) -----------------------
@@ -127,10 +136,17 @@ class AgentCoreStack(Stack):
             self,
             "OpenClawExecutionRole",
             role_name=execution_role_name,
-            assumed_by=iam.CompositePrincipal(
-                iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-                iam.ServicePrincipal("bedrock.amazonaws.com"),
-                iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
+            assumed_by=iam.ServicePrincipal(
+                "bedrock-agentcore.amazonaws.com"
+            ).with_conditions(
+                {
+                    "StringEquals": {"aws:SourceAccount": account},
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            f"arn:aws:bedrock-agentcore:{region}:{account}:*"
+                        )
+                    },
+                }
             ),
         )
 
@@ -287,29 +303,67 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # CloudWatch Logs — scoped to /openclaw/ log group prefix
+        # The reviewed bridge logger writes one fixed group and stream. Keep
+        # its application-owned log authority separate from AgentCore's
+        # service-managed platform telemetry authority below.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
-                actions=[
-                    "logs:CreateLogGroup",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                ],
+                actions=["logs:CreateLogGroup"],
                 resources=[
-                    f"arn:aws:logs:{region}:{account}:log-group:/openclaw/*",
-                    f"arn:aws:logs:{region}:{account}:log-group:/openclaw/*:*",
+                    f"arn:aws:logs:{region}:{account}:"
+                    "log-group:/openclaw/container"
+                ],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                resources=[
+                    f"arn:aws:logs:{region}:{account}:"
+                    "log-group:/openclaw/container:log-stream:runtime"
                 ],
             )
         )
 
-        # CloudWatch Metrics — namespace condition prevents alarm falsification
+        # AgentCore emits its own platform logs. These are the exact runtime
+        # telemetry permissions required by the service, independent of the
+        # bridge's closed-schema application log stream above.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:DescribeLogStreams", "logs:CreateLogGroup"],
+                resources=[
+                    f"arn:aws:logs:{region}:{account}:"
+                    "log-group:/aws/bedrock-agentcore/runtimes/*"
+                ],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:DescribeLogGroups"],
+                resources=[
+                    f"arn:aws:logs:{region}:{account}:log-group:*"
+                ],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                resources=[
+                    f"arn:aws:logs:{region}:{account}:"
+                    "log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
+                ],
+            )
+        )
+
+        # CloudWatch Metrics — exact service namespace prevents unrelated
+        # metric publication.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["cloudwatch:PutMetricData"],
                 resources=["*"],
                 conditions={
                     "StringEquals": {
-                        "cloudwatch:namespace": "OpenClaw/AgentCore"
+                        "cloudwatch:namespace": "bedrock-agentcore"
                     }
                 },
             )
@@ -321,6 +375,8 @@ class AgentCoreStack(Stack):
                 actions=[
                     "xray:PutTraceSegments",
                     "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets",
                 ],
                 resources=["*"],
             )
@@ -424,7 +480,6 @@ class AgentCoreStack(Stack):
                 actions=[
                     "ecr:GetDownloadUrlForLayer",
                     "ecr:BatchGetImage",
-                    "ecr:BatchCheckLayerAvailability",
                 ],
                 resources=[
                     f"arn:aws:ecr:{region}:{account}:"
@@ -620,6 +675,10 @@ class AgentCoreStack(Stack):
             runtime_environment = {
                 "AWS_REGION": region,
                 "AWS_DEFAULT_REGION": region,
+                # AgentCore's default ADOT application telemetry can include
+                # request/response and tool payloads. Keep that transport off;
+                # the closed-schema bridge and platform operational logs remain.
+                "DISABLE_ADOT_OBSERVABILITY": "true",
                 "BEDROCK_MODEL_ID": str(
                     self.node.try_get_context("default_model_id")
                     or BEDROCK_INFERENCE_PROFILE_ID
@@ -706,6 +765,65 @@ class AgentCoreStack(Stack):
                 name=expected_endpoint_name,
             )
             self.runtime_endpoint.apply_removal_policy(
+                RemovalPolicy.RETAIN,
+                apply_to_update_replace_policy=True,
+            )
+
+            def command_deny_policy(resource_arn: str) -> str:
+                return Stack.of(self).to_json_string(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Sid": "DenyRuntimeCommandExecution",
+                                "Effect": "Deny",
+                                "Principal": "*",
+                                "Action": [
+                                    (
+                                        "bedrock-agentcore:"
+                                        "InvokeAgentRuntimeCommand"
+                                    ),
+                                    (
+                                        "bedrock-agentcore:"
+                                        "InvokeAgentRuntimeCommandShell"
+                                    ),
+                                ],
+                                "Resource": resource_arn,
+                            }
+                        ],
+                    }
+                )
+
+            # AgentCore runtimes created after 2026-03-17 expose command and
+            # interactive-shell APIs independently of the model tool catalog.
+            # Explicit resource denies on both hierarchical subjects prevent a
+            # broad caller identity policy from turning that platform surface
+            # into a catalog or credential-boundary bypass.
+            self.runtime_command_deny_policy = agentcore.CfnResourcePolicy(
+                self,
+                "BridgeRuntimeCommandDenyPolicy",
+                resource_arn=self.runtime.attr_agent_runtime_arn,
+                policy=command_deny_policy(self.runtime.attr_agent_runtime_arn),
+            )
+            self.runtime_command_deny_policy.add_dependency(self.runtime)
+            self.runtime_command_deny_policy.apply_removal_policy(
+                RemovalPolicy.RETAIN,
+                apply_to_update_replace_policy=True,
+            )
+            self.endpoint_command_deny_policy = agentcore.CfnResourcePolicy(
+                self,
+                "BridgeEndpointCommandDenyPolicy",
+                resource_arn=(
+                    self.runtime_endpoint.attr_agent_runtime_endpoint_arn
+                ),
+                policy=command_deny_policy(
+                    self.runtime_endpoint.attr_agent_runtime_endpoint_arn
+                ),
+            )
+            self.endpoint_command_deny_policy.add_dependency(
+                self.runtime_endpoint
+            )
+            self.endpoint_command_deny_policy.apply_removal_policy(
                 RemovalPolicy.RETAIN,
                 apply_to_update_replace_policy=True,
             )
@@ -815,13 +933,19 @@ class AgentCoreStack(Stack):
             [
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
-                    reason="Log streams, ECR repositories, and telemetry APIs require "
-                    "bounded wildcard resources or do not support resource-level "
-                    "permissions.",
+                    reason=(
+                        "AgentCore platform log groups and streams require its "
+                        "documented runtime-name wildcards. CloudWatch metric, "
+                        "X-Ray sampling/telemetry, and ECR authorization APIs do "
+                        "not support narrower resource-level permissions."
+                    ),
                     applies_to=[
                         "Resource::*",
-                        f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*",
-                        f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*:*",
+                        f"Resource::arn:aws:logs:{region}:{account}:log-group:*",
+                        f"Resource::arn:aws:logs:{region}:{account}:"
+                        "log-group:/aws/bedrock-agentcore/runtimes/*",
+                        f"Resource::arn:aws:logs:{region}:{account}:"
+                        "log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*",
                     ],
                 ),
             ],

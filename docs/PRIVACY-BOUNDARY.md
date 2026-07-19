@@ -1,19 +1,19 @@
-# Personal Operator v0 Privacy Boundary
+# Personal Operator v1 Privacy Boundary
 
 This document describes the implemented local boundary and the remaining
 deployment claims. It is not a privacy policy and does not claim that a cloud
 deployment has been verified.
 
-## v1 source-contract extension
+## v1 catalog and implementation boundary
 
-The frozen v1 source catalog and canonical value types extend this document
-without changing any v0 runtime or deployment claim. The source catalog names
-the existing four workspace tools plus `po_web_read`, `po_schedule_list`,
-`po_schedule_propose`, `po_schedule_cancel_propose`, `po_compute_run`, and
-`po_compute_status`. At this task boundary those six entries are contracts, not
-installed runtime authority. They remain unavailable until the separately
-tested runtime catalog, trusted relay, admission gateway, and isolated adapters
-have exact release/catalog/schema parity.
+The frozen source catalog names the four workspace tools `po_file_list`,
+`po_file_read`, `po_file_write`, and `po_file_delete`, plus `po_web_read`,
+`po_schedule_list`, `po_schedule_propose`, `po_schedule_cancel_propose`,
+`po_compute_run`, and `po_compute_status`. The runtime package, plugin manifest,
+trusted relay, admission gateway, and schemas have exact local
+release/catalog/schema parity for those ten tools. That source integration is
+not deployment evidence: runtime image publication, IAM/network behavior,
+AgentCore readiness, and every real provider gate remain open.
 
 The catalog does not place provider, browser, database, approval-signing, or
 cross-user credentials in OpenClaw, model input, workspace, grants, tool
@@ -44,16 +44,24 @@ state, and delivery/effect receipts.
 
 OpenClaw is a replaceable per-user conversational runtime. It receives only a
 canonical internal user ID, a temporary AWS session restricted to that user's
-S3 namespace, model/runtime configuration, and four curated tools:
-`po_file_list`, `po_file_read`, `po_file_write`, and `po_file_delete`. The
+S3 namespace, model/runtime configuration, and exactly ten curated tools. The
 upstream `session_status` built-in is explicitly denied because it can persist
 a model/provider override. The visible catalog and primary selection contain
 only the loopback `agentcore/bedrock-agentcore` route, with no fallback. Its
-gateway is loopback-only. It has no model-callable
-network egress, including URL fetch or search, and no
+gateway is loopback-only. The runtime itself has no arbitrary network,
 Telegram delivery, Google, OpenAI ranking, DynamoDB, approval-signing, Gmail
-send, arbitrary shell, browser, scheduler, MCP, marketplace, or plugin-install
-authority.
+send, arbitrary shell, browser, direct scheduler, dynamic MCP, marketplace, or
+plugin-install authority. `po_web_read` crosses a separate exact-target trusted
+reader under a current-request grant. Schedule tools cross the trusted control
+plane, and scheduled turns remain read/propose-only. Both compute tools return
+`ADAPTER_DISABLED` because production composition contains no compute adapter
+or launcher.
+
+AgentCore's platform-level command and interactive-shell APIs are outside the
+model tool catalog and would share the container filesystem and environment.
+Retained resource policies on both the runtime and immutable endpoint therefore
+deny both actions for every principal, and the live evidence adapter requires
+the exact deny documents.
 
 The temporary session is not self-issued. The runtime role cannot assume the
 workspace role or construct a session policy; it can only invoke the exact
@@ -145,12 +153,15 @@ base64 encoding and the proxy envelope remain below Lambda's response limit.
 | Telegram update queue | Encrypted SQS FIFO and DLQ | Main queue retains messages for at most 4 days; dead-letter messages for at most 14 days; account deletion cannot selectively erase an already-enqueued message |
 | Workspace snapshot | Versioned, KMS-encrypted user S3 namespace | Current and parent generations retained for recovery; 30 days of inactivity triggers runtime/workspace-only purge; account deletion aborts incomplete multipart uploads and removes every user object version and delete marker after runtime purge |
 | Web assets and access logs | Separate blocked-public-access S3 buckets | Versioned assets; bounded noncurrent/log lifecycle in the synthesized stack |
-| Runtime and application logs | CloudWatch | Context-configured 30-day retention; payload/secret logging is prohibited |
+| Runtime and application logs | CloudWatch | Context-configured 30-day retention; payload-rich ADOT application observability is disabled and application-emitted payload/secret logging is prohibited |
 | DynamoDB recovery history | Point-in-time recovery | Historical table recovery follows AWS PITR retention and is not selectively rewritten by account deletion |
 
 The active observability stack uses aggregate AWS service metrics for its
 dashboards and alarms. It does not enable model invocation text or image
-payload logging, and the archived legacy token-monitoring stack is not active.
+payload logging. The runtime sets `DISABLE_ADOT_OBSERVABILITY=true` so
+payload-rich AgentCore application observability is disabled; ordinary
+platform operational logs remain. The archived legacy token-monitoring stack
+is not active, and live CloudWatch inspection remains OPEN.
 
 The hourly maintenance path performs bounded action reconciliation, TTL
 cleanup, account-deletion finalization, and inactive-workspace cleanup. Local
@@ -213,14 +224,19 @@ not reverse an external provider effect.
 
 ## Logging exclusions
 
-The retained runtime and router logs contain only closed metadata: schema,
-component or event code, severity, bounded count, and allowlisted status.
-Console arguments, child stdout/stderr, identities, paths, provider errors,
-exception messages and stacks, prompts, workspace bytes, and responses are
-discarded before a platform or CloudWatch record is created. CloudWatch is not
-a response-inspection transport. The former E2E log tailer now fails before
-constructing a CloudWatch client; live response checks must use direct
-AgentCore invocation evidence, while provider/message journeys remain OPEN.
+Application-emitted runtime and router message fields contain only closed
+metadata: schema, component or event code, severity, bounded count, and
+allowlisted status. Console arguments, child stdout/stderr, identities, paths,
+provider errors, exception messages and stacks, prompts, workspace bytes, and
+responses are discarded before the application emits a message. AWS Lambda
+and other platform envelopes/system records still add operational request,
+timing, and lifecycle metadata. AgentCore's payload-rich ADOT application
+observability is explicitly disabled with `DISABLE_ADOT_OBSERVABILITY=true`;
+ordinary platform operational logs remain. CloudWatch is not a
+response-inspection transport, and exact live retained-field inspection
+remains OPEN. The former E2E log tailer now fails before constructing a
+CloudWatch client; live response checks must use direct AgentCore invocation
+evidence, while provider/message journeys remain OPEN.
 
 Never log or include in release evidence:
 
@@ -232,11 +248,13 @@ Never log or include in release evidence:
 - scoped AWS credential files or execution-role credentials;
 - decrypted workspace contents or another user's identifiers.
 
-That list is an exclusion boundary, not permission to add identifiers to logs.
-Retained runtime/router records are limited to the exact closed metadata set
-above. Typed state, receipt, and trace identifiers may appear only inside their
-existing trusted non-log contracts and stores when those contracts require
-them; they are not CloudWatch fields or release-report dimensions.
+That list is an exclusion boundary, not permission to add identifiers to
+application log messages. Application-emitted runtime/router fields are limited
+to the exact closed set above; platform envelopes are separately constrained
+and must be inspected live. Typed state, receipt, and trace identifiers may
+appear only inside their existing trusted non-log contracts and stores when
+those contracts require them; they are not application-emitted log fields or
+release-report dimensions.
 
 ## Locally tested, not deployment-proven
 

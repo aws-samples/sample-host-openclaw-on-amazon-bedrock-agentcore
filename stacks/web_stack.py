@@ -644,11 +644,16 @@ class WebStack(Stack):
         )
         cfn_stage.access_log_settings = apigwv2.CfnStage.AccessLogSettingsProperty(
             destination_arn=api_access_log_group.log_group_arn,
-            format=(
-                '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp",'
-                '"routeKey":"$context.routeKey",'
-                '"status":"$context.status","latency":"$context.responseLatency",'
-                '"responseLength":"$context.responseLength"}'
+            format=json.dumps(
+                {
+                    "latency": "$context.responseLatency",
+                    "method": "$context.httpMethod",
+                    "responseLength": "$context.responseLength",
+                    "route": "$context.routeKey",
+                    "status": "$context.status",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
             ),
         )
 
@@ -1238,8 +1243,8 @@ class WebStack(Stack):
                     reason=(
                         "CloudFront standard logs persist the literal URI and would leak "
                         "bearer approval tokens from /approve/{token}. The HTTP API instead "
-                        "logs only its route template, status, latency, and request ID; the "
-                        "static S3 origin retains server access logs separately."
+                        "logs only its method, route template, status, response length, and "
+                        "latency; the static S3 origin retains server access logs separately."
                     ),
                 ),
             ],

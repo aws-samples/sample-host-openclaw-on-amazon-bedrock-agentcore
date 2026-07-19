@@ -67,25 +67,25 @@ class ObservabilityStack(Stack):
             statistic="Sum",
         )
 
-        # AgentCore Runtime metrics
-        agentcore_invocations = cw.Metric(
-            namespace="AWS/BedrockAgentCore",
-            metric_name="Invocations",
-            period=Duration.minutes(5),
-            statistic="Sum",
-        )
-        agentcore_latency = cw.Metric(
-            namespace="AWS/BedrockAgentCore",
-            metric_name="InvocationLatency",
-            period=Duration.minutes(5),
-            statistic="p99",
-        )
-        agentcore_errors = cw.Metric(
-            namespace="AWS/BedrockAgentCore",
-            metric_name="InvocationErrors",
-            period=Duration.minutes(5),
-            statistic="Sum",
-        )
+        # AgentCore service metrics use the hyphenated AWS namespace. Search
+        # expressions intentionally cover every documented dimension set so a
+        # dashboard does not silently select a nonexistent dimensionless
+        # series for a particular runtime release.
+        def agentcore_metric(metric_name: str, statistic: str) -> cw.SearchExpression:
+            return cw.SearchExpression(
+                expression=(
+                    "SEARCH('{AWS/Bedrock-AgentCore} "
+                    f'MetricName="{metric_name}"\', \'{statistic}\', 300)'
+                ),
+                label=f"AgentCore {metric_name}",
+                period=Duration.minutes(5),
+            )
+
+        agentcore_invocations = agentcore_metric("Invocations", "Sum")
+        agentcore_system_errors = agentcore_metric("SystemErrors", "Sum")
+        agentcore_user_errors = agentcore_metric("UserErrors", "Sum")
+        agentcore_throttles = agentcore_metric("Throttles", "Sum")
+        agentcore_latency = agentcore_metric("Latency", "p99")
 
         # Router Lambda metrics
         router_invocations = cw.Metric(
@@ -133,7 +133,11 @@ class ObservabilityStack(Stack):
             cw.GraphWidget(
                 title="AgentCore Runtime Invocations & Errors",
                 left=[agentcore_invocations],
-                right=[agentcore_errors],
+                right=[
+                    agentcore_system_errors,
+                    agentcore_user_errors,
+                    agentcore_throttles,
+                ],
                 width=12,
             ),
             cw.GraphWidget(

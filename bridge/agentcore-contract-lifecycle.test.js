@@ -158,6 +158,29 @@ describe("AgentCore workspace lifecycle production coupling", () => {
 });
 
 describe("runtime image lifecycle contract", () => {
+  it("runs unprivileged with only ephemeral runtime paths writable", () => {
+    assert.match(dockerfile, /^USER 1000:1000$/m);
+    assert.doesNotMatch(dockerfile, /container runs as root/i);
+    assert.doesNotMatch(dockerfile, /chown -R 1000:1000 \/(?:app|opt)/);
+    assert.match(dockerfile, /chmod a-w \/var\/tmp/);
+    assert.match(
+      entrypoint,
+      /^export HOME="\/run\/personal-operator\/home"$/m,
+    );
+    assert.match(
+      entrypoint,
+      /^\s*export NODE_COMPILE_CACHE=\/tmp\/personal-operator-compile-cache$/m,
+    );
+    assert.doesNotMatch(
+      entrypoint,
+      /^\s*export NODE_COMPILE_CACHE=\/app\/\.compile-cache$/m,
+    );
+    assert.match(
+      contract,
+      /OPENCLAW_HOME_LINK = "\/run\/personal-operator\/home\/\.openclaw"/,
+    );
+  });
+
   it("copies every trusted persistence module and a read-only seed", () => {
     for (const file of [
       "workspace-path-policy.js",

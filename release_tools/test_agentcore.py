@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 
 import pytest
 
@@ -25,6 +26,10 @@ ENDPOINT_NAME = f"release_{COMMIT}"
 RUNTIME_ARN = (
     f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:"
     f"agent/12345678-1234-1234-1234-123456789abc:{VERSION}"
+)
+ENDPOINT_ARN = (
+    f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:"
+    "agentEndpoint/87654321-4321-4321-4321-cba987654321"
 )
 ROLE_ARN = (
     f"arn:aws:iam::{ACCOUNT}:role/"
@@ -62,6 +67,7 @@ def _runtime(**overrides):
         "networkConfiguration": {
             "networkMode": "VPC",
             "networkModeConfig": {
+                "requireServiceS3Endpoint": False,
                 "securityGroups": list(SECURITY_GROUP_IDS),
                 "subnets": list(SUBNET_IDS),
             },
@@ -89,6 +95,7 @@ def _endpoint(**overrides):
         "liveVersion": VERSION,
         "targetVersion": VERSION,
         "agentRuntimeArn": RUNTIME_ARN,
+        "agentRuntimeEndpointArn": ENDPOINT_ARN,
     }
     value.update(overrides)
     return value
@@ -102,6 +109,10 @@ class FakeAgentCore:
         self.runtimes: dict = {"agentRuntimes": []}
         self.calls: list[tuple[str, dict]] = []
         self.failure: Exception | None = None
+        self.policies = {
+            RUNTIME_ARN: _command_deny_policy(RUNTIME_ARN),
+            ENDPOINT_ARN: _command_deny_policy(ENDPOINT_ARN),
+        }
 
     def _respond(self, name: str, arguments: dict, value: dict) -> dict:
         self.calls.append((name, arguments))
@@ -124,6 +135,36 @@ class FakeAgentCore:
 
     def list_agent_runtimes(self, **kwargs) -> dict:
         return self._respond("list_agent_runtimes", kwargs, self.runtimes)
+
+    def get_resource_policy(self, **kwargs) -> dict:
+        resource_arn = kwargs.get("resourceArn")
+        return self._respond(
+            "get_resource_policy",
+            kwargs,
+            {"policy": self.policies.get(resource_arn)},
+        )
+
+
+def _command_deny_policy(resource_arn: str) -> str:
+    return json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "DenyRuntimeCommandExecution",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": [
+                        "bedrock-agentcore:InvokeAgentRuntimeCommand",
+                        "bedrock-agentcore:InvokeAgentRuntimeCommandShell",
+                    ],
+                    "Resource": resource_arn,
+                }
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _collect(adapter: AgentCoreEvidenceAdapter):
@@ -167,10 +208,97 @@ def test_collects_one_ready_digest_bound_runtime_context() -> None:
             },
         ),
         (
+            "get_resource_policy",
+            {"resourceArn": RUNTIME_ARN},
+        ),
+        (
             "get_agent_runtime_endpoint",
             {"agentRuntimeId": RUNTIME_ID, "endpointName": ENDPOINT_NAME},
         ),
+        (
+            "get_resource_policy",
+            {"resourceArn": ENDPOINT_ARN},
+        ),
     ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.update(Effect="Allow"),
+        lambda value: value.update(Principal={"AWS": ROLE_ARN}),
+        lambda value: value.update(
+            Action=["bedrock-agentcore:InvokeAgentRuntimeCommand"]
+        ),
+        lambda value: value.update(Resource=ENDPOINT_ARN),
+        lambda value: value.update(Sid="DifferentBoundary"),
+    ],
+)
+def test_rejects_any_runtime_command_policy_drift(mutation) -> None:
+    fake = FakeAgentCore()
+    policy = json.loads(fake.policies[RUNTIME_ARN])
+    mutation(policy["Statement"][0])
+    fake.policies[RUNTIME_ARN] = json.dumps(policy)
+
+    with pytest.raises(AgentCoreEvidenceError, match="command.*policy"):
+        _collect(AgentCoreEvidenceAdapter(fake))
+
+
+@pytest.mark.parametrize("value", [None, "", "not-json", "[]", "{}"])
+def test_rejects_missing_or_malformed_runtime_command_policy(value) -> None:
+    fake = FakeAgentCore()
+    fake.policies[RUNTIME_ARN] = value
+
+    with pytest.raises(AgentCoreEvidenceError, match="command.*policy"):
+        _collect(AgentCoreEvidenceAdapter(fake))
+
+
+def test_rejects_endpoint_command_policy_drift() -> None:
+    fake = FakeAgentCore()
+    policy = json.loads(fake.policies[ENDPOINT_ARN])
+    policy["Statement"][0]["Action"] = [
+        "bedrock-agentcore:InvokeAgentRuntimeCommand"
+    ]
+    fake.policies[ENDPOINT_ARN] = json.dumps(policy)
+
+    with pytest.raises(AgentCoreEvidenceError, match="command.*policy"):
+        _collect(AgentCoreEvidenceAdapter(fake))
+
+
+def test_live_runtime_accepts_only_explicitly_disabled_service_s3_endpoint() -> None:
+    fake = FakeAgentCore()
+    fake.runtime["networkConfiguration"]["networkModeConfig"][
+        "requireServiceS3Endpoint"
+    ] = False
+
+    context = _collect(AgentCoreEvidenceAdapter(fake))
+
+    assert "requireServiceS3Endpoint" not in context.runtime_configuration.to_mapping()[
+        "networkConfiguration"
+    ]["networkModeConfig"]
+
+
+def test_missing_live_service_s3_endpoint_disposition_is_ambiguous() -> None:
+    fake = FakeAgentCore()
+    del fake.runtime["networkConfiguration"]["networkModeConfig"][
+        "requireServiceS3Endpoint"
+    ]
+
+    with pytest.raises(AgentCoreEvidenceAmbiguous, match="S3 endpoint disposition"):
+        _collect(AgentCoreEvidenceAdapter(fake))
+
+
+@pytest.mark.parametrize("value", [True, 0, 1, "false", None, [], {}])
+def test_live_service_s3_endpoint_disposition_rejects_every_value_except_false(
+    value,
+) -> None:
+    fake = FakeAgentCore()
+    fake.runtime["networkConfiguration"]["networkModeConfig"][
+        "requireServiceS3Endpoint"
+    ] = value
+
+    with pytest.raises(AgentCoreEvidenceError, match="service-managed S3 endpoint"):
+        _collect(AgentCoreEvidenceAdapter(fake))
 
 
 def test_collects_runtime_identity_without_requiring_an_endpoint() -> None:
@@ -199,7 +327,8 @@ def test_collects_runtime_identity_without_requiring_an_endpoint() -> None:
                 "agentRuntimeId": RUNTIME_ID,
                 "agentRuntimeVersion": VERSION,
             },
-        )
+        ),
+        ("get_resource_policy", {"resourceArn": RUNTIME_ARN}),
     ]
 
 

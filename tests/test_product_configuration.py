@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from release_tools.contracts import canonical_json_bytes
 
 
@@ -260,6 +262,38 @@ def test_bridge_runtime_versions_are_frozen() -> None:
     assert "COPY --from=builder /opt/openclaw /opt/openclaw" in dockerfile
     assert "ln -s /opt/openclaw/openclaw.mjs /usr/local/bin/openclaw" in dockerfile
     assert "npm install -g openclaw@" not in dockerfile
+
+
+def test_bridge_runtime_uses_an_unprivileged_user_and_ephemeral_writes() -> None:
+    dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
+    entrypoint = (ROOT / "bridge/entrypoint.sh").read_text(encoding="utf-8")
+    runtime_stage = dockerfile.split("FROM --platform=linux/arm64", maxsplit=2)[2]
+
+    assert re.findall(r"^USER (\S+)$", dockerfile, flags=re.MULTILINE) == [
+        "1000:1000"
+    ]
+    assert runtime_stage.index("USER 1000:1000") < runtime_stage.index("ENTRYPOINT")
+    assert "container runs as root" not in runtime_stage
+    assert "chown -R 1000:1000 /app" not in runtime_stage
+    assert "chown -R 1000:1000 /opt" not in runtime_stage
+    assert "chown -R 0:0 /home/node" in runtime_stage
+    assert (
+        "chmod -R a-w /home/node /app /opt/openclaw /opt/personal-operator/seed"
+        in runtime_stage
+    )
+    assert "chmod a-w /var/tmp" in runtime_stage
+    assert "HOME=\"/run/personal-operator/home\"" in entrypoint
+    assert "NODE_COMPILE_CACHE=/tmp/personal-operator-compile-cache" in entrypoint
+    assert "NODE_COMPILE_CACHE=/app/.compile-cache" not in entrypoint
+    assert '"$(id -u)" != "1000"' in entrypoint
+    assert '"$(id -g)" != "1000"' in entrypoint
+    for relative in (
+        "bridge/entrypoint.sh",
+        "bridge/agentcore-contract.js",
+        "bridge/scoped-credentials.js",
+        "bridge/runtime-policy.js",
+    ):
+        assert "/root" not in (ROOT / relative).read_text(encoding="utf-8")
 
 
 def test_bridge_image_copies_only_the_reviewed_plugin() -> None:
@@ -790,6 +824,7 @@ def _build_agentcore_stack(
     region: str = "eu-west-1",
     context_overrides: dict | None = None,
     *,
+    s3_prefix_list_id: str = "pl-6da54004",
     guardrail_id: str = "",
     guardrail_version: str = "",
     guardrail_arn: str = "",
@@ -833,6 +868,7 @@ def _build_agentcore_stack(
         ),
         capability_gateway_function_arn=TEST_CAPABILITY_GATEWAY_ARN,
         trusted_endpoint_security_group=trusted_endpoint_sg,
+        s3_prefix_list_id=s3_prefix_list_id,
         guardrail_id=guardrail_id,
         guardrail_version=guardrail_version,
         guardrail_arn=guardrail_arn,
@@ -1200,20 +1236,58 @@ def test_synthesized_runtime_invokes_only_exact_broker_and_capability_gateway() 
     _, statements = _role_and_statements(
         template, "openclaw-agentcore-execution-role-eu-west-1"
     )
-    actions = _flatten_statement_actions(statements)
-    forbidden_prefixes = ("s3:", "scheduler:", "events:", "dynamodb:")
+    inference_profile_arn = (
+        "arn:aws:bedrock:eu-west-1:123456789012:inference-profile/"
+        "eu.anthropic.claude-sonnet-4-6"
+    )
 
-    assert not any(action.startswith(forbidden_prefixes) for action in actions)
-    assert not any(action.startswith("secretsmanager:") for action in actions)
-    assert not any(action.startswith("iam:") for action in actions)
-    assert "iam:PassRole" not in actions
-    assert [action for action in actions if action.startswith("sts:")] == []
-    invoke_statements = [
-        statement
-        for statement in statements
-        if statement.get("Action") == "lambda:InvokeFunction"
-    ]
-    assert invoke_statements == [
+    assert statements == [
+        {
+            "Action": [
+                "bedrock:InvokeModel",
+                "bedrock:InvokeModelWithResponseStream",
+            ],
+            "Effect": "Allow",
+            "Resource": inference_profile_arn,
+        },
+        {
+            "Action": [
+                "bedrock:InvokeModel",
+                "bedrock:InvokeModelWithResponseStream",
+            ],
+            "Condition": {
+                "StringLike": {
+                    "bedrock:InferenceProfileArn": inference_profile_arn,
+                }
+            },
+            "Effect": "Allow",
+            "Resource": [
+                (
+                    "arn:aws:bedrock:eu-central-1::foundation-model/"
+                    "anthropic.claude-sonnet-4-6"
+                ),
+                (
+                    "arn:aws:bedrock:eu-north-1::foundation-model/"
+                    "anthropic.claude-sonnet-4-6"
+                ),
+                (
+                    "arn:aws:bedrock:eu-south-1::foundation-model/"
+                    "anthropic.claude-sonnet-4-6"
+                ),
+                (
+                    "arn:aws:bedrock:eu-south-2::foundation-model/"
+                    "anthropic.claude-sonnet-4-6"
+                ),
+                (
+                    "arn:aws:bedrock:eu-west-1::foundation-model/"
+                    "anthropic.claude-sonnet-4-6"
+                ),
+                (
+                    "arn:aws:bedrock:eu-west-3::foundation-model/"
+                    "anthropic.claude-sonnet-4-6"
+                ),
+            ],
+        },
         {
             "Action": "lambda:InvokeFunction",
             "Effect": "Allow",
@@ -1227,31 +1301,177 @@ def test_synthesized_runtime_invokes_only_exact_broker_and_capability_gateway() 
             "Effect": "Allow",
             "Resource": TEST_CAPABILITY_GATEWAY_ARN,
         },
+        {
+            "Action": "logs:CreateLogGroup",
+            "Effect": "Allow",
+            "Resource": (
+                "arn:aws:logs:eu-west-1:123456789012:"
+                "log-group:/openclaw/container"
+            ),
+        },
+        {
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Effect": "Allow",
+            "Resource": (
+                "arn:aws:logs:eu-west-1:123456789012:"
+                "log-group:/openclaw/container:log-stream:runtime"
+            ),
+        },
+        {
+            "Action": ["logs:DescribeLogStreams", "logs:CreateLogGroup"],
+            "Effect": "Allow",
+            "Resource": (
+                "arn:aws:logs:eu-west-1:123456789012:"
+                "log-group:/aws/bedrock-agentcore/runtimes/*"
+            ),
+        },
+        {
+            "Action": "logs:DescribeLogGroups",
+            "Effect": "Allow",
+            "Resource": (
+                "arn:aws:logs:eu-west-1:123456789012:log-group:*"
+            ),
+        },
+        {
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Effect": "Allow",
+            "Resource": (
+                "arn:aws:logs:eu-west-1:123456789012:"
+                "log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
+            ),
+        },
+        {
+            "Action": "cloudwatch:PutMetricData",
+            "Condition": {
+                "StringEquals": {
+                    "cloudwatch:namespace": "bedrock-agentcore",
+                }
+            },
+            "Effect": "Allow",
+            "Resource": "*",
+        },
+        {
+            "Action": [
+                "xray:PutTraceSegments",
+                "xray:PutTelemetryRecords",
+                "xray:GetSamplingRules",
+                "xray:GetSamplingTargets",
+            ],
+            "Effect": "Allow",
+            "Resource": "*",
+        },
+        {
+            "Action": [
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+            ],
+            "Effect": "Allow",
+            "Resource": (
+                "arn:aws:ecr:eu-west-1:123456789012:"
+                "repository/personal-operator/bridge"
+            ),
+        },
+        {
+            "Action": "ecr:GetAuthorizationToken",
+            "Effect": "Allow",
+            "Resource": "*",
+        },
+    ]
+
+
+def test_synthesized_runtime_trusts_only_agentcore_with_confused_deputy_guards() -> None:
+    template = _synth_agentcore_template()
+    role, _ = _role_and_statements(
+        template, "openclaw-agentcore-execution-role-eu-west-1"
+    )
+
+    assert set(role["Properties"]) == {
+        "AssumeRolePolicyDocument",
+        "RoleName",
+    }
+    assert role["Properties"]["RoleName"] == (
+        "openclaw-agentcore-execution-role-eu-west-1"
+    )
+    assert role["Properties"]["AssumeRolePolicyDocument"]["Statement"] == [
+        {
+            "Action": "sts:AssumeRole",
+            "Condition": {
+                "ArnLike": {
+                    "aws:SourceArn": (
+                        "arn:aws:bedrock-agentcore:eu-west-1:123456789012:*"
+                    )
+                },
+                "StringEquals": {"aws:SourceAccount": "123456789012"},
+            },
+            "Effect": "Allow",
+            "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+        }
     ]
 
 
 def test_synthesized_runtime_has_no_public_egress_and_only_trusted_destinations() -> None:
     template = _synth_agentcore_template()
+    resources = template["Resources"]
+    runtime_group_id, runtime_group = next(
+        (logical_id, resource)
+        for logical_id, resource in resources.items()
+        if resource["Type"] == "AWS::EC2::SecurityGroup"
+        and resource["Properties"].get("GroupDescription")
+        == "AgentCore Runtime container security group"
+    )
+    runtime_group_properties = runtime_group["Properties"]
+    assert "SecurityGroupIngress" not in runtime_group_properties
+    assert "SecurityGroupEgress" not in runtime_group_properties
+
+    runtime_group_ref = {"Fn::GetAtt": [runtime_group_id, "GroupId"]}
+    ingress = [
+        resource["Properties"]
+        for resource in resources.values()
+        if resource["Type"] == "AWS::EC2::SecurityGroupIngress"
+        and resource["Properties"].get("GroupId") == runtime_group_ref
+    ]
+    assert ingress == []
+
     egress = [
         resource["Properties"]
-        for resource in template["Resources"].values()
+        for resource in resources.values()
         if resource["Type"] == "AWS::EC2::SecurityGroupEgress"
+        and resource["Properties"].get("GroupId") == runtime_group_ref
+    ]
+    assert egress == [
+        {
+            "Description": (
+                "Personal Operator runtime HTTPS to trusted AWS interface "
+                "endpoints only"
+            ),
+            "DestinationSecurityGroupId": {
+                "Fn::ImportValue": (
+                    "Networkeuwest1:ExportsOutputFnGetAtt"
+                    "TrustedEndpointSecurityGroupE68AAB76GroupId6BB5975F"
+                )
+            },
+            "FromPort": 443,
+            "GroupId": runtime_group_ref,
+            "IpProtocol": "tcp",
+            "ToPort": 443,
+        },
+        {
+            "Description": (
+                "Personal Operator runtime HTTPS to the exact eu-west-1 S3 "
+                "managed prefix list under the scoped gateway policy"
+            ),
+            "DestinationPrefixListId": "pl-6da54004",
+            "FromPort": 443,
+            "GroupId": runtime_group_ref,
+            "IpProtocol": "tcp",
+            "ToPort": 443,
+        },
     ]
 
-    assert egress
-    assert all(rule.get("CidrIp") != "0.0.0.0/0" for rule in egress)
-    runtime_rules = [
-        rule
-        for rule in egress
-        if rule.get("Description", "").startswith("Personal Operator runtime")
-    ]
-    assert len(runtime_rules) == 1
-    assert {rule["IpProtocol"] for rule in runtime_rules} == {"tcp"}
-    assert {(rule["FromPort"], rule["ToPort"]) for rule in runtime_rules} == {
-        (443, 443)
-    }
-    assert "DestinationSecurityGroupId" in runtime_rules[0]
-    assert "DestinationPrefixListId" not in runtime_rules[0]
+
+def test_agentcore_stack_rejects_any_noncanonical_s3_prefix_list() -> None:
+    with pytest.raises(ValueError, match="S3 prefix list"):
+        _build_agentcore_stack(s3_prefix_list_id="pl-00000000")
 
 
 def test_guardrail_iam_and_runtime_bind_exact_subject_and_version() -> None:
@@ -1271,17 +1491,18 @@ def test_guardrail_iam_and_runtime_bind_exact_subject_and_version() -> None:
     _, statements = _role_and_statements(
         template, "openclaw-agentcore-execution-role-eu-west-1"
     )
-    apply = [
-        statement
-        for statement in statements
-        if statement.get("Action") == "bedrock:ApplyGuardrail"
-    ]
-    assert apply == [
+    _, base_statements = _role_and_statements(
+        _synth_agentcore_template(),
+        "openclaw-agentcore-execution-role-eu-west-1",
+    )
+    assert statements == [
+        *base_statements[:2],
         {
             "Action": "bedrock:ApplyGuardrail",
             "Effect": "Allow",
             "Resource": guardrail_arn,
-        }
+        },
+        *base_statements[2:],
     ]
     runtime = next(
         resource
@@ -1291,6 +1512,8 @@ def test_guardrail_iam_and_runtime_bind_exact_subject_and_version() -> None:
     environment = runtime["Properties"]["EnvironmentVariables"]
     assert environment["BEDROCK_GUARDRAIL_ID"] == guardrail_id
     assert environment["BEDROCK_GUARDRAIL_VERSION"] == guardrail_version
+    assert environment["DISABLE_ADOT_OBSERVABILITY"] == "true"
+    assert not any(name.startswith("OTEL_") for name in environment)
 
 
 def test_app_wires_the_exact_guardrail_and_trusted_endpoint_boundary() -> None:
@@ -1299,7 +1522,7 @@ def test_app_wires_the_exact_guardrail_and_trusted_endpoint_boundary() -> None:
     assert "guardrail_version=guardrails_stack.guardrail_version" in source
     assert "guardrail_arn=guardrails_stack.guardrail_arn" in source
     assert "trusted_endpoint_security_group=vpc_stack.vpce_sg" in source
-    assert "s3_prefix_list_id=" not in source
+    assert "s3_prefix_list_id=vpc_stack.s3_prefix_list_id" in source
 
 
 def test_vpc_exposes_lambda_and_private_bedrock_endpoints_for_runtime_mediation() -> None:
@@ -1327,8 +1550,70 @@ def test_vpc_exposes_lambda_and_private_bedrock_endpoints_for_runtime_mediation(
         if endpoint.get("VpcEndpointType") == "Interface"
         and "com.amazonaws.eu-west-1.s3" in json.dumps(endpoint, sort_keys=True)
     ]
-    assert len(s3_interface) == 1
-    assert s3_interface[0]["PrivateDnsEnabled"] is True
+    assert s3_interface == []
+    s3_gateway = [
+        endpoint
+        for endpoint in endpoints
+        if endpoint.get("VpcEndpointType") == "Gateway"
+        and "PolicyDocument" in endpoint
+    ]
+    assert len(s3_gateway) == 1
+    assert s3_gateway[0]["PolicyDocument"] == {
+        "Statement": [
+            {
+                "Action": "s3:GetObject",
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Resource": (
+                    "arn:aws:s3:::prod-eu-west-1-starport-layer-bucket/*"
+                ),
+            },
+            {
+                "Action": "s3:ListBucket",
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Resource": (
+                    "arn:aws:s3:::openclaw-user-files-"
+                    "123456789012-eu-west-1"
+                ),
+            },
+            {
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                ],
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Resource": (
+                    "arn:aws:s3:::openclaw-user-files-"
+                    "123456789012-eu-west-1/*"
+                ),
+            },
+            {
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:ListBucket",
+                ],
+                "Condition": {
+                    "StringEquals": {
+                        "aws:PrincipalServiceName": (
+                            "bedrock-agentcore.amazonaws.com"
+                        )
+                    }
+                },
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Resource": [
+                    "arn:aws:s3:::acr-storage-*-eu-west-1-an",
+                    "arn:aws:s3:::acr-storage-*-eu-west-1-an/*",
+                ],
+            }
+        ],
+        "Version": "2012-10-17",
+    }
+    assert stack.s3_prefix_list_id == "pl-6da54004"
     bedrock = [
         endpoint
         for endpoint in endpoints
@@ -1336,6 +1621,18 @@ def test_vpc_exposes_lambda_and_private_bedrock_endpoints_for_runtime_mediation(
     ]
     assert len(bedrock) == 1
     assert bedrock[0]["PrivateDnsEnabled"] is True
+
+
+def test_vpc_stack_rejects_every_noncanonical_region() -> None:
+    from aws_cdk import App, Environment
+    from stacks.vpc_stack import VpcStack
+
+    with pytest.raises(ValueError, match="eu-west-1"):
+        VpcStack(
+            App(),
+            "WrongRegionVpc",
+            env=Environment(account="123456789012", region="us-east-1"),
+        )
 
 
 def test_runtime_owned_browser_flag_is_rejected_and_never_synthesizes_iam() -> None:

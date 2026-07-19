@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timedelta, timezone
 from email.utils import getaddresses
+import json
 import logging
 import re
 from typing import Callable, Iterable, Mapping
@@ -16,6 +17,10 @@ except ImportError:  # direct file loading in Lambda/unit tests
 
 
 LOG = logging.getLogger(__name__)
+_LOG_SCHEMA = "personal-operator.log.v1"
+_LOG_WARNING_EVENTS = frozenset(
+    {"thread_listing_failed", "thread_processing_failed"}
+)
 SEARCH_QUERY = "in:sent older_than:3d newer_than:30d -in:chats"
 MAX_THREADS = 50
 MAX_MIME_DEPTH = 8
@@ -28,8 +33,27 @@ _AUTOMATED_LOCAL = re.compile(
 )
 
 
+def _log_warning(event: str) -> None:
+    """Emit one closed metadata record without provider or exception data."""
+
+    if event not in _LOG_WARNING_EVENTS:
+        raise ValueError("Gmail scanner log event is not allowlisted")
+    LOG.warning(
+        json.dumps(
+            {
+                "component": "gmail",
+                "event": event,
+                "level": "WARNING",
+                "schema": _LOG_SCHEMA,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
 class GmailProviderError(RuntimeError):
-    """A provider failure whose message is safe to expose to application logs."""
+    """A canonical provider failure that is never logged verbatim."""
 
 
 class GmailPayloadBoundsError(ValueError):
@@ -239,8 +263,8 @@ class GmailScanner:
             listed = self._client.list_threads(
                 query=SEARCH_QUERY, max_results=MAX_THREADS
             )
-        except Exception as error:
-            LOG.warning("Gmail thread listing failed (%s)", type(error).__name__)
+        except Exception:
+            _log_warning("thread_listing_failed")
             return []
         if not isinstance(listed, list):
             return []
@@ -251,8 +275,9 @@ class GmailScanner:
             try:
                 thread = self._client.get_thread(thread_id=item["id"], format="full")
                 candidate = self._candidate(thread)
-            except Exception as error:  # provider records are untrusted; never log their content
-                LOG.warning("Skipping malformed Gmail thread (%s)", type(error).__name__)
+            except Exception:
+                # Provider records and exception details are untrusted.
+                _log_warning("thread_processing_failed")
                 continue
             if candidate is not None:
                 results.append(candidate)

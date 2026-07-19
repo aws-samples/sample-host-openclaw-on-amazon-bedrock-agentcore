@@ -1,5 +1,10 @@
 # Code Review: feature/agentcore-browser
 
+> **Archived rejected feature review — not authoritative for Personal Operator
+> v1.** Browser composition remains disabled. Do not use the enablement advice
+> below; current boundaries are in `README.md` and
+> `docs/V1-IMPLEMENTATION-EVIDENCE.md`.
+
 ## Summary
 
 The AgentCore Browser feature adds an optional headless Chromium browser skill to the OpenClaw container, with CDK infrastructure, session lifecycle management, screenshot delivery to Telegram/Slack, and comprehensive tests. The overall design is solid — the feature is cleanly gated behind `enable_browser=true`, follows existing patterns (skill scripts, S3 uploads, marker-based delivery), and is non-fatal on failure. However, there are **two security issues** (S3 key injection, missing namespace validation), **one bug** (undefined variable reference), and several minor improvements needed before merge.
