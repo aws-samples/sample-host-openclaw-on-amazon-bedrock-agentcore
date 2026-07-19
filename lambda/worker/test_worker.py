@@ -28,8 +28,14 @@ class FakeRuntimeDriver:
         self.response = response or {"response": "**Done** <safely>"}
         self.calls = []
 
-    def invoke(self, user_id, request, trace_id):
-        self.calls.append((user_id, request, trace_id))
+    def invoke(self, user_id, request, trace_id, *, scheduled_read_only=False):
+        # Mirror the real RuntimeDriver contract: reject any request carrying
+        # caller-controlled authority fields, so a fake can never mask the
+        # divergence that the scheduled read-only path must respect.
+        allowed = {"message", "actorId", "channel"}
+        if "message" not in request or set(request) - allowed:
+            raise ValueError("runtime request contains caller-controlled authority")
+        self.calls.append((user_id, request, trace_id, scheduled_read_only))
         return self.response
 
 
@@ -232,8 +238,9 @@ def test_free_form_input_invokes_runtime_with_minimal_secret_free_request():
     worker.process_envelope(item, deps)
 
     assert len(runtime.calls) == 1
-    user_id, request, trace_id = runtime.calls[0]
+    user_id, request, trace_id, scheduled_read_only = runtime.calls[0]
     assert user_id == "user_a1"
+    assert scheduled_read_only is False  # an interactive turn, not scheduled
     assert trace_id == derive_event_trace("telegram", "user_a1", "100")
     assert set(request) == {"channel", "actorId", "message"}
     serialized = json.dumps(request).lower()
@@ -640,6 +647,48 @@ def occurrence_sqs_record(body, occurrence_id, message_id="sqs-occ-1"):
     }
 
 
+def test_scheduled_agent_turn_uses_the_real_runtime_contract_and_marks_read_only():
+    # C1/C2 regression: a READ_ONLY_AGENT_TURN must build a request the REAL
+    # RuntimeDriver._validated_request accepts (only {message, actorId, channel},
+    # requires 'message') and carry read-only via a trusted invoke parameter that
+    # stamps the payload — never via caller-controlled request fields.
+    import importlib.util
+    import pathlib
+    import sys as _sys
+
+    root = pathlib.Path(worker.__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "router_runtime_driver_real", root / "router" / "runtime_driver.py"
+    )
+    rd = importlib.util.module_from_spec(spec)
+    _sys.modules["router_runtime_driver_real"] = rd
+    spec.loader.exec_module(rd)
+
+    class ContractEnforcingDriver:
+        def __init__(self):
+            self.payloads = []
+
+        def invoke(self, user_id, request, trace_id, *, scheduled_read_only=False):
+            # Raises ValueError if the worker sends a non-conforming request.
+            validated = rd.RuntimeDriver._validated_request(user_id, request)
+            payload = {"action": "chat", "message": validated["message"]}
+            if scheduled_read_only:
+                payload["externalEffects"] = False
+            self.payloads.append(payload)
+            return {"response": "ok"}
+
+    driver = ContractEnforcingDriver()
+    deps = dependencies(runtime=driver)
+    body, occurrence_id = occurrence_body(task_type="READ_ONLY_AGENT_TURN")
+    occurrence = worker.ScheduledOccurrence(json.loads(body))
+
+    # Must not raise: the request conforms to the real runtime contract.
+    worker._occurrence_result(occurrence, deps)
+
+    assert driver.payloads, "the scheduled turn never reached the runtime"
+    assert driver.payloads[0]["externalEffects"] is False
+
+
 def test_worker_processes_scheduled_occurrence_at_most_once_reusing_ledger_state_machine():
     ledger = FakeLedger()
     delivery = FakeDelivery()
@@ -680,10 +729,13 @@ def test_scheduled_reminder_delivers_once_and_read_only_turn_invokes_runtime_wit
     worker.process_sqs_event({"Records": [occurrence_sqs_record(body2, occ2, message_id="sqs-occ-2")]}, deps2)
 
     assert len(runtime2.calls) == 1
-    user_id, request, trace_id = runtime2.calls[0]
+    user_id, request, trace_id, scheduled_read_only = runtime2.calls[0]
     assert user_id == "user_a1"
-    assert request["scheduled"] is True
-    assert request["externalEffects"] is False
+    # Read-only authority travels through the trusted invoke parameter, NOT via
+    # caller-controlled request fields (the real runtime contract rejects those).
+    assert scheduled_read_only is True
+    assert request["message"] == "read inbox"
+    assert set(request) <= {"message", "actorId", "channel"}
     # The read-only turn's request carries no chatId or provider secret.
     serialized = json.dumps(request).lower()
     assert "chatid" not in serialized

@@ -463,17 +463,21 @@ def _occurrence_result(
     if occurrence.task_type == "REMINDER":
         return occurrence.content
     if occurrence.task_type == "READ_ONLY_AGENT_TURN":
-        # No chatId, no provider secret, and an explicit read-only marker. The
-        # runtime's capability grant is thereby confined to read/propose.
+        # The request carries ONLY the fields the runtime contract allows
+        # ({message, actorId, channel}); the read-only authority is a trusted,
+        # server-set invoke parameter (never a caller-controlled request field),
+        # so the runtime's capability grant is confined to read/propose and can
+        # never dispatch a connector/browser effect.
         request = {
             "channel": occurrence.channel,
             "actorId": occurrence.actor_id,
-            "prompt": occurrence.content,
-            "scheduled": True,
-            "externalEffects": False,
+            "message": occurrence.content,
         }
         result = dependencies.runtime_driver.invoke(
-            occurrence.user_id, request, occurrence.trace_id
+            occurrence.user_id,
+            request,
+            occurrence.trace_id,
+            scheduled_read_only=True,
         )
         return _extract_runtime_text(result)
     raise WorkerContractError("scheduled occurrence task type is unsupported")
