@@ -254,11 +254,14 @@ class RuntimeConfigurationV1:
 
     FIELDS: ClassVar[set[str]] = {
         "agentRuntimeArtifact",
+        "authorizerConfiguration",
         "environmentVariables",
         "filesystemConfigurations",
         "lifecycleConfiguration",
+        "metadataConfiguration",
         "networkConfiguration",
         "protocolConfiguration",
+        "requestHeaderConfiguration",
     }
 
     runtime_image_uri: str
@@ -290,6 +293,14 @@ class RuntimeConfigurationV1:
         )
         if container["containerUri"] != runtime_image_uri:
             raise ContractError("runtime configuration image differs")
+        if value["authorizerConfiguration"] != {}:
+            raise ContractError("runtime authorizer configuration is not disabled")
+        if value["requestHeaderConfiguration"] != {}:
+            raise ContractError(
+                "runtime request header configuration is not disabled"
+            )
+        if value["metadataConfiguration"] != {"requireMMDSV2": True}:
+            raise ContractError("runtime metadata configuration is not hardened")
 
         network = _exact_object(
             value["networkConfiguration"],
@@ -404,6 +415,7 @@ class RuntimeConfigurationV1:
             "agentRuntimeArtifact": {
                 "containerConfiguration": {"containerUri": self.runtime_image_uri}
             },
+            "authorizerConfiguration": {},
             "environmentVariables": dict(self.environment_variables),
             "filesystemConfigurations": [
                 {"sessionStorage": {"mountPath": "/mnt/workspace"}}
@@ -419,7 +431,9 @@ class RuntimeConfigurationV1:
                     "subnets": list(self.subnet_ids),
                 },
             },
+            "metadataConfiguration": {"requireMMDSV2": True},
             "protocolConfiguration": {"serverProtocol": "HTTP"},
+            "requestHeaderConfiguration": {},
         }
 
     def digest_for_role(self, execution_role_arn: str) -> str:
@@ -459,6 +473,7 @@ class ProductionObservationConfigV1:
         "foundationStackRequestDigests",
         "runtimeStackRequestDigest",
         "consumerStackRequestDigests",
+        "evidenceRuntimeSha256",
     }
 
     source_commit: str
@@ -480,6 +495,7 @@ class ProductionObservationConfigV1:
     foundation_stack_request_digests: tuple[tuple[str, str], ...]
     runtime_stack_request_digest: str
     consumer_stack_request_digests: tuple[tuple[str, str], ...]
+    evidence_runtime_sha256: str
 
     @classmethod
     def from_mapping(
@@ -540,6 +556,7 @@ class ProductionObservationConfigV1:
                 "agentRuntimeArtifact": {
                     "containerConfiguration": {"containerUri": runtime_image_uri}
                 },
+                "authorizerConfiguration": {},
                 "environmentVariables": value["runtimeEnvironmentVariables"],
                 "filesystemConfigurations": [
                     {"sessionStorage": {"mountPath": "/mnt/workspace"}}
@@ -557,7 +574,9 @@ class ProductionObservationConfigV1:
                         "subnets": value["runtimeSubnetIds"],
                     },
                 },
+                "metadataConfiguration": {"requireMMDSV2": True},
                 "protocolConfiguration": {"serverProtocol": "HTTP"},
+                "requestHeaderConfiguration": {},
             },
             runtime_image_uri=runtime_image_uri,
             region=region,
@@ -597,6 +616,11 @@ class ProductionObservationConfigV1:
             CONSUMER_RELEASE_STACKS,
             label="consumer stack request digest inventory",
         )
+        evidence_runtime_sha256 = _text(
+            value["evidenceRuntimeSha256"],
+            field="evidence runtime digest",
+            pattern=_SHA_64,
+        )
         return cls(
             source_commit=commit,
             source_tree=tree,
@@ -619,6 +643,7 @@ class ProductionObservationConfigV1:
             foundation_stack_request_digests=foundation_stack_request_digests,
             runtime_stack_request_digest=runtime_stack_request_digest,
             consumer_stack_request_digests=consumer_stack_request_digests,
+            evidence_runtime_sha256=evidence_runtime_sha256,
         )
 
     @classmethod
@@ -665,6 +690,7 @@ class ProductionObservationConfigV1:
             "consumerStackRequestDigests": dict(
                 self.consumer_stack_request_digests
             ),
+            "evidenceRuntimeSha256": self.evidence_runtime_sha256,
         }
 
     def to_bytes(self) -> bytes:

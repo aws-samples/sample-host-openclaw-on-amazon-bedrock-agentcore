@@ -69,6 +69,7 @@ def _create_e2e_script_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Pa
         "agentRuntimeArtifact": {
             "containerConfiguration": {"containerUri": image}
         },
+        "authorizerConfiguration": {},
         "environmentVariables": {
             "AWS_DEFAULT_REGION": "eu-west-1",
             "AWS_REGION": "eu-west-1",
@@ -96,7 +97,9 @@ def _create_e2e_script_harness(tmp_path: Path) -> tuple[Path, dict[str, str], Pa
                 ],
             },
         },
+        "metadataConfiguration": {"requireMMDSV2": True},
         "protocolConfiguration": {"serverProtocol": "HTTP"},
+        "requestHeaderConfiguration": {},
     }
     (build / "runtime-context.json").write_text(
         json.dumps(
@@ -474,7 +477,7 @@ def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
     app = (ROOT / "app.py").read_text(encoding="utf-8")
 
     assert 'REQUIRED_REGION = "eu-west-1"' in release_cli
-    assert 'exec "${PYTHON}" -I "${SCRIPT_DIR}/staging-release.py" "$@"' in deploy
+    assert 'exec "${PYTHON}" -I -S "${SCRIPT_DIR}/staging-release.py" "$@"' in deploy
     assert "agentcore deploy" not in deploy.casefold()
     assert "get-agent-runtime" not in deploy
     assert "RuntimeContext" not in deploy
@@ -1562,6 +1565,7 @@ def test_shell_region_guards_fail_before_aws_cli(tmp_path: Path) -> None:
             arguments = [
                 sys.executable,
                 "-I",
+                "-S",
                 str(ROOT / "scripts/staging-release.py"),
             ]
             arguments.extend(

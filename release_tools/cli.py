@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import hashlib
+import importlib
 import os
 from pathlib import Path
 import pwd
@@ -21,6 +22,10 @@ from release_tools.contracts import (
     StagingTransactionV1,
     parse_canonical_object,
     read_regular_bytes,
+)
+from release_tools.evidence_runtime import (
+    EvidenceRuntimeError,
+    snapshot_evidence_runtime,
 )
 from release_tools.production_observation import (
     HttpsArtifactBlobReader,
@@ -292,12 +297,29 @@ def _load_observation_config(
 
 def _production_composer(
     config: ProductionObservationConfigV1,
+    *,
+    ca_descriptor: int | None = None,
 ) -> EvidenceComposer:
-    """Construct regional SDK clients only after live account discovery."""
+    """Freeze exact credentials into regional clients after account discovery."""
 
     try:
         import boto3
         from botocore.config import Config
+        from botocore import httpsession
+
+        if ca_descriptor is not None:
+            ca_path = _descriptor_path(ca_descriptor)
+
+            def retained_ca_path() -> str:
+                try:
+                    os.lseek(ca_descriptor, 0, os.SEEK_SET)
+                except OSError as error:
+                    raise ReleaseCliError(
+                        "authenticated AWS CA bundle is unavailable"
+                    ) from error
+                return ca_path
+
+            httpsession.where = retained_ca_path
 
         client_config = Config(
             region_name=config.region,
@@ -305,14 +327,61 @@ def _production_composer(
             proxies={},
             retries={"mode": "standard", "max_attempts": 3},
         )
-        session = boto3.Session(region_name=config.region)
+        source_session = boto3.Session(region_name=config.region)
+        credentials = source_session.get_credentials()
+        if credentials is None:
+            raise ReleaseCliError(
+                "production observation credentials are unavailable"
+            )
+        frozen = credentials.get_frozen_credentials()
+        if (
+            not isinstance(frozen.access_key, str)
+            or not frozen.access_key
+            or not isinstance(frozen.secret_key, str)
+            or not frozen.secret_key
+            or (
+                frozen.token is not None
+                and (not isinstance(frozen.token, str) or not frozen.token)
+            )
+        ):
+            raise ReleaseCliError(
+                "production observation credentials cannot be frozen"
+            )
+        frozen_arguments = {
+            "aws_access_key_id": frozen.access_key,
+            "aws_secret_access_key": frozen.secret_key,
+        }
+        if frozen.token is not None:
+            frozen_arguments["aws_session_token"] = frozen.token
+        session = boto3.Session(
+            region_name=config.region,
+            **frozen_arguments,
+        )
+        sts = session.client(
+            "sts",
+            region_name=config.region,
+            config=client_config,
+        )
+        identity = sts.get_caller_identity()
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("Account") != config.account
+        ):
+            raise ReleaseCliError(
+                "production observation credentials differ from the release account"
+            )
+        artifact_ca_file = (
+            retained_ca_path() if ca_descriptor is not None else None
+        )
         return compose_production_evidence(
             ecr_client=session.client(
                 "ecr",
                 region_name=config.region,
                 config=client_config,
             ),
-            artifact_blob_reader=HttpsArtifactBlobReader(),
+            artifact_blob_reader=HttpsArtifactBlobReader(
+                ca_file=artifact_ca_file,
+            ),
             agentcore_client=session.client(
                 "bedrock-agentcore-control",
                 region_name=config.region,
@@ -325,9 +394,151 @@ def _production_composer(
             ),
             config=config,
         )
-    except (ImportError, OSError, ValueError) as error:
+    except ReleaseCliError:
+        raise
+    except Exception as error:
         raise ReleaseCliError(
             "production observation authority is unavailable"
+        ) from error
+
+
+_EVIDENCE_MODULE_ROOTS = frozenset(
+    {
+        "_awscrt",
+        "awscrt",
+        "boto3",
+        "botocore",
+        "certifi",
+        "dateutil",
+        "jmespath",
+        "s3transfer",
+        "six",
+        "urllib3",
+    }
+)
+
+
+def _descriptor_path(descriptor: int) -> str:
+    if not isinstance(descriptor, int) or descriptor < 0:
+        raise ReleaseCliError("authenticated AWS CA descriptor is invalid")
+    for root in (Path("/dev/fd"), Path("/proc/self/fd")):
+        candidate = root / str(descriptor)
+        if candidate.exists():
+            return str(candidate)
+    raise ReleaseCliError("authenticated AWS CA descriptor path is unavailable")
+
+
+class _DescriptorBoundComposer:
+    """Keep one unlinked, read-only CA inode alive for one live observation."""
+
+    def __init__(self, delegate: EvidenceComposer, ca_descriptor: int) -> None:
+        self._delegate = delegate
+        self._ca_descriptor = ca_descriptor
+
+    def _close(self) -> None:
+        descriptor = self._ca_descriptor
+        if descriptor >= 0:
+            self._ca_descriptor = -1
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def observe_phase(
+        self,
+        phase: str,
+        transaction: StagingTransactionV1,
+    ) -> tuple[bool, Mapping[str, str]]:
+        if self._ca_descriptor < 0:
+            raise ReleaseCliError(
+                "production observation authority was already consumed"
+            )
+        try:
+            return self._delegate.observe_phase(phase, transaction)
+        finally:
+            self._close()
+
+    def __del__(self) -> None:
+        self._close()
+
+
+def _authenticated_production_composer(
+    config: ProductionObservationConfigV1,
+    *,
+    site_packages: Path,
+) -> EvidenceComposer:
+    """Load clients from one reviewed SDK snapshot, then erase its file tree."""
+
+    preloaded = sorted(
+        name
+        for name in sys.modules
+        if name.partition(".")[0] in _EVIDENCE_MODULE_ROOTS
+    )
+    if preloaded:
+        raise ReleaseCliError(
+            "production evidence SDK modules were loaded before authentication"
+        )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="personal-operator-evidence-runtime-"
+        ) as temporary_root:
+            retained = Path(temporary_root) / "sdk"
+            observed = snapshot_evidence_runtime(
+                site_packages,
+                destination=retained,
+            )
+            if observed != config.evidence_runtime_sha256:
+                raise ReleaseCliError(
+                    "production evidence runtime differs from the reviewed digest"
+                )
+            ca_file = retained / "botocore" / "cacert.pem"
+            ca_descriptor = -1
+            try:
+                ca_descriptor = os.open(
+                    ca_file,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                os.set_inheritable(ca_descriptor, False)
+            except OSError as error:
+                if ca_descriptor >= 0:
+                    os.close(ca_descriptor)
+                raise ReleaseCliError(
+                    "authenticated AWS CA bundle is unavailable"
+                ) from error
+            ca_metadata = os.fstat(ca_descriptor)
+            if (
+                os.get_inheritable(ca_descriptor)
+                or not stat.S_ISREG(ca_metadata.st_mode)
+                or ca_metadata.st_size <= 0
+            ):
+                os.close(ca_descriptor)
+                raise ReleaseCliError(
+                    "authenticated AWS CA bundle is invalid"
+                )
+            retained_text = str(retained)
+            sys.path.insert(0, retained_text)
+            previous_dont_write_bytecode = sys.dont_write_bytecode
+            sys.dont_write_bytecode = True
+            importlib.invalidate_caches()
+            try:
+                composer = _production_composer(
+                    config,
+                    ca_descriptor=ca_descriptor,
+                )
+            except Exception:
+                os.close(ca_descriptor)
+                raise
+            finally:
+                sys.dont_write_bytecode = previous_dont_write_bytecode
+                try:
+                    sys.path.remove(retained_text)
+                except ValueError:
+                    pass
+                importlib.invalidate_caches()
+            return _DescriptorBoundComposer(composer, ca_descriptor)
+    except EvidenceRuntimeError as error:
+        raise ReleaseCliError(
+            "production evidence runtime cannot be authenticated"
         ) from error
 
 
@@ -580,14 +791,31 @@ def _mutation_acknowledgement(phase: str, raw: Mapping[str, Any]) -> None:
         raise ReleaseCliError(f"{phase} mutation acknowledgement is not exact")
 
 
+def _prepare_composer(
+    journal: TransactionJournal,
+    *,
+    environment: Mapping[str, str],
+    observation_config: ProductionObservationConfigV1,
+    composer_factory: EvidenceComposerFactory,
+) -> EvidenceComposer:
+    """Authenticate and retain the live authority before untrusted dispatch."""
+
+    _discover_account(
+        journal.current.account,
+        journal.current.region,
+        environment=environment,
+    )
+    with _scoped_release_environment(environment):
+        return composer_factory(observation_config)
+
+
 def _observe_and_reconcile(
     journal: TransactionJournal,
     *,
     phase: str,
     operation_sha256: str,
     environment: Mapping[str, str],
-    observation_config: ProductionObservationConfigV1,
-    composer_factory: EvidenceComposerFactory,
+    composer: EvidenceComposer,
     release_root: Path | None = None,
 ) -> StagingTransactionV1:
     _validate_region(journal.current.region)
@@ -599,7 +827,6 @@ def _observe_and_reconcile(
         environment=environment,
     )
     with _scoped_release_environment(environment):
-        composer = composer_factory(observation_config)
         persisted, raw_evidence = composer.observe_phase(phase, journal.current)
     if not isinstance(persisted, bool) or not isinstance(raw_evidence, Mapping):
         raise ReleaseCliError(
@@ -676,10 +903,11 @@ def _run_phase(
             journal.current.account,
             journal.current.region,
         )
-        _discover_account(
-            journal.current.account,
-            journal.current.region,
+        composer = _prepare_composer(
+            journal,
             environment=environment,
+            observation_config=observation_config,
+            composer_factory=composer_factory,
         )
         raw = _invoke_mutation_driver(
             driver,
@@ -695,8 +923,7 @@ def _run_phase(
             phase=phase,
             operation_sha256=operation_sha256,
             environment=environment,
-            observation_config=observation_config,
-            composer_factory=composer_factory,
+            composer=composer,
             release_root=release_root,
         )
 
@@ -766,13 +993,18 @@ def _resume(args: argparse.Namespace) -> StagingTransactionV1:
                 journal.current.account,
                 journal.current.region,
             )
+            composer = _prepare_composer(
+                journal,
+                environment=environment,
+                observation_config=observation_config,
+                composer_factory=args.composer_factory,
+            )
             return _observe_and_reconcile(
                 journal,
                 phase=phase,
                 operation_sha256=operation_sha256,
                 environment=environment,
-                observation_config=observation_config,
-                composer_factory=args.composer_factory,
+                composer=composer,
                 release_root=release_root,
             )
     if journal.current.state == "UNCERTAIN":
@@ -823,10 +1055,11 @@ def _rollback(args: argparse.Namespace) -> StagingTransactionV1:
             journal.current.account,
             journal.current.region,
         )
-        _discover_account(
-            journal.current.account,
-            journal.current.region,
+        composer = _prepare_composer(
+            journal,
             environment=environment,
+            observation_config=observation_config,
+            composer_factory=args.composer_factory,
         )
         raw = _invoke_mutation_driver(
             driver,
@@ -842,8 +1075,7 @@ def _rollback(args: argparse.Namespace) -> StagingTransactionV1:
             phase="rollback",
             operation_sha256=operation_sha256,
             environment=environment,
-            observation_config=observation_config,
-            composer_factory=args.composer_factory,
+            composer=composer,
             release_root=release_root,
         )
 
@@ -896,10 +1128,26 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     composer_factory: EvidenceComposerFactory | None = None,
+    production_site_packages: Path | None = None,
 ) -> int:
     args = _parser().parse_args(argv)
     production_entrypoint = composer_factory is None
-    args.composer_factory = composer_factory or _production_composer
+    if composer_factory is None:
+        def production_factory(
+            config: ProductionObservationConfigV1,
+        ) -> EvidenceComposer:
+            if production_site_packages is None:
+                raise ReleaseCliError(
+                    "production evidence runtime path is unavailable"
+                )
+            return _authenticated_production_composer(
+                config,
+                site_packages=production_site_packages,
+            )
+
+        args.composer_factory = production_factory
+    else:
+        args.composer_factory = composer_factory
     try:
         if production_entrypoint and not args.status:
             _assert_executing_repository(args.root)

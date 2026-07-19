@@ -6,9 +6,10 @@ from __future__ import annotations
 import sys
 
 
-if not sys.flags.isolated:
+if not sys.flags.isolated or not sys.flags.no_site:
     print(
-        "staging release: the production entrypoint requires isolated Python; "
+        "staging release: the production entrypoint requires isolated Python "
+        "with site loading disabled; "
         "use scripts/deploy.sh",
         file=sys.stderr,
     )
@@ -26,4 +27,11 @@ from release_tools.cli import main  # noqa: E402
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    site_packages = (
+        REPOSITORY_ROOT
+        / ".venv"
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    raise SystemExit(main(production_site_packages=site_packages))

@@ -201,9 +201,9 @@ Safe local checks are credential-free:
 
 ```bash
 ./scripts/test-local.sh
-./.venv/bin/python scripts/staging-release.py --help
-./.venv/bin/python scripts/staging-release.py \
-  --status .release/<exact-commit>/staging-transaction.json
+./scripts/deploy.sh --help
+./scripts/deploy.sh \
+  --status build/releases/release_<exact-commit>.json
 ```
 
 A release preflight is also local and creates only a canonical journal for the
@@ -211,9 +211,9 @@ exact clean Git commit/tree, explicit non-synthetic account, and
 `eu-west-1`. It does not discover credentials or mutate AWS:
 
 ```bash
-./.venv/bin/python scripts/staging-release.py \
+./scripts/deploy.sh \
   --preflight \
-  --journal .release/<exact-commit>/staging-transaction.json \
+  --journal build/releases/release_<exact-commit>.json \
   --account <12-digit-account> \
   --region eu-west-1 \
   --commit <exact-40-character-HEAD>

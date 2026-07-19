@@ -106,6 +106,7 @@ def _production_observation_config() -> dict[str, object]:
             name: hashlib.sha256(f"consumer-request:{name}".encode()).hexdigest()
             for name in CONSUMER_STACKS
         },
+        "evidenceRuntimeSha256": "9" * 64,
     }
 
 
@@ -114,6 +115,7 @@ def _runtime_configuration() -> dict[str, object]:
         "agentRuntimeArtifact": {
             "containerConfiguration": {"containerUri": IMAGE_URI}
         },
+        "authorizerConfiguration": {},
         "environmentVariables": dict(RUNTIME_ENVIRONMENT),
         "filesystemConfigurations": [
             {"sessionStorage": {"mountPath": "/mnt/workspace"}}
@@ -129,7 +131,9 @@ def _runtime_configuration() -> dict[str, object]:
                 "subnets": list(SUBNET_IDS),
             },
         },
+        "metadataConfiguration": {"requireMMDSV2": True},
         "protocolConfiguration": {"serverProtocol": "HTTP"},
+        "requestHeaderConfiguration": {},
     }
 
 
@@ -399,6 +403,10 @@ def test_production_observation_config_is_canonical_digest_bound_and_derives_rol
             "consumer stack request",
         ),
         (
+            lambda value: value.update(evidenceRuntimeSha256="9" * 63),
+            "evidence runtime",
+        ),
+        (
             lambda value: value.update(executionRoleArn=ROLE_ARN),
             "fields",
         ),
@@ -465,6 +473,26 @@ def test_runtime_context_rejects_extra_cross_boundary_or_mutable_values(
                 "environmentVariables"
             ].update(AWS_REGION="us-east-1"),
             "environment",
+        ),
+        (
+            lambda value: value["runtimeConfiguration"].update(  # type: ignore[index]
+                authorizerConfiguration={"customJWTAuthorizer": {}}
+            ),
+            "authorizer",
+        ),
+        (
+            lambda value: value["runtimeConfiguration"].update(  # type: ignore[index]
+                requestHeaderConfiguration={
+                    "requestHeaderAllowlist": ["Authorization"]
+                }
+            ),
+            "request header",
+        ),
+        (
+            lambda value: value["runtimeConfiguration"].update(  # type: ignore[index]
+                metadataConfiguration={"requireMMDSV2": False}
+            ),
+            "metadata",
         ),
         (
             lambda value: value["runtimeConfiguration"][  # type: ignore[index]

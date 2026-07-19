@@ -137,7 +137,8 @@ Python package. For a real release checkout, create the ignored
 `<checkout>/.venv` from the reviewed project environment before preflight.
 The shim rejects `PYTHON` overrides and group/world-writable interpreters,
 pins `PATH` before resolving its own location, starts that checkout-local
-interpreter with `-I`, and the Python entrypoint refuses non-isolated startup.
+interpreter with `-I -S`, and the Python entrypoint refuses startup that is
+not isolated or that permits automatic site-package loading.
 The integration worktree does not create this environment automatically; it
 is an explicit predeploy prerequisite. `requirements.txt` pins Boto3 with its
 CRT extra because the SDK `aws login` provider requires that dependency.
@@ -190,6 +191,26 @@ parameter values must match the reviewed final stack digest;
 missing, noncanonical, or journal-mismatched config before write-ahead intent
 or credential discovery.
 
+The config must also carry `evidenceRuntimeSha256`, the 64-character digest of
+the exact Python interpreter and minimal Boto3/Botocore dependency closure used
+by live observation. After installing the exact reviewed `requirements.txt`
+into the checkout-local `.venv`, compute that value without loading ambient
+site packages:
+
+```bash
+./.venv/bin/python -I -S scripts/hash-release-environment.py
+```
+
+The phase process authenticates and copies only that reviewed SDK closure into
+a private snapshot before importing it. It freezes the resolved credentials,
+validates their account with STS, constructs all live clients before invoking
+the mutation driver, and deletes the copied modules before dispatch. The only
+retained file authority is an unlinked, read-only descriptor for the
+authenticated Botocore CA bundle; it is not inherited by the driver and is
+closed after the one live observation. A preloaded Boto3, Botocore, Certifi, or
+dependency module, a runtime-digest mismatch, or an unavailable frozen
+credential fails closed while the write-ahead journal remains `UNCERTAIN`.
+
 A real phase also requires one self-contained reviewed mutation executable.
 The CLI frames and hashes its exact bytes together with the canonical
 observation-config bytes as one reviewed-operation digest, copies the
@@ -216,12 +237,14 @@ proof: the executable is invoked only with
 `--mode mutate`, and its STDOUT can never choose a journal outcome or provide
 release evidence.
 
-After the second exact-account check, the CLI constructs the in-package
-`ProductionEvidenceComposer` with regional ECR, AgentCore control, and
-CloudFormation clients. SDK endpoint overrides and ambient proxy settings are
-disabled. Attestation downloads use a separate proxy-free HTTPS opener and TLS
-context, ignoring `HTTPS_PROXY` and `ALL_PROXY`. The composer, not the driver,
-reads and reconciles every phase:
+Before mutation, the CLI constructs the in-package
+`ProductionEvidenceComposer` with frozen-credential regional ECR, AgentCore
+control, and CloudFormation clients. After dispatch it performs the second
+exact-account check and uses those already-retained clients. SDK endpoint
+overrides and ambient proxy settings are disabled. Attestation downloads use a
+separate proxy-free HTTPS opener and a TLS context built from the same
+authenticated CA, ignoring `HTTPS_PROXY` and `ALL_PROXY`. The composer, not the
+driver, reads and reconciles every phase:
 
 - foundation: all seven exact foundation stacks exist in a complete state,
   each processed template/parameter and request/security digest matches the

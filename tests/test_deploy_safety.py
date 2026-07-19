@@ -37,6 +37,7 @@ def _run(*args: str, **environment: str) -> subprocess.CompletedProcess[str]:
         [
             sys.executable,
             "-I",
+            "-S",
             str(ROOT / "scripts" / "staging-release.py"),
             *args,
         ],
@@ -178,6 +179,7 @@ if observed:
         "agentRuntimeArtifact": {
             "containerConfiguration": {"containerUri": image}
         },
+        "authorizerConfiguration": {},
         "environmentVariables": {
             "AWS_DEFAULT_REGION": region,
             "AWS_REGION": region,
@@ -205,7 +207,9 @@ if observed:
                 ],
             },
         },
+        "metadataConfiguration": {"requireMMDSV2": True},
         "protocolConfiguration": {"serverProtocol": "HTTP"},
+        "requestHeaderConfiguration": {},
     }
     runtime_context = {
         "schema": "personal-operator.runtime-context.v3",
@@ -302,7 +306,7 @@ def test_no_mutable_agentcore_toolkit_deploy_path_remains() -> None:
 
 def test_deploy_is_only_an_exec_compatibility_shim() -> None:
     source = _source()
-    assert 'exec "${PYTHON}" -I "${SCRIPT_DIR}/staging-release.py" "$@"' in source
+    assert 'exec "${PYTHON}" -I -S "${SCRIPT_DIR}/staging-release.py" "$@"' in source
     assert "aws " not in source
     assert "cdk " not in source
     assert "docker " not in source
@@ -358,6 +362,7 @@ def test_isolated_release_entrypoint_ignores_pythonpath_sitecustomize_and_fake_b
         [
             sys.executable,
             "-I",
+            "-S",
             str(ROOT / "scripts" / "staging-release.py"),
             "--help",
         ],
@@ -504,11 +509,16 @@ def test_deploy_shim_contains_no_embedded_runtime_context_parser() -> None:
 def test_credentials_are_discovered_only_inside_confirmed_phase_execution() -> None:
     source = (ROOT / "release_tools/cli.py").read_text(encoding="utf-8")
     assert "def _discover_account" in source
+    assert "def _prepare_composer" in source
     assert "journal.begin_mutation" in source
     phase_body = source.split("def _run_phase(", 1)[1].split("def _read_evidence", 1)[0]
     assert phase_body.index("journal.begin_mutation") < phase_body.index(
-        "_discover_account("
+        "_prepare_composer("
     )
+    prepare_body = source.split("def _prepare_composer(", 1)[1].split(
+        "def _observe_and_reconcile(", 1
+    )[0]
+    assert "_discover_account(" in prepare_body
     assert "def _preflight" in source
 
 

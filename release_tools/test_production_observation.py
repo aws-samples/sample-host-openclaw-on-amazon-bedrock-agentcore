@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -162,6 +163,7 @@ def _config() -> ProductionObservationConfigV1:
                 name: _stack_request_digest(name)
                 for name in CONSUMER_STACKS
             },
+            "evidenceRuntimeSha256": "9" * 64,
         }
     )
 
@@ -231,6 +233,7 @@ def _runtime_configuration() -> dict[str, object]:
         "agentRuntimeArtifact": {
             "containerConfiguration": {"containerUri": IMAGE_URI}
         },
+        "authorizerConfiguration": {},
         "environmentVariables": dict(RUNTIME_ENVIRONMENT),
         "filesystemConfigurations": [
             {"sessionStorage": {"mountPath": "/mnt/workspace"}}
@@ -246,7 +249,9 @@ def _runtime_configuration() -> dict[str, object]:
                 "subnets": list(SUBNET_IDS),
             },
         },
+        "metadataConfiguration": {"requireMMDSV2": True},
         "protocolConfiguration": {"serverProtocol": "HTTP"},
+        "requestHeaderConfiguration": {},
     }
 
 
@@ -841,6 +846,35 @@ def test_default_artifact_reader_ignores_ambient_proxy_configuration(
     assert calls == ["https://artifacts.example.invalid/blob"]
 
 
+def test_default_artifact_reader_accepts_only_an_explicit_absolute_ca_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from release_tools import production_observation as observation_module
+
+    contexts: list[tuple[object, str | None]] = []
+    sentinel = object()
+
+    def create_default_context(purpose, *, cafile=None):
+        contexts.append((purpose, cafile))
+        return sentinel
+
+    monkeypatch.setattr(
+        observation_module.ssl,
+        "create_default_context",
+        create_default_context,
+    )
+    monkeypatch.setattr(
+        observation_module.urllib_request,
+        "build_opener",
+        lambda *handlers: SimpleNamespace(open=lambda *args, **kwargs: None),
+    )
+
+    HttpsArtifactBlobReader(ca_file="/dev/fd/17")
+    assert contexts == [(observation_module.ssl.Purpose.SERVER_AUTH, "/dev/fd/17")]
+    with pytest.raises(ProductionObservationError, match="CA file"):
+        HttpsArtifactBlobReader(ca_file="relative-ca.pem")
+
+
 class CloudFormationNotFound(Exception):
     response = {"Error": {"Code": "ValidationError"}}
 
@@ -990,6 +1024,16 @@ def test_cloudformation_foundation_requires_all_exact_complete_stacks() -> None:
     assert _cloudformation_adapter(empty_policy).observe_foundation(
         _transaction("foundation")
     ) is True
+
+    for status in ("DRIFTED", "UNKNOWN"):
+        known_drift = FakeCloudFormation()
+        known_drift.stacks["OpenClawVpc"]["DriftInformation"] = {
+            "StackDriftStatus": status
+        }
+        with pytest.raises(ProductionObservationError, match="drift"):
+            _cloudformation_adapter(known_drift).observe_foundation(
+                _transaction("foundation")
+            )
 
 
 def test_cloudformation_runtime_identity_is_bound_to_exact_stack_outputs() -> None:

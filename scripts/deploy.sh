@@ -24,4 +24,4 @@ if [[ ! -O "${PYTHON}" ]] || /usr/bin/find -L "${PYTHON}" -prune \( -perm -002 -
 fi
 
 unset PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT
-exec "${PYTHON}" -I "${SCRIPT_DIR}/staging-release.py" "$@"
+exec "${PYTHON}" -I -S "${SCRIPT_DIR}/staging-release.py" "$@"

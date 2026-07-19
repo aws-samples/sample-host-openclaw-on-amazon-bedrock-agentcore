@@ -64,9 +64,21 @@ class HttpsArtifactBlobReader:
         *,
         opener: Any | None = None,
         timeout_seconds: int = 15,
+        ca_file: str | None = None,
     ) -> None:
         if opener is None:
-            tls_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            if ca_file is not None and (
+                not isinstance(ca_file, str)
+                or not ca_file.startswith("/")
+                or "\x00" in ca_file
+            ):
+                raise ProductionObservationError(
+                    "artifact reader CA file is invalid"
+                )
+            tls_context = ssl.create_default_context(
+                ssl.Purpose.SERVER_AUTH,
+                cafile=ca_file,
+            )
             explicit_opener = urllib_request.build_opener(
                 urllib_request.ProxyHandler({}),
                 urllib_request.HTTPSHandler(context=tls_context),
@@ -424,6 +436,21 @@ class CloudFormationEvidenceAdapter:
             raise ProductionObservationError(
                 f"stack {stack_name} is not in a proven complete state: {status!r}"
             )
+        drift = stack.get("DriftInformation")
+        if drift is not None:
+            if (
+                not isinstance(drift, Mapping)
+                or set(drift) - {"StackDriftStatus", "LastCheckTimestamp"}
+                or drift.get("StackDriftStatus")
+                not in {"IN_SYNC", "NOT_CHECKED", "DRIFTED", "UNKNOWN"}
+            ):
+                raise ProductionObservationError(
+                    f"stack {stack_name} drift information is malformed"
+                )
+            if drift["StackDriftStatus"] in {"DRIFTED", "UNKNOWN"}:
+                raise ProductionObservationError(
+                    f"stack {stack_name} has unresolved drift"
+                )
         template = self._call(
             "get_template",
             StackName=stack_name,

@@ -75,6 +75,7 @@ def _runtime(**overrides):
             "idleRuntimeSessionTimeout": IDLE_TIMEOUT,
             "maxLifetime": MAX_LIFETIME,
         },
+        "metadataConfiguration": {"requireMMDSV2": True},
     }
     value.update(overrides)
     return value
@@ -271,6 +272,47 @@ def test_retained_runtime_and_endpoint_disposition_is_exact_or_coherently_absent
         expected_max_lifetime=MAX_LIFETIME,
     ) == ("ABSENT", "")
 
+    replacement = MissingBoth()
+    replacement.runtimes = {
+        "agentRuntimes": [
+            {
+                "agentRuntimeName": "personal_operator_bridge",
+                "agentRuntimeId": "replacement_runtime-9876543210",
+            }
+        ]
+    }
+    with pytest.raises(AgentCoreEvidenceError, match="still exists"):
+        AgentCoreEvidenceAdapter(replacement).observe_retained_disposition(
+            source_commit=COMMIT,
+            account=ACCOUNT,
+            region=REGION,
+            runtime_id=RUNTIME_ID,
+            runtime_version=VERSION,
+            runtime_image_uri=IMAGE_URI,
+            expected_subnet_ids=SUBNET_IDS,
+            expected_security_group_ids=SECURITY_GROUP_IDS,
+            expected_environment_variables=ENVIRONMENT,
+            expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
+            expected_max_lifetime=MAX_LIFETIME,
+        )
+
+    paginated = MissingBoth()
+    paginated.runtimes = {"agentRuntimes": [], "nextToken": "more"}
+    with pytest.raises(AgentCoreEvidenceAmbiguous, match="paginated"):
+        AgentCoreEvidenceAdapter(paginated).observe_retained_disposition(
+            source_commit=COMMIT,
+            account=ACCOUNT,
+            region=REGION,
+            runtime_id=RUNTIME_ID,
+            runtime_version=VERSION,
+            runtime_image_uri=IMAGE_URI,
+            expected_subnet_ids=SUBNET_IDS,
+            expected_security_group_ids=SECURITY_GROUP_IDS,
+            expected_environment_variables=ENVIRONMENT,
+            expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
+            expected_max_lifetime=MAX_LIFETIME,
+        )
+
     class MissingEndpoint(FakeAgentCore):
         def get_agent_runtime_endpoint(self, **kwargs):
             raise ResourceNotFound("missing endpoint")
@@ -440,6 +482,27 @@ def test_unknown_pending_and_failed_states_are_not_release_evidence(
         ),
         ("runtime", {"filesystemConfigurations": []}),
         ("runtime", {"protocolConfiguration": {"serverProtocol": "HTTPS"}}),
+        (
+            "runtime",
+            {
+                "authorizerConfiguration": {
+                    "customJWTAuthorizer": {
+                        "allowedAudience": ["attacker"],
+                        "discoveryUrl": "https://attacker.invalid",
+                    }
+                }
+            },
+        ),
+        (
+            "runtime",
+            {
+                "requestHeaderConfiguration": {
+                    "requestHeaderAllowlist": ["Authorization", "Cookie"]
+                }
+            },
+        ),
+        ("runtime", {"metadataConfiguration": {"requireMMDSV2": False}}),
+        ("runtime", {"metadataConfiguration": {}}),
         ("endpoint", {"liveVersion": "6"}),
         ("endpoint", {"targetVersion": "8"}),
         ("endpoint", {"name": "DEFAULT"}),

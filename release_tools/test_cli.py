@@ -32,13 +32,33 @@ def test_production_observation_clients_ignore_operator_endpoint_and_proxy_overr
 ) -> None:
     clients: list[tuple[str, object]] = []
 
+    sessions: list[dict[str, object]] = []
+
+    class FakeFrozenCredentials:
+        access_key = "test-access"
+        secret_key = "test-secret"
+        token = "test-token"
+
+    class FakeCredentials:
+        def get_frozen_credentials(self) -> FakeFrozenCredentials:
+            return FakeFrozenCredentials()
+
     class FakeSession:
-        def __init__(self, *, region_name: str) -> None:
+        def __init__(self, *, region_name: str, **kwargs: object) -> None:
             assert region_name == REGION
+            sessions.append(dict(kwargs))
+
+        def get_credentials(self) -> FakeCredentials:
+            assert sessions[-1] == {}
+            return FakeCredentials()
 
         def client(self, service: str, **kwargs: object) -> object:
             assert kwargs["region_name"] == REGION
             clients.append((service, kwargs["config"]))
+            if service == "sts":
+                return SimpleNamespace(
+                    get_caller_identity=lambda: {"Account": ACCOUNT}
+                )
             return object()
 
     sentinel = object()
@@ -55,7 +75,16 @@ def test_production_observation_clients_ignore_operator_endpoint_and_proxy_overr
     )
 
     assert release_cli._production_composer(config) is sentinel
+    assert sessions == [
+        {},
+        {
+            "aws_access_key_id": "test-access",
+            "aws_secret_access_key": "test-secret",
+            "aws_session_token": "test-token",
+        },
+    ]
     assert [service for service, _ in clients] == [
+        "sts",
         "ecr",
         "bedrock-agentcore-control",
         "cloudformation",
@@ -63,6 +92,68 @@ def test_production_observation_clients_ignore_operator_endpoint_and_proxy_overr
     for _, client_config in clients:
         assert client_config.ignore_configured_endpoint_urls is True
         assert client_config.proxies == {}
+
+
+def test_authenticated_composer_erases_sdk_files_but_retains_unlinked_ca(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _observation_config({"commit": "a" * 40, "tree": "b" * 40})
+    retained_root: Path | None = None
+    observed_ca: bytes | None = None
+
+    def fake_snapshot(site_packages, *, destination):
+        nonlocal retained_root
+        assert site_packages == tmp_path / "site-packages"
+        retained_root = destination
+        ca_file = destination / "botocore" / "cacert.pem"
+        ca_file.parent.mkdir(parents=True)
+        ca_file.write_bytes(b"reviewed-ca")
+        return config.evidence_runtime_sha256
+
+    class Delegate:
+        def observe_phase(self, phase, transaction):
+            return True, {}
+
+    def fake_production_composer(_config, *, ca_descriptor):
+        nonlocal observed_ca
+        assert _config == config
+        os.lseek(ca_descriptor, 0, os.SEEK_SET)
+        observed_ca = os.read(ca_descriptor, 64)
+        return Delegate()
+
+    monkeypatch.setattr(release_cli, "snapshot_evidence_runtime", fake_snapshot)
+    monkeypatch.setattr(
+        release_cli,
+        "_production_composer",
+        fake_production_composer,
+    )
+    monkeypatch.setattr(release_cli, "_EVIDENCE_MODULE_ROOTS", frozenset())
+
+    composer = release_cli._authenticated_production_composer(
+        config,
+        site_packages=tmp_path / "site-packages",
+    )
+
+    assert observed_ca == b"reviewed-ca"
+    assert retained_root is not None and not retained_root.exists()
+    assert composer.observe_phase("foundation", object()) == (True, {})
+    with pytest.raises(release_cli.ReleaseCliError, match="already consumed"):
+        composer.observe_phase("foundation", object())
+
+
+def test_authenticated_composer_rejects_preloaded_sdk_modules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _observation_config({"commit": "a" * 40, "tree": "b" * 40})
+    monkeypatch.setitem(sys.modules, "certifi.injected", object())
+
+    with pytest.raises(release_cli.ReleaseCliError, match="loaded before"):
+        release_cli._authenticated_production_composer(
+            config,
+            site_packages=tmp_path / "site-packages",
+        )
 
 
 def test_account_discovery_ignores_an_ambient_path_shadow(
@@ -237,6 +328,7 @@ def _observation_config(fixture: dict[str, object]) -> ProductionObservationConf
                     "PersonalOperatorScheduler",
                 )
             },
+            "evidenceRuntimeSha256": "9" * 64,
         }
     )
 
@@ -592,7 +684,7 @@ def _phase(
 
 def test_help_exposes_only_the_explicit_release_modes() -> None:
     completed = subprocess.run(
-        [sys.executable, "-I", str(SCRIPT), "--help"],
+        [sys.executable, "-I", "-S", str(SCRIPT), "--help"],
         cwd=ROOT,
         check=False,
         capture_output=True,
@@ -634,6 +726,7 @@ def test_production_entrypoint_rejects_a_different_release_root(
         [
             sys.executable,
             "-I",
+            "-S",
             str(SCRIPT),
             "--root",
             str(fixture["repo"]),
@@ -1003,6 +1096,56 @@ def test_forged_driver_observation_cannot_advance_the_journal(
     ]
 
 
+def test_live_authority_is_constructed_before_the_mutation_driver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+    journal = TransactionJournal.load(fixture["journal"])
+    config = _observation_config(fixture)
+    operation_sha256 = release_cli._reviewed_operation_sha256(
+        fixture["driver"].read_bytes(),
+        config,
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "driver": fixture["driver"],
+            "confirm": (
+                f"mutate:{journal.current.transaction_id}:foundation:"
+                f"{operation_sha256}"
+            ),
+            "rollback_reference": fixture["rollback"],
+        },
+    )()
+
+    class LiveAuthority:
+        def observe_phase(self, phase, transaction):
+            return False, {}
+
+    def factory(_config):
+        with fixture["log"].open("a", encoding="utf-8") as stream:
+            stream.write("composer authenticated\n")
+        return LiveAuthority()
+
+    monkeypatch.setattr(release_cli, "_discover_account", lambda *args, **kwargs: None)
+
+    release_cli._run_phase(
+        journal,
+        "foundation",
+        args,
+        observation_config=config,
+        composer_factory=factory,
+    )
+
+    assert fixture["log"].read_text(encoding="utf-8").splitlines() == [
+        "composer authenticated",
+        "driver mutate <foundation> region=<eu-west-1>/<eu-west-1>/<eu-west-1>",
+    ]
+
+
 def test_uncertain_operation_digest_binds_the_observation_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1033,6 +1176,10 @@ def test_uncertain_operation_digest_binds_the_observation_config(
     changed_stack_sha256 = release_cli._reviewed_operation_sha256(
         fixture["driver"].read_bytes(),
         changed_stack,
+    )
+    changed_runtime_sha256 = release_cli._reviewed_operation_sha256(
+        fixture["driver"].read_bytes(),
+        replace(config, evidence_runtime_sha256="8" * 64),
     )
     args = type(
         "Args",
@@ -1066,6 +1213,7 @@ def test_uncertain_operation_digest_binds_the_observation_config(
     assert current.uncertain_operation_sha256 == operation_sha256
     assert changed_sha256 != operation_sha256
     assert changed_stack_sha256 != operation_sha256
+    assert changed_runtime_sha256 != operation_sha256
 
 
 def test_phase_revalidates_region_before_write_ahead_or_credentials(

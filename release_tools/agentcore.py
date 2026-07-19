@@ -118,6 +118,9 @@ def _sorted_runtime_configuration(runtime: Mapping[str, Any]) -> dict[str, Any]:
     configuration = {
         field: runtime.get(field) for field in RuntimeConfigurationV1.FIELDS
     }
+    for field in ("authorizerConfiguration", "requestHeaderConfiguration"):
+        if configuration[field] is None:
+            configuration[field] = {}
     network = configuration.get("networkConfiguration")
     if not isinstance(network, Mapping):
         return configuration
@@ -275,6 +278,7 @@ class AgentCoreEvidenceAdapter:
                             "containerUri": runtime_image_uri
                         }
                     },
+                    "authorizerConfiguration": {},
                     "environmentVariables": expected_environment_variables,
                     "filesystemConfigurations": [
                         {"sessionStorage": {"mountPath": "/mnt/workspace"}}
@@ -292,7 +296,9 @@ class AgentCoreEvidenceAdapter:
                             "subnets": sorted(expected_subnet_ids),
                         },
                     },
+                    "metadataConfiguration": {"requireMMDSV2": True},
                     "protocolConfiguration": {"serverProtocol": "HTTP"},
+                    "requestHeaderConfiguration": {},
                 },
                 runtime_image_uri=runtime_image_uri,
                 region=region,
@@ -306,6 +312,16 @@ class AgentCoreEvidenceAdapter:
             agentRuntimeId=runtime_id,
             agentRuntimeVersion=runtime_version,
         )
+        for field in ("authorizerConfiguration", "requestHeaderConfiguration"):
+            value = runtime.get(field)
+            if value not in (None, {}):
+                raise AgentCoreEvidenceError(
+                    f"runtime {field} grants unreviewed authority"
+                )
+        if runtime.get("metadataConfiguration") != {"requireMMDSV2": True}:
+            raise AgentCoreEvidenceError(
+                "runtime metadata configuration does not require MMDSv2"
+            )
         _ready(runtime.get("status"), subject="runtime")
         if runtime.get("agentRuntimeId") != runtime_id:
             raise AgentCoreEvidenceError("runtime ID differs from the request")
@@ -490,6 +506,11 @@ class AgentCoreEvidenceAdapter:
                     endpointName=f"release_{source_commit}",
                 )
             except AgentCoreEndpointAbsent:
+                self.assert_runtime_name_absent(
+                    source_commit=source_commit,
+                    account=account,
+                    region=region,
+                )
                 return "ABSENT", ""
             raise AgentCoreEvidenceError(
                 "retained AgentCore disposition is partial: runtime absent, endpoint present"

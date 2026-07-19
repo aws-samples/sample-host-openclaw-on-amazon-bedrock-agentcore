@@ -42,6 +42,7 @@ def _runtime_configuration() -> dict[str, object]:
         "agentRuntimeArtifact": {
             "containerConfiguration": {"containerUri": IMAGE}
         },
+        "authorizerConfiguration": {},
         "environmentVariables": dict(RUNTIME_ENVIRONMENT),
         "filesystemConfigurations": [
             {"sessionStorage": {"mountPath": "/mnt/workspace"}}
@@ -57,7 +58,9 @@ def _runtime_configuration() -> dict[str, object]:
                 "subnets": list(SUBNET_IDS),
             },
         },
+        "metadataConfiguration": {"requireMMDSV2": True},
         "protocolConfiguration": {"serverProtocol": "HTTP"},
+        "requestHeaderConfiguration": {},
     }
 
 
