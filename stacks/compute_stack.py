@@ -1,11 +1,12 @@
 """Networkless, ambient-authority-free Linux compute job runner boundary.
 
 The runner executes a single pinned-by-digest image in a fully isolated VPC:
-no NAT, no internet gateway route, no VPC endpoints, IMDS disabled, and a task
-role that may only read the one immutable input object and write under the
-per-job output prefix. The real Docker build, ARM64 image, and static-scan
-gates are OPEN and are not run here; the pinned image digest is supplied as an
-explicit argument so synth stays offline.
+no NAT, no internet gateway route, no VPC endpoints, IMDS disabled, and no ECS
+task role at all. A trusted control-plane service must copy exact inputs into
+the job before launch and collect outputs after termination; the container
+never receives an AWS credential endpoint. The real Docker build, ARM64 image,
+and static-scan gates are OPEN and are not run here; the pinned image digest is
+supplied as an explicit argument so synth stays offline.
 """
 
 from __future__ import annotations
@@ -159,49 +160,10 @@ class ComputeStack(Stack):
             container_insights=True,
         )
 
-        # The task role carries no ambient AWS provider authority. It may only
-        # read one immutable input object and write under the per-job prefix.
-        task_role = iam.Role(
-            self,
-            "ComputeJobTaskRole",
-            role_name=f"personal-operator-compute-job-{region}",
-            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-            description=(
-                "Networkless compute job role with no ambient AWS provider authority"
-            ),
-        )
-        task_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["s3:GetObject"],
-                resources=[f"{self.input_bucket.bucket_arn}/*"],
-            )
-        )
-        task_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["s3:PutObject"],
-                resources=[f"{self.output_bucket.bucket_arn}/*/jobs/*"],
-            )
-        )
-        task_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "kms:Decrypt",
-                    "kms:Encrypt",
-                    "kms:GenerateDataKey*",
-                    "kms:ReEncrypt*",
-                    "kms:DescribeKey",
-                ],
-                resources=[cmk_arn],
-                conditions={
-                    "StringEquals": {
-                        "kms:CallerAccount": account,
-                        "kms:ViaService": f"s3.{region}.amazonaws.com",
-                    }
-                },
-            )
-        )
-
-        # A minimal execution role only writes the runner's own log stream.
+        # The execution role is consumed by the ECS agent, not exposed to the
+        # workload. It can pull the one repository image and write the runner's
+        # own log stream. The task definition deliberately has no TaskRoleArn,
+        # so ECS does not inject a container credential endpoint.
         execution_role = iam.Role(
             self,
             "ComputeJobExecutionRole",
@@ -217,52 +179,82 @@ class ComputeStack(Stack):
                 ],
             )
         )
+        execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["ecr:GetAuthorizationToken"],
+                resources=["*"],
+            )
+        )
+        execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage",
+                ],
+                resources=[
+                    f"arn:aws:ecr:{region}:{account}:repository/"
+                    "personal-operator-compute"
+                ],
+            )
+        )
 
-        self.task_definition = ecs.FargateTaskDefinition(
+        image = (
+            f"{account}.dkr.ecr.{region}.amazonaws.com/"
+            f"personal-operator-compute@{image_digest}"
+        )
+        self.task_definition = ecs.CfnTaskDefinition(
             self,
             "ComputeJobTaskDefinition",
-            cpu=256,
-            memory_limit_mib=512,
-            task_role=task_role,
-            execution_role=execution_role,
-            runtime_platform=ecs.RuntimePlatform(
-                cpu_architecture=ecs.CpuArchitecture.ARM64,
-                operating_system_family=ecs.OperatingSystemFamily.LINUX,
+            cpu="256",
+            memory="512",
+            network_mode="awsvpc",
+            requires_compatibilities=["FARGATE"],
+            execution_role_arn=execution_role.role_arn,
+            runtime_platform=ecs.CfnTaskDefinition.RuntimePlatformProperty(
+                cpu_architecture="ARM64",
+                operating_system_family="LINUX",
             ),
-        )
-        # The image is pinned by digest. The real build/scan gates are OPEN;
-        # synth references the immutable digest through an ECR repository ARN
-        # form rather than building a local Docker image.
-        self.task_definition.add_container(
-            "JobRunner",
-            image=ecs.ContainerImage.from_registry(
-                f"{account}.dkr.ecr.{region}.amazonaws.com/"
-                f"personal-operator-compute@{image_digest}"
-            ),
-            command=["python", "-m", "compute.runner", "/job/input", "/job/output"],
-            readonly_root_filesystem=True,
-            user="10001:10001",
-            logging=ecs.LogDrivers.aws_logs(
-                stream_prefix="job",
-                log_group=log_group,
-            ),
+            container_definitions=[
+                ecs.CfnTaskDefinition.ContainerDefinitionProperty(
+                    name="JobRunner",
+                    image=image,
+                    command=[
+                        "python",
+                        "-m",
+                        "compute.runner",
+                        "/job/input",
+                        "/job/output",
+                    ],
+                    essential=True,
+                    readonly_root_filesystem=True,
+                    user="10001:10001",
+                    log_configuration=ecs.CfnTaskDefinition.LogConfigurationProperty(
+                        log_driver="awslogs",
+                        options={
+                            "awslogs-group": log_group.log_group_name,
+                            "awslogs-region": region,
+                            "awslogs-stream-prefix": "job",
+                        },
+                    ),
+                )
+            ],
         )
 
         CfnOutput(self, "ComputeImageDigest", value=self.image_digest)
         CfnOutput(self, "ComputeOutputBucketName", value=self.output_bucket.bucket_name)
 
-        for role in (task_role, execution_role):
+        for role in (execution_role,):
             cdk_nag.NagSuppressions.add_resource_suppressions(
                 role,
                 [
                     cdk_nag.NagPackSuppression(
                         id="AwsSolutions-IAM5",
                         reason=(
-                            "The only wildcards select objects beneath the exact "
-                            "input bucket, the per-job output prefix, and the one "
-                            "precreated runner log group. KMS data-plane actions "
-                            "remain bound to the exact key via the S3 via-service "
-                            "condition."
+                            "The execution role is not exposed to the container. "
+                            "Its only wildcard is required by ECR token retrieval; "
+                            "image reads are bound to the exact repository and logs "
+                            "to the precreated runner log group."
                         ),
                     ),
                 ],

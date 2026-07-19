@@ -76,22 +76,28 @@ def test_compute_runner_has_no_internet_route_and_disables_imds():
         assert "NatGatewayId" not in route["Properties"]
 
 
-def test_compute_task_role_reads_only_inputs_and_writes_only_job_prefix():
+def test_compute_container_has_no_task_role_or_ambient_aws_credentials():
     _, template = _synth()
+    task_definition = _resources(template, "AWS::ECS::TaskDefinition")[0]
+    assert "TaskRoleArn" not in task_definition["Properties"]
     actions = _actions(template)
-    # No ambient AWS provider authority: no STS, no secrets, no broad S3.
+    # The execution role is not exposed to the workload. The container itself
+    # receives no task role and therefore no ECS credential endpoint at all.
     for forbidden in (
         "sts:AssumeRole",
         "sts:GetSessionToken",
         "secretsmanager:GetSecretValue",
         "s3:*",
+        "s3:GetObject",
+        "s3:PutObject",
         "s3:DeleteObject",
+        "kms:Decrypt",
+        "kms:Encrypt",
+        "kms:GenerateDataKey*",
+        "kms:ReEncrypt*",
         "ec2:CreateRoute",
     ):
         assert forbidden not in actions
-    # The runner may read job inputs and write outputs, nothing broader.
-    assert "s3:GetObject" in actions
-    assert "s3:PutObject" in actions
 
 
 def test_compute_stack_rejects_a_non_pinned_image_digest():
