@@ -9,7 +9,11 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
+import pytest
+
+from release_tools import cli as release_cli
 from release_tools.contracts import canonical_json_bytes
 
 
@@ -26,12 +30,16 @@ def _run(*args: str, **environment: str) -> subprocess.CompletedProcess[str]:
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": os.environ.get("HOME", "/tmp"),
-        "PYTHON": sys.executable,
         "PYTHONPATH": str(ROOT),
         **environment,
     }
     return subprocess.run(
-        ["/bin/bash", str(SCRIPT), *args],
+        [
+            sys.executable,
+            "-I",
+            str(ROOT / "scripts" / "staging-release.py"),
+            *args,
+        ],
         cwd=ROOT,
         env=env,
         check=False,
@@ -294,12 +302,114 @@ def test_no_mutable_agentcore_toolkit_deploy_path_remains() -> None:
 
 def test_deploy_is_only_an_exec_compatibility_shim() -> None:
     source = _source()
-    assert 'exec "${PYTHON}" "${SCRIPT_DIR}/staging-release.py" "$@"' in source
+    assert 'exec "${PYTHON}" -I "${SCRIPT_DIR}/staging-release.py" "$@"' in source
     assert "aws " not in source
     assert "cdk " not in source
     assert "docker " not in source
     assert "RuntimeContext" not in source
     assert source.count("exec ") == 1
+
+
+def test_release_entrypoint_rejects_nonisolated_python_and_python_override(
+    tmp_path: Path,
+) -> None:
+    direct = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "staging-release.py"), "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert direct.returncode != 0
+    assert "isolated" in direct.stderr.casefold()
+
+    overridden = subprocess.run(
+        ["/bin/bash", str(SCRIPT), "--help"],
+        cwd=ROOT,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "PYTHON": sys.executable,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert overridden.returncode != 0
+    assert "python override" in overridden.stderr.casefold()
+
+
+def test_isolated_release_entrypoint_ignores_pythonpath_sitecustomize_and_fake_boto3(
+    tmp_path: Path,
+) -> None:
+    poison = tmp_path / "poison"
+    poison.mkdir()
+    marker = tmp_path / "loaded"
+    (poison / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('sitecustomize', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (poison / "boto3.py").write_text(
+        "raise RuntimeError('unreviewed boto3 loaded')\n",
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(ROOT / "scripts" / "staging-release.py"),
+            "--help",
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(poison),
+            "PYTHONHOME": str(poison),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists()
+    assert "unreviewed boto3" not in completed.stderr
+
+
+def test_deploy_shim_pins_path_before_resolving_its_own_location(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "shadow-ran"
+    attacker = tmp_path / "attacker"
+    shadow = tmp_path / "shadow" / "dirname"
+    _write_executable(
+        shadow,
+        "#!/bin/sh\n"
+        f": > {str(marker)!r}\n"
+        f"printf '%s\\n' {str(attacker / 'scripts')!r}\n",
+    )
+    _write_executable(
+        attacker / ".venv" / "bin" / "python",
+        "#!/bin/sh\n"
+        f": > {str(marker)!r}\n"
+        "exit 0\n",
+    )
+
+    completed = subprocess.run(
+        ["/bin/bash", str(SCRIPT), "--help"],
+        cwd=ROOT,
+        env={
+            "PATH": f"{shadow.parent}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert not marker.exists()
+    assert "python environment is missing" in completed.stderr.casefold()
 
 
 def test_cli_preflight_executes_exact_git_identity_checks_without_aws(
@@ -330,37 +440,26 @@ def test_cli_preflight_executes_exact_git_identity_checks_without_aws(
         cwd=repository,
         text=True,
     ).strip()
-    journal = tmp_path / "journal.json"
-
-    wrong_head = _run(
-        "--preflight",
-        "--root",
-        str(repository),
-        "--journal",
-        str(journal),
-        "--account",
-        "123456789012",
-        "--commit",
-        "0" * 40,
+    wrong_args = SimpleNamespace(
+        root=repository,
+        account="123456789012",
+        region="eu-west-1",
+        commit="0" * 40,
+        tree="",
     )
+    with pytest.raises(release_cli.ReleaseCliError, match="exact Git HEAD"):
+        release_cli._preflight_identity(wrong_args)
+
     (repository / "untracked.txt").write_text("drift\n", encoding="utf-8")
-    dirty = _run(
-        "--preflight",
-        "--root",
-        str(repository),
-        "--journal",
-        str(journal),
-        "--account",
-        "123456789012",
-        "--commit",
-        head,
+    dirty_args = SimpleNamespace(
+        root=repository,
+        account="123456789012",
+        region="eu-west-1",
+        commit=head,
+        tree="",
     )
-
-    assert wrong_head.returncode != 0
-    assert "exact Git HEAD" in wrong_head.stderr
-    assert dirty.returncode != 0
-    assert "clean worktree" in dirty.stderr
-    assert not journal.exists()
+    with pytest.raises(release_cli.ReleaseCliError, match="clean worktree"):
+        release_cli._preflight_identity(dirty_args)
 
 
 def test_cli_exposes_the_frozen_linear_phase_surface() -> None:

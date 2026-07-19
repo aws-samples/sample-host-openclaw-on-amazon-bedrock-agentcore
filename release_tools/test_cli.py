@@ -87,6 +87,71 @@ def test_account_discovery_ignores_an_ambient_path_shadow(
         release_cli._trusted_aws_cli()
 
 
+def test_git_identity_ignores_path_shadow_and_git_repository_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path / "candidate")
+    foreign = _fixture(tmp_path / "foreign")
+    marker = tmp_path / "shadow-ran"
+    shadow = tmp_path / "shadow" / "git"
+    _write_executable(
+        shadow,
+        f"#!/bin/sh\nprintf shadow\n: > {str(marker)!r}\n",
+    )
+    monkeypatch.setenv("PATH", f"{shadow.parent}:/usr/bin:/bin")
+    monkeypatch.setenv("GIT_DIR", str(foreign["repo"] / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(foreign["repo"]))
+
+    assert (
+        release_cli._git(fixture["repo"], "rev-parse", "HEAD")
+        == fixture["commit"]
+    )
+    assert not marker.exists()
+
+
+def test_release_environment_supports_fixed_aws_login_profile_and_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login_home = tmp_path / "login-home"
+    monkeypatch.setattr(release_cli, "_LOGIN_HOME", login_home)
+    monkeypatch.setenv("AWS_PROFILE", "personal-operator-release")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "poison-config"))
+    monkeypatch.setenv(
+        "AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "poison-credentials")
+    )
+    monkeypatch.setenv(
+        "AWS_LOGIN_CACHE_DIRECTORY", str(tmp_path / "poison-login-cache")
+    )
+
+    environment = release_cli._sanitized_environment(ACCOUNT, REGION)
+
+    assert environment["AWS_PROFILE"] == "personal-operator-release"
+    assert environment["AWS_CONFIG_FILE"] == str(login_home / ".aws" / "config")
+    assert environment["AWS_SHARED_CREDENTIALS_FILE"] == str(
+        login_home / ".aws" / "credentials"
+    )
+    assert environment["AWS_LOGIN_CACHE_DIRECTORY"] == str(
+        login_home / ".aws" / "login" / "cache"
+    )
+    assert environment["AWS_SDK_LOAD_CONFIG"] == "1"
+
+
+def test_live_observer_runs_inside_the_exact_account_discovery_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_ROLE_ARN", "arn:aws:iam::999999999999:role/poison")
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9")
+    environment = release_cli._sanitized_environment(ACCOUNT, REGION)
+
+    with release_cli._scoped_release_environment(environment):
+        assert dict(os.environ) == environment
+
+    assert os.environ["AWS_ROLE_ARN"].endswith("role/poison")
+    assert os.environ["AWS_ENDPOINT_URL"] == "http://127.0.0.1:9"
+
+
 def _observation_config(fixture: dict[str, object]) -> ProductionObservationConfigV1:
     return ProductionObservationConfigV1.from_mapping(
         {
@@ -139,6 +204,32 @@ def _observation_config(fixture: dict[str, object]) -> ProductionObservationConf
             },
             "consumerChangeSetContentDigests": {
                 name: hashlib.sha256(f"change-set:{name}".encode()).hexdigest()
+                for name in (
+                    "OpenClawRouter",
+                    "PersonalOperatorWeb",
+                    "OpenClawCron",
+                    "PersonalOperatorScheduler",
+                )
+            },
+            "foundationStackRequestDigests": {
+                name: hashlib.sha256(
+                    f"foundation-request:{name}".encode()
+                ).hexdigest()
+                for name in (
+                    "OpenClawVpc",
+                    "OpenClawSecurity",
+                    "OpenClawGuardrails",
+                    "PersonalOperatorCapabilities",
+                    "PersonalOperatorCompute",
+                    "OpenClawAgentCore",
+                    "OpenClawObservability",
+                )
+            },
+            "runtimeStackRequestDigest": "7" * 64,
+            "consumerStackRequestDigests": {
+                name: hashlib.sha256(
+                    f"consumer-request:{name}".encode()
+                ).hexdigest()
                 for name in (
                     "OpenClawRouter",
                     "PersonalOperatorWeb",
@@ -374,14 +465,13 @@ from release_tools.cli import main
 from release_tools.production_observation import ProductionObservationError
 
 release_cli._trusted_aws_cli = lambda: Path({str(fake_bin / 'aws')!r})
+CONTROL_PATH = Path(os.environ["PERSONAL_OPERATOR_TEST_CONTROL"])
 
 
 class LiveAuthority:
     def observe_phase(self, phase, transaction):
         control = json.loads(
-            Path(os.environ["PERSONAL_OPERATOR_TEST_CONTROL"]).read_text(
-                encoding="utf-8"
-            )
+            CONTROL_PATH.read_text(encoding="utf-8")
         )
         if control.get("RELEASE_FAIL_OBSERVE_PHASE") == phase:
             raise ProductionObservationError(
@@ -502,7 +592,7 @@ def _phase(
 
 def test_help_exposes_only_the_explicit_release_modes() -> None:
     completed = subprocess.run(
-        [sys.executable, str(SCRIPT), "--help"],
+        [sys.executable, "-I", str(SCRIPT), "--help"],
         cwd=ROOT,
         check=False,
         capture_output=True,
@@ -534,6 +624,93 @@ def test_preflight_and_status_never_discover_aws_credentials(
     assert not fixture["log"].exists()
     current = StagingTransactionV1.from_bytes(status.stdout.encode("utf-8"))
     assert current.state == "PREFLIGHTED"
+
+
+def test_production_entrypoint_rejects_a_different_release_root(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(SCRIPT),
+            "--root",
+            str(fixture["repo"]),
+            "--account",
+            ACCOUNT,
+            "--commit",
+            str(fixture["commit"]),
+            "--journal",
+            str(fixture["journal"]),
+            "--preflight",
+        ],
+        cwd=fixture["repo"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "executing repository" in completed.stderr.casefold()
+    assert not fixture["journal"].exists()
+
+
+@pytest.mark.parametrize("mutation", ["dirty", "new-head"])
+def test_phase_revalidates_exact_checkout_before_credentials(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    fixture = _fixture(tmp_path)
+    assert _preflight(fixture).returncode == 0
+    readme = fixture["repo"] / "README.md"
+    readme.write_text("changed after preflight\n", encoding="utf-8")
+    if mutation == "new-head":
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=fixture["repo"], check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-qm", "change candidate"],
+            cwd=fixture["repo"],
+            check=True,
+        )
+
+    completed = _phase(fixture, "foundation")
+
+    assert completed.returncode != 0
+    assert "checkout" in completed.stderr.casefold()
+    assert not fixture["log"].exists()
+    assert TransactionJournal.load(fixture["journal"]).current.state == "PREFLIGHTED"
+
+
+def test_phase_revalidates_checkout_after_driver_before_live_composition(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _write_executable(
+        fixture["driver"],
+        f"""#!{sys.executable}
+import argparse
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+for name in ("mode", "phase", "journal", "transaction-id", "source-commit", "source-tree", "account", "region", "operation-sha256"):
+    parser.add_argument("--" + name, required=True)
+args = parser.parse_args()
+Path({str(fixture["repo"] / "README.md")!r}).write_text("driver dirtied checkout\\n", encoding="utf-8")
+print(json.dumps({{"dispatched": True}}, separators=(",", ":"), sort_keys=True))
+""",
+    )
+    assert _preflight(fixture).returncode == 0
+
+    completed = _phase(fixture, "foundation")
+
+    assert completed.returncode != 0
+    assert "checkout" in completed.stderr.casefold()
+    current = TransactionJournal.load(fixture["journal"]).current
+    assert current.state == "UNCERTAIN"
+    assert current.last_stable_state == "PREFLIGHTED"
 
 
 def test_mutation_requires_exact_confirmation_before_credentials_or_driver(

@@ -474,7 +474,7 @@ def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
     app = (ROOT / "app.py").read_text(encoding="utf-8")
 
     assert 'REQUIRED_REGION = "eu-west-1"' in release_cli
-    assert 'exec "${PYTHON}" "${SCRIPT_DIR}/staging-release.py" "$@"' in deploy
+    assert 'exec "${PYTHON}" -I "${SCRIPT_DIR}/staging-release.py" "$@"' in deploy
     assert "agentcore deploy" not in deploy.casefold()
     assert "get-agent-runtime" not in deploy
     assert "RuntimeContext" not in deploy
@@ -1558,6 +1558,12 @@ def test_shell_region_guards_fail_before_aws_cli(tmp_path: Path) -> None:
         )
         arguments = ["bash", str(ROOT / relative_script)]
         if relative_script == "scripts/deploy.sh":
+            env.pop("PYTHON", None)
+            arguments = [
+                sys.executable,
+                "-I",
+                str(ROOT / "scripts/staging-release.py"),
+            ]
             arguments.extend(
                 [
                     "--preflight",

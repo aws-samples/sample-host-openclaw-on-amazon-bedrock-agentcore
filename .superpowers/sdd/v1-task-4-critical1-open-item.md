@@ -46,8 +46,10 @@ crash-safety and immutable-subject invariants.
 - A strict `personal-operator.production-observation-config.v1` is required
   before mutation. Its canonical bytes and the exact executable bytes are
   jointly bound into the journal operation digest. The config includes reviewed
-  template/parameter digests for every foundation, runtime, and consumer stack
-  plus complete content digests for all consumer change sets.
+  template/parameter and request/security digests for every foundation,
+  runtime, and consumer stack plus complete content digests for all consumer
+  change sets. Each proposed processed change-set template and its direct
+  parameters must also match the reviewed final stack digest.
 - The composer resolves all eight forward phases plus rollback from injected
   ECR, AgentCore, and CloudFormation clients. It validates exact account,
   `eu-west-1`, commit, tree, immutable artifacts, runtime configuration, stack
@@ -61,6 +63,20 @@ crash-safety and immutable-subject invariants.
 - Rollback additionally queries the retained AgentCore runtime and endpoint;
   CloudFormation absence alone cannot complete it. Both AgentCore subjects must
   be coherently absent or still form the exact release context.
+- Every stack observation requires the real processed-template SDK shape,
+  rejects a nonempty stack policy, and binds security-bearing request fields.
+  Consumer application/verification fingerprints contain only reviewed stack
+  content digests rather than arbitrary outputs or generated IDs.
+- The production entrypoint is isolated from `PYTHONPATH`, `PYTHONHOME`, and
+  `sitecustomize`, rejects interpreter overrides and a different `--root`, and
+  revalidates the exact clean checkout before dispatch and again before live
+  composition. The shell shim pins `PATH` before resolving itself; runbook
+  invocation clears `BASH_ENV`. Git resolution ignores ambient `PATH` and
+  `GIT_*` redirection.
+- Account discovery, the mutation child, and the SDK observer use one exact
+  sanitized credential environment. Fixed login-user AWS config and login
+  cache paths support a prior user-run `aws login` without accepting ambient
+  alternate credential paths.
 - SDK endpoint overrides and ambient SDK proxies are disabled. Artifact reads
   use an explicit proxy-free HTTPS opener/context, and account discovery uses a
   validated absolute AWS CLI path rather than ambient `PATH`.
@@ -69,8 +85,11 @@ crash-safety and immutable-subject invariants.
   operation digest, missing config stops before write-ahead, and hostile
   ECR/AgentCore/CloudFormation responses cannot select persistence. Hostile
   probes cover reviewed-template drift, arbitrary or truncated change-set
-  content, missing stable prerequisites, partial AgentCore rollback state,
-  proxy poisoning, and `PATH` shadowing.
+  content and proposed-template drift, stack policies, request/security-field
+  drift, missing stable prerequisites, orphan runtimes hidden behind absent
+  CloudFormation outputs, changed runtime context, partial AgentCore rollback
+  state, proxy poisoning, Python import poisoning, dirty/changed checkouts, Git
+  repository redirection, and executable `PATH` shadowing.
 
 ## Gate posture
 

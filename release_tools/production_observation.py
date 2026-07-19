@@ -211,17 +211,25 @@ class CloudFormationEvidenceAdapter:
             raise ProductionObservationError("stack parameters are malformed")
         result: list[dict[str, str]] = []
         observed: set[str] = set()
-        allowed = {"ParameterKey", "ParameterValue", "ResolvedValue"}
+        allowed = {
+            "ParameterKey",
+            "ParameterValue",
+            "ResolvedValue",
+            "UsePreviousValue",
+        }
         for raw in value:
             if not isinstance(raw, Mapping) or set(raw) - allowed:
                 raise ProductionObservationError("stack parameter is malformed")
             key = raw.get("ParameterKey")
             parameter_value = raw.get("ParameterValue")
+            use_previous = raw.get("UsePreviousValue", False)
             if (
                 not isinstance(key, str)
                 or not key
                 or key in observed
                 or not isinstance(parameter_value, str)
+                or not isinstance(use_previous, bool)
+                or use_previous
                 or (
                     "ResolvedValue" in raw
                     and not isinstance(raw.get("ResolvedValue"), str)
@@ -229,8 +237,34 @@ class CloudFormationEvidenceAdapter:
             ):
                 raise ProductionObservationError("stack parameter is not exact")
             observed.add(key)
-            result.append({name: raw[name] for name in sorted(raw)})
+            result.append(
+                {
+                    name: raw[name]
+                    for name in sorted(raw)
+                    if name != "UsePreviousValue"
+                }
+            )
         return sorted(result, key=lambda item: item["ParameterKey"])
+
+    @classmethod
+    def _processed_template(cls, response: Mapping[str, Any]) -> dict[str, Any]:
+        if (
+            set(response) - {"TemplateBody", "StagesAvailable", "ResponseMetadata"}
+            or "TemplateBody" not in response
+        ):
+            raise ProductionObservationError("stack template response is not exact")
+        stages = response.get("StagesAvailable")
+        if (
+            not isinstance(stages, list)
+            or not stages
+            or len(stages) != len(set(stages))
+            or any(stage not in {"Original", "Processed"} for stage in stages)
+            or "Processed" not in stages
+        ):
+            raise ProductionObservationError(
+                "processed stack template stage is unavailable or malformed"
+            )
+        return cls._template(response["TemplateBody"])
 
     @staticmethod
     def _content_digest(value: Mapping[str, Any]) -> str:
@@ -241,6 +275,88 @@ class CloudFormationEvidenceAdapter:
                 "live CloudFormation content is not canonical"
             ) from error
         return hashlib.sha256(payload).hexdigest()
+
+    @classmethod
+    def _stack_request(
+        cls,
+        stack_name: str,
+        stack: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if stack.get("ParentId") or stack.get("RootId"):
+            raise ProductionObservationError(
+                "release stack unexpectedly belongs to a nested stack"
+            )
+        capabilities = stack.get("Capabilities", [])
+        notification_arns = stack.get("NotificationARNs", [])
+        tags = stack.get("Tags", [])
+        if (
+            not isinstance(capabilities, list)
+            or any(not isinstance(item, str) for item in capabilities)
+            or not isinstance(notification_arns, list)
+            or any(not isinstance(item, str) for item in notification_arns)
+            or not isinstance(tags, list)
+        ):
+            raise ProductionObservationError("stack request lists are malformed")
+        canonical_tags: list[dict[str, str]] = []
+        observed_tag_keys: set[str] = set()
+        for raw in tags:
+            if not isinstance(raw, Mapping) or set(raw) != {"Key", "Value"}:
+                raise ProductionObservationError("stack request tag is malformed")
+            key = raw.get("Key")
+            value = raw.get("Value")
+            if (
+                not isinstance(key, str)
+                or not key
+                or key in observed_tag_keys
+                or not isinstance(value, str)
+            ):
+                raise ProductionObservationError("stack request tag is not exact")
+            observed_tag_keys.add(key)
+            canonical_tags.append({"Key": key, "Value": value})
+        mapping_fields = {
+            "RollbackConfiguration": "rollbackConfiguration",
+            "DeploymentConfig": "deploymentConfig",
+        }
+        mappings: dict[str, dict[str, Any]] = {}
+        for source, target in mapping_fields.items():
+            raw = stack.get(source, {})
+            if not isinstance(raw, Mapping):
+                raise ProductionObservationError(
+                    f"stack request {source} is malformed"
+                )
+            mappings[target] = dict(raw)
+        description = stack.get("Description", "")
+        role_arn = stack.get("RoleARN", "")
+        timeout = stack.get("TimeoutInMinutes", 0)
+        boolean_fields = {
+            "DisableRollback": "disableRollback",
+            "EnableTerminationProtection": "enableTerminationProtection",
+            "RetainExceptOnCreate": "retainExceptOnCreate",
+        }
+        booleans = {
+            target: stack.get(source, False)
+            for source, target in boolean_fields.items()
+        }
+        if (
+            not isinstance(description, str)
+            or not isinstance(role_arn, str)
+            or not isinstance(timeout, int)
+            or isinstance(timeout, bool)
+            or timeout < 0
+            or any(not isinstance(value, bool) for value in booleans.values())
+        ):
+            raise ProductionObservationError("stack request scalars are malformed")
+        return {
+            "stackName": stack_name,
+            "description": description,
+            "roleArn": role_arn,
+            "timeoutInMinutes": timeout,
+            "capabilities": sorted(capabilities),
+            "notificationArns": sorted(notification_arns),
+            "tags": sorted(canonical_tags, key=lambda item: item["Key"]),
+            **mappings,
+            **booleans,
+        }
 
     def _call(self, method_name: str, **arguments: Any) -> dict[str, Any]:
         method = getattr(self._client, method_name, None)
@@ -278,6 +394,7 @@ class CloudFormationEvidenceAdapter:
         stack_name: str,
         *,
         expected_template_parameter_digest: str | None = None,
+        expected_request_digest: str | None = None,
     ) -> dict[str, Any] | None:
         try:
             response = self._call("describe_stacks", StackName=stack_name)
@@ -307,13 +424,22 @@ class CloudFormationEvidenceAdapter:
             raise ProductionObservationError(
                 f"stack {stack_name} is not in a proven complete state: {status!r}"
             )
-        template = self._call("get_template", StackName=stack_name)
+        template = self._call(
+            "get_template",
+            StackName=stack_name,
+            TemplateStage="Processed",
+        )
+        canonical_template = self._processed_template(template)
+        policy = self._call("get_stack_policy", StackName=stack_name)
+        policy_body = policy.get("StackPolicyBody", "")
         if (
-            set(template) - {"TemplateBody", "Stages", "ResponseMetadata"}
-            or "TemplateBody" not in template
+            set(policy) - {"StackPolicyBody", "ResponseMetadata"}
+            or not isinstance(policy_body, str)
+            or policy_body != ""
         ):
-            raise ProductionObservationError("stack template response is not exact")
-        canonical_template = self._template(template["TemplateBody"])
+            raise ProductionObservationError(
+                f"stack {stack_name} has an unreviewed stack policy"
+            )
         canonical_parameters = self._parameters(stack.get("Parameters", []))
         template_parameter_digest = self._content_digest(
             {
@@ -328,6 +454,12 @@ class CloudFormationEvidenceAdapter:
             raise ProductionObservationError(
                 f"stack {stack_name} differs from reviewed template and parameters"
             )
+        request = self._stack_request(stack_name, stack)
+        request_digest = self._content_digest(request)
+        if expected_request_digest is not None and request_digest != expected_request_digest:
+            raise ProductionObservationError(
+                f"stack {stack_name} differs from reviewed request and security fields"
+            )
         return {
             "stackId": stack_id,
             "stackName": stack_name,
@@ -339,8 +471,8 @@ class CloudFormationEvidenceAdapter:
                     item.get("OutputKey", "") if isinstance(item, dict) else ""
                 ),
             ),
-            "capabilities": sorted(stack.get("Capabilities", [])),
-            "roleArn": stack.get("RoleARN", ""),
+            "request": request,
+            "requestDigest": request_digest,
             "template": canonical_template,
             "templateParameterDigest": template_parameter_digest,
         }
@@ -350,12 +482,18 @@ class CloudFormationEvidenceAdapter:
         stack_names: tuple[str, ...],
         *,
         expected_digests: Mapping[str, str] | None = None,
+        expected_request_digests: Mapping[str, str] | None = None,
     ) -> tuple[dict[str, Any], ...] | None:
         observed = tuple(
             self._stack(
                 name,
                 expected_template_parameter_digest=(
                     expected_digests[name] if expected_digests is not None else None
+                ),
+                expected_request_digest=(
+                    expected_request_digests[name]
+                    if expected_request_digests is not None
+                    else None
                 ),
             )
             for name in stack_names
@@ -391,11 +529,13 @@ class CloudFormationEvidenceAdapter:
 
     def observe_foundation(self, transaction: StagingTransactionV1) -> bool | None:
         expected = dict(self._config.foundation_stack_template_parameter_digests)
+        expected_requests = dict(self._config.foundation_stack_request_digests)
         return (
             True
             if self._snapshot(
                 FOUNDATION_STACKS,
                 expected_digests=expected,
+                expected_request_digests=expected_requests,
             )
             is not None
             else None
@@ -407,12 +547,20 @@ class CloudFormationEvidenceAdapter:
         foundation_expected = dict(
             self._config.foundation_stack_template_parameter_digests
         )
+        foundation_request_expected = dict(
+            self._config.foundation_stack_request_digests
+        )
         observed: dict[str, dict[str, Any]] = {}
         for name in FOUNDATION_STACKS:
             stack = self._stack(
                 name,
                 expected_template_parameter_digest=(
                     None if name == "OpenClawAgentCore" else foundation_expected[name]
+                ),
+                expected_request_digest=(
+                    None
+                    if name == "OpenClawAgentCore"
+                    else foundation_request_expected[name]
                 ),
             )
             if stack is None:
@@ -428,6 +576,8 @@ class CloudFormationEvidenceAdapter:
             if (
                 stack["templateParameterDigest"]
                 != foundation_expected["OpenClawAgentCore"]
+                or stack["requestDigest"]
+                != foundation_request_expected["OpenClawAgentCore"]
             ):
                 raise ProductionObservationError(
                     "runtime absence differs from reviewed foundation prerequisite"
@@ -436,9 +586,10 @@ class CloudFormationEvidenceAdapter:
         if (
             stack["templateParameterDigest"]
             != self._config.runtime_stack_template_parameter_digest
+            or stack["requestDigest"] != self._config.runtime_stack_request_digest
         ):
             raise ProductionObservationError(
-                "runtime stack differs from reviewed template and parameters"
+                "runtime stack differs from reviewed template, parameters, or request"
             )
         expected_uri = (
             f"{transaction.account}.dkr.ecr.{transaction.region}.amazonaws.com/"
@@ -474,6 +625,13 @@ class CloudFormationEvidenceAdapter:
             raise ProductionObservationError("change set crossed its stack subject")
         if response.get("ChangeSetName") != change_set_name:
             raise ProductionObservationError("change set name is not commit bound")
+        for field in ("ParentChangeSetId", "RootChangeSetId"):
+            if field in response and (
+                not isinstance(response[field], str) or response[field]
+            ):
+                raise ProductionObservationError(
+                    "consumer change set unexpectedly belongs to a nested change set"
+                )
         expected_stack_prefix = (
             f"arn:aws:cloudformation:{self._config.region}:"
             f"{self._config.account}:stack/{stack_name}/"
@@ -548,7 +706,6 @@ class CloudFormationEvidenceAdapter:
         )
         mapping_fields = {
             "RollbackConfiguration": "rollbackConfiguration",
-            "DeploymentMode": "deploymentMode",
             "DeploymentConfig": "deploymentConfig",
         }
         mappings: dict[str, dict[str, Any]] = {}
@@ -561,6 +718,7 @@ class CloudFormationEvidenceAdapter:
             mappings[target] = dict(raw)
         scalar_defaults = {
             "Description": "",
+            "DeploymentMode": "",
             "IncludeNestedStacks": False,
             "OnStackFailure": "",
             "ImportExistingResources": False,
@@ -571,21 +729,46 @@ class CloudFormationEvidenceAdapter:
         }
         if (
             not isinstance(scalars["Description"], str)
+            or not isinstance(scalars["DeploymentMode"], str)
             or not isinstance(scalars["IncludeNestedStacks"], bool)
             or not isinstance(scalars["OnStackFailure"], str)
             or not isinstance(scalars["ImportExistingResources"], bool)
         ):
             raise ProductionObservationError("change set scalar content is malformed")
+        proposed = self._call(
+            "get_template",
+            StackName=stack_name,
+            ChangeSetName=change_set_name,
+            TemplateStage="Processed",
+        )
+        proposed_template = self._processed_template(proposed)
+        canonical_parameters = self._parameters(response["Parameters"])
+        template_parameter_digest = self._content_digest(
+            {
+                "parameters": canonical_parameters,
+                "template": proposed_template,
+            }
+        )
+        expected_template_parameter_digest = dict(
+            self._config.consumer_stack_template_parameter_digests
+        )[stack_name]
+        if template_parameter_digest != expected_template_parameter_digest:
+            raise ProductionObservationError(
+                f"change set {stack_name} has an unreviewed proposed template or parameters"
+            )
+        sequences["parameters"] = canonical_parameters
         content = {
             "stackName": stack_name,
             "changeSetName": change_set_name,
             "changeSetType": response.get("ChangeSetType"),
             "description": scalars["Description"],
+            "deploymentMode": scalars["DeploymentMode"],
             **sequences,
             **mappings,
             "includeNestedStacks": scalars["IncludeNestedStacks"],
             "onStackFailure": scalars["OnStackFailure"],
             "importExistingResources": scalars["ImportExistingResources"],
+            "templateParameterDigest": template_parameter_digest,
         }
         content_digest = self._content_digest(content)
         expected_digest = dict(
@@ -639,6 +822,9 @@ class CloudFormationEvidenceAdapter:
             expected_digests=dict(
                 self._config.consumer_stack_template_parameter_digests
             ),
+            expected_request_digests=dict(
+                self._config.consumer_stack_request_digests
+            ),
         )
         if stacks is None:
             if all(
@@ -661,7 +847,20 @@ class CloudFormationEvidenceAdapter:
         stacks = self._consumer_application()
         if stacks is None:
             return None
-        return self._digest({"consumerStacks": stacks})
+        return self._digest({"consumerStacks": self._bound_stack_content(stacks)})
+
+    @staticmethod
+    def _bound_stack_content(
+        stacks: tuple[dict[str, Any], ...],
+    ) -> tuple[dict[str, str], ...]:
+        return tuple(
+            {
+                "stackName": stack["stackName"],
+                "templateParameterDigest": stack["templateParameterDigest"],
+                "requestDigest": stack["requestDigest"],
+            }
+            for stack in stacks
+        )
 
     def observe_verification(
         self,
@@ -676,14 +875,22 @@ class CloudFormationEvidenceAdapter:
         expected_foundation["OpenClawAgentCore"] = (
             self._config.runtime_stack_template_parameter_digest
         )
+        expected_foundation_requests = dict(
+            self._config.foundation_stack_request_digests
+        )
+        expected_foundation_requests["OpenClawAgentCore"] = (
+            self._config.runtime_stack_request_digest
+        )
         foundation = self._snapshot(
             FOUNDATION_STACKS,
             expected_digests=expected_foundation,
+            expected_request_digests=expected_foundation_requests,
         )
         consumers = self._consumer_application()
         if foundation is None or consumers is None:
             return None
-        application_digest = self._digest({"consumerStacks": consumers})
+        bound_consumers = self._bound_stack_content(consumers)
+        application_digest = self._digest({"consumerStacks": bound_consumers})
         if application_digest != transaction.consumer_application_sha256:
             raise ProductionObservationError(
                 "live consumer application differs from the journal"
@@ -691,8 +898,8 @@ class CloudFormationEvidenceAdapter:
         return self._digest(
             {
                 "transactionId": transaction.transaction_id,
-                "foundationStacks": foundation,
-                "consumerStacks": consumers,
+                "foundationStacks": self._bound_stack_content(foundation),
+                "consumerStacks": bound_consumers,
                 "runtimeImageEvidence": image.to_mapping(),
                 "runtimeContext": context.to_mapping(),
             }
@@ -900,7 +1107,7 @@ class ProductionEvidenceComposer:
         self._require_image(transaction)
         self._require_runtime(transaction)
         try:
-            return self._runtime_context(
+            context = self._runtime_context(
                 runtime_id=transaction.runtime_id,
                 runtime_version=transaction.runtime_version,
                 runtime_image_digest=transaction.runtime_image_digest,
@@ -909,6 +1116,14 @@ class ProductionEvidenceComposer:
             raise ProductionObservationError(
                 "lastStable endpoint prerequisite is missing"
             ) from error
+        if (
+            hashlib.sha256(context.to_bytes()).hexdigest()
+            != transaction.runtime_context_sha256
+        ):
+            raise ProductionObservationError(
+                "lastStable runtime context prerequisite differs from the journal"
+            )
+        return context
 
     def endpoint_evidence(
         self,
@@ -979,6 +1194,11 @@ class ProductionEvidenceComposer:
                 self._require_image(transaction)
                 identity = self._deployment.observe_runtime_identity(transaction)
                 if identity is None:
+                    self._agentcore.assert_runtime_name_absent(
+                        source_commit=self._config.source_commit,
+                        account=self._config.account,
+                        region=self._config.region,
+                    )
                     return False, {}
                 if (
                     not isinstance(identity, tuple)
@@ -1084,7 +1304,26 @@ class ProductionEvidenceComposer:
                     raise ProductionObservationError(
                         "rollback retained AgentCore disposition is ambiguous"
                     ) from error
-                if disposition not in {"PRESENT", "ABSENT"}:
+                if (
+                    not isinstance(disposition, tuple)
+                    or len(disposition) != 2
+                    or any(not isinstance(item, str) for item in disposition)
+                ):
+                    raise ProductionObservationError(
+                        "rollback retained AgentCore disposition is malformed"
+                    )
+                disposition_state, context_digest = disposition
+                if disposition_state == "PRESENT":
+                    if context_digest != transaction.runtime_context_sha256:
+                        raise ProductionObservationError(
+                            "rollback retained AgentCore differs from journaled context"
+                        )
+                elif disposition_state == "ABSENT":
+                    if context_digest:
+                        raise ProductionObservationError(
+                            "rollback absent AgentCore disposition carries context"
+                        )
+                else:
                     raise ProductionObservationError(
                         "rollback retained AgentCore disposition is malformed"
                     )

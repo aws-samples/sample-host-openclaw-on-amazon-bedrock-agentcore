@@ -31,6 +31,7 @@ from release_tools.transaction import TransactionError, TransactionJournal
 
 
 REQUIRED_REGION = "eu-west-1"
+EXECUTING_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PHASE_TO_STATE = {
     "foundation": "FOUNDATION_READY",
     "image": "IMAGE_PUBLISHED",
@@ -44,6 +45,7 @@ PHASE_TO_STATE = {
 STATE_TO_PHASE = {state: phase for phase, state in PHASE_TO_STATE.items()}
 _ACCOUNT = re.compile(r"[0-9]{12}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
+_AWS_PROFILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+=,-]{0,127}")
 _ACCOUNT_OWNER_UIDS = frozenset({0, os.getuid()})
 _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 TRUSTED_AWS_CLI_CANDIDATES = (
@@ -51,6 +53,11 @@ TRUSTED_AWS_CLI_CANDIDATES = (
     Path("/opt/homebrew/bin/aws"),
     Path("/usr/bin/aws"),
     _LOGIN_HOME / ".local" / "bin" / "aws",
+)
+TRUSTED_GIT_CANDIDATES = (
+    Path("/usr/bin/git"),
+    Path("/usr/local/bin/git"),
+    Path("/opt/homebrew/bin/git"),
 )
 
 
@@ -92,12 +99,63 @@ def _reviewed_operation_sha256(
     return "sha256:" + hashlib.sha256(framed).hexdigest()
 
 
+def _trusted_executable(
+    candidates: Sequence[Path],
+    *,
+    description: str,
+) -> Path:
+    for candidate in candidates:
+        if not isinstance(candidate, Path) or not candidate.is_absolute():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            metadata = resolved.stat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid in _ACCOUNT_OWNER_UIDS
+            and metadata.st_mode & 0o111
+            and metadata.st_mode & 0o022 == 0
+        ):
+            return resolved
+    raise ReleaseCliError(
+        f"{description} requires a trusted absolute executable path"
+    )
+
+
+def _trusted_git() -> Path:
+    return _trusted_executable(
+        TRUSTED_GIT_CANDIDATES,
+        description="Git identity verification",
+    )
+
+
 def _git(root: Path, *arguments: str) -> str:
+    executable = _trusted_git()
     try:
         return subprocess.check_output(
-            ["git", "-C", str(root), *arguments],
+            [
+                str(executable),
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-C",
+                str(root),
+                *arguments,
+            ],
             text=True,
             stderr=subprocess.PIPE,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            },
         ).strip()
     except (OSError, subprocess.CalledProcessError) as error:
         raise ReleaseCliError(
@@ -140,6 +198,39 @@ def _preflight_identity(args: argparse.Namespace) -> tuple[Path, str, str, str]:
     if _git(root, "status", "--porcelain", "--untracked-files=all"):
         raise ReleaseCliError("release preflight requires a clean worktree")
     return root, account, commit, tree
+
+
+def _assert_release_checkout(
+    journal: TransactionJournal,
+    root_value: Path,
+) -> Path:
+    try:
+        root = Path(root_value).resolve(strict=True)
+    except OSError as error:
+        raise ReleaseCliError("release checkout root does not exist") from error
+    if not root.is_dir():
+        raise ReleaseCliError("release checkout root is not a directory")
+    current = journal.current
+    if (
+        _git(root, "rev-parse", "HEAD") != current.source_commit
+        or _git(root, "rev-parse", "HEAD^{tree}") != current.source_tree
+        or _git(root, "status", "--porcelain", "--untracked-files=all")
+    ):
+        raise ReleaseCliError(
+            "release checkout no longer matches the clean journaled commit and tree"
+        )
+    return root
+
+
+def _assert_executing_repository(root_value: Path) -> None:
+    try:
+        requested = Path(root_value).resolve(strict=True)
+    except OSError as error:
+        raise ReleaseCliError("release root does not exist") from error
+    if requested != EXECUTING_REPOSITORY_ROOT:
+        raise ReleaseCliError(
+            "release root differs from the executing repository"
+        )
 
 
 def _emit(transaction: StagingTransactionV1) -> None:
@@ -296,19 +387,57 @@ def _sanitized_environment(account: str, region: str) -> dict[str, str]:
         for name in _FORWARDED_AWS_CREDENTIALS
         if os.environ.get(name)
     }
+    profile = os.environ.get("AWS_PROFILE", "")
+    default_profile = os.environ.get("AWS_DEFAULT_PROFILE", "")
+    if profile and default_profile and profile != default_profile:
+        raise ReleaseCliError("AWS profile selectors conflict")
+    profile = profile or default_profile
+    if profile and _AWS_PROFILE.fullmatch(profile) is None:
+        raise ReleaseCliError("AWS profile selector is invalid")
+    aws_home = _LOGIN_HOME / ".aws"
     environment.update({
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
-        "AWS_CONFIG_FILE": "/dev/null",
-        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+        "AWS_CONFIG_FILE": str(aws_home / "config"),
+        "AWS_SHARED_CREDENTIALS_FILE": str(aws_home / "credentials"),
+        "AWS_LOGIN_CACHE_DIRECTORY": str(aws_home / "login" / "cache"),
+        "AWS_SDK_LOAD_CONFIG": "1",
         "AWS_EC2_METADATA_DISABLED": "true",
         "CDK_DEFAULT_ACCOUNT": account,
         "CDK_DEFAULT_REGION": region,
         "AWS_REGION": region,
         "AWS_DEFAULT_REGION": region,
     })
+    if profile:
+        environment["AWS_PROFILE"] = profile
     return environment
+
+
+@contextmanager
+def _scoped_release_environment(
+    environment: Mapping[str, str],
+) -> Iterator[None]:
+    """Expose exactly the account-checked environment to live SDK adapters."""
+
+    exact = dict(environment)
+    if any(
+        not isinstance(name, str)
+        or not name
+        or not isinstance(value, str)
+        or "\x00" in name
+        or "\x00" in value
+        for name, value in exact.items()
+    ):
+        raise ReleaseCliError("release environment is malformed")
+    previous = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(exact)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
 
 
 def _discover_account(
@@ -349,24 +478,9 @@ def _discover_account(
 
 def _trusted_aws_cli() -> Path:
     """Resolve AWS CLI only from fixed absolute, owner-controlled locations."""
-
-    for candidate in TRUSTED_AWS_CLI_CANDIDATES:
-        if not isinstance(candidate, Path) or not candidate.is_absolute():
-            continue
-        try:
-            resolved = candidate.resolve(strict=True)
-            metadata = resolved.stat()
-        except OSError:
-            continue
-        if (
-            stat.S_ISREG(metadata.st_mode)
-            and metadata.st_uid in _ACCOUNT_OWNER_UIDS
-            and metadata.st_mode & 0o111
-            and metadata.st_mode & 0o022 == 0
-        ):
-            return resolved
-    raise ReleaseCliError(
-        "AWS credential discovery requires a trusted absolute AWS CLI path"
+    return _trusted_executable(
+        TRUSTED_AWS_CLI_CANDIDATES,
+        description="AWS credential discovery",
     )
 
 
@@ -474,15 +588,19 @@ def _observe_and_reconcile(
     environment: Mapping[str, str],
     observation_config: ProductionObservationConfigV1,
     composer_factory: EvidenceComposerFactory,
+    release_root: Path | None = None,
 ) -> StagingTransactionV1:
     _validate_region(journal.current.region)
+    if release_root is not None:
+        _assert_release_checkout(journal, release_root)
     _discover_account(
         journal.current.account,
         journal.current.region,
         environment=environment,
     )
-    composer = composer_factory(observation_config)
-    persisted, raw_evidence = composer.observe_phase(phase, journal.current)
+    with _scoped_release_environment(environment):
+        composer = composer_factory(observation_config)
+        persisted, raw_evidence = composer.observe_phase(phase, journal.current)
     if not isinstance(persisted, bool) or not isinstance(raw_evidence, Mapping):
         raise ReleaseCliError(
             f"{phase} live observation authority returned an invalid result"
@@ -524,6 +642,12 @@ def _run_phase(
     composer_factory: EvidenceComposerFactory,
 ) -> StagingTransactionV1:
     _validate_region(journal.current.region)
+    release_root_value = getattr(args, "root", None)
+    release_root = (
+        _assert_release_checkout(journal, Path(release_root_value))
+        if release_root_value is not None
+        else None
+    )
     target = PHASE_TO_STATE[phase]
     if journal.resume_target() != target:
         raise ReleaseCliError(
@@ -573,6 +697,7 @@ def _run_phase(
             environment=environment,
             observation_config=observation_config,
             composer_factory=composer_factory,
+            release_root=release_root,
         )
 
 
@@ -609,6 +734,7 @@ def _resume(args: argparse.Namespace) -> StagingTransactionV1:
     journal = TransactionJournal.load(Path(args.resume))
     _check_requested_identity(journal.current, args)
     _validate_region(journal.current.region)
+    release_root = _assert_release_checkout(journal, Path(args.root))
     if args.reconcile:
         if journal.current.state != "UNCERTAIN":
             raise ReleaseCliError("only an UNCERTAIN journal can reconcile")
@@ -647,6 +773,7 @@ def _resume(args: argparse.Namespace) -> StagingTransactionV1:
                 environment=environment,
                 observation_config=observation_config,
                 composer_factory=args.composer_factory,
+                release_root=release_root,
             )
     if journal.current.state == "UNCERTAIN":
         raise ReleaseCliError(
@@ -668,6 +795,7 @@ def _rollback(args: argparse.Namespace) -> StagingTransactionV1:
     journal = TransactionJournal.load(_journal_path(args))
     _check_requested_identity(journal.current, args)
     _validate_region(journal.current.region)
+    release_root = _assert_release_checkout(journal, Path(args.root))
     transaction_id = args.rollback
     if transaction_id != journal.current.transaction_id:
         raise ReleaseCliError("rollback transaction ID differs from the journal")
@@ -716,6 +844,7 @@ def _rollback(args: argparse.Namespace) -> StagingTransactionV1:
             environment=environment,
             observation_config=observation_config,
             composer_factory=args.composer_factory,
+            release_root=release_root,
         )
 
 
@@ -769,8 +898,11 @@ def main(
     composer_factory: EvidenceComposerFactory | None = None,
 ) -> int:
     args = _parser().parse_args(argv)
+    production_entrypoint = composer_factory is None
     args.composer_factory = composer_factory or _production_composer
     try:
+        if production_entrypoint and not args.status:
+            _assert_executing_repository(args.root)
         if args.status:
             if args.reconcile:
                 raise ReleaseCliError("status accepts no reconciliation options")
@@ -780,6 +912,7 @@ def main(
         elif args.phase:
             journal = TransactionJournal.load(_journal_path(args))
             _check_requested_identity(journal.current, args)
+            _assert_release_checkout(journal, Path(args.root))
             current = _run_phase(
                 journal,
                 args.phase,

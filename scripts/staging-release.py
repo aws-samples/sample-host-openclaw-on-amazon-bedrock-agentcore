@@ -3,8 +3,19 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
+
+
+if not sys.flags.isolated:
+    print(
+        "staging release: the production entrypoint requires isolated Python; "
+        "use scripts/deploy.sh",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]

@@ -456,6 +456,9 @@ class ProductionObservationConfigV1:
         "runtimeStackTemplateParameterDigest",
         "consumerStackTemplateParameterDigests",
         "consumerChangeSetContentDigests",
+        "foundationStackRequestDigests",
+        "runtimeStackRequestDigest",
+        "consumerStackRequestDigests",
     }
 
     source_commit: str
@@ -474,6 +477,9 @@ class ProductionObservationConfigV1:
     runtime_stack_template_parameter_digest: str
     consumer_stack_template_parameter_digests: tuple[tuple[str, str], ...]
     consumer_change_set_content_digests: tuple[tuple[str, str], ...]
+    foundation_stack_request_digests: tuple[tuple[str, str], ...]
+    runtime_stack_request_digest: str
+    consumer_stack_request_digests: tuple[tuple[str, str], ...]
 
     @classmethod
     def from_mapping(
@@ -576,6 +582,21 @@ class ProductionObservationConfigV1:
             CONSUMER_RELEASE_STACKS,
             label="consumer change-set digest inventory",
         )
+        foundation_stack_request_digests = _exact_digest_inventory(
+            value["foundationStackRequestDigests"],
+            FOUNDATION_RELEASE_STACKS,
+            label="foundation stack request digest inventory",
+        )
+        runtime_stack_request_digest = _text(
+            value["runtimeStackRequestDigest"],
+            field="runtime stack request digest",
+            pattern=_SHA_64,
+        )
+        consumer_stack_request_digests = _exact_digest_inventory(
+            value["consumerStackRequestDigests"],
+            CONSUMER_RELEASE_STACKS,
+            label="consumer stack request digest inventory",
+        )
         return cls(
             source_commit=commit,
             source_tree=tree,
@@ -595,6 +616,9 @@ class ProductionObservationConfigV1:
             runtime_stack_template_parameter_digest=runtime_stack_digest,
             consumer_stack_template_parameter_digests=consumer_stack_digests,
             consumer_change_set_content_digests=consumer_change_set_digests,
+            foundation_stack_request_digests=foundation_stack_request_digests,
+            runtime_stack_request_digest=runtime_stack_request_digest,
+            consumer_stack_request_digests=consumer_stack_request_digests,
         )
 
     @classmethod
@@ -633,6 +657,13 @@ class ProductionObservationConfigV1:
             ),
             "consumerChangeSetContentDigests": dict(
                 self.consumer_change_set_content_digests
+            ),
+            "foundationStackRequestDigests": dict(
+                self.foundation_stack_request_digests
+            ),
+            "runtimeStackRequestDigest": self.runtime_stack_request_digest,
+            "consumerStackRequestDigests": dict(
+                self.consumer_stack_request_digests
             ),
         }
 

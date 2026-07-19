@@ -12,6 +12,7 @@ from release_tools.ecr import (
 )
 from release_tools.agentcore import (
     AgentCoreEndpointAbsent,
+    AgentCoreEvidenceError,
     AgentCoreRuntimeAbsent,
 )
 from release_tools.contracts import (
@@ -70,6 +71,27 @@ def _stack_digest(name: str) -> str:
     ).hexdigest()
 
 
+def _stack_request(name: str) -> dict[str, object]:
+    return {
+        "capabilities": ["CAPABILITY_IAM"],
+        "deploymentConfig": {},
+        "description": "",
+        "disableRollback": False,
+        "enableTerminationProtection": False,
+        "notificationArns": [],
+        "retainExceptOnCreate": False,
+        "roleArn": "",
+        "rollbackConfiguration": {},
+        "stackName": name,
+        "tags": [],
+        "timeoutInMinutes": 0,
+    }
+
+
+def _stack_request_digest(name: str) -> str:
+    return hashlib.sha256(canonical_json_bytes(_stack_request(name))).hexdigest()
+
+
 def _change_set_content(name: str) -> dict[str, object]:
     return {
         "capabilities": ["CAPABILITY_IAM"],
@@ -77,7 +99,7 @@ def _change_set_content(name: str) -> dict[str, object]:
         "changeSetType": "UPDATE",
         "changes": [],
         "deploymentConfig": {},
-        "deploymentMode": {},
+        "deploymentMode": "",
         "description": "",
         "importExistingResources": False,
         "includeNestedStacks": False,
@@ -87,6 +109,7 @@ def _change_set_content(name: str) -> dict[str, object]:
         "rollbackConfiguration": {},
         "stackName": name,
         "tags": [],
+        "templateParameterDigest": _stack_digest(name),
     }
 
 
@@ -126,6 +149,17 @@ def _config() -> ProductionObservationConfigV1:
             },
             "consumerChangeSetContentDigests": {
                 name: _change_set_digest(name)
+                for name in CONSUMER_STACKS
+            },
+            "foundationStackRequestDigests": {
+                name: _stack_request_digest(name)
+                for name in FOUNDATION_STACKS
+            },
+            "runtimeStackRequestDigest": _stack_request_digest(
+                "OpenClawAgentCore"
+            ),
+            "consumerStackRequestDigests": {
+                name: _stack_request_digest(name)
                 for name in CONSUMER_STACKS
             },
         }
@@ -302,7 +336,13 @@ class FakeAgentCoreAdapter:
 
     def observe_retained_disposition(self, **kwargs):
         self.calls.append(kwargs)
-        return "PRESENT"
+        return (
+            "PRESENT",
+            hashlib.sha256(self.result.to_bytes()).hexdigest(),
+        )
+
+    def assert_runtime_name_absent(self, **kwargs):
+        self.calls.append(kwargs)
 
 
 class FakeDeploymentAdapter:
@@ -648,6 +688,34 @@ def test_absence_requires_every_last_stable_prerequisite_to_remain_exact() -> No
             FakeAgentCoreAdapter(_context()),
         ).observe_phase("verify", _transaction("verify"))
 
+    class OrphanRuntime(FakeAgentCoreAdapter):
+        def assert_runtime_name_absent(self, **kwargs):
+            raise AgentCoreEvidenceError("runtime still exists")
+
+    deployment = FakeDeploymentAdapter()
+    deployment.runtime = None
+    with pytest.raises(ProductionObservationError, match="runtime"):
+        _composer(
+            FakeEcrAdapter(_image()),
+            OrphanRuntime(_context()),
+            deployment,
+        ).observe_phase("runtime", _transaction("runtime"))
+
+
+def test_consumer_phases_require_the_exact_journaled_runtime_context() -> None:
+    drifted = replace(
+        _context(),
+        runtime_endpoint_id="ReleaseEndpoint-ZYXWVUTSRQ",
+    )
+    with pytest.raises(ProductionObservationError, match="context prerequisite"):
+        _composer(
+            FakeEcrAdapter(_image()),
+            FakeAgentCoreAdapter(drifted),
+        ).observe_phase(
+            "consumer-changesets",
+            _transaction("consumer-changesets"),
+        )
+
 
 def test_rollback_requires_exact_agentcore_retained_disposition() -> None:
     class AmbiguousRetainedAgentCore(FakeAgentCoreAdapter):
@@ -663,6 +731,19 @@ def test_rollback_requires_exact_agentcore_retained_disposition() -> None:
             deployment,
         ).observe_phase("rollback", _transaction("rollback"))
     assert deployment.calls == []
+
+    drifted = replace(
+        _context(),
+        runtime_endpoint_id="ReleaseEndpoint-ZYXWVUTSRQ",
+    )
+    exact_cf = FakeDeploymentAdapter()
+    with pytest.raises(ProductionObservationError, match="journaled context"):
+        _composer(
+            FakeEcrAdapter(_image()),
+            FakeAgentCoreAdapter(drifted),
+            exact_cf,
+        ).observe_phase("rollback", _transaction("rollback"))
+    assert exact_cf.calls == []
 
 
 def test_artifact_reader_is_https_only_and_bounded_before_returning_bytes() -> None:
@@ -795,6 +876,10 @@ class FakeCloudFormation:
             name: _stack_template(name)
             for name in (*FOUNDATION_STACKS, *CONSUMER_STACKS)
         }
+        self.change_set_templates = {
+            name: _stack_template(name) for name in CONSUMER_STACKS
+        }
+        self.stack_policies: dict[str, str] = {}
         self.change_sets = {
             name: {
                 "StackId": self.stacks[name]["StackId"],
@@ -823,12 +908,30 @@ class FakeCloudFormation:
 
     def get_template(self, **kwargs):
         self.calls.append(("get_template", kwargs))
-        if kwargs["StackName"] not in self.stacks:
+        if "ChangeSetName" in kwargs:
+            if kwargs["StackName"] not in self.change_sets:
+                raise CloudFormationNotFound("missing")
+        elif kwargs["StackName"] not in self.stacks:
             raise CloudFormationNotFound("missing")
+        template = (
+            self.change_set_templates[kwargs["StackName"]]
+            if "ChangeSetName" in kwargs
+            else self.templates[kwargs["StackName"]]
+        )
         return {
-            "TemplateBody": self.templates[kwargs["StackName"]],
+            "TemplateBody": template,
+            "StagesAvailable": ["Original", "Processed"],
             "ResponseMetadata": {},
         }
+
+    def get_stack_policy(self, **kwargs):
+        self.calls.append(("get_stack_policy", kwargs))
+        if kwargs["StackName"] not in self.stacks:
+            raise CloudFormationNotFound("missing")
+        response: dict[str, object] = {"ResponseMetadata": {}}
+        if kwargs["StackName"] in self.stack_policies:
+            response["StackPolicyBody"] = self.stack_policies[kwargs["StackName"]]
+        return response
 
     def describe_change_set(self, **kwargs):
         self.calls.append(("describe_change_set", kwargs))
@@ -862,6 +965,31 @@ def test_cloudformation_foundation_requires_all_exact_complete_stacks() -> None:
         _cloudformation_adapter(drifted).observe_foundation(
             _transaction("foundation")
         )
+
+    drifted_request = FakeCloudFormation()
+    drifted_request.stacks["OpenClawVpc"]["RoleARN"] = (
+        f"arn:aws:iam::{ACCOUNT}:role/unreviewed-cloudformation-role"
+    )
+    with pytest.raises(ProductionObservationError, match="reviewed request"):
+        _cloudformation_adapter(drifted_request).observe_foundation(
+            _transaction("foundation")
+        )
+
+    unreviewed_policy = FakeCloudFormation()
+    unreviewed_policy.stack_policies["OpenClawVpc"] = (
+        '{"Statement":[{"Effect":"Deny","Action":"Update:*",'
+        '"Principal":"*","Resource":"*"}]}'
+    )
+    with pytest.raises(ProductionObservationError, match="stack policy"):
+        _cloudformation_adapter(unreviewed_policy).observe_foundation(
+            _transaction("foundation")
+        )
+
+    empty_policy = FakeCloudFormation()
+    empty_policy.stack_policies["OpenClawVpc"] = ""
+    assert _cloudformation_adapter(empty_policy).observe_foundation(
+        _transaction("foundation")
+    ) is True
 
 
 def test_cloudformation_runtime_identity_is_bound_to_exact_stack_outputs() -> None:
@@ -941,6 +1069,16 @@ def test_cloudformation_consumer_evidence_rejects_partial_or_cross_account_sets(
             _transaction("consumer-changesets")
         )
 
+    proposed_template_drift = FakeCloudFormation()
+    proposed_template_drift.change_set_templates[CONSUMER_STACKS[0]] = {
+        "Resources": {CONSUMER_STACKS[0]: {}},
+        "Outputs": {"Unreviewed": {"Value": "foreign"}},
+    }
+    with pytest.raises(ProductionObservationError, match="proposed template"):
+        _cloudformation_adapter(proposed_template_drift).observe_consumer_changesets(
+            _transaction("consumer-changesets")
+        )
+
     paginated = FakeCloudFormation()
     original = paginated.describe_change_set
 
@@ -970,6 +1108,34 @@ def test_cloudformation_consumer_evidence_rejects_partial_or_cross_account_sets(
             _transaction("consumer-changesets")
         )
 
+    nested = FakeCloudFormation()
+    nested.change_sets[CONSUMER_STACKS[0]]["ParentChangeSetId"] = (
+        f"arn:aws:cloudformation:{REGION}:{ACCOUNT}:changeSet/foreign/"
+        "00000000-0000-0000-0000-000000000000"
+    )
+    with pytest.raises(ProductionObservationError, match="nested"):
+        _cloudformation_adapter(nested).observe_consumer_changesets(
+            _transaction("consumer-changesets")
+        )
+
+    invalid_deployment_mode = FakeCloudFormation()
+    invalid_deployment_mode.change_sets[CONSUMER_STACKS[0]][
+        "DeploymentMode"
+    ] = {"Mode": "REVERT_DRIFT"}
+    with pytest.raises(ProductionObservationError, match="scalar"):
+        _cloudformation_adapter(invalid_deployment_mode).observe_consumer_changesets(
+            _transaction("consumer-changesets")
+        )
+
+    use_previous = FakeCloudFormation()
+    use_previous.change_sets[CONSUMER_STACKS[0]]["Parameters"] = [
+        {"ParameterKey": "Foreign", "UsePreviousValue": True}
+    ]
+    with pytest.raises(ProductionObservationError, match="parameter is not exact"):
+        _cloudformation_adapter(use_previous).observe_consumer_changesets(
+            _transaction("consumer-changesets")
+        )
+
 
 def test_cloudformation_application_and_verification_are_content_bound() -> None:
     fake = FakeCloudFormation()
@@ -993,12 +1159,12 @@ def test_cloudformation_application_and_verification_are_content_bound() -> None
     fake.stacks[CONSUMER_STACKS[0]]["Outputs"] = [
         {"OutputKey": "Drift", "OutputValue": "changed"}
     ]
-    with pytest.raises(ProductionObservationError, match="journal"):
-        adapter.observe_verification(
-            transaction,
-            image=_image(),
-            context=_context(),
-        )
+    assert adapter.observe_consumers(_transaction("consumers")) == application
+    assert adapter.observe_verification(
+        transaction,
+        image=_image(),
+        context=_context(),
+    ) == verification
 
     drifted = FakeCloudFormation()
     for change_set in drifted.change_sets.values():
@@ -1008,6 +1174,17 @@ def test_cloudformation_application_and_verification_are_content_bound() -> None
     }
     with pytest.raises(ProductionObservationError, match="reviewed"):
         _cloudformation_adapter(drifted).observe_consumers(
+            _transaction("consumers")
+        )
+
+    drifted_request = FakeCloudFormation()
+    for change_set in drifted_request.change_sets.values():
+        change_set["ExecutionStatus"] = "EXECUTE_COMPLETE"
+    drifted_request.stacks[CONSUMER_STACKS[0]]["Capabilities"] = [
+        "CAPABILITY_NAMED_IAM"
+    ]
+    with pytest.raises(ProductionObservationError, match="reviewed request"):
+        _cloudformation_adapter(drifted_request).observe_consumers(
             _transaction("consumers")
         )
 

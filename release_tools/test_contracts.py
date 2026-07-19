@@ -97,6 +97,15 @@ def _production_observation_config() -> dict[str, object]:
             name: hashlib.sha256(f"change-set:{name}".encode()).hexdigest()
             for name in CONSUMER_STACKS
         },
+        "foundationStackRequestDigests": {
+            name: hashlib.sha256(f"foundation-request:{name}".encode()).hexdigest()
+            for name in FOUNDATION_STACKS
+        },
+        "runtimeStackRequestDigest": "7" * 64,
+        "consumerStackRequestDigests": {
+            name: hashlib.sha256(f"consumer-request:{name}".encode()).hexdigest()
+            for name in CONSUMER_STACKS
+        },
     }
 
 
@@ -372,6 +381,22 @@ def test_production_observation_config_is_canonical_digest_bound_and_derives_rol
                 "consumerChangeSetContentDigests"
             ].update(Unexpected="8" * 64),
             "consumer change-set",
+        ),
+        (
+            lambda value: value[  # type: ignore[index]
+                "foundationStackRequestDigests"
+            ].update(OpenClawVpc="invalid"),
+            "foundation stack request",
+        ),
+        (
+            lambda value: value.update(runtimeStackRequestDigest="8" * 63),
+            "runtime stack request",
+        ),
+        (
+            lambda value: value[  # type: ignore[index]
+                "consumerStackRequestDigests"
+            ].pop("OpenClawRouter"),
+            "consumer stack request",
         ),
         (
             lambda value: value.update(executionRoleArn=ROLE_ARN),

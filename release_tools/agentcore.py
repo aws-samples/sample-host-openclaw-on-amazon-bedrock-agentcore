@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -26,6 +27,8 @@ _KNOWN = _PENDING | _FAILED | {"READY"}
 
 
 class AgentCoreClient(Protocol):
+    def list_agent_runtimes(self, **kwargs: Any) -> dict[str, Any]: ...
+
     def get_agent_runtime(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def list_agent_runtime_endpoints(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -210,6 +213,36 @@ class AgentCoreEvidenceAdapter:
             raise AgentCoreEvidenceError(
                 f"release endpoint name collision: {endpoint_name}"
             )
+
+    def assert_runtime_name_absent(
+        self,
+        *,
+        source_commit: str,
+        account: str,
+        region: str,
+    ) -> None:
+        """Prove no runtime with the stable release name exists anywhere."""
+
+        _identity(
+            source_commit=source_commit,
+            account=account,
+            region=region,
+        )
+        response = self._call("list_agent_runtimes", maxResults=100)
+        if response.get("nextToken"):
+            raise AgentCoreEvidenceAmbiguous("runtime lookup was paginated")
+        runtimes = _list(response.get("agentRuntimes"), label="agent runtimes")
+        for raw in runtimes:
+            runtime = _object(raw, label="agent runtime summary")
+            name = runtime.get("agentRuntimeName")
+            if not isinstance(name, str) or not name:
+                raise AgentCoreEvidenceError(
+                    "runtime inventory contains a malformed name"
+                )
+            if name == RUNTIME_NAME:
+                raise AgentCoreEvidenceError(
+                    "stable release runtime still exists"
+                )
 
     def _collect_runtime(
         self,
@@ -425,7 +458,7 @@ class AgentCoreEvidenceAdapter:
         expected_environment_variables: Mapping[str, str],
         expected_idle_runtime_session_timeout: int,
         expected_max_lifetime: int,
-    ) -> str:
+    ) -> tuple[str, str]:
         """Prove the retained runtime/endpoint are exact or coherently absent."""
 
         arguments = {
@@ -444,7 +477,7 @@ class AgentCoreEvidenceAdapter:
             "expected_max_lifetime": expected_max_lifetime,
         }
         try:
-            self.collect_context(**arguments)
+            context = self.collect_context(**arguments)
         except AgentCoreEndpointAbsent as error:
             raise AgentCoreEvidenceError(
                 "retained AgentCore disposition is partial: runtime present, endpoint absent"
@@ -457,8 +490,8 @@ class AgentCoreEvidenceAdapter:
                     endpointName=f"release_{source_commit}",
                 )
             except AgentCoreEndpointAbsent:
-                return "ABSENT"
+                return "ABSENT", ""
             raise AgentCoreEvidenceError(
                 "retained AgentCore disposition is partial: runtime absent, endpoint present"
             )
-        return "PRESENT"
+        return "PRESENT", hashlib.sha256(context.to_bytes()).hexdigest()

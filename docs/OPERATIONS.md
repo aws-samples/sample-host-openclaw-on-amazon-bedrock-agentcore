@@ -133,7 +133,16 @@ adapters, and phase CLI. No phase has been run against AWS.
 
 `scripts/deploy.sh` is only a compatibility shim for
 `scripts/staging-release.py`. Validation and state transitions live in the
-Python package. The CLI surface is:
+Python package. For a real release checkout, create the ignored
+`<checkout>/.venv` from the reviewed project environment before preflight.
+The shim rejects `PYTHON` overrides and group/world-writable interpreters,
+pins `PATH` before resolving its own location, starts that checkout-local
+interpreter with `-I`, and the Python entrypoint refuses non-isolated startup.
+The integration worktree does not create this environment automatically; it
+is an explicit predeploy prerequisite. Invoke a real evidence run through
+`/usr/bin/env -u BASH_ENV ./scripts/deploy.sh ...` so noninteractive Bash does
+not load an ambient startup file before the shim can enforce its checks. The
+CLI surface is:
 
 - `--preflight`: validate one clean commit/tree/account/region and create the
   canonical journal without discovering credentials;
@@ -170,10 +179,14 @@ real phase, create one canonical
 `<journal>.production-observation.json`. It binds the exact commit, tree,
 account, `eu-west-1`, image build inputs and builder identity, and the reviewed
 AgentCore subnet, security-group, environment, and lifecycle configuration. It
-also carries the exact canonical template/parameter digest for each foundation,
-runtime, and consumer stack and the complete expected content digest for every
-consumer change set. The CLI rejects a missing, noncanonical, or
-journal-mismatched config before write-ahead intent or credential discovery.
+also carries the exact canonical template/parameter and
+request/security-field digests for each foundation, runtime, and consumer
+stack, plus the complete expected content digest for every consumer change
+set. Each consumer change set's processed proposed template and direct
+parameter values must match the reviewed final stack digest;
+`UsePreviousValue` is deliberately rejected as ambiguous. The CLI rejects a
+missing, noncanonical, or journal-mismatched config before write-ahead intent
+or credential discovery.
 
 A real phase also requires one self-contained reviewed mutation executable.
 The CLI frames and hashes its exact bytes together with the canonical
@@ -189,7 +202,13 @@ Immediately before mutation and again before live observation, the CLI rejects
 conflicting `CDK_DEFAULT_REGION`, `AWS_REGION`, or `AWS_DEFAULT_REGION`,
 authenticates the exact account, and pins all three child variables to
 `eu-west-1`. Account discovery resolves AWS CLI only from fixed absolute,
-owner-controlled locations; ambient `PATH` entries cannot select it. Mutation
+owner-controlled locations; ambient `PATH` entries cannot select it. The same
+exact sanitized credential environment is used for discovery, mutation, and
+the in-process SDK observer. It supports a prior user-run `aws login` through
+the login user's fixed `~/.aws/config`, `~/.aws/credentials`, and
+`~/.aws/login/cache` paths plus one validated `AWS_PROFILE`; alternate ambient
+credential paths, role/web-identity selectors, endpoints, and proxies are not
+inherited. This repository never runs `aws login`. Mutation
 must return only `{"dispatched":true}`. It is never treated as persistence
 proof: the executable is invoked only with
 `--mode mutate`, and its STDOUT can never choose a journal outcome or provide
@@ -202,23 +221,30 @@ disabled. Attestation downloads use a separate proxy-free HTTPS opener and TLS
 context, ignoring `HTTPS_PROXY` and `ALL_PROXY`. The composer, not the driver,
 reads and reconciles every phase:
 
-- foundation: all seven exact foundation stacks exist in a complete state and
-  each live template/parameter digest matches the reviewed config, or all seven
-  are absent;
+- foundation: all seven exact foundation stacks exist in a complete state,
+  each processed template/parameter and request/security digest matches the
+  reviewed config, and each has no nonempty stack policy, or all seven are
+  absent;
 - image: the exact immutable image has strict SBOM, provenance, scan, and
   signature evidence;
 - runtime: CloudFormation outputs and the READY AgentCore runtime agree on the
   exact runtime ID, version, image, role, network, environment, storage, and
   lifecycle configuration, while the runtime stack matches its reviewed
-  template/parameter digest;
+  template/parameter and request/security digests. A runtime-phase `ABSENT`
+  result additionally
+  requires a complete, unpaginated AgentCore inventory with no runtime under
+  the stable release name;
 - endpoint and context: AgentCore returns the exact READY endpoint and strict
   canonical `RuntimeContextV3`;
 - consumer changesets: all four exact account/region change sets named
   `release-<40-sha>` are complete and available, have no unread pagination,
-  and match the config's expected complete content digests;
+  have no parent/root change-set identity, use direct parameters, and match
+  both the reviewed processed proposed-template/parameter digest and the
+  config's expected complete content digest;
 - consumers: those exact change sets are executed and the four complete live
-  stack templates and parameters match the reviewed config before the live
-  outputs, capabilities, and roles are hashed;
+  stack templates, parameters, request/security fields, and absent stack
+  policies match the reviewed config. Arbitrary outputs and generated stack
+  IDs are excluded from the persisted consumer-application fingerprint;
 - verify: image, context, foundation, consumer application, and journal
   digests are recomposed from live evidence;
 - rollback: the complete live stack snapshot must hash to the exact rollback
@@ -243,6 +269,14 @@ driver only to recompute the bound operation digest; it never executes the
 driver in an observation mode. Rollback follows the same write-ahead mutation
 plus in-package authoritative observation rule, with
 `rollback:release_<40-sha>:sha256:<operation-hex>`.
+
+Every mutation and reconciliation re-resolves the exact checkout HEAD, tree,
+and complete worktree status before dispatch and immediately before live
+composition. The production entrypoint rejects a `--root` different from the
+repository containing the executing `release_tools` package. Git is resolved
+from a fixed absolute owner-controlled binary in a minimal environment that
+ignores ambient `PATH`, `GIT_DIR`, `GIT_WORK_TREE`, and global/system Git
+configuration overrides.
 
 The CDK foundation owns exactly one private retained
 `personal-operator/bridge` repository with immutable tags, scan-on-push, KMS

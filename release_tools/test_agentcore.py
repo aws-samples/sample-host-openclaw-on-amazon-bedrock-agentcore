@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 
 import pytest
 
@@ -97,6 +98,7 @@ class FakeAgentCore:
         self.runtime = _runtime()
         self.endpoint = _endpoint()
         self.listing: dict = {"runtimeEndpoints": []}
+        self.runtimes: dict = {"agentRuntimes": []}
         self.calls: list[tuple[str, dict]] = []
         self.failure: Exception | None = None
 
@@ -118,6 +120,9 @@ class FakeAgentCore:
         return self._respond(
             "get_agent_runtime_endpoint", kwargs, self.endpoint
         )
+
+    def list_agent_runtimes(self, **kwargs) -> dict:
+        return self._respond("list_agent_runtimes", kwargs, self.runtimes)
 
 
 def _collect(adapter: AgentCoreEvidenceAdapter):
@@ -234,7 +239,12 @@ def test_retained_runtime_and_endpoint_disposition_is_exact_or_coherently_absent
         expected_environment_variables=ENVIRONMENT,
         expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
         expected_max_lifetime=MAX_LIFETIME,
-    ) == "PRESENT"
+    ) == (
+        "PRESENT",
+        hashlib.sha256(
+            _collect(AgentCoreEvidenceAdapter(FakeAgentCore())).to_bytes()
+        ).hexdigest(),
+    )
 
     class ResourceNotFound(Exception):
         response = {"Error": {"Code": "ResourceNotFoundException"}}
@@ -259,7 +269,7 @@ def test_retained_runtime_and_endpoint_disposition_is_exact_or_coherently_absent
         expected_environment_variables=ENVIRONMENT,
         expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
         expected_max_lifetime=MAX_LIFETIME,
-    ) == "ABSENT"
+    ) == ("ABSENT", "")
 
     class MissingEndpoint(FakeAgentCore):
         def get_agent_runtime_endpoint(self, **kwargs):
@@ -300,6 +310,46 @@ def test_endpoint_name_must_be_unused_before_the_create_mutation() -> None:
     with pytest.raises(AgentCoreEvidenceError, match="collision"):
         adapter.assert_endpoint_name_available(
             runtime_id=RUNTIME_ID,
+            source_commit=COMMIT,
+            account=ACCOUNT,
+            region=REGION,
+        )
+
+
+def test_runtime_absence_requires_a_complete_exact_name_inventory() -> None:
+    fake = FakeAgentCore()
+    adapter = AgentCoreEvidenceAdapter(fake)
+
+    adapter.assert_runtime_name_absent(
+        source_commit=COMMIT,
+        account=ACCOUNT,
+        region=REGION,
+    )
+    assert fake.calls == [("list_agent_runtimes", {"maxResults": 100})]
+
+    fake = FakeAgentCore()
+    fake.runtimes = {
+        "agentRuntimes": [
+            {
+                "agentRuntimeArn": RUNTIME_ARN,
+                "agentRuntimeId": RUNTIME_ID,
+                "agentRuntimeVersion": VERSION,
+                "agentRuntimeName": "personal_operator_bridge",
+                "status": "READY",
+            }
+        ]
+    }
+    with pytest.raises(AgentCoreEvidenceError, match="still exists"):
+        AgentCoreEvidenceAdapter(fake).assert_runtime_name_absent(
+            source_commit=COMMIT,
+            account=ACCOUNT,
+            region=REGION,
+        )
+
+    fake = FakeAgentCore()
+    fake.runtimes = {"agentRuntimes": [], "nextToken": "truncated"}
+    with pytest.raises(AgentCoreEvidenceAmbiguous, match="paginated"):
+        AgentCoreEvidenceAdapter(fake).assert_runtime_name_absent(
             source_commit=COMMIT,
             account=ACCOUNT,
             region=REGION,
