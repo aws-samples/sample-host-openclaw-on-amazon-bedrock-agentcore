@@ -551,6 +551,13 @@ def derive_call_id(
     return f"call_{_domain_hash(b'personal-operator.capability-call.v1', invocation_id, tool_use_id, catalog_digest, operation_id, tool_name, args_hash)}"
 
 
+def derive_target_tenant_binding(tenant_id: str) -> str:
+    """Return the stable partition binding for one exact tenant."""
+
+    _string(tenant_id, "tenantId", pattern=_USER_ID)
+    return _domain_hash(b"personal-operator.target-tenant.v1", tenant_id)
+
+
 def derive_target_hash(
     normalized_target: str,
     method: str,
@@ -558,6 +565,7 @@ def derive_target_hash(
     expires_at: int,
     max_uses: int,
     request_id: str,
+    tenant_binding: str,
 ) -> str:
     _public_https_url(normalized_target)
     _enum(method, "method", {"GET"})
@@ -565,6 +573,7 @@ def derive_target_hash(
     _integer(expires_at, "expiresAt")
     _integer(max_uses, "maxUses", minimum=1, maximum=3)
     _string(request_id, "currentRequestId", pattern=_OPAQUE_ID)
+    _sha256(tenant_binding, "tenantBinding")
     return hashlib.sha256(
         b"personal-operator.target-grant.v1\0"
         + canonical_json_bytes(
@@ -576,6 +585,7 @@ def derive_target_hash(
                 "expiresAt": expires_at,
                 "maxUses": max_uses,
                 "currentRequestId": request_id,
+                "tenantBinding": tenant_binding,
             }
         )
     ).hexdigest()
@@ -1551,6 +1561,7 @@ class TargetGrantV1(ContractValue):
         "expiresAt",
         "maxUses",
         "currentRequestId",
+        "tenantBinding",
     )
 
     @classmethod
@@ -1566,6 +1577,9 @@ class TargetGrantV1(ContractValue):
         result["currentRequestId"] = _string(
             result["currentRequestId"], "currentRequestId", pattern=_OPAQUE_ID
         )
+        result["tenantBinding"] = _sha256(
+            result["tenantBinding"], "tenantBinding"
+        )
         expected = derive_target_hash(
             result["normalizedTarget"],
             result["method"],
@@ -1573,6 +1587,7 @@ class TargetGrantV1(ContractValue):
             result["expiresAt"],
             result["maxUses"],
             result["currentRequestId"],
+            result["tenantBinding"],
         )
         if result["targetHash"] != expected:
             _fail("targetHash does not bind the exact current-request target")
@@ -2534,6 +2549,7 @@ __all__ = [
     "derive_call_id",
     "derive_occurrence_id",
     "derive_target_hash",
+    "derive_target_tenant_binding",
     "parse_canonical_json",
     "public_ip_or_none",
 ]

@@ -14,6 +14,7 @@ from .contracts import (
     TargetGrantV1,
     TurnCapabilityGrantV1,
     canonical_json_bytes,
+    derive_target_tenant_binding,
 )
 
 
@@ -75,9 +76,17 @@ class AdmissionRepository(Protocol):
         self, user_id: str, pack_id: str
     ) -> CapabilityInstallationV1 | Mapping[str, Any] | None: ...
 
-    def strong_read_target_grant(self, target_hash: str) -> LiveTargetGrant | None: ...
+    def strong_read_target_grant(
+        self, tenant_binding: str, target_hash: str
+    ) -> LiveTargetGrant | None: ...
 
-    def claim_target_use(self, target_hash: str, call_id: str) -> bool: ...
+    def claim_target_use(
+        self,
+        tenant_binding: str,
+        target_hash: str,
+        current_request_id: str,
+        call_id: str,
+    ) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,10 +336,15 @@ class AdmissionGate:
         if pack["approvalPolicy"]["mode"] != "CURRENT_REQUEST_TARGET_GRANT":
             return None
         requested_url = call.arguments.get("url")
+        tenant_binding = derive_target_tenant_binding(grant.sub)
         expired = False
         exhausted = False
         for target_hash in grant.target_grant_hashes:
-            live = self._strong(self._repository.strong_read_target_grant, target_hash)
+            live = self._strong(
+                self._repository.strong_read_target_grant,
+                tenant_binding,
+                target_hash,
+            )
             if live is None:
                 continue
             if not isinstance(live, LiveTargetGrant):
@@ -338,6 +352,10 @@ class AdmissionGate:
             target = live.grant
             if target.target_hash != target_hash:
                 _deny("TARGET_GRANT_INVALID")
+            if target.current_request_id != grant.invocation_id:
+                _deny("TARGET_GRANT_REQUEST_MISMATCH")
+            if target.tenant_binding != tenant_binding:
+                _deny("TARGET_GRANT_TENANT_MISMATCH")
             if target.normalized_target != requested_url or target.method != "GET":
                 continue
             if now >= target.expires_at:
@@ -360,9 +378,12 @@ class AdmissionGate:
         if admitted.target is None:
             return
         target_hash = admitted.target.grant.target_hash
+        tenant_binding = derive_target_tenant_binding(admitted.grant.sub)
         claimed = self._strong(
             self._repository.claim_target_use,
+            tenant_binding,
             target_hash,
+            admitted.grant.invocation_id,
             admitted.call.call_id,
         )
         if claimed is not True:

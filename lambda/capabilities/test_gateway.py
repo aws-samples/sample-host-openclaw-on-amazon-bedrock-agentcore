@@ -15,6 +15,7 @@ from capabilities.contracts import (
     canonical_sha256,
     derive_call_id,
     derive_target_hash,
+    derive_target_tenant_binding,
 )
 
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
@@ -81,14 +82,22 @@ def _call(
     )
 
 
-def _target_grant(*, expires_at=NOW + 120, max_uses=1):
+def _target_grant(
+    *,
+    expires_at=NOW + 120,
+    max_uses=1,
+    request_id="invocation_12345678",
+    tenant_id="user_alpha",
+):
+    tenant_binding = derive_target_tenant_binding(tenant_id)
     target_hash = derive_target_hash(
         "https://example.com/exact",
         "GET",
         "NO_REDIRECT",
         expires_at,
         max_uses,
-        "request_12345678",
+        request_id,
+        tenant_binding,
     )
     return TargetGrantV1.from_mapping(
         {
@@ -99,7 +108,8 @@ def _target_grant(*, expires_at=NOW + 120, max_uses=1):
             "redirectPolicy": "NO_REDIRECT",
             "expiresAt": expires_at,
             "maxUses": max_uses,
-            "currentRequestId": "request_12345678",
+            "currentRequestId": request_id,
+            "tenantBinding": tenant_binding,
         }
     )
 
@@ -208,11 +218,17 @@ class FakeRepository:
             return None
         return self.installations.get(pack_id)
 
-    def strong_read_target_grant(self, target_hash: str):
+    def strong_read_target_grant(self, tenant_binding: str, target_hash: str):
         self.trace.append("target")
         return self.targets.get(target_hash)
 
-    def claim_target_use(self, target_hash: str, call_id: str) -> bool:
+    def claim_target_use(
+        self,
+        tenant_binding: str,
+        target_hash: str,
+        current_request_id: str,
+        call_id: str,
+    ) -> bool:
         self.trace.append("target_claim")
         target = self.targets.get(target_hash)
         if target is None:

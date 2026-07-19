@@ -161,7 +161,8 @@ policy. It never contains provider credentials or raw bearer grants.
 ### Supporting contracts
 
 - `TargetGrantV1`: exact normalized target, method, redirect policy, expiry,
-  use count, current request identity, and target hash.
+  use count, current request/invocation identity, tenant binding, and target
+  hash.
 - `ActionProposalV1`: user, capability, resource, connection, canonical
   arguments/hash, revision, originating invocation, approval policy, expiry.
 - `EffectReceiptV1`: capability, resource, arguments hash, provider evidence
@@ -364,4 +365,3 @@ Local implementation completion requires:
 Cloud and pilot completion additionally require retained exact-commit artifact
 and account evidence. Source completion alone must be reported as implemented
 and locally verified, not deployed or production-ready.
-

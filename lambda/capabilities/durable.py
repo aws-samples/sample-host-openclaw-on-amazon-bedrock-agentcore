@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from decimal import Decimal
 import json
-from typing import Any, Mapping
+import re
+from typing import Any, Mapping, Sequence
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
-from .admission import LiveTargetGrant
+from .admission import AdmissionDenied, LiveTargetGrant
 from .contracts import (
     CapabilityCallV1,
     CapabilityInstallationV1,
@@ -18,6 +19,7 @@ from .contracts import (
     TurnCapabilityGrantV1,
     canonical_json_bytes,
     canonical_sha256,
+    derive_target_tenant_binding,
 )
 from .ledger import (
     LedgerClaim,
@@ -33,6 +35,10 @@ _CONDITIONAL_ERRORS = frozenset(
     {"ConditionalCheckFailedException", "TransactionCanceledException"}
 )
 _RETRY_MODES = frozenset({"READ_ONLY", "IDEMPOTENT", "DEDUPE_KEY_REQUIRED"})
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{7,127}")
+_CALL_ID = re.compile(r"call_[0-9a-f]{64}")
+_MAX_TARGET_GRANTS = 64
 
 
 def _serialize_item(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -94,13 +100,21 @@ class DynamoAdmissionRepository:
         item = self._get(pk, sk)
         if item is None:
             return None
+        self._validate_item(item, pk, sk)
+        return _json_mapping(item["recordJson"], "live authority")
+
+    @staticmethod
+    def _validate_item(item: Mapping[str, Any], pk: str, sk: str) -> None:
         if set(item) != {"PK", "SK", "recordJson", "version"}:
             raise RuntimeError("live authority item has unexpected fields")
         if item["PK"] != pk or item["SK"] != sk:
             raise RuntimeError("live authority item key is inconsistent")
-        if not isinstance(item["version"], int) or item["version"] < 1:
+        if (
+            isinstance(item["version"], bool)
+            or not isinstance(item["version"], int)
+            or item["version"] < 1
+        ):
             raise RuntimeError("live authority item version is invalid")
-        return _json_mapping(item["recordJson"], "live authority")
 
     def _required_flag(self, pk: str, sk: str) -> bool:
         record = self._record(pk, sk)
@@ -132,8 +146,106 @@ class DynamoAdmissionRepository:
     ) -> CapabilityInstallationV1 | Mapping[str, Any] | None:
         return self._record(f"USER#{user_id}", f"INSTALL#{pack_id}")
 
-    def strong_read_target_grant(self, target_hash: str) -> LiveTargetGrant | None:
-        record = self._record(f"TARGET#{target_hash}", "GRANT")
+    def persist_target_grants(
+        self,
+        *,
+        tenant_id: str,
+        current_request_id: str,
+        grants: Sequence[TargetGrantV1],
+    ) -> None:
+        """Atomically retain fresh grants under their trusted tenant partition."""
+
+        tenant_binding = derive_target_tenant_binding(tenant_id)
+        if (
+            not isinstance(current_request_id, str)
+            or _OPAQUE_ID.fullmatch(current_request_id) is None
+        ):
+            raise TypeError("target persistence requires an exact request identity")
+        if isinstance(grants, (str, bytes)) or not isinstance(grants, Sequence):
+            raise TypeError("target persistence requires a grant sequence")
+        if len(grants) > _MAX_TARGET_GRANTS:
+            raise ValueError("target persistence exceeds its grant bound")
+
+        actions: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for grant in grants:
+            if not isinstance(grant, TargetGrantV1):
+                raise TypeError("target persistence requires validated grants")
+            if grant.current_request_id != current_request_id:
+                raise ValueError("target grant request binding is not current")
+            if grant.tenant_binding != tenant_binding:
+                raise ValueError("target grant tenant binding is not current")
+            if grant.target_hash in seen:
+                raise ValueError("target persistence contains a duplicate grant")
+            seen.add(grant.target_hash)
+            pk, sk = self._target_key(tenant_binding, grant.target_hash)
+            record = {
+                "grant": grant.to_mapping(),
+                "uses": 0,
+                "claimedCallIds": [],
+            }
+            actions.append(
+                {
+                    "Put": {
+                        "TableName": self._table_name,
+                        "Item": _serialize_item(
+                            {
+                                "PK": pk,
+                                "SK": sk,
+                                "recordJson": canonical_json_bytes(record).decode(
+                                    "utf-8"
+                                ),
+                                "version": 1,
+                            }
+                        ),
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }
+                }
+            )
+        if not actions:
+            return
+        conditional_error: ClientError | None = None
+        try:
+            self._client.transact_write_items(TransactItems=actions)
+            return
+        except ClientError as error:
+            if not _is_conditional(error):
+                raise
+            conditional_error = error
+
+        # A retry after a lost response is idempotent only when every retained
+        # row is the exact unused grant from this same request and tenant.
+        for grant in grants:
+            recovered = self.strong_read_target_grant(
+                tenant_binding,
+                grant.target_hash,
+            )
+            if (
+                recovered is None
+                or recovered.grant.to_bytes() != grant.to_bytes()
+                or recovered.uses != 0
+                or recovered.claimed_call_ids
+            ):
+                raise RuntimeError(
+                    "target grant persistence conflict"
+                ) from conditional_error
+
+    @staticmethod
+    def _target_key(tenant_binding: str, target_hash: str) -> tuple[str, str]:
+        if (
+            not isinstance(tenant_binding, str)
+            or _SHA256.fullmatch(tenant_binding) is None
+            or not isinstance(target_hash, str)
+            or _SHA256.fullmatch(target_hash) is None
+        ):
+            raise TypeError("target state requires exact tenant and target bindings")
+        return f"TENANT#{tenant_binding}", f"TARGET#{target_hash}"
+
+    def strong_read_target_grant(
+        self, tenant_binding: str, target_hash: str
+    ) -> LiveTargetGrant | None:
+        pk, sk = self._target_key(tenant_binding, target_hash)
+        record = self._record(pk, sk)
         if record is None:
             return None
         if set(record) != {"grant", "uses", "claimedCallIds"}:
@@ -145,25 +257,53 @@ class DynamoAdmissionRepository:
             or claimed != sorted(set(claimed))
         ):
             raise RuntimeError("live target claim inventory is invalid")
+        grant = TargetGrantV1.from_mapping(record["grant"])
+        if grant.target_hash != target_hash:
+            raise RuntimeError("live target grant binding is invalid")
+        if grant.tenant_binding != tenant_binding:
+            raise AdmissionDenied("TARGET_GRANT_TENANT_MISMATCH")
         return LiveTargetGrant(
-            grant=TargetGrantV1.from_mapping(record["grant"]),
+            grant=grant,
             uses=record["uses"],
             claimed_call_ids=tuple(claimed),
         )
 
-    def claim_target_use(self, target_hash: str, call_id: str) -> bool:
-        if not isinstance(target_hash, str) or not isinstance(call_id, str):
-            raise TypeError("target claim requires exact string identities")
-        pk, sk = f"TARGET#{target_hash}", "GRANT"
+    def claim_target_use(
+        self,
+        tenant_binding: str,
+        target_hash: str,
+        current_request_id: str,
+        call_id: str,
+    ) -> bool:
+        pk, sk = self._target_key(tenant_binding, target_hash)
+        if (
+            not isinstance(current_request_id, str)
+            or _OPAQUE_ID.fullmatch(current_request_id) is None
+            or not isinstance(call_id, str)
+            or _CALL_ID.fullmatch(call_id) is None
+        ):
+            raise TypeError("target claim requires exact request and call identities")
         for _ in range(4):
             item = self._get(pk, sk)
             if item is None:
                 return False
+            self._validate_item(item, pk, sk)
             record = _json_mapping(item.get("recordJson"), "live target")
             if set(record) != {"grant", "uses", "claimedCallIds"}:
                 raise RuntimeError("live target grant record is invalid")
             grant = TargetGrantV1.from_mapping(record["grant"])
             claimed = record["claimedCallIds"]
+            LiveTargetGrant(
+                grant=grant,
+                uses=record["uses"],
+                claimed_call_ids=tuple(claimed),
+            )
+            if grant.target_hash != target_hash:
+                raise RuntimeError("live target grant binding is invalid")
+            if grant.tenant_binding != tenant_binding:
+                raise AdmissionDenied("TARGET_GRANT_TENANT_MISMATCH")
+            if grant.current_request_id != current_request_id:
+                raise AdmissionDenied("TARGET_GRANT_REQUEST_MISMATCH")
             if call_id in claimed:
                 return True
             if record["uses"] >= grant.max_uses:

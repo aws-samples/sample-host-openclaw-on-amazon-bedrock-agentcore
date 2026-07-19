@@ -22,6 +22,7 @@ from capabilities.contracts import (
     canonical_sha256,
     derive_call_id,
     derive_target_hash,
+    derive_target_tenant_binding,
 )
 
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
@@ -31,7 +32,7 @@ CALLER_ARN = (
     "arn:aws:iam::000000000000:role/" "openclaw-agentcore-execution-role-eu-west-1"
 )
 NOW = 1_800_000_100
-REQUEST_ID = "request_12345678"
+REQUEST_ID = "invocation_12345678"
 SCHEMA_DIR = Path(__file__).resolve().parents[2] / "specs/capabilities/schemas"
 
 PUBLIC_IP = "93.184.216.34"
@@ -189,9 +190,17 @@ def _target_grant(
     max_uses: int = 1,
     redirect_policy: str = "NO_REDIRECT",
     request_id: str = REQUEST_ID,
+    tenant_id: str = "user_alpha",
 ) -> TargetGrantV1:
+    tenant_binding = derive_target_tenant_binding(tenant_id)
     target_hash = derive_target_hash(
-        url, "GET", redirect_policy, expires_at, max_uses, request_id
+        url,
+        "GET",
+        redirect_policy,
+        expires_at,
+        max_uses,
+        request_id,
+        tenant_binding,
     )
     return TargetGrantV1.from_mapping(
         {
@@ -203,6 +212,7 @@ def _target_grant(
             "expiresAt": expires_at,
             "maxUses": max_uses,
             "currentRequestId": request_id,
+            "tenantBinding": tenant_binding,
         }
     )
 
@@ -241,15 +251,22 @@ def _gateway_modules():
 
 
 class FakeRepository:
-    def __init__(self, catalog, live_target_type, *, target_grant=None):
+    def __init__(
+        self,
+        catalog,
+        live_target_type,
+        *,
+        target_grant=None,
+        user_id="user_alpha",
+    ):
         self.catalog = catalog
         self.trace: list[str] = []
         self.global_kill_switch = False
         self.deletion_fence = False
-        self.user = {"userId": "user_alpha", "state": "ACTIVE", "deletionFence": False}
+        self.user = {"userId": user_id, "state": "ACTIVE", "deletionFence": False}
         self.session = {
             "sessionId": "session_12345678",
-            "userId": "user_alpha",
+            "userId": user_id,
             "runtimeArn": RUNTIME_ARN,
             "runtimeQualifier": RUNTIME_QUALIFIER,
             "state": "ACTIVE",
@@ -258,7 +275,7 @@ class FakeRepository:
             "runtimeArn": RUNTIME_ARN,
             "runtimeQualifier": RUNTIME_QUALIFIER,
             "sessionId": "session_12345678",
-            "userId": "user_alpha",
+            "userId": user_id,
             "releaseCommit": RELEASE_COMMIT,
             "catalogDigest": catalog.catalog_digest,
             "state": "READY",
@@ -268,7 +285,7 @@ class FakeRepository:
             self.installations[pack["packId"]] = CapabilityInstallationV1.from_mapping(
                 {
                     "schema": CapabilityInstallationV1.SCHEMA,
-                    "userId": "user_alpha",
+                    "userId": user_id,
                     "packId": pack["packId"],
                     "catalogDigest": catalog.catalog_digest,
                     "state": "ENABLED",
@@ -314,11 +331,17 @@ class FakeRepository:
             return None
         return self.installations.get(pack_id)
 
-    def strong_read_target_grant(self, target_hash: str):
+    def strong_read_target_grant(self, tenant_binding: str, target_hash: str):
         self.trace.append("target")
         return self.targets.get(target_hash)
 
-    def claim_target_use(self, target_hash: str, call_id: str) -> bool:
+    def claim_target_use(
+        self,
+        tenant_binding: str,
+        target_hash: str,
+        current_request_id: str,
+        call_id: str,
+    ) -> bool:
         self.trace.append("target_claim")
         target = self.targets.get(target_hash)
         if target is None:
@@ -345,12 +368,18 @@ def _build_gateway(
     clock=None,
     adapter=True,
     max_redirects=0,
+    repository_user_id="user_alpha",
 ):
     from capabilities.web_reader import build_web_read_adapter
 
     LiveTargetGrant, AdapterOutcome, CapabilityGateway, Ledger = _gateway_modules()
     catalog = _catalog()
-    repository = FakeRepository(catalog, LiveTargetGrant, target_grant=target_grant)
+    repository = FakeRepository(
+        catalog,
+        LiveTargetGrant,
+        target_grant=target_grant,
+        user_id=repository_user_id,
+    )
     web_clock = clock or FakeClock(NOW)
     adapters = {}
     if adapter:
@@ -477,6 +506,7 @@ def test_previous_turn_url_yields_no_grant():
     grants = derive_target_grants(
         "please summarize the earlier link",
         current_request_id="request_87654321",
+        tenant_id="user_alpha",
         now=NOW,
         ttl_seconds=120,
     )
@@ -503,18 +533,78 @@ def test_prior_turn_request_id_binding_makes_hash_unusable():
     r1 = derive_target_grants(
         f"read {url} please",
         current_request_id="request_r1r1r1r1",
+        tenant_id="user_alpha",
         now=NOW,
         ttl_seconds=120,
     )
     r2 = derive_target_grants(
         f"read {url} please",
         current_request_id="request_r2r2r2r2",
+        tenant_id="user_alpha",
         now=NOW,
         ttl_seconds=120,
     )
-    assert len(r1) == 1 and len(r2) == 1
+    tenant_b = derive_target_grants(
+        f"read {url} please",
+        current_request_id="request_r1r1r1r1",
+        tenant_id="user_beta",
+        now=NOW,
+        ttl_seconds=120,
+    )
+    assert len(r1) == 1 and len(r2) == 1 and len(tenant_b) == 1
     # Same URL, different request id => different bound target hash.
     assert r1[0].target_hash != r2[0].target_hash
+    assert r1[0].target_hash != tenant_b[0].target_hash
+    assert r1[0].tenant_binding != tenant_b[0].tenant_binding
+
+
+def test_prior_request_target_grant_is_denied_before_dns_with_typed_mismatch():
+    url = "https://example.com/exact"
+    prior = _target_grant(url, request_id="request_prior_1234")
+    resolver = FakeResolver([[PUBLIC_IP]])
+    connect = FakeSocketFactory(FakeResponse(body_chunks=(b"must not fetch",)))
+    catalog, _, gateway = _build_gateway(
+        target_grant=prior,
+        resolver=resolver,
+        connect=connect,
+    )
+
+    result = gateway.invoke(
+        _call(catalog, url),
+        _iam(catalog, target_grant=prior),
+    )
+
+    assert result.status == "DENIED"
+    assert result.error_code == "TARGET_GRANT_REQUEST_MISMATCH"
+    assert resolver.calls == []
+    assert connect.connections == []
+
+
+def test_different_tenant_target_grant_is_denied_before_dns_with_typed_mismatch():
+    url = "https://example.com/exact"
+    tenant_a = _target_grant(url, tenant_id="user_alpha")
+    resolver = FakeResolver([[PUBLIC_IP]])
+    connect = FakeSocketFactory(FakeResponse(body_chunks=(b"must not fetch",)))
+    catalog, _, gateway = _build_gateway(
+        target_grant=tenant_a,
+        resolver=resolver,
+        connect=connect,
+        repository_user_id="user_beta",
+    )
+
+    result = gateway.invoke(
+        _call(catalog, url),
+        _iam(
+            catalog,
+            target_grant=tenant_a,
+            overrides={"sub": "user_beta"},
+        ),
+    )
+
+    assert result.status == "DENIED"
+    assert result.error_code == "TARGET_GRANT_TENANT_MISMATCH"
+    assert resolver.calls == []
+    assert connect.connections == []
 
 
 # --------------------------------------------------------------------------- #
@@ -530,6 +620,7 @@ def test_workspace_derived_url_yields_no_grant():
     grants = derive_target_grants(
         "no url here at all",
         current_request_id=REQUEST_ID,
+        tenant_id="user_alpha",
         now=NOW,
         ttl_seconds=120,
     )
@@ -567,6 +658,7 @@ def test_private_special_ip_and_nonhttps_rejected_at_mint(message):
     grants = derive_target_grants(
         message,
         current_request_id=REQUEST_ID,
+        tenant_id="user_alpha",
         now=NOW,
         ttl_seconds=120,
     )

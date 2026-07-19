@@ -143,14 +143,16 @@ def _documents(contracts):
                 "SAME_HOST",
                 1_800_000_300,
                 1,
-                "request_12345678",
+                "invocation_12345678",
+                contracts.derive_target_tenant_binding("user_alpha"),
             ),
             "normalizedTarget": "https://example.com/exact",
             "method": "GET",
             "redirectPolicy": "SAME_HOST",
             "expiresAt": 1_800_000_300,
             "maxUses": 1,
-            "currentRequestId": "request_12345678",
+            "currentRequestId": "invocation_12345678",
+            "tenantBinding": contracts.derive_target_tenant_binding("user_alpha"),
         },
         "personal-operator.action-proposal.v1": {
             "schema": "personal-operator.action-proposal.v1",
@@ -718,6 +720,7 @@ def test_target_grant_rejects_non_global_literals_and_url_aliases(target):
             document["expiresAt"],
             document["maxUses"],
             document["currentRequestId"],
+            document["tenantBinding"],
         )
     document["normalizedTarget"] = target
     document["targetHash"] = _legacy_target_hash(target)
@@ -725,13 +728,24 @@ def test_target_grant_rejects_non_global_literals_and_url_aliases(target):
         contracts.parse_canonical_json(_canonical(document), document["schema"])
 
 
-def test_target_hash_binds_expiry_and_use_authority():
+def test_target_hash_binds_expiry_use_request_and_tenant_authority():
     contracts, _ = _load_modules()
     document = _documents(contracts)["personal-operator.target-grant.v1"]
-    for field, value in (("expiresAt", document["expiresAt"] + 1), ("maxUses", 2)):
+    for field, value in (
+        ("expiresAt", document["expiresAt"] + 1),
+        ("maxUses", 2),
+        ("currentRequestId", "invocation_other_1234"),
+        ("tenantBinding", contracts.derive_target_tenant_binding("user_beta")),
+    ):
         mutated = {**document, field: value}
         with pytest.raises(contracts.ContractValidationError):
             contracts.parse_canonical_json(_canonical(mutated), document["schema"])
+
+
+def test_target_grant_contract_requires_a_tenant_binding():
+    contracts, _ = _load_modules()
+
+    assert "tenantBinding" in contracts.TargetGrantV1.FIELDS
 
 
 @pytest.mark.parametrize(
@@ -753,6 +767,7 @@ def test_target_grant_accepts_only_canonical_global_https_examples(target):
         document["expiresAt"],
         document["maxUses"],
         document["currentRequestId"],
+        document["tenantBinding"],
     )
     assert contracts.parse_canonical_json(_canonical(document), document["schema"])
 

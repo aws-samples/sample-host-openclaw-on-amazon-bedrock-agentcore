@@ -17,6 +17,7 @@ from .contracts import (
     ContractValidationError,
     TargetGrantV1,
     derive_target_hash,
+    derive_target_tenant_binding,
 )
 
 # Literal https token scan. We never rewrite or guess a URL: a candidate is a
@@ -45,6 +46,7 @@ def derive_target_grants(
     message_text: str,
     *,
     current_request_id: str,
+    tenant_id: str,
     now: int,
     ttl_seconds: int,
     redirect_policy: str = "NO_REDIRECT",
@@ -53,9 +55,9 @@ def derive_target_grants(
     """Mint target grants for the exact https URLs literally in ``message_text``.
 
     Returns ``[]`` when the message carries no admissible exact URL. Each
-    surviving URL is bound to ``current_request_id`` so a stale grant minted in
-    a previous turn fails admission (different request id -> different
-    targetHash -> ``TARGET_GRANT_MISMATCH``). Pure; never touches the network.
+    surviving URL is bound to ``current_request_id`` and ``tenant_id`` so a
+    stale or cross-tenant grant fails admission. The request identity must be
+    the trusted turn's invocation ID. Pure; never touches the network.
     """
 
     if not isinstance(message_text, str):
@@ -66,6 +68,7 @@ def derive_target_grants(
         raise ValueError("ttl_seconds must be a positive integer")
 
     expires_at = now + ttl_seconds
+    tenant_binding = derive_target_tenant_binding(tenant_id)
     grants: list[TargetGrantV1] = []
     seen: set[str] = set()
     for candidate in _candidate_urls(message_text):
@@ -79,6 +82,7 @@ def derive_target_grants(
                 expires_at,
                 max_uses,
                 current_request_id,
+                tenant_binding,
             )
             grant = TargetGrantV1.from_mapping(
                 {
@@ -90,6 +94,7 @@ def derive_target_grants(
                     "expiresAt": expires_at,
                     "maxUses": max_uses,
                     "currentRequestId": current_request_id,
+                    "tenantBinding": tenant_binding,
                 }
             )
         except (ContractValidationError, TypeError, ValueError):

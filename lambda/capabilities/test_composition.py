@@ -275,21 +275,17 @@ def _durable_web_gateway(client: MemoryDynamoClient, catalog, adapter):
 
 
 def _seed_web_target(client: MemoryDynamoClient, catalog):
+    from capabilities.durable import DynamoAdmissionRepository
+
     target = _target_grant(max_uses=1)
     _seed_installation(client, catalog, "web.exact-read")
-    client.put(
-        f"TARGET#{target.target_hash}",
-        "GRANT",
-        recordJson=json.dumps(
-            {
-                "grant": target.to_mapping(),
-                "uses": 0,
-                "claimedCallIds": [],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        version=1,
+    DynamoAdmissionRepository(
+        client=client,
+        table_name="capability-state",
+    ).persist_target_grants(
+        tenant_id="user_alpha",
+        current_request_id="invocation_12345678",
+        grants=[target],
     )
     return target
 
@@ -311,7 +307,9 @@ def _web_success():
 
 
 def _target_record(client, target):
-    item = client.items[(f"TARGET#{target.target_hash}", "GRANT")]
+    item = client.items[
+        (f"TENANT#{target.tenant_binding}", f"TARGET#{target.target_hash}")
+    ]
     return json.loads(item["recordJson"])
 
 
@@ -458,6 +456,148 @@ def test_durable_target_claim_allows_exact_cached_response_loss_recovery_only():
     }
     assert _turn_record(client)["callCount"] == 1
     assert _turn_record(client)["packCounts"] == {"web.exact-read": 1}
+
+
+def test_durable_target_rows_are_partitioned_by_the_grants_tenant_binding():
+    catalog = _catalog()
+    client = MemoryDynamoClient()
+
+    target = _seed_web_target(client, catalog)
+
+    assert (
+        f"TENANT#{target.tenant_binding}",
+        f"TARGET#{target.target_hash}",
+    ) in client.items
+    assert (f"TARGET#{target.target_hash}", "GRANT") not in client.items
+
+
+def test_durable_target_persistence_claim_and_cached_recovery_keep_exact_bindings():
+    from capabilities.admission import AdmissionDenied
+    from capabilities.contracts import derive_target_tenant_binding
+    from capabilities.durable import DynamoAdmissionRepository
+
+    client = MemoryDynamoClient()
+    repository = DynamoAdmissionRepository(
+        client=client,
+        table_name="capability-state",
+    )
+    target = _target_grant(max_uses=1)
+
+    assert callable(getattr(repository, "persist_target_grants", None))
+    repository.persist_target_grants(
+        tenant_id="user_alpha",
+        current_request_id="invocation_12345678",
+        grants=[target],
+    )
+    repository.persist_target_grants(
+        tenant_id="user_alpha",
+        current_request_id="invocation_12345678",
+        grants=[target],
+    )
+
+    tenant_binding = derive_target_tenant_binding("user_alpha")
+    recovered = repository.strong_read_target_grant(
+        tenant_binding,
+        target.target_hash,
+    )
+    assert recovered is not None
+    assert recovered.grant.to_bytes() == target.to_bytes()
+    assert recovered.uses == 0
+
+    with pytest.raises(ValueError, match="request"):
+        repository.persist_target_grants(
+            tenant_id="user_alpha",
+            current_request_id="invocation_other_1234",
+            grants=[target],
+        )
+    with pytest.raises(ValueError, match="tenant"):
+        repository.persist_target_grants(
+            tenant_id="user_beta",
+            current_request_id="invocation_12345678",
+            grants=[target],
+        )
+
+    call_id = "call_" + "a" * 64
+    with pytest.raises(AdmissionDenied) as request_mismatch:
+        repository.claim_target_use(
+            tenant_binding,
+            target.target_hash,
+            "invocation_other_1234",
+            call_id,
+        )
+    assert request_mismatch.value.code == "TARGET_GRANT_REQUEST_MISMATCH"
+    assert repository.claim_target_use(
+        derive_target_tenant_binding("user_beta"),
+        target.target_hash,
+        "invocation_12345678",
+        call_id,
+    ) is False
+    assert repository.claim_target_use(
+        tenant_binding,
+        target.target_hash,
+        "invocation_12345678",
+        call_id,
+    ) is True
+    update_count = len(client.update_calls)
+    assert repository.claim_target_use(
+        tenant_binding,
+        target.target_hash,
+        "invocation_12345678",
+        call_id,
+    ) is True
+    assert len(client.update_calls) == update_count
+
+    claimed = repository.strong_read_target_grant(
+        tenant_binding,
+        target.target_hash,
+    )
+    assert claimed is not None
+    assert claimed.uses == 1
+    assert claimed.claimed_call_ids == (call_id,)
+    target_key = (
+        f"TENANT#{tenant_binding}",
+        f"TARGET#{target.target_hash}",
+    )
+    client.items[target_key]["unexpected"] = "must fail closed"
+    with pytest.raises(RuntimeError, match="unexpected fields"):
+        repository.claim_target_use(
+            tenant_binding,
+            target.target_hash,
+            "invocation_12345678",
+            call_id,
+        )
+    client.items[target_key].pop("unexpected")
+    with pytest.raises(RuntimeError, match="persistence conflict"):
+        repository.persist_target_grants(
+            tenant_id="user_alpha",
+            current_request_id="invocation_12345678",
+            grants=[target],
+        )
+
+
+def test_durable_cached_target_row_rejects_a_cross_tenant_partition_copy():
+    from capabilities.admission import AdmissionDenied
+    from capabilities.contracts import derive_target_tenant_binding
+    from capabilities.durable import DynamoAdmissionRepository
+
+    catalog = _catalog()
+    client = MemoryDynamoClient()
+    target = _seed_web_target(client, catalog)
+    repository = DynamoAdmissionRepository(
+        client=client,
+        table_name="capability-state",
+    )
+    tenant_a = derive_target_tenant_binding("user_alpha")
+    tenant_b = derive_target_tenant_binding("user_beta")
+    source_key = (f"TENANT#{tenant_a}", f"TARGET#{target.target_hash}")
+    copied = deepcopy(client.items[source_key])
+    copied["PK"] = f"TENANT#{tenant_b}"
+    client.items[(copied["PK"], copied["SK"])] = copied
+
+    with pytest.raises(AdmissionDenied) as mismatch:
+        repository.strong_read_target_grant(tenant_b, target.target_hash)
+
+    assert mismatch.value.code == "TARGET_GRANT_TENANT_MISMATCH"
 
 
 def test_durable_target_claim_allows_one_same_call_read_retry_without_recharge():
