@@ -140,10 +140,14 @@ agentcore_stack = AgentCoreStack(
     cmk_arn=security_stack.cmk.key_arn,
     vpc=vpc_stack.vpc,
     private_subnet_ids=[s.subnet_id for s in vpc_stack.vpc.private_subnets],
+    trusted_endpoint_security_group=vpc_stack.vpce_sg,
     workspace_capability_secret_name=(
         security_stack.workspace_capability_secret.secret_name
     ),
     capability_gateway_function_arn=capability_stack.gateway_function_arn,
+    guardrail_id=guardrails_stack.guardrail_id,
+    guardrail_version=guardrails_stack.guardrail_version,
+    guardrail_arn=guardrails_stack.guardrail_arn,
     env=env,
 )
 agentcore_stack.add_dependency(capability_stack)

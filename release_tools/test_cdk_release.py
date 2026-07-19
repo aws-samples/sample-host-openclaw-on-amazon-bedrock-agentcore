@@ -42,12 +42,19 @@ def _stack(context_overrides: dict[str, str] | None = None) -> AgentCoreStack:
     env = Environment(account=ACCOUNT, region=REGION)
     network = Stack(app, "Network", env=env)
     vpc = ec2.Vpc(network, "Vpc", max_azs=2, nat_gateways=0)
+    trusted_endpoint_sg = ec2.SecurityGroup(
+        network,
+        "TrustedEndpointSecurityGroup",
+        vpc=vpc,
+        allow_all_outbound=False,
+    )
     return AgentCoreStack(
         app,
         "AgentCore",
         cmk_arn=f"arn:aws:kms:{REGION}:{ACCOUNT}:key/test-key",
         vpc=vpc,
         private_subnet_ids=["subnet-00000000000000001"],
+        trusted_endpoint_security_group=trusted_endpoint_sg,
         workspace_capability_secret_name=(
             "personal-operator/workspace-capability"
         ),

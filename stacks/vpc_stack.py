@@ -89,18 +89,15 @@ class VpcStack(Stack):
             subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
         )
 
-        # Bedrock Runtime endpoint: Private DNS disabled so global/* cross-region
-        # inference profiles (e.g. global.anthropic.claude-sonnet-4-6) can route
-        # via NAT gateway to AWS's global routing layer. With private DNS enabled,
-        # bedrock-runtime.{region}.amazonaws.com resolves to the VPC endpoint IP
-        # even when the proxy sets a custom endpoint URL, blocking cross-region calls.
-        # Regional model calls still work — they route via NAT to the public endpoint.
+        # The untrusted runtime has no NAT egress. Bedrock calls resolve to this
+        # trusted interface endpoint; the EU inference profile is invoked at the
+        # regional API and any service-side routing remains outside the runtime.
         self.vpc.add_interface_endpoint(
             "BedrockRuntimeEndpoint",
             service=ec2.InterfaceVpcEndpointAwsService.BEDROCK_RUNTIME,
             subnets=private_subnets,
             security_groups=[self.vpce_sg],
-            private_dns_enabled=False,  # Disabled: cross-region profiles need NAT→global routing
+            private_dns_enabled=True,
         )
 
         interface_endpoints = {
@@ -112,6 +109,14 @@ class VpcStack(Stack):
             "SecretsManager": ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
             "CwLogs": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS,
             "Monitoring": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_MONITORING,
+            # Workspace files and AgentCore session storage remain on private
+            # S3 connectivity; the runtime security group can target this same
+            # reviewed endpoint security group instead of a public prefix.
+            "S3Interface": ec2.InterfaceVpcEndpointAwsService.S3,
+            # Workspace broker and capability gateway are the two trusted
+            # mediators the runtime may invoke; exact function IAM remains in
+            # AgentCoreStack while this endpoint removes generic internet egress.
+            "Lambda": ec2.InterfaceVpcEndpointAwsService.LAMBDA_,
         }
 
         for name, service in interface_endpoints.items():
@@ -124,7 +129,7 @@ class VpcStack(Stack):
             )
 
         # S3 gateway endpoint (free, no SG needed)
-        self.vpc.add_gateway_endpoint(
+        self.s3_endpoint = self.vpc.add_gateway_endpoint(
             "S3Endpoint",
             service=ec2.GatewayVpcEndpointAwsService.S3,
             subnets=[private_subnets],

@@ -53,9 +53,12 @@ class AgentCoreStack(Stack):
         cmk_arn: str,
         vpc: ec2.IVpc,
         private_subnet_ids: list[str],
+        trusted_endpoint_security_group: ec2.ISecurityGroup,
         workspace_capability_secret_name: str,
         capability_gateway_function_arn: str,
-        guardrail_id: str = "",
+        guardrail_id: str | None = None,
+        guardrail_version: str | None = None,
+        guardrail_arn: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -78,6 +81,21 @@ class AgentCoreStack(Stack):
         )
         if capability_gateway_function_arn != expected_gateway_arn:
             raise ValueError("capability gateway function ARN is not canonical")
+        guardrail_values = (guardrail_id, guardrail_version, guardrail_arn)
+        if any(guardrail_values) != all(guardrail_values):
+            raise ValueError("guardrail identity, version, and ARN must be atomic")
+        if guardrail_id and not Token.is_unresolved(guardrail_id):
+            if re.fullmatch(r"[a-z0-9]+", guardrail_id) is None:
+                raise ValueError("guardrail identity is not canonical")
+        if guardrail_version and not Token.is_unresolved(guardrail_version):
+            if re.fullmatch(r"(?:DRAFT|[1-9][0-9]{0,7})", guardrail_version) is None:
+                raise ValueError("guardrail version is not canonical")
+        if guardrail_arn and not Token.is_unresolved(guardrail_arn):
+            expected_guardrail_arn = (
+                f"arn:aws:bedrock:{region}:{account}:guardrail/{guardrail_id}"
+            )
+            if guardrail_arn != expected_guardrail_arn:
+                raise ValueError("guardrail ARN does not match the configured subject")
 
         # --- Security Group for AgentCore Runtime containers ------------------
         self.agent_sg = ec2.SecurityGroup(
@@ -88,9 +106,11 @@ class AgentCoreStack(Stack):
             allow_all_outbound=False,
         )
         self.agent_sg.add_egress_rule(
-            peer=ec2.Peer.any_ipv4(),
+            peer=trusted_endpoint_security_group,
             connection=ec2.Port.tcp(443),
-            description="HTTPS to VPC endpoints and internet (web_fetch/web_search tools)",
+            description=(
+                "Personal Operator runtime HTTPS to trusted AWS interface endpoints only"
+            ),
         )
         self.agent_sg.add_ingress_rule(
             peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
@@ -148,13 +168,11 @@ class AgentCoreStack(Stack):
         )
 
         # Bedrock Guardrails — ApplyGuardrail permission (only when guardrails enabled)
-        if guardrail_id:
+        if guardrail_arn:
             self.execution_role.add_to_policy(
                 iam.PolicyStatement(
                     actions=["bedrock:ApplyGuardrail"],
-                    resources=[
-                        f"arn:aws:bedrock:{region}:{account}:guardrail/*",
-                    ],
+                    resources=[guardrail_arn],
                 )
             )
 
@@ -623,7 +641,7 @@ class AgentCoreStack(Stack):
                 runtime_environment.update(
                     {
                         "BEDROCK_GUARDRAIL_ID": guardrail_id,
-                        "BEDROCK_GUARDRAIL_VERSION": "DRAFT",
+                        "BEDROCK_GUARDRAIL_VERSION": guardrail_version,
                     }
                 )
 
@@ -804,8 +822,6 @@ class AgentCoreStack(Stack):
                         "Resource::*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*:*",
-                        # Bedrock Guardrails (wildcard for guardrail version changes)
-                        f"Resource::arn:aws:bedrock:{region}:{account}:guardrail/*",
                     ],
                 ),
             ],

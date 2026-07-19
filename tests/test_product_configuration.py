@@ -775,7 +775,12 @@ TEST_CAPABILITY_CATALOG_DIGEST = "b" * 64
 
 
 def _build_agentcore_stack(
-    region: str = "eu-west-1", context_overrides: dict | None = None
+    region: str = "eu-west-1",
+    context_overrides: dict | None = None,
+    *,
+    guardrail_id: str = "",
+    guardrail_version: str = "",
+    guardrail_arn: str = "",
 ):
     from aws_cdk import App, Environment, Stack, aws_ec2 as ec2
     from stacks.agentcore_stack import AgentCoreStack
@@ -799,6 +804,12 @@ def _build_agentcore_stack(
     env = Environment(account=account, region=region)
     network = Stack(app, f"Network{region.replace('-', '')}", env=env)
     vpc = ec2.Vpc(network, "Vpc", max_azs=2, nat_gateways=0)
+    trusted_endpoint_sg = ec2.SecurityGroup(
+        network,
+        "TrustedEndpointSecurityGroup",
+        vpc=vpc,
+        allow_all_outbound=False,
+    )
     stack = AgentCoreStack(
         app,
         f"AgentCore{region.replace('-', '')}",
@@ -809,6 +820,10 @@ def _build_agentcore_stack(
             "personal-operator/workspace-capability"
         ),
         capability_gateway_function_arn=TEST_CAPABILITY_GATEWAY_ARN,
+        trusted_endpoint_security_group=trusted_endpoint_sg,
+        guardrail_id=guardrail_id,
+        guardrail_version=guardrail_version,
+        guardrail_arn=guardrail_arn,
         env=env,
     )
     return stack
@@ -1201,6 +1216,114 @@ def test_synthesized_runtime_invokes_only_exact_broker_and_capability_gateway() 
             "Resource": TEST_CAPABILITY_GATEWAY_ARN,
         },
     ]
+
+
+def test_synthesized_runtime_has_no_public_egress_and_only_trusted_destinations() -> None:
+    template = _synth_agentcore_template()
+    egress = [
+        resource["Properties"]
+        for resource in template["Resources"].values()
+        if resource["Type"] == "AWS::EC2::SecurityGroupEgress"
+    ]
+
+    assert egress
+    assert all(rule.get("CidrIp") != "0.0.0.0/0" for rule in egress)
+    runtime_rules = [
+        rule
+        for rule in egress
+        if rule.get("Description", "").startswith("Personal Operator runtime")
+    ]
+    assert len(runtime_rules) == 1
+    assert {rule["IpProtocol"] for rule in runtime_rules} == {"tcp"}
+    assert {(rule["FromPort"], rule["ToPort"]) for rule in runtime_rules} == {
+        (443, 443)
+    }
+    assert "DestinationSecurityGroupId" in runtime_rules[0]
+    assert "DestinationPrefixListId" not in runtime_rules[0]
+
+
+def test_guardrail_iam_and_runtime_bind_exact_subject_and_version() -> None:
+    from aws_cdk.assertions import Template
+
+    guardrail_id = "guardrail1234"
+    guardrail_version = "7"
+    guardrail_arn = (
+        "arn:aws:bedrock:eu-west-1:123456789012:guardrail/guardrail1234"
+    )
+    stack = _build_agentcore_stack(
+        guardrail_id=guardrail_id,
+        guardrail_version=guardrail_version,
+        guardrail_arn=guardrail_arn,
+    )
+    template = Template.from_stack(stack).to_json()
+    _, statements = _role_and_statements(
+        template, "openclaw-agentcore-execution-role-eu-west-1"
+    )
+    apply = [
+        statement
+        for statement in statements
+        if statement.get("Action") == "bedrock:ApplyGuardrail"
+    ]
+    assert apply == [
+        {
+            "Action": "bedrock:ApplyGuardrail",
+            "Effect": "Allow",
+            "Resource": guardrail_arn,
+        }
+    ]
+    runtime = next(
+        resource
+        for resource in template["Resources"].values()
+        if resource["Type"] == "AWS::BedrockAgentCore::Runtime"
+    )
+    environment = runtime["Properties"]["EnvironmentVariables"]
+    assert environment["BEDROCK_GUARDRAIL_ID"] == guardrail_id
+    assert environment["BEDROCK_GUARDRAIL_VERSION"] == guardrail_version
+
+
+def test_app_wires_the_exact_guardrail_and_trusted_endpoint_boundary() -> None:
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "guardrail_id=guardrails_stack.guardrail_id" in source
+    assert "guardrail_version=guardrails_stack.guardrail_version" in source
+    assert "guardrail_arn=guardrails_stack.guardrail_arn" in source
+    assert "trusted_endpoint_security_group=vpc_stack.vpce_sg" in source
+    assert "s3_prefix_list_id=" not in source
+
+
+def test_vpc_exposes_lambda_and_private_bedrock_endpoints_for_runtime_mediation() -> None:
+    from aws_cdk import App, Environment
+    from aws_cdk.assertions import Template
+    from stacks.vpc_stack import VpcStack
+
+    app = App()
+    stack = VpcStack(
+        app,
+        "RuntimeVpc",
+        env=Environment(account="123456789012", region="eu-west-1"),
+    )
+    template = Template.from_stack(stack).to_json()
+    endpoints = [
+        resource["Properties"]
+        for resource in template["Resources"].values()
+        if resource["Type"] == "AWS::EC2::VPCEndpoint"
+    ]
+    rendered = json.dumps(endpoints, sort_keys=True, separators=(",", ":"))
+    assert "com.amazonaws.eu-west-1.lambda" in rendered
+    s3_interface = [
+        endpoint
+        for endpoint in endpoints
+        if endpoint.get("VpcEndpointType") == "Interface"
+        and "com.amazonaws.eu-west-1.s3" in json.dumps(endpoint, sort_keys=True)
+    ]
+    assert len(s3_interface) == 1
+    assert s3_interface[0]["PrivateDnsEnabled"] is True
+    bedrock = [
+        endpoint
+        for endpoint in endpoints
+        if "bedrock-runtime" in json.dumps(endpoint, sort_keys=True)
+    ]
+    assert len(bedrock) == 1
+    assert bedrock[0]["PrivateDnsEnabled"] is True
 
 
 def test_runtime_owned_browser_flag_is_rejected_and_never_synthesizes_iam() -> None:
