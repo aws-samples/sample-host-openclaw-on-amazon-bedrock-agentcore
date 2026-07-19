@@ -28,8 +28,14 @@ class FakeRuntimeDriver:
         self.response = response or {"response": "**Done** <safely>"}
         self.calls = []
 
-    def invoke(self, user_id, request, trace_id):
-        self.calls.append((user_id, request, trace_id))
+    def invoke(self, user_id, request, trace_id, *, scheduled_read_only=False):
+        # Mirror the real RuntimeDriver contract: reject any request carrying
+        # caller-controlled authority fields, so a fake can never mask the
+        # divergence that the scheduled read-only path must respect.
+        allowed = {"message", "actorId", "channel"}
+        if "message" not in request or set(request) - allowed:
+            raise ValueError("runtime request contains caller-controlled authority")
+        self.calls.append((user_id, request, trace_id, scheduled_read_only))
         return self.response
 
 
@@ -232,8 +238,9 @@ def test_free_form_input_invokes_runtime_with_minimal_secret_free_request():
     worker.process_envelope(item, deps)
 
     assert len(runtime.calls) == 1
-    user_id, request, trace_id = runtime.calls[0]
+    user_id, request, trace_id, scheduled_read_only = runtime.calls[0]
     assert user_id == "user_a1"
+    assert scheduled_read_only is False  # an interactive turn, not scheduled
     assert trace_id == derive_event_trace("telegram", "user_a1", "100")
     assert set(request) == {"channel", "actorId", "message"}
     serialized = json.dumps(request).lower()
@@ -591,3 +598,160 @@ def test_runtime_cannot_claim_it_streamed_directly_to_telegram():
         assert "stream" in str(error).lower()
     else:
         raise AssertionError("untrusted runtime streaming claim must be rejected")
+
+
+# --- Task 7: scheduled read-only occurrences ---------------------------------
+
+import hashlib as _hashlib
+
+sys.path.insert(0, str(WORKER_DIR.parent / "capabilities"))
+from contracts import derive_occurrence_id as _derive_occurrence_id  # noqa: E402
+
+OCCURRENCE_BODY_SCHEMA = "personal-operator.schedule-occurrence-body.v1"
+SCHEDULE_ID = "sch_" + "a" * 64
+
+
+def occurrence_body(*, task_type="REMINDER", generation=1, occurrence_time=1_800_000_600, content=None):
+    occurrence_id = _derive_occurrence_id(SCHEDULE_ID, generation, occurrence_time)
+    content_field = "message" if task_type == "REMINDER" else "prompt"
+    if content is None:
+        content = "water the plants" if task_type == "REMINDER" else "read my inbox"
+    body = {
+        "schema": OCCURRENCE_BODY_SCHEMA,
+        "occurrenceId": occurrence_id,
+        "scheduleId": SCHEDULE_ID,
+        "userId": "user_a1",
+        "generation": generation,
+        "occurrenceTime": occurrence_time,
+        "taskType": task_type,
+        "chatId": "42",
+        "actorId": "telegram:42",
+        content_field: content,
+        "scheduled": True,
+        "externalEffects": False,
+    }
+    return json.dumps(body, ensure_ascii=True, separators=(",", ":"), sort_keys=True, allow_nan=False), occurrence_id
+
+
+def occurrence_sqs_record(body, occurrence_id, message_id="sqs-occ-1"):
+    return {
+        "messageId": message_id,
+        "receiptHandle": "synthetic",
+        "body": body,
+        "attributes": {
+            "MessageGroupId": "user_a1",
+            "MessageDeduplicationId": occurrence_id,
+        },
+        "messageAttributes": {},
+        "eventSource": "aws:sqs",
+    }
+
+
+def test_scheduled_agent_turn_uses_the_real_runtime_contract_and_marks_read_only():
+    # C1/C2 regression: a READ_ONLY_AGENT_TURN must build a request the REAL
+    # RuntimeDriver._validated_request accepts (only {message, actorId, channel},
+    # requires 'message') and carry read-only via a trusted invoke parameter that
+    # stamps the payload — never via caller-controlled request fields.
+    import importlib.util
+    import pathlib
+    import sys as _sys
+
+    root = pathlib.Path(worker.__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "router_runtime_driver_real", root / "router" / "runtime_driver.py"
+    )
+    rd = importlib.util.module_from_spec(spec)
+    _sys.modules["router_runtime_driver_real"] = rd
+    spec.loader.exec_module(rd)
+
+    class ContractEnforcingDriver:
+        def __init__(self):
+            self.payloads = []
+
+        def invoke(self, user_id, request, trace_id, *, scheduled_read_only=False):
+            # Raises ValueError if the worker sends a non-conforming request.
+            validated = rd.RuntimeDriver._validated_request(user_id, request)
+            payload = {"action": "chat", "message": validated["message"]}
+            if scheduled_read_only:
+                payload["externalEffects"] = False
+            self.payloads.append(payload)
+            return {"response": "ok"}
+
+    driver = ContractEnforcingDriver()
+    deps = dependencies(runtime=driver)
+    body, occurrence_id = occurrence_body(task_type="READ_ONLY_AGENT_TURN")
+    occurrence = worker.ScheduledOccurrence(json.loads(body))
+
+    # Must not raise: the request conforms to the real runtime contract.
+    worker._occurrence_result(occurrence, deps)
+
+    assert driver.payloads, "the scheduled turn never reached the runtime"
+    assert driver.payloads[0]["externalEffects"] is False
+
+
+def test_worker_processes_scheduled_occurrence_at_most_once_reusing_ledger_state_machine():
+    ledger = FakeLedger()
+    delivery = FakeDelivery()
+    deps = dependencies(ledger=ledger, delivery=delivery)
+    body, occurrence_id = occurrence_body(task_type="REMINDER")
+    record = occurrence_sqs_record(body, occurrence_id)
+
+    first = worker.process_sqs_event({"Records": [record]}, deps)
+    second = worker.process_sqs_event({"Records": [record]}, deps)
+
+    assert first == {"batchItemFailures": []}
+    assert second == {"batchItemFailures": []}
+    # At-most-once delivery despite a duplicate fire replay.
+    assert len(delivery.calls) == 1
+    # The occurrence reused the existing ledger state machine keyed by dedupe id.
+    assert list(ledger.records) == [occurrence_id]
+    assert ledger.records[occurrence_id].state == "DELIVERED"
+
+
+def test_scheduled_reminder_delivers_once_and_read_only_turn_invokes_runtime_with_external_effects_false():
+    # REMINDER: delivered as a notification, runtime is never invoked.
+    runtime = FakeRuntimeDriver()
+    delivery = FakeDelivery()
+    deps = dependencies(runtime=runtime, delivery=delivery)
+    body, occurrence_id = occurrence_body(task_type="REMINDER", content="**call mum**")
+    worker.process_sqs_event({"Records": [occurrence_sqs_record(body, occurrence_id)]}, deps)
+
+    assert runtime.calls == []
+    assert len(delivery.calls) == 1
+    assert delivery.calls[0]["chat_id"] == "42"
+    assert delivery.calls[0]["html"] == "<b>call mum</b>"
+
+    # READ_ONLY_AGENT_TURN: the runtime is invoked with the read-only markers.
+    runtime2 = FakeRuntimeDriver({"response": "here is your digest"})
+    delivery2 = FakeDelivery()
+    deps2 = dependencies(runtime=runtime2, delivery=delivery2)
+    body2, occ2 = occurrence_body(task_type="READ_ONLY_AGENT_TURN", content="read inbox")
+    worker.process_sqs_event({"Records": [occurrence_sqs_record(body2, occ2, message_id="sqs-occ-2")]}, deps2)
+
+    assert len(runtime2.calls) == 1
+    user_id, request, trace_id, scheduled_read_only = runtime2.calls[0]
+    assert user_id == "user_a1"
+    # Read-only authority travels through the trusted invoke parameter, NOT via
+    # caller-controlled request fields (the real runtime contract rejects those).
+    assert scheduled_read_only is True
+    assert request["message"] == "read inbox"
+    assert set(request) <= {"message", "actorId", "channel"}
+    # The read-only turn's request carries no chatId or provider secret.
+    serialized = json.dumps(request).lower()
+    assert "chatid" not in serialized
+    assert "token" not in serialized
+    assert len(delivery2.calls) == 1
+    assert delivery2.calls[0]["html"] == "here is your digest"
+
+
+def test_scheduled_occurrence_body_with_forbidden_shape_is_rejected():
+    deps = dependencies()
+    # An occurrence that lies about its bound occurrenceId is rejected.
+    body, occurrence_id = occurrence_body(task_type="REMINDER")
+    tampered = json.loads(body)
+    tampered["occurrenceId"] = _derive_occurrence_id(SCHEDULE_ID, 9, 1_800_000_600)
+    record = occurrence_sqs_record(
+        json.dumps(tampered, separators=(",", ":"), sort_keys=True), occurrence_id
+    )
+    result = worker.process_sqs_event({"Records": [record]}, deps)
+    assert result == {"batchItemFailures": [{"itemIdentifier": "sqs-occ-1"}]}

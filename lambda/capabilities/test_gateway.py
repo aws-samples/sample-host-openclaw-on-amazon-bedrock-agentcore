@@ -846,3 +846,101 @@ def test_lambda_handler_is_exact_and_fails_closed_on_invalid_production_configur
     assert result["errorCode"] == "GATEWAY_CONFIGURATION_INVALID"
     assert "grant" not in result
     assert "nonce" not in str(result).lower()
+
+
+# --- Task 7: schedule read/propose adapters (proposal-only) -------------------
+
+
+class FakeSchedulePort:
+    """Delegates to the trusted scheduler service's read/propose surface only.
+
+    It deliberately exposes no confirm/update/pause/cancel method, mirroring the
+    split that keeps scheduled turns read-only.
+    """
+
+    def __init__(self):
+        self.proposals = []
+        self.cancels = []
+
+    def list_view(self, user_id):
+        return {"schedules": []}
+
+    def propose(self, *, user_id, task_type, definition):
+        self.proposals.append((user_id, task_type, definition))
+        return {
+            "proposalRef": "prop_" + "a" * 60,
+            "expiresAt": NOW + 900,
+        }
+
+    def cancel_propose(self, *, user_id, schedule_id):
+        self.cancels.append((user_id, schedule_id))
+        return {
+            "proposalRef": "prop_" + "b" * 60,
+            "expiresAt": NOW + 900,
+        }
+
+
+def _schedule_gateway(operation_id, port):
+    from capabilities.gateway import CapabilityGateway, build_schedule_adapters
+    from capabilities.admission import LiveTargetGrant
+    from capabilities.ledger import InMemoryCapabilityLedger
+
+    catalog = _catalog()
+    repository = FakeRepository(catalog, LiveTargetGrant)
+    adapters = build_schedule_adapters(port)
+    gateway = CapabilityGateway(
+        catalog=catalog,
+        repository=repository,
+        ledger=InMemoryCapabilityLedger(),
+        adapters=adapters,
+        allowed_caller_arn=CALLER_ARN,
+        clock=lambda: NOW,
+    )
+    return catalog, gateway, adapters
+
+
+def test_schedule_propose_adapter_returns_proposal_never_a_live_schedule():
+    port = FakeSchedulePort()
+    catalog, gateway, adapters = _schedule_gateway("schedule.propose", port)
+    arguments = {
+        "taskType": "REMINDER",
+        "definition": {
+            "message": "call mum",
+            "runAt": NOW + 3600,
+            "timezone": "Europe/London",
+        },
+    }
+    call = _call(catalog, "schedule.propose", arguments)
+
+    result = gateway.invoke(call, _iam(catalog))
+
+    assert result.status == "PENDING_APPROVAL"
+    data = result.to_mapping()["data"]
+    assert set(data) == {"proposalRef", "argsHash", "expiresAt"}
+    assert result.proposal_ref == data["proposalRef"]
+    # A proposal was recorded; no live schedule and no receipt exist.
+    assert len(port.proposals) == 1
+    assert result.to_mapping()["receiptRef"] is None
+
+
+def test_confirm_update_pause_cancel_are_not_reachable_through_the_gateway_surface():
+    from capabilities.gateway import build_schedule_adapters
+
+    catalog = _catalog()
+    catalog_ops = {
+        operation["operationId"]
+        for pack in catalog.packs
+        for operation in pack["operations"]
+    }
+    # The trusted-control-plane transitions are absent from the catalog surface.
+    for hidden in ("schedule.confirm", "schedule.update", "schedule.pause", "schedule.cancel"):
+        assert hidden not in catalog_ops
+
+    # The gateway can only bind adapters for catalog operation ids, so a confirm
+    # adapter cannot be registered at all.
+    port = FakeSchedulePort()
+    adapters = build_schedule_adapters(port)
+    assert set(adapters) == {"schedule.list", "schedule.propose", "schedule.cancel.propose"}
+    # The port itself exposes no dispatch transition.
+    for forbidden in ("confirm", "update", "pause", "cancel"):
+        assert not hasattr(port, forbidden)

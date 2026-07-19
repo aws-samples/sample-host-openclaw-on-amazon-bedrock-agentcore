@@ -105,6 +105,101 @@ def _catalog_operation_ids(catalog: CapabilityCatalogV1) -> frozenset[str]:
     )
 
 
+class SchedulePort(Protocol):
+    """Read/propose surface of the trusted scheduler control plane.
+
+    Deliberately narrow: it exposes only the read view and the two proposal-only
+    entry points. Confirm/update/pause/cancel live on the trusted control plane
+    and are intentionally absent here, so the runtime can never reach them
+    through the gateway. That split is what keeps scheduled turns read-only.
+    """
+
+    def list_view(self, user_id: str) -> Mapping[str, Any]: ...
+
+    def propose(
+        self, *, user_id: str, task_type: str, definition: Mapping[str, Any]
+    ) -> Mapping[str, Any]: ...
+
+    def cancel_propose(
+        self, *, user_id: str, schedule_id: str
+    ) -> Mapping[str, Any]: ...
+
+
+class _ScheduleListAdapter:
+    def __init__(self, port: SchedulePort) -> None:
+        self._port = port
+
+    def invoke(self, admitted: AdmittedCall) -> AdapterOutcome:
+        view = self._port.list_view(admitted.grant.sub)
+        return AdapterOutcome(
+            status="SUCCEEDED",
+            data=dict(view),
+            provenance_refs=("schedule:list",),
+        )
+
+
+class _ScheduleProposeAdapter:
+    """Returns a PENDING_APPROVAL proposal and never a live schedule."""
+
+    def __init__(self, port: SchedulePort) -> None:
+        self._port = port
+
+    def invoke(self, admitted: AdmittedCall) -> AdapterOutcome:
+        arguments = admitted.call.data["arguments"]
+        proposal = self._port.propose(
+            user_id=admitted.grant.sub,
+            task_type=arguments["taskType"],
+            definition=arguments["definition"],
+        )
+        return self._proposal_outcome(admitted, proposal)
+
+    @staticmethod
+    def _proposal_outcome(
+        admitted: AdmittedCall, proposal: Mapping[str, Any]
+    ) -> AdapterOutcome:
+        proposal_ref = proposal.get("proposalRef")
+        expires_at = proposal.get("expiresAt")
+        # The proposal binds the exact originating call arguments; a proposal
+        # can only be prepared, never dispatched.
+        data = {
+            "proposalRef": proposal_ref,
+            "argsHash": admitted.call.args_hash,
+            "expiresAt": expires_at,
+        }
+        return AdapterOutcome(
+            status="PENDING_APPROVAL",
+            data=data,
+            proposal_ref=proposal_ref,
+        )
+
+
+class _ScheduleCancelProposeAdapter(_ScheduleProposeAdapter):
+    def invoke(self, admitted: AdmittedCall) -> AdapterOutcome:
+        arguments = admitted.call.data["arguments"]
+        proposal = self._port.cancel_propose(
+            user_id=admitted.grant.sub,
+            schedule_id=arguments["scheduleId"],
+        )
+        return self._proposal_outcome(admitted, proposal)
+
+
+def build_schedule_adapters(port: SchedulePort) -> dict[str, CapabilityAdapter]:
+    """Bind the three schedule read/propose operations to the trusted port.
+
+    Only schedule.list (read-only), schedule.propose, and
+    schedule.cancel.propose (both proposal-only) are bound. Every dispatch-class
+    operation stays ADAPTER_DISABLED, and confirm/update/pause/cancel are not
+    catalog operations at all, so the runtime cannot reach a live schedule
+    mutation through the gateway.
+    """
+
+    return {
+        "schedule.list": _ScheduleListAdapter(port),
+        "schedule.propose": _ScheduleProposeAdapter(port),
+        "schedule.cancel.propose": _ScheduleCancelProposeAdapter(port),
+    }
+
+
 class CapabilityGateway:
     """Admit, replay-protect, and dispatch one exact catalog operation."""
 
@@ -373,5 +468,7 @@ __all__ = [
     "WEB_READ_OPERATION_ID",
     "build_web_read_adapter",
     "ConnectorPlaneRegistry",
+    "SchedulePort",
+    "build_schedule_adapters",
     "lambda_handler",
 ]

@@ -678,7 +678,14 @@ class RuntimeDriver:
             raise RuntimeInvocationUncertain("runtime lease heartbeat was lost") from failure[0]
         return result
 
-    def invoke(self, user_id: str, request: Mapping, trace_id: str) -> dict:
+    def invoke(
+        self,
+        user_id: str,
+        request: Mapping,
+        trace_id: str,
+        *,
+        scheduled_read_only: bool = False,
+    ) -> dict:
         user_id = canonical_user_id(user_id)
         trace_id = self._trace(trace_id)
         request = self._validated_request(user_id, request)
@@ -690,6 +697,11 @@ class RuntimeDriver:
             **({"channel": request["channel"]} if "channel" in request else {}),
             "message": request["message"],
             "invocationId": trace_id,
+            # A scheduled turn is confined to read/propose. This is a trusted,
+            # server-set authority marker in the payload the runtime enforces —
+            # NOT a caller-controlled request field — so the turn's capability
+            # grant can never dispatch a connector/browser effect.
+            **({"externalEffects": False} if scheduled_read_only else {}),
         }
         # Reject oversized caller content before acquiring durable execution
         # authority, reserving the broker token's full bounded size.
