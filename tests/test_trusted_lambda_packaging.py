@@ -361,7 +361,7 @@ def test_build_executes_only_the_immutable_lambda_313_arm64_boundary(
         record
         for record in records
         if record["argv"][:1] == ["run"]
-        and '"ID=amzn"' in " ".join(str(value) for value in record["argv"])
+        and "os_fields" in " ".join(str(value) for value in record["argv"])
     )
     assert "--platform" in platform_probe["argv"]
     assert platform_probe["argv"][platform_probe["argv"].index("--platform") + 1] == (
@@ -369,7 +369,9 @@ def test_build_executes_only_the_immutable_lambda_313_arm64_boundary(
     )
     probe_program = " ".join(str(value) for value in platform_probe["argv"])
     assert "sys.version_info[:2] == (3, 13)" in probe_program
-    assert '"ID=amzn"' in probe_program
+    assert 'os_fields.get("ID") == "amzn"' in probe_program
+    assert 'os_fields.get("VERSION_ID") == "2023"' in probe_program
+    assert ".strip(chr(34))" in probe_program
 
 
 def test_container_commands_do_not_forward_credentials_or_invoke_deploy(
