@@ -201,12 +201,16 @@ class FakeRepository:
         self.trace.append("user")
         return self.user if user_id == self.user.get("userId") else None
 
-    def strong_read_session(self, session_id: str):
+    def strong_read_session(self, user_id: str, session_id: str):
         self.trace.append("session")
         return self.session if session_id == self.session.get("sessionId") else None
 
     def strong_read_runtime(
-        self, runtime_arn: str, runtime_qualifier: str, session_id: str
+        self,
+        user_id: str,
+        runtime_arn: str,
+        runtime_qualifier: str,
+        session_id: str,
     ):
         self.trace.append("runtime")
         if runtime_arn == self.runtime.get(
@@ -230,13 +234,13 @@ class FakeRepository:
             return None
         return self.installations.get(pack_id)
 
-    def strong_read_target_grant(self, tenant_binding: str, target_hash: str):
+    def strong_read_target_grant(self, user_id: str, target_hash: str):
         self.trace.append("target")
         return self.targets.get(target_hash)
 
     def claim_target_use(
         self,
-        tenant_binding: str,
+        user_id: str,
         target_hash: str,
         current_request_id: str,
         call_id: str,

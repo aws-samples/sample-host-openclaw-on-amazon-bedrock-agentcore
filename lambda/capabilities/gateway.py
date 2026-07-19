@@ -262,6 +262,7 @@ class CapabilityGateway:
                 pack_id=admitted.pack_id,
                 pack_max_calls=admitted.pack["quotaPolicy"]["maxCallsPerTurn"],
                 retry_mode=admitted.retry_mode,
+                retention_max_days=admitted.pack["retentionPolicy"]["maxDays"],
             )
         except LedgerDenied as error:
             return _denied(validated_call, error.code)

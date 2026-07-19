@@ -6,6 +6,10 @@ import json
 import pytest
 
 from capabilities.schedule_port import DynamoScheduleCapabilityPort
+from capabilities.retention import (
+    derive_deletion_subject_binding,
+    subject_partition_key,
+)
 from scheduler.models import build_schedule_spec
 
 
@@ -76,9 +80,12 @@ class MemorySchedulerClient:
         }
 
     def seed_delivery(self, *, user_id="user_alpha", invocation_id="invocation_12345678"):
-        self.items[(f"TURN#{invocation_id}", "DELIVERY")] = {
-            "PK": {"S": f"TURN#{invocation_id}"},
-            "SK": {"S": "DELIVERY"},
+        binding = derive_deletion_subject_binding(user_id)
+        key = (subject_partition_key(user_id), f"DELIVERY#{invocation_id}")
+        self.items[key] = {
+            "PK": {"S": key[0]},
+            "SK": {"S": key[1]},
+            "ownerBinding": {"S": binding},
             "recordJson": {
                 "S": json.dumps(
                     {
@@ -93,6 +100,7 @@ class MemorySchedulerClient:
                     separators=(",", ":"),
                 )
             },
+            "ttl": {"N": str(NOW + 300)},
             "version": {"N": "1"},
         }
 
@@ -174,6 +182,10 @@ def test_proposals_are_durable_bounded_and_never_dispatch_a_live_schedule():
     assert record["deliveryTarget"] == {
         "actorId": "telegram:1",
         "chatId": "1",
+    }
+    assert client.get_calls[0]["Key"] == {
+        "PK": {"S": subject_partition_key("user_alpha")},
+        "SK": {"S": "DELIVERY#invocation_12345678"},
     }
     assert client.put_calls[0]["ConditionExpression"] == (
         "attribute_not_exists(PK) AND attribute_not_exists(SK)"

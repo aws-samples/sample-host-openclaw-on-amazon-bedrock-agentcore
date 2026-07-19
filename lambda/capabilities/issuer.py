@@ -15,6 +15,13 @@ from .target_grants import (
 
 
 class TurnAuthorityRepository(Protocol):
+    def strong_read_enabled_pack_ids(
+        self,
+        *,
+        user_id: str,
+        issued_at: int,
+    ) -> Sequence[str]: ...
+
     def prepare_turn(
         self,
         *,
@@ -91,11 +98,28 @@ class TurnCapabilityIssuer:
         now = self._clock()
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:
             raise RuntimeError("turn issuer clock is invalid")
+        enabled_pack_ids = self._repository.strong_read_enabled_pack_ids(
+            user_id=user_id,
+            issued_at=now,
+        )
+        if (
+            isinstance(enabled_pack_ids, (str, bytes))
+            or not isinstance(enabled_pack_ids, Sequence)
+            or any(not isinstance(pack_id, str) for pack_id in enabled_pack_ids)
+            or list(enabled_pack_ids) != sorted(set(enabled_pack_ids))
+        ):
+            raise RuntimeError("turn installation authority is invalid")
+        catalog_pack_ids = {pack["packId"] for pack in self._catalog.packs}
+        if not set(enabled_pack_ids).issubset(catalog_pack_ids):
+            raise RuntimeError("turn installation authority differs from catalog")
         packs = [
             pack
             for pack in self._catalog.packs
-            if not scheduled_read_only or _scheduled_allowed(pack)
+            if pack["packId"] in enabled_pack_ids
+            and (not scheduled_read_only or _scheduled_allowed(pack))
         ]
+        if not packs:
+            raise RuntimeError("turn has no enabled capability installation")
         operations = sorted(pack["operations"][0]["operationId"] for pack in packs)
         pack_ids = sorted(pack["packId"] for pack in packs)
         targets = derive_target_grants(

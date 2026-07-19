@@ -66,10 +66,16 @@ class AdmissionRepository(Protocol):
 
     def strong_read_user(self, user_id: str) -> Mapping[str, Any] | None: ...
 
-    def strong_read_session(self, session_id: str) -> Mapping[str, Any] | None: ...
+    def strong_read_session(
+        self, user_id: str, session_id: str
+    ) -> Mapping[str, Any] | None: ...
 
     def strong_read_runtime(
-        self, runtime_arn: str, runtime_qualifier: str, session_id: str
+        self,
+        user_id: str,
+        runtime_arn: str,
+        runtime_qualifier: str,
+        session_id: str,
     ) -> Mapping[str, Any] | None: ...
 
     def strong_read_turn_grant(
@@ -81,12 +87,12 @@ class AdmissionRepository(Protocol):
     ) -> CapabilityInstallationV1 | Mapping[str, Any] | None: ...
 
     def strong_read_target_grant(
-        self, tenant_binding: str, target_hash: str
+        self, user_id: str, target_hash: str
     ) -> LiveTargetGrant | None: ...
 
     def claim_target_use(
         self,
-        tenant_binding: str,
+        user_id: str,
         target_hash: str,
         current_request_id: str,
         call_id: str,
@@ -253,7 +259,11 @@ class AdmissionGate:
             _deny("DELETION_FENCE")
 
         session = _exact_record(
-            self._strong(self._repository.strong_read_session, grant.session_id),
+            self._strong(
+                self._repository.strong_read_session,
+                grant.sub,
+                grant.session_id,
+            ),
             frozenset(
                 {
                     "sessionId",
@@ -279,6 +289,7 @@ class AdmissionGate:
         runtime = _exact_record(
             self._strong(
                 self._repository.strong_read_runtime,
+                grant.sub,
                 grant.runtime_arn,
                 grant.runtime_qualifier,
                 grant.session_id,
@@ -361,7 +372,7 @@ class AdmissionGate:
         for target_hash in grant.target_grant_hashes:
             live = self._strong(
                 self._repository.strong_read_target_grant,
-                tenant_binding,
+                grant.sub,
                 target_hash,
             )
             if live is None:
@@ -397,10 +408,9 @@ class AdmissionGate:
         if admitted.target is None:
             return
         target_hash = admitted.target.grant.target_hash
-        tenant_binding = derive_target_tenant_binding(admitted.grant.sub)
         claimed = self._strong(
             self._repository.claim_target_use,
-            tenant_binding,
+            admitted.grant.sub,
             target_hash,
             admitted.grant.invocation_id,
             admitted.call.call_id,

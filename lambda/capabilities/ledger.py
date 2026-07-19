@@ -45,6 +45,7 @@ class CapabilityLedger(Protocol):
         pack_id: str,
         pack_max_calls: int,
         retry_mode: str,
+        retention_max_days: int = 0,
     ) -> LedgerClaim: ...
 
     def complete(
@@ -135,6 +136,7 @@ class InMemoryCapabilityLedger:
         pack_id: str,
         pack_max_calls: int,
         retry_mode: str,
+        retention_max_days: int = 0,
     ) -> LedgerClaim:
         if not isinstance(call, CapabilityCallV1) or not isinstance(
             grant, TurnCapabilityGrantV1
@@ -150,6 +152,12 @@ class InMemoryCapabilityLedger:
             raise TypeError("ledger pack budget is invalid")
         if retry_mode not in {"READ_ONLY", "IDEMPOTENT", "DEDUPE_KEY_REQUIRED"}:
             raise TypeError("ledger retry mode is invalid")
+        if (
+            isinstance(retention_max_days, bool)
+            or not isinstance(retention_max_days, int)
+            or not 0 <= retention_max_days <= 365
+        ):
+            raise TypeError("ledger retention policy is invalid")
 
         tenant_binding = derive_tenant_binding(grant)
         grant_binding = canonical_sha256(grant.to_mapping())

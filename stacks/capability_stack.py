@@ -81,6 +81,7 @@ class CapabilityStack(Stack):
                 type=dynamodb.AttributeType.STRING,
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="ttl",
             encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
             encryption_key=encryption_key,
             point_in_time_recovery_specification=(

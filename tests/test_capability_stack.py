@@ -164,6 +164,10 @@ def test_gateway_role_has_only_exact_logs_dynamo_and_kms_authority():
             "SSEType": "KMS",
         },
         "TableName": TABLE_NAME,
+        "TimeToLiveSpecification": {
+            "AttributeName": "ttl",
+            "Enabled": True,
+        },
     }
     assert tables[0]["DeletionPolicy"] == "Retain"
     assert tables[0]["UpdateReplacePolicy"] == "Retain"

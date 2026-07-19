@@ -30,8 +30,16 @@ from botocore.exceptions import ClientError
 import pytest
 
 from capabilities.catalog import compile_catalog
-from capabilities.contracts import CapabilityInstallationV1
-from capabilities.contracts import TurnCapabilityGrantV1
+from capabilities.contracts import (
+    CapabilityInstallationV1,
+    TurnCapabilityGrantV1,
+    canonical_sha256,
+)
+from capabilities.retention import (
+    DELETION_FENCE_SCHEMA,
+    derive_deletion_subject_binding,
+    subject_partition_key,
+)
 from capabilities.test_gateway import (
     CALLER_ARN,
     NOW,
@@ -80,7 +88,24 @@ class MemoryDynamoClient:
 
     def query(self, **kwargs):
         self.query_calls.append(deepcopy(kwargs))
-        return {"Items": []}
+        values = _deserialize(kwargs.get("ExpressionAttributeValues", {}))
+        partition = values.get(":pk")
+        if partition is None:
+            return {"Items": []}
+        matching = [
+            deepcopy(item)
+            for (pk, _), item in sorted(self.items.items())
+            if pk == partition
+        ]
+        limit = kwargs.get("Limit", len(matching))
+        page = matching[:limit]
+        response = {"Items": [_serialize(item) for item in page]}
+        if len(matching) > len(page):
+            last = page[-1]
+            response["LastEvaluatedKey"] = _serialize(
+                {"PK": last["PK"], "SK": last["SK"]}
+            )
+        return response
 
     def put_item(self, **kwargs):
         item = _deserialize(kwargs["Item"])
@@ -149,6 +174,22 @@ class MemoryDynamoClient:
                         "TransactWriteItems",
                     )
                 candidate[key] = self._apply_update(current, action)
+            elif kind == "ConditionCheck":
+                key = self._key(action["Key"])
+                if not self._condition_matches(candidate.get(key), action):
+                    raise ClientError(
+                        {"Error": {"Code": "TransactionCanceledException"}},
+                        "TransactWriteItems",
+                    )
+            elif kind == "Delete":
+                key = self._key(action["Key"])
+                current = candidate.get(key)
+                if not self._condition_matches(current, action):
+                    raise ClientError(
+                        {"Error": {"Code": "TransactionCanceledException"}},
+                        "TransactWriteItems",
+                    )
+                del candidate[key]
             else:  # pragma: no cover - production emits only reviewed actions
                 raise AssertionError(kind)
         self.items = candidate
@@ -197,11 +238,37 @@ def _seed_installation(client: MemoryDynamoClient, catalog, pack_id: str) -> Non
             "killSwitch": False,
         }
     )
+    binding = derive_deletion_subject_binding("user_alpha")
+    _seed_live_fence(client, "user_alpha")
     client.put(
-        "USER#user_alpha",
-        f"INSTALL#{pack_id}",
+        subject_partition_key("user_alpha"),
+        f"AUTHORITY#INSTALL#{pack_id}",
+        ownerBinding=binding,
         recordJson=json.dumps(
             installation.to_mapping(), sort_keys=True, separators=(",", ":")
+        ),
+        ttl=NOW + 90 * 24 * 60 * 60,
+        version=1,
+    )
+
+
+def _seed_live_fence(client: MemoryDynamoClient, user_id: str) -> None:
+    binding = derive_deletion_subject_binding(user_id)
+    key = (subject_partition_key(user_id), "DELETION")
+    if key in client.items:
+        return
+    client.put(
+        key[0],
+        key[1],
+        ownerBinding=binding,
+        recordJson=json.dumps(
+            {
+                "schema": DELETION_FENCE_SCHEMA,
+                "enabled": False,
+                "subjectBinding": binding,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
         ),
         version=1,
     )
@@ -212,17 +279,29 @@ def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
     session_id = "session_12345678"
     runtime_arn = "arn:aws:bedrock-agentcore:eu-west-1:000000000000:runtime/example"
     runtime_qualifier = f"release_{RELEASE_COMMIT}"
+    binding = derive_deletion_subject_binding(user_id)
+    subject_pk = subject_partition_key(user_id)
+    ephemeral_ttl = NOW + 300
     records = [
-        ("CONTROL", "GLOBAL", {"enabled": False}),
-        (f"USER#{user_id}", "DELETION", {"enabled": False}),
         (
-            f"USER#{user_id}",
-            "PROFILE",
-            {"userId": user_id, "state": "ACTIVE", "deletionFence": False},
+            subject_pk,
+            "DELETION",
+            {
+                "schema": DELETION_FENCE_SCHEMA,
+                "enabled": False,
+                "subjectBinding": binding,
+            },
+            None,
         ),
         (
+            subject_pk,
+            "AUTHORITY#PROFILE",
+            {"userId": user_id, "state": "ACTIVE", "deletionFence": False},
+            NOW + 90 * 24 * 60 * 60,
+        ),
+        (
+            subject_pk,
             f"SESSION#{session_id}",
-            "PROFILE",
             {
                 "sessionId": session_id,
                 "userId": user_id,
@@ -230,10 +309,18 @@ def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
                 "runtimeQualifier": runtime_qualifier,
                 "state": "ACTIVE",
             },
+            ephemeral_ttl,
         ),
         (
-            f"RUNTIME#{runtime_arn}",
-            f"{runtime_qualifier}#SESSION#{session_id}",
+            subject_pk,
+            "RUNTIME#"
+            + canonical_sha256(
+                {
+                    "runtimeArn": runtime_arn,
+                    "runtimeQualifier": runtime_qualifier,
+                    "sessionId": session_id,
+                }
+            ),
             {
                 "runtimeArn": runtime_arn,
                 "runtimeQualifier": runtime_qualifier,
@@ -243,34 +330,54 @@ def _seed_authority(client: MemoryDynamoClient, catalog) -> None:
                 "catalogDigest": catalog.catalog_digest,
                 "state": "READY",
             },
+            ephemeral_ttl,
         ),
     ]
-    for pk, sk, payload in records:
+    client.put(
+        "CONTROL",
+        "GLOBAL",
+        recordJson='{"enabled":false}',
+        version=1,
+    )
+    for pk, sk, payload, ttl in records:
+        values = {
+            "ownerBinding": binding,
+            "recordJson": json.dumps(
+                payload, sort_keys=True, separators=(",", ":")
+            ),
+            "version": 1,
+        }
+        if ttl is not None:
+            values["ttl"] = ttl
         client.put(
             pk,
             sk,
-            recordJson=json.dumps(payload, sort_keys=True, separators=(",", ":")),
-            version=1,
+            **values,
         )
     issued_grant = _turn_grant(catalog)
     client.put(
-        f"USER#{user_id}",
+        subject_pk,
         f"TURN#{issued_grant['invocationId']}",
+        ownerBinding=binding,
         recordJson=json.dumps(
             issued_grant,
             sort_keys=True,
             separators=(",", ":"),
         ),
+        ttl=issued_grant["exp"],
         version=1,
     )
     _seed_installation(client, catalog, "schedule.list")
 
 
 def _seed_turn_authority(client: MemoryDynamoClient, grant) -> None:
+    binding = derive_deletion_subject_binding(grant["sub"])
     client.put(
-        f"USER#{grant['sub']}",
+        subject_partition_key(grant["sub"]),
         f"TURN#{grant['invocationId']}",
+        ownerBinding=binding,
         recordJson=json.dumps(grant, sort_keys=True, separators=(",", ":")),
+        ttl=grant["exp"],
         version=1,
     )
 
@@ -345,7 +452,7 @@ def _web_success():
 
 def _target_record(client, target):
     item = client.items[
-        (f"TENANT#{target.tenant_binding}", f"TARGET#{target.target_hash}")
+        (subject_partition_key("user_alpha"), f"TARGET#{target.target_hash}")
     ]
     return json.loads(item["recordJson"])
 
@@ -354,7 +461,8 @@ def _turn_record(client):
     return next(
         item
         for (pk, sk), item in client.items.items()
-        if pk.startswith("TENANT#") and sk == "TURN#invocation_12345678"
+        if pk == subject_partition_key("user_alpha")
+        and sk == "LEDGER#TURN#invocation_12345678"
     )
 
 
@@ -663,7 +771,7 @@ def test_durable_target_rows_are_partitioned_by_the_grants_tenant_binding():
     target = _seed_web_target(client, catalog)
 
     assert (
-        f"TENANT#{target.tenant_binding}",
+        subject_partition_key("user_alpha"),
         f"TARGET#{target.target_hash}",
     ) in client.items
     assert (f"TARGET#{target.target_hash}", "GRANT") not in client.items
@@ -671,7 +779,6 @@ def test_durable_target_rows_are_partitioned_by_the_grants_tenant_binding():
 
 def test_durable_target_persistence_claim_and_cached_recovery_keep_exact_bindings():
     from capabilities.admission import AdmissionDenied
-    from capabilities.contracts import derive_target_tenant_binding
     from capabilities.durable import DynamoAdmissionRepository
 
     client = MemoryDynamoClient()
@@ -680,6 +787,7 @@ def test_durable_target_persistence_claim_and_cached_recovery_keep_exact_binding
         table_name="capability-state",
     )
     target = _target_grant(max_uses=1)
+    _seed_live_fence(client, "user_alpha")
 
     assert callable(getattr(repository, "persist_target_grants", None))
     repository.persist_target_grants(
@@ -693,9 +801,8 @@ def test_durable_target_persistence_claim_and_cached_recovery_keep_exact_binding
         grants=[target],
     )
 
-    tenant_binding = derive_target_tenant_binding("user_alpha")
     recovered = repository.strong_read_target_grant(
-        tenant_binding,
+        "user_alpha",
         target.target_hash,
     )
     assert recovered is not None
@@ -718,27 +825,27 @@ def test_durable_target_persistence_claim_and_cached_recovery_keep_exact_binding
     call_id = "call_" + "a" * 64
     with pytest.raises(AdmissionDenied) as request_mismatch:
         repository.claim_target_use(
-            tenant_binding,
+            "user_alpha",
             target.target_hash,
             "invocation_other_1234",
             call_id,
         )
     assert request_mismatch.value.code == "TARGET_GRANT_REQUEST_MISMATCH"
     assert repository.claim_target_use(
-        derive_target_tenant_binding("user_beta"),
+        "user_beta",
         target.target_hash,
         "invocation_12345678",
         call_id,
     ) is False
     assert repository.claim_target_use(
-        tenant_binding,
+        "user_alpha",
         target.target_hash,
         "invocation_12345678",
         call_id,
     ) is True
     update_count = len(client.update_calls)
     assert repository.claim_target_use(
-        tenant_binding,
+        "user_alpha",
         target.target_hash,
         "invocation_12345678",
         call_id,
@@ -746,20 +853,20 @@ def test_durable_target_persistence_claim_and_cached_recovery_keep_exact_binding
     assert len(client.update_calls) == update_count
 
     claimed = repository.strong_read_target_grant(
-        tenant_binding,
+        "user_alpha",
         target.target_hash,
     )
     assert claimed is not None
     assert claimed.uses == 1
     assert claimed.claimed_call_ids == (call_id,)
     target_key = (
-        f"TENANT#{tenant_binding}",
+        subject_partition_key("user_alpha"),
         f"TARGET#{target.target_hash}",
     )
     client.items[target_key]["unexpected"] = "must fail closed"
     with pytest.raises(RuntimeError, match="unexpected fields"):
         repository.claim_target_use(
-            tenant_binding,
+            "user_alpha",
             target.target_hash,
             "invocation_12345678",
             call_id,
@@ -775,7 +882,6 @@ def test_durable_target_persistence_claim_and_cached_recovery_keep_exact_binding
 
 def test_durable_cached_target_row_rejects_a_cross_tenant_partition_copy():
     from capabilities.admission import AdmissionDenied
-    from capabilities.contracts import derive_target_tenant_binding
     from capabilities.durable import DynamoAdmissionRepository
 
     catalog = _catalog()
@@ -785,15 +891,17 @@ def test_durable_cached_target_row_rejects_a_cross_tenant_partition_copy():
         client=client,
         table_name="capability-state",
     )
-    tenant_a = derive_target_tenant_binding("user_alpha")
-    tenant_b = derive_target_tenant_binding("user_beta")
-    source_key = (f"TENANT#{tenant_a}", f"TARGET#{target.target_hash}")
+    source_key = (
+        subject_partition_key("user_alpha"),
+        f"TARGET#{target.target_hash}",
+    )
     copied = deepcopy(client.items[source_key])
-    copied["PK"] = f"TENANT#{tenant_b}"
+    copied["PK"] = subject_partition_key("user_beta")
+    copied["ownerBinding"] = derive_deletion_subject_binding("user_beta")
     client.items[(copied["PK"], copied["SK"])] = copied
 
     with pytest.raises(AdmissionDenied) as mismatch:
-        repository.strong_read_target_grant(tenant_b, target.target_hash)
+        repository.strong_read_target_grant("user_beta", target.target_hash)
 
     assert mismatch.value.code == "TARGET_GRANT_TENANT_MISMATCH"
 
@@ -887,6 +995,8 @@ def test_durable_ledger_isolates_tenants_fences_mutations_and_caps_read_retry():
 
     catalog = _catalog()
     client = MemoryDynamoClient()
+    _seed_live_fence(client, "user_alpha")
+    _seed_live_fence(client, "user_beta")
     ledger = DynamoCapabilityLedger(client=client, table_name="capability-state")
     grant_alpha = TurnCapabilityGrantV1.from_mapping(_turn_grant(catalog))
     grant_beta = TurnCapabilityGrantV1.from_mapping(
@@ -991,3 +1101,56 @@ def test_durable_ledger_isolates_tenants_fences_mutations_and_caps_read_retry():
     ledger.complete(call=read, grant=grant_alpha, result=retryable)
     assert ledger.begin(**begin_args).disposition is LedgerDisposition.RETRY_EXHAUSTED
     assert all(call["ConsistentRead"] is True for call in client.get_calls)
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "pack_id", "retry_mode", "retention_days"),
+    [
+        ("web.exact.read", "web.exact-read", "READ_ONLY", 0),
+        ("schedule.list", "schedule.list", "READ_ONLY", 90),
+    ],
+)
+def test_durable_ledger_rows_are_hashed_owned_and_catalog_ttl_bounded(
+    operation_id,
+    pack_id,
+    retry_mode,
+    retention_days,
+):
+    from capabilities.durable import DynamoCapabilityLedger
+
+    catalog = _catalog()
+    client = MemoryDynamoClient()
+    _seed_authority(client, catalog)
+    call = _call(
+        catalog,
+        operation_id,
+        {"url": "https://example.com/exact"}
+        if operation_id == "web.exact.read"
+        else {},
+    )
+    grant = TurnCapabilityGrantV1.from_mapping(_turn_grant(catalog))
+    ledger = DynamoCapabilityLedger(client=client, table_name="capability-state")
+
+    ledger.begin(
+        call=call,
+        grant=grant,
+        pack_id=pack_id,
+        pack_max_calls=8,
+        retry_mode=retry_mode,
+        retention_max_days=retention_days,
+    )
+
+    binding = derive_deletion_subject_binding("user_alpha")
+    pk = subject_partition_key("user_alpha")
+    ledger_rows = [
+        item
+        for (item_pk, sk), item in client.items.items()
+        if item_pk == pk and sk.startswith("LEDGER#")
+    ]
+    assert len(ledger_rows) == 4
+    assert all(row["ownerBinding"] == binding for row in ledger_rows)
+    expected_ttl = (
+        grant.exp if retention_days == 0 else grant.iat + retention_days * 86400
+    )
+    assert all(row["ttl"] == expected_ttl for row in ledger_rows)
+    assert not any(item_pk.startswith("TENANT#") for item_pk, _ in client.items)

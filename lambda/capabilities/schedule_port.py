@@ -16,6 +16,7 @@ from scheduler.proposals import (
 )
 
 from .contracts import ScheduleSpecV1, canonical_json_bytes
+from .retention import derive_deletion_subject_binding, subject_partition_key
 
 
 _TABLE = re.compile(r"[A-Za-z0-9_.-]{3,255}")
@@ -85,7 +86,9 @@ class DynamoScheduleCapabilityPort:
             raise RuntimeError("schedule capability clock is invalid")
         return value
 
-    def _delivery(self, user_id: str, invocation_id: str) -> Mapping[str, str]:
+    def _delivery(
+        self, user_id: str, invocation_id: str, now: int
+    ) -> Mapping[str, str]:
         if (
             not isinstance(invocation_id, str)
             or _INVOCATION.fullmatch(invocation_id) is None
@@ -94,8 +97,8 @@ class DynamoScheduleCapabilityPort:
         response = self._client.get_item(
             TableName=self._authority_table_name,
             Key={
-                "PK": {"S": f"TURN#{invocation_id}"},
-                "SK": {"S": "DELIVERY"},
+                "PK": {"S": subject_partition_key(user_id)},
+                "SK": {"S": f"DELIVERY#{invocation_id}"},
             },
             ConsistentRead=True,
         )
@@ -103,16 +106,30 @@ class DynamoScheduleCapabilityPort:
         if not isinstance(raw, Mapping) or set(raw) != {
             "PK",
             "SK",
+            "ownerBinding",
             "recordJson",
+            "ttl",
             "version",
         }:
             raise RuntimeError("schedule proposal delivery context is unavailable")
         if (
-            _string_attribute(raw, "PK") != f"TURN#{invocation_id}"
-            or _string_attribute(raw, "SK") != "DELIVERY"
+            _string_attribute(raw, "PK") != subject_partition_key(user_id)
+            or _string_attribute(raw, "SK") != f"DELIVERY#{invocation_id}"
+            or _string_attribute(raw, "ownerBinding")
+            != derive_deletion_subject_binding(user_id)
             or raw.get("version") != {"N": "1"}
+            or raw.get("ttl") is None
         ):
             raise RuntimeError("schedule proposal delivery context is invalid")
+        ttl = raw["ttl"]
+        if (
+            not isinstance(ttl, Mapping)
+            or set(ttl) != {"N"}
+            or not isinstance(ttl.get("N"), str)
+            or not ttl["N"].isdigit()
+            or int(ttl["N"]) <= now
+        ):
+            raise RuntimeError("schedule proposal delivery context is expired")
         try:
             record = json.loads(_string_attribute(raw, "recordJson"))
         except (TypeError, ValueError):
@@ -288,8 +305,8 @@ class DynamoScheduleCapabilityPort:
         definition: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         user_id = self._user(user_id)
-        delivery = self._delivery(user_id, invocation_id)
         now = self._now()
+        delivery = self._delivery(user_id, invocation_id, now)
         return self._put_proposal(
             build_create_schedule_proposal(
                 catalog_digest=self._catalog_digest,
@@ -314,8 +331,8 @@ class DynamoScheduleCapabilityPort:
         spec = self._read_schedule(schedule_id)
         if spec is None or spec.user_id != user_id:
             raise RuntimeError("schedule is unavailable for cancellation")
-        delivery = self._delivery(user_id, invocation_id)
         now = self._now()
+        delivery = self._delivery(user_id, invocation_id, now)
         return self._put_proposal(
             build_cancel_schedule_proposal(
                 catalog_digest=self._catalog_digest,
