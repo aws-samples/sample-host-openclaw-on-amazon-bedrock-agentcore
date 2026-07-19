@@ -9,7 +9,9 @@ credential-provider chain must fail closed while a pure compute job completes.
 from __future__ import annotations
 
 import _socket
+import os
 import socket
+import subprocess
 
 import pytest
 
@@ -21,6 +23,7 @@ LOOPBACK = "127.0.0.1"
 
 
 def test_dns_resolution_is_blocked_but_pure_job_completes():
+    original_getaddrinfo = socket.getaddrinfo
     completed = {}
     with runner.networkless_namespace():
         with pytest.raises(runner.NetworklessViolation):
@@ -29,7 +32,7 @@ def test_dns_resolution_is_blocked_but_pure_job_completes():
         completed["value"] = sum(index * index for index in range(1000))
     assert completed["value"] == sum(index * index for index in range(1000))
     # The guard is fully removed once the namespace context exits.
-    assert socket.getaddrinfo is runner._ORIGINAL_GETADDRINFO
+    assert socket.getaddrinfo is original_getaddrinfo
 
 
 @pytest.mark.parametrize(
@@ -60,50 +63,56 @@ def test_alternate_dns_resolvers_cannot_bypass_the_fence(resolver, arguments):
 
 
 def test_outbound_internet_tcp_connect_is_refused():
-    with runner.networkless_namespace():
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        with pytest.raises(runner.NetworklessViolation):
-            client.connect(("93.184.216.34", 443))
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        with runner.networkless_namespace():
+            with pytest.raises(runner.NetworklessViolation):
+                client.connect(("93.184.216.34", 443))
+    finally:
+        client.close()
 
 
 def test_vpc_endpoint_connect_is_refused():
-    with runner.networkless_namespace():
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        with pytest.raises(runner.NetworklessViolation):
-            client.connect((VPC_ENDPOINT, 443))
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        with runner.networkless_namespace():
+            with pytest.raises(runner.NetworklessViolation):
+                client.connect((VPC_ENDPOINT, 443))
+    finally:
+        client.close()
 
 
 def test_connect_ex_cannot_bypass_the_stream_connect_fence():
-    with runner.networkless_namespace():
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        with runner.networkless_namespace():
             with pytest.raises(runner.NetworklessViolation):
                 client.connect_ex((LOOPBACK, 9))
-        finally:
-            client.close()
+    finally:
+        client.close()
 
 
 def test_udp_sendto_is_refused_without_resolving_a_hostname():
-    with runner.networkless_namespace():
-        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        with runner.networkless_namespace():
             with pytest.raises(runner.NetworklessViolation):
                 client.sendto(b"synthetic", (LOOPBACK, 9))
-        finally:
-            client.close()
+    finally:
+        client.close()
 
 
 @pytest.mark.skipif(
     not hasattr(socket.socket, "sendmsg"), reason="sendmsg is platform dependent"
 )
 def test_udp_sendmsg_is_refused_without_resolving_a_hostname():
-    with runner.networkless_namespace():
-        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        with runner.networkless_namespace():
             with pytest.raises(runner.NetworklessViolation):
                 client.sendmsg([b"synthetic"], [], 0, (LOOPBACK, 9))
-        finally:
-            client.close()
+    finally:
+        client.close()
 
 
 @pytest.mark.parametrize("method_name", ["send", "sendall"])
@@ -147,23 +156,22 @@ def test_raw_socket_constructors_are_refused_before_syscall(constructor):
             constructor()(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
 
 
-def test_low_level_socket_type_cannot_bypass_udp_write_fences():
+def test_low_level_socket_type_cannot_create_even_a_local_socket():
     with runner.networkless_namespace():
-        client = _socket.SocketType(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            with pytest.raises(runner.NetworklessViolation):
-                client.sendto(b"synthetic", (LOOPBACK, 9))
-        finally:
-            client.close()
+        with pytest.raises(runner.NetworklessViolation):
+            _socket.SocketType(socket.AF_UNIX, socket.SOCK_STREAM)
 
 
 def test_imds_endpoint_is_unreachable():
-    with runner.networkless_namespace():
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        with pytest.raises(runner.NetworklessViolation):
-            client.connect((IMDS_ADDRESS, 80))
-        with pytest.raises(runner.NetworklessViolation):
-            socket.create_connection((IMDS_ADDRESS, 80), timeout=1)
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        with runner.networkless_namespace():
+            with pytest.raises(runner.NetworklessViolation):
+                client.connect((IMDS_ADDRESS, 80))
+            with pytest.raises(runner.NetworklessViolation):
+                socket.create_connection((IMDS_ADDRESS, 80), timeout=1)
+    finally:
+        client.close()
 
 
 def test_boto3_credential_provider_chain_resolves_to_nothing():
@@ -173,19 +181,36 @@ def test_boto3_credential_provider_chain_resolves_to_nothing():
 
 
 def test_networkless_namespace_restores_socket_on_exception():
+    originals = {
+        "getaddrinfo": socket.getaddrinfo,
+        "socket": socket.socket,
+        "socket_type": socket.SocketType,
+        "low_socket": _socket.socket,
+        "low_socket_type": _socket.SocketType,
+        "connect": socket.socket.connect,
+        "connect_ex": socket.socket.connect_ex,
+        "send": socket.socket.send,
+        "sendall": socket.socket.sendall,
+        "sendto": socket.socket.sendto,
+        "sendfile": socket.socket.sendfile,
+        "sendmsg": getattr(socket.socket, "sendmsg", None),
+        "popen": subprocess.Popen,
+        "system": os.system,
+    }
     with pytest.raises(ValueError):
         with runner.networkless_namespace():
             raise ValueError("job body error")
-    assert socket.getaddrinfo is runner._ORIGINAL_GETADDRINFO
-    assert socket.socket is runner._ORIGINAL_SOCKET
-    assert socket.SocketType is runner._ORIGINAL_SOCKET_TYPE
-    assert _socket.socket is runner._ORIGINAL_LOW_LEVEL_SOCKET
-    assert _socket.SocketType is runner._ORIGINAL_LOW_LEVEL_SOCKET_TYPE
-    assert socket.socket.connect is runner._ORIGINAL_CONNECT
-    assert socket.socket.connect_ex is runner._ORIGINAL_CONNECT_EX
-    assert socket.socket.send is runner._ORIGINAL_SEND
-    assert socket.socket.sendall is runner._ORIGINAL_SENDALL
-    assert socket.socket.sendto is runner._ORIGINAL_SENDTO
-    assert socket.socket.sendfile is runner._ORIGINAL_SENDFILE
-    if runner._ORIGINAL_SENDMSG is not None:
-        assert socket.socket.sendmsg is runner._ORIGINAL_SENDMSG
+    assert socket.getaddrinfo is originals["getaddrinfo"]
+    assert socket.socket is originals["socket"]
+    assert socket.SocketType is originals["socket_type"]
+    assert _socket.socket is originals["low_socket"]
+    assert _socket.SocketType is originals["low_socket_type"]
+    assert socket.socket.connect is originals["connect"]
+    assert socket.socket.connect_ex is originals["connect_ex"]
+    assert socket.socket.send is originals["send"]
+    assert socket.socket.sendall is originals["sendall"]
+    assert socket.socket.sendto is originals["sendto"]
+    assert socket.socket.sendfile is originals["sendfile"]
+    assert getattr(socket.socket, "sendmsg", None) is originals["sendmsg"]
+    assert subprocess.Popen is originals["popen"]
+    assert os.system is originals["system"]

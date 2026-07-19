@@ -3,8 +3,9 @@
 The adapter contains no ambient AWS client and performs no import-time I/O.
 Production composition must inject a staging implementation and a launcher.
 Those seams are deliberately narrow enough to prove locally that exact input
-bytes, task definition, image digest, deadline, network mode, and fresh output
-namespace are checked before the existing importer can publish any output.
+bytes, task definition, image digest, deadline, zero-egress network binding,
+and fresh output namespace are checked before the existing importer can
+publish any output.
 
 Real object-store, ECS/Fargate, Docker, image-scan, and run evidence remain
 external gates. This module does not claim that those gates have run.
@@ -34,6 +35,38 @@ _TASK_DEFINITION = re.compile(
 )
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{7,127}")
+_SECURITY_GROUP_ID = re.compile(r"sg-[0-9a-f]{8,17}")
+_SUBNET_ID = re.compile(r"subnet-[0-9a-f]{8,17}")
+
+
+@dataclass(frozen=True, slots=True)
+class ComputeNetworkBinding:
+    """Exact awsvpc launch boundary for one zero-egress compute task."""
+
+    security_group_id: str
+    subnet_ids: tuple[str, ...]
+    assign_public_ip: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.security_group_id, str)
+            or _SECURITY_GROUP_ID.fullmatch(self.security_group_id) is None
+        ):
+            raise ValueError("compute security-group identity is invalid")
+        if (
+            not isinstance(self.subnet_ids, tuple)
+            or not self.subnet_ids
+            or len(self.subnet_ids) > 16
+            or len(set(self.subnet_ids)) != len(self.subnet_ids)
+            or any(
+                not isinstance(subnet_id, str)
+                or _SUBNET_ID.fullmatch(subnet_id) is None
+                for subnet_id in self.subnet_ids
+            )
+        ):
+            raise ValueError("compute subnet binding is invalid")
+        if self.assign_public_ip != "DISABLED":
+            raise ValueError("compute public-IP assignment must be disabled")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +94,7 @@ class LaunchReceipt:
     task_definition_arn: str
     image_digest: str
     output_namespace_id: str
+    network_binding: ComputeNetworkBinding
 
     def __post_init__(self) -> None:
         if _IDENTIFIER.fullmatch(self.task_ref) is None:
@@ -71,6 +105,8 @@ class LaunchReceipt:
             raise ValueError("image attestation is invalid")
         if _IDENTIFIER.fullmatch(self.output_namespace_id) is None:
             raise ValueError("output namespace attestation is invalid")
+        if not isinstance(self.network_binding, ComputeNetworkBinding):
+            raise TypeError("launch receipt network attestation is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +154,16 @@ class ComputeStaging(Protocol):
 
 
 class ExactTaskLauncher(Protocol):
-    def launch(self, **kwargs: Any) -> LaunchReceipt: ...
+    def launch(
+        self,
+        *,
+        task_definition_arn: str,
+        image_digest: str,
+        staged_job: StagedJob,
+        deadline: int,
+        network: str,
+        network_binding: ComputeNetworkBinding,
+    ) -> LaunchReceipt: ...
 
     def wait(self, task_ref: str, *, deadline: int) -> TaskCompletion: ...
 
@@ -135,18 +180,22 @@ class ProductionComputeRunner:
         launcher: ExactTaskLauncher,
         task_definition_arn: str,
         image_digest: str,
+        network_binding: ComputeNetworkBinding,
         clock: Callable[[], int],
     ) -> None:
         if _TASK_DEFINITION.fullmatch(task_definition_arn) is None:
             raise ValueError("production runner requires one exact task definition")
         if _IMAGE_DIGEST.fullmatch(image_digest) is None:
             raise ValueError("production runner requires one exact image digest")
+        if not isinstance(network_binding, ComputeNetworkBinding):
+            raise TypeError("production runner requires one exact network binding")
         if not callable(clock):
             raise TypeError("production runner requires a trusted clock")
         self._staging = staging
         self._launcher = launcher
         self._task_definition_arn = task_definition_arn
         self._image_digest = image_digest
+        self._network_binding = network_binding
         self._clock = clock
 
     def run(self, *, spec, output_dir: Path, input_dir: Path) -> RunnerResult:
@@ -188,10 +237,16 @@ class ProductionComputeRunner:
                 staged_job=staged_job,
                 deadline=spec.deadline,
                 network="NONE",
+                network_binding=self._network_binding,
             )
             if not isinstance(launch, LaunchReceipt):
                 return self._breach(
                     "FAILED", "COMPUTE_LAUNCH_ATTESTATION_MISMATCH", started_at
+                )
+            if launch.network_binding != self._network_binding:
+                self._launcher.terminate_tree(launch.task_ref)
+                return self._breach(
+                    "FAILED", "COMPUTE_LAUNCH_BINDING_MISMATCH", started_at
                 )
             if (
                 launch.task_definition_arn != self._task_definition_arn
@@ -356,6 +411,7 @@ class ProductionComputeRunner:
 
 
 __all__ = [
+    "ComputeNetworkBinding",
     "ComputeStaging",
     "ExactTaskLauncher",
     "LaunchReceipt",

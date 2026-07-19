@@ -21,8 +21,9 @@ FROM --platform=linux/arm64 gcr.io/distroless/python3-debian12@sha256:0000000000
 COPY lambda/compute /app/lambda/compute
 COPY compute/runner.py /app/compute/runner.py
 
-# Non-root, unprivileged runtime identity. The task definition additionally
-# enforces a read-only root filesystem and drops all Linux capabilities.
+# Non-root, unprivileged runtime identity. The synthesized task definition
+# additionally enforces a read-only root filesystem and drops all Linux
+# capabilities. Live exact-task evidence remains OPEN.
 USER 10001:10001
 
 WORKDIR /app

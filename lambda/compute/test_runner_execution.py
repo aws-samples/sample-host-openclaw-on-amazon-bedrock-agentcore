@@ -95,20 +95,141 @@ else:
     assert "network" in (output_dir / "network.txt").read_text().casefold()
 
 
-def test_timeout_kills_descendants_and_commits_no_candidate_output(tmp_path):
-    marker = tmp_path / "descendant-survived.txt"
-    script = f"""
+def test_bound_runner_refuses_fresh_child_interpreters(tmp_path):
+    script = """
 from pathlib import Path
 import subprocess
 import sys
+
+try:
+    subprocess.run(
+        [sys.executable, "-I", "-S", "-c", "raise SystemExit(0)"],
+        check=False,
+    )
+except Exception as error:
+    if type(error).__name__ != "NetworklessViolation":
+        raise AssertionError(type(error).__name__) from error
+    Path("process.txt").write_text(type(error).__name__, encoding="utf-8")
+else:
+    raise AssertionError("fresh child interpreter was allowed")
+"""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    result = runner.LocalProcessRunner(clock=lambda: NOW).run(
+        spec=_spec(script=script),
+        input_dir=tmp_path / "input",
+        output_dir=output_dir,
+    )
+
+    assert result.breach is None
+    assert (output_dir / "process.txt").read_text() == "NetworklessViolation"
+
+
+def test_bound_runner_refuses_low_level_posix_process_creation(tmp_path):
+    script = """
+from pathlib import Path
+import os
+import posix
+import sys
+
+try:
+    child = posix.posix_spawn(
+        sys.executable,
+        [sys.executable, "-I", "-S", "-c", "raise SystemExit(0)"],
+        {},
+    )
+except Exception as error:
+    if type(error).__name__ != "NetworklessViolation":
+        raise AssertionError(type(error).__name__) from error
+    Path("posix.txt").write_text(type(error).__name__, encoding="utf-8")
+else:
+    os.waitpid(child, 0)
+    raise AssertionError("low-level POSIX process creation was allowed")
+"""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    result = runner.LocalProcessRunner(clock=lambda: NOW).run(
+        spec=_spec(script=script),
+        input_dir=tmp_path / "input",
+        output_dir=output_dir,
+    )
+
+    assert result.breach is None
+    assert (output_dir / "posix.txt").read_text() == "NetworklessViolation"
+
+
+def test_bound_runner_refuses_local_sockets_and_descriptor_adoption(tmp_path):
+    script = """
+from pathlib import Path
+import socket
+
+attempts = {
+    "unix": lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM),
+    "socketpair": socket.socketpair,
+    "descriptor": lambda: socket.socket(fileno=1),
+}
+blocked = []
+for label, attempt in attempts.items():
+    try:
+        result = attempt()
+    except Exception as error:
+        if type(error).__name__ != "NetworklessViolation":
+            raise AssertionError(label + ":" + type(error).__name__) from error
+        blocked.append(label)
+    else:
+        if isinstance(result, tuple):
+            for item in result:
+                item.close()
+        else:
+            result.close()
+        raise AssertionError(label + " socket creation was allowed")
+Path("sockets.txt").write_text(",".join(blocked), encoding="utf-8")
+"""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    result = runner.LocalProcessRunner(clock=lambda: NOW).run(
+        spec=_spec(script=script),
+        input_dir=tmp_path / "input",
+        output_dir=output_dir,
+    )
+
+    assert result.breach is None
+    assert (output_dir / "sockets.txt").read_text() == (
+        "unix,socketpair,descriptor"
+    )
+
+
+def test_job_visible_runner_module_retains_no_escape_handles(tmp_path):
+    script = """
+from pathlib import Path
+import __main__ as runner
+
+retained = sorted(name for name in vars(runner) if name.startswith("_ORIGINAL_"))
+if retained:
+    raise AssertionError("retained authority:" + ",".join(retained))
+Path("globals.txt").write_text("none", encoding="utf-8")
+"""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    result = runner.LocalProcessRunner(clock=lambda: NOW).run(
+        spec=_spec(script=script),
+        input_dir=tmp_path / "input",
+        output_dir=output_dir,
+    )
+
+    assert result.breach is None
+    assert (output_dir / "globals.txt").read_text() == "none"
+
+
+def test_timeout_kills_job_process_and_commits_no_candidate_output(tmp_path):
+    script = """
+from pathlib import Path
 import time
 
-subprocess.Popen([
-    sys.executable,
-    "-c",
-    "import time; from pathlib import Path; time.sleep(2); "
-    "Path({str(marker)!r}).write_text('survived')",
-])
 Path("partial.txt").write_text("must never publish")
 time.sleep(5)
 """
@@ -117,9 +238,6 @@ time.sleep(5)
         deadline_seconds=1,
         cpu_seconds=models.SMALL.cpu_seconds,
         memory_bytes=models.SMALL.memory_bytes,
-        # macOS accounts RLIMIT_NPROC across the whole login user. Keep a
-        # finite bound above the host's concurrent developer processes so this
-        # specific test can create one descendant and prove group termination.
         pids_limit=1024,
         file_size_bytes=models.SMALL.file_size_bytes,
         max_output_files=models.SMALL.max_output_files,
@@ -139,8 +257,6 @@ time.sleep(5)
     assert result.breach is not None
     assert result.breach.kind == "TIMEOUT"
     assert list(output_dir.iterdir()) == []
-    time.sleep(2.2)
-    assert not marker.exists()
 
 
 def test_nonzero_exit_discards_every_partial_output(tmp_path):

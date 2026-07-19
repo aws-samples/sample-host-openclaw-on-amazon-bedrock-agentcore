@@ -1,12 +1,11 @@
-"""Networkless, ambient-authority-free Linux compute job runner boundary.
+"""No-route, zero-egress Linux compute job infrastructure boundary.
 
-The runner executes a single pinned-by-digest image in a fully isolated VPC:
-no NAT, no internet gateway route, no VPC endpoints, IMDS disabled, and no ECS
-task role at all. A trusted control-plane service must copy exact inputs into
-the job before launch and collect outputs after termination; the container
-never receives an AWS credential endpoint. The real Docker build, ARM64 image,
-and static-scan gates are OPEN and are not run here; the pinned image digest is
-supplied as an explicit argument so synth stays offline.
+The stack creates isolated subnets plus a dedicated workload security group
+with no ingress or egress. An exact launcher must bind both, disable public IP
+assignment, and run the single pinned-by-digest task definition. The task has
+no ECS task role, so it receives no workload credential endpoint. The real
+Docker build, ARM64 image, static scan, launch binding, and live isolation
+evidence remain OPEN; synthesis alone is not deployment evidence.
 """
 
 from __future__ import annotations
@@ -66,9 +65,9 @@ class ComputeStack(Stack):
             self, "ComputeStateEncryptionKey", cmk_arn
         )
 
-        # A fully isolated VPC: only PRIVATE_ISOLATED subnets, no NAT, no
-        # internet gateway. There is no route to the internet, IMDS, or any
-        # AWS service, which proves the runner is networkless.
+        # PRIVATE_ISOLATED subnets add no NAT, internet route, or VPC endpoint.
+        # The dedicated zero-egress workload SG below is an independently
+        # required launch binding. Live ENI/flow evidence remains an open gate.
         self.vpc = ec2.Vpc(
             self,
             "ComputeIsolatedVpc",
@@ -83,8 +82,20 @@ class ComputeStack(Stack):
                 ),
             ],
         )
+        self.isolated_subnet_ids = self.vpc.select_subnets(
+            subnet_type=ec2.SubnetType.PRIVATE_ISOLATED
+        ).subnet_ids
+        self.workload_security_group = ec2.SecurityGroup(
+            self,
+            "ComputeWorkloadSecurityGroup",
+            vpc=self.vpc,
+            description="No-ingress, no-egress compute job ENIs",
+            allow_all_outbound=False,
+            allow_all_ipv6_outbound=False,
+        )
 
-        # An isolated VPC flow log proves and audits the networkless posture.
+        # Flow logs support live isolation evidence after an exact task launch;
+        # their synthesized presence is not itself execution evidence.
         flow_log_group = logs.LogGroup(
             self,
             "ComputeVpcFlowLogGroup",
@@ -230,6 +241,12 @@ class ComputeStack(Stack):
                     essential=True,
                     readonly_root_filesystem=True,
                     user="10001:10001",
+                    linux_parameters=ecs.CfnTaskDefinition.LinuxParametersProperty(
+                        capabilities=ecs.CfnTaskDefinition.KernelCapabilitiesProperty(
+                            drop=["ALL"]
+                        ),
+                        init_process_enabled=True,
+                    ),
                     log_configuration=ecs.CfnTaskDefinition.LogConfigurationProperty(
                         log_driver="awslogs",
                         options={
@@ -244,6 +261,17 @@ class ComputeStack(Stack):
 
         CfnOutput(self, "ComputeImageDigest", value=self.image_digest)
         CfnOutput(self, "ComputeOutputBucketName", value=self.output_bucket.bucket_name)
+        CfnOutput(
+            self,
+            "ComputeWorkloadSecurityGroupId",
+            value=self.workload_security_group.security_group_id,
+        )
+        CfnOutput(
+            self,
+            "ComputeIsolatedSubnetIds",
+            value=",".join(self.isolated_subnet_ids),
+        )
+        CfnOutput(self, "ComputeAssignPublicIp", value="DISABLED")
 
         for role in (execution_role,):
             cdk_nag.NagSuppressions.add_resource_suppressions(

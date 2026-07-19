@@ -62,10 +62,10 @@ def test_compute_stack_has_an_isolated_networkless_job_runner():
     assert stack.image_digest == IMAGE_DIGEST
 
 
-def test_compute_runner_has_no_internet_route_and_disables_imds():
+def test_compute_runner_has_no_routed_internet_or_aws_endpoints():
     stack, template = _synth()
     # No NAT gateways, no egress-only gateways, no VPC interface/gateway endpoints:
-    # the job VPC is fully isolated with no route to the internet, IMDS, or AWS.
+    # the job VPC has no routed path to the internet or an AWS service.
     assert _resources(template, "AWS::EC2::NatGateway") == []
     assert _resources(template, "AWS::EC2::VPCEndpoint") == []
     # Subnets used by the runner must not auto-assign public IPs.
@@ -75,6 +75,28 @@ def test_compute_runner_has_no_internet_route_and_disables_imds():
     for route in _resources(template, "AWS::EC2::Route"):
         assert "GatewayId" not in route["Properties"]
         assert "NatGatewayId" not in route["Properties"]
+
+
+def test_compute_workload_binding_has_explicit_zero_ingress_and_egress():
+    stack, template = _synth()
+    security_groups = _resources(template, "AWS::EC2::SecurityGroup")
+    assert len(security_groups) == 1
+    properties = security_groups[0]["Properties"]
+    assert properties.get("SecurityGroupIngress", []) == []
+    assert properties["SecurityGroupEgress"] == [
+        {
+            "CidrIp": "255.255.255.255/32",
+            "Description": "Disallow all traffic",
+            "FromPort": 252,
+            "IpProtocol": "icmp",
+            "ToPort": 86,
+        }
+    ]
+    assert len(stack.isolated_subnet_ids) == 2
+    assert stack.workload_security_group is not None
+    assert "ComputeWorkloadSecurityGroupId" in template["Outputs"]
+    assert "ComputeIsolatedSubnetIds" in template["Outputs"]
+    assert template["Outputs"]["ComputeAssignPublicIp"]["Value"] == "DISABLED"
 
 
 def test_compute_container_has_no_task_role_or_ambient_aws_credentials():
@@ -99,6 +121,16 @@ def test_compute_container_has_no_task_role_or_ambient_aws_credentials():
         "ec2:CreateRoute",
     ):
         assert forbidden not in actions
+
+
+def test_compute_container_drops_every_linux_capability_and_uses_init():
+    _, template = _synth()
+    task_definition = _resources(template, "AWS::ECS::TaskDefinition")[0]
+    container = task_definition["Properties"]["ContainerDefinitions"][0]
+    assert container["LinuxParameters"] == {
+        "Capabilities": {"Drop": ["ALL"]},
+        "InitProcessEnabled": True,
+    }
 
 
 def test_compute_stack_rejects_a_non_pinned_image_digest():

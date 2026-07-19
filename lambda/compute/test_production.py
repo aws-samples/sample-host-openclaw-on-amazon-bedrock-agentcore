@@ -6,9 +6,12 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from capabilities.contracts import canonical_json_bytes
 from compute import models
 from compute.production import (
+    ComputeNetworkBinding,
     LaunchReceipt,
     ProductionComputeRunner,
     StagedJob,
@@ -22,6 +25,63 @@ TASK_DEFINITION = (
     "personal-operator-compute:7"
 )
 NOW = 1_800_000_000
+SECURITY_GROUP_ID = "sg-0123456789abcdef0"
+SUBNET_IDS = ("subnet-0123456789abcdef0", "subnet-0123456789abcdef1")
+NETWORK_BINDING = ComputeNetworkBinding(
+    security_group_id=SECURITY_GROUP_ID,
+    subnet_ids=SUBNET_IDS,
+    assign_public_ip="DISABLED",
+)
+
+
+def test_compute_network_binding_is_exact_and_public_ip_disabled():
+    from compute import production
+
+    binding = production.ComputeNetworkBinding(
+        security_group_id=SECURITY_GROUP_ID,
+        subnet_ids=SUBNET_IDS,
+        assign_public_ip="DISABLED",
+    )
+    assert binding.security_group_id == SECURITY_GROUP_ID
+    assert binding.subnet_ids == SUBNET_IDS
+    assert binding.assign_public_ip == "DISABLED"
+
+    bad_bindings = (
+        {
+            "security_group_id": "sg-bad",
+            "subnet_ids": SUBNET_IDS,
+            "assign_public_ip": "DISABLED",
+        },
+        {
+            "security_group_id": SECURITY_GROUP_ID,
+            "subnet_ids": (),
+            "assign_public_ip": "DISABLED",
+        },
+        {
+            "security_group_id": SECURITY_GROUP_ID,
+            "subnet_ids": (SUBNET_IDS[0], SUBNET_IDS[0]),
+            "assign_public_ip": "DISABLED",
+        },
+        {
+            "security_group_id": SECURITY_GROUP_ID,
+            "subnet_ids": SUBNET_IDS,
+            "assign_public_ip": "ENABLED",
+        },
+    )
+    for values in bad_bindings:
+        with pytest.raises((TypeError, ValueError)):
+            production.ComputeNetworkBinding(**values)
+
+
+def test_launch_receipt_attests_the_exact_network_binding():
+    receipt = LaunchReceipt(
+        task_ref="task_12345678",
+        task_definition_arn=TASK_DEFINITION,
+        image_digest=PINNED_DIGEST,
+        output_namespace_id="namespace_fresh_12345678",
+        network_binding=NETWORK_BINDING,
+    )
+    assert receipt.network_binding == NETWORK_BINDING
 
 
 class RecordingStaging:
@@ -64,6 +124,7 @@ class RecordingLauncher:
             task_definition_arn=TASK_DEFINITION,
             image_digest=PINNED_DIGEST,
             output_namespace_id="namespace_fresh_12345678",
+            network_binding=NETWORK_BINDING,
         )
         self.completion = completion or TaskCompletion(
             status="SUCCEEDED",
@@ -122,8 +183,28 @@ def _runner(staging, launcher):
         launcher=launcher,
         task_definition_arn=TASK_DEFINITION,
         image_digest=PINNED_DIGEST,
+        network_binding=NETWORK_BINDING,
         clock=lambda: NOW,
     )
+
+
+def test_adapter_launches_only_with_exact_zero_egress_network_binding(tmp_path):
+    staging = RecordingStaging()
+    launcher = RecordingLauncher()
+    spec, input_dir, output_dir = _spec_and_input(tmp_path)
+    subject = ProductionComputeRunner(
+        staging=staging,
+        launcher=launcher,
+        task_definition_arn=TASK_DEFINITION,
+        image_digest=PINNED_DIGEST,
+        network_binding=NETWORK_BINDING,
+        clock=lambda: NOW,
+    )
+
+    result = subject.run(spec=spec, input_dir=input_dir, output_dir=output_dir)
+
+    assert result.breach is None
+    assert launcher.launch_calls[0]["network_binding"] == NETWORK_BINDING
 
 
 def test_adapter_hash_binds_inputs_and_launches_only_exact_task_and_image(tmp_path):
@@ -146,6 +227,7 @@ def test_adapter_hash_binds_inputs_and_launches_only_exact_task_and_image(tmp_pa
             "staged_job": staging.stage_calls and staging.discarded[0],
             "deadline": spec.deadline,
             "network": "NONE",
+            "network_binding": NETWORK_BINDING,
         }
     ]
     assert (output_dir / "result.txt").read_bytes() == b"done"
@@ -160,12 +242,14 @@ def test_adapter_refuses_task_definition_or_image_attestation_drift(tmp_path):
             task_definition_arn=TASK_DEFINITION.replace(":7", ":8"),
             image_digest=PINNED_DIGEST,
             output_namespace_id="namespace_fresh_12345678",
+            network_binding=NETWORK_BINDING,
         ),
         LaunchReceipt(
             task_ref="task_12345678",
             task_definition_arn=TASK_DEFINITION,
             image_digest="sha256:" + "b" * 64,
             output_namespace_id="namespace_fresh_12345678",
+            network_binding=NETWORK_BINDING,
         ),
     ):
         staging = RecordingStaging()
@@ -181,6 +265,35 @@ def test_adapter_refuses_task_definition_or_image_attestation_drift(tmp_path):
         assert launcher.terminated == ["task_12345678"]
         assert staging.read_calls == []
         assert list(output_dir.iterdir()) == []
+
+
+def test_adapter_refuses_network_binding_attestation_drift(tmp_path):
+    drifted_binding = ComputeNetworkBinding(
+        security_group_id="sg-1123456789abcdef0",
+        subnet_ids=SUBNET_IDS,
+        assign_public_ip="DISABLED",
+    )
+    launcher = RecordingLauncher(
+        receipt=LaunchReceipt(
+            task_ref="task_12345678",
+            task_definition_arn=TASK_DEFINITION,
+            image_digest=PINNED_DIGEST,
+            output_namespace_id="namespace_fresh_12345678",
+            network_binding=drifted_binding,
+        )
+    )
+    staging = RecordingStaging()
+    spec, input_dir, output_dir = _spec_and_input(tmp_path)
+
+    result = _runner(staging, launcher).run(
+        spec=spec, input_dir=input_dir, output_dir=output_dir
+    )
+
+    assert result.breach is not None
+    assert result.breach.error_code == "COMPUTE_LAUNCH_BINDING_MISMATCH"
+    assert launcher.terminated == ["task_12345678"]
+    assert staging.read_calls == []
+    assert list(output_dir.iterdir()) == []
 
 
 def test_adapter_timeout_terminates_tree_and_never_reads_or_publishes_output(tmp_path):
