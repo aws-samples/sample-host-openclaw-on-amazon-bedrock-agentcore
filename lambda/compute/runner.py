@@ -5,8 +5,8 @@ in production, by the read-only job image. It drops ambient authority, applies
 POSIX resource limits (CPU, address space for OOM, process count for fork
 bombs, and file size), runs the command in a fresh process group so the whole
 tree can be killed on a deadline or resource breach, and proves the namespace
-is networkless: DNS, outbound TCP, VPC endpoints, IMDS, and the credential
-provider chain all fail closed.
+is networkless: DNS, stream/datagram/raw socket egress, VPC endpoints, IMDS,
+and the credential provider chain all fail closed.
 
 No import here performs I/O at module load. The container mounts an immutable
 input directory and writes only to a fresh output directory.
@@ -14,6 +14,7 @@ input directory and writes only to a fresh output directory.
 
 from __future__ import annotations
 
+import _socket
 import contextlib
 import json
 import os
@@ -35,9 +36,30 @@ except ImportError:  # pragma: no cover - platform dependent
 
 IMDS_ADDRESS = "169.254.169.254"
 
+_ORIGINAL_SOCKET = socket.socket
+_ORIGINAL_SOCKET_TYPE = socket.SocketType
+_ORIGINAL_LOW_LEVEL_SOCKET = _socket.socket
+_ORIGINAL_LOW_LEVEL_SOCKET_TYPE = _socket.SocketType
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
-_ORIGINAL_CONNECT = socket.socket.connect
+_ORIGINAL_CONNECT = _ORIGINAL_SOCKET.connect
+_ORIGINAL_CONNECT_EX = _ORIGINAL_SOCKET.connect_ex
 _ORIGINAL_CREATE_CONNECTION = socket.create_connection
+_ORIGINAL_SEND = _ORIGINAL_SOCKET.send
+_ORIGINAL_SENDALL = _ORIGINAL_SOCKET.sendall
+_ORIGINAL_SENDTO = _ORIGINAL_SOCKET.sendto
+_ORIGINAL_SENDMSG = getattr(_ORIGINAL_SOCKET, "sendmsg", None)
+_ORIGINAL_SENDFILE = _ORIGINAL_SOCKET.sendfile
+_DNS_RESOLVER_NAMES = (
+    "getaddrinfo",
+    "gethostbyname",
+    "gethostbyname_ex",
+    "gethostbyaddr",
+    "getnameinfo",
+    "getfqdn",
+)
+_LOW_LEVEL_DNS_RESOLVER_NAMES = tuple(
+    name for name in _DNS_RESOLVER_NAMES if hasattr(_socket, name)
+)
 
 
 class NetworklessViolation(RuntimeError):
@@ -56,24 +78,107 @@ def _blocked_create_connection(*_args, **_kwargs):
     raise NetworklessViolation("outbound network connect is blocked in the job")
 
 
+def _blocked_socket_write(self, *_args, **_kwargs):
+    raise NetworklessViolation("outbound network I/O is blocked in the job")
+
+
+def _is_raw_socket_type(socket_type: int) -> bool:
+    """Recognize ``SOCK_RAW`` even when Linux constructor flags are present."""
+
+    normalized = int(socket_type)
+    for flag_name in ("SOCK_NONBLOCK", "SOCK_CLOEXEC"):
+        normalized &= ~int(getattr(socket, flag_name, 0))
+    return normalized == int(socket.SOCK_RAW)
+
+
+class _NetworklessSocket(_ORIGINAL_SOCKET):
+    """Public socket constructor that rejects raw sockets before their syscall."""
+
+    def __init__(self, family=-1, type=-1, proto=-1, fileno=None):
+        if fileno is None:
+            if family == -1:
+                family = socket.AF_INET
+            if type == -1:
+                type = socket.SOCK_STREAM
+            if proto == -1:
+                proto = 0
+            if _is_raw_socket_type(type):
+                raise NetworklessViolation(
+                    "raw socket creation is blocked in the networkless job"
+                )
+        # Call the retained C type directly. During the fence, the public
+        # ``_socket.socket`` alias also points at this guarded class.
+        _ORIGINAL_LOW_LEVEL_SOCKET.__init__(self, family, type, proto, fileno)
+        self._io_refs = 0
+        self._closed = False
+        if _is_raw_socket_type(self.type):
+            self.close()
+            raise NetworklessViolation(
+                "raw socket adoption is blocked in the networkless job"
+            )
+
+
+_SOCKET_METHOD_FENCES = {
+    "connect": _blocked_connect,
+    "connect_ex": _blocked_connect,
+    "send": _blocked_socket_write,
+    "sendall": _blocked_socket_write,
+    "sendto": _blocked_socket_write,
+    "sendfile": _blocked_socket_write,
+}
+if _ORIGINAL_SENDMSG is not None:
+    _SOCKET_METHOD_FENCES["sendmsg"] = _blocked_socket_write
+
+
 @contextlib.contextmanager
 def networkless_namespace() -> Iterator[None]:
     """Fence every egress path for the duration of the job body.
 
-    The fence covers DNS, direct socket connects (which also serve VPC endpoint
-    and IMDS attempts), and the higher-level ``create_connection`` helper. The
-    original callables are always restored, even when the job body raises.
+    The fence covers DNS, every public socket constructor, direct and
+    connectionless socket writes, VPC endpoint and IMDS attempts, and the
+    higher-level ``create_connection`` helper. The original callables are
+    always restored, even when the job body raises.
     """
 
-    socket.getaddrinfo = _blocked_getaddrinfo
-    socket.socket.connect = _blocked_connect
+    previous_socket = socket.socket
+    previous_socket_type = socket.SocketType
+    previous_low_level_socket = _socket.socket
+    previous_low_level_socket_type = _socket.SocketType
+    previous_create_connection = socket.create_connection
+    previous_resolvers = {
+        name: getattr(socket, name) for name in _DNS_RESOLVER_NAMES
+    }
+    previous_low_level_resolvers = {
+        name: getattr(_socket, name) for name in _LOW_LEVEL_DNS_RESOLVER_NAMES
+    }
+    previous_methods = {
+        name: getattr(_ORIGINAL_SOCKET, name) for name in _SOCKET_METHOD_FENCES
+    }
+    for name, fence in _SOCKET_METHOD_FENCES.items():
+        setattr(_ORIGINAL_SOCKET, name, fence)
+    socket.socket = _NetworklessSocket
+    socket.SocketType = _NetworklessSocket
+    _socket.socket = _NetworklessSocket
+    _socket.SocketType = _NetworklessSocket
+    for name in _DNS_RESOLVER_NAMES:
+        setattr(socket, name, _blocked_getaddrinfo)
+    for name in _LOW_LEVEL_DNS_RESOLVER_NAMES:
+        setattr(_socket, name, _blocked_getaddrinfo)
     socket.create_connection = _blocked_create_connection
     try:
         yield
     finally:
-        socket.getaddrinfo = _ORIGINAL_GETADDRINFO
-        socket.socket.connect = _ORIGINAL_CONNECT
-        socket.create_connection = _ORIGINAL_CREATE_CONNECTION
+        socket.create_connection = previous_create_connection
+        for name, original in previous_low_level_resolvers.items():
+            setattr(_socket, name, original)
+        for name, original in previous_resolvers.items():
+            setattr(socket, name, original)
+        _socket.SocketType = previous_low_level_socket_type
+        _socket.socket = previous_low_level_socket
+        socket.SocketType = previous_socket_type
+        socket.socket = previous_socket
+        for name, original in previous_methods.items():
+            setattr(_ORIGINAL_SOCKET, name, original)
 
 
 def resolve_ambient_credentials() -> None:
