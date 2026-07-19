@@ -83,6 +83,38 @@ class ComputeStack(Stack):
             ],
         )
 
+        # An isolated VPC flow log proves and audits the networkless posture.
+        flow_log_group = logs.LogGroup(
+            self,
+            "ComputeVpcFlowLogGroup",
+            retention=logs.RetentionDays.ONE_MONTH,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        flow_log_role = iam.Role(
+            self,
+            "ComputeVpcFlowLogRole",
+            assumed_by=iam.ServicePrincipal("vpc-flow-logs.amazonaws.com"),
+        )
+        self.vpc.add_flow_log(
+            "ComputeFlowLog",
+            destination=ec2.FlowLogDestination.to_cloud_watch_logs(
+                flow_log_group, flow_log_role
+            ),
+            traffic_type=ec2.FlowLogTrafficType.ALL,
+        )
+
+        # Server-access logs for the input/output stores.
+        self.access_log_bucket = s3.Bucket(
+            self,
+            "ComputeAccessLogBucket",
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=encryption_key,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+            versioned=True,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+
         # The immutable input object store and the per-job output store. Both
         # are private, encrypted, versioned, and retained.
         self.input_bucket = s3.Bucket(
@@ -95,6 +127,8 @@ class ComputeStack(Stack):
             enforce_ssl=True,
             versioned=True,
             removal_policy=RemovalPolicy.RETAIN,
+            server_access_logs_bucket=self.access_log_bucket,
+            server_access_logs_prefix="s3/compute-inputs/",
         )
         self.output_bucket = s3.Bucket(
             self,
@@ -106,6 +140,8 @@ class ComputeStack(Stack):
             enforce_ssl=True,
             versioned=True,
             removal_policy=RemovalPolicy.RETAIN,
+            server_access_logs_bucket=self.access_log_bucket,
+            server_access_logs_prefix="s3/compute-outputs/",
         )
 
         log_group = logs.LogGroup(
@@ -120,6 +156,7 @@ class ComputeStack(Stack):
             self,
             "ComputeCluster",
             vpc=self.vpc,
+            container_insights=True,
         )
 
         # The task role carries no ambient AWS provider authority. It may only
@@ -231,6 +268,21 @@ class ComputeStack(Stack):
                 ],
                 apply_to_children=True,
             )
+
+        # The access-log bucket is the terminal server-access-log sink for the
+        # input/output stores; it cannot log to itself.
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            self.access_log_bucket,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-S1",
+                    reason=(
+                        "This bucket is the terminal server-access-log sink for "
+                        "the compute input/output stores and cannot log to itself."
+                    ),
+                ),
+            ],
+        )
 
 
 __all__ = [

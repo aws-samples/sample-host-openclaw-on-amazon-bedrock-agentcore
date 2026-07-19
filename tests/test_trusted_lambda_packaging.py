@@ -945,9 +945,9 @@ def test_app_and_deploy_path_require_the_trusted_asset_for_real_stacks() -> None
     )
 
     assert "resolve_trusted_lambda_asset_metadata(" in app_source
-    # router, web, and the capability gateway stack all consume the exact
-    # authenticated trusted asset path.
-    assert app_source.count("trusted_code_asset_root=trusted_lambda_asset.path") == 3
+    # capability gateway, router, web, and the scheduler ingress stack all
+    # consume the exact authenticated trusted asset path.
+    assert app_source.count("trusted_code_asset_root=trusted_lambda_asset.path") == 4
     assert app_source.count("trusted_code_asset_hash=trusted_lambda_asset.asset_hash") == 2
     assert 'web_asset_root=str(repository_root / "web" / "dist")' in app_source
     for source in (router_source, web_source):

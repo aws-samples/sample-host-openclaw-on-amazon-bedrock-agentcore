@@ -327,6 +327,14 @@ class UnusedRetention:
         raise AssertionError("synthetic journey does not run retention")
 
 
+class UnusedImporter:
+    def build_plan(self, *_args, **_kwargs):
+        raise AssertionError("founder journey does not stage a portable import")
+
+    def activate(self, *_args, **_kwargs):
+        raise AssertionError("founder journey does not activate a portable import")
+
+
 class UnusedPilotPorts:
     def get(self, _user_id):
         raise AssertionError("founder journey does not request the pilot overview")
@@ -482,6 +490,7 @@ def test_complete_synthetic_founder_connect_approve_receipt_export_delete_journe
         workspace=WorkspaceView(),
         gmail_workspace=GmailWorkspaceView(),
         exporter=UserExporter(ExportSource(repository)),
+        importer=UnusedImporter(),
         deletion=deletion,
         retention=UnusedRetention(),
         overview=UnusedPilotPorts(),

@@ -802,6 +802,14 @@ class NoRetention:
         raise AssertionError("synthetic journey does not run retention")
 
 
+class NoImporter:
+    def build_plan(self, *_args, **_kwargs):
+        raise AssertionError("pilot journey does not stage a portable import")
+
+    def activate(self, *_args, **_kwargs):
+        raise AssertionError("pilot journey does not activate a portable import")
+
+
 class LocalConditionalFailure(Exception):
     response = {"Error": {"Code": "ConditionalCheckFailedException"}}
 
@@ -1330,6 +1338,7 @@ def test_three_isolated_pilots_complete_provider_free_read_only_journey(
         workspace=workspace,
         gmail_workspace=gmail_workspace,
         exporter=UserExporter(SyntheticExportSource()),
+        importer=NoImporter(),
         deletion=deletion,
         retention=NoRetention(),
         overview=overview,
