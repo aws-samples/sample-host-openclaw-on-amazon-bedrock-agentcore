@@ -120,6 +120,71 @@ test("console hooks and CloudWatch retain only closed structured metadata", asyn
   }
 });
 
+test("accessor-backed metadata is rejected without invoking stateful getters", async () => {
+  const platformStdout = [];
+  const platformStderr = [];
+  const commands = [];
+  const logger = loggerModule.createStructuredLogger({
+    platformStdout: (line) => platformStdout.push(line),
+    platformStderr: (line) => platformStderr.push(line),
+    clientFactory: () => ({
+      async send(command) {
+        commands.push(command);
+      },
+    }),
+    clock: () => 1_726_000_000_000,
+    scheduleFlush: () => ({ unref() {} }),
+    cancelFlush: () => {},
+  });
+  const reads = { level: 0, status: 0, count: 0 };
+  const cases = [
+    {
+      field: "level",
+      metadata: { status: "READY", count: 1 },
+      value(readCount) {
+        return readCount < 100 ? "INFO" : SENTINELS[2];
+      },
+    },
+    {
+      field: "status",
+      metadata: { level: "INFO", count: 1 },
+      value(readCount) {
+        return readCount < 4 ? "READY" : SENTINELS[1];
+      },
+    },
+    {
+      field: "count",
+      metadata: { level: "ERROR", status: "FAILED" },
+      value(readCount) {
+        return readCount < 6 ? 1 : SENTINELS[0];
+      },
+    },
+  ];
+
+  const records = cases.map(({ field, metadata, value }) => {
+    Object.defineProperty(metadata, field, {
+      enumerable: true,
+      get() {
+        reads[field] += 1;
+        return value(reads[field]);
+      },
+    });
+    return logger.emit("RUNTIME_STATE", metadata);
+  });
+
+  await logger.init({ env: { AWS_REGION: "eu-west-1" } });
+  await logger.flush();
+
+  assertNoSentinels(platformStdout);
+  assertNoSentinels(platformStderr);
+  assertNoSentinels(commands.map((command) => command.input));
+  assert.deepEqual(reads, { level: 0, status: 0, count: 0 });
+  assert.deepEqual(
+    records.map(({ event }) => event),
+    ["LOG_EVENT_REJECTED", "LOG_EVENT_REJECTED", "LOG_EVENT_REJECTED"],
+  );
+});
+
 test("child output is drained as bounded counts and never retained or emitted", () => {
   const platform = [];
   const logger = loggerModule.createStructuredLogger({

@@ -41,13 +41,18 @@ const CHILD_OUTPUT_CHANNELS = new Set([
 ]);
 const CONSOLE_HOOK = Symbol("personalOperatorSafeConsoleHook");
 const PROCESS_FAILURE_HOOK = Symbol("personalOperatorSafeProcessFailureHook");
+const METADATA_FIELDS = new Set(["level", "status", "count"]);
 
 function isPlainObject(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return false;
   }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
 }
 
 function rejectedRecord() {
@@ -58,25 +63,51 @@ function rejectedRecord() {
   });
 }
 
-function sanitizeRecord(eventCode, metadata = {}) {
-  if (!EVENT_CODES.has(eventCode) || !isPlainObject(metadata)) {
-    return rejectedRecord();
+function snapshotMetadata(metadata) {
+  if (!isPlainObject(metadata)) return null;
+  let descriptors;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(metadata);
+  } catch {
+    return null;
   }
-  const keys = Object.keys(metadata);
-  if (keys.some((key) => !["level", "status", "count"].includes(key))) {
+
+  const snapshot = Object.create(null);
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== "string" || !METADATA_FIELDS.has(key)) return null;
+    const descriptor = descriptors[key];
+    if (
+      !descriptor ||
+      descriptor.enumerable !== true ||
+      !Object.hasOwn(descriptor, "value") ||
+      Object.hasOwn(descriptor, "get") ||
+      Object.hasOwn(descriptor, "set")
+    ) {
+      return null;
+    }
+    snapshot[key] = descriptor.value;
+  }
+  return Object.freeze(snapshot);
+}
+
+function sanitizeRecord(eventCode, metadata = {}) {
+  const snapshot = snapshotMetadata(metadata);
+  if (!EVENT_CODES.has(eventCode) || snapshot === null) {
     return rejectedRecord();
   }
 
-  const level = metadata.level === undefined ? "INFO" : metadata.level;
+  const hasStatus = Object.hasOwn(snapshot, "status");
+  const hasCount = Object.hasOwn(snapshot, "count");
+  const level = Object.hasOwn(snapshot, "level") ? snapshot.level : "INFO";
+  const status = hasStatus ? snapshot.status : undefined;
+  const count = hasCount ? snapshot.count : undefined;
   if (!LEVELS.has(level)) return rejectedRecord();
-  if (metadata.status !== undefined && !STATUSES.has(metadata.status)) {
+  if (hasStatus && !STATUSES.has(status)) {
     return rejectedRecord();
   }
   if (
-    metadata.count !== undefined &&
-    (!Number.isSafeInteger(metadata.count) ||
-      metadata.count < 0 ||
-      metadata.count > MAX_COUNT)
+    hasCount &&
+    (!Number.isSafeInteger(count) || count < 0 || count > MAX_COUNT)
   ) {
     return rejectedRecord();
   }
@@ -85,8 +116,8 @@ function sanitizeRecord(eventCode, metadata = {}) {
     version: 1,
     event: eventCode,
     level,
-    ...(metadata.status === undefined ? {} : { status: metadata.status }),
-    ...(metadata.count === undefined ? {} : { count: metadata.count }),
+    ...(hasStatus ? { status } : {}),
+    ...(hasCount ? { count } : {}),
   });
 }
 
