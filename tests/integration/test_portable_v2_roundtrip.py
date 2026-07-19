@@ -4,17 +4,26 @@ from __future__ import annotations
 
 import base64
 import copy
+import io
 import json
 from pathlib import Path
 import sys
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "lambda"))
 
 from portable import FORMAT, PortableExporter, PortableImporter
+from portable.live import PortableLiveProjection
 from portable.staging import DynamoStagedImportStore
 from portable.test_staging import FakeBlobs, FakeTable
+from capabilities.schedule_port import (
+    DynamoScheduleCapabilityPort,
+    DynamoScheduleDefinitionReader,
+)
+from capabilities.test_schedule_port import MemorySchedulerClient
+from scheduler.models import build_schedule_spec
 from web.composition import _ExportSource
 from web.test_index import USER, bootstrap, event, setup_app
 
@@ -247,3 +256,138 @@ def test_route_v2_roundtrip_live_activation_and_identical_replay_denial():
     assert replay_activation["statusCode"] == 400
     assert store.load_generation(USER) == before_generation
     assert table.items == before_table
+
+
+def test_native_governed_schedule_roundtrip_lands_inert_and_lists_without_provider_dispatch():
+    target_user = "user_imported"
+    intruder_user = "user_intruder"
+
+    class ProviderAwareSchedulerClient(MemorySchedulerClient):
+        def __init__(self):
+            super().__init__()
+            self.provider_calls = []
+
+        def create_schedule(self, **request):
+            self.provider_calls.append(("create", request))
+            raise AssertionError("portable projection must never arm EventBridge")
+
+        def delete_schedule(self, **request):
+            self.provider_calls.append(("delete", request))
+            raise AssertionError("portable projection must never delete EventBridge")
+
+    scheduler = ProviderAwareSchedulerClient()
+    source_spec = build_schedule_spec(
+        schedule_id="schedule_portable_12345678",
+        user_id=USER,
+        task_type="REMINDER",
+        definition={
+            "message": "synthetic private reminder content",
+            "runAt": 1_800_003_600,
+            "timezone": "Europe/Tallinn",
+        },
+        revision=3,
+        state="ENABLED",
+    )
+    foreign_spec = build_schedule_spec(
+        schedule_id="schedule_foreign_12345678",
+        user_id=intruder_user,
+        task_type="REMINDER",
+        definition={
+            "message": "must never cross tenants",
+            "runAt": 1_800_007_200,
+            "timezone": "Europe/Tallinn",
+        },
+        revision=1,
+        state="ENABLED",
+    )
+    scheduler.seed_schedule(source_spec)
+    scheduler.seed_schedule(foreign_spec)
+    scheduler_items_before = copy.deepcopy(scheduler.items)
+    source = _ExportSource(
+        records=EmptyRecords(),
+        workspace=EmptyWorkspace(),
+        schedules=DynamoScheduleDefinitionReader(
+            client=scheduler,
+            table_name="personal-operator-scheduler-control",
+        ),
+    )
+
+    bundle = PortableExporter(source).build(USER)
+
+    with zipfile.ZipFile(io.BytesIO(bundle.zip_bytes)) as archive:
+        exported_schedules = json.loads(archive.read("records/schedules.json"))
+    expected_portable = source_spec.to_mapping()
+    expected_portable.pop("schema")
+    expected_portable.pop("nextRunAt")
+    expected_portable["state"] = "DISABLED"
+    assert exported_schedules == [expected_portable]
+    assert foreign_spec.schedule_id not in str(exported_schedules)
+
+    table = FakeTable()
+    store = DynamoStagedImportStore(table, blobs=FakeBlobs())
+    importer = PortableImporter(staging=store, now=lambda: 1_800_000_100)
+    plan = importer.build_plan(bundle.zip_bytes, target_user_id=target_user)
+    prepared = importer.prepare_activation(
+        bundle.zip_bytes,
+        target_user_id=target_user,
+        approved_bundle_hash=plan.bundle_hash,
+        approved_plan_id=plan.plan_id,
+        approved_base_generation=plan.base_generation,
+    )
+    importer.activate(
+        bundle.zip_bytes,
+        target_user_id=target_user,
+        approved_bundle_hash=prepared.bundle_hash,
+        approved_plan_id=prepared.plan_id,
+        approved_base_generation=prepared.base_generation,
+        activation_approval=prepared.activation_approval,
+        expected_generation=prepared.expected_generation,
+    )
+
+    live = store.load_live(target_user)
+    landed = live["staged"]["records"]["schedules"]
+    assert landed == [{**expected_portable, "userId": target_user}]
+    assert live["staged"]["landing"]["schedules"] == "DISABLED"
+    assert live["staged"]["landing"]["receipts"]["replayable"] is False
+    assert "nextRunAt" not in landed[0]
+    assert "deliveryTarget" not in landed[0]
+
+    operational = DynamoScheduleCapabilityPort(
+        client=scheduler,
+        table_name="personal-operator-scheduler-control",
+        authority_table_name="personal-operator-capability-state",
+        catalog_digest="c" * 64,
+        clock=lambda: 1_800_000_100,
+        nonce_factory=lambda: "nonce_12345678",
+        imported_schedules=PortableLiveProjection(store),
+    )
+    target_view = operational.list_view(target_user)
+
+    assert target_view == {
+        "schedules": [
+            {
+                "scheduleId": source_spec.schedule_id,
+                "taskType": "REMINDER",
+                "state": "PAUSED",
+                "nextRunAt": None,
+            }
+        ]
+    }
+    assert set(target_view["schedules"][0]) == {
+        "scheduleId",
+        "taskType",
+        "state",
+        "nextRunAt",
+    }
+    assert "synthetic private reminder content" not in str(target_view)
+    assert operational.list_view(intruder_user)["schedules"] == [
+        {
+            "scheduleId": foreign_spec.schedule_id,
+            "taskType": "REMINDER",
+            "state": "ENABLED",
+            "nextRunAt": 1_800_007_200,
+        }
+    ]
+    assert scheduler.items == scheduler_items_before
+    assert scheduler.put_calls == []
+    assert scheduler.provider_calls == []

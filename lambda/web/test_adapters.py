@@ -6,6 +6,11 @@ import io
 
 import pytest
 
+from capabilities.retention import (
+    derive_deletion_subject_binding,
+    subject_partition_key,
+)
+
 from .adapters import (
     DataAdapterError,
     DataDeletionPending,
@@ -568,12 +573,14 @@ def test_portable_native_source_reads_installations_and_typed_compute_history_on
 
         def get_item(self, **request):
             self.reads.append(request)
-            if request["Key"]["SK"] != "INSTALL#schedule.list":
+            if request["Key"]["SK"] != "AUTHORITY#INSTALL#schedule.list":
                 return {}
+            binding = derive_deletion_subject_binding(USER)
             return {
                 "Item": {
-                    "PK": f"USER#{USER}",
-                    "SK": "INSTALL#schedule.list",
+                    "PK": subject_partition_key(USER),
+                    "SK": "AUTHORITY#INSTALL#schedule.list",
+                    "ownerBinding": binding,
                     "recordJson": (
                         '{"catalogDigest":"' + "d" * 64
                         + '","connectionRefs":["conn_12345678"],'
@@ -582,6 +589,7 @@ def test_portable_native_source_reads_installations_and_typed_compute_history_on
                         '"schema":"personal-operator.capability-installation.v1",'
                         '"state":"ENABLED","userId":"' + USER + '"}'
                     ),
+                    "ttl": 1_900_000_000,
                     "version": 1,
                 }
             }
@@ -590,6 +598,7 @@ def test_portable_native_source_reads_installations_and_typed_compute_history_on
     records = DynamoUserDataStore(
         table,
         installation_table=installations,
+        now=lambda: 1_800_000_000,
     ).records_for_user(USER)
 
     assert records["installed_packs"] == [
@@ -611,6 +620,55 @@ def test_portable_native_source_reads_installations_and_typed_compute_history_on
     assert "ciphertext" not in str(records)
     assert installations.reads
     assert all(read["ConsistentRead"] is True for read in installations.reads)
+    assert all(
+        read["Key"]["PK"] == subject_partition_key(USER)
+        and read["Key"]["SK"].startswith("AUTHORITY#INSTALL#")
+        for read in installations.reads
+    )
+    assert USER not in repr([read["Key"] for read in installations.reads])
+
+
+def test_portable_installation_export_logically_skips_expired_hashed_authority():
+    binding = derive_deletion_subject_binding(USER)
+
+    class InstallationTable:
+        def __init__(self):
+            self.reads = []
+
+        def get_item(self, **request):
+            self.reads.append(request)
+            if request["Key"]["SK"] != "AUTHORITY#INSTALL#schedule.list":
+                return {}
+            return {
+                "Item": {
+                    "PK": subject_partition_key(USER),
+                    "SK": "AUTHORITY#INSTALL#schedule.list",
+                    "ownerBinding": binding,
+                    "recordJson": (
+                        '{"catalogDigest":"' + "d" * 64
+                        + '","connectionRefs":[],"killSwitch":false,'
+                        '"packId":"schedule.list","policyRevision":1,'
+                        '"schema":"personal-operator.capability-installation.v1",'
+                        '"state":"ENABLED","userId":"' + USER + '"}'
+                    ),
+                    "ttl": 100,
+                    "version": 1,
+                }
+            }
+
+    installations = InstallationTable()
+    records = DynamoUserDataStore(
+        PaginatedTable([{"Items": []}]),
+        installation_table=installations,
+        now=lambda: 100,
+    ).records_for_user(USER)
+
+    assert records["installed_packs"] == []
+    assert all(
+        read["Key"]["PK"] == subject_partition_key(USER)
+        and read["Key"]["SK"].startswith("AUTHORITY#INSTALL#")
+        for read in installations.reads
+    )
 
 
 @pytest.mark.parametrize("response", [None, [], "malformed", 1])

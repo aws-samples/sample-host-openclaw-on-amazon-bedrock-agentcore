@@ -30,6 +30,7 @@ from actions.reconcile import GmailEffectReconciler
 from actions.repository import DynamoActionRepository
 from actions.state_machine import ActionStateMachine, ApprovalService, ApprovalTokenCodec
 from capabilities.retention import DynamoCapabilityDeletionAdapter
+from capabilities.schedule_port import DynamoScheduleDefinitionReader
 from router.runtime_driver import (
     AgentCoreAdapter,
     NoWorkspaceCapabilitySigner,
@@ -75,6 +76,7 @@ from .stores import DynamoOAuthStateStore, DynamoWebStore
 
 
 REQUIRED_REGION = "eu-west-1"
+SCHEDULER_CONTROL_TABLE_NAME = "personal-operator-scheduler-control"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 FOUNDER_GMAIL_SCOPES = frozenset({GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE})
 MAX_TOKEN_RESPONSE_BYTES = 64 * 1024
@@ -392,9 +394,14 @@ class LazyApprovalPort(_LazyPort):
 class _ExportSource:
     """Strong-read native plus active portable state for web/export surfaces."""
 
-    def __init__(self, *, records, workspace, portable=None) -> None:
+    def __init__(self, *, records, workspace, portable=None, schedules=None) -> None:
+        if schedules is not None and not callable(
+            getattr(schedules, "definitions_for_user", None)
+        ):
+            raise TypeError("native schedule export projection is invalid")
         self._records = records
         self._workspace = workspace
+        self._schedules = schedules
         self._portable = (
             None if portable is None else PortableLiveProjection(portable)
         )
@@ -406,9 +413,28 @@ class _ExportSource:
         return snapshot.records, snapshot.workspace
 
     def records_for_user(self, user_id: str):
-        native = self._records.records_for_user(user_id)
+        native = self._native_records(user_id)
         imported, _workspace = self._live(user_id)
         return self._merge_records(native, imported)
+
+    def _native_records(self, user_id: str):
+        native = self._records.records_for_user(user_id)
+        if self._schedules is None:
+            return native
+        if not isinstance(native, Mapping) or set(native) != RECORD_CATEGORIES:
+            raise DataAdapterError("native export records are invalid")
+        definitions = self._schedules.definitions_for_user(user_id)
+        if not isinstance(definitions, list) or any(
+            not isinstance(item, Mapping) for item in definitions
+        ):
+            raise DataAdapterError("native schedule export is invalid")
+        rows = native.get("schedules")
+        if not isinstance(rows, list):
+            raise DataAdapterError("native export records are invalid")
+        return {
+            **native,
+            "schedules": [*rows, *(dict(item) for item in definitions)],
+        }
 
     @staticmethod
     def _merge_records(native, imported):
@@ -436,7 +462,7 @@ class _ExportSource:
     def snapshot_for_user(self, user_id: str):
         """Capture one portable generation for both halves of one export."""
 
-        native_records = self._records.records_for_user(user_id)
+        native_records = self._native_records(user_id)
         native_workspace = self._workspace.workspace_files(user_id)
         imported_records, imported_workspace = self._live(user_id)
         return (
@@ -1025,6 +1051,10 @@ def build_production_application() -> WebApplication:
         records=record_store,
         workspace=authored_files_store,
         portable=portable_store,
+        schedules=DynamoScheduleDefinitionReader(
+            client=dynamodb_client,
+            table_name=SCHEDULER_CONTROL_TABLE_NAME,
+        ),
     )
     workspace = WorkspaceService(
         workspace_store=portable_source,

@@ -38,6 +38,174 @@ def _string_attribute(item: Mapping[str, Any], name: str) -> str:
     return text
 
 
+class DynamoScheduleDefinitionReader:
+    """Strong-read exact native definitions without delivery/provider authority."""
+
+    def __init__(self, *, client: Any, table_name: str) -> None:
+        if any(
+            not callable(getattr(client, method, None))
+            for method in ("query", "get_item")
+        ):
+            raise TypeError("schedule definition reader requires exact Dynamo methods")
+        if not isinstance(table_name, str) or _TABLE.fullmatch(table_name) is None:
+            raise ValueError("schedule definition table name is invalid")
+        self._client = client
+        self._table_name = table_name
+
+    @staticmethod
+    def _user(user_id: str) -> str:
+        if not isinstance(user_id, str) or _USER.fullmatch(user_id) is None:
+            raise ValueError("schedule capability user is invalid")
+        return user_id
+
+    def read_schedule(self, schedule_id: str) -> ScheduleSpecV1 | None:
+        if not isinstance(schedule_id, str) or _SCHEDULE.fullmatch(schedule_id) is None:
+            raise ValueError("schedule identity is invalid")
+        response = self._client.get_item(
+            TableName=self._table_name,
+            Key={
+                "PK": {"S": f"SCHEDULE#{schedule_id}"},
+                "SK": {"S": "STATE"},
+            },
+            ConsistentRead=True,
+        )
+        if not isinstance(response, Mapping):
+            raise RuntimeError("scheduler control strong read is invalid")
+        raw = response.get("Item")
+        if raw is None:
+            return None
+        required_fields = {
+            "PK",
+            "SK",
+            "userId",
+            "scheduleUserId",
+            "scheduleSortKey",
+            "recordJson",
+            "deliveryJson",
+        }
+        if not isinstance(raw, Mapping) or frozenset(raw) not in {
+            frozenset(required_fields),
+            frozenset({*required_fields, "ttl"}),
+        }:
+            raise RuntimeError("scheduler control record is invalid")
+        if (
+            _string_attribute(raw, "PK") != f"SCHEDULE#{schedule_id}"
+            or _string_attribute(raw, "SK") != "STATE"
+            or _string_attribute(raw, "scheduleSortKey")
+            != f"SCHEDULE#{schedule_id}"
+        ):
+            raise RuntimeError("scheduler control record crossed a schedule boundary")
+        try:
+            spec = ScheduleSpecV1.from_mapping(
+                json.loads(_string_attribute(raw, "recordJson"))
+            )
+        except (TypeError, ValueError):
+            raise RuntimeError("scheduler control record is invalid") from None
+        if (
+            spec.schedule_id != schedule_id
+            or _string_attribute(raw, "userId") != spec.user_id
+            or _string_attribute(raw, "scheduleUserId") != spec.user_id
+        ):
+            raise RuntimeError("scheduler control record binding is invalid")
+        ttl = raw.get("ttl")
+        if spec.state == "ENABLED":
+            if ttl is not None:
+                raise RuntimeError("scheduler control record is invalid")
+        elif (
+            not isinstance(ttl, Mapping)
+            or set(ttl) != {"N"}
+            or not isinstance(ttl.get("N"), str)
+            or not ttl["N"].isdigit()
+            or int(ttl["N"]) <= 0
+        ):
+            raise RuntimeError("scheduler control record is invalid")
+        return spec
+
+    def definitions_for_user(self, user_id: str) -> list[dict[str, Any]]:
+        user_id = self._user(user_id)
+        definitions: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        seen_cursors: set[tuple[str, str]] = set()
+        start_key: dict[str, Any] | None = None
+        while True:
+            request = {
+                "TableName": self._table_name,
+                "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :prefix)",
+                "ExpressionAttributeNames": {"#pk": "PK", "#sk": "SK"},
+                "ExpressionAttributeValues": {
+                    ":pk": {"S": f"USER#{user_id}"},
+                    ":prefix": {"S": "SCHEDULE#"},
+                },
+                "ProjectionExpression": "PK, SK, recordType, scheduleId",
+                "ConsistentRead": True,
+                "Limit": _MAX_SCHEDULES + 1,
+            }
+            if start_key is not None:
+                request["ExclusiveStartKey"] = start_key
+            response = self._client.query(**request)
+            if not isinstance(response, Mapping):
+                raise RuntimeError("schedule listing is invalid")
+            raw_items = response.get("Items")
+            if not isinstance(raw_items, list) or len(raw_items) > _MAX_SCHEDULES + 1:
+                raise RuntimeError("schedule listing page is invalid")
+            for raw in raw_items:
+                if not isinstance(raw, Mapping) or set(raw) != {
+                    "PK",
+                    "SK",
+                    "recordType",
+                    "scheduleId",
+                }:
+                    raise RuntimeError("schedule owner record is invalid")
+                pk = _string_attribute(raw, "PK")
+                sk = _string_attribute(raw, "SK")
+                schedule_id = _string_attribute(raw, "scheduleId")
+                if (
+                    pk != f"USER#{user_id}"
+                    or sk != f"SCHEDULE#{schedule_id}"
+                    or _string_attribute(raw, "recordType") != "SCHEDULE_OWNER"
+                    or _SCHEDULE.fullmatch(schedule_id) is None
+                ):
+                    raise RuntimeError("schedule owner crossed a tenant boundary")
+                if schedule_id in seen:
+                    raise RuntimeError("schedule owner inventory contains a duplicate")
+                seen.add(schedule_id)
+                spec = self.read_schedule(schedule_id)
+                # Terminal STATE rows have bounded physical retention while
+                # their owner rows deliberately remain for provider-orphan
+                # discovery during account deletion. Missing STATE is thus an
+                # inert historical owner, not an authority race.
+                if spec is None:
+                    continue
+                if spec.user_id != user_id:
+                    raise RuntimeError("schedule listing authority changed during read")
+                definitions.append(spec.to_mapping())
+                if len(definitions) > _MAX_SCHEDULES:
+                    raise RuntimeError("live schedule listing exceeds its bound")
+
+            cursor = response.get("LastEvaluatedKey")
+            if cursor is None:
+                break
+            if not isinstance(cursor, Mapping) or set(cursor) != {"PK", "SK"}:
+                raise RuntimeError("schedule listing cursor is invalid")
+            cursor_pk = _string_attribute(cursor, "PK")
+            cursor_sk = _string_attribute(cursor, "SK")
+            marker = (cursor_pk, cursor_sk)
+            if (
+                cursor_pk != f"USER#{user_id}"
+                or not cursor_sk.startswith("SCHEDULE#")
+                or _SCHEDULE.fullmatch(cursor_sk.removeprefix("SCHEDULE#")) is None
+                or marker in seen_cursors
+            ):
+                raise RuntimeError("schedule listing cursor is invalid")
+            seen_cursors.add(marker)
+            start_key = {
+                "PK": {"S": cursor_pk},
+                "SK": {"S": cursor_sk},
+            }
+        definitions.sort(key=lambda item: item["scheduleId"])
+        return definitions
+
+
 class DynamoScheduleCapabilityPort:
     """Strong-read schedules and durably prepare proposals, never dispatch."""
 
@@ -50,6 +218,7 @@ class DynamoScheduleCapabilityPort:
         catalog_digest: str,
         clock: Callable[[], int],
         nonce_factory: Callable[[], str],
+        imported_schedules: Any | None = None,
     ) -> None:
         if any(
             not callable(getattr(client, method, None))
@@ -67,12 +236,21 @@ class DynamoScheduleCapabilityPort:
             raise ValueError("schedule capability catalog digest is invalid")
         if not callable(clock) or not callable(nonce_factory):
             raise TypeError("schedule capability port requires trusted time and nonce")
+        if imported_schedules is not None and not callable(
+            getattr(imported_schedules, "disabled_schedules", None)
+        ):
+            raise TypeError("imported schedule projection is invalid")
         self._client = client
         self._table_name = table_name
         self._authority_table_name = authority_table_name
         self._catalog_digest = catalog_digest
         self._clock = clock
         self._nonce_factory = nonce_factory
+        self._definitions = DynamoScheduleDefinitionReader(
+            client=client,
+            table_name=table_name,
+        )
+        self._imported_schedules = imported_schedules
 
     @staticmethod
     def _user(user_id: str) -> str:
@@ -158,101 +336,71 @@ class DynamoScheduleCapabilityPort:
         return {"actorId": record["actorId"], "chatId": record["chatId"]}
 
     def _read_schedule(self, schedule_id: str) -> ScheduleSpecV1 | None:
-        if not isinstance(schedule_id, str) or _SCHEDULE.fullmatch(schedule_id) is None:
-            raise ValueError("schedule identity is invalid")
-        response = self._client.get_item(
-            TableName=self._table_name,
-            Key={
-                "PK": {"S": f"SCHEDULE#{schedule_id}"},
-                "SK": {"S": "STATE"},
-            },
-            ConsistentRead=True,
-        )
-        raw = response.get("Item")
-        if raw is None:
-            return None
-        if not isinstance(raw, Mapping) or set(raw) != {
-            "PK",
-            "SK",
-            "userId",
-            "scheduleUserId",
-            "scheduleSortKey",
-            "recordJson",
-            "deliveryJson",
-        }:
-            raise RuntimeError("scheduler control record is invalid")
-        if (
-            _string_attribute(raw, "PK") != f"SCHEDULE#{schedule_id}"
-            or _string_attribute(raw, "SK") != "STATE"
-            or _string_attribute(raw, "scheduleSortKey")
-            != f"SCHEDULE#{schedule_id}"
-        ):
-            raise RuntimeError("scheduler control record crossed a schedule boundary")
-        try:
-            spec = ScheduleSpecV1.from_mapping(
-                json.loads(_string_attribute(raw, "recordJson"))
-            )
-        except (TypeError, ValueError):
-            raise RuntimeError("scheduler control record is invalid") from None
-        if (
-            spec.schedule_id != schedule_id
-            or _string_attribute(raw, "userId") != spec.user_id
-            or _string_attribute(raw, "scheduleUserId") != spec.user_id
-        ):
-            raise RuntimeError("scheduler control record binding is invalid")
-        return spec
+        return self._definitions.read_schedule(schedule_id)
 
     def list_view(self, user_id: str) -> Mapping[str, Any]:
         user_id = self._user(user_id)
-        response = self._client.query(
-            TableName=self._table_name,
-            IndexName="schedule-user-index-v1",
-            KeyConditionExpression="#user = :user",
-            ExpressionAttributeNames={"#user": "scheduleUserId"},
-            ExpressionAttributeValues={":user": {"S": user_id}},
-            ProjectionExpression="PK, SK, scheduleUserId, scheduleSortKey",
-            Limit=_MAX_SCHEDULES + 1,
-        )
-        raw_items = response.get("Items")
-        if (
-            not isinstance(raw_items, list)
-            or response.get("LastEvaluatedKey") is not None
-            or len(raw_items) > _MAX_SCHEDULES
-        ):
+        native = self._definitions.definitions_for_user(user_id)
+        schedules = [
+            {
+                "scheduleId": definition["scheduleId"],
+                "taskType": definition["taskType"],
+                "state": definition["state"],
+                "nextRunAt": definition["nextRunAt"],
+            }
+            for definition in native
+        ]
+        seen = {item["scheduleId"] for item in schedules}
+        if self._imported_schedules is not None:
+            imported = self._imported_schedules.disabled_schedules(user_id)
+            if not isinstance(imported, list) or len(imported) > _MAX_SCHEDULES:
+                raise RuntimeError("imported schedule listing is invalid")
+            expected = set(ScheduleSpecV1.FIELDS) - {"schema", "nextRunAt"}
+            for raw in imported:
+                if not isinstance(raw, Mapping):
+                    raise RuntimeError("imported schedule listing is invalid")
+                # Portable-v2 historically admitted other inert schedule
+                # descriptors. They remain portable, but only the exact
+                # governed portable projection enters schedule.list.
+                if set(raw) != expected:
+                    if {
+                        "scheduleId",
+                        "userId",
+                        "taskType",
+                        "definition",
+                        "definitionHash",
+                        "revision",
+                    }.issubset(raw):
+                        raise RuntimeError("imported schedule listing is invalid")
+                    continue
+                if (
+                    raw.get("userId") != user_id
+                    or raw.get("state") != "DISABLED"
+                ):
+                    raise RuntimeError("imported schedule listing is invalid")
+                candidate = dict(raw)
+                candidate.update(
+                    schema=ScheduleSpecV1.SCHEMA,
+                    state="PAUSED",
+                    nextRunAt=None,
+                )
+                try:
+                    spec = ScheduleSpecV1.from_mapping(candidate)
+                except (TypeError, ValueError):
+                    raise RuntimeError("imported schedule listing is invalid") from None
+                if spec.schedule_id in seen:
+                    raise RuntimeError("imported schedule listing contains a duplicate")
+                seen.add(spec.schedule_id)
+                schedules.append(
+                    {
+                        "scheduleId": spec.schedule_id,
+                        "taskType": spec.task_type,
+                        "state": "PAUSED",
+                        "nextRunAt": None,
+                    }
+                )
+        if len(schedules) > _MAX_SCHEDULES:
             raise RuntimeError("schedule listing exceeds its bound")
-        schedules = []
-        seen: set[str] = set()
-        for raw in raw_items:
-            if not isinstance(raw, Mapping) or set(raw) != {
-                "PK",
-                "SK",
-                "scheduleUserId",
-                "scheduleSortKey",
-            }:
-                raise RuntimeError("schedule index record is invalid")
-            pk = _string_attribute(raw, "PK")
-            sk = _string_attribute(raw, "SK")
-            if _string_attribute(raw, "scheduleUserId") != user_id:
-                raise RuntimeError("schedule index crossed a tenant boundary")
-            if not pk.startswith("SCHEDULE#") or sk != "STATE":
-                continue
-            schedule_id = pk.removeprefix("SCHEDULE#")
-            if _string_attribute(raw, "scheduleSortKey") != pk:
-                raise RuntimeError("schedule index sort binding is invalid")
-            if schedule_id in seen:
-                raise RuntimeError("schedule index contains a duplicate")
-            spec = self._read_schedule(schedule_id)
-            if spec is None or spec.user_id != user_id:
-                raise RuntimeError("schedule listing authority changed during read")
-            seen.add(schedule_id)
-            schedules.append(
-                {
-                    "scheduleId": spec.schedule_id,
-                    "taskType": spec.task_type,
-                    "state": spec.state,
-                    "nextRunAt": spec.next_run_at,
-                }
-            )
         schedules.sort(key=lambda item: item["scheduleId"])
         return {"schedules": schedules}
 
@@ -347,4 +495,4 @@ class DynamoScheduleCapabilityPort:
         )
 
 
-__all__ = ["DynamoScheduleCapabilityPort"]
+__all__ = ["DynamoScheduleCapabilityPort", "DynamoScheduleDefinitionReader"]

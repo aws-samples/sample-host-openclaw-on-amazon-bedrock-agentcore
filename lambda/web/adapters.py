@@ -17,6 +17,10 @@ from capabilities.contracts import (
     ContractValidationError,
     FROZEN_CATALOG_PACKS_V1,
 )
+from capabilities.retention import (
+    derive_deletion_subject_binding,
+    subject_partition_key,
+)
 from portable.manifest import strict_json_loads
 
 
@@ -390,12 +394,16 @@ class DynamoUserDataStore:
         self._installation_table = installation_table
         self._now = now or (lambda: int(time.time()))
 
-    def _installed_packs(self, user_id: str) -> list[dict]:
+    def _installed_packs(self, user_id: str, *, now: int) -> list[dict]:
         if self._installation_table is None:
             return []
         result = []
+        owner_binding = derive_deletion_subject_binding(user_id)
         for pack_id in _PORTABLE_PACK_IDS:
-            key = {"PK": f"USER#{user_id}", "SK": f"INSTALL#{pack_id}"}
+            key = {
+                "PK": subject_partition_key(user_id),
+                "SK": f"AUTHORITY#INSTALL#{pack_id}",
+            }
             try:
                 response = self._installation_table.get_item(
                     Key=key,
@@ -414,14 +422,28 @@ class DynamoUserDataStore:
                 continue
             if (
                 not isinstance(item, Mapping)
-                or set(item) != {"PK", "SK", "recordJson", "version"}
+                or set(item)
+                != {
+                    "PK",
+                    "SK",
+                    "ownerBinding",
+                    "recordJson",
+                    "ttl",
+                    "version",
+                }
                 or item.get("PK") != key["PK"]
                 or item.get("SK") != key["SK"]
+                or item.get("ownerBinding") != owner_binding
             ):
                 raise DataAdapterError("capability installation record is invalid")
             version = _portable_json_value(item.get("version"))
             if isinstance(version, bool) or not isinstance(version, int) or version < 1:
                 raise DataAdapterError("capability installation record is invalid")
+            ttl = _portable_json_value(item.get("ttl"))
+            if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+                raise DataAdapterError("capability installation record is invalid")
+            if ttl <= now:
+                continue
             try:
                 parsed = strict_json_loads(item.get("recordJson"))
                 installation = CapabilityInstallationV1.from_mapping(parsed)
@@ -581,7 +603,7 @@ class DynamoUserDataStore:
         records = {
             "memory": [],
             "schedules": [],
-            "installed_packs": self._installed_packs(user_id),
+            "installed_packs": self._installed_packs(user_id, now=now),
             "connectors": [],
             "compute_receipts": [],
             "receipts": [],

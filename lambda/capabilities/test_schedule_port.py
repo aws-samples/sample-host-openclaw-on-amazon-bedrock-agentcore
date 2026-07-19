@@ -5,7 +5,10 @@ import json
 
 import pytest
 
-from capabilities.schedule_port import DynamoScheduleCapabilityPort
+from capabilities.schedule_port import (
+    DynamoScheduleCapabilityPort,
+    DynamoScheduleDefinitionReader,
+)
 from capabilities.retention import (
     derive_deletion_subject_binding,
     subject_partition_key,
@@ -29,20 +32,37 @@ class MemorySchedulerClient:
 
     def query(self, **kwargs):
         self.query_calls.append(kwargs)
-        user_id = kwargs["ExpressionAttributeValues"][":user"]["S"]
-        index_field = kwargs["ExpressionAttributeNames"]["#user"]
-        items = []
-        for (pk, sk), item in self.items.items():
-            if item.get(index_field, {}).get("S") == user_id:
-                items.append(
-                    {
-                        "PK": {"S": pk},
-                        "SK": {"S": sk},
-                        index_field: {"S": user_id},
-                        "scheduleSortKey": item["scheduleSortKey"],
-                    }
-                )
-        return {"Items": items}
+        partition = kwargs["ExpressionAttributeValues"][":pk"]["S"]
+        prefix = kwargs["ExpressionAttributeValues"][":prefix"]["S"]
+        items = sorted(
+            (
+                dict(item)
+                for (pk, sk), item in self.items.items()
+                if pk == partition and sk.startswith(prefix)
+            ),
+            key=lambda item: item["SK"]["S"],
+        )
+        start = kwargs.get("ExclusiveStartKey")
+        if start is not None:
+            start_sk = start["SK"]["S"]
+            items = [item for item in items if item["SK"]["S"] > start_sk]
+        limit = kwargs.get("Limit", len(items))
+        page = items[:limit]
+        response = {"Items": page}
+        if len(items) > limit:
+            response["LastEvaluatedKey"] = {
+                "PK": dict(page[-1]["PK"]),
+                "SK": dict(page[-1]["SK"]),
+            }
+        return response
+
+    def seed_owner(self, *, user_id, schedule_id):
+        self.items[(f"USER#{user_id}", f"SCHEDULE#{schedule_id}")] = {
+            "PK": {"S": f"USER#{user_id}"},
+            "SK": {"S": f"SCHEDULE#{schedule_id}"},
+            "recordType": {"S": "SCHEDULE_OWNER"},
+            "scheduleId": {"S": schedule_id},
+        }
 
     def get_item(self, **kwargs):
         self.get_calls.append(kwargs)
@@ -63,7 +83,7 @@ class MemorySchedulerClient:
         return {}
 
     def seed_schedule(self, spec):
-        self.items[(f"SCHEDULE#{spec.schedule_id}", "STATE")] = {
+        state = {
             "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
             "SK": {"S": "STATE"},
             "userId": {"S": spec.user_id},
@@ -78,6 +98,10 @@ class MemorySchedulerClient:
                 "S": '{"actorId":"telegram:1","chatId":"1"}'
             },
         }
+        if spec.state != "ENABLED":
+            state["ttl"] = {"N": str(NOW + 90 * 86400)}
+        self.items[(f"SCHEDULE#{spec.schedule_id}", "STATE")] = state
+        self.seed_owner(user_id=spec.user_id, schedule_id=spec.schedule_id)
 
     def seed_delivery(self, *, user_id="user_alpha", invocation_id="invocation_12345678"):
         binding = derive_deletion_subject_binding(user_id)
@@ -149,8 +173,211 @@ def test_lists_only_strong_read_tenant_bound_schedule_views():
             }
         ]
     }
-    assert client.query_calls[0]["IndexName"] == "schedule-user-index-v1"
+    assert "IndexName" not in client.query_calls[0]
+    assert client.query_calls[0]["ConsistentRead"] is True
     assert client.get_calls[0]["ConsistentRead"] is True
+
+
+def test_native_definition_reader_exports_exact_tenant_specs_without_delivery_authority():
+    client = MemorySchedulerClient()
+    own = _spec()
+    foreign = build_schedule_spec(
+        schedule_id="schedule_87654321",
+        user_id="user_beta",
+        task_type="REMINDER",
+        definition={
+            "message": "foreign",
+            "runAt": NOW + 7200,
+            "timezone": "Europe/Tallinn",
+        },
+        revision=1,
+        state="ENABLED",
+    )
+    client.seed_schedule(own)
+    client.seed_schedule(foreign)
+
+    definitions = DynamoScheduleDefinitionReader(
+        client=client,
+        table_name="personal-operator-scheduler-control",
+    ).definitions_for_user("user_alpha")
+
+    assert definitions == [own.to_mapping()]
+    assert "deliveryTarget" not in definitions[0]
+    assert "deliveryJson" not in definitions[0]
+    assert "IndexName" not in client.query_calls[0]
+    assert client.query_calls[0]["ConsistentRead"] is True
+    assert all(call["ConsistentRead"] is True for call in client.get_calls)
+
+
+def test_definition_reader_accepts_only_state_appropriate_terminal_ttl():
+    client = MemorySchedulerClient()
+    paused = build_schedule_spec(
+        schedule_id="schedule_paused_12345678",
+        user_id="user_alpha",
+        task_type="REMINDER",
+        definition={
+            "message": "paused",
+            "runAt": NOW + 3600,
+            "timezone": "Europe/Tallinn",
+        },
+        revision=2,
+        state="PAUSED",
+    )
+    client.seed_schedule(paused)
+    reader = DynamoScheduleDefinitionReader(
+        client=client,
+        table_name="personal-operator-scheduler-control",
+    )
+
+    assert reader.definitions_for_user("user_alpha") == [paused.to_mapping()]
+
+    client.items[(f"SCHEDULE#{paused.schedule_id}", "STATE")].pop("ttl")
+    with pytest.raises(RuntimeError, match="scheduler control record"):
+        reader.definitions_for_user("user_alpha")
+
+    enabled = _spec()
+    client = MemorySchedulerClient()
+    client.seed_schedule(enabled)
+    client.items[(f"SCHEDULE#{enabled.schedule_id}", "STATE")]["ttl"] = {
+        "N": str(NOW + 90 * 86400)
+    }
+    with pytest.raises(RuntimeError, match="scheduler control record"):
+        DynamoScheduleDefinitionReader(
+            client=client,
+            table_name="personal-operator-scheduler-control",
+        ).definitions_for_user("user_alpha")
+
+
+def test_definition_reader_skips_durable_owner_after_terminal_state_ttl_expiry():
+    client = MemorySchedulerClient()
+    client.seed_owner(
+        user_id="user_alpha",
+        schedule_id="schedule_aged_12345678",
+    )
+    reader = DynamoScheduleDefinitionReader(
+        client=client,
+        table_name="personal-operator-scheduler-control",
+    )
+
+    assert reader.definitions_for_user("user_alpha") == []
+    assert _port(client).list_view("user_alpha") == {"schedules": []}
+    assert all(call["ConsistentRead"] is True for call in client.get_calls)
+
+
+def test_definition_reader_paginates_more_than_256_historical_owners():
+    client = MemorySchedulerClient()
+    for offset in range(300):
+        client.seed_owner(
+            user_id="user_alpha",
+            schedule_id=f"schedule_history_{offset:08d}",
+        )
+    live = build_schedule_spec(
+        schedule_id="schedule_z_live_12345678",
+        user_id="user_alpha",
+        task_type="REMINDER",
+        definition={
+            "message": "still live",
+            "runAt": NOW + 7200,
+            "timezone": "Europe/Tallinn",
+        },
+        revision=1,
+        state="ENABLED",
+    )
+    client.seed_schedule(live)
+    reader = DynamoScheduleDefinitionReader(
+        client=client,
+        table_name="personal-operator-scheduler-control",
+    )
+
+    assert reader.definitions_for_user("user_alpha") == [live.to_mapping()]
+    assert len(client.query_calls) == 2
+    assert "ExclusiveStartKey" not in client.query_calls[0]
+    assert client.query_calls[1]["ExclusiveStartKey"]["PK"] == {
+        "S": "USER#user_alpha"
+    }
+
+
+def test_schedule_list_merges_catalog_valid_imported_definitions_as_disabled_only():
+    client = MemorySchedulerClient()
+    native = _spec()
+    client.seed_schedule(native)
+    imported_spec = build_schedule_spec(
+        schedule_id="schedule_imported_12345678",
+        user_id="user_alpha",
+        task_type="READ_ONLY_AGENT_TURN",
+        definition={
+            "prompt": "summarize workspace",
+            "runAt": NOW + 10_800,
+            "timezone": "Europe/Tallinn",
+        },
+        revision=4,
+        state="PAUSED",
+    ).to_mapping()
+    imported_spec.pop("schema")
+    imported_spec.pop("nextRunAt")
+    imported_spec["state"] = "DISABLED"
+
+    class Imported:
+        def disabled_schedules(self, user_id):
+            assert user_id == "user_alpha"
+            return [imported_spec]
+
+    port = DynamoScheduleCapabilityPort(
+        client=client,
+        table_name="personal-operator-scheduler-control",
+        authority_table_name="personal-operator-capability-state",
+        catalog_digest="c" * 64,
+        clock=lambda: NOW,
+        nonce_factory=lambda: "nonce_12345678",
+        imported_schedules=Imported(),
+    )
+
+    assert port.list_view("user_alpha") == {
+        "schedules": [
+            {
+                "scheduleId": "schedule_12345678",
+                "taskType": "REMINDER",
+                "state": "ENABLED",
+                "nextRunAt": NOW + 3600,
+            },
+            {
+                "scheduleId": "schedule_imported_12345678",
+                "taskType": "READ_ONLY_AGENT_TURN",
+                "state": "PAUSED",
+                "nextRunAt": None,
+            },
+        ]
+    }
+
+
+def test_imported_schedule_projection_rejects_cross_tenant_or_armed_rows():
+    client = MemorySchedulerClient()
+    imported = _spec(user_id="user_beta").to_mapping()
+    imported.pop("schema")
+    imported["state"] = "DISABLED"
+    imported.pop("nextRunAt")
+
+    class Imported:
+        def disabled_schedules(self, _user_id):
+            return [imported]
+
+    port = DynamoScheduleCapabilityPort(
+        client=client,
+        table_name="personal-operator-scheduler-control",
+        authority_table_name="personal-operator-capability-state",
+        catalog_digest="c" * 64,
+        clock=lambda: NOW,
+        nonce_factory=lambda: "nonce_12345678",
+        imported_schedules=Imported(),
+    )
+
+    with pytest.raises(RuntimeError, match="imported schedule"):
+        port.list_view("user_alpha")
+
+    imported["userId"] = "user_alpha"
+    imported["nextRunAt"] = NOW + 3600
+    with pytest.raises(RuntimeError, match="imported schedule"):
+        port.list_view("user_alpha")
 
 
 def test_proposals_are_durable_bounded_and_never_dispatch_a_live_schedule():

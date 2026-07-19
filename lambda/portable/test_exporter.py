@@ -8,6 +8,7 @@ import pytest
 
 from capabilities.contracts import PortableStateManifestV2
 from capabilities.contracts import ImportPlanV1
+from scheduler.models import build_schedule_spec
 
 from portable import (
     FORMAT,
@@ -232,6 +233,34 @@ def test_export_normalizes_authority_bearing_metadata_to_inert_rows():
     assert packs[0]["state"] == "PAUSED"
     assert packs[0]["killSwitch"] is True
     assert packs[0]["connectionRefs"] == []
+
+
+def test_governed_schedule_exports_as_explicit_portable_row_without_mutating_frozen_schema():
+    spec = build_schedule_spec(
+        schedule_id="schedule_12345678",
+        user_id=USER,
+        task_type="REMINDER",
+        definition={
+            "message": "review notes",
+            "runAt": 1_800_003_600,
+            "timezone": "Europe/Tallinn",
+        },
+        revision=2,
+        state="ENABLED",
+    )
+    source = Source(records=_required_records(schedules=[spec.to_mapping()]))
+
+    bundle = PortableExporter(source).build(USER)
+
+    with zipfile.ZipFile(io.BytesIO(bundle.zip_bytes)) as archive:
+        schedules = json.loads(archive.read("records/schedules.json"))
+    expected = spec.to_mapping()
+    expected.pop("schema")
+    expected.pop("nextRunAt")
+    expected["state"] = "DISABLED"
+    assert schedules == [expected]
+    assert "schema" not in schedules[0]
+    assert "nextRunAt" not in schedules[0]
 
 
 def test_include_exclude_categories_reject_unknown_record_category():

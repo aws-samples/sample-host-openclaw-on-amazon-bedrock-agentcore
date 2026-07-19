@@ -819,19 +819,19 @@ class FakeKms:
 
 class FakeDynamoClient:
     def get_item(self, **_kwargs):
-        raise AssertionError("capability deletion fence was unexpectedly called")
+        raise AssertionError("trusted Dynamo adapter was unexpectedly called")
 
     def put_item(self, **_kwargs):
-        raise AssertionError("capability deletion fence was unexpectedly called")
+        raise AssertionError("trusted Dynamo adapter was unexpectedly called")
 
     def update_item(self, **_kwargs):
-        raise AssertionError("capability deletion fence was unexpectedly called")
+        raise AssertionError("trusted Dynamo adapter was unexpectedly called")
 
     def query(self, **_kwargs):
-        raise AssertionError("capability deletion fence was unexpectedly called")
+        raise AssertionError("trusted Dynamo adapter was unexpectedly called")
 
     def transact_write_items(self, **_kwargs):
-        raise AssertionError("capability deletion fence was unexpectedly called")
+        raise AssertionError("trusted Dynamo adapter was unexpectedly called")
 
 
 class FakeLambda:
@@ -877,6 +877,34 @@ def install_fake_aws(monkeypatch, secret_client):
     monkeypatch.setitem(sys.modules, "botocore", botocore)
     monkeypatch.setitem(sys.modules, "botocore.config", botocore_config)
     return dynamo
+
+
+def test_production_export_source_uses_read_only_native_scheduler_projection(
+    monkeypatch,
+):
+    base_env(monkeypatch)
+    secrets = SecretClient(
+        {
+            "web-auth": "w" * 64,
+            "approval-signing": "a" * 64,
+            "google-readonly": '{"client_id":"REPLACE_ME","client_secret":"REPLACE_ME"}',
+            "google-send": (
+                '{"client_id":"REPLACE_ME","client_secret":"REPLACE_ME",'
+                '"refresh_token":"REPLACE_ME","email":"REPLACE_ME",'
+                '"connection_id":"REPLACE_ME","user_id":"founder-1"}'
+            ),
+        }
+    )
+    install_fake_aws(monkeypatch, secrets)
+
+    application = composition.build_production_application()
+
+    from capabilities.schedule_port import DynamoScheduleDefinitionReader
+
+    schedules = application._exporter._source._schedules
+    assert isinstance(schedules, DynamoScheduleDefinitionReader)
+    assert schedules._table_name == "personal-operator-scheduler-control"
+    assert secrets.calls == ["web-auth"]
 
 
 def test_production_builder_reads_only_web_auth_secret_and_defers_provider_paths(
@@ -1055,6 +1083,64 @@ def test_export_source_strong_reads_and_merges_active_portable_generation():
         "native.md": b"native",
     }
     assert portable.reads == ["founder-1", "founder-1"]
+
+
+def test_export_source_merges_governed_scheduler_definitions_into_portable_records():
+    definition = {
+        "schema": "personal-operator.schedule-spec.v1",
+        "scheduleId": "schedule_12345678",
+        "userId": "founder-1",
+        "taskType": "REMINDER",
+        "definition": {
+            "message": "review notes",
+            "runAt": 1_800_003_600,
+            "timezone": "Europe/Tallinn",
+        },
+        "definitionHash": "d" * 64,
+        "revision": 2,
+        "state": "ENABLED",
+        "timezone": "Europe/Tallinn",
+        "nextRunAt": 1_800_003_600,
+    }
+
+    class Records:
+        def records_for_user(self, user_id):
+            assert user_id == "founder-1"
+            return {
+                "memory": [{"native": True}],
+                "schedules": [{"legacy": "inert"}],
+                "installed_packs": [],
+                "connectors": [],
+                "compute_receipts": [],
+                "receipts": [],
+            }
+
+    class Workspace:
+        def workspace_files(self, user_id):
+            assert user_id == "founder-1"
+            return {}
+
+    class Schedules:
+        def __init__(self):
+            self.reads = []
+
+        def definitions_for_user(self, user_id):
+            self.reads.append(user_id)
+            return [definition]
+
+    schedules = Schedules()
+    source = composition._ExportSource(
+        records=Records(),
+        workspace=Workspace(),
+        schedules=schedules,
+    )
+
+    records, files = source.snapshot_for_user("founder-1")
+
+    assert records["schedules"] == [{"legacy": "inert"}, definition]
+    assert records["memory"] == [{"native": True}]
+    assert files == {}
+    assert schedules.reads == ["founder-1"]
 
 
 def test_source_has_no_top_level_google_or_openai_provider_imports():

@@ -17,6 +17,7 @@ from capabilities.contracts import (
     ComputeReceiptV1,
     ContractValidationError,
     EffectReceiptV1,
+    ScheduleSpecV1,
 )
 
 from .manifest import ImportRejected, RECORD_CATEGORIES, scan_for_secrets, user_id
@@ -33,6 +34,10 @@ _ARMED_SCHEDULE_FIELDS = frozenset(
         "connectionRefs",
     }
 )
+_GOVERNED_PORTABLE_SCHEDULE_FIELDS = frozenset(ScheduleSpecV1.FIELDS) - {
+    "schema",
+    "nextRunAt",
+}
 
 
 def _record_rows(value: object) -> dict[str, list[dict]]:
@@ -96,6 +101,37 @@ def _effect_receipt(row: Mapping) -> dict:
 
 
 def _schedule(row: Mapping, *, target_user_id: str, normalize: bool) -> dict:
+    if row.get("schema") == ScheduleSpecV1.SCHEMA:
+        try:
+            native = ScheduleSpecV1.from_mapping(row)
+        except (ContractValidationError, TypeError, ValueError) as error:
+            raise ImportRejected("portable governed schedule is invalid") from error
+        if native.user_id != target_user_id:
+            raise ImportRejected("portable governed schedule crossed a tenant boundary")
+        landed = native.to_mapping()
+        landed.pop("schema")
+        landed.pop("nextRunAt")
+        landed["state"] = "DISABLED"
+        return landed
+    if set(row) == _GOVERNED_PORTABLE_SCHEDULE_FIELDS:
+        if row.get("state") != "DISABLED":
+            raise ImportRejected("portable governed schedule is not disabled")
+        candidate = dict(row)
+        candidate.update(
+            schema=ScheduleSpecV1.SCHEMA,
+            state="PAUSED",
+            nextRunAt=None,
+        )
+        try:
+            governed = ScheduleSpecV1.from_mapping(candidate)
+        except (ContractValidationError, TypeError, ValueError) as error:
+            raise ImportRejected("portable governed schedule is invalid") from error
+        if not normalize and governed.user_id != target_user_id:
+            raise ImportRejected("portable governed schedule crossed a tenant boundary")
+        landed = dict(row)
+        landed["userId"] = target_user_id
+        landed["state"] = "DISABLED"
+        return landed
     if not normalize and (
         row.get("state") != "DISABLED"
         or row.get("userId") != target_user_id
