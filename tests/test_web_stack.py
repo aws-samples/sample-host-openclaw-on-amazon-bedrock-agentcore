@@ -30,6 +30,10 @@ SCHEDULER_CONTROL_ARN = (
     "arn:aws:lambda:eu-west-1:123456789012:function:"
     "personal-operator-scheduler-control"
 )
+SCHEDULER_CONTROL_TABLE_ARN = (
+    "arn:aws:dynamodb:eu-west-1:123456789012:table/"
+    "personal-operator-scheduler-control"
+)
 
 
 def _resources(template: dict, resource_type: str) -> list[dict]:
@@ -158,6 +162,7 @@ def _synth_web_template(
         runtime_iam_arn=RUNTIME_IAM_ARN,
         runtime_endpoint_name=RELEASE_ENDPOINT,
         scheduler_control_function_arn=SCHEDULER_CONTROL_ARN,
+        scheduler_control_table_arn=SCHEDULER_CONTROL_TABLE_ARN,
         trusted_code_asset_root="lambda",
         web_asset_root="tests/fixtures/web-dist",
         founder_user_ids=founder_user_ids,
@@ -194,6 +199,7 @@ def test_web_stack_rejects_every_region_except_eu_west_1() -> None:
             runtime_iam_arn=RUNTIME_IAM_ARN,
             runtime_endpoint_name=RELEASE_ENDPOINT,
             scheduler_control_function_arn=SCHEDULER_CONTROL_ARN,
+            scheduler_control_table_arn=SCHEDULER_CONTROL_TABLE_ARN,
             trusted_code_asset_root="lambda",
             web_asset_root="tests/fixtures/web-dist",
             env=cdk.Environment(account="123456789012", region="us-east-1"),
@@ -225,6 +231,22 @@ def test_web_capability_deletion_has_only_exact_table_authority() -> None:
         "dynamodb:TransactWriteItems",
         "dynamodb:UpdateItem",
     }
+
+
+def test_web_native_schedule_export_has_only_exact_read_authority() -> None:
+    statements = [
+        statement
+        for statement in _web_statements(_synth_web_template())
+        if statement.get("Resource") == SCHEDULER_CONTROL_TABLE_ARN
+    ]
+
+    assert statements == [
+        {
+            "Action": ["dynamodb:GetItem", "dynamodb:Query"],
+            "Effect": "Allow",
+            "Resource": SCHEDULER_CONTROL_TABLE_ARN,
+        }
+    ]
 
 
 def test_static_site_is_private_encrypted_and_cloudfront_only() -> None:
@@ -1012,6 +1034,9 @@ def test_app_wires_existing_runtime_state_bucket_and_cmk_into_web_stack() -> Non
     assert "runtime_arn=agentcore_stack.runtime_arn" in source
     assert "runtime_iam_arn=agentcore_stack.runtime_iam_arn" in source
     assert "runtime_endpoint_name=agentcore_stack.runtime_endpoint_name" in source
+    assert "scheduler_control_table_arn=(" in source
+    assert "scheduler_stack.control_table.table_arn" in source
+    assert "web_stack.add_dependency(scheduler_stack)" in source
     assert "auth_secret=security_stack.web_auth_secret" in source
     assert "approval_secret=security_stack.approval_signing_secret" in source
     assert (

@@ -75,6 +75,7 @@ class WebStack(Stack):
         runtime_iam_arn: str,
         runtime_endpoint_name: str,
         scheduler_control_function_arn: str,
+        scheduler_control_table_arn: str,
         trusted_code_asset_root: str,
         trusted_code_asset_hash: str | None = None,
         web_asset_root: str,
@@ -146,6 +147,23 @@ class WebStack(Stack):
             )
         ):
             raise ValueError("scheduler control function ARN is invalid")
+        scheduler_table_pattern = (
+            rf"arn:aws:dynamodb:{re.escape(region)}:{re.escape(account)}:"
+            r"table/personal-operator-scheduler-control"
+        )
+        if (
+            not isinstance(scheduler_control_table_arn, str)
+            or not scheduler_control_table_arn
+            or (
+                not Token.is_unresolved(scheduler_control_table_arn)
+                and re.fullmatch(
+                    scheduler_table_pattern,
+                    scheduler_control_table_arn,
+                )
+                is None
+            )
+        ):
+            raise ValueError("scheduler control table ARN is invalid")
         runtime_values = (runtime_arn, runtime_iam_arn, runtime_endpoint_name)
         if runtime_values == ("PLACEHOLDER", "PLACEHOLDER", "PLACEHOLDER"):
             pass
@@ -822,6 +840,12 @@ class WebStack(Stack):
             iam.PolicyStatement(
                 actions=["lambda:InvokeFunction"],
                 resources=[scheduler_control_function_arn],
+            )
+        )
+        self.web_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:GetItem", "dynamodb:Query"],
+                resources=[scheduler_control_table_arn],
             )
         )
         self.web_fn.add_to_role_policy(

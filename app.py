@@ -228,6 +228,9 @@ web_stack = WebStack(
     scheduler_control_function_arn=(
         scheduler_stack.control_function.function_arn
     ),
+    scheduler_control_table_arn=(
+        scheduler_stack.control_table.table_arn
+    ),
     trusted_code_asset_root=trusted_lambda_asset.path,
     trusted_code_asset_hash=trusted_lambda_asset.asset_hash,
     web_asset_root=str(repository_root / "web" / "dist"),
@@ -247,6 +250,7 @@ web_stack = WebStack(
     web_acl_id=app.node.try_get_context("cloudfront_web_acl_arn") or None,
     env=env,
 )
+web_stack.add_dependency(scheduler_stack)
 
 # Same-ID tombstone deployment removes any legacy Scheduler/Lambda/IAM
 # resources from an existing OpenClawCron CloudFormation stack.
