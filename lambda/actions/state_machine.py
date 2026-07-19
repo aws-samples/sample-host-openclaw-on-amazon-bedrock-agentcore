@@ -152,6 +152,53 @@ class ActionStateMachine:
             raise ConcurrentActionUpdate("action repository cannot read exact state")
         return getter(action_id=action_id, user_id=user_id)
 
+    def stale_for_new_draft(
+        self,
+        *,
+        action_id: str,
+        revision: int,
+        user_id: str,
+        expected_draft_revision: int,
+        current_draft_revision: int,
+        now: datetime,
+    ):
+        """Atomically fence an active action superseded by a newer draft."""
+
+        record = self.get(action_id=action_id, user_id=user_id)
+        if (
+            not isinstance(record, Mapping)
+            or record.get("revision") != revision
+            or record.get("draftRevision") != expected_draft_revision
+            or isinstance(current_draft_revision, bool)
+            or not isinstance(current_draft_revision, int)
+            or current_draft_revision <= expected_draft_revision
+        ):
+            raise ConcurrentActionUpdate(
+                "draft revision is not the expected stale boundary"
+            )
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise ValueError("stale transition clock must be timezone-aware")
+        state = ActionState(record["state"])
+        if state not in {
+            ActionState.PREPARED,
+            ActionState.APPROVAL_PENDING,
+            ActionState.APPROVED,
+        }:
+            raise IllegalTransition("action can no longer be marked stale")
+        return self.transition(
+            action_id=action_id,
+            user_id=user_id,
+            current=state,
+            target=ActionState.STALE,
+            revision=revision,
+            updates={
+                "staleAt": now.astimezone(timezone.utc).isoformat(),
+                "staleReason": "newer-draft-revision",
+                "staleDraftRevision": expected_draft_revision,
+                "supersededByDraftRevision": current_draft_revision,
+            },
+        )
+
 
 def _b64(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
@@ -577,34 +624,12 @@ class ApprovalService:
         expected_draft_revision: int,
         current_draft_revision: int,
     ):
-        record = self._machine.get(action_id=action_id, user_id=user_id)
-        if (
-            not isinstance(record, Mapping)
-            or record.get("revision") != revision
-            or record.get("draftRevision") != expected_draft_revision
-            or isinstance(current_draft_revision, bool)
-            or not isinstance(current_draft_revision, int)
-            or current_draft_revision <= expected_draft_revision
-        ):
-            raise ConcurrentActionUpdate("draft revision is not the expected stale boundary")
-        state = ActionState(record["state"])
-        if state not in {
-            ActionState.PREPARED,
-            ActionState.APPROVAL_PENDING,
-            ActionState.APPROVED,
-        }:
-            raise IllegalTransition("action can no longer be marked stale")
         now = self._exact_time(self._now(), "now")
-        return self._machine.transition(
+        return self._machine.stale_for_new_draft(
             action_id=action_id,
             user_id=user_id,
-            current=state,
-            target=ActionState.STALE,
             revision=revision,
-            updates={
-                "staleAt": now.isoformat(),
-                "staleReason": "newer-draft-revision",
-                "staleDraftRevision": expected_draft_revision,
-                "supersededByDraftRevision": current_draft_revision,
-            },
+            expected_draft_revision=expected_draft_revision,
+            current_draft_revision=current_draft_revision,
+            now=now,
         )

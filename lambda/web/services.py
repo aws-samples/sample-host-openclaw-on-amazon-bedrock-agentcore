@@ -258,10 +258,10 @@ class ApprovalWebService:
         )
         # Resolve and validate the exact send connection before consuming the
         # approval transition. This function must not perform the effect.
-        executor = self._executor_factory(record)
-        execute = getattr(executor, "execute", None)
-        if not callable(execute):
-            raise TypeError("executor factory returned an invalid executor")
+        dispatcher = self._executor_factory(record)
+        dispatch = getattr(dispatcher, "dispatch", None)
+        if not callable(dispatch):
+            raise TypeError("executor factory returned an invalid connector dispatcher")
         approved = self._approvals.approve(
             action_id=action_id,
             revision=revision,
@@ -276,7 +276,7 @@ class ApprovalWebService:
             or approved.get("state") != ActionState.APPROVED.value
         ):
             raise RuntimeError("approval transition returned an invalid action")
-        receipt = execute(approved)
+        receipt = dispatch(approved)
         receipt_record = getattr(receipt, "record", None)
         if not callable(receipt_record):
             raise RuntimeError("Gmail execution returned no effect receipt")

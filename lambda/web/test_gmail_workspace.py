@@ -157,6 +157,17 @@ class ConnectionFence:
         self.saved.append(kwargs)
 
 
+class ApprovalSuperseder:
+    def __init__(self, error=None):
+        self.calls = []
+        self.error = error
+
+    def supersede_pending(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+
+
 def test_get_returns_only_live_derived_opportunities_and_latest_draft_per_action():
     expired = int((NOW - timedelta(seconds=1)).timestamp())
     table = Table(
@@ -300,6 +311,65 @@ def test_fenced_edit_forwards_the_generation_captured_before_reading():
     )
 
     assert fence.saved[0]["expected_generation"] == 6
+
+
+def test_edit_stales_pending_approval_before_persisting_new_draft_revision():
+    item = draft_item()
+    item["connectionGeneration"] = 6
+    table = Table([item])
+    fence = ConnectionFence()
+    superseder = ApprovalSuperseder()
+    workspace = GmailWorkspaceService(
+        table,
+        repository=fence,
+        approval_superseder=superseder,
+        enforce_connection_fence=True,
+        now=lambda: NOW,
+    )
+
+    workspace.edit_draft(
+        user_id=USER,
+        action_id=ACTION,
+        revision=1,
+        subject="Updated subject",
+        body="Updated body",
+    )
+
+    assert superseder.calls == [
+        {
+            "action_id": ACTION,
+            "user_id": USER,
+            "expected_draft_revision": 1,
+            "current_draft_revision": 2,
+        }
+    ]
+    assert len(fence.saved) == 1
+
+
+def test_edit_fails_closed_without_saving_when_approval_staling_fails():
+    item = draft_item()
+    item["connectionGeneration"] = 6
+    table = Table([item])
+    fence = ConnectionFence()
+    superseder = ApprovalSuperseder(RuntimeError("stale transition failed"))
+    workspace = GmailWorkspaceService(
+        table,
+        repository=fence,
+        approval_superseder=superseder,
+        enforce_connection_fence=True,
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="stale transition failed"):
+        workspace.edit_draft(
+            user_id=USER,
+            action_id=ACTION,
+            revision=1,
+            subject="Updated subject",
+            body="Updated body",
+        )
+
+    assert fence.saved == []
 
 
 def test_edit_rejects_stale_or_missing_draft_without_writing():

@@ -242,12 +242,18 @@ class GmailWorkspaceService:
         table,
         *,
         repository=None,
+        approval_superseder=None,
         enforce_connection_fence: bool = False,
         now=None,
     ) -> None:
         self._table = table
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._repository = repository or DynamoGmailRepository(table, now=self._now)
+        if approval_superseder is not None and not callable(
+            getattr(approval_superseder, "supersede_pending", None)
+        ):
+            raise TypeError("approval superseder is invalid")
+        self._approval_superseder = approval_superseder
         if not isinstance(enforce_connection_fence, bool):
             raise TypeError("connection fence setting is invalid")
         self._enforce_connection_fence = enforce_connection_fence
@@ -480,6 +486,13 @@ class GmailWorkspaceService:
             body=preliminary.body,
         )
         expires_at = int((now + DERIVED_RECORD_TTL).timestamp())
+        if self._approval_superseder is not None:
+            self._approval_superseder.supersede_pending(
+                action_id=action_id,
+                user_id=user_id,
+                expected_draft_revision=revision,
+                current_draft_revision=revised.revision,
+            )
         try:
             arguments = {
                 "user_id": user_id,

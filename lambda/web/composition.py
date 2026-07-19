@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen as _stdlib_urlopen
 
 from actions.gmail_send import GmailApiAdapter, GmailSendExecutor
+from actions.connectors import GenericConnectorKernel, GmailConnectorAdapter
 from actions.maintenance import (
     ActionLifecycleMaintainer,
     ActionMaintenanceRunner,
@@ -307,6 +308,24 @@ class CompositeConnectionRevoker:
             revoker.revoke_all(user_id)
 
 
+class KernelConnectionRevoker:
+    """Expose account-deletion revocation only through the connector kernel."""
+
+    def __init__(self, kernel) -> None:
+        if not callable(getattr(kernel, "revoke", None)):
+            raise ValueError("connector revocation kernel is invalid")
+        self._kernel = kernel
+
+    def revoke_all(self, connection_ref: str) -> None:
+        self._kernel.revoke(connection_ref)
+
+
+class _UnavailableGmailExecutor:
+    @staticmethod
+    def execute(_action):
+        raise RuntimeError("control-only Gmail adapter cannot dispatch")
+
+
 class CompositeUserRecordDeleter:
     """Remove raw-user and pseudonymous user partitions in fixed order."""
 
@@ -580,15 +599,19 @@ class ProductionGmailExecutorFactory:
         state_machine,
         founder_user_ids: Iterable[str],
         deletion_blocked,
+        connection_revoker,
         token_client=None,
     ) -> None:
         if not callable(deletion_blocked):
             raise ValueError("Gmail effect deletion fence is required")
+        if not callable(getattr(connection_revoker, "revoke_all", None)):
+            raise ValueError("Gmail connector revoker is required")
         self._secrets = secret_client
         self._secret_id = secret_id
         self._machine = state_machine
         self._founders = frozenset(founder_user_ids)
         self._deletion_blocked = deletion_blocked
+        self._connection_revoker = connection_revoker
         self._tokens = token_client or _GoogleSendTokenClient()
 
     def _assert_deletion_allows(self, action: Mapping[str, object]) -> str:
@@ -676,7 +699,7 @@ class ProductionGmailExecutorFactory:
     def __call__(self, action: Mapping[str, object]):
         self._assert_deletion_allows(action)
         provider, connection_id, account_email, _user_id = self._provider(action)
-        return GmailSendExecutor(
+        executor = GmailSendExecutor(
             state_machine=self._machine,
             provider=provider,
             founder_user_ids=self._founders,
@@ -684,6 +707,13 @@ class ProductionGmailExecutorFactory:
             account_email=account_email,
             sender_address=account_email,
             deletion_blocked=self._deletion_blocked,
+        )
+        return GenericConnectorKernel(
+            GmailConnectorAdapter(
+                executor=executor,
+                provider=provider,
+                connection_revoker=self._connection_revoker,
+            )
         )
 
 
@@ -808,6 +838,11 @@ def build_production_application() -> WebApplication:
         if founders
         else os.environ.get("GOOGLE_SEND_OAUTH_SECRET_ID", "")
     )
+    founder_connection_revoker = SecretsManagerFounderConnectionRevoker(
+        secret_client=secrets,
+        secret_id=send_secret_id,
+        founder_user_id=next(iter(founders), None),
+    )
     gmail_provider_factory = ProductionGmailExecutorFactory(
         secret_client=secrets,
         secret_id=send_secret_id,
@@ -816,6 +851,15 @@ def build_production_application() -> WebApplication:
         deletion_blocked=lambda user_id: (
             web_store.get_deletion_intent(user_id) is not None
         ),
+        connection_revoker=founder_connection_revoker,
+    )
+    gmail_control_kernel = GenericConnectorKernel(
+        GmailConnectorAdapter(
+            executor=_UnavailableGmailExecutor(),
+            repository=action_repository,
+            state_machine=action_machine,
+            connection_revoker=founder_connection_revoker,
+        )
     )
 
     def oauth_factory():
@@ -887,11 +931,7 @@ def build_production_application() -> WebApplication:
     deletion = DeletionCoordinator(
         session_store=web_store,
         connection_store=CompositeConnectionRevoker(
-            SecretsManagerFounderConnectionRevoker(
-                secret_client=secrets,
-                secret_id=send_secret_id,
-                founder_user_id=next(iter(founders), None),
-            ),
+            KernelConnectionRevoker(gmail_control_kernel),
             record_store,
         ),
         runtime_driver=runtime_driver,
@@ -910,6 +950,7 @@ def build_production_application() -> WebApplication:
     gmail_workspace = GmailWorkspaceService(
         control_table,
         repository=gmail_repository,
+        approval_superseder=gmail_control_kernel,
         enforce_connection_fence=True,
     )
     connections = DynamoConnectionLifecycle(

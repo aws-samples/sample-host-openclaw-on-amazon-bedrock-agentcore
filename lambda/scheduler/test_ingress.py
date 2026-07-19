@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from scheduler.conftest import (
@@ -95,3 +97,82 @@ def test_ingress_lambda_handler_uses_injected_factory_without_touching_aws(servi
         assert result == {"status": "ENQUEUED"}
     finally:
         ingress.configure_service_factory(None)
+
+
+def test_packaged_production_handler_strong_reads_and_enqueues_with_injected_aws_clients(
+    service, monkeypatch
+):
+    spec = _confirmed(service)
+    event = SchedulePayloadV1(
+        schedule_id=spec.schedule_id,
+        generation=spec.revision,
+        fire_time=spec.next_run_at,
+    ).to_mapping()
+
+    class Dynamo:
+        def __init__(self):
+            self.get_calls = []
+            self.put_calls = []
+
+        def get_item(self, **kwargs):
+            self.get_calls.append(kwargs)
+            return {
+                "Item": {
+                    "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+                    "SK": {"S": "STATE"},
+                    "recordJson": {
+                        "S": json.dumps(
+                            spec.to_mapping(),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    },
+                    "deliveryJson": {
+                        "S": json.dumps(
+                            DELIVERY_TARGET,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    },
+                }
+            }
+
+        def put_item(self, **kwargs):
+            self.put_calls.append(kwargs)
+            return {}
+
+    class Sqs:
+        def __init__(self):
+            self.calls = []
+
+        def send_message(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"MessageId": "synthetic-message"}
+
+    dynamo = Dynamo()
+    sqs = Sqs()
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    monkeypatch.setenv("SCHEDULER_CONTROL_TABLE_NAME", "scheduler-control")
+    monkeypatch.setenv(
+        "SCHEDULER_UPDATE_QUEUE_URL",
+        "https://sqs.eu-west-1.amazonaws.com/123456789012/update.fifo",
+    )
+    monkeypatch.setattr(
+        ingress,
+        "_aws_client",
+        lambda service_name: {"dynamodb": dynamo, "sqs": sqs}[service_name],
+        raising=False,
+    )
+    ingress.configure_service_factory(None)
+
+    result = ingress.lambda_handler(event, None)
+
+    assert result == {"status": "ENQUEUED"}
+    assert dynamo.get_calls[0]["ConsistentRead"] is True
+    assert dynamo.put_calls[0]["ConditionExpression"] == (
+        "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+    )
+    assert len(sqs.calls) == 1
+    assert sqs.calls[0]["MessageGroupId"] == spec.user_id
+    assert sqs.calls[0]["MessageBody"].find('"externalEffects":false') >= 0
+    ingress.configure_service_factory(None)

@@ -140,8 +140,8 @@ class Executor:
         self.events = events
         self.reader = reader
 
-    def execute(self, action):
-        self.events.append(("execute", dict(action)))
+    def dispatch(self, action):
+        self.events.append(("dispatch", dict(action)))
         assert action["state"] == ActionState.APPROVED.value
         self.reader.record.update(
             state=ActionState.CONFIRMED.value,
@@ -247,7 +247,7 @@ def test_approve_validates_exact_pending_revision_then_prepares_and_executes_onc
         args=ARGS,
     )
 
-    assert [event[0] for event in events] == ["prepare-executor", "execute"]
+    assert [event[0] for event in events] == ["prepare-executor", "dispatch"]
     assert [call[0] for call in approvals.calls] == ["decode", "approve"]
     assert result["actionId"] == ACTION_ID
     assert result["userId"] == USER

@@ -358,12 +358,17 @@ def test_send_provider_secret_is_not_read_until_exact_executor_is_prepared():
             )
         }
     )
+    class Revoker:
+        def revoke_all(self, _connection_ref):
+            raise AssertionError("revocation must not run during dispatch construction")
+
     factory = composition.ProductionGmailExecutorFactory(
         secret_client=secrets,
         secret_id="send",
         state_machine=object(),
         founder_user_ids={"founder-1"},
         deletion_blocked=lambda _user_id: False,
+        connection_revoker=Revoker(),
     )
     assert secrets.calls == []
 
@@ -381,6 +386,53 @@ def test_send_provider_secret_is_not_read_until_exact_executor_is_prepared():
         )
 
     assert secrets.calls == ["send"]
+
+
+def test_production_gmail_factory_requires_revocation_and_returns_kernel_dispatcher(
+    monkeypatch,
+):
+    class Revoker:
+        def revoke_all(self, _connection_ref):
+            pass
+
+    with pytest.raises((TypeError, ValueError)):
+        composition.ProductionGmailExecutorFactory(
+            secret_client=object(),
+            secret_id="send",
+            state_machine=object(),
+            founder_user_ids={"founder-1"},
+            deletion_blocked=lambda _user_id: False,
+        )
+
+    factory = composition.ProductionGmailExecutorFactory(
+        secret_client=object(),
+        secret_id="send",
+        state_machine=object(),
+        founder_user_ids={"founder-1"},
+        deletion_blocked=lambda _user_id: False,
+        connection_revoker=Revoker(),
+    )
+    monkeypatch.setattr(factory, "_assert_deletion_allows", lambda action: action["userId"])
+    monkeypatch.setattr(
+        factory,
+        "_provider",
+        lambda _action: (object(), "google_conn_1234", "founder@example.com", "founder-1"),
+    )
+
+    dispatcher = factory(
+        {
+            "actionId": "action_12345678",
+            "userId": "founder-1",
+            "connectionId": "google_conn_1234",
+            "accountEmail": "founder@example.com",
+            "senderAddress": "founder@example.com",
+        }
+    )
+
+    from actions.connectors import GenericConnectorKernel
+
+    assert isinstance(dispatcher, GenericConnectorKernel)
+    assert callable(dispatcher.dispatch)
 
 
 @pytest.mark.parametrize("reconciliation", [False, True])
@@ -404,6 +456,7 @@ def test_deletion_intent_blocks_send_secret_and_oauth_before_provider_constructi
         state_machine=object(),
         founder_user_ids={"founder-1"},
         deletion_blocked=lambda user_id: user_id == "founder-1",
+        connection_revoker=LocalConnectionRevoker([]),
         token_client=tokens,
     )
     action = {
@@ -456,6 +509,7 @@ def test_uncertain_deletion_read_blocks_reconciliation_before_secret_or_oauth():
         state_machine=object(),
         founder_user_ids={"founder-1"},
         deletion_blocked=unavailable,
+        connection_revoker=LocalConnectionRevoker([]),
         token_client=tokens,
     )
     observers = composition.ProductionGmailReconcilerFactory(
@@ -515,6 +569,7 @@ def test_send_executor_rejects_cross_founder_secret_before_token_refresh():
         state_machine=object(),
         founder_user_ids={"founder-1", "founder-2"},
         deletion_blocked=lambda _user_id: False,
+        connection_revoker=LocalConnectionRevoker([]),
         token_client=tokens,
     )
 

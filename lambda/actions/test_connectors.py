@@ -56,6 +56,14 @@ message_id = gmail_fixtures.message_id
 NOW = gmail_fixtures.NOW
 
 
+class Revoker:
+    def __init__(self):
+        self.calls = []
+
+    def revoke_all(self, connection_ref):
+        self.calls.append(connection_ref)
+
+
 def build_adapter(
     record,
     *,
@@ -71,7 +79,12 @@ def build_adapter(
         repo=repo,
         deletion_blocked=deletion_blocked,
     )
-    adapter = GmailConnectorAdapter(executor=executor, provider=provider, repository=repo)
+    adapter = GmailConnectorAdapter(
+        executor=executor,
+        provider=provider,
+        repository=repo,
+        connection_revoker=Revoker(),
+    )
     return adapter, repo, provider
 
 
@@ -79,7 +92,12 @@ def build_adapter(
 # Structural registration: the existing types satisfy the generic contracts.
 # ---------------------------------------------------------------------------
 def test_existing_types_satisfy_generic_protocols():
-    assert isinstance(GmailConnectorAdapter(executor=object()), ConnectorAdapter)
+    assert isinstance(
+        GmailConnectorAdapter(executor=object(), connection_revoker=Revoker()),
+        ConnectorAdapter,
+    )
+    with pytest.raises(ValueError, match="revoker"):
+        GmailConnectorAdapter(executor=object())
     draft = models.DraftRevision(
         action_id="action_12345678",
         user_id="founder-1",
@@ -289,7 +307,10 @@ def test_dispatching_or_uncertain_reconciles_never_redispatches(state):
     )
     reconciler, rrepo = gmail_fixtures.reconciler(action(state=state, revision=9), confirming)
     radapter = GmailConnectorAdapter(
-        executor=object(), reconciler=reconciler, provider=confirming
+        executor=object(),
+        reconciler=reconciler,
+        provider=confirming,
+        connection_revoker=Revoker(),
     )
     receipt = radapter.reconcile(rrepo.record)
     assert rrepo.record["state"] == "CONFIRMED"
@@ -305,7 +326,10 @@ def test_dispatching_or_uncertain_reconciles_never_redispatches(state):
     )
     reconciler2, rrepo2 = gmail_fixtures.reconciler(action(state=state, revision=9), mismatched)
     radapter2 = GmailConnectorAdapter(
-        executor=object(), reconciler=reconciler2, provider=mismatched
+        executor=object(),
+        reconciler=reconciler2,
+        provider=mismatched,
+        connection_revoker=Revoker(),
     )
     assert radapter2.reconcile(rrepo2.record) is None
     assert rrepo2.record["state"] == state.value
@@ -323,7 +347,11 @@ def test_new_draft_revision_atomically_stales_pending_founder_approval_via_kerne
     assert repo.record["state"] == "APPROVAL_PENDING"
     pending_revision = repo.record["revision"]
 
-    adapter = GmailConnectorAdapter(executor=object(), approval_service=service)
+    adapter = GmailConnectorAdapter(
+        executor=object(),
+        approval_service=service,
+        connection_revoker=Revoker(),
+    )
     stale = adapter.supersede_pending(
         action_id=record["actionId"],
         user_id=record["userId"],
@@ -344,3 +372,16 @@ def test_new_draft_revision_atomically_stales_pending_founder_approval_via_kerne
             token="x.y",
             args=record["args"],
         )
+
+
+def test_kernel_revocation_cannot_succeed_without_revoking_exact_authority():
+    revoker = Revoker()
+    adapter = GmailConnectorAdapter(
+        executor=object(),
+        connection_revoker=revoker,
+    )
+    kernel = connectors_module.GenericConnectorKernel(adapter)
+
+    kernel.revoke("google_conn_1234")
+
+    assert revoker.calls == ["google_conn_1234"]

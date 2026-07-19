@@ -21,6 +21,7 @@ v0; it simply forwards to the concrete adapter.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Mapping, Optional, Protocol, runtime_checkable
 
 try:
@@ -107,6 +108,12 @@ class GenericConnectorKernel:
     def revoke(self, connection_ref):
         return self._adapter.revoke(connection_ref)
 
+    def supersede_pending(self, **kwargs):
+        supersede = getattr(self._adapter, "supersede_pending", None)
+        if not callable(supersede):
+            raise ValueError("connector adapter has no approval supersede boundary")
+        return supersede(**kwargs)
+
 
 class GmailConnectorAdapter:
     """The Gmail-send concrete :class:`ConnectorAdapter`.
@@ -126,15 +133,21 @@ class GmailConnectorAdapter:
         approval_service=None,
         provider=None,
         connection_revoker=None,
+        state_machine=None,
+        now=None,
     ) -> None:
         if executor is None:
             raise ValueError("GmailConnectorAdapter requires a GmailSendExecutor")
+        if not callable(getattr(connection_revoker, "revoke_all", None)):
+            raise ValueError("GmailConnectorAdapter requires a connection revoker")
         self._executor = executor
         self._reconciler = reconciler
         self._repository = repository
         self._approvals = approval_service
         self._provider = provider
         self._connection_revoker = connection_revoker
+        self._state_machine = state_machine
+        self._now = now or (lambda: datetime.now(timezone.utc))
 
     # --- read: no-effect provider observation ---------------------------
     def read(
@@ -196,10 +209,6 @@ class GmailConnectorAdapter:
 
     # --- revoke: kernel never holds provider creds ----------------------
     def revoke(self, connection_ref: str) -> None:
-        if self._connection_revoker is None:
-            # Documented effect-path no-op: revocation lives outside the effect
-            # kernel (web/composition SecretsManager revoker) when not injected.
-            return None
         self._connection_revoker.revoke_all(connection_ref)
 
     # --- property 7: a newer draft atomically stales a pending approval -
@@ -208,7 +217,7 @@ class GmailConnectorAdapter:
         *,
         action_id: str,
         user_id: str,
-        revision: int,
+        revision: int | None = None,
         expected_draft_revision: int,
         current_draft_revision: int,
     ):
@@ -218,12 +227,34 @@ class GmailConnectorAdapter:
         draft revision must atomically STALE the old pending founder approval,
         under the repository's conditional draft-fence.
         """
-        if self._approvals is None:
-            raise ValueError("supersede requires an ApprovalService")
-        return self._approvals.mark_stale(
+        if revision is None:
+            if self._repository is None:
+                raise ValueError("supersede requires an action repository")
+            record = self._repository.get(action_id=action_id, user_id=user_id)
+            if record is None:
+                return None
+            if record.get("state") not in {
+                "PREPARED",
+                "APPROVAL_PENDING",
+                "APPROVED",
+            }:
+                return None
+            revision = record.get("revision")
+        if self._approvals is not None:
+            return self._approvals.mark_stale(
+                action_id=action_id,
+                revision=revision,
+                user_id=user_id,
+                expected_draft_revision=expected_draft_revision,
+                current_draft_revision=current_draft_revision,
+            )
+        if self._state_machine is None:
+            raise ValueError("supersede requires an approval state machine")
+        return self._state_machine.stale_for_new_draft(
             action_id=action_id,
             revision=revision,
             user_id=user_id,
             expected_draft_revision=expected_draft_revision,
             current_draft_revision=current_draft_revision,
+            now=self._now(),
         )
