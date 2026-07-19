@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from urllib import request as urllib_request
 from urllib.parse import quote
 
@@ -78,6 +79,136 @@ class _MetadataOnlyRouterLogger:
 _root_logger = logging.getLogger()
 _root_logger.setLevel(logging.INFO)
 logger = _MetadataOnlyRouterLogger(_root_logger)
+
+_STANDARD_LOG_RECORD_FIELDS = frozenset(
+    logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+)
+_PLATFORM_LOG_FIELDS = frozenset({"aws_request_id", "aws_trace_id"})
+_LOGGING_BOUNDARY_LOCK = threading.RLock()
+_METADATA_ONLY_FORMATTER = logging.Formatter("%(message)s")
+_LOGGING_BOUNDARY_DEPTH = 0
+
+
+class _MetadataOnlyDependencyFilter(logging.Filter):
+    """Sanitize propagated SDK/dependency records at every active handler."""
+
+    _LEVELS = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARNING",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "CRITICAL",
+    }
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        level = self._LEVELS.get(record.levelno, "ERROR")
+        record.msg = json.dumps(
+            {
+                "component": "router",
+                "event": "dependency_event",
+                "level": level,
+                "schema": "personal-operator.log.v1",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+        for key in tuple(record.__dict__):
+            if key not in _STANDARD_LOG_RECORD_FIELDS and key not in _PLATFORM_LOG_FIELDS:
+                record.__dict__.pop(key, None)
+        for key in _PLATFORM_LOG_FIELDS:
+            if key in record.__dict__:
+                record.__dict__[key] = "redacted"
+        return True
+
+
+@contextmanager
+def _metadata_only_dependency_logging():
+    """Close every Python logging sink for the duration of one Lambda turn."""
+
+    global _LOGGING_BOUNDARY_DEPTH
+    with _LOGGING_BOUNDARY_LOCK:
+        if _LOGGING_BOUNDARY_DEPTH:
+            _LOGGING_BOUNDARY_DEPTH += 1
+            try:
+                yield
+            finally:
+                _LOGGING_BOUNDARY_DEPTH -= 1
+            return
+
+        _LOGGING_BOUNDARY_DEPTH = 1
+        boundary = _MetadataOnlyDependencyFilter()
+        installed_handlers: set[logging.Handler] = set()
+        original_formatters: dict[logging.Handler, logging.Formatter | None] = {}
+        original_filters: dict[logging.Handler, tuple[logging.Filter, ...]] = {}
+
+        def secure_handler(handler_instance: logging.Handler) -> None:
+            if handler_instance not in installed_handlers:
+                original_formatters[handler_instance] = handler_instance.formatter
+                original_filters[handler_instance] = tuple(handler_instance.filters)
+                handler_instance.filters[:] = [boundary, *handler_instance.filters]
+                handler_instance.setFormatter(_METADATA_ONLY_FORMATTER)
+                installed_handlers.add(handler_instance)
+
+        root = logging.getLogger()
+        loggers = [root]
+        loggers.extend(
+            value
+            for value in logging.Logger.manager.loggerDict.values()
+            if isinstance(value, logging.Logger)
+        )
+        for candidate in loggers:
+            for handler_instance in candidate.handlers:
+                secure_handler(handler_instance)
+
+        original_factory = logging.getLogRecordFactory()
+        original_add_handler = logging.Logger.addHandler
+
+        def safe_factory(
+            name,
+            level,
+            pathname,
+            lineno,
+            _message,
+            _arguments,
+            _exc_info,
+            function=None,
+            _stack_info=None,
+            **kwargs,
+        ):
+            record = original_factory(
+                name,
+                level,
+                pathname,
+                lineno,
+                "",
+                (),
+                None,
+                function,
+                None,
+                **kwargs,
+            )
+            boundary.filter(record)
+            return record
+
+        def safe_add_handler(logger_instance, handler_instance):
+            secure_handler(handler_instance)
+            return original_add_handler(logger_instance, handler_instance)
+
+        logging.setLogRecordFactory(safe_factory)
+        logging.Logger.addHandler = safe_add_handler
+        try:
+            yield
+        finally:
+            logging.Logger.addHandler = original_add_handler
+            logging.setLogRecordFactory(original_factory)
+            for handler_instance in installed_handlers:
+                handler_instance.filters[:] = original_filters[handler_instance]
+                handler_instance.setFormatter(original_formatters[handler_instance])
+            _LOGGING_BOUNDARY_DEPTH = 0
 
 # --- Configuration ---
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
@@ -2210,7 +2341,7 @@ def handle_feishu(body, headers=None):
 # Lambda handler
 # ---------------------------------------------------------------------------
 
-def handler(event, context):
+def _handle_event(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
@@ -2336,6 +2467,13 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     return {"statusCode": 404, "body": "Not found"}
+
+
+def handler(event, context):
+    """Run the public handler inside the metadata-only dependency boundary."""
+
+    with _metadata_only_dependency_logging():
+        return _handle_event(event, context)
 
 
 def _self_invoke_async(channel, body, headers):
