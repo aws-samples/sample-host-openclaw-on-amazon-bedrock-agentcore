@@ -36,8 +36,48 @@ except ImportError:  # focused tests execute with lambda/router on sys.path
     from event_identity import derive_event_trace
     from telegram_ingress import MAX_WEBHOOK_BYTES, TelegramWebhookIngress
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+class _MetadataOnlyRouterLogger:
+    """Drop every caller value before the record reaches CloudWatch.
+
+    Router observability is provided by bounded metrics. Log messages are only
+    a content-free health signal: no identity, payload, provider response,
+    path, exception text, or stack is retained even when a call site supplies
+    formatting arguments or ``exc_info=True``.
+    """
+
+    _SCHEMA = "personal-operator.log.v1"
+    _COMPONENT = "router"
+    _EVENT = "runtime_event"
+
+    def __init__(self, delegate: logging.Logger) -> None:
+        self._delegate = delegate
+
+    def _emit(self, level: int) -> None:
+        payload = json.dumps(
+            {
+                "component": self._COMPONENT,
+                "event": self._EVENT,
+                "level": logging.getLevelName(level),
+                "schema": self._SCHEMA,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self._delegate.log(level, payload, exc_info=None, stack_info=False)
+
+    def info(self, _message: object, *_args: object, **_kwargs: object) -> None:
+        self._emit(logging.INFO)
+
+    def warning(self, _message: object, *_args: object, **_kwargs: object) -> None:
+        self._emit(logging.WARNING)
+
+    def error(self, _message: object, *_args: object, **_kwargs: object) -> None:
+        self._emit(logging.ERROR)
+
+
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+logger = _MetadataOnlyRouterLogger(_root_logger)
 
 # --- Configuration ---
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
