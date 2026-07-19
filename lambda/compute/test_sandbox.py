@@ -1,9 +1,9 @@
-"""RED-first proof that the networkless sandbox fails every egress attempt.
+"""RED-first checks for the same-interpreter defense-in-depth API fences.
 
 These tests model the locked job namespace with in-process fakes rather than a
-real container. Inside :func:`networkless_namespace`, all DNS resolver aliases,
-stream/datagram/raw socket egress, VPC-endpoint connects, IMDS, and the boto3
-credential-provider chain must fail closed while a pure compute job completes.
+real container or isolation boundary. Inside :func:`networkless_namespace`, the
+enumerated DNS, socket, process, IMDS, and credential APIs must fail closed
+while a pure compute job completes.
 """
 
 from __future__ import annotations

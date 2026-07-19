@@ -1,4 +1,4 @@
-"""RED-first execution proofs for the in-image networkless command runner."""
+"""RED-first checks for the inactive source-local command-runner harness."""
 
 from __future__ import annotations
 

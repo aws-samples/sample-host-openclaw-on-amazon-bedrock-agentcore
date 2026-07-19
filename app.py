@@ -23,7 +23,6 @@ from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.capability_stack import CapabilityStack, STATE_TABLE_NAME
-from stacks.compute_stack import ComputeStack
 from stacks.router_stack import RouterStack
 from stacks.web_stack import WebStack
 from stacks.guardrails_stack import GuardrailsStack
@@ -34,7 +33,6 @@ from stacks.trusted_lambda_asset import resolve_trusted_lambda_asset_metadata
 
 REQUIRED_REGION = "eu-west-1"
 RELEASE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
-IMAGE_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 
 repository_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(repository_root / "lambda"))
@@ -85,17 +83,6 @@ _, capability_catalog = compile_catalog(
     repository_root / "specs" / "capabilities" / "schemas",
 )
 
-# The networkless compute runner image is pinned by digest. The real Docker
-# build, ARM64 image, and static-scan gates are external and OPEN; the reviewed
-# release synth supplies the exact immutable digest as explicit CDK context.
-compute_image_digest = app.node.try_get_context("compute_image_digest") or ""
-if not compute_image_digest and configured_account == "000000000000":
-    compute_image_digest = "sha256:" + "0" * 64
-if IMAGE_DIGEST_PATTERN.fullmatch(compute_image_digest) is None:
-    raise RuntimeError(
-        "compute_image_digest must bind the exact reviewed pinned image digest"
-    )
-
 # --- Foundation ---
 vpc_stack = VpcStack(app, "OpenClawVpc", env=env)
 
@@ -119,18 +106,6 @@ capability_stack = CapabilityStack(
     cmk_arn=security_stack.cmk.key_arn,
     release_commit=capability_release_commit,
     catalog_digest=capability_catalog.catalog_digest,
-    env=env,
-)
-
-# --- Networkless Linux compute capsule (Task 8) ------------------------------
-# A disposable, ambient-authority-free job runner in a fully isolated VPC. The
-# capability gateway holds no compute execution or credential authority; the
-# adapter carries only a submit-only handle bound to this pinned image digest.
-compute_stack = ComputeStack(
-    app,
-    "PersonalOperatorCompute",
-    cmk_arn=security_stack.cmk.key_arn,
-    image_digest=compute_image_digest,
     env=env,
 )
 

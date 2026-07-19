@@ -1,11 +1,10 @@
-"""No-route, zero-egress Linux compute job infrastructure boundary.
+"""Inactive, non-production reference for a future Linux compute boundary.
 
-The stack creates isolated subnets plus a dedicated workload security group
-with no ingress or egress. An exact launcher must bind both, disable public IP
-assignment, and run the single pinned-by-digest task definition. The task has
-no ECS task role, so it receives no workload credential endpoint. The real
-Docker build, ARM64 image, static scan, launch binding, and live isolation
-evidence remain OPEN; synthesis alone is not deployment evidence.
+The active CDK application deliberately does not instantiate this stack. It
+lacks a concrete credential-free staging, launch, and collection transport and
+therefore cannot be deployed as part of v1. The real Docker build, ARM64 image,
+static scan, launch binding, and live isolation evidence remain OPEN; this
+standalone shape and its synthesis are local reference material only.
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class ComputeStack(Stack):
-    """Isolated Fargate job runner with no ambient AWS or network authority."""
+    """Inactive standalone infrastructure shape; never active app authority."""
 
     def __init__(
         self,
@@ -231,13 +230,9 @@ class ComputeStack(Stack):
                 ecs.CfnTaskDefinition.ContainerDefinitionProperty(
                     name="JobRunner",
                     image=image,
-                    command=[
-                        "python",
-                        "-m",
-                        "compute.runner",
-                        "/job/input",
-                        "/job/output",
-                    ],
+                    # The image ENTRYPOINT supplies python -m compute.runner.
+                    # ECS Command replaces only Docker CMD.
+                    command=["/job/input", "/job/output"],
                     essential=True,
                     readonly_root_filesystem=True,
                     user="10001:10001",

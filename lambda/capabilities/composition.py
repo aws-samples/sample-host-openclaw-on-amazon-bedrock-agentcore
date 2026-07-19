@@ -16,7 +16,7 @@ import boto3
 from .catalog import compile_catalog
 from .contracts import CapabilityCallV1, CapabilityCatalogV1, CapabilityResultV1
 from .durable import DynamoAdmissionRepository, DynamoCapabilityLedger
-from .gateway import AdapterOutcome, CapabilityGateway, build_schedule_adapters
+from .gateway import CapabilityGateway, build_schedule_adapters
 from .schedule_port import (
     DynamoPortableScheduleProjectionReader,
     DynamoScheduleCapabilityPort,
@@ -33,14 +33,6 @@ _CALLER = re.compile(
 )
 _SCHEDULER_TABLE = "personal-operator-scheduler-control"
 _PORTABLE_TABLE = "personal-operator-control"
-
-
-class _ComputeReleaseGateAdapter:
-    def invoke(self, _admitted) -> AdapterOutcome:
-        return AdapterOutcome(
-            status="DENIED",
-            error_code="COMPUTE_RELEASE_GATE_UNSATISFIED",
-        )
 
 
 def _required_env(env: Mapping[str, str], name: str) -> str:
@@ -164,11 +156,13 @@ def build_production_composition(
         raise TypeError("schedule port lacks the exact proposal-only surface")
     adapters.update(build_schedule_adapters(selected_schedule_port))
 
+    # Production supplies no compute adapter: the catalog stays visible while
+    # the gateway returns ADAPTER_DISABLED. This explicit injection seam is
+    # retained only for source-local contract tests until a credential-free
+    # staging, launch, and collection transport is implemented and reviewed.
     selected_compute = dict(compute_adapters or {})
     if set(selected_compute) - {"compute.run", "compute.status"}:
         raise RuntimeError("only compute operations may be injected")
-    for operation_id in ("compute.run", "compute.status"):
-        selected_compute.setdefault(operation_id, _ComputeReleaseGateAdapter())
     adapters.update(selected_compute)
 
     repository = DynamoAdmissionRepository(client=client, table_name=table_name)

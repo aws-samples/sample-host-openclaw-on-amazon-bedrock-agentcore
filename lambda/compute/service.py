@@ -1,15 +1,15 @@
-"""Networkless compute service: stage, dispatch, fence, import, and report.
+"""Inactive compute service contract: stage, dispatch, import, and report.
 
 The service derives a content-addressed job identity (the ``DEDUPE_KEY_REQUIRED``
 key), stages immutable content-hashed inputs from the requesting user's
 workspace into a fresh per-job namespace, builds a validated job spec bound to
-the single pinned image digest, invokes an injected runner that models the
-disposable networkless container, and on success validates and atomically
+the single pinned image digest, invokes an injected source-local runner model,
+and on success validates and atomically
 imports outputs under ``jobs/<jobId>/`` while issuing a content receipt. On a
 deadline or resource breach the runner kills the whole process tree and the
 service records a non-success receipt with no published outputs. Status reads
 are strictly scoped to the requesting user's namespace and never leak a foreign
-job's data.
+job's data. No active production transport calls this service.
 """
 
 from __future__ import annotations

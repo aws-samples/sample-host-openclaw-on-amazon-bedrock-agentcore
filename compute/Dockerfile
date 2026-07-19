@@ -1,8 +1,8 @@
-# Networkless Linux compute job image — SHAPE ONLY.
+# Networkless Linux compute job image — INACTIVE NON-PRODUCTION SHAPE ONLY.
 #
 # The real Docker build, ARM64 image, and static-scan gates are OPEN and are
 # NOT run in this local, offline change. This Dockerfile documents the reviewed
-# image contract the external build must satisfy:
+# image contract a future reviewed implementation would have to satisfy:
 #   - pinned-by-digest minimal base (no mutable tag)
 #   - non-root user
 #   - read-only root filesystem at runtime (enforced by the task definition)
@@ -17,9 +17,12 @@
 FROM --platform=linux/arm64 gcr.io/distroless/python3-debian12@sha256:0000000000000000000000000000000000000000000000000000000000000000 AS runtime
 
 # The distroless base ships no shell and no package manager by construction.
-# Only the reviewed, dependency-free compute package is copied in.
+# Only the local compute package and the capability package it imports are
+# copied into the inactive reference shape. PYTHONPATH points directly at that
+# package root so ``python -m compute.runner`` resolves exactly once.
 COPY lambda/compute /app/lambda/compute
-COPY compute/runner.py /app/compute/runner.py
+COPY lambda/capabilities /app/lambda/capabilities
+ENV PYTHONPATH=/app/lambda
 
 # Non-root, unprivileged runtime identity. The synthesized task definition
 # additionally enforces a read-only root filesystem and drops all Linux

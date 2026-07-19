@@ -60,8 +60,8 @@ ambiguous effect; it never means blind replay.
 | `po_schedule_list` | `LOCAL_READ`; no prompt | Trusted control plane owns schedule records; gateway strong-reads user, installation, catalog, and deletion state | Scheduler control adapter reads only; read-only retry | Control record, 90 days; `8 / 256 KiB / 1 MiB`; deletion fence cancels schedules and purges records |
 | `po_schedule_propose` | `DURABLE_MUTATION`; exact one-time proposal approval | Trusted control plane holds schedule authority; proposal binds user, definition/hash, revision, invocation, and expiry | Scheduler control adapter applies only an approved persisted proposal; retries require the same dedupe key and uncertainty stops for reconciliation | Control record, 90 days; `8 / 256 KiB / 256 KiB`; deletion fence cancels schedules and purges records |
 | `po_schedule_cancel_propose` | `DURABLE_MUTATION`; exact one-time proposal approval | Trusted control plane holds schedule authority; proposal binds exact user, schedule revision, invocation, and expiry | Scheduler control adapter cancels only the approved revision; retries require the same dedupe key and uncertainty stops for reconciliation | Control record, 90 days; `8 / 256 KiB / 256 KiB`; deletion fence cancels schedules and purges records |
-| `po_compute_run` | `LOCAL_MUTATION`; no prompt inside fixed quota | No provider credential enters the job; gateway validates user, image digest, copied input hashes, resource profile, deadline, and deletion fence | Trusted compute service launches a disposable networkless sandbox and imports validated outputs; retries require the same job dedupe key | Job receipt, 90 days; `2 / 1 MiB / 1 MiB`; fence, cancel, and purge job/input/output state |
-| `po_compute_status` | `LOCAL_READ`; no prompt | Trusted compute service owns job records; exact user/job namespace and deletion state decide authority | Compute control adapter reads status/receipts only; read-only retry | Job receipt, 90 days; `8 / 256 KiB / 1 MiB`; fence, cancel, and purge job/input/output state |
+| `po_compute_run` | Catalog contract only; operational approval and risk boundary remain unverified | Active production composition injects no compute adapter or credential authority | Returns `ADAPTER_DISABLED`; no staging, launch, or collection transport is active | Intended receipt/quota/deletion contract is source-local only; image, launcher, live isolation, and Task 8 operational completion remain OPEN |
+| `po_compute_status` | Catalog contract only; no active job exists to inspect | Active production composition injects no compute adapter or job-store authority | Returns `ADAPTER_DISABLED`; the retained status adapter is a local harness only | Intended receipt/quota/deletion contract is source-local only; image, launcher, live isolation, and Task 8 operational completion remain OPEN |
 
 The catalog contains exactly these ten tools: the existing four workspace tools
 and the six named v1 tools. Connector, MCP, browser, generic shell, generic
@@ -69,3 +69,10 @@ capability-call, plugin-install, and payment tools are absent. Catalog metadata
 is an admission contract, not an authority source by itself: later gateway and
 adapter code must strong-read live installation and deletion state at the last
 application-controlled point before execution.
+
+The retained compute service, runner, transport protocols, Dockerfile, and
+standalone `ComputeStack` are inactive reference material. `app.py` does not
+instantiate that stack or require a compute image digest. Same-interpreter
+Python API fences are defense in depth, not an isolation boundary. The active
+capability composition returns `ADAPTER_DISABLED`; Task 8 operational
+completion remains OPEN.

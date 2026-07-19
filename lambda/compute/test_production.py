@@ -1,4 +1,4 @@
-"""RED-first source-local proofs for the trusted compute production adapter."""
+"""RED-first checks for the inactive future compute transport contract."""
 
 from __future__ import annotations
 

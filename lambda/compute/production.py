@@ -1,11 +1,9 @@
-"""Trusted source-local adapter for exact networkless compute task launches.
+"""Inactive source-local contract model for future compute task launches.
 
-The adapter contains no ambient AWS client and performs no import-time I/O.
-Production composition must inject a staging implementation and a launcher.
-Those seams are deliberately narrow enough to prove locally that exact input
-bytes, task definition, image digest, deadline, zero-egress network binding,
-and fresh output namespace are checked before the existing importer can
-publish any output.
+This module has no active caller, ambient AWS client, staging implementation,
+launcher, or collection transport. Its seams model checks that a future
+credential-free implementation would need before output publication; they are
+not production authority or deployment evidence.
 
 Real object-store, ECS/Fargate, Docker, image-scan, and run evidence remain
 external gates. This module does not claim that those gates have run.

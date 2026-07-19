@@ -1,13 +1,16 @@
-"""Synthesized least-authority boundary for the networkless compute job runner.
+"""Inactive reference shape for a future networkless compute job runner.
 
 The real Docker build, ARM64 image, and static-scan gates are OPEN and not run
-here; the stack accepts a precomputed pinned image digest so synth stays
-offline and networkless.
+here. This stack is not part of the active application and must not be treated
+as production or deployment evidence.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import aws_cdk as cdk
 from aws_cdk.assertions import Template
@@ -133,6 +136,43 @@ def test_compute_container_drops_every_linux_capability_and_uses_init():
     }
 
 
+def test_inactive_reference_task_passes_only_runner_arguments_to_image_entrypoint():
+    _, template = _synth()
+    task_definition = _resources(template, "AWS::ECS::TaskDefinition")[0]
+    container = task_definition["Properties"]["ContainerDefinitions"][0]
+
+    # The image ENTRYPOINT already supplies ``python -m compute.runner``.
+    # Repeating it here would produce a malformed argv at an ECS launch.
+    assert container["Command"] == ["/job/input", "/job/output"]
+
+
+def test_inactive_image_shape_resolves_one_package_entrypoint_without_shim_recursion():
+    dockerfile = (ROOT / "compute/Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY lambda/compute /app/lambda/compute" in dockerfile
+    assert "COPY lambda/capabilities /app/lambda/capabilities" in dockerfile
+    assert "ENV PYTHONPATH=/app/lambda" in dockerfile
+    assert "COPY compute/runner.py" not in dockerfile
+    assert 'ENTRYPOINT ["python", "-m", "compute.runner"]' in dockerfile
+    assert 'CMD ["/job/input", "/job/output"]' in dockerfile
+
+
+def test_local_reference_shim_delegates_without_importing_itself():
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        [sys.executable, "-m", "compute.runner"],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stderr == "usage: runner.py <input_dir> <output_dir>\n"
+
+
 def test_compute_stack_rejects_a_non_pinned_image_digest():
     from stacks.compute_stack import ComputeStack
 
@@ -153,7 +193,7 @@ def test_compute_stack_rejects_every_noncanonical_region():
         _synth("us-east-1")
 
 
-def test_app_instantiates_compute_stack():
+def test_active_app_does_not_instantiate_inactive_compute_reference():
     app_source = (ROOT / "app.py").read_text(encoding="utf-8")
-    assert "ComputeStack" in app_source
-    assert "compute_stack" in app_source
+    assert "ComputeStack" not in app_source
+    assert "compute_image_digest" not in app_source

@@ -1,13 +1,11 @@
-"""In-container networkless compute entrypoint and egress fences.
+"""Source-local compute runner with same-interpreter defense-in-depth fences.
 
-This module is driven directly by the local sandbox harness (with fakes) and,
-in production, by the read-only job image. It drops ambient authority, applies
-POSIX resource limits (CPU, address space for OOM, process count for fork
-bombs, and file size), runs the command in a fresh process group so the whole
-tree can be killed on a deadline or resource breach, and denies the job's
-public Python socket, DNS, and process-creation APIs. Production network
-isolation additionally requires the exact no-route, zero-egress VPC binding;
-an unattached seccomp profile is not treated as enforcement.
+This inactive local harness drops ambient authority, applies POSIX resource
+limits, runs the command in a fresh process group, and intercepts public Python
+socket, DNS, and process-creation APIs. Those same-interpreter fences are
+defense in depth, not a security or isolation boundary for hostile Python.
+There is no active production stack, image, launcher, or collection transport;
+OS/container/network isolation and live evidence remain OPEN.
 
 No import here performs I/O at module load. The container mounts an immutable
 input directory and writes only to a fresh output directory.
@@ -228,10 +226,10 @@ del _build_networkless_namespace
 
 
 def resolve_ambient_credentials() -> None:
-    """Prove the boto3 credential-provider chain resolves to nothing.
+    """Fail closed if the inactive local harness asks for AWS credentials.
 
-    A networkless job holds no ambient AWS providers. Any resolution attempt is
-    a fail-closed violation regardless of whether boto3 is importable.
+    This same-interpreter guard is defense in depth and does not prove that a
+    future container lacks ambient providers.
     """
 
     raise NetworklessViolation("no ambient AWS credential provider is available")
@@ -263,10 +261,10 @@ def apply_resource_limits(profile) -> None:  # pragma: no cover - POSIX only
     resource.setrlimit(
         resource.RLIMIT_CPU, (profile.cpu_seconds, profile.cpu_seconds)
     )
-    # macOS exposes RLIMIT_AS but rejects every finite value. The reviewed
-    # production image is Linux, where the exact address-space limit is
-    # mandatory; Darwin is only a local development harness and still applies
-    # CPU/process/file limits plus the wall-clock deadline.
+    # macOS exposes RLIMIT_AS but rejects every finite value. A future Linux
+    # image must enforce and verify its exact address-space limit separately;
+    # Darwin is only a local harness and still applies CPU/process/file limits
+    # plus the wall-clock deadline.
     if sys.platform != "darwin":
         resource.setrlimit(
             resource.RLIMIT_AS, (profile.memory_bytes, profile.memory_bytes)
@@ -288,10 +286,11 @@ def _read_spec(input_dir: Path) -> dict:  # pragma: no cover - container entry
 def _child_python_command(spec: dict, input_dir: Path) -> None:
     """Execute the already-validated Python-only command inside the child.
 
-    The distroless image deliberately contains one interpreter and no shell or
-    package installer. ``SCRIPT`` executes as isolated Python source. ``ARGV``
-    accepts only that interpreter and one bound Python file from the immutable
-    input tree; it cannot select an arbitrary host executable.
+    The inactive image shape contains one interpreter and no shell or package
+    installer. ``SCRIPT`` executes in this Python interpreter and is not an
+    isolation boundary. ``ARGV`` accepts only that interpreter and one bound
+    Python file from the input tree; it cannot select another executable
+    through this API.
     """
 
     command = spec.get("command")
@@ -344,14 +343,14 @@ def _child_main(argv: list[str]) -> int:
 
 
 class LocalProcessRunner:
-    """Execute a bound command in one disposable, resource-limited process tree.
+    """Exercise a bound command in a source-local resource-limit harness.
 
-    This is the reviewed image entrypoint semantics. The child denies public
-    Python socket and process creation. The exact no-route/zero-egress launch
-    binding, built image, and any attached syscall enforcement remain separate
-    live gates; local execution does not close them. Candidate output is
-    written to a private sibling and published only after the child exits
-    successfully and the output importer accepts the complete tree.
+    The child intercepts public Python socket and process creation APIs as
+    defense in depth; hostile Python remains outside this harness's security
+    claims. The exact no-route/zero-egress launch binding, built image, syscall
+    enforcement, and live evidence remain OPEN. Candidate output is written to
+    a private sibling and published only after the child exits successfully
+    and the output importer accepts the complete tree.
     """
 
     def __init__(self, *, clock: Callable[[], int] | None = None) -> None:
@@ -483,7 +482,7 @@ class LocalProcessRunner:
 
 
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover - container entry
-    """Container entrypoint: drop authority, fence egress, run networklessly."""
+    """Inactive image-shape entrypoint for the source-local harness."""
 
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["--child"]:

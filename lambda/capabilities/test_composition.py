@@ -579,13 +579,51 @@ def test_offline_handler_composes_strong_dynamo_state_and_binds_safe_adapters(
         "schedule.list",
         "schedule.propose",
         "schedule.cancel.propose",
-        "compute.run",
-        "compute.status",
     }
     assert client.get_calls
     assert all(call["ConsistentRead"] is True for call in client.get_calls)
     assert client.transact_calls
     assert "callerArn" not in event
+
+
+def test_production_composition_keeps_compute_disabled_without_transport(
+    tmp_path,
+):
+    from capabilities.composition import build_production_composition
+
+    artifacts = _artifact_copy(tmp_path)
+    catalog = _catalog()
+    client = MemoryDynamoClient()
+    _seed_authority(client, catalog)
+    _seed_installation(client, catalog, "compute.run")
+    production = build_production_composition(
+        env=_environment(catalog.catalog_digest),
+        artifact_root=artifacts,
+        dynamodb_client=client,
+        clock=lambda: NOW,
+    )
+    call = _call(
+        catalog,
+        "compute.run",
+        {
+            "command": {"mode": "SCRIPT", "value": "print('safe')"},
+            "inputPaths": [],
+            "network": "NONE",
+            "resourceProfile": "SMALL",
+        },
+        tool_use_id="tooluse_disabled1",
+    )
+
+    result = production.invoke(
+        {
+            "schema": "personal-operator.capability-relay-envelope.v1",
+            "grant": _turn_grant(catalog),
+            "call": call.to_mapping(),
+        }
+    )
+
+    assert result.status == "DENIED"
+    assert result.error_code == "ADAPTER_DISABLED"
 
 
 class TrustedWebAdapter:

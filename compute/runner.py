@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Container entrypoint shim for the networkless compute job.
+"""Inactive image-shape entrypoint shim for the local compute harness.
 
-The image ships the reviewed ``compute`` package alongside this shim. All fence
-logic lives in :mod:`compute.runner` (the reviewed package module); this file
-only wires the interpreter path and delegates so the Docker ENTRYPOINT stays a
-single stable command. The real Docker build/ARM64/static-scan gates are OPEN
-and are not exercised locally.
+The reference image shape places the ``compute`` package alongside this shim.
+All defense-in-depth API fence logic lives in :mod:`compute.runner`; this file
+only wires the interpreter path and delegates. There is no active image or
+launcher. Docker build, ARM64, static-scan, and live-isolation gates are OPEN.
 """
 
 from __future__ import annotations
@@ -17,6 +16,13 @@ from pathlib import Path
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "lambda"
 if _PACKAGE_ROOT.is_dir():
     sys.path.insert(0, str(_PACKAGE_ROOT))
+
+# ``python -m compute.runner`` first creates a namespace package from this
+# shim's parent directory. Remove only that namespace before resolving the real
+# regular package now placed first on sys.path; otherwise the import recurses
+# into this shim.
+if __package__ == "compute":
+    sys.modules.pop("compute", None)
 
 from compute.runner import main  # noqa: E402
 

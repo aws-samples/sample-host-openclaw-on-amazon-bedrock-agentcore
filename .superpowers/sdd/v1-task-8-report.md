@@ -1,4 +1,4 @@
-# Task 8 — Networkless Linux compute capsule
+# Task 8 — inactive compute reference; operational completion OPEN
 
 Single-writer worktree `/private/tmp/personal-operator-v1-task8-compute`,
 branch `codex/po-v1-task8-compute`, from Gate A `5e4930e`. Strict
@@ -6,16 +6,28 @@ RED -> GREEN -> REFACTOR. Offline, credential-free, public/synthetic only. No
 real Docker container, network, or AWS call was made; the job runner and
 sandbox are modeled behind local test fakes.
 
+## Final-audit safe-release correction
+
+The integrated audit found that source-local contracts and a synthesized stack
+did not provide a concrete credential-free staging, launch, and collection
+transport. The active application therefore no longer imports or instantiates
+`ComputeStack` and no longer requires `compute_image_digest`. Production
+composition injects no compute adapters, so both catalog operations return
+`ADAPTER_DISABLED`. The standalone stack, Dockerfile, transport contracts, and
+runner remain inactive reference material. Same-interpreter Python API fences
+are defense in depth, not a security or isolation boundary. Image, launcher,
+live isolation, and Task 8 operational completion remains OPEN.
+
 ## Open external gates (NOT run locally, NOT claimed)
 
 - Real Docker build of `compute/Dockerfile` is OPEN.
 - ARM64 image build/publish and the immutable digest resolution are OPEN.
 - Static image/security scan of the runner image is OPEN.
+- Credential-free staging, launch, and output collection are OPEN.
+- Exact-task launch plus ENI/flow-log isolation evidence is OPEN.
 
-`compute/Dockerfile` and `compute/seccomp.json` are SHAPE ONLY. `ComputeStack`
-and `app.py` accept a precomputed pinned image digest as explicit CDK context
-so synth stays offline; the digest the reviewed pipeline resolves replaces the
-placeholder before any build.
+`compute/Dockerfile`, `compute/seccomp.json`, and `ComputeStack` are INACTIVE
+NON-PRODUCTION SHAPE ONLY. They are not instantiated or required by `app.py`.
 
 ## What was built
 
@@ -35,18 +47,19 @@ placeholder before any build.
   submit-only capability adapters. Idempotent short-circuit on an existing
   receipt. Status reads are strictly scoped to `grant.sub` and never leak a
   foreign receipt.
-- `compute/runner.py` (+ package copy `lambda/compute/runner.py`) — networkless
-  namespace fence (DNS, connect, create_connection), ambient-authority drop,
+- `compute/runner.py` (+ package copy `lambda/compute/runner.py`) — local
+  same-interpreter API fences (DNS, socket, process creation), environment scrub,
   POSIX rlimits (CPU/AS/NPROC/FSIZE), new process group + `killpg` tree kill,
-  credential-provider fail-closed. Root shim delegates to the package module.
+  credential-provider fail-closed. The inactive image resolves the package
+  entrypoint directly; the repository root shim is local reference only.
 - `compute/Dockerfile`, `compute/seccomp.json` — shape-only image contract.
-- `stacks/compute_stack.py` — isolated VPC (no NAT, no VPC endpoints, no public
-  IPs, no internet route), ARM64 Fargate task, read-only root fs, non-root
-  user, task role that can only `s3:GetObject` inputs and `s3:PutObject` under
-  the per-job output prefix, KMS bound by S3 via-service. No ambient providers.
-- `app.py` — instantiates `ComputeStack`, pins the image digest; `composition.py`
-  gains a compute-only injection seam (the credential-free Lambda holds no
-  compute authority unless the two compute adapters are explicitly injected).
+- `stacks/compute_stack.py` — inactive isolated-VPC reference (no NAT, no VPC
+  endpoints, public IPs, or internet route), ARM64 Fargate task, read-only root
+  fs, non-root user, and no workload task role. Its ECS execution role is for
+  the exact ECR repository and runner log group only.
+- `app.py` — intentionally instantiates no compute stack and requires no compute
+  image digest; `composition.py` retains a test-only injection seam while the
+  active default has no compute adapters and returns `ADAPTER_DISABLED`.
 
 ## Hostile cases covered (RED-first)
 

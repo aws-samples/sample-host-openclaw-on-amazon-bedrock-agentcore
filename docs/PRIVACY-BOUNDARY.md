@@ -19,10 +19,13 @@ The catalog does not place provider, browser, database, approval-signing, or
 cross-user credentials in OpenClaw, model input, workspace, grants, tool
 arguments, results, or logs. The target reader is credential-free and bound to
 an exact current-request public URL grant. Schedule authority remains in the
-trusted control plane. Compute inputs are copied into a disposable networkless,
-credential-free job and validated outputs enter only a fresh job namespace.
-Durable mutations remain exact proposals requiring one-time approval; standing
-approval and irreversible effects are rejected.
+trusted control plane. Active production composition injects no compute
+adapter, staging path, launcher, or collector: both compute operations return
+`ADAPTER_DISABLED`. The retained same-interpreter runner fences are defense in
+depth, not an isolation boundary; image, launcher, and live isolation gates
+remain open. Task 8 operational completion remains OPEN. Durable mutations
+remain exact proposals requiring one-time approval; standing approval and
+irreversible effects are rejected.
 
 Catalog retention and deletion fields are mandatory admission metadata, not a
 claim that deletion execution is implemented by the catalog compiler. Live
