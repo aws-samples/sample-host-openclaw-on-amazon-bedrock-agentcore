@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -173,7 +174,7 @@ case "$args" in
   *"lambda get-function-configuration"*"AGENTCORE_QUALIFIER"*) echo 'release_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
   *"lambda get-function-configuration"*"Role"*) echo 'arn:aws:iam::123456789012:role/OpenClawRouter-RouterFnServiceRole-test' ;;
   *"iam list-role-policies"*) echo 'OpenClawRouter-RouterFnServiceRoleDefaultPolicy-test' ;;
-  *"iam get-role-policy"*) printf '%s\n' "${E2E_FAKE_ROUTER_IAM_RESOURCES:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789 arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789/runtime-endpoint/release_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
+  *"iam get-role-policy"*) printf '%s\n' "${E2E_FAKE_ROUTER_IAM_RESOURCES:-arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789 arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/openclaw_agent-0123456789/runtime-endpoint/release_endpoint-0123456789}" ;;
   *"describe-repositories"*) echo 'example.invalid/openclaw-bridge' ;;
   *"get-login-password"*) echo 'not-a-password' ;;
   *"get-secret-value"*) echo 'not-a-token' ;;
@@ -545,6 +546,19 @@ def test_deploy_and_e2e_contract_use_exact_region_and_workspace_role() -> None:
     assert 'REQUIRED_REGION="eu-west-1"' in e2e
     assert 'CronStack(app, "OpenClawCron", env=env)' in app
     assert "runtime_iam_arn=agentcore_stack.runtime_iam_arn" in app
+    assert "runtime_endpoint_id=agentcore_stack.runtime_endpoint_id" in app
+    assert "runtime_binding=agentcore_stack.runtime_binding" in app
+    assert "canonical_resource_multiset" in e2e
+    assert "LC_ALL=C sort" in e2e
+    assert '"$RUNTIME_IAM_ARN"' in e2e
+    assert (
+        '"${RUNTIME_IAM_ARN}/runtime-endpoint/${RUNTIME_ENDPOINT_ID}"'
+        in e2e
+    )
+    assert (
+        '${RUNTIME_IAM_ARN}/runtime-endpoint/${RUNTIME_ENDPOINT_NAME}'
+        not in e2e
+    )
     assert 'REQUIRED_REGION = "eu-west-1"' in app
 
 
@@ -731,6 +745,69 @@ def test_e2e_rejects_router_iam_resource_drift(tmp_path: Path) -> None:
     assert not any(call.startswith("PYTHON <-m> <pytest>") for call in calls)
 
 
+def test_e2e_accepts_router_iam_resources_in_reverse_order(tmp_path: Path) -> None:
+    script, env, _ = _create_e2e_script_harness(tmp_path)
+    env["E2E_FAKE_ROUTER_IAM_RESOURCES"] = (
+        f"{TEST_RUNTIME_ENDPOINT_IAM_ARN} {TEST_RUNTIME_IAM_ARN}"
+    )
+
+    completed = subprocess.run(
+        ["bash", str(script), "--skip-deploy"],
+        cwd=script.parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["missing", "duplicate", "foreign", "wildcard", "extra"],
+)
+def test_e2e_router_iam_resource_multiset_rejects_drift(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    script, env, call_log = _create_e2e_script_harness(tmp_path)
+    resources = {
+        "missing": TEST_RUNTIME_IAM_ARN,
+        "duplicate": (
+            f"{TEST_RUNTIME_IAM_ARN} {TEST_RUNTIME_ENDPOINT_IAM_ARN} "
+            f"{TEST_RUNTIME_ENDPOINT_IAM_ARN}"
+        ),
+        "foreign": (
+            f"{TEST_RUNTIME_IAM_ARN} "
+            + TEST_RUNTIME_ENDPOINT_IAM_ARN.replace(
+                "123456789012", "999999999999"
+            )
+        ),
+        "wildcard": f"{TEST_RUNTIME_IAM_ARN} {TEST_RUNTIME_IAM_ARN}/*",
+        "extra": (
+            f"{TEST_RUNTIME_IAM_ARN} {TEST_RUNTIME_ENDPOINT_IAM_ARN} "
+            "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
+            "runtime/unexpected-0123456789"
+        ),
+    }[case]
+    env["E2E_FAKE_ROUTER_IAM_RESOURCES"] = resources
+
+    completed = subprocess.run(
+        ["bash", str(script), "--skip-deploy"],
+        cwd=script.parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "router IAM runtime resources mismatch" in completed.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert not any(call.startswith("PYTHON <-m> <pytest>") for call in calls)
+
+
 def test_e2e_option_errors_fail_before_aws(tmp_path: Path) -> None:
     poison_bin = tmp_path / "bin"
     poison_bin.mkdir()
@@ -827,6 +904,9 @@ TEST_RUNTIME_IAM_ARN = (
     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
     f"runtime/{TEST_RUNTIME_ID}"
 )
+TEST_RUNTIME_ENDPOINT_IAM_ARN = (
+    f"{TEST_RUNTIME_IAM_ARN}/runtime-endpoint/{TEST_RUNTIME_ENDPOINT_ID}"
+)
 TEST_RUNTIME_IMAGE_URI = (
     "123456789012.dkr.ecr.eu-west-1.amazonaws.com/"
     "personal-operator/bridge@sha256:" + "a" * 64
@@ -857,6 +937,7 @@ def _build_agentcore_stack(
 
     account = "123456789012"
     context = {
+        "agentcore_release_stage": "endpoint",
         "runtime_source_commit": TEST_SOURCE_COMMIT,
         "runtime_id": TEST_RUNTIME_ID,
         "runtime_endpoint_id": TEST_RUNTIME_ENDPOINT_ID,
@@ -907,21 +988,136 @@ def _synth_agentcore_template(region: str = "eu-west-1") -> dict:
     return Template.from_stack(stack).to_json()
 
 
-def test_agentcore_stack_uses_only_persisted_runtime_arn() -> None:
+def test_agentcore_endpoint_stage_exposes_parameter_and_generated_tokens() -> None:
+    from aws_cdk import Token
+
     stack = _build_agentcore_stack()
 
     assert stack.runtime_source_commit == TEST_SOURCE_COMMIT
-    assert stack.runtime_arn == TEST_RUNTIME_ARN
-    assert stack.runtime_iam_arn == TEST_RUNTIME_IAM_ARN
-    assert stack.runtime_endpoint_id == TEST_RUNTIME_ENDPOINT_ID
+    assert Token.is_unresolved(stack.runtime_id)
+    assert Token.is_unresolved(stack.runtime_arn)
+    assert Token.is_unresolved(stack.runtime_iam_arn)
+    assert Token.is_unresolved(stack.runtime_endpoint_id)
     assert stack.runtime_endpoint_name == TEST_RUNTIME_ENDPOINT_NAME
-    assert stack.runtime_version == TEST_RUNTIME_VERSION
+    assert Token.is_unresolved(stack.runtime_version)
     assert stack.runtime_image_uri == TEST_RUNTIME_IMAGE_URI
+
+
+def test_agentcore_endpoint_stage_synthesizes_before_runtime_identity_exists() -> None:
+    from aws_cdk import Token
+
+    stack = _build_agentcore_stack(
+        context_overrides={
+            "runtime_id": "",
+            "runtime_endpoint_id": "",
+            "runtime_endpoint_name": "",
+            "runtime_version": "",
+            "runtime_arn": "",
+        }
+    )
+
+    assert all(
+        Token.is_unresolved(value)
+        for value in (
+            stack.runtime_id,
+            stack.runtime_arn,
+            stack.runtime_iam_arn,
+            stack.runtime_endpoint_id,
+            stack.runtime_version,
+        )
+    )
+    assert stack.runtime_endpoint_name == TEST_RUNTIME_ENDPOINT_NAME
+
+
+def test_endpoint_stage_full_app_imports_parameters_and_generated_endpoint(
+    tmp_path: Path,
+) -> None:
+    context = dict(_json("cdk.json")["context"])
+    context.update(
+        {
+            "account": "000000000000",
+            "agentcore_release_stage": "endpoint",
+            "runtime_source_commit": TEST_SOURCE_COMMIT,
+            "capability_release_commit": TEST_SOURCE_COMMIT,
+            "runtime_image_uri": (
+                "000000000000.dkr.ecr.eu-west-1.amazonaws.com/"
+                "personal-operator/bridge@sha256:" + "b" * 64
+            ),
+        }
+    )
+    out_dir = tmp_path / "cdk.out"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "AWS_ACCESS_KEY_ID": "",
+            "AWS_SECRET_ACCESS_KEY": "",
+            "AWS_SESSION_TOKEN": "",
+            "AWS_EC2_METADATA_DISABLED": "true",
+            "AWS_REGION": "eu-west-1",
+            "AWS_DEFAULT_REGION": "eu-west-1",
+            "CDK_DEFAULT_ACCOUNT": "000000000000",
+            "CDK_DEFAULT_REGION": "eu-west-1",
+            "CDK_CONTEXT_JSON": json.dumps(context, separators=(",", ":")),
+            "CDK_OUTDIR": str(out_dir),
+            "PERSONAL_OPERATOR_SYNTH_SOURCE_ASSET": "1",
+        }
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "app.py")],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    router = json.loads(
+        (out_dir / "OpenClawRouter.template.json").read_text(encoding="utf-8")
+    )
+    web = json.loads(
+        (out_dir / "PersonalOperatorWeb.template.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    for template in (router, web):
+        agentcore_statements = [
+            statement
+            for resource in template["Resources"].values()
+            if resource["Type"] == "AWS::IAM::Policy"
+            for statement in resource["Properties"]["PolicyDocument"]["Statement"]
+            if "bedrock-agentcore" in json.dumps(statement.get("Action"))
+        ]
+        assert agentcore_statements
+        resources = json.dumps(
+            [statement["Resource"] for statement in agentcore_statements],
+            sort_keys=True,
+        )
+        assert "ExportsOutputRefHardenedRuntimeId" in resources
+        assert "ExportsOutputFnGetAttBridgeRuntimeEndpointId" in resources
+        assert (
+            "arn:aws:bedrock-agentcore:eu-west-1:000000000000:runtime/"
+            in resources
+        )
+        assert TEST_RUNTIME_ENDPOINT_NAME not in resources
+        assert '"*"' not in resources
+
+        environments = json.dumps(
+            [
+                resource["Properties"].get("Environment", {}).get("Variables", {})
+                for resource in template["Resources"].values()
+                if resource["Type"] == "AWS::Lambda::Function"
+            ],
+            sort_keys=True,
+        )
+        assert "ExportsOutputRefHardenedRuntimeArn" in environments
 
 
 def test_agentcore_stack_allows_only_fully_empty_offline_runtime_context() -> None:
     stack = _build_agentcore_stack(
         context_overrides={
+            "agentcore_release_stage": "",
             "runtime_source_commit": "",
             "runtime_id": "",
             "runtime_endpoint_id": "",
@@ -939,6 +1135,32 @@ def test_agentcore_stack_allows_only_fully_empty_offline_runtime_context() -> No
     assert stack.runtime_endpoint_name == "PLACEHOLDER"
     assert stack.runtime_version == "PLACEHOLDER"
     assert stack.runtime_image_uri == "PLACEHOLDER"
+
+
+def test_runtime_creation_stage_keeps_the_app_consumer_tuple_atomic() -> None:
+    stack = _build_agentcore_stack(
+        context_overrides={
+            "agentcore_release_stage": "runtime",
+            "runtime_id": "",
+            "runtime_endpoint_id": "",
+            "runtime_endpoint_name": "",
+            "runtime_version": "",
+            "runtime_arn": "",
+        }
+    )
+
+    _synth_router_template(
+        runtime_arn=stack.runtime_arn,
+        runtime_iam_arn=stack.runtime_iam_arn,
+        runtime_endpoint_id=stack.runtime_endpoint_id,
+        runtime_endpoint_name=stack.runtime_endpoint_name,
+    )
+    assert (
+        stack.runtime_arn,
+        stack.runtime_iam_arn,
+        stack.runtime_endpoint_id,
+        stack.runtime_endpoint_name,
+    ) == ("PLACEHOLDER",) * 4
 
 
 def test_agentcore_stack_rejects_incomplete_or_noncanonical_runtime_context() -> None:
@@ -1005,12 +1227,15 @@ def _synth_router_template(
     *,
     runtime_arn: str = TEST_RUNTIME_ARN,
     runtime_iam_arn: str = TEST_RUNTIME_IAM_ARN,
+    runtime_endpoint_id: str = TEST_RUNTIME_ENDPOINT_ID,
     runtime_endpoint_name: str = TEST_RUNTIME_ENDPOINT_NAME,
     registration_open: str = "false",
     capability_state_table_name: str = TEST_CAPABILITY_STATE_TABLE_NAME,
     capability_state_table_arn: str = TEST_CAPABILITY_STATE_TABLE_ARN,
     capability_release_commit: str = TEST_SOURCE_COMMIT,
     capability_catalog_digest: str = TEST_CAPABILITY_CATALOG_DIGEST,
+    runtime_binding=None,
+    app=None,
 ) -> dict:
     from aws_cdk import App, Environment
     from aws_cdk.assertions import Template
@@ -1018,12 +1243,12 @@ def _synth_router_template(
     from stacks.router_stack import RouterStack
 
     account = "123456789012"
-    app = App(context={"registration_open": registration_open})
-    stack = RouterStack(
-        app,
-        "Router",
+    if app is None:
+        app = App(context={"registration_open": registration_open})
+    arguments = dict(
         runtime_arn=runtime_arn,
         runtime_iam_arn=runtime_iam_arn,
+        runtime_endpoint_id=runtime_endpoint_id,
         runtime_endpoint_name=runtime_endpoint_name,
         capability_state_table_name=capability_state_table_name,
         capability_state_table_arn=capability_state_table_arn,
@@ -1055,6 +1280,9 @@ def _synth_router_template(
         trusted_code_asset_root="lambda",
         env=Environment(account=account, region="eu-west-1"),
     )
+    if runtime_binding is not None:
+        arguments["runtime_binding"] = runtime_binding
+    stack = RouterStack(app, "Router", **arguments)
     return Template.from_stack(stack).to_json()
 
 
@@ -1068,7 +1296,7 @@ def test_external_pilot_router_rejects_open_registration():
         raise AssertionError("external pilot accepted open registration")
 
 
-def test_worker_separates_invocation_arn_from_iam_runtime_resource() -> None:
+def test_worker_uses_endpoint_id_for_iam_and_name_only_for_invocation() -> None:
     template = _synth_router_template()
     resources = template["Resources"].values()
     worker = next(
@@ -1103,15 +1331,104 @@ def test_worker_separates_invocation_arn_from_iam_runtime_resource() -> None:
     ] == TEST_RUNTIME_ENDPOINT_NAME
     assert invocation["Resource"] == [
         TEST_RUNTIME_IAM_ARN,
-        f"{TEST_RUNTIME_IAM_ARN}/runtime-endpoint/{TEST_RUNTIME_ENDPOINT_NAME}",
+        TEST_RUNTIME_ENDPOINT_IAM_ARN,
     ]
     assert TEST_RUNTIME_ARN not in invocation["Resource"]
+    assert all(TEST_RUNTIME_ENDPOINT_NAME not in arn for arn in invocation["Resource"])
+
+
+def test_router_rejects_unbound_unresolved_agentcore_endpoint_id_token() -> None:
+    from aws_cdk import Token
+
+    with pytest.raises(ValueError, match="binding"):
+        _synth_router_template(
+            runtime_endpoint_id=Token.as_string(
+                {"Ref": "UnconstrainedEndpointId"}
+            )
+        )
+
+
+def test_router_rejects_unbound_ref_join_foreign_and_wildcard_tokens() -> None:
+    from aws_cdk import Token
+
+    attempts = [
+        {"runtime_arn": Token.as_string({"Ref": "UnconstrainedRuntimeArn"})},
+        {
+            "runtime_arn": Token.as_string(
+                {
+                    "Fn::Join": [
+                        "",
+                        [
+                            (
+                                "arn:aws:bedrock-agentcore:us-east-1:"
+                                "123456789012:agent/"
+                            ),
+                            {"Ref": "ForeignRuntimeArnSuffix"},
+                        ],
+                    ]
+                }
+            )
+        },
+        {
+            "runtime_iam_arn": Token.as_string(
+                {
+                    "Fn::Join": [
+                        "",
+                        [
+                            (
+                                "arn:aws:bedrock-agentcore:eu-west-1:"
+                                "999999999999:runtime/"
+                            ),
+                            {"Ref": "ForeignRuntimeId"},
+                        ],
+                    ]
+                }
+            )
+        },
+        {
+            "runtime_iam_arn": Token.as_string(
+                {
+                    "Fn::Join": [
+                        "",
+                        [
+                            TEST_RUNTIME_IAM_ARN,
+                            "/",
+                            {"Ref": "WildcardSuffix"},
+                            "/*",
+                        ],
+                    ]
+                }
+            )
+        },
+    ]
+
+    for attempt in attempts:
+        with pytest.raises(ValueError, match="binding"):
+            _synth_router_template(**attempt)
+
+
+def test_router_rejects_reconstructed_agentcore_runtime_binding() -> None:
+    stack = _build_agentcore_stack()
+    binding = stack.runtime_binding
+    assert binding is not None
+    reconstructed = replace(binding)
+
+    with pytest.raises(ValueError, match="binding"):
+        _synth_router_template(
+            runtime_arn=stack.runtime_arn,
+            runtime_iam_arn=stack.runtime_iam_arn,
+            runtime_endpoint_id=stack.runtime_endpoint_id,
+            runtime_endpoint_name=stack.runtime_endpoint_name,
+            runtime_binding=reconstructed,
+            app=stack.node.root,
+        )
 
 
 def test_router_accepts_only_matching_grammar_or_all_placeholders() -> None:
     _synth_router_template(
         runtime_arn="PLACEHOLDER",
         runtime_iam_arn="PLACEHOLDER",
+        runtime_endpoint_id="PLACEHOLDER",
         runtime_endpoint_name="PLACEHOLDER",
     )
     invalid_values = [
@@ -1132,6 +1449,8 @@ def test_router_accepts_only_matching_grammar_or_all_placeholders() -> None:
             ),
         },
         {"runtime_iam_arn": "PLACEHOLDER"},
+        {"runtime_endpoint_id": "PLACEHOLDER"},
+        {"runtime_endpoint_id": TEST_RUNTIME_ENDPOINT_NAME},
         {"runtime_endpoint_name": "PLACEHOLDER"},
     ]
     for overrides in invalid_values:

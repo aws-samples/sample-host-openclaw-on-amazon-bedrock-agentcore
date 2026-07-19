@@ -2329,6 +2329,7 @@ def test_worker_stack_provisions_exact_runtime_state_boundary():
             "12345678-1234-1234-1234-123456789abc:1"
         ),
         runtime_iam_arn=runtime_iam_arn,
+        runtime_endpoint_id="release_endpoint-0123456789",
         runtime_endpoint_name=RELEASE_ENDPOINT,
         capability_state_table_name="personal-operator-capability-state",
         capability_state_table_arn=(
@@ -2448,7 +2449,7 @@ def test_worker_stack_provisions_exact_runtime_state_boundary():
     }
     assert runtime_policy["Resource"] == [
         runtime_iam_arn,
-        f"{runtime_iam_arn}/runtime-endpoint/{RELEASE_ENDPOINT}",
+        f"{runtime_iam_arn}/runtime-endpoint/release_endpoint-0123456789",
     ]
 
 

@@ -97,6 +97,11 @@ require_equal() {
   fi
 }
 
+canonical_resource_multiset() {
+  awk '{ for (field = 1; field <= NF; field++) print $field }' \
+    | LC_ALL=C sort
+}
+
 validate_deployed_runtime() {
   echo "--- Validating deployed runtime contract ---"
 
@@ -303,8 +308,11 @@ PY
     fi
   done
   ROUTER_AGENTCORE_RESOURCES=$(printf '%s\n' "$ROUTER_AGENTCORE_RESOURCES" \
-    | tr '\t\n' '  ' | awk '{$1=$1; print}')
-  EXPECTED_ROUTER_IAM_RESOURCES="${RUNTIME_IAM_ARN} ${RUNTIME_IAM_ARN}/runtime-endpoint/${RUNTIME_ENDPOINT_NAME}"
+    | canonical_resource_multiset)
+  EXPECTED_ROUTER_IAM_RESOURCES=$(printf '%s\n%s\n' \
+    "$RUNTIME_IAM_ARN" \
+    "${RUNTIME_IAM_ARN}/runtime-endpoint/${RUNTIME_ENDPOINT_ID}" \
+    | canonical_resource_multiset)
   require_equal \
     "router IAM runtime resources" \
     "$EXPECTED_ROUTER_IAM_RESOURCES" \

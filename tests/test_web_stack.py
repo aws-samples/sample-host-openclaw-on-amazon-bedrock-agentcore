@@ -26,6 +26,10 @@ RUNTIME_IAM_ARN = (
     "arn:aws:bedrock-agentcore:eu-west-1:123456789012:"
     "runtime/personal_operator-0123456789"
 )
+RUNTIME_ENDPOINT_ID = "release_endpoint-0123456789"
+RUNTIME_ENDPOINT_IAM_ARN = (
+    f"{RUNTIME_IAM_ARN}/runtime-endpoint/{RUNTIME_ENDPOINT_ID}"
+)
 RELEASE_ENDPOINT = "release_" + "a" * 40
 SCHEDULER_CONTROL_ARN = (
     "arn:aws:lambda:eu-west-1:123456789012:function:"
@@ -99,6 +103,11 @@ def _synth_web_template(
     founder_user_ids: str = "",
     gmail_send_connection_id: str = "",
     gmail_send_account_email: str = "",
+    runtime_arn: str = RUNTIME_ARN,
+    runtime_iam_arn: str = RUNTIME_IAM_ARN,
+    runtime_endpoint_id: str = RUNTIME_ENDPOINT_ID,
+    runtime_endpoint_name: str = RELEASE_ENDPOINT,
+    runtime_binding=None,
 ) -> dict:
     app = cdk.App()
     resources = cdk.Stack(app, "WebTestResources", env=ENV)
@@ -150,18 +159,17 @@ def _synth_web_template(
         encryption=s3.BucketEncryption.KMS,
         encryption_key=cmk,
     )
-    stack = WebStack(
-        app,
-        "PersonalOperatorWeb",
+    arguments = dict(
         cmk_arn=cmk.key_arn,
         runtime_state_table=runtime_table,
         capability_state_table=capability_state_table,
         identity_table=identity_table,
         message_ledger_table=message_ledger_table,
         user_files_bucket=user_files_bucket,
-        runtime_arn=RUNTIME_ARN,
-        runtime_iam_arn=RUNTIME_IAM_ARN,
-        runtime_endpoint_name=RELEASE_ENDPOINT,
+        runtime_arn=runtime_arn,
+        runtime_iam_arn=runtime_iam_arn,
+        runtime_endpoint_id=runtime_endpoint_id,
+        runtime_endpoint_name=runtime_endpoint_name,
         scheduler_control_function_arn=SCHEDULER_CONTROL_ARN,
         scheduler_control_table_arn=SCHEDULER_CONTROL_TABLE_ARN,
         trusted_code_asset_root="lambda",
@@ -172,6 +180,9 @@ def _synth_web_template(
         web_acl_id=web_acl_id,
         env=ENV,
     )
+    if runtime_binding is not None:
+        arguments["runtime_binding"] = runtime_binding
+    stack = WebStack(app, "PersonalOperatorWeb", **arguments)
     return app.synth().get_stack_by_name(stack.stack_name).template
 
 
@@ -198,6 +209,7 @@ def test_web_stack_rejects_every_region_except_eu_west_1() -> None:
             user_files_bucket=bucket,
             runtime_arn=RUNTIME_ARN,
             runtime_iam_arn=RUNTIME_IAM_ARN,
+            runtime_endpoint_id=RUNTIME_ENDPOINT_ID,
             runtime_endpoint_name=RELEASE_ENDPOINT,
             scheduler_control_function_arn=SCHEDULER_CONTROL_ARN,
             scheduler_control_table_arn=SCHEDULER_CONTROL_TABLE_ARN,
@@ -205,6 +217,56 @@ def test_web_stack_rejects_every_region_except_eu_west_1() -> None:
             web_asset_root="tests/fixtures/web-dist",
             env=cdk.Environment(account="123456789012", region="us-east-1"),
         )
+
+
+def test_web_stack_rejects_endpoint_name_in_endpoint_id_slot() -> None:
+    with pytest.raises(ValueError, match="runtime"):
+        _synth_web_template(runtime_endpoint_id=RELEASE_ENDPOINT)
+
+
+def test_web_stack_rejects_unbound_unresolved_endpoint_id_token() -> None:
+    with pytest.raises(ValueError, match="binding"):
+        _synth_web_template(
+            runtime_endpoint_id=cdk.Token.as_string(
+                {"Ref": "UnconstrainedEndpointId"}
+            )
+        )
+
+
+def test_web_rejects_unbound_ref_join_foreign_and_wildcard_tokens() -> None:
+    attempts = [
+        {"runtime_arn": cdk.Token.as_string({"Ref": "UnconstrainedRuntimeArn"})},
+        {
+            "runtime_iam_arn": cdk.Token.as_string(
+                {
+                    "Fn::Join": [
+                        "",
+                        [
+                            (
+                                "arn:aws:bedrock-agentcore:eu-west-1:"
+                                "999999999999:runtime/"
+                            ),
+                            {"Ref": "ForeignRuntimeId"},
+                        ],
+                    ]
+                }
+            )
+        },
+        {
+            "runtime_endpoint_id": cdk.Token.as_string(
+                {
+                    "Fn::Join": [
+                        "",
+                        [{"Ref": "EndpointPrefix"}, "/*"],
+                    ]
+                }
+            )
+        },
+    ]
+
+    for attempt in attempts:
+        with pytest.raises(ValueError, match="binding"):
+            _synth_web_template(**attempt)
 
 
 def test_web_capability_deletion_has_only_exact_table_authority() -> None:
@@ -881,6 +943,16 @@ def test_web_lambda_has_only_control_plane_authority() -> None:
         "ses:SendEmail",
         "ses:SendRawEmail",
     }.isdisjoint(actions)
+    stop_runtime = next(
+        statement
+        for statement in statements
+        if statement.get("Action") == "bedrock-agentcore:StopRuntimeSession"
+    )
+    assert stop_runtime["Resource"] == [
+        RUNTIME_IAM_ARN,
+        RUNTIME_ENDPOINT_IAM_ARN,
+    ]
+    assert all(RELEASE_ENDPOINT not in arn for arn in stop_runtime["Resource"])
     scheduler_invoke = [
         statement
         for statement in statements
@@ -1116,7 +1188,9 @@ def test_app_wires_existing_runtime_state_bucket_and_cmk_into_web_stack() -> Non
     assert "user_files_bucket=agentcore_stack.user_files_bucket" in source
     assert "runtime_arn=agentcore_stack.runtime_arn" in source
     assert "runtime_iam_arn=agentcore_stack.runtime_iam_arn" in source
+    assert "runtime_endpoint_id=agentcore_stack.runtime_endpoint_id" in source
     assert "runtime_endpoint_name=agentcore_stack.runtime_endpoint_name" in source
+    assert "runtime_binding=agentcore_stack.runtime_binding" in source
     assert "scheduler_control_table_arn=(" in source
     assert "scheduler_stack.control_table.table_arn" in source
     assert "web_stack.add_dependency(scheduler_stack)" in source

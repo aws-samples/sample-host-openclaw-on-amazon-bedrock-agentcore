@@ -25,6 +25,7 @@ import cdk_nag
 from constructs import Construct
 
 from stacks import retention_days
+from stacks.agentcore_stack import AgentCoreRuntimeBinding
 
 
 REQUIRED_REGION = "eu-west-1"
@@ -39,6 +40,7 @@ class RouterStack(Stack):
         *,
         runtime_arn: str,
         runtime_iam_arn: str,
+        runtime_endpoint_id: str,
         runtime_endpoint_name: str,
         capability_state_table_name: str,
         capability_state_table_arn: str,
@@ -57,6 +59,7 @@ class RouterStack(Stack):
         user_files_bucket_arn: str,
         trusted_code_asset_root: str,
         trusted_code_asset_hash: str | None = None,
+        runtime_binding: AgentCoreRuntimeBinding | None = None,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -104,40 +107,101 @@ class RouterStack(Stack):
         ):
             raise ValueError("workspace capability secret name is not canonical")
 
-        runtime_values = (runtime_arn, runtime_iam_arn, runtime_endpoint_name)
-        if runtime_values == ("PLACEHOLDER", "PLACEHOLDER", "PLACEHOLDER"):
-            # Foundation/offline synthesis precedes creation of the runtime.
-            # Partial placeholders are rejected below so they cannot reach a
-            # deployable Router template.
-            pass
+        runtime_values = (
+            runtime_arn,
+            runtime_iam_arn,
+            runtime_endpoint_id,
+            runtime_endpoint_name,
+        )
+        if runtime_binding is not None:
+            if type(runtime_binding) is not AgentCoreRuntimeBinding:
+                raise ValueError("runtime binding type is not canonical")
+            (
+                runtime_id,
+                _,
+                bound_runtime_arn,
+                bound_endpoint_id,
+                bound_endpoint_name,
+            ) = AgentCoreRuntimeBinding.validated_values_for(
+                runtime_binding,
+                self,
+            )
+            bound_runtime_iam_arn = (
+                f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/"
+                f"{runtime_id}"
+            )
+            exact_values = (
+                bound_runtime_arn,
+                bound_runtime_iam_arn,
+                bound_endpoint_id,
+                bound_endpoint_name,
+            )
+            if runtime_values != exact_values:
+                raise ValueError(
+                    "runtime values must be the exact stack-produced binding"
+                )
+            (
+                runtime_arn,
+                runtime_iam_arn,
+                runtime_endpoint_id,
+                runtime_endpoint_name,
+            ) = exact_values
         else:
-            if "PLACEHOLDER" in runtime_values:
+            if any(Token.is_unresolved(value) for value in runtime_values):
                 raise ValueError(
-                    "runtime ARN, IAM ARN, and endpoint must be concrete together"
+                    "unresolved runtime tokens require the exact producer binding"
                 )
-            runtime_id_pattern = r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
-            invocation_arn_pattern = (
-                rf"arn:aws:bedrock-agentcore:{re.escape(region)}:"
-                rf"{re.escape(account)}:agent/"
-                r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
-                r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
-            )
-            iam_arn_pattern = (
-                rf"arn:aws:bedrock-agentcore:{re.escape(region)}:"
-                rf"{re.escape(account)}:runtime/{runtime_id_pattern}"
-            )
-            if re.fullmatch(invocation_arn_pattern, runtime_arn) is None:
-                raise ValueError(
-                    "runtime_arn must be the exact AgentCore invocation ARN"
+            if runtime_values == (
+                "PLACEHOLDER",
+                "PLACEHOLDER",
+                "PLACEHOLDER",
+                "PLACEHOLDER",
+            ):
+                # Foundation/offline synthesis precedes creation of the runtime.
+                # Partial placeholders are rejected below so they cannot reach a
+                # deployable Router template.
+                pass
+            else:
+                if "PLACEHOLDER" in runtime_values:
+                    raise ValueError(
+                        "runtime ARN, IAM ARN, endpoint ID, and endpoint name "
+                        "must be concrete together"
+                    )
+                runtime_id_pattern = (
+                    r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
                 )
-            if re.fullmatch(iam_arn_pattern, runtime_iam_arn) is None:
-                raise ValueError(
-                    "runtime_iam_arn must be the exact AgentCore IAM runtime resource"
+                invocation_arn_pattern = (
+                    rf"arn:aws:bedrock-agentcore:{re.escape(region)}:"
+                    rf"{re.escape(account)}:agent/"
+                    r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
+                    r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
                 )
-            if re.fullmatch(r"release_[0-9a-f]{40}", runtime_endpoint_name) is None:
-                raise ValueError(
-                    "runtime_endpoint_name must be an exact release endpoint"
+                iam_arn_pattern = (
+                    rf"arn:aws:bedrock-agentcore:{re.escape(region)}:"
+                    rf"{re.escape(account)}:runtime/{runtime_id_pattern}"
                 )
+                if re.fullmatch(invocation_arn_pattern, runtime_arn) is None:
+                    raise ValueError(
+                        "runtime_arn must be the exact AgentCore invocation ARN"
+                    )
+                if re.fullmatch(iam_arn_pattern, runtime_iam_arn) is None:
+                    raise ValueError(
+                        "runtime_iam_arn must be the exact AgentCore IAM runtime "
+                        "resource"
+                    )
+                if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
+                    raise ValueError(
+                        "runtime_endpoint_id must be the exact generated endpoint ID"
+                    )
+                if (
+                    re.fullmatch(
+                        r"release_[0-9a-f]{40}", runtime_endpoint_name
+                    )
+                    is None
+                ):
+                    raise ValueError(
+                        "runtime_endpoint_name must be an exact release endpoint"
+                    )
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         worker_timeout = int(
             self.node.try_get_context("router_lambda_timeout_seconds") or "600"
@@ -548,7 +612,7 @@ class RouterStack(Stack):
                 ],
                 resources=[
                     runtime_iam_arn,
-                    f"{runtime_iam_arn}/runtime-endpoint/{runtime_endpoint_name}",
+                    f"{runtime_iam_arn}/runtime-endpoint/{runtime_endpoint_id}",
                 ],
             )
         )

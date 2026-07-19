@@ -13,9 +13,11 @@ added only for an exact digest-bound release input.
 
 import json
 import re
+from dataclasses import dataclass
 
 from aws_cdk import (
     CfnOutput,
+    CfnParameter,
     Duration,
     Stack,
     RemovalPolicy,
@@ -43,6 +45,136 @@ BEDROCK_DESTINATION_REGIONS = (
     "eu-west-1",
     "eu-west-3",
 )
+_RUNTIME_ID_ALLOWED_PATTERN = (
+    r"^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}$"
+)
+_RUNTIME_VERSION_ALLOWED_PATTERN = r"^[1-9][0-9]{0,4}$"
+
+
+def _runtime_arn_allowed_pattern(*, account: str, region: str) -> str:
+    return (
+        rf"^arn:aws:bedrock-agentcore:{region}:{account}:agent/"
+        r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
+        r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}$"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AgentCoreRuntimeBinding:
+    """Exact endpoint-stage producer objects trusted by consumer stacks."""
+
+    producer_stack: "AgentCoreStack"
+    account: str
+    region: str
+    runtime_id_parameter: CfnParameter
+    runtime_version_parameter: CfnParameter
+    runtime_arn_parameter: CfnParameter
+    runtime_endpoint: agentcore.CfnRuntimeEndpoint
+    runtime_endpoint_name: str
+
+    @property
+    def runtime_id(self) -> str:
+        return self.runtime_id_parameter.value_as_string
+
+    @property
+    def runtime_version(self) -> str:
+        return self.runtime_version_parameter.value_as_string
+
+    @property
+    def runtime_arn(self) -> str:
+        return self.runtime_arn_parameter.value_as_string
+
+    @property
+    def runtime_endpoint_id(self) -> str:
+        return self.runtime_endpoint.attr_id
+
+    def validated_values_for(
+        self,
+        consumer_stack: Stack,
+    ) -> tuple[str, str, str, str, str]:
+        """Return values only for this exact producer object and consumer env."""
+
+        if type(self) is not AgentCoreRuntimeBinding:
+            raise ValueError("runtime binding type is not canonical")
+        producer = self.producer_stack
+        if not isinstance(producer, AgentCoreStack):
+            raise ValueError("runtime binding producer is not canonical")
+        if getattr(producer, "runtime_binding", None) is not self:
+            raise ValueError("runtime binding was reconstructed or replaced")
+        if producer.node.root is not consumer_stack.node.root:
+            raise ValueError("runtime binding crosses its CDK application")
+        producer_stack = Stack.of(producer)
+        consumer = Stack.of(consumer_stack)
+        if (
+            self.region != REQUIRED_REGION
+            or producer_stack.region != self.region
+            or consumer.region != self.region
+            or re.fullmatch(r"[0-9]{12}", self.account) is None
+            or producer_stack.account != self.account
+            or consumer.account != self.account
+        ):
+            raise ValueError("runtime binding crosses its canonical account or region")
+
+        parameter_contracts = (
+            (
+                self.runtime_id_parameter,
+                getattr(producer, "hardened_runtime_id_parameter", None),
+                "HardenedRuntimeId",
+                _RUNTIME_ID_ALLOWED_PATTERN,
+            ),
+            (
+                self.runtime_version_parameter,
+                getattr(producer, "hardened_runtime_version_parameter", None),
+                "HardenedRuntimeVersion",
+                _RUNTIME_VERSION_ALLOWED_PATTERN,
+            ),
+            (
+                self.runtime_arn_parameter,
+                getattr(producer, "hardened_runtime_arn_parameter", None),
+                "HardenedRuntimeArn",
+                _runtime_arn_allowed_pattern(
+                    account=self.account,
+                    region=self.region,
+                ),
+            ),
+        )
+        for parameter, exact_parameter, node_id, allowed_pattern in (
+            parameter_contracts
+        ):
+            if (
+                parameter is not exact_parameter
+                or parameter.node.scope is not producer
+                or parameter.node.id != node_id
+                or parameter.type != "String"
+                or parameter.default is not None
+                or parameter.allowed_pattern != allowed_pattern
+            ):
+                raise ValueError("runtime binding parameter boundary is not canonical")
+
+        endpoint = self.runtime_endpoint
+        if (
+            endpoint is not getattr(producer, "runtime_endpoint", None)
+            or endpoint.node.scope is not producer
+            or endpoint.node.id != "BridgeRuntimeEndpoint"
+            or endpoint.agent_runtime_id != self.runtime_id
+            or endpoint.agent_runtime_version != self.runtime_version
+            or endpoint.name != self.runtime_endpoint_name
+            or producer.runtime_id != self.runtime_id
+            or producer.runtime_version != self.runtime_version
+            or producer.runtime_arn != self.runtime_arn
+            or producer.runtime_endpoint_id != self.runtime_endpoint_id
+            or producer.runtime_endpoint_name != self.runtime_endpoint_name
+            or self.runtime_endpoint_name
+            != f"release_{producer.runtime_source_commit}"
+        ):
+            raise ValueError("runtime binding endpoint boundary is not canonical")
+        return (
+            self.runtime_id,
+            self.runtime_version,
+            self.runtime_arn,
+            self.runtime_endpoint_id,
+            self.runtime_endpoint_name,
+        )
 
 
 class AgentCoreStack(Stack):
@@ -562,10 +694,12 @@ class AgentCoreStack(Stack):
         )
 
         # --- Immutable AgentCore release resources ---------------------------
-        # A foundation synth supplies no runtime values and therefore owns no
-        # Runtime/Endpoint. A release synth must supply the exact source commit
-        # and canonical digest URI together. Post-deployment consumer synths may
-        # additionally carry the complete, independently verified v3 context.
+        # CloudFormation's create model cannot set requireMMDSV2. The release
+        # therefore has three explicit stages: foundation, runtime-only, then
+        # endpoint bound to the exact version returned by the hardening update.
+        raw_release_stage = str(
+            self.node.try_get_context("agentcore_release_stage") or ""
+        )
         runtime_source_commit = str(
             self.node.try_get_context("runtime_source_commit") or ""
         )
@@ -582,14 +716,31 @@ class AgentCoreStack(Stack):
             self.node.try_get_context("runtime_image_uri") or ""
         )
         release_inputs = (runtime_source_commit, runtime_image_uri)
-        persisted_runtime_values = (
-            runtime_id,
-            runtime_endpoint_id,
-            runtime_endpoint_name,
-            runtime_version,
-            runtime_arn,
-        )
-        if not any(release_inputs) and not any(persisted_runtime_values):
+        runtime_identity = (runtime_id, runtime_version, runtime_arn)
+        endpoint_identity = (runtime_endpoint_id, runtime_endpoint_name)
+        all_runtime_values = release_inputs + runtime_identity + endpoint_identity
+        if not raw_release_stage:
+            if any(all_runtime_values):
+                raise ValueError(
+                    "agentcore_release_stage is required for runtime release inputs"
+                )
+            release_stage = "foundation"
+        else:
+            release_stage = raw_release_stage
+        if release_stage not in {"foundation", "runtime", "endpoint"}:
+            raise ValueError(
+                "agentcore_release_stage must be foundation, runtime, or endpoint"
+            )
+        self.hardened_runtime_id_parameter = None
+        self.hardened_runtime_version_parameter = None
+        self.hardened_runtime_arn_parameter = None
+        self.runtime_binding = None
+
+        if release_stage == "foundation":
+            if any(all_runtime_values):
+                raise ValueError(
+                    "foundation stage cannot include runtime release inputs"
+                )
             # Foundation stacks are synthesizable before any image mutation.
             # Consumer placeholders are intentionally undeployable release
             # identities; the staging transaction never deploys those stacks.
@@ -603,19 +754,18 @@ class AgentCoreStack(Stack):
             self.runtime_iam_arn = "PLACEHOLDER"
             self.runtime = None
             self.runtime_endpoint = None
+            self.runtime_command_deny_policy = None
+            self.endpoint_command_deny_policy = None
         else:
             if not all(release_inputs):
                 raise ValueError(
                     "runtime_source_commit and runtime_image_uri must be set together"
                 )
             source_commit_pattern = r"[0-9a-f]{40}"
-            runtime_version_pattern = r"[1-9][0-9]{0,4}"
-            runtime_id_pattern = r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}"
+            runtime_version_pattern = _RUNTIME_VERSION_ALLOWED_PATTERN
+            runtime_id_pattern = _RUNTIME_ID_ALLOWED_PATTERN
             runtime_arn_pattern = (
-                rf"arn:aws:bedrock-agentcore:{re.escape(region)}:"
-                rf"{re.escape(account)}:agent/"
-                r"[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-"
-                r"[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}:[1-9][0-9]{0,4}"
+                _runtime_arn_allowed_pattern(account=account, region=region)
             )
             runtime_image_uri_pattern = (
                 rf"{re.escape(account)}\.dkr\.ecr\."
@@ -631,36 +781,88 @@ class AgentCoreStack(Stack):
                     f"ECR digest in account {account} and region {region}"
                 )
 
-            has_persisted_context = any(persisted_runtime_values)
-            if has_persisted_context and not all(persisted_runtime_values):
+            if release_stage == "runtime" and any(
+                runtime_identity + endpoint_identity
+            ):
                 raise ValueError(
-                    "runtime_id, runtime_endpoint_id, runtime_endpoint_name, "
-                    "runtime_version, and runtime_arn must be set together"
+                    "runtime stage cannot include persisted runtime identity"
                 )
             expected_endpoint_name = f"release_{runtime_source_commit}"
-            if has_persisted_context:
-                if re.fullmatch(runtime_version_pattern, runtime_version) is None:
-                    raise ValueError("runtime_version is not canonical")
-                if re.fullmatch(runtime_id_pattern, runtime_id) is None:
-                    raise ValueError(f"runtime_id is not canonical: {runtime_id}")
-                if re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None:
+            if release_stage == "endpoint":
+                if any(runtime_identity) and not all(runtime_identity):
+                    raise ValueError(
+                        "endpoint stage literal runtime identity must be atomic"
+                    )
+                if all(runtime_identity):
+                    if (
+                        re.fullmatch(runtime_version_pattern, runtime_version)
+                        is None
+                    ):
+                        raise ValueError("runtime_version is not canonical")
+                    if re.fullmatch(runtime_id_pattern, runtime_id) is None:
+                        raise ValueError(f"runtime_id is not canonical: {runtime_id}")
+                    if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
+                        raise ValueError(
+                            "runtime_arn must be the exact AgentCore ARN returned for "
+                            f"account {account} in {region}"
+                        )
+                    if runtime_arn.rsplit(":", 1)[-1] != runtime_version:
+                        raise ValueError(
+                            "runtime_version must equal the exact runtime ARN version"
+                        )
+                if any(endpoint_identity) and not all(endpoint_identity):
+                    raise ValueError(
+                        "runtime endpoint ID and name must be set together"
+                    )
+                if runtime_endpoint_id and (
+                    re.fullmatch(runtime_id_pattern, runtime_endpoint_id) is None
+                ):
                     raise ValueError(
                         f"runtime_endpoint_id is not canonical: {runtime_endpoint_id}"
                     )
-                if runtime_endpoint_name != expected_endpoint_name:
+                if (
+                    runtime_endpoint_name
+                    and runtime_endpoint_name != expected_endpoint_name
+                ):
                     raise ValueError(
                         "runtime_endpoint_name must be derived from the exact "
                         "runtime_source_commit"
                     )
-                if re.fullmatch(runtime_arn_pattern, runtime_arn) is None:
-                    raise ValueError(
-                        "runtime_arn must be the exact AgentCore ARN returned for "
-                        f"account {account} in {region}"
-                    )
-                if runtime_arn.rsplit(":", 1)[-1] != runtime_version:
-                    raise ValueError(
-                        "runtime_version must equal the exact runtime ARN version"
-                    )
+
+            hardened_runtime_id = runtime_id
+            hardened_runtime_version = runtime_version
+            hardened_runtime_arn = runtime_arn
+            if release_stage == "endpoint":
+                self.hardened_runtime_id_parameter = CfnParameter(
+                    self,
+                    "HardenedRuntimeId",
+                    type="String",
+                    allowed_pattern=_RUNTIME_ID_ALLOWED_PATTERN,
+                )
+                hardened_runtime_id = (
+                    self.hardened_runtime_id_parameter.value_as_string
+                )
+                self.hardened_runtime_version_parameter = CfnParameter(
+                    self,
+                    "HardenedRuntimeVersion",
+                    type="String",
+                    allowed_pattern=_RUNTIME_VERSION_ALLOWED_PATTERN,
+                )
+                hardened_runtime_version = (
+                    self.hardened_runtime_version_parameter.value_as_string
+                )
+                self.hardened_runtime_arn_parameter = CfnParameter(
+                    self,
+                    "HardenedRuntimeArn",
+                    type="String",
+                    allowed_pattern=_runtime_arn_allowed_pattern(
+                        account=account,
+                        region=region,
+                    ),
+                )
+                hardened_runtime_arn = (
+                    self.hardened_runtime_arn_parameter.value_as_string
+                )
 
             idle_timeout = int(
                 self.node.try_get_context("session_idle_timeout") or "1800"
@@ -760,17 +962,20 @@ class AgentCoreStack(Stack):
                 RemovalPolicy.RETAIN,
                 apply_to_update_replace_policy=True,
             )
-            self.runtime_endpoint = agentcore.CfnRuntimeEndpoint(
-                self,
-                "BridgeRuntimeEndpoint",
-                agent_runtime_id=self.runtime.attr_agent_runtime_id,
-                agent_runtime_version=self.runtime.attr_agent_runtime_version,
-                name=expected_endpoint_name,
-            )
-            self.runtime_endpoint.apply_removal_policy(
-                RemovalPolicy.RETAIN,
-                apply_to_update_replace_policy=True,
-            )
+            self.runtime_endpoint = None
+            if release_stage == "endpoint":
+                self.runtime_endpoint = agentcore.CfnRuntimeEndpoint(
+                    self,
+                    "BridgeRuntimeEndpoint",
+                    agent_runtime_id=hardened_runtime_id,
+                    agent_runtime_version=hardened_runtime_version,
+                    name=expected_endpoint_name,
+                )
+                self.runtime_endpoint.add_dependency(self.runtime)
+                self.runtime_endpoint.apply_removal_policy(
+                    RemovalPolicy.RETAIN,
+                    apply_to_update_replace_policy=True,
+                )
 
             def command_deny_policy(resource_arn: str) -> str:
                 return Stack.of(self).to_json_string(
@@ -802,59 +1007,83 @@ class AgentCoreStack(Stack):
             # Explicit resource denies on both hierarchical subjects prevent a
             # broad caller identity policy from turning that platform surface
             # into a catalog or credential-boundary bypass.
+            runtime_resource_arn = (
+                f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/"
+                f"{self.runtime.attr_agent_runtime_id}"
+            )
             self.runtime_command_deny_policy = agentcore.CfnResourcePolicy(
                 self,
                 "BridgeRuntimeCommandDenyPolicy",
-                resource_arn=self.runtime.attr_agent_runtime_arn,
-                policy=command_deny_policy(self.runtime.attr_agent_runtime_arn),
+                resource_arn=runtime_resource_arn,
+                policy=command_deny_policy(runtime_resource_arn),
             )
             self.runtime_command_deny_policy.add_dependency(self.runtime)
             self.runtime_command_deny_policy.apply_removal_policy(
                 RemovalPolicy.RETAIN,
                 apply_to_update_replace_policy=True,
             )
-            self.endpoint_command_deny_policy = agentcore.CfnResourcePolicy(
-                self,
-                "BridgeEndpointCommandDenyPolicy",
-                resource_arn=(
-                    self.runtime_endpoint.attr_agent_runtime_endpoint_arn
-                ),
-                policy=command_deny_policy(
-                    self.runtime_endpoint.attr_agent_runtime_endpoint_arn
-                ),
-            )
-            self.endpoint_command_deny_policy.add_dependency(
-                self.runtime_endpoint
-            )
-            self.endpoint_command_deny_policy.apply_removal_policy(
-                RemovalPolicy.RETAIN,
-                apply_to_update_replace_policy=True,
-            )
+            self.endpoint_command_deny_policy = None
+            if self.runtime_endpoint is not None:
+                endpoint_resource_arn = (
+                    f"arn:aws:bedrock-agentcore:{region}:{account}:"
+                    f"runtime/{hardened_runtime_id}/runtime-endpoint/"
+                    f"{self.runtime_endpoint.attr_id}"
+                )
+                self.endpoint_command_deny_policy = agentcore.CfnResourcePolicy(
+                    self,
+                    "BridgeEndpointCommandDenyPolicy",
+                    resource_arn=endpoint_resource_arn,
+                    policy=command_deny_policy(endpoint_resource_arn),
+                )
+                self.endpoint_command_deny_policy.add_dependency(
+                    self.runtime_endpoint
+                )
+                self.endpoint_command_deny_policy.apply_removal_policy(
+                    RemovalPolicy.RETAIN,
+                    apply_to_update_replace_policy=True,
+                )
 
             self.runtime_source_commit = runtime_source_commit
             self.runtime_image_uri = runtime_image_uri
-            if has_persisted_context:
-                self.runtime_id = runtime_id
-                self.runtime_endpoint_id = runtime_endpoint_id
-                self.runtime_endpoint_name = runtime_endpoint_name
-                self.runtime_version = runtime_version
-                self.runtime_arn = runtime_arn
-                self.runtime_iam_arn = (
-                    f"arn:aws:bedrock-agentcore:{region}:{account}:"
-                    f"runtime/{runtime_id}"
-                )
-            else:
-                self.runtime_id = self.runtime.attr_agent_runtime_id
+            if release_stage == "endpoint":
+                runtime_output_id = hardened_runtime_id
+                runtime_output_version = hardened_runtime_version
+                runtime_output_arn = hardened_runtime_arn
+                self.runtime_id = hardened_runtime_id
                 self.runtime_endpoint_id = self.runtime_endpoint.attr_id
                 self.runtime_endpoint_name = expected_endpoint_name
-                self.runtime_version = self.runtime.attr_agent_runtime_version
-                self.runtime_arn = self.runtime.attr_agent_runtime_arn
-                # AgentCore invocation and IAM use distinct ARN namespaces.
-                self.runtime_iam_arn = Stack.of(self).format_arn(
-                    service="bedrock-agentcore",
-                    resource="runtime",
-                    resource_name=self.runtime_id,
+                self.runtime_version = hardened_runtime_version
+                self.runtime_arn = hardened_runtime_arn
+                self.runtime_iam_arn = (
+                    f"arn:aws:bedrock-agentcore:{region}:{account}:"
+                    f"runtime/{hardened_runtime_id}"
                 )
+                self.runtime_binding = AgentCoreRuntimeBinding(
+                    producer_stack=self,
+                    account=account,
+                    region=region,
+                    runtime_id_parameter=self.hardened_runtime_id_parameter,
+                    runtime_version_parameter=(
+                        self.hardened_runtime_version_parameter
+                    ),
+                    runtime_arn_parameter=self.hardened_runtime_arn_parameter,
+                    runtime_endpoint=self.runtime_endpoint,
+                    runtime_endpoint_name=expected_endpoint_name,
+                )
+            else:
+                runtime_output_id = self.runtime.attr_agent_runtime_id
+                runtime_output_version = self.runtime.attr_agent_runtime_version
+                runtime_output_arn = self.runtime.attr_agent_runtime_arn
+                # Runtime creation is not yet a deployable consumer identity:
+                # there is no hardened version-bound Endpoint. Keep the tuple
+                # atomic so the full app can synthesize this stage without
+                # granting Router/Web partial runtime authority.
+                self.runtime_id = "PLACEHOLDER"
+                self.runtime_endpoint_id = "PLACEHOLDER"
+                self.runtime_endpoint_name = "PLACEHOLDER"
+                self.runtime_version = "PLACEHOLDER"
+                self.runtime_arn = "PLACEHOLDER"
+                self.runtime_iam_arn = "PLACEHOLDER"
 
         # --- Browser authority is forbidden in the runtime -------------------
         # The conversational runtime never owns a browser. Curated browsing is
@@ -898,27 +1127,28 @@ class AgentCoreStack(Stack):
             value=",".join(private_subnet_ids),
         )
         if self.runtime is not None:
-            CfnOutput(self, "RuntimeId", value=self.runtime.attr_agent_runtime_id)
+            CfnOutput(self, "RuntimeId", value=runtime_output_id)
             CfnOutput(
                 self,
                 "RuntimeVersion",
-                value=self.runtime.attr_agent_runtime_version,
+                value=runtime_output_version,
             )
             CfnOutput(
                 self,
                 "RuntimeArn",
-                value=self.runtime.attr_agent_runtime_arn,
+                value=runtime_output_arn,
             )
-            CfnOutput(
-                self,
-                "RuntimeEndpointId",
-                value=self.runtime_endpoint.attr_id,
-            )
-            CfnOutput(
-                self,
-                "RuntimeEndpointName",
-                value=self.runtime_endpoint_name,
-            )
+            if self.runtime_endpoint is not None:
+                CfnOutput(
+                    self,
+                    "RuntimeEndpointId",
+                    value=self.runtime_endpoint_id,
+                )
+                CfnOutput(
+                    self,
+                    "RuntimeEndpointName",
+                    value=self.runtime_endpoint_name,
+                )
             CfnOutput(
                 self,
                 "RuntimeImageUri",
