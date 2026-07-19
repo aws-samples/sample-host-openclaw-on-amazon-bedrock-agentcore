@@ -62,7 +62,7 @@ class FakeReceiptStore:
 
 
 class FakeRunner:
-    def run(self, *, spec, output_dir):
+    def run(self, *, spec, output_dir, input_dir):
         (Path(output_dir) / "out.txt").write_bytes(b"done")
         return RunnerResult(breach=None, started_at=NOW, completed_at=NOW + 1)
 

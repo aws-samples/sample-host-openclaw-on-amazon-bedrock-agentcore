@@ -64,10 +64,19 @@ class FakeRunner:
         self.calls: list[Any] = []
         self.killed_pgids: list[int] = []
         self.last_output_dir: Path | None = None
+        self.last_input_dir: Path | None = None
+        self.seen_inputs: dict[str, bytes] = {}
 
-    def run(self, *, spec, output_dir: Path) -> RunnerResult:
+    def run(self, *, spec, output_dir: Path, input_dir: Path) -> RunnerResult:
         self.calls.append(spec)
         self.last_output_dir = Path(output_dir)
+        self.last_input_dir = Path(input_dir)
+        # Record exactly the immutable input tree the job was given.
+        for path in sorted(Path(input_dir).rglob("*")):
+            if path.is_file():
+                self.seen_inputs[path.relative_to(input_dir).as_posix()] = (
+                    path.read_bytes()
+                )
         if self.breach is not None:
             # A breach kills the whole process group; record the effect.
             self.killed_pgids.append(4242)
@@ -169,6 +178,22 @@ def test_run_binds_input_digest_to_the_sorted_staged_manifest(tmp_path):
         {"path": "in/b.txt", "sha256": hashlib.sha256(b"beta").hexdigest(), "size": 4},
     ]
     assert receipt.input_digest == canonical_sha256(expected_manifest)
+
+
+def test_run_materializes_staged_inputs_into_a_fresh_input_dir_for_the_runner(tmp_path):
+    # I-1 regression: staged immutable inputs must actually reach the runner in a
+    # fresh per-job input directory, not just be hashed into the manifest.
+    fake_runner = FakeRunner(outputs={"r.txt": b"x"})
+    service = _service(
+        tmp_path,
+        runner_obj=fake_runner,
+        input_files={"in/a.txt": b"alpha", "in/b.txt": b"beta"},
+    )
+    service.run(_admitted(_run_args(("in/a.txt", "in/b.txt"))))
+    assert fake_runner.last_input_dir is not None
+    assert fake_runner.seen_inputs == {"in/a.txt": b"alpha", "in/b.txt": b"beta"}
+    # The input dir is fresh and separate from the output dir.
+    assert fake_runner.last_input_dir != fake_runner.last_output_dir
 
 
 def test_run_rejects_a_missing_or_oversized_input(tmp_path):
@@ -300,7 +325,7 @@ def test_run_output_validation_rejects_hostile_runner_output(tmp_path):
     import os
 
     class SymlinkRunner(FakeRunner):
-        def run(self, *, spec, output_dir):
+        def run(self, *, spec, output_dir, input_dir):
             self.calls.append(spec)
             real = Path(output_dir) / "real.txt"
             real.write_bytes(b"real")

@@ -51,7 +51,7 @@ class RunnerResult:
 
 
 class ComputeRunner(Protocol):
-    def run(self, *, spec, output_dir: Path) -> RunnerResult: ...
+    def run(self, *, spec, output_dir: Path, input_dir: Path) -> RunnerResult: ...
 
 
 class ComputeServiceError(RuntimeError):
@@ -118,14 +118,31 @@ class ComputeService:
         )
 
         job_root = self._fresh_job_root(user_id, job_id)
+        input_dir = job_root / "input"
         output_dir = job_root / "output"
+        input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
+        # Materialize the immutable, content-hashed inputs into the fresh
+        # per-job input directory so the networkless runner receives exactly the
+        # staged bytes (and nothing from the live workspace).
+        self._materialize_inputs(input_dir, staged_blobs)
         try:
-            result = self._runner.run(spec=spec, output_dir=output_dir)
+            result = self._runner.run(
+                spec=spec, output_dir=output_dir, input_dir=input_dir
+            )
             self._finalize(spec, result, output_dir, input_digest)
         finally:
             shutil.rmtree(job_root, ignore_errors=True)
         return self._queued(job_id)
+
+    @staticmethod
+    def _materialize_inputs(input_dir: Path, staged_blobs: dict[str, bytes]) -> None:
+        for relative, data in staged_blobs.items():
+            # relative was already validated by _safe_path during staging.
+            target = input_dir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            target.chmod(0o400)
 
     def _finalize(self, spec, result, output_dir, input_digest) -> None:
         if not isinstance(result, RunnerResult):
