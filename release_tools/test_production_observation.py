@@ -5,7 +5,15 @@ import hashlib
 
 import pytest
 
-from release_tools.ecr import EcrEvidenceError
+from release_tools.ecr import (
+    EcrEvidenceError,
+    EcrImageAbsent,
+    EcrRepositoryAbsent,
+)
+from release_tools.agentcore import (
+    AgentCoreEndpointAbsent,
+    AgentCoreRuntimeAbsent,
+)
 from release_tools.contracts import (
     ProductionObservationConfigV1,
     RuntimeContextV3,
@@ -19,7 +27,6 @@ from release_tools.production_observation import (
     CloudFormationEvidenceAdapter,
     HttpsArtifactBlobReader,
     ProductionEvidenceComposer,
-    ProductionEvidenceAbsent,
     ProductionObservationError,
     compose_production_evidence,
 )
@@ -51,6 +58,42 @@ RUNTIME_ENVIRONMENT = {
 ROLLBACK = f"rollback:v1:{ACCOUNT}:{REGION}:{COMMIT}:sha256:" + "9" * 64
 
 
+def _stack_template(name: str) -> dict[str, object]:
+    return {"Resources": {name: {}}}
+
+
+def _stack_digest(name: str) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {"parameters": [], "template": _stack_template(name)}
+        )
+    ).hexdigest()
+
+
+def _change_set_content(name: str) -> dict[str, object]:
+    return {
+        "capabilities": ["CAPABILITY_IAM"],
+        "changeSetName": f"release-{COMMIT}",
+        "changeSetType": "UPDATE",
+        "changes": [],
+        "deploymentConfig": {},
+        "deploymentMode": {},
+        "description": "",
+        "importExistingResources": False,
+        "includeNestedStacks": False,
+        "notificationArns": [],
+        "onStackFailure": "",
+        "parameters": [],
+        "rollbackConfiguration": {},
+        "stackName": name,
+        "tags": [],
+    }
+
+
+def _change_set_digest(name: str) -> str:
+    return hashlib.sha256(canonical_json_bytes(_change_set_content(name))).hexdigest()
+
+
 def _config() -> ProductionObservationConfigV1:
     return ProductionObservationConfigV1.from_mapping(
         {
@@ -70,6 +113,21 @@ def _config() -> ProductionObservationConfigV1:
             "runtimeEnvironmentVariables": dict(RUNTIME_ENVIRONMENT),
             "runtimeIdleSessionTimeout": 1800,
             "runtimeMaxLifetime": 28800,
+            "foundationStackTemplateParameterDigests": {
+                name: _stack_digest(name)
+                for name in FOUNDATION_STACKS
+            },
+            "runtimeStackTemplateParameterDigest": _stack_digest(
+                "OpenClawAgentCore"
+            ),
+            "consumerStackTemplateParameterDigests": {
+                name: _stack_digest(name)
+                for name in CONSUMER_STACKS
+            },
+            "consumerChangeSetContentDigests": {
+                name: _change_set_digest(name)
+                for name in CONSUMER_STACKS
+            },
         }
     )
 
@@ -241,6 +299,10 @@ class FakeAgentCoreAdapter:
     def collect_runtime_identity(self, **kwargs):
         self.calls.append(kwargs)
         return (self.result.runtime_id, self.result.runtime_version)
+
+    def observe_retained_disposition(self, **kwargs):
+        self.calls.append(kwargs)
+        return "PRESENT"
 
 
 class FakeDeploymentAdapter:
@@ -491,7 +553,7 @@ def test_authoritative_absence_is_distinct_from_ambiguous_live_evidence() -> Non
 def test_image_absence_is_authoritative_but_other_ecr_errors_fail_closed() -> None:
     class AbsentEcr(FakeEcrAdapter):
         def collect(self, **kwargs):
-            raise ProductionEvidenceAbsent("image does not exist")
+            raise EcrImageAbsent("image does not exist")
 
     composer = _composer(AbsentEcr(_image()), FakeAgentCoreAdapter(_context()))
 
@@ -507,6 +569,100 @@ def test_image_absence_is_authoritative_but_other_ecr_errors_fail_closed() -> No
     )
     with pytest.raises(ProductionObservationError, match="live evidence"):
         ambiguous.observe_phase("image", _transaction("image"))
+
+
+def test_absence_requires_every_last_stable_prerequisite_to_remain_exact() -> None:
+    class MissingImage(FakeEcrAdapter):
+        def collect(self, **kwargs):
+            raise EcrImageAbsent("exact image is absent")
+
+    class MissingRepository(FakeEcrAdapter):
+        def collect(self, **kwargs):
+            raise EcrRepositoryAbsent("retained repository is absent")
+
+    class MissingRuntime(FakeAgentCoreAdapter):
+        def collect_runtime_identity(self, **kwargs):
+            raise AgentCoreRuntimeAbsent("retained runtime is absent")
+
+        def collect_context(self, **kwargs):
+            raise AgentCoreRuntimeAbsent("retained runtime is absent")
+
+    class MissingEndpoint(FakeAgentCoreAdapter):
+        def collect_context(self, **kwargs):
+            raise AgentCoreEndpointAbsent("phase-owned endpoint is absent")
+
+    deployment = FakeDeploymentAdapter()
+    assert _composer(
+        MissingImage(_image()),
+        FakeAgentCoreAdapter(_context()),
+        deployment,
+    ).observe_phase("image", _transaction("image")) == (False, {})
+
+    deployment = FakeDeploymentAdapter()
+    deployment.foundation = None
+    with pytest.raises(ProductionObservationError, match="prerequisite"):
+        _composer(
+            MissingImage(_image()),
+            FakeAgentCoreAdapter(_context()),
+            deployment,
+        ).observe_phase("image", _transaction("image"))
+
+    with pytest.raises(ProductionObservationError, match="prerequisite"):
+        _composer(
+            MissingRepository(_image()),
+            FakeAgentCoreAdapter(_context()),
+        ).observe_phase("image", _transaction("image"))
+
+    with pytest.raises(ProductionObservationError, match="prerequisite"):
+        _composer(
+            FakeEcrAdapter(_image()),
+            MissingRuntime(_context()),
+        ).observe_phase("endpoint", _transaction("endpoint"))
+
+    assert _composer(
+        FakeEcrAdapter(_image()),
+        MissingEndpoint(_context()),
+    ).observe_phase("endpoint", _transaction("endpoint")) == (False, {})
+
+    with pytest.raises(ProductionObservationError, match="prerequisite"):
+        _composer(
+            FakeEcrAdapter(_image()),
+            MissingEndpoint(_context()),
+        ).observe_phase("context", _transaction("context"))
+
+    deployment = FakeDeploymentAdapter()
+    deployment.changesets = None
+    with pytest.raises(ProductionObservationError, match="prerequisite"):
+        _composer(
+            FakeEcrAdapter(_image()),
+            MissingRuntime(_context()),
+            deployment,
+        ).observe_phase(
+            "consumer-changesets",
+            _transaction("consumer-changesets"),
+        )
+
+    with pytest.raises(ProductionObservationError, match="prerequisite"):
+        _composer(
+            MissingImage(_image()),
+            FakeAgentCoreAdapter(_context()),
+        ).observe_phase("verify", _transaction("verify"))
+
+
+def test_rollback_requires_exact_agentcore_retained_disposition() -> None:
+    class AmbiguousRetainedAgentCore(FakeAgentCoreAdapter):
+        def observe_retained_disposition(self, **kwargs):
+            raise AgentCoreRuntimeAbsent("runtime missing but endpoint unproven")
+
+    deployment = FakeDeploymentAdapter()
+    deployment.rollback = True
+    with pytest.raises(ProductionObservationError, match="rollback"):
+        _composer(
+            FakeEcrAdapter(_image()),
+            AmbiguousRetainedAgentCore(_context()),
+            deployment,
+        ).observe_phase("rollback", _transaction("rollback"))
+    assert deployment.calls == []
 
 
 def test_artifact_reader_is_https_only_and_bounded_before_returning_bytes() -> None:
@@ -547,6 +703,63 @@ def test_artifact_reader_is_https_only_and_bounded_before_returning_bytes() -> N
     ]
 
 
+def test_default_artifact_reader_ignores_ambient_proxy_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from release_tools import production_observation as observation_module
+
+    built_handlers: list[object] = []
+    calls: list[str] = []
+
+    class Response:
+        status = 200
+        headers = {"Content-Length": "2"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def geturl(self):
+            return "https://artifacts.example.invalid/blob"
+
+        def read(self, maximum):
+            return b"{}"
+
+    class ExplicitOpener:
+        def open(self, request, *, timeout):
+            calls.append(request.full_url)
+            return Response()
+
+    def build_opener(*handlers):
+        built_handlers.extend(handlers)
+        return ExplicitOpener()
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:8")
+    monkeypatch.setattr(observation_module.urllib_request, "build_opener", build_opener)
+    reader = HttpsArtifactBlobReader()
+
+    assert reader.read(
+        "https://artifacts.example.invalid/blob",
+        maximum_bytes=2,
+    ) == b"{}"
+    proxy_handlers = [
+        item
+        for item in built_handlers
+        if isinstance(item, observation_module.urllib_request.ProxyHandler)
+    ]
+    https_handlers = [
+        item
+        for item in built_handlers
+        if isinstance(item, observation_module.urllib_request.HTTPSHandler)
+    ]
+    assert len(proxy_handlers) == 1 and proxy_handlers[0].proxies == {}
+    assert len(https_handlers) == 1
+    assert calls == ["https://artifacts.example.invalid/blob"]
+
+
 class CloudFormationNotFound(Exception):
     response = {"Error": {"Code": "ValidationError"}}
 
@@ -578,6 +791,10 @@ class FakeCloudFormation:
             {"OutputKey": "RuntimeImageUri", "OutputValue": IMAGE_URI},
             {"OutputKey": "RuntimeSourceCommit", "OutputValue": COMMIT},
         ]
+        self.templates = {
+            name: _stack_template(name)
+            for name in (*FOUNDATION_STACKS, *CONSUMER_STACKS)
+        }
         self.change_sets = {
             name: {
                 "StackId": self.stacks[name]["StackId"],
@@ -609,7 +826,7 @@ class FakeCloudFormation:
         if kwargs["StackName"] not in self.stacks:
             raise CloudFormationNotFound("missing")
         return {
-            "TemplateBody": {"Resources": {kwargs["StackName"]: {}}},
+            "TemplateBody": self.templates[kwargs["StackName"]],
             "ResponseMetadata": {},
         }
 
@@ -639,6 +856,13 @@ def test_cloudformation_foundation_requires_all_exact_complete_stacks() -> None:
         fake.stacks.pop(name)
     assert adapter.observe_foundation(_transaction("foundation")) is None
 
+    drifted = FakeCloudFormation()
+    drifted.templates["OpenClawVpc"] = {"Resources": {"Unreviewed": {}}}
+    with pytest.raises(ProductionObservationError, match="reviewed"):
+        _cloudformation_adapter(drifted).observe_foundation(
+            _transaction("foundation")
+        )
+
 
 def test_cloudformation_runtime_identity_is_bound_to_exact_stack_outputs() -> None:
     fake = FakeCloudFormation()
@@ -652,6 +876,29 @@ def test_cloudformation_runtime_identity_is_bound_to_exact_stack_outputs() -> No
     fake.stacks["OpenClawAgentCore"]["Outputs"][-1]["OutputValue"] = "0" * 40
     with pytest.raises(ProductionObservationError, match="outputs"):
         adapter.observe_runtime_identity(_transaction("runtime"))
+
+    absent = FakeCloudFormation()
+    absent.stacks["OpenClawAgentCore"]["Outputs"] = []
+    previous = _stack_digest("OpenClawAgentCore")
+    config = replace(
+        _config(),
+        foundation_stack_template_parameter_digests=tuple(
+            (name, previous if name == "OpenClawAgentCore" else digest)
+            for name, digest in _config().foundation_stack_template_parameter_digests
+        ),
+        runtime_stack_template_parameter_digest="f" * 64,
+    )
+    assert CloudFormationEvidenceAdapter(
+        absent,
+        config=config,
+    ).observe_runtime_identity(_transaction("runtime")) is None
+
+    absent.stacks.pop("OpenClawVpc")
+    with pytest.raises(ProductionObservationError, match="prerequisite"):
+        CloudFormationEvidenceAdapter(
+            absent,
+            config=config,
+        ).observe_runtime_identity(_transaction("runtime"))
 
 
 def test_cloudformation_consumer_evidence_rejects_partial_or_cross_account_sets() -> None:
@@ -685,6 +932,44 @@ def test_cloudformation_consumer_evidence_rejects_partial_or_cross_account_sets(
             InvalidChangeSetRequest()
         ).observe_consumer_changesets(_transaction("consumer-changesets"))
 
+    drifted = FakeCloudFormation()
+    drifted.change_sets[CONSUMER_STACKS[0]]["Changes"] = [
+        {"ResourceChange": {"LogicalResourceId": "Unreviewed"}}
+    ]
+    with pytest.raises(ProductionObservationError, match="reviewed"):
+        _cloudformation_adapter(drifted).observe_consumer_changesets(
+            _transaction("consumer-changesets")
+        )
+
+    paginated = FakeCloudFormation()
+    original = paginated.describe_change_set
+
+    def describe_change_set(**kwargs):
+        return {**original(**kwargs), "NextToken": "truncated"}
+
+    paginated.describe_change_set = describe_change_set  # type: ignore[method-assign]
+    with pytest.raises(ProductionObservationError, match="paginated"):
+        _cloudformation_adapter(paginated).observe_consumer_changesets(
+            _transaction("consumer-changesets")
+        )
+
+    truncated = FakeCloudFormation()
+    truncated.change_sets[CONSUMER_STACKS[0]].pop("Changes")
+    with pytest.raises(ProductionObservationError, match="complete"):
+        _cloudformation_adapter(truncated).observe_consumer_changesets(
+            _transaction("consumer-changesets")
+        )
+
+    malformed = FakeCloudFormation()
+    malformed.change_sets[CONSUMER_STACKS[0]]["NotificationARNs"] = [
+        "arn:aws:sns:eu-west-1:123456789012:reviewed",
+        7,
+    ]
+    with pytest.raises(ProductionObservationError, match="canonical"):
+        _cloudformation_adapter(malformed).observe_consumer_changesets(
+            _transaction("consumer-changesets")
+        )
+
 
 def test_cloudformation_application_and_verification_are_content_bound() -> None:
     fake = FakeCloudFormation()
@@ -713,4 +998,42 @@ def test_cloudformation_application_and_verification_are_content_bound() -> None
             transaction,
             image=_image(),
             context=_context(),
+        )
+
+    drifted = FakeCloudFormation()
+    for change_set in drifted.change_sets.values():
+        change_set["ExecutionStatus"] = "EXECUTE_COMPLETE"
+    drifted.templates[CONSUMER_STACKS[0]] = {
+        "Resources": {"UnreviewedConsumer": {}}
+    }
+    with pytest.raises(ProductionObservationError, match="reviewed"):
+        _cloudformation_adapter(drifted).observe_consumers(
+            _transaction("consumers")
+        )
+
+
+def test_consumer_absence_requires_exact_available_change_set_prerequisites() -> None:
+    absent = FakeCloudFormation()
+    for name in CONSUMER_STACKS:
+        absent.stacks.pop(name)
+    assert _cloudformation_adapter(absent).observe_consumers(
+        _transaction("consumers")
+    ) is None
+
+    missing_prerequisite = FakeCloudFormation()
+    for name in CONSUMER_STACKS:
+        missing_prerequisite.stacks.pop(name)
+        missing_prerequisite.change_sets.pop(name)
+    with pytest.raises(ProductionObservationError, match="prerequisite"):
+        _cloudformation_adapter(missing_prerequisite).observe_consumers(
+            _transaction("consumers")
+        )
+
+    contradictory = FakeCloudFormation()
+    for name in CONSUMER_STACKS:
+        contradictory.stacks.pop(name)
+        contradictory.change_sets[name]["ExecutionStatus"] = "EXECUTE_COMPLETE"
+    with pytest.raises(ProductionObservationError, match="contradict"):
+        _cloudformation_adapter(contradictory).observe_consumers(
+            _transaction("consumers")
         )

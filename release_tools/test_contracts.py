@@ -52,6 +52,21 @@ RUNTIME_ENVIRONMENT = {
     "WORKSPACE_SYNC_INTERVAL_MS": "300000",
 }
 BUILDER_INPUTS = ("sha256:" + "d" * 64, "sha256:" + "e" * 64)
+FOUNDATION_STACKS = (
+    "OpenClawVpc",
+    "OpenClawSecurity",
+    "OpenClawGuardrails",
+    "PersonalOperatorCapabilities",
+    "PersonalOperatorCompute",
+    "OpenClawAgentCore",
+    "OpenClawObservability",
+)
+CONSUMER_STACKS = (
+    "OpenClawRouter",
+    "PersonalOperatorWeb",
+    "OpenClawCron",
+    "PersonalOperatorScheduler",
+)
 
 
 def _production_observation_config() -> dict[str, object]:
@@ -69,6 +84,19 @@ def _production_observation_config() -> dict[str, object]:
         "runtimeEnvironmentVariables": dict(RUNTIME_ENVIRONMENT),
         "runtimeIdleSessionTimeout": 1800,
         "runtimeMaxLifetime": 28800,
+        "foundationStackTemplateParameterDigests": {
+            name: hashlib.sha256(f"foundation:{name}".encode()).hexdigest()
+            for name in FOUNDATION_STACKS
+        },
+        "runtimeStackTemplateParameterDigest": "6" * 64,
+        "consumerStackTemplateParameterDigests": {
+            name: hashlib.sha256(f"consumer:{name}".encode()).hexdigest()
+            for name in CONSUMER_STACKS
+        },
+        "consumerChangeSetContentDigests": {
+            name: hashlib.sha256(f"change-set:{name}".encode()).hexdigest()
+            for name in CONSUMER_STACKS
+        },
     }
 
 
@@ -320,6 +348,30 @@ def test_production_observation_config_is_canonical_digest_bound_and_derives_rol
         (
             lambda value: value.update(runtimeMaxLifetime=1799),
             "lifecycle",
+        ),
+        (
+            lambda value: value[  # type: ignore[index]
+                "foundationStackTemplateParameterDigests"
+            ].pop("OpenClawVpc"),
+            "foundation stack",
+        ),
+        (
+            lambda value: value[  # type: ignore[index]
+                "consumerStackTemplateParameterDigests"
+            ].update(OpenClawRouter="not-a-digest"),
+            "consumer stack",
+        ),
+        (
+            lambda value: value.update(
+                runtimeStackTemplateParameterDigest="7" * 63
+            ),
+            "runtime stack",
+        ),
+        (
+            lambda value: value[  # type: ignore[index]
+                "consumerChangeSetContentDigests"
+            ].update(Unexpected="8" * 64),
+            "consumer change-set",
         ),
         (
             lambda value: value.update(executionRoleArn=ROLE_ARN),

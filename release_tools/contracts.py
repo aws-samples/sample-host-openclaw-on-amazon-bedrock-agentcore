@@ -18,6 +18,21 @@ from typing import Any, ClassVar, Mapping, Protocol, TypeVar
 REQUIRED_REGION = "eu-west-1"
 RUNTIME_REPOSITORY = "personal-operator/bridge"
 MAX_CONTRACT_BYTES = 4 * 1024 * 1024
+FOUNDATION_RELEASE_STACKS = (
+    "OpenClawVpc",
+    "OpenClawSecurity",
+    "OpenClawGuardrails",
+    "PersonalOperatorCapabilities",
+    "PersonalOperatorCompute",
+    "OpenClawAgentCore",
+    "OpenClawObservability",
+)
+CONSUMER_RELEASE_STACKS = (
+    "OpenClawRouter",
+    "PersonalOperatorWeb",
+    "OpenClawCron",
+    "PersonalOperatorScheduler",
+)
 
 _SHA_40 = re.compile(r"[0-9a-f]{40}")
 _SHA_64 = re.compile(r"[0-9a-f]{64}")
@@ -135,6 +150,22 @@ def _exact_object(
             f"{label} has the wrong fields (missing={missing}, extra={extra})"
         )
     return dict(value)
+
+
+def _exact_digest_inventory(
+    value: Any,
+    expected_names: tuple[str, ...],
+    *,
+    label: str,
+) -> tuple[tuple[str, str], ...]:
+    inventory = _exact_object(value, set(expected_names), label=label)
+    if any(
+        not isinstance(inventory[name], str)
+        or _SHA_64.fullmatch(inventory[name]) is None
+        for name in expected_names
+    ):
+        raise ContractError(f"{label} contains a malformed digest")
+    return tuple((name, inventory[name]) for name in expected_names)
 
 
 def _text(value: Any, *, field: str, pattern: re.Pattern[str] | None = None) -> str:
@@ -421,6 +452,10 @@ class ProductionObservationConfigV1:
         "runtimeEnvironmentVariables",
         "runtimeIdleSessionTimeout",
         "runtimeMaxLifetime",
+        "foundationStackTemplateParameterDigests",
+        "runtimeStackTemplateParameterDigest",
+        "consumerStackTemplateParameterDigests",
+        "consumerChangeSetContentDigests",
     }
 
     source_commit: str
@@ -435,6 +470,10 @@ class ProductionObservationConfigV1:
     runtime_environment_variables: tuple[tuple[str, str], ...]
     runtime_idle_session_timeout: int
     runtime_max_lifetime: int
+    foundation_stack_template_parameter_digests: tuple[tuple[str, str], ...]
+    runtime_stack_template_parameter_digest: str
+    consumer_stack_template_parameter_digests: tuple[tuple[str, str], ...]
+    consumer_change_set_content_digests: tuple[tuple[str, str], ...]
 
     @classmethod
     def from_mapping(
@@ -517,6 +556,26 @@ class ProductionObservationConfigV1:
             runtime_image_uri=runtime_image_uri,
             region=region,
         )
+        foundation_stack_digests = _exact_digest_inventory(
+            value["foundationStackTemplateParameterDigests"],
+            FOUNDATION_RELEASE_STACKS,
+            label="foundation stack digest inventory",
+        )
+        runtime_stack_digest = _text(
+            value["runtimeStackTemplateParameterDigest"],
+            field="runtime stack digest",
+            pattern=_SHA_64,
+        )
+        consumer_stack_digests = _exact_digest_inventory(
+            value["consumerStackTemplateParameterDigests"],
+            CONSUMER_RELEASE_STACKS,
+            label="consumer stack digest inventory",
+        )
+        consumer_change_set_digests = _exact_digest_inventory(
+            value["consumerChangeSetContentDigests"],
+            CONSUMER_RELEASE_STACKS,
+            label="consumer change-set digest inventory",
+        )
         return cls(
             source_commit=commit,
             source_tree=tree,
@@ -530,6 +589,12 @@ class ProductionObservationConfigV1:
             runtime_environment_variables=runtime.environment_variables,
             runtime_idle_session_timeout=runtime.idle_runtime_session_timeout,
             runtime_max_lifetime=runtime.max_lifetime,
+            foundation_stack_template_parameter_digests=(
+                foundation_stack_digests
+            ),
+            runtime_stack_template_parameter_digest=runtime_stack_digest,
+            consumer_stack_template_parameter_digests=consumer_stack_digests,
+            consumer_change_set_content_digests=consumer_change_set_digests,
         )
 
     @classmethod
@@ -557,6 +622,18 @@ class ProductionObservationConfigV1:
             ),
             "runtimeIdleSessionTimeout": self.runtime_idle_session_timeout,
             "runtimeMaxLifetime": self.runtime_max_lifetime,
+            "foundationStackTemplateParameterDigests": dict(
+                self.foundation_stack_template_parameter_digests
+            ),
+            "runtimeStackTemplateParameterDigest": (
+                self.runtime_stack_template_parameter_digest
+            ),
+            "consumerStackTemplateParameterDigests": dict(
+                self.consumer_stack_template_parameter_digests
+            ),
+            "consumerChangeSetContentDigests": dict(
+                self.consumer_change_set_content_digests
+            ),
         }
 
     def to_bytes(self) -> bytes:

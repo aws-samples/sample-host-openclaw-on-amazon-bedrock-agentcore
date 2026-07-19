@@ -61,6 +61,14 @@ class EcrEvidenceAbsent(EcrEvidenceError):
     """The exact repository or commit-tagged image is authoritatively absent."""
 
 
+class EcrRepositoryAbsent(EcrEvidenceAbsent):
+    """The retained release repository itself is absent."""
+
+
+class EcrImageAbsent(EcrEvidenceAbsent):
+    """The repository exists but the exact commit image is absent."""
+
+
 class EcrEvidenceIncomplete(EcrEvidenceError):
     """A bounded asynchronous evidence step has not completed."""
 
@@ -126,11 +134,15 @@ class EcrEvidenceAdapter:
             response = getattr(error, "response", None)
             body = response.get("Error") if isinstance(response, dict) else None
             code = body.get("Code") if isinstance(body, dict) else None
-            if method_name in {"describe_repositories", "describe_images"} and code in {
-                "RepositoryNotFoundException",
-                "ImageNotFoundException",
-            }:
-                raise EcrEvidenceAbsent(
+            if (
+                method_name == "describe_repositories"
+                and code == "RepositoryNotFoundException"
+            ):
+                raise EcrRepositoryAbsent(
+                    f"{method_name} exact subject is absent"
+                ) from error
+            if method_name == "describe_images" and code == "ImageNotFoundException":
+                raise EcrImageAbsent(
                     f"{method_name} exact subject is absent"
                 ) from error
             raise EcrEvidenceError(
@@ -196,6 +208,8 @@ class EcrEvidenceAdapter:
         if response.get("nextToken"):
             raise EcrEvidenceAmbiguous("image lookup was paginated")
         details = _list(response.get("imageDetails"), label="image")
+        if not details:
+            raise EcrImageAbsent("exact commit image is absent")
         if len(details) != 1:
             raise EcrEvidenceAmbiguous("image lookup must return one exact image")
         detail = _object(details[0], label="image")
@@ -844,11 +858,16 @@ class EcrEvidenceAdapter:
             expected_tag=commit_tag,
         )
         digest = str(tagged["imageDigest"])
-        by_digest = self._one_image(
-            account=account,
-            image_id={"imageDigest": digest},
-            expected_tag=commit_tag,
-        )
+        try:
+            by_digest = self._one_image(
+                account=account,
+                image_id={"imageDigest": digest},
+                expected_tag=commit_tag,
+            )
+        except EcrImageAbsent as error:
+            raise EcrEvidenceError(
+                "commit tag resolved an image missing by exact digest"
+            ) from error
         if by_digest.get("imageDigest") != digest:
             raise EcrEvidenceError("tag and digest lookups resolve different digests")
         critical, high = self._scan(account=account, digest=digest)

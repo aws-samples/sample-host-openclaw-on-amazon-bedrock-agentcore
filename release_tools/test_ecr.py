@@ -8,10 +8,11 @@ import pytest
 
 from release_tools.ecr import (
     EcrEvidenceAdapter,
-    EcrEvidenceAbsent,
     EcrEvidenceAmbiguous,
     EcrEvidenceError,
     EcrEvidenceIncomplete,
+    EcrImageAbsent,
+    EcrRepositoryAbsent,
     PROVENANCE_ARTIFACT_TYPE,
     SBOM_ARTIFACT_TYPE,
 )
@@ -365,8 +366,20 @@ def test_missing_exact_image_is_authoritative_absence() -> None:
         def describe_images(self, **kwargs):
             raise ImageNotFound("missing")
 
-    with pytest.raises(EcrEvidenceAbsent, match="absent"):
+    with pytest.raises(EcrImageAbsent, match="absent"):
         _collect(MissingImageEcr())
+
+
+def test_missing_retained_repository_is_not_image_absence() -> None:
+    class RepositoryNotFound(Exception):
+        response = {"Error": {"Code": "RepositoryNotFoundException"}}
+
+    class MissingRepositoryEcr(FakeEcr):
+        def describe_repositories(self, **kwargs):
+            raise RepositoryNotFound("missing")
+
+    with pytest.raises(EcrRepositoryAbsent, match="absent"):
+        _collect(MissingRepositoryEcr())
 
 
 def _replace_provenance(

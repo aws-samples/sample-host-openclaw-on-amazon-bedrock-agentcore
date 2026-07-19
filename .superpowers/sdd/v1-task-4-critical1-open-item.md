@@ -2,10 +2,11 @@
 
 ## Status
 
-The code remediation is implemented locally with RED-first tests on the exact
-integration parent, but Critical #1 remains **OPEN pending an independent
-hostile review**. External Docker/AWS/deploy/provider gates remain open, and no
-local result is deployment evidence.
+The initial remediation commit `de4d1e9` was **REJECTED** by independent hostile
+review. Every Critical/Important review finding now has a separate RED-first
+follow-up implementation, but Critical #1 remains **OPEN pending independent
+re-review of the follow-up commit**. External Docker/AWS/deploy/provider gates
+remain open, and no local result is deployment evidence.
 
 ## Findings disposition
 
@@ -44,21 +45,32 @@ crash-safety and immutable-subject invariants.
   `ProductionEvidenceComposer`; operator STDOUT has no observation path.
 - A strict `personal-operator.production-observation-config.v1` is required
   before mutation. Its canonical bytes and the exact executable bytes are
-  jointly bound into the journal operation digest.
+  jointly bound into the journal operation digest. The config includes reviewed
+  template/parameter digests for every foundation, runtime, and consumer stack
+  plus complete content digests for all consumer change sets.
 - The composer resolves all eight forward phases plus rollback from injected
   ECR, AgentCore, and CloudFormation clients. It validates exact account,
   `eu-west-1`, commit, tree, immutable artifacts, runtime configuration, stack
-  identity/state/content, and deterministic `release-<40-sha>` consumer change
-  sets.
-- Authoritative total absence may reconcile to `ABSENT`; partial presence,
-  service errors, malformed or conflicting evidence, and rollback mismatch
-  fail closed and leave the journal `UNCERTAIN`.
-- SDK endpoint overrides and ambient proxy settings are disabled for the live
-  authority.
+  identity/state/content, deterministic `release-<40-sha>` consumer change
+  sets, and exact equality between live content and the reviewed config.
+- Normal-phase `ABSENT` requires all phase-owned subjects absent and every
+  `lastStableState` prerequisite still exactly present. Missing prerequisites,
+  partial presence, service errors, pagination, malformed or conflicting
+  evidence, and rollback mismatch fail closed and leave the journal
+  `UNCERTAIN`.
+- Rollback additionally queries the retained AgentCore runtime and endpoint;
+  CloudFormation absence alone cannot complete it. Both AgentCore subjects must
+  be coherently absent or still form the exact release context.
+- SDK endpoint overrides and ambient SDK proxies are disabled. Artifact reads
+  use an explicit proxy-free HTTPS opener/context, and account discovery uses a
+  validated absolute AWS CLI path rather than ambient `PATH`.
 - RED-first regression tests prove forged driver observations are ignored,
   all phases use live authority, observation config mutation changes the
   operation digest, missing config stops before write-ahead, and hostile
-  ECR/AgentCore/CloudFormation responses cannot select persistence.
+  ECR/AgentCore/CloudFormation responses cannot select persistence. Hostile
+  probes cover reviewed-template drift, arbitrary or truncated change-set
+  content, missing stable prerequisites, partial AgentCore rollback state,
+  proxy poisoning, and `PATH` shadowing.
 
 ## Gate posture
 

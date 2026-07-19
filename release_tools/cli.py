@@ -7,8 +7,8 @@ from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
+import pwd
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -44,6 +44,14 @@ PHASE_TO_STATE = {
 STATE_TO_PHASE = {state: phase for phase, state in PHASE_TO_STATE.items()}
 _ACCOUNT = re.compile(r"[0-9]{12}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
+_ACCOUNT_OWNER_UIDS = frozenset({0, os.getuid()})
+_LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+TRUSTED_AWS_CLI_CANDIDATES = (
+    Path("/usr/local/bin/aws"),
+    Path("/opt/homebrew/bin/aws"),
+    Path("/usr/bin/aws"),
+    _LOGIN_HOME / ".local" / "bin" / "aws",
+)
 
 
 class ReleaseCliError(RuntimeError):
@@ -311,13 +319,11 @@ def _discover_account(
 ) -> None:
     """Touch credentials only after durable intent and immediately pre-dispatch."""
 
-    executable = shutil.which("aws")
-    if executable is None:
-        raise ReleaseCliError("AWS credential discovery is unavailable")
+    executable = _trusted_aws_cli()
     try:
         completed = subprocess.run(
             [
-                executable,
+                str(executable),
                 "sts",
                 "get-caller-identity",
                 "--query",
@@ -339,6 +345,29 @@ def _discover_account(
         raise ReleaseCliError(
             "authenticated AWS account differs from the release journal"
         )
+
+
+def _trusted_aws_cli() -> Path:
+    """Resolve AWS CLI only from fixed absolute, owner-controlled locations."""
+
+    for candidate in TRUSTED_AWS_CLI_CANDIDATES:
+        if not isinstance(candidate, Path) or not candidate.is_absolute():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            metadata = resolved.stat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid in _ACCOUNT_OWNER_UIDS
+            and metadata.st_mode & 0o111
+            and metadata.st_mode & 0o022 == 0
+        ):
+            return resolved
+    raise ReleaseCliError(
+        "AWS credential discovery requires a trusted absolute AWS CLI path"
+    )
 
 
 def _invoke_mutation_driver(

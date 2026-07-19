@@ -169,9 +169,11 @@ real phase, create one canonical
 `--observation-config`, or place it at
 `<journal>.production-observation.json`. It binds the exact commit, tree,
 account, `eu-west-1`, image build inputs and builder identity, and the reviewed
-AgentCore subnet, security-group, environment, and lifecycle configuration.
-The CLI rejects a missing, noncanonical, or journal-mismatched config before
-write-ahead intent or credential discovery.
+AgentCore subnet, security-group, environment, and lifecycle configuration. It
+also carries the exact canonical template/parameter digest for each foundation,
+runtime, and consumer stack and the complete expected content digest for every
+consumer change set. The CLI rejects a missing, noncanonical, or
+journal-mismatched config before write-ahead intent or credential discovery.
 
 A real phase also requires one self-contained reviewed mutation executable.
 The CLI frames and hashes its exact bytes together with the canonical
@@ -186,38 +188,49 @@ requires the exact commit/account/region/digest-bound rollback reference.
 Immediately before mutation and again before live observation, the CLI rejects
 conflicting `CDK_DEFAULT_REGION`, `AWS_REGION`, or `AWS_DEFAULT_REGION`,
 authenticates the exact account, and pins all three child variables to
-`eu-west-1`. Mutation must return only `{"dispatched":true}`. It is never
-treated as persistence proof: the executable is invoked only with
+`eu-west-1`. Account discovery resolves AWS CLI only from fixed absolute,
+owner-controlled locations; ambient `PATH` entries cannot select it. Mutation
+must return only `{"dispatched":true}`. It is never treated as persistence
+proof: the executable is invoked only with
 `--mode mutate`, and its STDOUT can never choose a journal outcome or provide
 release evidence.
 
 After the second exact-account check, the CLI constructs the in-package
 `ProductionEvidenceComposer` with regional ECR, AgentCore control, and
 CloudFormation clients. SDK endpoint overrides and ambient proxy settings are
-disabled. The composer, not the driver, reads and reconciles every phase:
+disabled. Attestation downloads use a separate proxy-free HTTPS opener and TLS
+context, ignoring `HTTPS_PROXY` and `ALL_PROXY`. The composer, not the driver,
+reads and reconciles every phase:
 
-- foundation: all seven exact foundation stacks exist in a complete state, or
-  none exist;
+- foundation: all seven exact foundation stacks exist in a complete state and
+  each live template/parameter digest matches the reviewed config, or all seven
+  are absent;
 - image: the exact immutable image has strict SBOM, provenance, scan, and
   signature evidence;
 - runtime: CloudFormation outputs and the READY AgentCore runtime agree on the
   exact runtime ID, version, image, role, network, environment, storage, and
-  lifecycle configuration;
+  lifecycle configuration, while the runtime stack matches its reviewed
+  template/parameter digest;
 - endpoint and context: AgentCore returns the exact READY endpoint and strict
   canonical `RuntimeContextV3`;
 - consumer changesets: all four exact account/region change sets named
-  `release-<40-sha>` are complete, available, and hashed from their content;
+  `release-<40-sha>` are complete and available, have no unread pagination,
+  and match the config's expected complete content digests;
 - consumers: those exact change sets are executed and the four complete live
-  stack templates, parameters, outputs, capabilities, and roles are hashed;
+  stack templates and parameters match the reviewed config before the live
+  outputs, capabilities, and roles are hashed;
 - verify: image, context, foundation, consumer application, and journal
   digests are recomposed from live evidence;
 - rollback: the complete live stack snapshot must hash to the exact rollback
-  reference.
+  reference, and the retained AgentCore runtime and endpoint must be either
+  coherently absent or both still present with the exact release context.
 
-For a grouped phase, all exact subjects must be absent before the composer may
-return `ABSENT`. Partial presence, malformed responses, wrong identity,
-timeouts, SDK failures, or conflicting evidence remain ambiguous and leave the
-journal `UNCERTAIN`.
+For a normal phase, the composer may return `ABSENT` only when every subject
+owned by that phase is absent while every resource owned by `lastStableState`
+remains exactly present and bound. A missing stable prerequisite, partial
+presence, malformed response, wrong identity, unread pagination, timeout, SDK
+failure, or conflicting evidence remains ambiguous and leaves the journal
+`UNCERTAIN`.
 
 After a crash or ambiguous result, use the same exact operation bytes and the
 confirmation

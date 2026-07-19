@@ -65,6 +65,28 @@ def test_production_observation_clients_ignore_operator_endpoint_and_proxy_overr
         assert client_config.proxies == {}
 
 
+def test_account_discovery_ignores_an_ambient_path_shadow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted" / "aws"
+    shadow = tmp_path / "shadow" / "aws"
+    _write_executable(trusted, "#!/bin/sh\nexit 0\n")
+    _write_executable(shadow, "#!/bin/sh\nexit 99\n")
+    monkeypatch.setattr(
+        release_cli,
+        "TRUSTED_AWS_CLI_CANDIDATES",
+        (trusted,),
+    )
+    monkeypatch.setenv("PATH", f"{shadow.parent}:/usr/bin:/bin")
+
+    assert release_cli._trusted_aws_cli() == trusted.resolve()
+
+    trusted.chmod(0o777)
+    with pytest.raises(release_cli.ReleaseCliError, match="trusted absolute"):
+        release_cli._trusted_aws_cli()
+
+
 def _observation_config(fixture: dict[str, object]) -> ProductionObservationConfigV1:
     return ProductionObservationConfigV1.from_mapping(
         {
@@ -93,6 +115,37 @@ def _observation_config(fixture: dict[str, object]) -> ProductionObservationConf
             },
             "runtimeIdleSessionTimeout": 1800,
             "runtimeMaxLifetime": 28800,
+            "foundationStackTemplateParameterDigests": {
+                name: hashlib.sha256(f"foundation:{name}".encode()).hexdigest()
+                for name in (
+                    "OpenClawVpc",
+                    "OpenClawSecurity",
+                    "OpenClawGuardrails",
+                    "PersonalOperatorCapabilities",
+                    "PersonalOperatorCompute",
+                    "OpenClawAgentCore",
+                    "OpenClawObservability",
+                )
+            },
+            "runtimeStackTemplateParameterDigest": "6" * 64,
+            "consumerStackTemplateParameterDigests": {
+                name: hashlib.sha256(f"consumer:{name}".encode()).hexdigest()
+                for name in (
+                    "OpenClawRouter",
+                    "PersonalOperatorWeb",
+                    "OpenClawCron",
+                    "PersonalOperatorScheduler",
+                )
+            },
+            "consumerChangeSetContentDigests": {
+                name: hashlib.sha256(f"change-set:{name}".encode()).hexdigest()
+                for name in (
+                    "OpenClawRouter",
+                    "PersonalOperatorWeb",
+                    "OpenClawCron",
+                    "PersonalOperatorScheduler",
+                )
+            },
         }
     )
 
@@ -316,8 +369,11 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, {str(ROOT)!r})
+import release_tools.cli as release_cli
 from release_tools.cli import main
 from release_tools.production_observation import ProductionObservationError
+
+release_cli._trusted_aws_cli = lambda: Path({str(fake_bin / 'aws')!r})
 
 
 class LiveAuthority:
@@ -787,6 +843,20 @@ def test_uncertain_operation_digest_binds_the_observation_config(
         fixture["driver"].read_bytes(),
         changed,
     )
+    changed_stack = replace(
+        config,
+        foundation_stack_template_parameter_digests=tuple(
+            (
+                name,
+                "9" * 64 if name == "OpenClawVpc" else digest,
+            )
+            for name, digest in config.foundation_stack_template_parameter_digests
+        ),
+    )
+    changed_stack_sha256 = release_cli._reviewed_operation_sha256(
+        fixture["driver"].read_bytes(),
+        changed_stack,
+    )
     args = type(
         "Args",
         (),
@@ -818,6 +888,7 @@ def test_uncertain_operation_digest_binds_the_observation_config(
     assert current.state == "UNCERTAIN"
     assert current.uncertain_operation_sha256 == operation_sha256
     assert changed_sha256 != operation_sha256
+    assert changed_stack_sha256 != operation_sha256
 
 
 def test_phase_revalidates_region_before_write_ahead_or_credentials(

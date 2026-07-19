@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import ssl
 from typing import Any, Mapping, Protocol
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
@@ -11,11 +13,15 @@ from urllib import request as urllib_request
 
 from release_tools.agentcore import (
     AgentCoreClient,
+    AgentCoreEndpointAbsent,
     AgentCoreEvidenceAbsent,
     AgentCoreEvidenceAdapter,
     AgentCoreEvidenceError,
+    AgentCoreRuntimeAbsent,
 )
 from release_tools.contracts import (
+    CONSUMER_RELEASE_STACKS,
+    FOUNDATION_RELEASE_STACKS,
     ProductionObservationConfigV1,
     RuntimeContextV3,
     RuntimeImageEvidence,
@@ -25,9 +31,10 @@ from release_tools.contracts import (
 from release_tools.ecr import (
     ArtifactBlobReader,
     EcrClient,
-    EcrEvidenceAbsent,
     EcrEvidenceAdapter,
     EcrEvidenceError,
+    EcrImageAbsent,
+    EcrRepositoryAbsent,
 )
 
 
@@ -36,21 +43,8 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _RUNTIME_ID = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{10}")
 _VERSION = re.compile(r"[1-9][0-9]{0,4}")
 
-FOUNDATION_STACKS = (
-    "OpenClawVpc",
-    "OpenClawSecurity",
-    "OpenClawGuardrails",
-    "PersonalOperatorCapabilities",
-    "PersonalOperatorCompute",
-    "OpenClawAgentCore",
-    "OpenClawObservability",
-)
-CONSUMER_STACKS = (
-    "OpenClawRouter",
-    "PersonalOperatorWeb",
-    "OpenClawCron",
-    "PersonalOperatorScheduler",
-)
+FOUNDATION_STACKS = FOUNDATION_RELEASE_STACKS
+CONSUMER_STACKS = CONSUMER_RELEASE_STACKS
 _COMPLETE_STACK_STATES = frozenset({"CREATE_COMPLETE", "UPDATE_COMPLETE"})
 
 
@@ -68,9 +62,16 @@ class HttpsArtifactBlobReader:
     def __init__(
         self,
         *,
-        opener: Any = urllib_request.urlopen,
+        opener: Any | None = None,
         timeout_seconds: int = 15,
     ) -> None:
+        if opener is None:
+            tls_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            explicit_opener = urllib_request.build_opener(
+                urllib_request.ProxyHandler({}),
+                urllib_request.HTTPSHandler(context=tls_context),
+            )
+            opener = explicit_opener.open
         if (
             not callable(opener)
             or not isinstance(timeout_seconds, int)
@@ -184,6 +185,63 @@ class CloudFormationEvidenceAdapter:
         self._client = client
         self._config = config
 
+    @staticmethod
+    def _template(value: Any) -> dict[str, Any]:
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError) as error:
+                raise ProductionObservationError(
+                    "stack template is not canonical JSON"
+                ) from error
+            value = parsed
+        if not isinstance(value, Mapping):
+            raise ProductionObservationError("stack template is not an object")
+        try:
+            canonical_json_bytes(value)
+        except (TypeError, ValueError) as error:
+            raise ProductionObservationError(
+                "stack template cannot be canonicalized"
+            ) from error
+        return dict(value)
+
+    @staticmethod
+    def _parameters(value: Any) -> list[dict[str, str]]:
+        if not isinstance(value, list):
+            raise ProductionObservationError("stack parameters are malformed")
+        result: list[dict[str, str]] = []
+        observed: set[str] = set()
+        allowed = {"ParameterKey", "ParameterValue", "ResolvedValue"}
+        for raw in value:
+            if not isinstance(raw, Mapping) or set(raw) - allowed:
+                raise ProductionObservationError("stack parameter is malformed")
+            key = raw.get("ParameterKey")
+            parameter_value = raw.get("ParameterValue")
+            if (
+                not isinstance(key, str)
+                or not key
+                or key in observed
+                or not isinstance(parameter_value, str)
+                or (
+                    "ResolvedValue" in raw
+                    and not isinstance(raw.get("ResolvedValue"), str)
+                )
+            ):
+                raise ProductionObservationError("stack parameter is not exact")
+            observed.add(key)
+            result.append({name: raw[name] for name in sorted(raw)})
+        return sorted(result, key=lambda item: item["ParameterKey"])
+
+    @staticmethod
+    def _content_digest(value: Mapping[str, Any]) -> str:
+        try:
+            payload = canonical_json_bytes(value)
+        except (TypeError, ValueError) as error:
+            raise ProductionObservationError(
+                "live CloudFormation content is not canonical"
+            ) from error
+        return hashlib.sha256(payload).hexdigest()
+
     def _call(self, method_name: str, **arguments: Any) -> dict[str, Any]:
         method = getattr(self._client, method_name, None)
         if method is None or not callable(method):
@@ -215,7 +273,12 @@ class CloudFormationEvidenceAdapter:
             raise ProductionObservationError(f"{method_name} response is malformed")
         return value
 
-    def _stack(self, stack_name: str) -> dict[str, Any] | None:
+    def _stack(
+        self,
+        stack_name: str,
+        *,
+        expected_template_parameter_digest: str | None = None,
+    ) -> dict[str, Any] | None:
         try:
             response = self._call("describe_stacks", StackName=stack_name)
         except ProductionEvidenceAbsent:
@@ -250,16 +313,26 @@ class CloudFormationEvidenceAdapter:
             or "TemplateBody" not in template
         ):
             raise ProductionObservationError("stack template response is not exact")
+        canonical_template = self._template(template["TemplateBody"])
+        canonical_parameters = self._parameters(stack.get("Parameters", []))
+        template_parameter_digest = self._content_digest(
+            {
+                "parameters": canonical_parameters,
+                "template": canonical_template,
+            }
+        )
+        if (
+            expected_template_parameter_digest is not None
+            and template_parameter_digest != expected_template_parameter_digest
+        ):
+            raise ProductionObservationError(
+                f"stack {stack_name} differs from reviewed template and parameters"
+            )
         return {
             "stackId": stack_id,
             "stackName": stack_name,
             "status": status,
-            "parameters": sorted(
-                stack.get("Parameters", []),
-                key=lambda item: (
-                    item.get("ParameterKey", "") if isinstance(item, dict) else ""
-                ),
-            ),
+            "parameters": canonical_parameters,
             "outputs": sorted(
                 stack.get("Outputs", []),
                 key=lambda item: (
@@ -268,14 +341,25 @@ class CloudFormationEvidenceAdapter:
             ),
             "capabilities": sorted(stack.get("Capabilities", [])),
             "roleArn": stack.get("RoleARN", ""),
-            "template": template["TemplateBody"],
+            "template": canonical_template,
+            "templateParameterDigest": template_parameter_digest,
         }
 
     def _snapshot(
         self,
         stack_names: tuple[str, ...],
+        *,
+        expected_digests: Mapping[str, str] | None = None,
     ) -> tuple[dict[str, Any], ...] | None:
-        observed = tuple(self._stack(name) for name in stack_names)
+        observed = tuple(
+            self._stack(
+                name,
+                expected_template_parameter_digest=(
+                    expected_digests[name] if expected_digests is not None else None
+                ),
+            )
+            for name in stack_names
+        )
         present = tuple(item for item in observed if item is not None)
         if not present:
             return None
@@ -306,19 +390,56 @@ class CloudFormationEvidenceAdapter:
         return result
 
     def observe_foundation(self, transaction: StagingTransactionV1) -> bool | None:
-        return True if self._snapshot(FOUNDATION_STACKS) is not None else None
+        expected = dict(self._config.foundation_stack_template_parameter_digests)
+        return (
+            True
+            if self._snapshot(
+                FOUNDATION_STACKS,
+                expected_digests=expected,
+            )
+            is not None
+            else None
+        )
 
     def observe_runtime_identity(
         self, transaction: StagingTransactionV1
     ) -> tuple[str, str] | None:
-        stack = self._stack("OpenClawAgentCore")
-        if stack is None:
-            return None
+        foundation_expected = dict(
+            self._config.foundation_stack_template_parameter_digests
+        )
+        observed: dict[str, dict[str, Any]] = {}
+        for name in FOUNDATION_STACKS:
+            stack = self._stack(
+                name,
+                expected_template_parameter_digest=(
+                    None if name == "OpenClawAgentCore" else foundation_expected[name]
+                ),
+            )
+            if stack is None:
+                raise ProductionObservationError(
+                    "runtime phase lastStable foundation prerequisite is missing"
+                )
+            observed[name] = stack
+        stack = observed["OpenClawAgentCore"]
         outputs = self._outputs(stack)
         runtime_id = outputs.get("RuntimeId")
         runtime_version = outputs.get("RuntimeVersion")
         if runtime_id is None and runtime_version is None:
+            if (
+                stack["templateParameterDigest"]
+                != foundation_expected["OpenClawAgentCore"]
+            ):
+                raise ProductionObservationError(
+                    "runtime absence differs from reviewed foundation prerequisite"
+                )
             return None
+        if (
+            stack["templateParameterDigest"]
+            != self._config.runtime_stack_template_parameter_digest
+        ):
+            raise ProductionObservationError(
+                "runtime stack differs from reviewed template and parameters"
+            )
         expected_uri = (
             f"{transaction.account}.dkr.ecr.{transaction.region}.amazonaws.com/"
             f"personal-operator/bridge@{transaction.runtime_image_digest}"
@@ -345,6 +466,10 @@ class CloudFormationEvidenceAdapter:
             )
         except ProductionEvidenceAbsent:
             return None
+        if "NextToken" in response:
+            raise ProductionObservationError(
+                "consumer change-set observation was paginated or truncated"
+            )
         if response.get("StackName") != stack_name:
             raise ProductionObservationError("change set crossed its stack subject")
         if response.get("ChangeSetName") != change_set_name:
@@ -372,15 +497,108 @@ class CloudFormationEvidenceAdapter:
             raise ProductionObservationError(
                 f"change set is not complete: {response.get('Status')!r}"
             )
-        return {
+        sequence_fields = {
+            "Parameters": "parameters",
+            "NotificationARNs": "notificationArns",
+            "Capabilities": "capabilities",
+            "Tags": "tags",
+            "Changes": "changes",
+        }
+        if not {"Parameters", "Capabilities", "Changes"}.issubset(response):
+            raise ProductionObservationError(
+                "change set response omits complete executable content"
+            )
+        sequences: dict[str, list[Any]] = {}
+        for source, target in sequence_fields.items():
+            raw = response.get(source, [])
+            if not isinstance(raw, list):
+                raise ProductionObservationError(
+                    f"change set {source} content is malformed"
+                )
+            sequences[target] = list(raw)
+        if any(
+            not isinstance(item, Mapping)
+            for field in ("parameters", "tags", "changes")
+            for item in sequences[field]
+        ) or any(
+            not isinstance(item, str)
+            for field in ("notificationArns", "capabilities")
+            for item in sequences[field]
+        ):
+            raise ProductionObservationError("change set content is not canonical")
+        sequences["parameters"] = sorted(
+            sequences["parameters"],
+            key=lambda item: canonical_json_bytes(item)
+            if isinstance(item, Mapping)
+            else b"",
+        )
+        sequences["notificationArns"] = sorted(sequences["notificationArns"])
+        sequences["capabilities"] = sorted(sequences["capabilities"])
+        sequences["tags"] = sorted(
+            sequences["tags"],
+            key=lambda item: canonical_json_bytes(item)
+            if isinstance(item, Mapping)
+            else b"",
+        )
+        sequences["changes"] = sorted(
+            sequences["changes"],
+            key=lambda item: canonical_json_bytes(item)
+            if isinstance(item, Mapping)
+            else b"",
+        )
+        mapping_fields = {
+            "RollbackConfiguration": "rollbackConfiguration",
+            "DeploymentMode": "deploymentMode",
+            "DeploymentConfig": "deploymentConfig",
+        }
+        mappings: dict[str, dict[str, Any]] = {}
+        for source, target in mapping_fields.items():
+            raw = response.get(source, {})
+            if not isinstance(raw, Mapping):
+                raise ProductionObservationError(
+                    f"change set {source} content is malformed"
+                )
+            mappings[target] = dict(raw)
+        scalar_defaults = {
+            "Description": "",
+            "IncludeNestedStacks": False,
+            "OnStackFailure": "",
+            "ImportExistingResources": False,
+        }
+        scalars = {
+            source: response.get(source, default)
+            for source, default in scalar_defaults.items()
+        }
+        if (
+            not isinstance(scalars["Description"], str)
+            or not isinstance(scalars["IncludeNestedStacks"], bool)
+            or not isinstance(scalars["OnStackFailure"], str)
+            or not isinstance(scalars["ImportExistingResources"], bool)
+        ):
+            raise ProductionObservationError("change set scalar content is malformed")
+        content = {
             "stackName": stack_name,
-            "changeSetId": response.get("ChangeSetId"),
             "changeSetName": change_set_name,
             "changeSetType": response.get("ChangeSetType"),
+            "description": scalars["Description"],
+            **sequences,
+            **mappings,
+            "includeNestedStacks": scalars["IncludeNestedStacks"],
+            "onStackFailure": scalars["OnStackFailure"],
+            "importExistingResources": scalars["ImportExistingResources"],
+        }
+        content_digest = self._content_digest(content)
+        expected_digest = dict(
+            self._config.consumer_change_set_content_digests
+        )[stack_name]
+        if content_digest != expected_digest:
+            raise ProductionObservationError(
+                f"change set {stack_name} differs from reviewed complete content"
+            )
+        return {
+            "content": content,
+            "contentDigest": content_digest,
             "executionStatus": response.get("ExecutionStatus"),
-            "parameters": response.get("Parameters", []),
-            "capabilities": sorted(response.get("Capabilities", [])),
-            "changes": response.get("Changes", []),
         }
 
     def _change_sets(self) -> tuple[dict[str, Any], ...] | None:
@@ -405,18 +623,34 @@ class CloudFormationEvidenceAdapter:
                 "consumer change sets are not all available for reviewed execution"
             )
         stable = tuple(
-            {key: value for key, value in item.items() if key != "executionStatus"}
+            item["content"]
             for item in changes
         )
         return self._digest({"consumerChangeSets": stable})
 
     def _consumer_application(self) -> tuple[dict[str, Any], ...] | None:
-        stacks = self._snapshot(CONSUMER_STACKS)
-        if stacks is None:
-            return None
         changes = self._change_sets()
-        if changes is None or any(
-            item.get("executionStatus") != "EXECUTE_COMPLETE" for item in changes
+        if changes is None:
+            raise ProductionObservationError(
+                "consumer application change-set prerequisite is missing"
+            )
+        stacks = self._snapshot(
+            CONSUMER_STACKS,
+            expected_digests=dict(
+                self._config.consumer_stack_template_parameter_digests
+            ),
+        )
+        if stacks is None:
+            if all(
+                item.get("executionStatus") == "AVAILABLE" for item in changes
+            ):
+                return None
+            raise ProductionObservationError(
+                "consumer stack absence contradicts change-set execution state"
+            )
+        if any(
+            item.get("executionStatus") != "EXECUTE_COMPLETE"
+            for item in changes
         ):
             raise ProductionObservationError(
                 "consumer changesets are not all proven executed"
@@ -436,7 +670,16 @@ class CloudFormationEvidenceAdapter:
         image: RuntimeImageEvidence,
         context: RuntimeContextV3,
     ) -> str | None:
-        foundation = self._snapshot(FOUNDATION_STACKS)
+        expected_foundation = dict(
+            self._config.foundation_stack_template_parameter_digests
+        )
+        expected_foundation["OpenClawAgentCore"] = (
+            self._config.runtime_stack_template_parameter_digest
+        )
+        foundation = self._snapshot(
+            FOUNDATION_STACKS,
+            expected_digests=expected_foundation,
+        )
         consumers = self._consumer_application()
         if foundation is None or consumers is None:
             return None
@@ -603,6 +846,70 @@ class ProductionEvidenceComposer:
             )
         return context
 
+    def _require_foundation(self, transaction: StagingTransactionV1) -> None:
+        if self._deployment.observe_foundation(transaction) is not True:
+            raise ProductionObservationError(
+                "lastStable foundation prerequisite is missing"
+            )
+
+    def _require_image(self, transaction: StagingTransactionV1) -> RuntimeImageEvidence:
+        try:
+            image = self._image()
+        except (EcrImageAbsent, EcrRepositoryAbsent) as error:
+            raise ProductionObservationError(
+                "lastStable image prerequisite is missing"
+            ) from error
+        if image.image_digest != transaction.runtime_image_digest:
+            raise ProductionObservationError(
+                "lastStable image prerequisite differs from the journal"
+            )
+        return image
+
+    def _require_runtime(
+        self,
+        transaction: StagingTransactionV1,
+    ) -> tuple[str, str]:
+        identity = self._deployment.observe_runtime_identity(transaction)
+        expected = (transaction.runtime_id, transaction.runtime_version)
+        if identity is None or identity != expected:
+            raise ProductionObservationError(
+                "lastStable runtime prerequisite is missing or contradictory"
+            )
+        try:
+            observed = self._agentcore.collect_runtime_identity(
+                **self._agentcore_arguments(
+                    runtime_id=identity[0],
+                    runtime_version=identity[1],
+                    runtime_image_digest=transaction.runtime_image_digest,
+                )
+            )
+        except AgentCoreEvidenceAbsent as error:
+            raise ProductionObservationError(
+                "lastStable runtime prerequisite is missing"
+            ) from error
+        if observed != identity:
+            raise ProductionObservationError(
+                "AgentCore runtime prerequisite differs from CloudFormation"
+            )
+        return identity
+
+    def _require_runtime_context(
+        self,
+        transaction: StagingTransactionV1,
+    ) -> RuntimeContextV3:
+        self._require_image(transaction)
+        self._require_runtime(transaction)
+        try:
+            return self._runtime_context(
+                runtime_id=transaction.runtime_id,
+                runtime_version=transaction.runtime_version,
+                runtime_image_digest=transaction.runtime_image_digest,
+            )
+        except AgentCoreEvidenceAbsent as error:
+            raise ProductionObservationError(
+                "lastStable endpoint prerequisite is missing"
+            ) from error
+
     def endpoint_evidence(
         self,
         *,
@@ -658,9 +965,18 @@ class ProductionEvidenceComposer:
                     else (False, {})
                 )
             if phase == "image":
-                image = self._image()
+                self._require_foundation(transaction)
+                try:
+                    image = self._image()
+                except EcrImageAbsent:
+                    return False, {}
+                except EcrRepositoryAbsent as error:
+                    raise ProductionObservationError(
+                        "lastStable repository prerequisite is missing"
+                    ) from error
                 return True, {"runtime_image_digest": image.image_digest}
             if phase == "runtime":
+                self._require_image(transaction)
                 identity = self._deployment.observe_runtime_identity(transaction)
                 if identity is None:
                     return False, {}
@@ -673,13 +989,18 @@ class ProductionEvidenceComposer:
                         "runtime identity observation is malformed"
                     )
                 runtime_id, runtime_version = identity
-                observed = self._agentcore.collect_runtime_identity(
-                    **self._agentcore_arguments(
-                        runtime_id=runtime_id,
-                        runtime_version=runtime_version,
-                        runtime_image_digest=transaction.runtime_image_digest,
+                try:
+                    observed = self._agentcore.collect_runtime_identity(
+                        **self._agentcore_arguments(
+                            runtime_id=runtime_id,
+                            runtime_version=runtime_version,
+                            runtime_image_digest=transaction.runtime_image_digest,
+                        )
                     )
-                )
+                except AgentCoreEvidenceAbsent as error:
+                    raise ProductionObservationError(
+                        "runtime phase prerequisite evidence is contradictory"
+                    ) from error
                 if observed != identity:
                     raise ProductionObservationError(
                         "AgentCore runtime identity differs from CloudFormation"
@@ -689,11 +1010,24 @@ class ProductionEvidenceComposer:
                     "runtime_version": runtime_version,
                 }
             if phase in {"endpoint", "context"}:
-                context = self._runtime_context(
-                    runtime_id=transaction.runtime_id,
-                    runtime_version=transaction.runtime_version,
-                    runtime_image_digest=transaction.runtime_image_digest,
-                )
+                self._require_image(transaction)
+                self._require_runtime(transaction)
+                try:
+                    context = self._runtime_context(
+                        runtime_id=transaction.runtime_id,
+                        runtime_version=transaction.runtime_version,
+                        runtime_image_digest=transaction.runtime_image_digest,
+                    )
+                except AgentCoreEndpointAbsent:
+                    if phase == "endpoint":
+                        return False, {}
+                    raise ProductionObservationError(
+                        "lastStable endpoint prerequisite is missing"
+                    )
+                except AgentCoreRuntimeAbsent as error:
+                    raise ProductionObservationError(
+                        "lastStable runtime prerequisite is missing"
+                    ) from error
                 if phase == "endpoint":
                     return True, {}
                 return True, {
@@ -702,26 +1036,21 @@ class ProductionEvidenceComposer:
                     ).hexdigest()
                 }
             if phase == "consumer-changesets":
+                self._require_runtime_context(transaction)
                 return self._digest_evidence(
                     "consumer_changesets_sha256",
                     self._deployment.observe_consumer_changesets(transaction),
                 )
             if phase == "consumers":
+                self._require_runtime_context(transaction)
                 return self._digest_evidence(
                     "consumer_application_sha256",
                     self._deployment.observe_consumers(transaction),
                 )
             if phase == "verify":
-                image = self._image()
-                if image.image_digest != transaction.runtime_image_digest:
-                    raise ProductionObservationError(
-                        "live image differs from the journal"
-                    )
-                context = self._runtime_context(
-                    runtime_id=transaction.runtime_id,
-                    runtime_version=transaction.runtime_version,
-                    runtime_image_digest=transaction.runtime_image_digest,
-                )
+                image = self._require_image(transaction)
+                self._require_runtime(transaction)
+                context = self._require_runtime_context(transaction)
                 if (
                     hashlib.sha256(context.to_bytes()).hexdigest()
                     != transaction.runtime_context_sha256
@@ -729,26 +1058,41 @@ class ProductionEvidenceComposer:
                     raise ProductionObservationError(
                         "live runtime context differs from the journal"
                     )
+                verification = self._deployment.observe_verification(
+                    transaction,
+                    image=image,
+                    context=context,
+                )
+                if verification is None:
+                    raise ProductionObservationError(
+                        "verification prerequisites are missing or contradictory"
+                    )
                 return self._digest_evidence(
                     "verification_sha256",
-                    self._deployment.observe_verification(
-                        transaction,
-                        image=image,
-                        context=context,
-                    ),
+                    verification,
                 )
             if phase == "rollback":
+                try:
+                    disposition = self._agentcore.observe_retained_disposition(
+                        **self._agentcore_arguments(
+                            runtime_id=transaction.runtime_id,
+                            runtime_version=transaction.runtime_version,
+                            runtime_image_digest=transaction.runtime_image_digest,
+                        )
+                    )
+                except AgentCoreEvidenceError as error:
+                    raise ProductionObservationError(
+                        "rollback retained AgentCore disposition is ambiguous"
+                    ) from error
+                if disposition not in {"PRESENT", "ABSENT"}:
+                    raise ProductionObservationError(
+                        "rollback retained AgentCore disposition is malformed"
+                    )
                 return (
                     (True, {})
                     if self._deployment.observe_rollback(transaction) is True
                     else (False, {})
                 )
-        except (
-            AgentCoreEvidenceAbsent,
-            EcrEvidenceAbsent,
-            ProductionEvidenceAbsent,
-        ):
-            return False, {}
         except (AgentCoreEvidenceError, EcrEvidenceError) as error:
             raise ProductionObservationError(
                 f"{phase} live evidence is unavailable or ambiguous"

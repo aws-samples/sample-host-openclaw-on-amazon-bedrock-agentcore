@@ -6,10 +6,11 @@ import pytest
 
 from release_tools.agentcore import (
     AgentCoreEvidenceAdapter,
-    AgentCoreEvidenceAbsent,
     AgentCoreEvidenceAmbiguous,
     AgentCoreEvidenceError,
     AgentCoreEvidenceIncomplete,
+    AgentCoreEndpointAbsent,
+    AgentCoreRuntimeAbsent,
 )
 
 
@@ -203,8 +204,81 @@ def test_missing_exact_runtime_is_authoritative_absence() -> None:
     fake = FakeAgentCore()
     fake.failure = ResourceNotFound("missing")
 
-    with pytest.raises(AgentCoreEvidenceAbsent, match="absent"):
+    with pytest.raises(AgentCoreRuntimeAbsent, match="absent"):
         _collect(AgentCoreEvidenceAdapter(fake))
+
+
+def test_missing_endpoint_is_distinct_from_missing_retained_runtime() -> None:
+    class ResourceNotFound(Exception):
+        response = {"Error": {"Code": "ResourceNotFoundException"}}
+
+    class MissingEndpointAgentCore(FakeAgentCore):
+        def get_agent_runtime_endpoint(self, **kwargs):
+            raise ResourceNotFound("missing endpoint")
+
+    with pytest.raises(AgentCoreEndpointAbsent, match="absent"):
+        _collect(AgentCoreEvidenceAdapter(MissingEndpointAgentCore()))
+
+
+def test_retained_runtime_and_endpoint_disposition_is_exact_or_coherently_absent() -> None:
+    adapter = AgentCoreEvidenceAdapter(FakeAgentCore())
+    assert adapter.observe_retained_disposition(
+        source_commit=COMMIT,
+        account=ACCOUNT,
+        region=REGION,
+        runtime_id=RUNTIME_ID,
+        runtime_version=VERSION,
+        runtime_image_uri=IMAGE_URI,
+        expected_subnet_ids=SUBNET_IDS,
+        expected_security_group_ids=SECURITY_GROUP_IDS,
+        expected_environment_variables=ENVIRONMENT,
+        expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
+        expected_max_lifetime=MAX_LIFETIME,
+    ) == "PRESENT"
+
+    class ResourceNotFound(Exception):
+        response = {"Error": {"Code": "ResourceNotFoundException"}}
+
+    class MissingBoth(FakeAgentCore):
+        def get_agent_runtime(self, **kwargs):
+            raise ResourceNotFound("missing runtime")
+
+        def get_agent_runtime_endpoint(self, **kwargs):
+            raise ResourceNotFound("missing endpoint")
+
+    absent = AgentCoreEvidenceAdapter(MissingBoth())
+    assert absent.observe_retained_disposition(
+        source_commit=COMMIT,
+        account=ACCOUNT,
+        region=REGION,
+        runtime_id=RUNTIME_ID,
+        runtime_version=VERSION,
+        runtime_image_uri=IMAGE_URI,
+        expected_subnet_ids=SUBNET_IDS,
+        expected_security_group_ids=SECURITY_GROUP_IDS,
+        expected_environment_variables=ENVIRONMENT,
+        expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
+        expected_max_lifetime=MAX_LIFETIME,
+    ) == "ABSENT"
+
+    class MissingEndpoint(FakeAgentCore):
+        def get_agent_runtime_endpoint(self, **kwargs):
+            raise ResourceNotFound("missing endpoint")
+
+    with pytest.raises(AgentCoreEvidenceError, match="partial"):
+        AgentCoreEvidenceAdapter(MissingEndpoint()).observe_retained_disposition(
+            source_commit=COMMIT,
+            account=ACCOUNT,
+            region=REGION,
+            runtime_id=RUNTIME_ID,
+            runtime_version=VERSION,
+            runtime_image_uri=IMAGE_URI,
+            expected_subnet_ids=SUBNET_IDS,
+            expected_security_group_ids=SECURITY_GROUP_IDS,
+            expected_environment_variables=ENVIRONMENT,
+            expected_idle_runtime_session_timeout=IDLE_TIMEOUT,
+            expected_max_lifetime=MAX_LIFETIME,
+        )
 
 
 def test_endpoint_name_must_be_unused_before_the_create_mutation() -> None:

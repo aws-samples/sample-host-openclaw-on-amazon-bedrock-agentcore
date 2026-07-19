@@ -41,6 +41,14 @@ class AgentCoreEvidenceAbsent(AgentCoreEvidenceError):
     """The exact runtime or endpoint is authoritatively absent."""
 
 
+class AgentCoreRuntimeAbsent(AgentCoreEvidenceAbsent):
+    """The exact retained runtime is absent."""
+
+
+class AgentCoreEndpointAbsent(AgentCoreEvidenceAbsent):
+    """The exact release endpoint is absent while its runtime may remain."""
+
+
 class AgentCoreEvidenceIncomplete(AgentCoreEvidenceError):
     """A known asynchronous AgentCore operation has not completed."""
 
@@ -148,7 +156,12 @@ class AgentCoreEvidenceAdapter:
             body = response.get("Error") if isinstance(response, dict) else None
             code = body.get("Code") if isinstance(body, dict) else None
             if code == "ResourceNotFoundException":
-                raise AgentCoreEvidenceAbsent(
+                absent = (
+                    AgentCoreEndpointAbsent
+                    if method_name == "get_agent_runtime_endpoint"
+                    else AgentCoreRuntimeAbsent
+                )
+                raise absent(
                     f"{method_name} exact subject is absent"
                 ) from error
             raise AgentCoreEvidenceError(
@@ -397,3 +410,55 @@ class AgentCoreEvidenceAdapter:
             raise AgentCoreEvidenceError(
                 "AgentCore evidence cannot form a canonical runtime context"
             ) from error
+
+    def observe_retained_disposition(
+        self,
+        *,
+        source_commit: str,
+        account: str,
+        region: str,
+        runtime_id: str,
+        runtime_version: str,
+        runtime_image_uri: str,
+        expected_subnet_ids: Sequence[str],
+        expected_security_group_ids: Sequence[str],
+        expected_environment_variables: Mapping[str, str],
+        expected_idle_runtime_session_timeout: int,
+        expected_max_lifetime: int,
+    ) -> str:
+        """Prove the retained runtime/endpoint are exact or coherently absent."""
+
+        arguments = {
+            "source_commit": source_commit,
+            "account": account,
+            "region": region,
+            "runtime_id": runtime_id,
+            "runtime_version": runtime_version,
+            "runtime_image_uri": runtime_image_uri,
+            "expected_subnet_ids": expected_subnet_ids,
+            "expected_security_group_ids": expected_security_group_ids,
+            "expected_environment_variables": expected_environment_variables,
+            "expected_idle_runtime_session_timeout": (
+                expected_idle_runtime_session_timeout
+            ),
+            "expected_max_lifetime": expected_max_lifetime,
+        }
+        try:
+            self.collect_context(**arguments)
+        except AgentCoreEndpointAbsent as error:
+            raise AgentCoreEvidenceError(
+                "retained AgentCore disposition is partial: runtime present, endpoint absent"
+            ) from error
+        except AgentCoreRuntimeAbsent:
+            try:
+                self._call(
+                    "get_agent_runtime_endpoint",
+                    agentRuntimeId=runtime_id,
+                    endpointName=f"release_{source_commit}",
+                )
+            except AgentCoreEndpointAbsent:
+                return "ABSENT"
+            raise AgentCoreEvidenceError(
+                "retained AgentCore disposition is partial: runtime absent, endpoint present"
+            )
+        return "PRESENT"
