@@ -87,7 +87,16 @@ def build_production_composition(
     artifact_root: Path = DEFAULT_ARTIFACT_ROOT,
     dynamodb_client: Any | None = None,
     clock: Callable[[], int] | None = None,
+    compute_adapters: Mapping[str, Any] | None = None,
 ) -> ProductionCapabilityComposition:
+    # The credential-free gateway Lambda holds no compute execution authority.
+    # Compute wiring is an explicit, injected seam restricted to the two frozen
+    # compute operations; reject any other operation before touching state.
+    adapters: dict[str, Any] = {}
+    if compute_adapters is not None:
+        if set(compute_adapters) - {"compute.run", "compute.status"}:
+            raise RuntimeError("only compute operations may be injected")
+        adapters.update(compute_adapters)
     catalog = load_packaged_catalog(env, artifact_root=artifact_root)
     table_name = _required_env(env, "CAPABILITY_STATE_TABLE_NAME")
     caller_arn = _required_env(env, "CAPABILITY_ALLOWED_CALLER_ARN")
@@ -108,7 +117,7 @@ def build_production_composition(
         catalog=catalog,
         repository=repository,
         ledger=ledger,
-        adapters={},
+        adapters=adapters,
         allowed_caller_arn=caller_arn,
         clock=trusted_clock,
     )
