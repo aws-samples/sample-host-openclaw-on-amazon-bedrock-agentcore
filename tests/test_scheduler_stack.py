@@ -176,7 +176,6 @@ def test_control_role_has_exact_schedule_apply_authority_and_passrole_condition(
         "dynamodb:GetItem",
         "dynamodb:UpdateItem",
         "dynamodb:Query",
-        "dynamodb:BatchWriteItem",
         "dynamodb:TransactWriteItems",
         "scheduler:CreateSchedule",
         "scheduler:GetSchedule",

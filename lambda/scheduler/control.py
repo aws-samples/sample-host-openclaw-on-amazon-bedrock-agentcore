@@ -213,6 +213,8 @@ class ScheduleControlRepository(Protocol):
 
     def list_user_schedules(self, user_id: str) -> tuple[ScheduleSnapshot, ...]: ...
 
+    def active_deletion_fence(self, user_id: str) -> bool: ...
+
     def list_user_schedule_orphans(self, user_id: str) -> tuple[str, ...]: ...
 
     def delete_orphan_owner(self, *, user_id: str, schedule_id: str) -> bool: ...
@@ -629,6 +631,7 @@ class ScheduleControlService:
 
         if not isinstance(user_id, str) or _USER.fullmatch(user_id) is None:
             raise ScheduleControlError("schedule purge user is invalid")
+        self._require_active_deletion_fence(user_id)
         try:
             schedules = self._repository.list_user_schedules(user_id)
         except Exception as error:
@@ -644,12 +647,14 @@ class ScheduleControlService:
                 raise ScheduleControlError("schedule purge crossed a tenant boundary")
             fenced = current
             if current.spec.state == "ENABLED":
+                self._require_active_deletion_fence(user_id)
                 fenced = self._repository.fence_schedule_for_purge(
                     current, now=self._now()
                 )
                 if fenced is None:
                     remaining += 1
                     continue
+            self._require_active_deletion_fence(user_id)
             try:
                 self._provider.delete_schedule(
                     schedule_id=current.spec.schedule_id
@@ -675,6 +680,7 @@ class ScheduleControlService:
         ):
             raise ScheduleControlError("schedule orphan inventory is invalid")
         for schedule_id in orphans:
+            self._require_active_deletion_fence(user_id)
             try:
                 self._provider.delete_schedule(schedule_id=schedule_id)
             except self._uncertain:
@@ -686,9 +692,22 @@ class ScheduleControlService:
                 remaining += 1
         if remaining:
             return remaining
+        self._require_active_deletion_fence(user_id)
         if not self._repository.delete_user_proposals(user_id):
             return 1
         return 0
+
+    def _require_active_deletion_fence(self, user_id: str) -> None:
+        try:
+            active = self._repository.active_deletion_fence(user_id)
+        except Exception as error:
+            raise ScheduleControlError(
+                "schedule purge deletion fence is unavailable"
+            ) from error
+        if active is not True:
+            raise ScheduleControlError(
+                "schedule purge deletion fence is not active"
+            )
 
 
 def _attribute_string(item: Mapping[str, Any], name: str) -> str:
@@ -739,7 +758,6 @@ class DynamoScheduleControlRepository:
                 "transact_write_items",
                 "update_item",
                 "query",
-                "batch_write_item",
             )
         ):
             raise TypeError("scheduler control requires exact DynamoDB methods")
@@ -937,6 +955,21 @@ class DynamoScheduleControlRepository:
 
     def _active_deletion_condition(self, user_id: str) -> dict[str, Any]:
         return self._deletion_fence_condition(user_id, enabled=True)
+
+    def active_deletion_fence(self, user_id: str) -> bool:
+        if not isinstance(user_id, str) or _USER.fullmatch(user_id) is None:
+            raise ValueError("schedule deletion fence user is invalid")
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {"ConditionCheck": self._active_deletion_condition(user_id)}
+                ]
+            )
+            return True
+        except ClientError as error:
+            if _conditional(error):
+                return False
+            raise
 
     @staticmethod
     def _proposal_claim(snapshot: ProposalSnapshot, *, now: int) -> dict[str, Any]:
@@ -1418,7 +1451,9 @@ class DynamoScheduleControlRepository:
                 occurrence_keys.append(
                     {"PK": {"S": item_pk}, "SK": {"S": item_sk}}
                 )
-            if occurrence_keys and not self._delete_keys(occurrence_keys):
+            if occurrence_keys and not self._delete_keys(
+                occurrence_keys, user_id=user_id
+            ):
                 return False
             start_key = response.get("LastEvaluatedKey")
             if start_key is None:
@@ -1430,6 +1465,7 @@ class DynamoScheduleControlRepository:
         try:
             self._client.transact_write_items(
                 TransactItems=[
+                    {"ConditionCheck": self._active_deletion_condition(user_id)},
                     {
                         "ConditionCheck": {
                             "TableName": self._table_name,
@@ -1482,6 +1518,11 @@ class DynamoScheduleControlRepository:
             self._client.transact_write_items(
                 TransactItems=[
                     {
+                        "ConditionCheck": self._active_deletion_condition(
+                            current.spec.user_id
+                        )
+                    },
+                    {
                         "Update": {
                             "TableName": self._table_name,
                             "Key": self._schedule_key(current.spec.schedule_id),
@@ -1515,24 +1556,35 @@ class DynamoScheduleControlRepository:
             delivery_target=current.delivery_target,
         )
 
-    def _delete_keys(self, keys: list[dict[str, Any]]) -> bool:
-        for offset in range(0, len(keys), 25):
-            response = self._client.batch_write_item(
-                RequestItems={
-                    self._table_name: [
-                        {"DeleteRequest": {"Key": key}}
-                        for key in keys[offset : offset + 25]
+    def _delete_keys(
+        self, keys: list[dict[str, Any]], *, user_id: str
+    ) -> bool:
+        # DynamoDB transactions permit at most 100 actions. Keep one action for
+        # the exact capability-plane deletion fence on every destructive chunk.
+        for offset in range(0, len(keys), 99):
+            try:
+                self._client.transact_write_items(
+                    TransactItems=[
+                        {
+                            "ConditionCheck": self._active_deletion_condition(
+                                user_id
+                            )
+                        },
+                        *(
+                            {
+                                "Delete": {
+                                    "TableName": self._table_name,
+                                    "Key": key,
+                                }
+                            }
+                            for key in keys[offset : offset + 99]
+                        ),
                     ]
-                }
-            )
-            if not isinstance(response, Mapping):
-                return False
-            unprocessed = response.get("UnprocessedItems")
-            if unprocessed not in ({}, None):
-                if not isinstance(unprocessed, Mapping) or any(
-                    not isinstance(items, list) or items for items in unprocessed.values()
-                ):
+                )
+            except ClientError as error:
+                if _conditional(error):
                     return False
+                raise
         return True
 
     def delete_schedule_partition(self, current: ScheduleSnapshot) -> bool:
@@ -1573,7 +1625,9 @@ class DynamoScheduleControlRepository:
                     occurrence_keys.append(
                         {"PK": {"S": item_pk}, "SK": {"S": item_sk}}
                     )
-            if occurrence_keys and not self._delete_keys(occurrence_keys):
+            if occurrence_keys and not self._delete_keys(
+                occurrence_keys, user_id=current.spec.user_id
+            ):
                 return False
             start_key = response.get("LastEvaluatedKey")
             if start_key is None:
@@ -1587,6 +1641,11 @@ class DynamoScheduleControlRepository:
         try:
             self._client.transact_write_items(
                 TransactItems=[
+                    {
+                        "ConditionCheck": self._active_deletion_condition(
+                            current.spec.user_id
+                        )
+                    },
                     {
                         "Delete": {
                             "TableName": self._table_name,
@@ -1658,7 +1717,7 @@ class DynamoScheduleControlRepository:
                 if pk != f"USER#{user_id}" or not sk.startswith("PROPOSAL#"):
                     return False
                 keys.append({"PK": {"S": pk}, "SK": {"S": sk}})
-            if keys and not self._delete_keys(keys):
+            if keys and not self._delete_keys(keys, user_id=user_id):
                 return False
             start_key = response.get("LastEvaluatedKey")
             if start_key is None:
@@ -1702,6 +1761,7 @@ class DynamoScheduleApprovalAuthority:
         *,
         repository: DynamoAdmissionRepository,
         catalog_digest: str,
+        clock: Callable[[], int],
     ) -> None:
         if not isinstance(repository, DynamoAdmissionRepository):
             raise TypeError("schedule approval authority repository is invalid")
@@ -1710,8 +1770,17 @@ class DynamoScheduleApprovalAuthority:
             or _SHA256.fullmatch(catalog_digest) is None
         ):
             raise ValueError("schedule approval authority catalog is invalid")
+        if not callable(clock):
+            raise TypeError("schedule approval authority clock is invalid")
         self._repository = repository
         self._catalog_digest = catalog_digest
+        self._clock = clock
+
+    def _now(self) -> int:
+        value = self._clock()
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ScheduleControlError("schedule approval authority clock is invalid")
+        return value
 
     def assert_enabled(self, user_id: str, operation_id: str) -> None:
         if operation_id not in self._PACKS:
@@ -1720,7 +1789,10 @@ class DynamoScheduleApprovalAuthority:
             raise ScheduleControlError("schedule approval deletion fence is active")
         if self._repository.strong_read_global_kill_switch():
             raise ScheduleControlError("schedule approval global kill switch is active")
-        user = self._repository.strong_read_user(user_id)
+        user_lease = self._repository.strong_read_user_with_ttl(user_id)
+        if user_lease is None:
+            raise ScheduleControlError("schedule approval user is not active")
+        user, user_ttl = user_lease
         if (
             not isinstance(user, Mapping)
             or set(user) != {"userId", "state", "deletionFence"}
@@ -1729,9 +1801,12 @@ class DynamoScheduleApprovalAuthority:
             or user.get("deletionFence") is not False
         ):
             raise ScheduleControlError("schedule approval user is not active")
-        raw = self._repository.strong_read_installation(
+        installation_lease = self._repository.strong_read_installation_with_ttl(
             user_id, self._PACKS[operation_id]
         )
+        if installation_lease is None:
+            raise ScheduleControlError("schedule approval installation is invalid")
+        raw, installation_ttl = installation_lease
         try:
             installation = (
                 raw
@@ -1742,8 +1817,11 @@ class DynamoScheduleApprovalAuthority:
             raise ScheduleControlError(
                 "schedule approval installation is invalid"
             ) from None
+        now = self._now()
         if (
-            installation.user_id != user_id
+            user_ttl <= now
+            or installation_ttl <= now
+            or installation.user_id != user_id
             or installation.pack_id != self._PACKS[operation_id]
             or installation.catalog_digest != self._catalog_digest
             or installation.state != "ENABLED"
@@ -1954,6 +2032,7 @@ def build_control_service(
     if region != REQUIRED_REGION or env.get("AWS_REGION_LOCK") != REQUIRED_REGION:
         raise RuntimeError("schedule control requires exact eu-west-1 region")
     dynamodb_client = _aws_client("dynamodb")
+    clock = lambda: int(time.time())
     catalog_digest = _required_env(env, "CAPABILITY_CATALOG_DIGEST")
     capability_table_name = _required_env(env, "CAPABILITY_STATE_TABLE_NAME")
     repository = DynamoScheduleControlRepository(
@@ -1967,6 +2046,7 @@ def build_control_service(
             table_name=capability_table_name,
         ),
         catalog_digest=catalog_digest,
+        clock=clock,
     )
     provider = EventBridgeSchedulerAdapter(
         client=_aws_client("scheduler"),
@@ -1980,7 +2060,7 @@ def build_control_service(
         repository=repository,
         provider=provider,
         catalog_digest=catalog_digest,
-        clock=lambda: int(time.time()),
+        clock=clock,
         authority_guard=authority.assert_enabled,
         uncertain_errors=(Exception,),
     )

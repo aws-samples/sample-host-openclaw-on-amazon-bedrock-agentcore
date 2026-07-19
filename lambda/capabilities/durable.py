@@ -133,6 +133,28 @@ class DynamoAdmissionRepository:
         )
         return _json_mapping(item["recordJson"], "live authority")
 
+    def _retained_record(
+        self,
+        pk: str,
+        sk: str,
+        *,
+        owner_binding: str,
+    ) -> tuple[dict[str, Any], int] | None:
+        item = self._get(pk, sk)
+        if item is None:
+            return None
+        self._validate_item(
+            item,
+            pk,
+            sk,
+            owner_binding=owner_binding,
+            ttl_required=True,
+        )
+        return (
+            _json_mapping(item["recordJson"], "live authority"),
+            item["ttl"],
+        )
+
     @staticmethod
     def _validate_item(
         item: Mapping[str, Any],
@@ -203,6 +225,16 @@ class DynamoAdmissionRepository:
             ttl_required=True,
         )
 
+    def strong_read_user_with_ttl(
+        self, user_id: str
+    ) -> tuple[Mapping[str, Any], int] | None:
+        binding = derive_deletion_subject_binding(user_id)
+        return self._retained_record(
+            subject_partition_key(user_id),
+            "AUTHORITY#PROFILE",
+            owner_binding=binding,
+        )
+
     def strong_read_session(
         self, user_id: str, session_id: str
     ) -> Mapping[str, Any] | None:
@@ -256,6 +288,16 @@ class DynamoAdmissionRepository:
             f"AUTHORITY#INSTALL#{pack_id}",
             owner_binding=binding,
             ttl_required=True,
+        )
+
+    def strong_read_installation_with_ttl(
+        self, user_id: str, pack_id: str
+    ) -> tuple[Mapping[str, Any], int] | None:
+        binding = derive_deletion_subject_binding(user_id)
+        return self._retained_record(
+            subject_partition_key(user_id),
+            f"AUTHORITY#INSTALL#{pack_id}",
+            owner_binding=binding,
         )
 
     def persist_target_grants(

@@ -318,7 +318,6 @@ class SchedulerStack(Stack):
                     "dynamodb:GetItem",
                     "dynamodb:UpdateItem",
                     "dynamodb:Query",
-                    "dynamodb:BatchWriteItem",
                 ],
                 resources=[self.control_table.table_arn],
             )

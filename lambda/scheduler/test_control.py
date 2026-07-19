@@ -8,6 +8,7 @@ import json
 import pytest
 from botocore.exceptions import ClientError
 
+from capabilities.durable import DynamoAdmissionRepository
 from capabilities.retention import (
     DELETION_FENCE_SCHEMA,
     derive_deletion_subject_binding,
@@ -23,11 +24,13 @@ from scheduler.proposals import (
 )
 from scheduler.control import (
     ControlOutcome,
+    DynamoScheduleApprovalAuthority,
     DynamoScheduleControlRepository,
     EventBridgeSchedulerAdapter,
     ProposalSnapshot,
     ScheduleControlService,
     ScheduleSnapshot,
+    build_control_service,
     configure_service_factory,
     handle_control,
     lambda_handler,
@@ -56,6 +59,8 @@ class MemoryControlRepository:
         self.schedules = {}
         self.orphan_schedule_ids = set()
         self.fail_next_finish = False
+        self.deletion_fence_active = True
+        self.deletion_fence_checks = []
 
     def strong_read_proposal(self, *, user_id, proposal_ref):
         row = self.proposals.get(proposal_ref)
@@ -141,6 +146,12 @@ class MemoryControlRepository:
             for row in self.schedules.values()
             if row["spec"].user_id == user_id
         )
+
+    def active_deletion_fence(self, user_id):
+        assert user_id == "user_a1"
+        if self.deletion_fence_checks:
+            return self.deletion_fence_checks.pop(0)
+        return self.deletion_fence_active
 
     def list_user_schedule_orphans(self, user_id):
         assert user_id == "user_a1"
@@ -506,6 +517,148 @@ def test_live_authority_is_rechecked_immediately_before_schedule_effect():
     assert provider.created == provider.deleted == []
 
 
+def _physical_authority_client(*, profile_ttl, installation_ttl):
+    binding = derive_deletion_subject_binding("user_a1")
+    partition = subject_partition_key("user_a1")
+    records = {
+        ("CONTROL", "GLOBAL"): {
+            "PK": {"S": "CONTROL"},
+            "SK": {"S": "GLOBAL"},
+            "recordJson": {"S": '{"enabled":false}'},
+            "version": {"N": "1"},
+        },
+        (partition, "DELETION"): {
+            "PK": {"S": partition},
+            "SK": {"S": "DELETION"},
+            "ownerBinding": {"S": binding},
+            "recordJson": {
+                "S": json.dumps(
+                    {
+                        "schema": DELETION_FENCE_SCHEMA,
+                        "enabled": False,
+                        "subjectBinding": binding,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+            "version": {"N": "1"},
+        },
+        (partition, "AUTHORITY#PROFILE"): {
+            "PK": {"S": partition},
+            "SK": {"S": "AUTHORITY#PROFILE"},
+            "ownerBinding": {"S": binding},
+            "recordJson": {
+                "S": json.dumps(
+                    {
+                        "userId": "user_a1",
+                        "state": "ACTIVE",
+                        "deletionFence": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+            "ttl": {"N": str(profile_ttl)},
+            "version": {"N": "1"},
+        },
+        (partition, "AUTHORITY#INSTALL#schedule.propose"): {
+            "PK": {"S": partition},
+            "SK": {"S": "AUTHORITY#INSTALL#schedule.propose"},
+            "ownerBinding": {"S": binding},
+            "recordJson": {
+                "S": json.dumps(
+                    {
+                        "schema": "personal-operator.capability-installation.v1",
+                        "userId": "user_a1",
+                        "packId": "schedule.propose",
+                        "catalogDigest": CATALOG_DIGEST,
+                        "state": "ENABLED",
+                        "policyRevision": 1,
+                        "connectionRefs": [],
+                        "killSwitch": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+            "ttl": {"N": str(installation_ttl)},
+            "version": {"N": "1"},
+        },
+    }
+
+    class AuthorityDynamo:
+        def __init__(self):
+            self.gets = []
+
+        def get_item(self, **kwargs):
+            self.gets.append(kwargs)
+            key = (kwargs["Key"]["PK"]["S"], kwargs["Key"]["SK"]["S"])
+            item = records.get(key)
+            return {} if item is None else {"Item": deepcopy(item)}
+
+    return AuthorityDynamo()
+
+
+@pytest.mark.parametrize("lease", ["profile", "installation"])
+@pytest.mark.parametrize("ttl", [NOW - 1, NOW])
+def test_production_authority_denies_expired_or_equal_profile_and_pack_before_provider(
+    lease, ttl
+):
+    record = create_record()
+    client = _physical_authority_client(
+        profile_ttl=ttl if lease == "profile" else NOW + 60,
+        installation_ttl=ttl if lease == "installation" else NOW + 60,
+    )
+    authority = DynamoScheduleApprovalAuthority(
+        repository=DynamoAdmissionRepository(
+            client=client, table_name="capability-state"
+        ),
+        catalog_digest=CATALOG_DIGEST,
+        clock=lambda: NOW,
+    )
+    service, repository, provider = service_for(
+        record, clock=lambda: NOW, authority_guard=authority.assert_enabled
+    )
+
+    with pytest.raises(Exception, match="authority"):
+        approve(service, record)
+
+    assert repository.proposals[record.proposal_id]["state"] == "PENDING"
+    assert repository.schedules == {}
+    assert provider.created == provider.deleted == []
+
+
+def test_production_authority_expiry_racing_after_claim_is_stale_before_provider():
+    record = create_record()
+    client = _physical_authority_client(
+        profile_ttl=NOW + 1,
+        installation_ttl=NOW + 1,
+    )
+    ticks = iter((NOW, NOW, NOW + 1, NOW + 1))
+
+    def clock():
+        return next(ticks)
+
+    authority = DynamoScheduleApprovalAuthority(
+        repository=DynamoAdmissionRepository(
+            client=client, table_name="capability-state"
+        ),
+        catalog_digest=CATALOG_DIGEST,
+        clock=clock,
+    )
+    service, repository, provider = service_for(
+        record, clock=clock, authority_guard=authority.assert_enabled
+    )
+
+    outcome = approve(service, record)
+
+    assert outcome.status == "STALE"
+    assert repository.proposals[record.proposal_id]["state"] == "STALE"
+    assert repository.schedules == {}
+    assert provider.created == provider.deleted == []
+
+
 @pytest.mark.parametrize("race", ["authority", "expiry"])
 def test_authority_or_expiry_race_after_claim_is_durably_stale_without_provider_call(
     race,
@@ -557,6 +710,56 @@ def test_account_purge_fences_live_schedules_then_deletes_all_user_records():
     assert provider.deleted == [record.schedule_id]
     assert repository.schedules == {}
     assert repository.proposals == {}
+
+
+def test_account_purge_without_active_deletion_fence_has_zero_destructive_calls():
+    record = create_record()
+    service, repository, provider = service_for(record)
+    original = build_schedule_spec(
+        schedule_id=record.schedule_id,
+        user_id="user_a1",
+        task_type="REMINDER",
+        definition=reminder_definition(),
+        revision=1,
+        state="ENABLED",
+    )
+    repository.schedules[record.schedule_id] = {
+        "spec": original,
+        "deliveryTarget": dict(DELIVERY_TARGET),
+    }
+    repository.deletion_fence_active = False
+
+    with pytest.raises(Exception, match="deletion fence"):
+        service.purge_user_schedules("user_a1")
+
+    assert repository.schedules[record.schedule_id]["spec"] == original
+    assert record.proposal_id in repository.proposals
+    assert provider.created == provider.deleted == []
+
+
+def test_account_purge_fence_loss_before_first_mutation_has_zero_destructive_calls():
+    record = create_record()
+    service, repository, provider = service_for(record)
+    original = build_schedule_spec(
+        schedule_id=record.schedule_id,
+        user_id="user_a1",
+        task_type="REMINDER",
+        definition=reminder_definition(),
+        revision=1,
+        state="ENABLED",
+    )
+    repository.schedules[record.schedule_id] = {
+        "spec": original,
+        "deliveryTarget": dict(DELIVERY_TARGET),
+    }
+    repository.deletion_fence_checks = [True, False]
+
+    with pytest.raises(Exception, match="deletion fence"):
+        service.purge_user_schedules("user_a1")
+
+    assert repository.schedules[record.schedule_id]["spec"] == original
+    assert record.proposal_id in repository.proposals
+    assert provider.created == provider.deleted == []
 
 
 def test_account_purge_keeps_records_and_reports_remaining_on_uncertain_delete():
@@ -659,9 +862,6 @@ class RecordingDynamo:
 
     def query(self, **kwargs):
         return {"Items": []}
-
-    def batch_write_item(self, **kwargs):
-        return {"UnprocessedItems": {}}
 
 
 def test_dynamo_repository_strong_reads_exact_shared_proposal_and_transacts_intent():
@@ -818,6 +1018,41 @@ def test_dynamo_cancel_claim_atomically_checks_deletion_expires_and_decrements_l
     assert "liveCount > :zero" in writes[3]["Update"]["ConditionExpression"]
 
 
+def test_dynamo_purge_state_fence_is_atomic_with_active_deletion_fence():
+    record = create_record()
+    current = ScheduleSnapshot(
+        spec=build_schedule_spec(
+            schedule_id=record.schedule_id,
+            user_id=record.user_id,
+            task_type="REMINDER",
+            definition=reminder_definition(),
+            revision=1,
+            state="ENABLED",
+        ),
+        delivery_target=DELIVERY_TARGET,
+    )
+    client = RecordingDynamo()
+    repository = DynamoScheduleControlRepository(
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
+    )
+
+    assert repository.fence_schedule_for_purge(current, now=NOW) is not None
+
+    writes = client.transactions[0]["TransactItems"]
+    assert [set(write) for write in writes] == [
+        {"ConditionCheck"},
+        {"Update"},
+        {"Update"},
+    ]
+    active = writes[0]["ConditionCheck"]
+    assert active["TableName"] == "capability-state"
+    assert active["ExpressionAttributeValues"][":record"]["S"].find(
+        '"enabled":true'
+    ) >= 0
+
+
 def test_dynamo_repository_rejects_extra_or_cross_tenant_proposal_fields():
     record = create_record()
     poisoned = _proposal_item(record)
@@ -850,7 +1085,6 @@ def test_dynamo_purge_uses_both_sparse_indexes_and_deletes_exact_partitions():
         def __init__(self):
             super().__init__()
             self.queries = []
-            self.batches = []
 
         def get_item(self, **kwargs):
             self.gets.append(kwargs)
@@ -894,10 +1128,6 @@ def test_dynamo_purge_uses_both_sparse_indexes_and_deletes_exact_partitions():
                 ]
             }
 
-        def batch_write_item(self, **kwargs):
-            self.batches.append(kwargs)
-            return {"UnprocessedItems": {}}
-
     client = PurgeDynamo()
     repository = DynamoScheduleControlRepository(
         client=client,
@@ -913,30 +1143,41 @@ def test_dynamo_purge_uses_both_sparse_indexes_and_deletes_exact_partitions():
     assert [query.get("IndexName") for query in client.queries] == [None, None, None]
     assert client.queries[0]["ConsistentRead"] is True
     assert client.queries[2]["ConsistentRead"] is True
-    deleted_keys = [
-        request["DeleteRequest"]["Key"]
-        for batch in client.batches
-        for request in batch["RequestItems"]["scheduler-control"]
+    occurrence_cleanup = client.transactions[0]["TransactItems"]
+    assert [set(item) for item in occurrence_cleanup] == [
+        {"ConditionCheck"},
+        {"Delete"},
     ]
-    assert {
-        (key["PK"]["S"], key["SK"]["S"]) for key in deleted_keys
-    } == {
-        (f"SCHEDULE#{spec.schedule_id}", "OCCURRENCE#occ_12345678"),
-        ("USER#user_a1", f"PROPOSAL#{record.proposal_id}"),
+    assert occurrence_cleanup[1]["Delete"]["Key"] == {
+        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+        "SK": {"S": "OCCURRENCE#occ_12345678"},
     }
-    cleanup = client.transactions[0]["TransactItems"]
-    assert [set(item) for item in cleanup] == [{"Delete"}, {"Delete"}]
+    cleanup = client.transactions[1]["TransactItems"]
+    assert [set(item) for item in cleanup] == [
+        {"ConditionCheck"},
+        {"Delete"},
+        {"Delete"},
+    ]
     assert {
         (
             item["Delete"]["Key"]["PK"]["S"],
             item["Delete"]["Key"]["SK"]["S"],
         )
-        for item in cleanup
+        for item in cleanup[1:]
     } == {
         (f"SCHEDULE#{spec.schedule_id}", "STATE"),
         ("USER#user_a1", f"SCHEDULE#{spec.schedule_id}"),
     }
-    counter_cleanup = client.transactions[1]["TransactItems"]
+    proposal_cleanup = client.transactions[2]["TransactItems"]
+    assert [set(item) for item in proposal_cleanup] == [
+        {"ConditionCheck"},
+        {"Delete"},
+    ]
+    assert proposal_cleanup[1]["Delete"]["Key"] == {
+        "PK": {"S": "USER#user_a1"},
+        "SK": {"S": f"PROPOSAL#{record.proposal_id}"},
+    }
+    counter_cleanup = client.transactions[3]["TransactItems"]
     assert [set(item) for item in counter_cleanup] == [
         {"ConditionCheck"},
         {"Delete"},
@@ -975,7 +1216,73 @@ def test_dynamo_purge_uses_both_sparse_indexes_and_deletes_exact_partitions():
     }
 
 
-def test_dynamo_schedule_cleanup_never_deletes_state_or_owner_when_occurrence_batch_is_partial():
+def test_dynamo_schedule_inventory_paginates_beyond_256_owners_and_preserves_orphans():
+    schedule_ids = tuple(f"schedule_owner_{index:08d}" for index in range(301))
+    live_id = schedule_ids[-1]
+    live_spec = build_schedule_spec(
+        schedule_id=live_id,
+        user_id="user_a1",
+        task_type="REMINDER",
+        definition=reminder_definition(),
+        revision=2,
+        state="CANCELLED",
+        next_run_at=None,
+    )
+
+    def owner_item(schedule_id):
+        return {
+            "PK": {"S": "USER#user_a1"},
+            "SK": {"S": f"SCHEDULE#{schedule_id}"},
+            "recordType": {"S": "SCHEDULE_OWNER"},
+            "scheduleId": {"S": schedule_id},
+        }
+
+    class PaginatedOwnerDynamo(RecordingDynamo):
+        def __init__(self):
+            super().__init__()
+            self.queries = []
+
+        def query(self, **kwargs):
+            self.queries.append(kwargs)
+            if "ExclusiveStartKey" in kwargs:
+                return {"Items": [owner_item(value) for value in schedule_ids[257:]]}
+            marker = owner_item(schedule_ids[256])
+            return {
+                "Items": [owner_item(value) for value in schedule_ids[:257]],
+                "LastEvaluatedKey": {
+                    "PK": marker["PK"],
+                    "SK": marker["SK"],
+                },
+            }
+
+        def get_item(self, **kwargs):
+            self.gets.append(kwargs)
+            schedule_id = kwargs["Key"]["PK"]["S"].removeprefix("SCHEDULE#")
+            if schedule_id == live_id:
+                return {"Item": _schedule_item(live_spec)}
+            return {}
+
+    client = PaginatedOwnerDynamo()
+    repository = DynamoScheduleControlRepository(
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
+    )
+
+    assert repository.list_user_schedules("user_a1") == (
+        ScheduleSnapshot(spec=live_spec, delivery_target=DELIVERY_TARGET),
+    )
+    assert repository.list_user_schedule_orphans("user_a1") == schedule_ids[:-1]
+
+    assert len(client.queries) == 4
+    assert all(query["Limit"] == 1000 for query in client.queries)
+    assert client.queries[1]["ExclusiveStartKey"] == {
+        "PK": {"S": "USER#user_a1"},
+        "SK": {"S": f"SCHEDULE#{schedule_ids[256]}"},
+    }
+
+
+def test_dynamo_schedule_cleanup_never_deletes_state_or_owner_when_occurrence_chunk_is_cancelled():
     record = create_record()
     spec = build_schedule_spec(
         schedule_id=record.schedule_id,
@@ -1002,9 +1309,17 @@ def test_dynamo_schedule_cleanup_never_deletes_state_or_owner_when_occurrence_ba
                 ]
             }
 
-        def batch_write_item(self, **kwargs):
-            request = kwargs["RequestItems"]["scheduler-control"]
-            return {"UnprocessedItems": {"scheduler-control": request}}
+        def transact_write_items(self, **kwargs):
+            self.transactions.append(kwargs)
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "TransactionCanceledException",
+                        "Message": "synthetic partial cleanup",
+                    }
+                },
+                "TransactWriteItems",
+            )
 
     client = PartialDynamo()
     repository = DynamoScheduleControlRepository(
@@ -1016,7 +1331,145 @@ def test_dynamo_schedule_cleanup_never_deletes_state_or_owner_when_occurrence_ba
     assert repository.delete_schedule_partition(
         ScheduleSnapshot(spec=spec, delivery_target=DELIVERY_TARGET)
     ) is False
-    assert client.transactions == []
+    assert len(client.transactions) == 1
+    writes = client.transactions[0]["TransactItems"]
+    assert [set(write) for write in writes] == [
+        {"ConditionCheck"},
+        {"Delete"},
+    ]
+    assert writes[1]["Delete"]["Key"]["SK"] == {
+        "S": "OCCURRENCE#occ_12345678"
+    }
+
+
+def test_dynamo_schedule_cleanup_keeps_state_and_owner_in_one_terminal_transaction():
+    record = create_record()
+    spec = build_schedule_spec(
+        schedule_id=record.schedule_id,
+        user_id=record.user_id,
+        task_type="REMINDER",
+        definition=reminder_definition(),
+        revision=2,
+        state="CANCELLED",
+        next_run_at=None,
+    )
+
+    class TerminalCancellationDynamo(RecordingDynamo):
+        def query(self, **_kwargs):
+            return {
+                "Items": [
+                    {
+                        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+                        "SK": {"S": "STATE"},
+                    },
+                    {
+                        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+                        "SK": {"S": "OCCURRENCE#occ_12345678"},
+                    },
+                ]
+            }
+
+        def transact_write_items(self, **kwargs):
+            self.transactions.append(kwargs)
+            if len(self.transactions) == 2:
+                raise ClientError(
+                    {
+                        "Error": {
+                            "Code": "TransactionCanceledException",
+                            "Message": "synthetic terminal cancellation",
+                        }
+                    },
+                    "TransactWriteItems",
+                )
+            return {}
+
+    client = TerminalCancellationDynamo()
+    repository = DynamoScheduleControlRepository(
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
+    )
+
+    assert repository.delete_schedule_partition(
+        ScheduleSnapshot(spec=spec, delivery_target=DELIVERY_TARGET)
+    ) is False
+
+    assert len(client.transactions) == 2
+    terminal = client.transactions[1]["TransactItems"]
+    assert [set(write) for write in terminal] == [
+        {"ConditionCheck"},
+        {"Delete"},
+        {"Delete"},
+    ]
+    assert {
+        (write["Delete"]["Key"]["PK"]["S"], write["Delete"]["Key"]["SK"]["S"])
+        for write in terminal[1:]
+    } == {
+        (f"SCHEDULE#{spec.schedule_id}", "STATE"),
+        ("USER#user_a1", f"SCHEDULE#{spec.schedule_id}"),
+    }
+
+
+def test_dynamo_schedule_cleanup_transactionally_fences_occurrences_state_and_owner():
+    record = create_record()
+    spec = build_schedule_spec(
+        schedule_id=record.schedule_id,
+        user_id=record.user_id,
+        task_type="REMINDER",
+        definition=reminder_definition(),
+        revision=2,
+        state="CANCELLED",
+        next_run_at=None,
+    )
+
+    class CleanupDynamo(RecordingDynamo):
+        def __init__(self):
+            super().__init__()
+
+        def query(self, **_kwargs):
+            return {
+                "Items": [
+                    {
+                        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+                        "SK": {"S": "STATE"},
+                    },
+                    {
+                        "PK": {"S": f"SCHEDULE#{spec.schedule_id}"},
+                        "SK": {"S": "OCCURRENCE#occ_12345678"},
+                    },
+                ]
+            }
+
+    client = CleanupDynamo()
+    repository = DynamoScheduleControlRepository(
+        client=client,
+        table_name="scheduler-control",
+        capability_table_name="capability-state",
+    )
+
+    assert repository.delete_schedule_partition(
+        ScheduleSnapshot(spec=spec, delivery_target=DELIVERY_TARGET)
+    ) is True
+
+    assert len(client.transactions) == 2
+    assert all(
+        set(transaction["TransactItems"][0]) == {"ConditionCheck"}
+        and transaction["TransactItems"][0]["ConditionCheck"]["TableName"]
+        == "capability-state"
+        for transaction in client.transactions
+    )
+    occurrence_deletes = client.transactions[0]["TransactItems"][1:]
+    assert occurrence_deletes[0]["Delete"]["Key"]["SK"] == {
+        "S": "OCCURRENCE#occ_12345678"
+    }
+    terminal_deletes = client.transactions[1]["TransactItems"][1:]
+    assert {
+        (item["Delete"]["Key"]["PK"]["S"], item["Delete"]["Key"]["SK"]["S"])
+        for item in terminal_deletes
+    } == {
+        (f"SCHEDULE#{spec.schedule_id}", "STATE"),
+        ("USER#user_a1", f"SCHEDULE#{spec.schedule_id}"),
+    }
 
 
 def test_dynamo_orphan_cleanup_deletes_all_occurrences_before_owner():
@@ -1026,7 +1479,6 @@ def test_dynamo_orphan_cleanup_deletes_all_occurrences_before_owner():
         def __init__(self):
             super().__init__()
             self.queries = []
-            self.batches = []
 
         def query(self, **kwargs):
             self.queries.append(kwargs)
@@ -1038,10 +1490,6 @@ def test_dynamo_orphan_cleanup_deletes_all_occurrences_before_owner():
                     }
                 ]
             }
-
-        def batch_write_item(self, **kwargs):
-            self.batches.append(kwargs)
-            return {"UnprocessedItems": {}}
 
     client = OrphanDynamo()
     repository = DynamoScheduleControlRepository(
@@ -1058,27 +1506,26 @@ def test_dynamo_orphan_cleanup_deletes_all_occurrences_before_owner():
     assert client.queries[0]["ExpressionAttributeValues"] == {
         ":pk": {"S": f"SCHEDULE#{schedule_id}"}
     }
-    assert client.batches[0]["RequestItems"]["scheduler-control"] == [
-        {
-            "DeleteRequest": {
-                "Key": {
-                    "PK": {"S": f"SCHEDULE#{schedule_id}"},
-                    "SK": {"S": "OCCURRENCE#occ_orphan_12345678"},
-                }
-            }
-        }
-    ]
-    writes = client.transactions[0]["TransactItems"]
-    assert writes[0]["ConditionCheck"]["ConditionExpression"] == (
+    occurrence_writes = client.transactions[0]["TransactItems"]
+    assert occurrence_writes[0]["ConditionCheck"]["TableName"] == (
+        "capability-state"
+    )
+    assert occurrence_writes[1]["Delete"]["Key"] == {
+        "PK": {"S": f"SCHEDULE#{schedule_id}"},
+        "SK": {"S": "OCCURRENCE#occ_orphan_12345678"},
+    }
+    writes = client.transactions[1]["TransactItems"]
+    assert writes[0]["ConditionCheck"]["TableName"] == "capability-state"
+    assert writes[1]["ConditionCheck"]["ConditionExpression"] == (
         "attribute_not_exists(PK)"
     )
-    assert writes[1]["Delete"]["Key"] == {
+    assert writes[2]["Delete"]["Key"] == {
         "PK": {"S": "USER#user_a1"},
         "SK": {"S": f"SCHEDULE#{schedule_id}"},
     }
 
 
-def test_dynamo_orphan_cleanup_retains_owner_when_occurrence_batch_is_partial():
+def test_dynamo_orphan_cleanup_retains_owner_when_occurrence_chunk_is_cancelled():
     schedule_id = "schedule_orphan_12345678"
 
     class PartialOrphanDynamo(RecordingDynamo):
@@ -1092,9 +1539,17 @@ def test_dynamo_orphan_cleanup_retains_owner_when_occurrence_batch_is_partial():
                 ]
             }
 
-        def batch_write_item(self, **kwargs):
-            requests = kwargs["RequestItems"]["scheduler-control"]
-            return {"UnprocessedItems": {"scheduler-control": requests}}
+        def transact_write_items(self, **kwargs):
+            self.transactions.append(kwargs)
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "TransactionCanceledException",
+                        "Message": "synthetic partial orphan cleanup",
+                    }
+                },
+                "TransactWriteItems",
+            )
 
     client = PartialOrphanDynamo()
     repository = DynamoScheduleControlRepository(
@@ -1106,7 +1561,11 @@ def test_dynamo_orphan_cleanup_retains_owner_when_occurrence_batch_is_partial():
     assert repository.delete_orphan_owner(
         user_id="user_a1", schedule_id=schedule_id
     ) is False
-    assert client.transactions == []
+    assert len(client.transactions) == 1
+    assert [set(write) for write in client.transactions[0]["TransactItems"]] == [
+        {"ConditionCheck"},
+        {"Delete"},
+    ]
 
 
 def test_dynamo_proposal_purge_paginates_without_a_total_record_bound():
@@ -1114,7 +1573,6 @@ def test_dynamo_proposal_purge_paginates_without_a_total_record_bound():
         def __init__(self):
             super().__init__()
             self.queries = []
-            self.batches = []
 
         def query(self, **kwargs):
             self.queries.append(kwargs)
@@ -1133,10 +1591,6 @@ def test_dynamo_proposal_purge_paginates_without_a_total_record_bound():
                 }
             return {"Items": [item]}
 
-        def batch_write_item(self, **kwargs):
-            self.batches.append(kwargs)
-            return {"UnprocessedItems": {}}
-
     client = PaginatedDynamo()
     repository = DynamoScheduleControlRepository(
         client=client,
@@ -1152,14 +1606,18 @@ def test_dynamo_proposal_purge_paginates_without_a_total_record_bound():
         "SK": {"S": "PROPOSAL#proposal_page_00000001"},
     }
     deleted = [
-        request["DeleteRequest"]["Key"]["SK"]["S"]
-        for batch in client.batches
-        for request in batch["RequestItems"]["scheduler-control"]
+        transaction["TransactItems"][1]["Delete"]["Key"]["SK"]["S"]
+        for transaction in client.transactions[:-1]
     ]
     assert deleted == [
         "PROPOSAL#proposal_page_00000001",
         "PROPOSAL#proposal_page_00000002",
     ]
+    assert all(
+        transaction["TransactItems"][0]["ConditionCheck"]["TableName"]
+        == "capability-state"
+        for transaction in client.transactions
+    )
 
 
 class RecordingSchedulerClient:
@@ -1184,6 +1642,41 @@ class RecordingSchedulerClient:
         if self.get_error is not None:
             raise self.get_error
         return self.get_response
+
+
+def test_production_builder_shares_one_trusted_clock_with_service_and_authority(
+    monkeypatch,
+):
+    dynamo = RecordingDynamo()
+    scheduler = RecordingSchedulerClient()
+    monkeypatch.setattr(
+        "scheduler.control._aws_client",
+        lambda service: dynamo if service == "dynamodb" else scheduler,
+    )
+    monkeypatch.setattr("scheduler.control.time.time", lambda: NOW)
+
+    service = build_control_service(
+        env={
+            "AWS_REGION": "eu-west-1",
+            "AWS_REGION_LOCK": "eu-west-1",
+            "CAPABILITY_CATALOG_DIGEST": CATALOG_DIGEST,
+            "CAPABILITY_STATE_TABLE_NAME": "capability-state",
+            "SCHEDULER_CONTROL_TABLE_NAME": "scheduler-control",
+            "SCHEDULER_INGRESS_FUNCTION_ARN": (
+                "arn:aws:lambda:eu-west-1:123456789012:function:"
+                "personal-operator-scheduler-ingress"
+            ),
+            "SCHEDULER_INVOKE_ROLE_ARN": (
+                "arn:aws:iam::123456789012:role/"
+                "personal-operator-scheduler-invoke-eu-west-1"
+            ),
+            "SCHEDULER_GROUP_NAME": "personal-operator-v1",
+        }
+    )
+
+    authority = service._authority_guard.__self__
+    assert service._clock is authority._clock
+    assert service._clock() == authority._clock() == NOW
 
 
 def test_eventbridge_adapter_uses_opaque_bounded_name_and_exact_ingress_target():
