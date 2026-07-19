@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:synthetic-notes-read-list-output:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"notes":{"items":{"maxLength":512,"minLength":1,"type":"string"},"maxItems":64,"type":"array"}},"required":["notes"],"title":"Synthetic notes read-list output","type":"object"}

@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:browser-observe-output:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"observations":{"items":{"maxLength":1024,"minLength":1,"type":"string"},"maxItems":64,"type":"array"}},"required":["observations"],"title":"Browser observe output","type":"object"}

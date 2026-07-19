@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:synthetic-notes-read-list-input:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{},"required":[],"title":"Synthetic notes read-list input","type":"object"}
