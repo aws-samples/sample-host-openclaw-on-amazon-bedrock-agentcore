@@ -64,7 +64,8 @@ run_check "Python unit tests" \
 
 run_check "E2E session-control unit tests" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \
-  "$PYTHON" -m pytest tests/e2e/test_session_control.py -v
+  "$PYTHON" -m pytest tests/e2e/test_session_control.py \
+  tests/e2e/test_log_tailer_privacy.py -v
 
 run_check "Bridge Node tests (serialized)" \
   env AWS_REGION="$AWS_TEST_REGION" AWS_DEFAULT_REGION="$AWS_TEST_REGION" \

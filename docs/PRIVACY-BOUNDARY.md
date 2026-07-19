@@ -213,6 +213,15 @@ not reverse an external provider effect.
 
 ## Logging exclusions
 
+The retained runtime and router logs contain only closed metadata: schema,
+component or event code, severity, bounded count, and allowlisted status.
+Console arguments, child stdout/stderr, identities, paths, provider errors,
+exception messages and stacks, prompts, workspace bytes, and responses are
+discarded before a platform or CloudWatch record is created. CloudWatch is not
+a response-inspection transport. The former E2E log tailer now fails before
+constructing a CloudWatch client; live response checks must use direct
+AgentCore invocation evidence, while provider/message journeys remain OPEN.
+
 Never log or include in release evidence:
 
 - raw email bodies or full provider responses;
@@ -223,9 +232,11 @@ Never log or include in release evidence:
 - scoped AWS credential files or execution-role credentials;
 - decrypted workspace contents or another user's identifiers.
 
-Safe operational fields are bounded internal user IDs, canonical trace/action
-IDs, state names, error types without provider messages, provider receipt IDs,
-payload hashes, and timestamps.
+That list is an exclusion boundary, not permission to add identifiers to logs.
+Retained runtime/router records are limited to the exact closed metadata set
+above. Typed state, receipt, and trace identifiers may appear only inside their
+existing trusted non-log contracts and stores when those contracts require
+them; they are not CloudWatch fields or release-report dimensions.
 
 ## Locally tested, not deployment-proven
 

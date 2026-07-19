@@ -124,3 +124,13 @@ def test_current_boundary_docs_disclose_metadata_only_observability() -> None:
         normalized = " ".join(document.split())
         assert "model invocation text or image payload logging" in normalized
         assert "legacy token-monitoring stack is not active" in normalized
+
+
+def test_privacy_boundary_retires_logs_as_an_application_data_transport() -> None:
+    privacy = " ".join(
+        (ROOT / "docs/PRIVACY-BOUNDARY.md").read_text(encoding="utf-8").split()
+    )
+
+    assert "retained runtime and router logs contain only closed metadata" in privacy
+    assert "CloudWatch is not a response-inspection transport" in privacy
+    assert "Safe operational fields are bounded internal user IDs" not in privacy
