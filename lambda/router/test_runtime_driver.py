@@ -1018,6 +1018,18 @@ class FakeWorkspaceCapabilitySigner:
         return f"capability.{user_id}.{session_id}"
 
 
+class FakeTurnCapabilityIssuer:
+    def __init__(self):
+        self.calls = []
+
+    def mint(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "schema": "personal-operator.turn-capability-grant.v1",
+            "nonce": "nonce_12345678",
+        }
+
+
 def build_driver(repo=None, adapter=None):
     ids = iter(["owner-a", "owner-b", "owner-c"])
     sessions = iter([NEW_SESSION, "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
@@ -1052,6 +1064,42 @@ def test_runtime_driver_mints_capability_only_after_exact_session_acquisition():
     assert adapter.events[0][3]["workspaceCapability"] == (
         f"capability.{USER}.{SESSION}"
     )
+
+
+def test_runtime_driver_mints_and_delivers_server_owned_turn_authority():
+    repo = FakeRepository()
+    adapter = FakeAdapter()
+    issuer = FakeTurnCapabilityIssuer()
+    driver = RuntimeDriver(
+        repository=repo,
+        adapter=adapter,
+        workspace_capability_signer=FakeWorkspaceCapabilitySigner(),
+        turn_capability_issuer=issuer,
+        owner_factory=lambda: "owner-a",
+        session_id_factory=lambda: NEW_SESSION,
+        lease_ms=30_000,
+        max_execution_ms=20_000,
+    )
+
+    driver.invoke(
+        USER,
+        {"message": "read https://example.com/exact"},
+        TRACE,
+        scheduled_read_only=True,
+    )
+
+    assert issuer.calls == [
+        {
+            "user_id": USER,
+            "session_id": SESSION,
+            "invocation_id": TRACE,
+            "message_text": "read https://example.com/exact",
+            "scheduled_read_only": True,
+        }
+    ]
+    payload = adapter.events[0][3]
+    assert payload["turnCapabilityGrant"]["nonce"] == "nonce_12345678"
+    assert payload["externalEffects"] is False
 
 
 def test_driver_heartbeats_long_running_invocation_under_same_fence():

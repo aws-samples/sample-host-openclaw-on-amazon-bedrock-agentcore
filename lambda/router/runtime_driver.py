@@ -255,6 +255,7 @@ class RuntimeDriver:
         repository,
         adapter: AgentCoreAdapter,
         workspace_capability_signer,
+        turn_capability_issuer=None,
         owner_factory=None,
         session_id_factory=None,
         lease_ms: int = 120_000,
@@ -277,6 +278,11 @@ class RuntimeDriver:
         self.repository = repository
         self.adapter = adapter
         self.workspace_capability_signer = workspace_capability_signer
+        if turn_capability_issuer is not None and not callable(
+            getattr(turn_capability_issuer, "mint", None)
+        ):
+            raise TypeError("turn capability issuer is invalid")
+        self.turn_capability_issuer = turn_capability_issuer
         self.owner_factory = owner_factory or (lambda: f"op-{uuid.uuid4().hex}")
         self.session_id_factory = session_id_factory or generate_session_id
         self.lease_ms = lease_ms
@@ -642,6 +648,43 @@ class RuntimeDriver:
             )
         return capability
 
+    def _turn_capability(
+        self,
+        lease: RuntimeRecord,
+        *,
+        invocation_id: str,
+        message,
+        scheduled_read_only: bool,
+    ) -> dict | None:
+        if self.turn_capability_issuer is None:
+            return None
+        message_text = message if isinstance(message, str) else message["text"]
+        try:
+            grant = self.turn_capability_issuer.mint(
+                user_id=lease.user_id,
+                session_id=lease.session_id,
+                invocation_id=invocation_id,
+                message_text=message_text,
+                scheduled_read_only=scheduled_read_only,
+            )
+            if not isinstance(grant, Mapping):
+                raise TypeError("turn issuer returned a non-object")
+            encoded = json.dumps(
+                grant,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(encoded) > 64 * 1024:
+                raise ValueError("turn grant exceeds its bound")
+            return dict(grant)
+        except Exception as error:
+            self._quarantine(lease)
+            raise RuntimeInvocationUncertain(
+                "turn capability authority could not be prepared"
+            ) from error
+
     def _with_heartbeat(self, lease: RuntimeRecord, operation):
         try:
             active_lease = self.repository.heartbeat(
@@ -713,6 +756,14 @@ class RuntimeDriver:
             **payload_base,
             "workspaceCapability": self._workspace_capability(lease),
         }
+        turn_capability = self._turn_capability(
+            lease,
+            invocation_id=trace_id,
+            message=request["message"],
+            scheduled_read_only=scheduled_read_only,
+        )
+        if turn_capability is not None:
+            payload["turnCapabilityGrant"] = turn_capability
         self._validate_payload_json_bound(payload)
         response, receipt = self._invoke_with_receipt(
             lease, payload=payload, trace_id=trace_id
