@@ -1149,6 +1149,11 @@ def main(
     else:
         args.composer_factory = composer_factory
     try:
+        if production_entrypoint and (args.phase or args.resume or args.rollback):
+            raise ReleaseCliError(
+                "v1 mutation is disabled; use only credential-free preflight/status "
+                "until the reviewed v2 transaction is available"
+            )
         if production_entrypoint and not args.status:
             _assert_executing_repository(args.root)
         if args.status:

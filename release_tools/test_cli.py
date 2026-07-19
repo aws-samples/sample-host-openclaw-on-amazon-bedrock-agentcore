@@ -752,6 +752,42 @@ def test_production_entrypoint_rejects_a_different_release_root(
     assert not fixture["journal"].exists()
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        ["--phase", "foundation", "--journal", "/tmp/v1-release.json"],
+        ["--resume", "/tmp/v1-release.json"],
+        [
+            "--rollback",
+            "release_" + "a" * 40,
+            "--journal",
+            "/tmp/v1-release.json",
+        ],
+    ],
+)
+def test_production_entrypoint_rejects_every_v1_mutation_mode_before_io(
+    mode: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        release_cli,
+        "_assert_executing_repository",
+        lambda root: (_ for _ in ()).throw(
+            AssertionError("v1 mutation must stop before checkout or AWS access")
+        ),
+    )
+
+    result = release_cli.main(
+        [*mode, "--root", str(ROOT)],
+        production_site_packages=tmp_path,
+    )
+
+    assert result == 1
+    assert "v1 mutation" in capsys.readouterr().err.casefold()
+
+
 @pytest.mark.parametrize("mutation", ["dirty", "new-head"])
 def test_phase_revalidates_exact_checkout_before_credentials(
     tmp_path: Path,
