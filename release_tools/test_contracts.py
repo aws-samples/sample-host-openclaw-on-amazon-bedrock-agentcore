@@ -2,22 +2,35 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
 
 from release_tools.contracts import (
+    AbortRetainedEvidenceV2,
     ContractError,
+    FoundationRuntimeInputsV1,
+    MutationRequestV2,
     ProductionObservationConfigV1,
+    ReleasePlanV2,
+    ReleaseStepObservationV2,
+    ResolvedMutationRequestV2,
+    RuntimeConfigurationV1,
     RuntimeContextV3,
     RuntimeImageEvidence,
     StagingTransactionV1,
+    StagingTransactionV2,
     TrustedLambdaAssetV2,
     canonical_json_bytes,
     parse_canonical_object,
     parse_release_contract,
     write_new_contract,
+)
+from release_tools.image_publication import (
+    OCI_CONFIG_MEDIA_TYPE,
+    ImagePublicationEffectV1,
 )
 
 
@@ -43,6 +56,24 @@ ROLE_ARN = (
 )
 SUBNET_IDS = ("subnet-00000000000000001", "subnet-00000000000000002")
 SECURITY_GROUP_IDS = ("sg-00000000000000001",)
+AGENTCORE_STACK_ID = (
+    f"arn:aws:cloudformation:{REGION}:{ACCOUNT}:stack/OpenClawAgentCore/"
+    "00000000-0000-0000-0000-000000000001"
+)
+
+
+def _consumer_stack_id(stack_name: str, marker: int) -> str:
+    return (
+        f"arn:aws:cloudformation:{REGION}:{ACCOUNT}:stack/{stack_name}/"
+        f"00000000-0000-0000-0000-{marker:012d}"
+    )
+
+
+def _consumer_change_set_id(marker: int) -> str:
+    return (
+        f"arn:aws:cloudformation:{REGION}:{ACCOUNT}:changeSet/"
+        f"release-{COMMIT}/00000000-0000-0000-0000-{marker:012d}"
+    )
 RUNTIME_ENVIRONMENT = {
     "AWS_DEFAULT_REGION": REGION,
     "AWS_REGION": REGION,
@@ -71,6 +102,438 @@ CONSUMER_STACKS = (
     "OpenClawCron",
     "PersonalOperatorScheduler",
 )
+
+V2_PHASES = (
+    "foundation",
+    "image",
+    "runtime",
+    "endpoint",
+    "context",
+    "router-cron-cs",
+    "router-cron",
+    "scheduler-cs",
+    "scheduler",
+    "web-cs",
+    "web",
+    "verify",
+)
+
+
+def _release_subject(suffix: str) -> str:
+    return f"release:{ACCOUNT}:{REGION}:{COMMIT}:{suffix}"
+
+
+def _stack_subject(name: str) -> str:
+    return f"cfn:{ACCOUNT}:{REGION}:stack:{name}:release:{COMMIT}"
+
+
+def _v2_steps_and_artifacts() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    asset_id = hashlib.sha256(b"synthesized-cdk-asset-id").hexdigest()
+    asset_payload_sha256 = hashlib.sha256(b"trusted-cdk-asset").hexdigest()
+    image_subject = (
+        f"ecr:{ACCOUNT}:{REGION}:repository:personal-operator/bridge:"
+        f"release:{COMMIT}"
+    )
+    image_effect_prefix = (
+        f"ecr:{ACCOUNT}:{REGION}:repository:personal-operator/bridge"
+    )
+    image_blob_digests = sorted(
+        {
+            hashlib.sha256(b"runtime-config-blob").hexdigest(),
+            hashlib.sha256(b"runtime-layer-blob").hexdigest(),
+        }
+    )
+    image_manifest_digest = DIGEST.removeprefix("sha256:")
+    image_publication_plan_sha256 = hashlib.sha256(
+        b"image-publication-plan"
+    ).hexdigest()
+    sbom_referrer_digest = hashlib.sha256(b"sbom-referrer-manifest").hexdigest()
+    provenance_referrer_digest = hashlib.sha256(
+        b"provenance-referrer-manifest"
+    ).hexdigest()
+    definitions = (
+        ("foundation", "BASELINE_OBSERVE", False, _release_subject("baseline"), ""),
+        ("foundation", "BOOTSTRAP_STACK", True, _stack_subject("CDKToolkit"), ""),
+        (
+            "foundation",
+            "ASSET_PUBLISH",
+            True,
+            f"cdk:asset:{asset_id}",
+            asset_payload_sha256,
+        ),
+        *(
+            ("foundation", "STACK_CREATE", True, _stack_subject(stack), "")
+            for stack in FOUNDATION_STACKS
+        ),
+        *(
+            (
+                "image",
+                "IMAGE_PUBLISH",
+                True,
+                f"{image_effect_prefix}:blob:sha256:{digest}",
+                digest,
+            )
+            for digest in image_blob_digests
+        ),
+        (
+            "image",
+            "IMAGE_PUBLISH",
+            True,
+            (
+                f"{image_effect_prefix}:subject-manifest:sha256:"
+                f"{image_manifest_digest}:tag:commit-{COMMIT}"
+            ),
+            image_manifest_digest,
+        ),
+        (
+            "image",
+            "IMAGE_PUBLISH",
+            True,
+            (
+                f"{image_effect_prefix}:sbom-referrer-manifest:sha256:"
+                f"{sbom_referrer_digest}:subject:sha256:{image_manifest_digest}"
+            ),
+            sbom_referrer_digest,
+        ),
+        (
+            "image",
+            "IMAGE_PUBLISH",
+            True,
+            (
+                f"{image_effect_prefix}:provenance-referrer-manifest:sha256:"
+                f"{provenance_referrer_digest}:subject:sha256:"
+                f"{image_manifest_digest}"
+            ),
+            provenance_referrer_digest,
+        ),
+        ("image", "IMAGE_OBSERVE", False, image_subject, ""),
+        ("runtime", "STACK_UPDATE", True, _stack_subject("OpenClawAgentCore"), ""),
+        (
+            "runtime",
+            "AGENTCORE_HARDEN",
+            True,
+            (
+                f"agentcore:{ACCOUNT}:{REGION}:runtime:personal_operator_bridge:"
+                f"release:{COMMIT}:mmdsv2"
+            ),
+            "",
+        ),
+        ("endpoint", "STACK_UPDATE", True, _stack_subject("OpenClawAgentCore"), ""),
+        (
+            "context",
+            "RUNTIME_CONTEXT_WRITE",
+            True,
+            _release_subject("artifact:build/runtime-context.json"),
+            "",
+        ),
+        ("router-cron-cs", "CHANGESET_CREATE", True, _stack_subject("OpenClawRouter"), ""),
+        ("router-cron-cs", "CHANGESET_CREATE", True, _stack_subject("OpenClawCron"), ""),
+        ("router-cron", "CHANGESET_EXECUTE", True, _stack_subject("OpenClawRouter"), ""),
+        ("router-cron", "CHANGESET_EXECUTE", True, _stack_subject("OpenClawCron"), ""),
+        (
+            "scheduler-cs",
+            "CHANGESET_CREATE",
+            True,
+            _stack_subject("PersonalOperatorScheduler"),
+            "",
+        ),
+        (
+            "scheduler",
+            "CHANGESET_EXECUTE",
+            True,
+            _stack_subject("PersonalOperatorScheduler"),
+            "",
+        ),
+        ("web-cs", "CHANGESET_CREATE", True, _stack_subject("PersonalOperatorWeb"), ""),
+        ("web", "CHANGESET_EXECUTE", True, _stack_subject("PersonalOperatorWeb"), ""),
+        ("verify", "VERIFY", False, _release_subject("verify"), ""),
+    )
+    artifacts: list[dict[str, object]] = []
+    steps: list[dict[str, object]] = []
+    for ordinal, (phase, kind, mutation, subject, content_override) in enumerate(definitions):
+        step_id = f"{ordinal:02d}-{phase}-{kind.lower().replace('_', '-')}"
+        path = (
+            "build/image-publication-plan.json"
+            if kind == "IMAGE_OBSERVE"
+            else f"requests/{step_id}.json"
+        )
+        digest = (
+            image_publication_plan_sha256
+            if kind == "IMAGE_OBSERVE"
+            else hashlib.sha256(path.encode()).hexdigest()
+        )
+        artifacts.append({"path": path, "size": ordinal + 1, "sha256": digest})
+        steps.append(
+            {
+                "id": step_id,
+                "phase": phase,
+                "ordinal": ordinal,
+                "kind": kind,
+                "subject": subject,
+                "mutation": mutation,
+                "requestArtifact": path,
+                "requestSha256": digest,
+                "expectedTemplateParameterSha256": (
+                    hashlib.sha256(f"template:{step_id}".encode()).hexdigest()
+                    if kind
+                    in {
+                        "BOOTSTRAP_STACK",
+                        "STACK_CREATE",
+                        "CHANGESET_CREATE",
+                    }
+                    else ""
+                ),
+                "expectedRequestSha256": digest,
+                "expectedObservedRequestSha256": (
+                    hashlib.sha256(
+                        f"observed-request:{step_id}".encode()
+                    ).hexdigest()
+                    if kind
+                    in {
+                        "BOOTSTRAP_STACK",
+                        "STACK_CREATE",
+                        "STACK_UPDATE",
+                        "CHANGESET_CREATE",
+                        "CHANGESET_EXECUTE",
+                    }
+                    else ""
+                ),
+                "expectedContentSha256": (
+                    DIGEST.removeprefix("sha256:")
+                    if kind in {"IMAGE_PUBLISH", "IMAGE_OBSERVE"}
+                    else hashlib.sha256(f"content:{step_id}".encode()).hexdigest()
+                    if kind == "ASSET_PUBLISH"
+                    else ""
+                ),
+            }
+        )
+        if content_override:
+            steps[-1]["expectedContentSha256"] = content_override
+    artifacts.sort(key=lambda artifact: artifact["path"])
+    return steps, artifacts
+
+
+def _release_plan_v2() -> dict[str, object]:
+    steps, artifacts = _v2_steps_and_artifacts()
+    return {
+        "schema": "personal-operator.release-plan.v2",
+        "transactionId": f"release_{COMMIT}",
+        "sourceCommit": COMMIT,
+        "sourceTree": TREE,
+        "account": ACCOUNT,
+        "region": REGION,
+        "releaseMode": "CLEAN_ACCOUNT",
+        "driverSha256": "1" * 64,
+        "evidenceRuntimeSha256": "2" * 64,
+        "runtimeImageDigest": DIGEST,
+        "runtimeImageUri": IMAGE_URI,
+        "runtimeEndpointName": f"release_{COMMIT}",
+        "contextRelativePath": "build/runtime-context.json",
+        "foundationInputsRelativePath": "build/foundation-runtime-inputs.json",
+        "derivationVersion": "foundation-runtime-inputs-v1",
+        "artifacts": artifacts,
+        "steps": steps,
+        "rollbackTarget": {"mode": "NO_PRIOR_RELEASE"},
+    }
+
+
+def _foundation_runtime_inputs_v1() -> dict[str, object]:
+    guardrail_id = "abcdefghij"
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    return {
+        "schema": "personal-operator.foundation-runtime-inputs.v1",
+        "sourceCommit": COMMIT,
+        "sourceTree": TREE,
+        "account": ACCOUNT,
+        "region": REGION,
+        "releasePlanSha256": plan.digest(),
+        "derivationVersion": "foundation-runtime-inputs-v1",
+        "privateSubnetIds": list(SUBNET_IDS),
+        "runtimeSecurityGroupIds": list(SECURITY_GROUP_IDS),
+        "userFilesBucketName": f"openclaw-user-files-{ACCOUNT}-{REGION}",
+        "capabilityGatewayFunctionArn": (
+            f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:"
+            "personal-operator-capability-gateway"
+        ),
+        "workspaceBrokerFunctionName": (
+            "personal-operator-workspace-credential-broker"
+        ),
+        "agentCoreStackId": AGENTCORE_STACK_ID,
+        "guardrailId": guardrail_id,
+        "guardrailVersion": "1",
+        "guardrailArn": (
+            f"arn:aws:bedrock:{REGION}:{ACCOUNT}:guardrail/{guardrail_id}"
+        ),
+        "foundationSnapshotSha256": "3" * 64,
+    }
+
+
+def _completed_prefix_sha256(
+    completed: list[dict[str, object]],
+) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "schema": "personal-operator.release-completed-prefix.v2",
+                "completedSteps": completed,
+            }
+        )
+    ).hexdigest()
+
+
+def _completed_steps(plan: ReleasePlanV2, count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "stepId": step.step_id,
+            "evidenceSha256": hashlib.sha256(
+                f"evidence:{step.step_id}".encode()
+            ).hexdigest(),
+        }
+        for step in plan.steps[:count]
+    ]
+
+
+def _mutation_request_v2(plan: ReleasePlanV2, ordinal: int) -> dict[str, object]:
+    step = plan.to_mapping()["steps"][ordinal]
+    assert isinstance(step, dict)
+    completed_prefix_sha256 = _completed_prefix_sha256(
+        _completed_steps(plan, ordinal)
+    )
+    operation_sha256 = "sha256:" + hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "schema": "personal-operator.release-operation.v2",
+                "planSha256": plan.digest(),
+                "completedPrefixSha256": completed_prefix_sha256,
+                "step": step,
+            }
+        )
+    ).hexdigest()
+    return {
+        "schema": "personal-operator.mutation-request.v2",
+        "transactionId": f"release_{COMMIT}",
+        "planSha256": plan.digest(),
+        "completedPrefixSha256": completed_prefix_sha256,
+        "stepId": step["id"],
+        "operationSha256": operation_sha256,
+        "kind": step["kind"],
+        "subject": step["subject"],
+        "requestArtifact": step["requestArtifact"],
+        "requestSha256": step["requestSha256"],
+    }
+
+
+def _staging_transaction_v2(
+    plan: ReleasePlanV2,
+    *,
+    completed_step_count: int = 0,
+    state: str = "PREFLIGHTED",
+    last_stable_state: str | None = None,
+) -> dict[str, object]:
+    plan_steps = plan.to_mapping()["steps"]
+    assert isinstance(plan_steps, list)
+    completed = _completed_steps(plan, completed_step_count)
+    value: dict[str, object] = {
+        "schema": "personal-operator.staging-transaction.v2",
+        "transactionId": f"release_{COMMIT}",
+        "sourceCommit": COMMIT,
+        "sourceTree": TREE,
+        "account": ACCOUNT,
+        "region": REGION,
+        "state": state,
+        "lastStableState": last_stable_state or state,
+        "planSha256": plan.digest(),
+        "completedStepCount": completed_step_count,
+        "completedSteps": completed,
+        "foundationInputsSha256": "",
+        "agentCoreStackId": "",
+        "runtimeImageDigest": "",
+        "runtimeId": "",
+        "runtimeVersion": "",
+        "runtimeArn": "",
+        "runtimeEndpointId": "",
+        "runtimeContextSha256": "",
+        "routerTargetStackId": "",
+        "routerChangeSetId": "",
+        "cronTargetStackId": "",
+        "cronChangeSetId": "",
+        "routerCronChangesetsSha256": "",
+        "routerCronApplicationSha256": "",
+        "schedulerTargetStackId": "",
+        "schedulerChangeSetId": "",
+        "schedulerChangesetSha256": "",
+        "schedulerApplicationSha256": "",
+        "webTargetStackId": "",
+        "webChangeSetId": "",
+        "webChangesetSha256": "",
+        "webApplicationSha256": "",
+        "verificationSha256": "",
+        "rollbackBaselineSha256": "",
+        "abortEvidenceSha256": "",
+        "failedRetainedEvidenceSha256": "",
+        "failureObservationSha256": "",
+        "failedStepId": "",
+        "failedSubject": "",
+        "failedOperationSha256": "",
+        "failureReason": "",
+        "uncertainStepId": "",
+        "uncertainOperationSha256": "",
+        "revision": completed_step_count,
+    }
+    if completed_step_count >= 1:
+        value["rollbackBaselineSha256"] = "5" * 64
+    phase_ends = {
+        phase: max(step.ordinal for step in plan.steps if step.phase == phase) + 1
+        for phase in V2_PHASES
+    }
+    first_runtime = min(
+        step.ordinal for step in plan.steps if step.phase == "runtime"
+    ) + 1
+    phase_evidence = (
+        (phase_ends["foundation"], "foundationInputsSha256", "6" * 64),
+        (phase_ends["foundation"], "agentCoreStackId", AGENTCORE_STACK_ID),
+        (phase_ends["image"], "runtimeImageDigest", DIGEST),
+        (first_runtime, "runtimeId", RUNTIME_ID),
+        (first_runtime, "runtimeVersion", "7"),
+        (
+            first_runtime,
+            "runtimeArn",
+            f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:agent/"
+            "12345678-1234-1234-1234-123456789abc:7",
+        ),
+        (phase_ends["endpoint"], "runtimeEndpointId", ENDPOINT_ID),
+        (phase_ends["context"], "runtimeContextSha256", "7" * 64),
+        (phase_ends["router-cron-cs"], "routerCronChangesetsSha256", "8" * 64),
+        (phase_ends["router-cron"], "routerCronApplicationSha256", "9" * 64),
+        (phase_ends["scheduler-cs"], "schedulerChangesetSha256", "a" * 64),
+        (phase_ends["scheduler"], "schedulerApplicationSha256", "b" * 64),
+        (phase_ends["web-cs"], "webChangesetSha256", "c" * 64),
+        (phase_ends["web"], "webApplicationSha256", "d" * 64),
+        (phase_ends["verify"], "verificationSha256", "e" * 64),
+    )
+    for threshold, field, evidence in phase_evidence:
+        if completed_step_count >= threshold:
+            value[field] = evidence
+    for stack_name, prefix, marker in (
+        ("OpenClawRouter", "router", 1),
+        ("OpenClawCron", "cron", 2),
+        ("PersonalOperatorScheduler", "scheduler", 3),
+        ("PersonalOperatorWeb", "web", 4),
+    ):
+        subject = _stack_subject(stack_name)
+        threshold = next(
+            step.ordinal + 1
+            for step in plan.steps
+            if step.kind == "CHANGESET_CREATE" and step.subject == subject
+        )
+        if completed_step_count >= threshold:
+            value[f"{prefix}TargetStackId"] = _consumer_stack_id(
+                stack_name, marker
+            )
+            value[f"{prefix}ChangeSetId"] = _consumer_change_set_id(marker)
+    if state == "ABORTED_RETAINED":
+        value["abortEvidenceSha256"] = "f" * 64
+    return value
 
 
 def _production_observation_config() -> dict[str, object]:
@@ -150,6 +613,49 @@ def _runtime_configuration_sha256() -> str:
             }
         )
     ).hexdigest()
+
+
+@pytest.mark.parametrize("version", ("1", "42", "99999999"))
+def test_runtime_configuration_accepts_canonical_numbered_guardrail_version(
+    version: str,
+) -> None:
+    value = _runtime_configuration()
+    environment = value["environmentVariables"]
+    assert isinstance(environment, dict)
+    environment.update(
+        BEDROCK_GUARDRAIL_ID="abcdefghij",
+        BEDROCK_GUARDRAIL_VERSION=version,
+    )
+
+    parsed = RuntimeConfigurationV1.from_mapping(
+        value,
+        runtime_image_uri=IMAGE_URI,
+        account=ACCOUNT,
+        region=REGION,
+    )
+
+    assert dict(parsed.environment_variables)["BEDROCK_GUARDRAIL_VERSION"] == version
+
+
+@pytest.mark.parametrize("version", ("0", "01", "100000000", "1.0", "draft"))
+def test_runtime_configuration_rejects_noncanonical_guardrail_version(
+    version: str,
+) -> None:
+    value = _runtime_configuration()
+    environment = value["environmentVariables"]
+    assert isinstance(environment, dict)
+    environment.update(
+        BEDROCK_GUARDRAIL_ID="abcdefghij",
+        BEDROCK_GUARDRAIL_VERSION=version,
+    )
+
+    with pytest.raises(ContractError, match="guardrail version"):
+        RuntimeConfigurationV1.from_mapping(
+            value,
+            runtime_image_uri=IMAGE_URI,
+            account=ACCOUNT,
+            region=REGION,
+        )
 
 
 def _runtime_context() -> dict[str, object]:
@@ -746,3 +1252,1026 @@ def test_write_new_contract_revalidates_reconstructed_value_objects(tmp_path: Pa
         )
 
     assert not (tmp_path / "runtime-context.json").exists()
+
+
+def test_release_plan_v2_round_trips_closed_clean_account_sequence() -> None:
+    expected = _release_plan_v2()
+    payload = canonical_json_bytes(expected)
+
+    parsed = ReleasePlanV2.from_bytes(payload)
+
+    assert parsed.to_mapping() == expected
+    assert parsed.to_bytes() == payload
+    assert parsed.digest() == hashlib.sha256(payload).hexdigest()
+    assert tuple(
+        dict.fromkeys(step["phase"] for step in parsed.to_mapping()["steps"])
+    ) == V2_PHASES
+    assert parse_release_contract(payload) == parsed
+    with pytest.raises(FrozenInstanceError):
+        parsed.steps[0].phase = "image"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda value: value.update(extra="x"), "fields"),
+        (lambda value: value.update(releaseMode="UPGRADE"), "release mode"),
+        (
+            lambda value: value.update(rollbackTarget={"mode": "DELETE_ALL"}),
+            "rollback target",
+        ),
+        (lambda value: value.update(region="us-east-1"), "region"),
+        (lambda value: value.update(runtimeImageDigest="f" * 64), "image digest"),
+        (
+            lambda value: value.update(
+                runtimeImageUri=value["runtimeImageUri"].replace(ACCOUNT, "999999999999")
+            ),
+            "image URI",
+        ),
+        (
+            lambda value: value.update(runtimeEndpointName="mutable-endpoint"),
+            "endpoint",
+        ),
+        (
+            lambda value: value.update(contextRelativePath="build/../context.json"),
+            "context",
+        ),
+        (
+            lambda value: value.update(
+                foundationInputsRelativePath="foundation-runtime-inputs.json"
+            ),
+            "foundation",
+        ),
+        (
+            lambda value: value.update(derivationVersion="latest"),
+            "derivation",
+        ),
+    ],
+)
+def test_release_plan_v2_rejects_identity_or_open_rollback_drift(
+    mutate: object,
+    match: str,
+) -> None:
+    value = _release_plan_v2()
+    assert callable(mutate)
+    mutate(value)
+
+    with pytest.raises(ContractError, match=match):
+        ReleasePlanV2.from_mapping(value)
+
+
+def test_release_plan_v2_rejects_noncanonical_artifact_inventory() -> None:
+    value = _release_plan_v2()
+    artifacts = value["artifacts"]
+    assert isinstance(artifacts, list)
+
+    for invalid in (
+        list(reversed(artifacts)),
+        [*artifacts, deepcopy(artifacts[0])],
+        [{**artifacts[0], "path": "../request.json"}, *artifacts[1:]],
+        [{**artifacts[0], "size": 0}, *artifacts[1:]],
+        [{**artifacts[0], "sha256": "sha256:" + "1" * 64}, *artifacts[1:]],
+    ):
+        candidate = {**value, "artifacts": invalid}
+        with pytest.raises(ContractError, match="artifact"):
+            ReleasePlanV2.from_mapping(candidate)
+
+
+def test_release_plan_v2_requires_every_phase_as_one_contiguous_ordered_run() -> None:
+    value = _release_plan_v2()
+    steps = value["steps"]
+    assert isinstance(steps, list)
+
+    missing_phase = [
+        deepcopy(step) for step in steps if step["phase"] != "scheduler-cs"
+    ]
+    for ordinal, step in enumerate(missing_phase):
+        step["ordinal"] = ordinal
+    with pytest.raises(ContractError, match="phase"):
+        ReleasePlanV2.from_mapping({**value, "steps": missing_phase})
+
+    returned_phase = deepcopy(steps)
+    returned_index = next(
+        index for index, step in enumerate(returned_phase) if step["phase"] == "endpoint"
+    )
+    returned_phase[returned_index]["phase"] = "foundation"
+    returned_phase[returned_index]["kind"] = "STACK_CREATE"
+    returned_phase[returned_index]["mutation"] = True
+    returned_phase[returned_index]["expectedTemplateParameterSha256"] = "f" * 64
+    returned_phase[returned_index]["expectedContentSha256"] = ""
+    with pytest.raises(ContractError, match="phase"):
+        ReleasePlanV2.from_mapping({**value, "steps": returned_phase})
+
+
+def test_release_plan_v2_requires_clean_baseline_before_any_mutation() -> None:
+    value = _release_plan_v2()
+    steps = deepcopy(value["steps"])
+    assert isinstance(steps, list)
+    steps[0], steps[1] = steps[1], steps[0]
+    for ordinal, step in enumerate(steps):
+        step["ordinal"] = ordinal
+
+    with pytest.raises(ContractError, match="baseline"):
+        ReleasePlanV2.from_mapping({**value, "steps": steps})
+
+
+def _remove_v2_step(
+    value: dict[str, object],
+    predicate: object,
+) -> dict[str, object]:
+    assert callable(predicate)
+    candidate = deepcopy(value)
+    steps = candidate["steps"]
+    artifacts = candidate["artifacts"]
+    assert isinstance(steps, list)
+    assert isinstance(artifacts, list)
+    removed = next(step for step in steps if predicate(step))
+    steps.remove(removed)
+    artifacts[:] = [
+        artifact
+        for artifact in artifacts
+        if artifact["path"] != removed["requestArtifact"]
+    ]
+    for ordinal, step in enumerate(steps):
+        step["ordinal"] = ordinal
+    return candidate
+
+
+def test_release_plan_v2_requires_exact_foundation_runtime_and_consumer_recipe() -> None:
+    value = _release_plan_v2()
+
+    candidates = (
+        _remove_v2_step(
+            value,
+            lambda step: step["phase"] == "foundation"
+            and step["kind"] == "ASSET_PUBLISH",
+        ),
+        _remove_v2_step(
+            value,
+            lambda step: step["subject"] == _stack_subject("OpenClawVpc"),
+        ),
+        _remove_v2_step(
+            value,
+            lambda step: step["kind"] == "AGENTCORE_HARDEN",
+        ),
+        _remove_v2_step(
+            value,
+            lambda step: step["phase"] == "router-cron-cs"
+            and step["subject"] == _stack_subject("OpenClawCron"),
+        ),
+    )
+    for candidate in candidates:
+        with pytest.raises(ContractError, match="recipe|asset|phase"):
+            ReleasePlanV2.from_mapping(candidate)
+
+    wrong_subject = deepcopy(value)
+    wrong_subject["steps"][3]["subject"] = _stack_subject("OtherVpc")
+    with pytest.raises(ContractError, match="recipe"):
+        ReleasePlanV2.from_mapping(wrong_subject)
+
+    wrong_runtime_kind = deepcopy(value)
+    runtime_step = next(
+        step
+        for step in wrong_runtime_kind["steps"]
+        if step["phase"] == "runtime" and step["kind"] == "STACK_UPDATE"
+    )
+    runtime_step["kind"] = "STACK_CREATE"
+    with pytest.raises(ContractError, match="kind|recipe"):
+        ReleasePlanV2.from_mapping(wrong_runtime_kind)
+
+
+def test_release_plan_v2_accepts_only_sorted_unique_content_bound_cdk_assets() -> None:
+    value = _release_plan_v2()
+    steps = value["steps"]
+    artifacts = value["artifacts"]
+    assert isinstance(steps, list)
+    assert isinstance(artifacts, list)
+    source = deepcopy(
+        next(step for step in steps if step["kind"] == "ASSET_PUBLISH")
+    )
+    source.update(
+        id="02b-foundation-asset-publish",
+        subject="cdk:asset:" + "f" * 64,
+        requestArtifact="requests/02b-foundation-asset-publish.json",
+        requestSha256="e" * 64,
+        expectedRequestSha256="e" * 64,
+        expectedObservedRequestSha256="",
+        expectedContentSha256="d" * 64,
+    )
+    insertion = next(
+        index for index, step in enumerate(steps) if step["kind"] == "STACK_CREATE"
+    )
+    steps.insert(insertion, source)
+    artifacts.append(
+        {
+            "path": source["requestArtifact"],
+            "size": 1,
+            "sha256": source["requestSha256"],
+        }
+    )
+    artifacts.sort(key=lambda artifact: artifact["path"])
+    for ordinal, step in enumerate(steps):
+        step["ordinal"] = ordinal
+
+    parsed = ReleasePlanV2.from_mapping(value)
+    assets = [step for step in parsed.steps if step.kind == "ASSET_PUBLISH"]
+    assert [step.subject for step in assets] == sorted(
+        step.subject for step in assets
+    )
+    assert all(
+        step.subject.removeprefix("cdk:asset:") != step.expected_content_sha256
+        for step in assets
+    )
+
+    unsorted = deepcopy(value)
+    asset_indexes = [
+        index
+        for index, step in enumerate(unsorted["steps"])
+        if step["kind"] == "ASSET_PUBLISH"
+    ]
+    left, right = asset_indexes
+    unsorted["steps"][left], unsorted["steps"][right] = (
+        unsorted["steps"][right],
+        unsorted["steps"][left],
+    )
+    for ordinal, step in enumerate(unsorted["steps"]):
+        step["ordinal"] = ordinal
+    with pytest.raises(ContractError, match="sorted and unique"):
+        ReleasePlanV2.from_mapping(unsorted)
+
+    duplicate = deepcopy(value)
+    duplicate["steps"][right]["subject"] = duplicate["steps"][left]["subject"]
+    with pytest.raises(ContractError, match="sorted and unique"):
+        ReleasePlanV2.from_mapping(duplicate)
+
+    malformed = deepcopy(value)
+    malformed["steps"][left]["subject"] = "cdk:asset:not-an-asset-id"
+    with pytest.raises(ContractError, match="asset subject"):
+        ReleasePlanV2.from_mapping(malformed)
+
+
+def test_release_plan_v2_requires_image_publish_then_terminal_observation() -> None:
+    value = _release_plan_v2()
+    steps = value["steps"]
+    assert isinstance(steps, list)
+
+    without_observation = [
+        deepcopy(step) for step in steps if step["kind"] != "IMAGE_OBSERVE"
+    ]
+    for ordinal, step in enumerate(without_observation):
+        step["ordinal"] = ordinal
+    with pytest.raises(ContractError, match="image.*recipe"):
+        ReleasePlanV2.from_mapping({**value, "steps": without_observation})
+
+    reordered = deepcopy(steps)
+    image_indexes = [
+        index for index, step in enumerate(reordered) if step["phase"] == "image"
+    ]
+    left, right = image_indexes[:2]
+    reordered[left], reordered[right] = reordered[right], reordered[left]
+    for ordinal, step in enumerate(reordered):
+        step["ordinal"] = ordinal
+    with pytest.raises(ContractError, match="image.*(?:recipe|sorted)"):
+        ReleasePlanV2.from_mapping({**value, "steps": reordered})
+
+
+def test_release_plan_v2_requires_one_exact_ordered_image_effect_per_step() -> None:
+    value = _release_plan_v2()
+    steps = value["steps"]
+    artifacts = value["artifacts"]
+    assert isinstance(steps, list)
+    assert isinstance(artifacts, list)
+    image_steps = [step for step in steps if step["phase"] == "image"]
+    publishes = image_steps[:-1]
+
+    assert len(publishes) == 5
+    assert [step["kind"] for step in publishes] == ["IMAGE_PUBLISH"] * 5
+    assert image_steps[-1]["kind"] == "IMAGE_OBSERVE"
+    assert [step["subject"] for step in publishes[:2]] == sorted(
+        step["subject"] for step in publishes[:2]
+    )
+    assert ":subject-manifest:" in publishes[2]["subject"]
+    assert ":sbom-referrer-manifest:" in publishes[3]["subject"]
+    assert ":provenance-referrer-manifest:" in publishes[4]["subject"]
+    assert image_steps[-1]["requestArtifact"] == (
+        "build/image-publication-plan.json"
+    )
+    for step in publishes:
+        assert step["subject"].split(":sha256:", 1)[1].split(":", 1)[0] == (
+            step["expectedContentSha256"]
+        )
+        assert step["requestSha256"] != step["expectedContentSha256"]
+
+    duplicate = deepcopy(value)
+    duplicate_steps = [
+        step for step in duplicate["steps"] if step["phase"] == "image"
+    ]
+    first_blob, second_blob = duplicate_steps[:2]
+    second_blob["subject"] = first_blob["subject"]
+    second_blob["expectedContentSha256"] = first_blob["expectedContentSha256"]
+    with pytest.raises(ContractError, match="image.*(?:digest|subject).*(?:unique|duplicate)"):
+        ReleasePlanV2.from_mapping(duplicate)
+
+    crossed = deepcopy(value)
+    crossed_publish = next(
+        step
+        for step in crossed["steps"]
+        if step["phase"] == "image" and ":blob:" in step["subject"]
+    )
+    crossed_publish["subject"] = crossed_publish["subject"].replace(
+        f"ecr:{ACCOUNT}:{REGION}:", f"ecr:999999999999:{REGION}:"
+    )
+    with pytest.raises(ContractError, match="image.*(?:subject|recipe)"):
+        ReleasePlanV2.from_mapping(crossed)
+
+    without_blobs = deepcopy(value)
+    blob_artifacts = {
+        step["requestArtifact"]
+        for step in without_blobs["steps"]
+        if step["phase"] == "image" and ":blob:" in step["subject"]
+    }
+    without_blobs["steps"] = [
+        step
+        for step in without_blobs["steps"]
+        if step["requestArtifact"] not in blob_artifacts
+    ]
+    without_blobs["artifacts"] = [
+        artifact
+        for artifact in without_blobs["artifacts"]
+        if artifact["path"] not in blob_artifacts
+    ]
+    for ordinal, step in enumerate(without_blobs["steps"]):
+        step["ordinal"] = ordinal
+    with pytest.raises(ContractError, match="image.*(?:blob|recipe)"):
+        ReleasePlanV2.from_mapping(without_blobs)
+
+    manifest_order = deepcopy(value)
+    manifest_indexes = [
+        index
+        for index, step in enumerate(manifest_order["steps"])
+        if step["phase"] == "image" and "referrer-manifest" in step["subject"]
+    ]
+    left, right = manifest_indexes
+    manifest_order["steps"][left], manifest_order["steps"][right] = (
+        manifest_order["steps"][right],
+        manifest_order["steps"][left],
+    )
+    for ordinal, step in enumerate(manifest_order["steps"]):
+        step["ordinal"] = ordinal
+    with pytest.raises(ContractError, match="image.*recipe"):
+        ReleasePlanV2.from_mapping(manifest_order)
+
+    wrong_referrer_target = deepcopy(value)
+    referrer = next(
+        step
+        for step in wrong_referrer_target["steps"]
+        if ":sbom-referrer-manifest:" in step["subject"]
+    )
+    referrer["subject"] = referrer["subject"].replace(
+        f":subject:{DIGEST}", ":subject:sha256:" + "f" * 64
+    )
+    with pytest.raises(ContractError, match="image referrer.*recipe"):
+        ReleasePlanV2.from_mapping(wrong_referrer_target)
+
+    wrong_observe_artifact = deepcopy(value)
+    observe = next(
+        step
+        for step in wrong_observe_artifact["steps"]
+        if step["kind"] == "IMAGE_OBSERVE"
+    )
+    old_path = observe["requestArtifact"]
+    observe["requestArtifact"] = "build/unbound-image-plan.json"
+    artifact = next(
+        item
+        for item in wrong_observe_artifact["artifacts"]
+        if item["path"] == old_path
+    )
+    artifact["path"] = observe["requestArtifact"]
+    wrong_observe_artifact["artifacts"].sort(key=lambda item: item["path"])
+    with pytest.raises(ContractError, match="image publication plan artifact"):
+        ReleasePlanV2.from_mapping(wrong_observe_artifact)
+
+    wrong_manifest = deepcopy(value)
+    manifest = next(
+        step
+        for step in wrong_manifest["steps"]
+        if ":subject-manifest:" in step["subject"]
+    )
+    replacement_digest = "f" * 64
+    manifest["subject"] = manifest["subject"].replace(
+        DIGEST.removeprefix("sha256:"), replacement_digest
+    )
+    manifest["expectedContentSha256"] = replacement_digest
+    with pytest.raises(ContractError, match="image.*(?:digest|manifest|plan)"):
+        ReleasePlanV2.from_mapping(wrong_manifest)
+
+
+def test_release_plan_v2_accepts_distinct_real_image_effect_file_digest(
+    tmp_path: Path,
+) -> None:
+    payload = b"runtime-config-blob"
+    content_sha256 = hashlib.sha256(payload).hexdigest()
+    effect = ImagePublicationEffectV1(
+        publication_plan_sha256="1" * 64,
+        effect_id=f"ecr-blob-{content_sha256}",
+        effect_kind="ECR_BLOB_PUT",
+        source_commit=COMMIT,
+        source_tree=TREE,
+        account=ACCOUNT,
+        region=REGION,
+        digest=f"sha256:{content_sha256}",
+        media_type=OCI_CONFIG_MEDIA_TYPE,
+        size=len(payload),
+        tag=None,
+        subject_digest=None,
+        artifact_type=None,
+        payload=payload,
+    )
+    descriptor = effect.write_private_file(tmp_path / "image-effect.private")
+    assert descriptor["sha256"] != content_sha256
+    assert descriptor["expectedContent"] == f"sha256:{content_sha256}"
+
+    value = _release_plan_v2()
+    step = next(
+        step
+        for step in value["steps"]
+        if step["subject"] == descriptor["providerSubject"]
+    )
+    artifact = next(
+        artifact
+        for artifact in value["artifacts"]
+        if artifact["path"] == step["requestArtifact"]
+    )
+    step["requestSha256"] = descriptor["sha256"]
+    step["expectedRequestSha256"] = descriptor["sha256"]
+    artifact["sha256"] = descriptor["sha256"]
+    artifact["size"] = descriptor["size"]
+
+    parsed = ReleasePlanV2.from_mapping(value)
+    parsed_step = next(
+        item for item in parsed.steps if item.subject == descriptor["providerSubject"]
+    )
+    assert parsed_step.request_sha256 == descriptor["sha256"]
+    assert parsed_step.expected_content_sha256 == content_sha256
+
+
+def test_release_plan_v2_binds_step_kinds_requests_and_ordinals() -> None:
+    value = _release_plan_v2()
+    steps = value["steps"]
+    assert isinstance(steps, list)
+
+    candidates = []
+    invalid_ordinal = deepcopy(steps)
+    invalid_ordinal[1]["ordinal"] = 9
+    candidates.append((invalid_ordinal, "ordinal"))
+    duplicate_id = deepcopy(steps)
+    duplicate_id[1]["id"] = duplicate_id[0]["id"]
+    candidates.append((duplicate_id, "unique"))
+    unknown_kind = deepcopy(steps)
+    unknown_kind[1]["kind"] = "ARBITRARY_SHELL"
+    candidates.append((unknown_kind, "kind"))
+    wrong_mutation = deepcopy(steps)
+    wrong_mutation[0]["mutation"] = True
+    candidates.append((wrong_mutation, "mutation"))
+    missing_artifact = deepcopy(steps)
+    missing_artifact[1]["requestArtifact"] = "requests/missing.json"
+    candidates.append((missing_artifact, "artifact"))
+    mismatched_request = deepcopy(steps)
+    mismatched_request[1]["requestSha256"] = "f" * 64
+    candidates.append((mismatched_request, "request"))
+
+    for invalid, match in candidates:
+        with pytest.raises(ContractError, match=match):
+            ReleasePlanV2.from_mapping({**value, "steps": invalid})
+
+
+@pytest.mark.parametrize(
+    ("ordinal", "field"),
+    [
+        (0, "requestArtifact"),
+        (1, "requestSha256"),
+        (1, "expectedTemplateParameterSha256"),
+        (1, "expectedObservedRequestSha256"),
+        (2, "expectedContentSha256"),
+        (13, "expectedRequestSha256"),
+    ],
+)
+def test_release_plan_v2_requires_kind_specific_request_and_evidence_bindings(
+    ordinal: int,
+    field: str,
+) -> None:
+    value = _release_plan_v2()
+    steps = deepcopy(value["steps"])
+    assert isinstance(steps, list)
+    steps[ordinal][field] = ""
+
+    with pytest.raises(ContractError, match="binding"):
+        ReleasePlanV2.from_mapping({**value, "steps": steps})
+
+
+def test_release_plan_v2_separates_artifact_and_observed_request_digests() -> None:
+    value = _release_plan_v2()
+    steps = deepcopy(value["steps"])
+    assert isinstance(steps, list)
+
+    cfn_step = next(step for step in steps if step["kind"] == "STACK_CREATE")
+    cfn_step["expectedObservedRequestSha256"] = cfn_step["requestSha256"]
+    with pytest.raises(ContractError, match="observed request.*alias"):
+        ReleasePlanV2.from_mapping({**value, "steps": steps})
+
+    steps = deepcopy(value["steps"])
+    asset_step = next(step for step in steps if step["kind"] == "ASSET_PUBLISH")
+    asset_step["expectedObservedRequestSha256"] = "f" * 64
+    with pytest.raises(ContractError, match="observed request.*kind"):
+        ReleasePlanV2.from_mapping({**value, "steps": steps})
+
+
+def test_release_plan_v2_does_not_preplan_generated_template_or_content() -> None:
+    value = _release_plan_v2()
+    steps = deepcopy(value["steps"])
+    assert isinstance(steps, list)
+
+    runtime_update = next(
+        step
+        for step in steps
+        if step["phase"] == "runtime" and step["kind"] == "STACK_UPDATE"
+    )
+    runtime_update["expectedTemplateParameterSha256"] = "d" * 64
+    with pytest.raises(ContractError, match="template.*kind|template.*phase"):
+        ReleasePlanV2.from_mapping({**value, "steps": steps})
+
+    for kind in (
+        "AGENTCORE_HARDEN",
+        "RUNTIME_CONTEXT_WRITE",
+        "CHANGESET_CREATE",
+        "CHANGESET_EXECUTE",
+        "VERIFY",
+    ):
+        steps = deepcopy(value["steps"])
+        generated = next(step for step in steps if step["kind"] == kind)
+        generated["expectedContentSha256"] = "e" * 64
+        with pytest.raises(ContractError, match="content.*kind"):
+            ReleasePlanV2.from_mapping({**value, "steps": steps})
+
+
+def test_release_plan_v2_image_content_is_the_exact_planned_digest() -> None:
+    value = _release_plan_v2()
+    steps = deepcopy(value["steps"])
+    assert isinstance(steps, list)
+    image_observe = next(step for step in steps if step["kind"] == "IMAGE_OBSERVE")
+    image_observe["expectedContentSha256"] = "e" * 64
+
+    with pytest.raises(ContractError, match="image content.*plan"):
+        ReleasePlanV2.from_mapping({**value, "steps": steps})
+
+
+def test_release_plan_v2_rejects_unreferenced_inventory_artifacts() -> None:
+    value = _release_plan_v2()
+    artifacts = deepcopy(value["artifacts"])
+    assert isinstance(artifacts, list)
+    artifacts.append(
+        {
+            "path": "requests/zz-unreferenced.json",
+            "size": 1,
+            "sha256": "f" * 64,
+        }
+    )
+
+    with pytest.raises(ContractError, match="inventory.*reference"):
+        ReleasePlanV2.from_mapping({**value, "artifacts": artifacts})
+
+
+def test_foundation_runtime_inputs_v1_round_trips_exact_outputs() -> None:
+    expected = _foundation_runtime_inputs_v1()
+    payload = canonical_json_bytes(expected)
+
+    parsed = FoundationRuntimeInputsV1.from_bytes(payload)
+
+    assert parsed.to_mapping() == expected
+    assert parsed.to_bytes() == payload
+    assert parse_release_contract(payload) == parsed
+
+
+def test_foundation_runtime_inputs_v1_binds_exact_agentcore_stack_id() -> None:
+    value = _foundation_runtime_inputs_v1()
+    value["agentCoreStackId"] = AGENTCORE_STACK_ID
+
+    parsed = FoundationRuntimeInputsV1.from_mapping(value)
+
+    assert parsed.agent_core_stack_id == AGENTCORE_STACK_ID
+    for hostile in (
+        AGENTCORE_STACK_ID.replace(ACCOUNT, "999999999999"),
+        AGENTCORE_STACK_ID.replace("OpenClawAgentCore", "OpenClawVpc"),
+    ):
+        candidate = deepcopy(value)
+        candidate["agentCoreStackId"] = hostile
+        with pytest.raises(ContractError, match="stack ID"):
+            FoundationRuntimeInputsV1.from_mapping(candidate)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda value: value.update(extra="x"), "fields"),
+        (lambda value: value.update(sourceCommit="A" * 40), "commit"),
+        (lambda value: value.update(sourceTree="B" * 40), "tree"),
+        (
+            lambda value: value.update(releasePlanSha256="sha256:" + "1" * 64),
+            "plan digest",
+        ),
+        (
+            lambda value: value.update(derivationVersion="latest"),
+            "derivation version",
+        ),
+        (
+            lambda value: value.update(privateSubnetIds=list(reversed(SUBNET_IDS))),
+            "subnet",
+        ),
+        (
+            lambda value: value.update(
+                runtimeSecurityGroupIds=[SECURITY_GROUP_IDS[0]] * 2
+            ),
+            "security group",
+        ),
+        (
+            lambda value: value.update(userFilesBucketName="some-bucket"),
+            "bucket",
+        ),
+        (
+            lambda value: value.update(capabilityGatewayFunctionArn="*"),
+            "gateway",
+        ),
+        (
+            lambda value: value.update(workspaceBrokerFunctionName="broker-latest"),
+            "broker",
+        ),
+        (lambda value: value.update(guardrailVersion=""), "guardrail"),
+        (lambda value: value.update(guardrailArn="arn:aws:bedrock:*"), "guardrail"),
+        (
+            lambda value: value.update(foundationSnapshotSha256="sha256:" + "3" * 64),
+            "snapshot",
+        ),
+    ],
+)
+def test_foundation_runtime_inputs_v1_rejects_cross_subject_or_partial_outputs(
+    mutate: object,
+    match: str,
+) -> None:
+    value = _foundation_runtime_inputs_v1()
+    assert callable(mutate)
+    mutate(value)
+
+    with pytest.raises(ContractError, match=match):
+        FoundationRuntimeInputsV1.from_mapping(value)
+
+
+def test_foundation_runtime_inputs_v1_allows_guardrail_to_be_atomically_absent() -> None:
+    value = _foundation_runtime_inputs_v1()
+    value.update(guardrailId="", guardrailVersion="", guardrailArn="")
+
+    parsed = FoundationRuntimeInputsV1.from_mapping(value)
+
+    assert parsed.guardrail_id == ""
+    assert parsed.guardrail_version == ""
+    assert parsed.guardrail_arn == ""
+
+
+def test_foundation_runtime_inputs_v1_rejects_a_different_plan_identity() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    for field, invalid in (
+        ("sourceCommit", "d" * 40),
+        ("sourceTree", "d" * 40),
+        ("releasePlanSha256", "d" * 64),
+    ):
+        value = _foundation_runtime_inputs_v1()
+        value[field] = invalid
+        inputs = FoundationRuntimeInputsV1.from_mapping(value)
+
+        with pytest.raises(ContractError, match="identity differs"):
+            inputs.validate_plan_identity(plan)
+
+
+def test_release_step_observation_v2_binds_observer_and_derived_bytes() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    ordinal = max(
+        step.ordinal for step in plan.steps if step.phase == "foundation"
+    )
+    step = plan.steps[ordinal]
+    value = {
+        "schema": ReleaseStepObservationV2.SCHEMA,
+        "planSha256": plan.digest(),
+        "stepId": step.step_id,
+        "subject": step.subject,
+        "observerEvidenceSha256": "4" * 64,
+        "foundationRuntimeInputs": _foundation_runtime_inputs_v1(),
+        "agentCoreStackId": "",
+        "runtimeImageDigest": "",
+        "runtimeId": "",
+        "runtimeVersion": "",
+        "runtimeArn": "",
+        "runtimeEndpointId": "",
+        "runtimeContextSha256": "",
+        "routerTargetStackId": "",
+        "routerChangeSetId": "",
+        "cronTargetStackId": "",
+        "cronChangeSetId": "",
+        "routerCronChangesetsSha256": "",
+        "routerCronApplicationSha256": "",
+        "schedulerTargetStackId": "",
+        "schedulerChangeSetId": "",
+        "schedulerChangesetSha256": "",
+        "schedulerApplicationSha256": "",
+        "webTargetStackId": "",
+        "webChangeSetId": "",
+        "webChangesetSha256": "",
+        "webApplicationSha256": "",
+        "verificationSha256": "",
+    }
+    observation = ReleaseStepObservationV2.from_mapping(value)
+
+    observation.validate_plan_step(plan, completed_step_count=ordinal)
+    assert observation.digest() == hashlib.sha256(observation.to_bytes()).hexdigest()
+    assert parse_release_contract(observation.to_bytes()) == observation
+
+    assert observation.foundation_runtime_inputs is not None
+    hostile = replace(
+        observation,
+        foundation_runtime_inputs=replace(
+            observation.foundation_runtime_inputs, source_tree="d" * 40
+        ),
+    )
+    with pytest.raises(ContractError, match="identity differs"):
+        hostile.validate_plan_step(plan, completed_step_count=ordinal)
+
+
+def test_mutation_request_v2_is_bound_to_the_exact_next_plan_step() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    expected = _mutation_request_v2(plan, 2)
+    payload = canonical_json_bytes(expected)
+
+    parsed = MutationRequestV2.from_bytes(
+        payload,
+        plan=plan,
+        completed_step_count=2,
+        completed_prefix_sha256=expected["completedPrefixSha256"],
+    )
+
+    assert parsed.to_mapping() == expected
+    assert parsed.to_bytes() == payload
+    assert parse_release_contract(payload) == MutationRequestV2.from_mapping(expected)
+    parsed.validate_plan(
+        plan,
+        completed_step_count=2,
+        completed_prefix_sha256=expected["completedPrefixSha256"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("transactionId", "release_other", "transaction"),
+        ("planSha256", "0" * 64, "plan"),
+        ("completedPrefixSha256", "7" * 64, "completed prefix"),
+        ("stepId", "03-foundation-stack-create", "next"),
+        ("operationSha256", "4" * 64, "operation"),
+        ("operationSha256", "sha256:" + "0" * 64, "operation"),
+        ("kind", "STACK_UPDATE", "kind"),
+        ("subject", "other", "subject"),
+        ("requestArtifact", "requests/other.json", "artifact"),
+        ("requestSha256", "0" * 64, "request"),
+    ],
+)
+def test_mutation_request_v2_rejects_any_plan_or_next_step_drift(
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    request = _mutation_request_v2(plan, 2)
+    completed_prefix_sha256 = request["completedPrefixSha256"]
+    request[field] = value
+
+    with pytest.raises(ContractError, match=match):
+        MutationRequestV2.from_mapping(
+            request,
+            plan=plan,
+            completed_step_count=2,
+            completed_prefix_sha256=completed_prefix_sha256,
+        )
+
+
+def test_mutation_request_v2_rejects_a_non_mutating_next_step() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    request = _mutation_request_v2(plan, 0)
+
+    with pytest.raises(ContractError, match="not a mutation"):
+        MutationRequestV2.from_mapping(
+            request,
+            plan=plan,
+            completed_step_count=0,
+            completed_prefix_sha256=request["completedPrefixSha256"],
+        )
+
+    with pytest.raises(ContractError, match="not a mutation"):
+        MutationRequestV2.from_mapping(request)
+
+
+def test_staging_transaction_v2_accepts_partial_and_phase_boundary_prefixes() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    foundation_end = max(
+        step.ordinal for step in plan.steps if step.phase == "foundation"
+    ) + 1
+    partial = _staging_transaction_v2(
+        plan,
+        completed_step_count=1,
+        state="PREFLIGHTED",
+    )
+    boundary = _staging_transaction_v2(
+        plan,
+        completed_step_count=foundation_end,
+        state="FOUNDATION_READY",
+    )
+
+    parsed_partial = StagingTransactionV2.from_mapping(partial, plan=plan)
+    parsed_boundary = StagingTransactionV2.from_mapping(boundary, plan=plan)
+
+    assert parsed_partial.to_mapping() == partial
+    assert parsed_boundary.to_mapping() == boundary
+    assert StagingTransactionV2.from_bytes(
+        parsed_boundary.to_bytes(), plan=plan
+    ) == parsed_boundary
+    parsed_partial.validate_plan(plan)
+    parsed_boundary.validate_plan(plan)
+    assert parse_release_contract(parsed_boundary.to_bytes()) == (
+        StagingTransactionV2.from_mapping(boundary)
+    )
+
+
+def test_staging_transaction_v2_uncertainty_names_the_exact_next_step() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    foundation_end = max(
+        step.ordinal for step in plan.steps if step.phase == "foundation"
+    ) + 1
+    next_step = plan.to_mapping()["steps"][foundation_end]
+    completed = _completed_steps(plan, foundation_end)
+    completed_prefix_sha256 = _completed_prefix_sha256(completed)
+    operation_sha256 = "sha256:" + hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "schema": "personal-operator.release-operation.v2",
+                "planSha256": plan.digest(),
+                "completedPrefixSha256": completed_prefix_sha256,
+                "step": next_step,
+            }
+        )
+    ).hexdigest()
+    value = _staging_transaction_v2(
+        plan,
+        completed_step_count=foundation_end,
+        state="UNCERTAIN",
+        last_stable_state="FOUNDATION_READY",
+    )
+    value.update(
+        uncertainStepId=next_step["id"],
+        uncertainOperationSha256=operation_sha256,
+    )
+
+    parsed = StagingTransactionV2.from_mapping(value, plan=plan)
+
+    assert parsed.to_mapping() == value
+    for field, invalid in (
+        ("uncertainStepId", "wrong-step"),
+        ("uncertainOperationSha256", "f" * 64),
+        ("uncertainOperationSha256", "sha256:" + "0" * 64),
+        ("revision", 0),
+    ):
+        candidate = {**value, field: invalid}
+        with pytest.raises(ContractError, match="uncertain"):
+            StagingTransactionV2.from_mapping(candidate, plan=plan)
+
+
+def test_staging_transaction_v2_rejects_non_prefix_or_wrong_stable_boundary() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    foundation_end = max(
+        step.ordinal for step in plan.steps if step.phase == "foundation"
+    ) + 1
+    value = _staging_transaction_v2(
+        plan,
+        completed_step_count=foundation_end,
+        state="FOUNDATION_READY",
+    )
+    wrong_prefix = deepcopy(value)
+    wrong_prefix["completedSteps"][1]["stepId"] = "different-step"
+    with pytest.raises(ContractError, match="prefix"):
+        StagingTransactionV2.from_mapping(wrong_prefix, plan=plan)
+
+    wrong_boundary = {**value, "state": "IMAGE_PUBLISHED", "lastStableState": "IMAGE_PUBLISHED"}
+    with pytest.raises(ContractError, match="stable state"):
+        StagingTransactionV2.from_mapping(wrong_boundary, plan=plan)
+
+
+def test_staging_transaction_v2_requires_atomic_versioned_runtime_arn() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    first_runtime_end = min(
+        step.ordinal for step in plan.steps if step.phase == "runtime"
+    ) + 1
+    value = _staging_transaction_v2(
+        plan,
+        completed_step_count=first_runtime_end,
+        state="IMAGE_PUBLISHED",
+    )
+
+    for field, invalid, match in (
+        ("runtimeArn", "", "atomic"),
+        (
+            "runtimeArn",
+            value["runtimeArn"].replace(ACCOUNT, "999999999999"),
+            "account or region",
+        ),
+        ("runtimeVersion", "8", "ARN and version"),
+    ):
+        candidate = {**value, field: invalid}
+        with pytest.raises(ContractError, match=match):
+            StagingTransactionV2.from_mapping(candidate, plan=plan)
+
+
+def test_clean_account_transaction_can_abort_retained_but_never_roll_back() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    foundation_end = max(
+        step.ordinal for step in plan.steps if step.phase == "foundation"
+    ) + 1
+    retained = _staging_transaction_v2(
+        plan,
+        completed_step_count=foundation_end,
+        state="ABORTED_RETAINED",
+        last_stable_state="FOUNDATION_READY",
+    )
+
+    parsed = StagingTransactionV2.from_mapping(retained, plan=plan)
+
+    assert parsed.state == "ABORTED_RETAINED"
+    assert parsed.abort_evidence_sha256 == "f" * 64
+    with pytest.raises(ContractError, match="exactly one terminal evidence"):
+        StagingTransactionV2.from_mapping(
+            {**retained, "abortEvidenceSha256": ""}, plan=plan
+        )
+    with pytest.raises(ContractError, match="outside ABORTED_RETAINED"):
+        StagingTransactionV2.from_mapping(
+            {
+                **retained,
+                "state": "FOUNDATION_READY",
+                "abortEvidenceSha256": "f" * 64,
+            },
+            plan=plan,
+        )
+    rolled_back = {**retained, "state": "ROLLED_BACK"}
+    with pytest.raises(ContractError, match="CLEAN_ACCOUNT.*ROLLED_BACK"):
+        StagingTransactionV2.from_mapping(rolled_back, plan=plan)
+    with pytest.raises(ContractError, match="CLEAN_ACCOUNT.*ROLLED_BACK"):
+        StagingTransactionV2.from_mapping(rolled_back)
+
+
+def test_abort_retained_evidence_v2_binds_exact_stable_prefix_and_reason() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    foundation_end = max(
+        step.ordinal for step in plan.steps if step.phase == "foundation"
+    ) + 1
+    transaction = StagingTransactionV2.from_mapping(
+        _staging_transaction_v2(
+            plan,
+            completed_step_count=foundation_end,
+            state="FOUNDATION_READY",
+        ),
+        plan=plan,
+    )
+    value = {
+        "schema": AbortRetainedEvidenceV2.SCHEMA,
+        "planSha256": plan.digest(),
+        "completedPrefixSha256": _completed_prefix_sha256(
+            [step.to_mapping() for step in transaction.completed_steps]
+        ),
+        "completedStepCount": foundation_end,
+        "retainedSteps": [
+            {"stepId": step.step_id, "subject": step.subject}
+            for step in plan.steps[:foundation_end]
+        ],
+        "stableState": "FOUNDATION_READY",
+        "stopReason": "SECURITY_REVIEW_FINDING",
+    }
+    evidence = AbortRetainedEvidenceV2.from_mapping(value)
+
+    evidence.validate_transaction(plan, transaction)
+    assert evidence.digest() == hashlib.sha256(evidence.to_bytes()).hexdigest()
+    assert parse_release_contract(evidence.to_bytes()) == evidence
+
+    for candidate in (
+        replace(evidence, plan_sha256="f" * 64),
+        replace(evidence, completed_prefix_sha256="f" * 64),
+        replace(evidence, stable_state="IMAGE_PUBLISHED"),
+    ):
+        with pytest.raises(ContractError, match="differs"):
+            candidate.validate_transaction(plan, transaction)
+    with pytest.raises(ContractError, match="stop reason"):
+        AbortRetainedEvidenceV2.from_mapping(
+            {**value, "stopReason": "FREE_FORM_REASON"}
+        )
