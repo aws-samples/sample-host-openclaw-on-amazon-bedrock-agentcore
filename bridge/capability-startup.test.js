@@ -67,7 +67,14 @@ describe("release-bound capability startup", () => {
 
   it("requires exact image release inputs and verifies generated metadata at build time", () => {
     assert.match(dockerfile, /^ARG PERSONAL_OPERATOR_RELEASE_COMMIT$/m);
-    assert.match(dockerfile, /^ARG PERSONAL_OPERATOR_CATALOG_DIGEST$/m);
+    assert.match(
+      dockerfile,
+      /^ARG PERSONAL_OPERATOR_CATALOG_SOURCE_SHA256$/m,
+    );
+    assert.match(
+      dockerfile,
+      /^ARG PERSONAL_OPERATOR_CAPABILITY_CATALOG_DIGEST$/m,
+    );
     assert.match(dockerfile, /personal-operator\.capability-release\.v1/);
     assert.match(dockerfile, /release-v1\.json/);
     assert.match(dockerfile, /loadRuntimeCapabilityRelease/);

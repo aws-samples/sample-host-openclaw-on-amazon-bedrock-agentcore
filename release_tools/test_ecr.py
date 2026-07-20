@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import hashlib
 import json
 
@@ -12,9 +13,22 @@ from release_tools.ecr import (
     EcrEvidenceError,
     EcrEvidenceIncomplete,
     EcrImageAbsent,
+    EcrImageScanFailed,
+    EcrImageSigningFailed,
     EcrRepositoryAbsent,
     PROVENANCE_ARTIFACT_TYPE,
     SBOM_ARTIFACT_TYPE,
+)
+from release_tools.image_publication import (
+    BRIDGE_BUILD_TYPE as BRIDGE_BUILD_TYPE_V2,
+    CAPABILITY_TOOL_NAMES,
+    BuilderDependency,
+    ImagePublicationPlanV1,
+    OCI_CONFIG_MEDIA_TYPE,
+    OCI_LAYER_MEDIA_TYPES,
+    OCI_MANIFEST_MEDIA_TYPE,
+    OciDescriptor,
+    ProbeEvidenceDescriptor,
 )
 
 
@@ -26,6 +40,7 @@ DIGEST = "sha256:" + "c" * 64
 BUILD_CONTEXT = "bridge"
 BUILDER_ID = "https://personal-operator.invalid/builders/bridge-v1"
 BUILDER_INPUT = "sha256:" + "f" * 64
+RUNTIME_BUILD_CLOSURE = "sha256:" + "8" * 64
 PROFILE = (
     f"arn:aws:signer:{REGION}:{ACCOUNT}:/signing-profiles/"
     "personal_operator_bridge"
@@ -171,6 +186,93 @@ PROVENANCE_MANIFEST = _artifact_manifest(
 )
 SBOM_DIGEST = "sha256:" + hashlib.sha256(SBOM_MANIFEST).hexdigest()
 PROVENANCE_DIGEST = "sha256:" + hashlib.sha256(PROVENANCE_MANIFEST).hexdigest()
+
+
+def _bound_provenance_blob() -> bytes:
+    value = json.loads(PROVENANCE_BLOB)
+    definition = value["predicate"]["buildDefinition"]
+    definition["buildType"] = BRIDGE_BUILD_TYPE_V2
+    definition["externalParameters"].update(
+        {
+            "gitArchiveSha256": "3" * 64,
+            "buildArchiveSha256": "4" * 64,
+            "catalogSourceSha256": "5" * 64,
+            "capabilityCatalogDigest": "9" * 64,
+            "runtimeBuildClosureSha256": (
+                RUNTIME_BUILD_CLOSURE.removeprefix("sha256:")
+            ),
+            "platform": "linux/arm64",
+        }
+    )
+    definition["resolvedDependencies"].append(
+        {
+            "digest": {
+                "sha256": RUNTIME_BUILD_CLOSURE.removeprefix("sha256:")
+            },
+            "uri": "urn:personal-operator:runtime-build-closure",
+        }
+    )
+    definition["internalParameters"] = {}
+    value["predicate"]["runDetails"]["metadata"] = {
+        "invocationId": "urn:sha256:" + DIGEST.removeprefix("sha256:")
+    }
+    return _json(value)
+
+
+def _publication_plan(
+    *,
+    provenance_blob: bytes,
+    provenance_manifest: bytes,
+) -> ImagePublicationPlanV1:
+    layer_media_type = next(iter(sorted(OCI_LAYER_MEDIA_TYPES)))
+    return ImagePublicationPlanV1(
+        COMMIT,
+        TREE,
+        ACCOUNT,
+        REGION,
+        "3" * 64,
+        "4" * 64,
+        10240,
+        "5" * 64,
+        "9" * 64,
+        CAPABILITY_TOOL_NAMES,
+        "2026-07-20T00:00:00Z",
+        BUILDER_ID,
+        (
+            BuilderDependency("pkg:docker/node@24.15.0-slim", BUILDER_INPUT),
+            BuilderDependency(
+                "urn:personal-operator:runtime-build-closure",
+                RUNTIME_BUILD_CLOSURE,
+            ),
+        ),
+        OciDescriptor(OCI_MANIFEST_MEDIA_TYPE, DIGEST, 123456),
+        OciDescriptor(OCI_CONFIG_MEDIA_TYPE, "sha256:" + "6" * 64, 123),
+        (OciDescriptor(layer_media_type, "sha256:" + "7" * 64, 456),),
+        OciDescriptor(
+            SBOM_ARTIFACT_TYPE,
+            "sha256:" + hashlib.sha256(SBOM_BLOB).hexdigest(),
+            len(SBOM_BLOB),
+        ),
+        OciDescriptor(
+            OCI_MANIFEST_MEDIA_TYPE,
+            SBOM_DIGEST,
+            len(SBOM_MANIFEST),
+        ),
+        OciDescriptor(
+            PROVENANCE_ARTIFACT_TYPE,
+            "sha256:" + hashlib.sha256(provenance_blob).hexdigest(),
+            len(provenance_blob),
+        ),
+        OciDescriptor(
+            OCI_MANIFEST_MEDIA_TYPE,
+            "sha256:" + hashlib.sha256(provenance_manifest).hexdigest(),
+            len(provenance_manifest),
+        ),
+        (
+            ProbeEvidenceDescriptor("fresh-1", "a" * 64, 1),
+            ProbeEvidenceDescriptor("fresh-2", "a" * 64, 1),
+        ),
+    )
 
 
 def _responses() -> dict[str, object]:
@@ -554,8 +656,35 @@ def test_unreviewed_high_or_critical_findings_fail_closed() -> None:
         "findingSeverityCounts"
     ] = {"HIGH": 1, "CRITICAL": 0}
 
-    with pytest.raises(EcrEvidenceError, match="findings"):
+    with pytest.raises(EcrImageScanFailed, match="findings") as captured:
         _collect(FakeEcr(responses))
+
+    assert captured.value.failure_reason == "IMAGE_SCAN_FAILED"
+    assert captured.value.provider_reason == "SCAN_POLICY_FAILED"
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "FAILED",
+        "UNSUPPORTED_IMAGE",
+        "SCAN_ELIGIBILITY_EXPIRED",
+        "FINDINGS_UNAVAILABLE",
+        "LIMIT_EXCEEDED",
+        "IMAGE_ARCHIVED",
+    ],
+)
+def test_terminal_scan_status_has_a_closed_driver_mapping(status: str) -> None:
+    responses = _responses()
+    responses["describe_image_scan_findings"]["imageScanStatus"][  # type: ignore[index]
+        "status"
+    ] = status
+
+    with pytest.raises(EcrImageScanFailed, match=status) as captured:
+        _collect(FakeEcr(responses))
+
+    assert captured.value.failure_reason == "IMAGE_SCAN_FAILED"
+    assert captured.value.provider_reason == "SCAN_POLICY_FAILED"
 
 
 @pytest.mark.parametrize(
@@ -668,9 +797,28 @@ def test_signing_status_never_defaults_to_signed(status: str) -> None:
         "status"
     ] = status
 
-    error = EcrEvidenceIncomplete if status == "IN_PROGRESS" else EcrEvidenceError
+    error = (
+        EcrEvidenceIncomplete
+        if status == "IN_PROGRESS"
+        else EcrImageSigningFailed
+        if status == "FAILED"
+        else EcrEvidenceError
+    )
     with pytest.raises(error, match="sign"):
         _collect(FakeEcr(responses))
+
+
+def test_terminal_signing_status_has_a_closed_driver_mapping() -> None:
+    responses = _responses()
+    responses["describe_image_signing_status"]["signingStatuses"][0][  # type: ignore[index]
+        "status"
+    ] = "FAILED"
+
+    with pytest.raises(EcrImageSigningFailed, match="FAILED") as captured:
+        _collect(FakeEcr(responses))
+
+    assert captured.value.failure_reason == "IMAGE_SIGNING_FAILED"
+    assert captured.value.provider_reason == "SIGNATURE_VERIFICATION_FAILED"
 
 
 def test_multiple_matching_signing_rules_are_ambiguous() -> None:
@@ -692,3 +840,113 @@ def test_adapter_construction_performs_no_ambient_client_or_blob_access() -> Non
 
     assert fake.calls == []
     assert reader.calls == []
+
+
+def test_bound_observer_reconciles_the_exact_precomputed_publication_plan() -> None:
+    responses = _responses()
+    provenance_blob = _bound_provenance_blob()
+    reader = _replace_provenance(responses, provenance_blob)
+    provenance_manifest = _artifact_manifest(
+        PROVENANCE_ARTIFACT_TYPE,
+        provenance_blob,
+    )
+    plan = _publication_plan(
+        provenance_blob=provenance_blob,
+        provenance_manifest=provenance_manifest,
+    )
+    fake = FakeEcr(responses)
+
+    evidence = EcrEvidenceAdapter(fake, blob_reader=reader).collect_bound(
+        publication_plan=plan.to_bytes(),
+        expected_publication_plan_sha256=plan.publication_plan_sha256,
+    )
+
+    assert evidence.image_digest == plan.subject_manifest_digest
+    assert evidence.sbom_sha256 == plan.sbom_manifest_digest.removeprefix("sha256:")
+    assert evidence.provenance_sha256 == (
+        plan.provenance_manifest_digest.removeprefix("sha256:")
+    )
+
+
+def test_bound_observer_rejects_provenance_for_a_different_runtime_closure() -> None:
+    responses = _responses()
+    provenance = json.loads(_bound_provenance_blob())
+    provenance["predicate"]["buildDefinition"]["externalParameters"][
+        "runtimeBuildClosureSha256"
+    ] = "0" * 64
+    provenance_blob = _json(provenance)
+    reader = _replace_provenance(responses, provenance_blob)
+    provenance_manifest = _artifact_manifest(
+        PROVENANCE_ARTIFACT_TYPE,
+        provenance_blob,
+    )
+    plan = _publication_plan(
+        provenance_blob=provenance_blob,
+        provenance_manifest=provenance_manifest,
+    )
+
+    with pytest.raises(EcrEvidenceError, match="publication-plan inputs"):
+        EcrEvidenceAdapter(
+            FakeEcr(responses), blob_reader=reader
+        ).collect_bound(
+            publication_plan=plan.to_bytes(),
+            expected_publication_plan_sha256=plan.publication_plan_sha256,
+        )
+
+
+def test_bound_observer_rejects_plan_substitution_before_live_calls() -> None:
+    plan = _publication_plan(
+        provenance_blob=_bound_provenance_blob(),
+        provenance_manifest=_artifact_manifest(
+            PROVENANCE_ARTIFACT_TYPE,
+            _bound_provenance_blob(),
+        ),
+    )
+    fake = FakeEcr()
+
+    with pytest.raises(EcrEvidenceError, match="publication plan"):
+        EcrEvidenceAdapter(fake, blob_reader=FakeBlobReader()).collect_bound(
+            publication_plan=plan.to_bytes(),
+            expected_publication_plan_sha256="f" * 64,
+        )
+
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("subject", ["image", "SBOM"])
+def test_bound_observer_rejects_subject_or_referrer_substitution(subject: str) -> None:
+    responses = _responses()
+    provenance_blob = _bound_provenance_blob()
+    reader = _replace_provenance(responses, provenance_blob)
+    provenance_manifest = _artifact_manifest(
+        PROVENANCE_ARTIFACT_TYPE,
+        provenance_blob,
+    )
+    plan = _publication_plan(
+        provenance_blob=provenance_blob,
+        provenance_manifest=provenance_manifest,
+    )
+    if subject == "image":
+        plan = replace(
+            plan,
+            subject=OciDescriptor(
+                OCI_MANIFEST_MEDIA_TYPE,
+                "sha256:" + "f" * 64,
+                plan.subject.size,
+            ),
+        )
+    else:
+        plan = replace(
+            plan,
+            sbom_manifest=OciDescriptor(
+                OCI_MANIFEST_MEDIA_TYPE,
+                "sha256:" + "f" * 64,
+                plan.sbom_manifest.size,
+            ),
+        )
+
+    with pytest.raises(EcrEvidenceError, match="planned"):
+        EcrEvidenceAdapter(FakeEcr(responses), blob_reader=reader).collect_bound(
+            publication_plan=plan.to_bytes(),
+            expected_publication_plan_sha256=plan.publication_plan_sha256,
+        )

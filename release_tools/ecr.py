@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from release_tools.contracts import RuntimeImageEvidence
 
@@ -75,6 +75,20 @@ class EcrEvidenceIncomplete(EcrEvidenceError):
 
 class EcrEvidenceAmbiguous(EcrEvidenceError):
     """Live evidence cannot prove one exact immutable subject."""
+
+
+class EcrImageScanFailed(EcrEvidenceError):
+    """The exact image reached a definitive scan-policy failure."""
+
+    failure_reason = "IMAGE_SCAN_FAILED"
+    provider_reason = "SCAN_POLICY_FAILED"
+
+
+class EcrImageSigningFailed(EcrEvidenceError):
+    """The exact image reached a definitive signature-verification failure."""
+
+    failure_reason = "IMAGE_SIGNING_FAILED"
+    provider_reason = "SIGNATURE_VERIFICATION_FAILED"
 
 
 def _object(value: Any, *, label: str) -> dict[str, Any]:
@@ -247,6 +261,17 @@ class EcrEvidenceAdapter:
         )
         if status in {"IN_PROGRESS", "ACTIVE", "PENDING"}:
             raise EcrEvidenceIncomplete(f"image scan is not complete: {status}")
+        if status in {
+            "FAILED",
+            "FAILURE",
+            "ERROR",
+            "UNSUPPORTED_IMAGE",
+            "SCAN_ELIGIBILITY_EXPIRED",
+            "FINDINGS_UNAVAILABLE",
+            "LIMIT_EXCEEDED",
+            "IMAGE_ARCHIVED",
+        }:
+            raise EcrImageScanFailed(f"image scan failed closed: {status}")
         if status != "COMPLETE":
             raise EcrEvidenceError(f"image scan failed closed: {status}")
         findings = _object(response.get("imageScanFindings"), label="image findings")
@@ -259,7 +284,9 @@ class EcrEvidenceAdapter:
         ):
             raise EcrEvidenceError("image finding counts are malformed")
         if critical or high:
-            raise EcrEvidenceError("image has unreviewed high or critical findings")
+            raise EcrImageScanFailed(
+                "image has unreviewed high or critical findings"
+            )
         return critical, high
 
     def _artifact_blob(
@@ -269,6 +296,8 @@ class EcrEvidenceAdapter:
         subject_digest: str,
         artifact_type: str,
         referrer: dict[str, Any],
+        expected_manifest_digest: str = "",
+        expected_subject: Mapping[str, Any] | None = None,
     ) -> tuple[str, bytes]:
         manifest_digest = referrer.get("digest")
         manifest_size = referrer.get("size")
@@ -281,6 +310,10 @@ class EcrEvidenceAdapter:
             or referrer.get("mediaType") != OCI_MANIFEST_MEDIA_TYPE
         ):
             raise EcrEvidenceError("attestation referrer metadata is malformed")
+        if expected_manifest_digest and manifest_digest != expected_manifest_digest:
+            raise EcrEvidenceError(
+                "attestation referrer differs from the planned manifest"
+            )
         response = self._call(
             "batch_get_image",
             registryId=account,
@@ -346,6 +379,10 @@ class EcrEvidenceAdapter:
             or subject.get("size") <= 0
         ):
             raise EcrEvidenceError("attestation manifest subject differs from image")
+        if expected_subject is not None and subject != dict(expected_subject):
+            raise EcrEvidenceError(
+                "attestation subject differs from the planned image descriptor"
+            )
         layers = _list(manifest.get("layers"), label="attestation layers")
         if len(layers) != 1:
             raise EcrEvidenceAmbiguous(
@@ -640,6 +677,9 @@ class EcrEvidenceAdapter:
         build_context: str,
         builder_id: str,
         builder_inputs: Sequence[str],
+        build_type: str = BRIDGE_BUILD_TYPE,
+        builder_dependencies: Sequence[tuple[str, str]] | None = None,
+        provenance_parameters: Mapping[str, str] | None = None,
     ) -> None:
         value = _strict_json(payload, label="provenance")
         if value.get("_type") != PROVENANCE_STATEMENT_TYPE:
@@ -659,7 +699,7 @@ class EcrEvidenceAdapter:
             predicate.get("buildDefinition"),
             label="provenance build definition",
         )
-        if definition.get("buildType") != BRIDGE_BUILD_TYPE:
+        if definition.get("buildType") != build_type:
             raise EcrEvidenceError("provenance build type is invalid")
         external = _object(
             definition.get("externalParameters"),
@@ -671,6 +711,11 @@ class EcrEvidenceAdapter:
             raise EcrEvidenceError("provenance source tree differs")
         if external.get("buildContext") != build_context:
             raise EcrEvidenceError("provenance build context differs")
+        if provenance_parameters is not None and any(
+            external.get(key) != expected
+            for key, expected in provenance_parameters.items()
+        ):
+            raise EcrEvidenceError("provenance publication-plan inputs differ")
         run_details = _object(predicate.get("runDetails"), label="provenance run")
         builder = _object(run_details.get("builder"), label="provenance builder")
         if builder.get("id") != builder_id:
@@ -680,6 +725,7 @@ class EcrEvidenceAdapter:
             label="provenance builder inputs",
         )
         observed_inputs: list[str] = []
+        observed_dependencies: list[tuple[str, str]] = []
         for raw in dependencies:
             dependency = _object(raw, label="provenance builder input")
             digest = _object(
@@ -697,8 +743,15 @@ class EcrEvidenceAdapter:
             ):
                 raise EcrEvidenceError("provenance builder input is malformed")
             observed_inputs.append(f"sha256:{sha256}")
+            observed_dependencies.append(
+                (dependency["uri"], f"sha256:{sha256}")
+            )
         if sorted(observed_inputs) != sorted(builder_inputs):
             raise EcrEvidenceError("provenance builder inputs differ")
+        if builder_dependencies is not None and observed_dependencies != list(
+            builder_dependencies
+        ):
+            raise EcrEvidenceError("provenance builder dependency closure differs")
 
     def _attestations(
         self,
@@ -710,6 +763,12 @@ class EcrEvidenceAdapter:
         build_context: str,
         builder_id: str,
         builder_inputs: Sequence[str],
+        expected_subject: Mapping[str, Any] | None = None,
+        expected_sbom_manifest_digest: str = "",
+        expected_provenance_manifest_digest: str = "",
+        build_type: str = BRIDGE_BUILD_TYPE,
+        builder_dependencies: Sequence[tuple[str, str]] | None = None,
+        provenance_parameters: Mapping[str, str] | None = None,
     ) -> tuple[str, str]:
         response = self._call(
             "list_image_referrers",
@@ -751,12 +810,16 @@ class EcrEvidenceAdapter:
             subject_digest=digest,
             artifact_type=SBOM_ARTIFACT_TYPE,
             referrer=by_type[SBOM_ARTIFACT_TYPE][0],
+            expected_manifest_digest=expected_sbom_manifest_digest,
+            expected_subject=expected_subject,
         )
         provenance_digest, provenance_blob = self._artifact_blob(
             account=account,
             subject_digest=digest,
             artifact_type=PROVENANCE_ARTIFACT_TYPE,
             referrer=by_type[PROVENANCE_ARTIFACT_TYPE][0],
+            expected_manifest_digest=expected_provenance_manifest_digest,
+            expected_subject=expected_subject,
         )
         self._validate_sbom(sbom_blob, subject_digest=digest)
         self._validate_provenance(
@@ -767,6 +830,9 @@ class EcrEvidenceAdapter:
             build_context=build_context,
             builder_id=builder_id,
             builder_inputs=builder_inputs,
+            build_type=build_type,
+            builder_dependencies=builder_dependencies,
+            provenance_parameters=provenance_parameters,
         )
         return sbom_digest, provenance_digest
 
@@ -815,6 +881,10 @@ class EcrEvidenceAdapter:
         status = matching_statuses[0].get("status")
         if status == "IN_PROGRESS":
             raise EcrEvidenceIncomplete("image signing is still in progress")
+        if status in {"FAILED", "FAILURE", "ERROR"}:
+            raise EcrImageSigningFailed(
+                f"image signing failed closed: {status}"
+            )
         if status != "COMPLETE":
             raise EcrEvidenceError(f"image signing failed closed: {status}")
 
@@ -828,6 +898,13 @@ class EcrEvidenceAdapter:
         build_context: str,
         builder_id: str,
         builder_inputs: Sequence[str],
+        expected_subject_digest: str = "",
+        expected_subject_size: int = 0,
+        expected_sbom_manifest_digest: str = "",
+        expected_provenance_manifest_digest: str = "",
+        build_type: str = BRIDGE_BUILD_TYPE,
+        builder_dependencies: Sequence[tuple[str, str]] | None = None,
+        provenance_parameters: Mapping[str, str] | None = None,
     ) -> RuntimeImageEvidence:
         """Return complete evidence for one exact commit-tagged image digest."""
 
@@ -850,6 +927,21 @@ class EcrEvidenceAdapter:
             or len(set(builder_inputs)) != len(builder_inputs)
         ):
             raise EcrEvidenceError("reviewed build provenance inputs are invalid")
+        if any(
+            value and (not isinstance(value, str) or _DIGEST.fullmatch(value) is None)
+            for value in (
+                expected_subject_digest,
+                expected_sbom_manifest_digest,
+                expected_provenance_manifest_digest,
+            )
+        ):
+            raise EcrEvidenceError("planned image or referrer digest is malformed")
+        if expected_subject_digest and (
+            not isinstance(expected_subject_size, int)
+            or isinstance(expected_subject_size, bool)
+            or expected_subject_size <= 0
+        ):
+            raise EcrEvidenceError("planned image descriptor size is malformed")
         self._repository(account=account)
         commit_tag = f"commit-{source_commit}"
         tagged = self._one_image(
@@ -858,6 +950,8 @@ class EcrEvidenceAdapter:
             expected_tag=commit_tag,
         )
         digest = str(tagged["imageDigest"])
+        if expected_subject_digest and digest != expected_subject_digest:
+            raise EcrEvidenceError("live image differs from the planned subject")
         try:
             by_digest = self._one_image(
                 account=account,
@@ -871,6 +965,13 @@ class EcrEvidenceAdapter:
         if by_digest.get("imageDigest") != digest:
             raise EcrEvidenceError("tag and digest lookups resolve different digests")
         critical, high = self._scan(account=account, digest=digest)
+        expected_subject = None
+        if expected_subject_digest:
+            expected_subject = {
+                "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+                "digest": expected_subject_digest,
+                "size": expected_subject_size,
+            }
         sbom, provenance = self._attestations(
             account=account,
             digest=digest,
@@ -879,6 +980,14 @@ class EcrEvidenceAdapter:
             build_context=build_context,
             builder_id=builder_id,
             builder_inputs=tuple(builder_inputs),
+            expected_subject=expected_subject,
+            expected_sbom_manifest_digest=expected_sbom_manifest_digest,
+            expected_provenance_manifest_digest=(
+                expected_provenance_manifest_digest
+            ),
+            build_type=build_type,
+            builder_dependencies=builder_dependencies,
+            provenance_parameters=provenance_parameters,
         )
         profile = (
             f"arn:aws:signer:{region}:{account}:/signing-profiles/"
@@ -909,4 +1018,72 @@ class EcrEvidenceAdapter:
                 "signingProfileArn": profile,
                 "signatureStatus": "SIGNED",
             }
+        )
+
+    def collect_bound(
+        self,
+        *,
+        publication_plan: bytes,
+        expected_publication_plan_sha256: str,
+    ) -> RuntimeImageEvidence:
+        """Observe only the exact immutable v2 publication-plan subjects."""
+
+        from release_tools.image_publication import (
+            BRIDGE_BUILD_TYPE as BRIDGE_BUILD_TYPE_V2,
+            ImagePublicationError,
+            ImagePublicationPlanV1,
+        )
+
+        if (
+            not isinstance(publication_plan, bytes)
+            or not isinstance(expected_publication_plan_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_publication_plan_sha256)
+            is None
+            or hashlib.sha256(publication_plan).hexdigest()
+            != expected_publication_plan_sha256
+        ):
+            raise EcrEvidenceError("image publication plan digest differs")
+        try:
+            plan = ImagePublicationPlanV1.from_bytes(publication_plan)
+        except ImagePublicationError as error:
+            raise EcrEvidenceError("image publication plan is invalid") from error
+        if plan.publication_plan_sha256 != expected_publication_plan_sha256:
+            raise EcrEvidenceError("image publication plan identity differs")
+        dependencies = tuple(
+            (dependency.uri, dependency.digest)
+            for dependency in plan.builder_dependencies
+        )
+        runtime_closures = tuple(
+            digest
+            for uri, digest in dependencies
+            if uri == "urn:personal-operator:runtime-build-closure"
+        )
+        if len(runtime_closures) != 1:
+            raise EcrEvidenceError(
+                "image publication plan runtime-build closure is ambiguous"
+            )
+        return self.collect(
+            source_commit=plan.source_commit,
+            source_tree=plan.source_tree,
+            account=plan.account,
+            region=plan.region,
+            build_context="bridge",
+            builder_id=plan.builder_id,
+            builder_inputs=tuple(digest for _, digest in dependencies),
+            expected_subject_digest=plan.subject.digest,
+            expected_subject_size=plan.subject.size,
+            expected_sbom_manifest_digest=plan.sbom_manifest.digest,
+            expected_provenance_manifest_digest=plan.provenance_manifest.digest,
+            build_type=BRIDGE_BUILD_TYPE_V2,
+            builder_dependencies=dependencies,
+            provenance_parameters={
+                "gitArchiveSha256": plan.git_archive_sha256,
+                "buildArchiveSha256": plan.build_archive_sha256,
+                "catalogSourceSha256": plan.catalog_source_sha256,
+                "capabilityCatalogDigest": plan.capability_catalog_digest,
+                "runtimeBuildClosureSha256": (
+                    runtime_closures[0].removeprefix("sha256:")
+                ),
+                "platform": "linux/arm64",
+            },
         )
