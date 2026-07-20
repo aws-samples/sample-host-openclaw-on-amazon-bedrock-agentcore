@@ -1149,10 +1149,18 @@ def main(
     else:
         args.composer_factory = composer_factory
     try:
-        if production_entrypoint and (args.phase or args.resume or args.rollback):
+        if production_entrypoint and (
+            args.phase
+            or args.resume
+            or args.rollback
+            or args.reconcile
+            or args.driver is not None
+        ):
             raise ReleaseCliError(
-                "v1 mutation is disabled; use only credential-free preflight/status "
-                "until the reviewed v2 transaction is available"
+                "v1 mutation is disabled; the legacy driver/composer completion "
+                "route is retired at the operator entrypoint; use only "
+                "credential-free preflight/status until the reviewed v2 session "
+                "transaction is available"
             )
         if production_entrypoint and not args.status:
             _assert_executing_repository(args.root)
