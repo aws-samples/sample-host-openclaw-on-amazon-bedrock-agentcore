@@ -1,3 +1,7 @@
+> **Archived red-team implementation history — not authoritative for Personal
+> Operator v1.** Current requirements and evidence are in `README.md` and
+> `docs/V1-IMPLEMENTATION-EVIDENCE.md`.
+
 STATUS: COMPLETE
 
 ## Goal

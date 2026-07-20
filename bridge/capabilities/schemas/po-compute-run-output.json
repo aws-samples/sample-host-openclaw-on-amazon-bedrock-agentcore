@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:po-compute-run-output:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"jobId":{"maxLength":128,"minLength":8,"type":"string"},"status":{"const":"QUEUED"}},"required":["jobId","status"],"title":"Networkless compute submission output","type":"object"}

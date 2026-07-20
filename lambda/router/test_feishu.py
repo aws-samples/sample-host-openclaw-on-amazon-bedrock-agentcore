@@ -9,10 +9,10 @@ import unittest
 from unittest.mock import MagicMock, patch, call
 
 # Set required env vars before importing the module
-os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/test")
-os.environ.setdefault("AGENTCORE_QUALIFIER", "test-endpoint")
+os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/test")
+os.environ.setdefault("AGENTCORE_QUALIFIER", "release_" + "a" * 40)
 os.environ.setdefault("IDENTITY_TABLE_NAME", "openclaw-identity")
-os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-us-west-2")
+os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-eu-west-1")
 os.environ.setdefault("FEISHU_TOKEN_SECRET_ID", "openclaw/channels/feishu")
 os.environ.setdefault("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 
@@ -165,6 +165,12 @@ class TestHandleFeishuTextMessage(unittest.TestCase):
         self.assertEqual(result["statusCode"], 200)
         mock_resolve.assert_called_once_with("feishu", "ou_test123")
         mock_invoke.assert_called_once()
+        self.assertEqual(
+            mock_invoke.call_args[0][5],
+            index._build_runtime_invocation_id(
+                "feishu", event["header"]["event_id"], "user_abc123"
+            ),
+        )
         mock_send.assert_called()
         # Last call should be the response
         last_call_text = mock_send.call_args_list[-1][0][1]

@@ -3,11 +3,11 @@
  *
  * Implements the required HTTP protocol contract for AgentCore Runtime:
  *   - GET  /ping         -> Health check (Healthy — allows idle termination)
- *   - POST /invocations  -> Chat handler with hybrid init
+ *   - POST /invocations  -> status, warmup, chat, or durable snapshot action
  *
  * Each AgentCore session is dedicated to a single user. On first invocation:
- *   1. Use pre-fetched secrets (fetched eagerly at boot)
- *   2. Start proxy + OpenClaw + workspace restore in parallel
+ *   1. Bind the exact internal identity and mint scoped workspace credentials
+ *   2. Start the execution-role proxy and scoped OpenClaw/workspace paths
  *   3. Once proxy is ready (~5s), route via lightweight agent shim
  *   4. Once OpenClaw is ready (~1-2 min), route via WebSocket bridge
  *
@@ -17,38 +17,52 @@
  * Runs on port 8080 (required by AgentCore Runtime).
  */
 
+const cwLogger = require("./cloudwatch-logger");
+cwLogger.installConsoleHooks();
+cwLogger.installProcessFailureHooks();
+
 const http = require("http");
 const fs = require("fs");
+const path = require("path");
+const { randomUUID } = require("crypto");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
-const {
-  SecretsManagerClient,
-  GetSecretValueCommand,
-} = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
-const cwLogger = require("./cloudwatch-logger");
-const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
+const runtimePolicy = require("./runtime-policy");
+const gatewayInvocation = require("./gateway-invocation");
+const capabilityCatalogModule = require("./capability-catalog");
+const capabilityRelayModule = require("./capability-relay");
+const { SessionBinding } = require("./session-binding");
+const { createInvocationHandler } = require("./invocation-handler");
+const { SqliteSnapshot } = require("./sqlite-snapshot");
+const { WorkspaceLifecycle } = require("./workspace-lifecycle");
+const { WorkspacePathPolicy } = require("./workspace-path-policy");
+const { RefreshingScopedS3 } = require("./workspace-s3-client");
+
+const RUNTIME_REGION = scopedCreds.requireExactRegion(process.env);
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
 const OPENCLAW_PORT = 18789;
+const CAPABILITY_RELAY_PORT = 18791;
 
-// Session storage mount path (set via filesystemConfigurations on Runtime)
 const SESSION_STORAGE_MOUNT = "/mnt/workspace";
-const OPENCLAW_DIR = process.env.HOME ? `${process.env.HOME}/.openclaw` : "/root/.openclaw";
+const WORKSPACE_SEED_DIR = "/opt/personal-operator/seed";
+const OPENCLAW_HOME_LINK = "/run/personal-operator/home/.openclaw";
+const OPENCLAW_CONFIG_PATH = runtimePolicy.OPENCLAW_CONFIG_PATH;
+const OPENCLAW_STATE_DIR = runtimePolicy.OPENCLAW_STATE_DIR;
+const OPENCLAW_WORKSPACE_DIR = runtimePolicy.OPENCLAW_WORKSPACE_DIR;
+const WORKSPACE_SYNC_INTERVAL_MS = (() => {
+  const value = Number(process.env.WORKSPACE_SYNC_INTERVAL_MS || "300000");
+  if (!Number.isSafeInteger(value) || value < 10_000 || value > 3_600_000) {
+    throw new Error("WORKSPACE_SYNC_INTERVAL_MS must be between 10000 and 3600000");
+  }
+  return value;
+})();
 
-// Gateway token — fetched from Secrets Manager eagerly at boot.
-// No fallback — container will fail to authenticate WebSocket if not set.
-let GATEWAY_TOKEN = null;
-
-// Telegram bot token — fetched from Secrets Manager eagerly at boot.
-// Used for typing indicator during processing + single final message delivery.
-let TELEGRAM_BOT_TOKEN = null;
-
-// Cognito password secret — fetched from Secrets Manager eagerly at boot.
-// Stored in-process only, never written to process.env.
-let COGNITO_PASSWORD_SECRET = null;
+// Ephemeral, microVM-local authentication for the loopback gateway only.
+const GATEWAY_TOKEN = runtimePolicy.createLocalGatewayToken();
 
 // Maximum request body size (1MB) to prevent memory exhaustion
 const MAX_BODY_SIZE = 1 * 1024 * 1024;
@@ -59,229 +73,296 @@ let lastPingLogTime = 0;
 const PING_LOG_INTERVAL_MS = 60000; // Log ping stats every 60s
 
 // State tracking
-let currentUserId = null;
+let currentInternalUserId = null;
 let currentNamespace = null;
 let openclawProcess = null;
 let proxyProcess = null;
 let openclawReady = false;
+let gatewayQuarantined = null;
 let proxyReady = false;
-let secretsReady = false;
 let initInProgress = false;
 let initPromise = null;
-let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
-let browserHeaderRefreshTimer = null;
-let currentBrowserSessionId = null;
-let currentBrowserEndpoint = null;
+let credentialRefreshInProgress = false;
+let currentWorkspaceCapability = null;
+let workspaceLifecycle = null;
+let agent = null;
+const runtimeInitializationGuard = createRuntimeInitializationGuard();
+const activeTaskTracker = createActiveTaskTracker();
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
-const IDENTITY_FILE = "/tmp/current-identity.json";
-const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
-const BROWSER_SESSION_TIMEOUT_SECONDS = 3600;
 const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
+const WORKSPACE_GENERATION_PATTERN =
+  /^g-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
-// Derive EVENTBRIDGE_ROLE_ARN from EXECUTION_ROLE_ARN + AWS_REGION if not already set.
-// The agentcore toolkit doesn't support injecting arbitrary env vars into the container,
-// so we derive it: arn:aws:iam::{account}:role/openclaw-cron-scheduler-role-{region}
-if (!process.env.EVENTBRIDGE_ROLE_ARN && process.env.EXECUTION_ROLE_ARN) {
-  const match = process.env.EXECUTION_ROLE_ARN.match(/arn:aws:iam::(\d+):role\//);
-  if (match) {
-    const account = match[1];
-    const region = process.env.AWS_REGION || "us-west-2";
-    process.env.EVENTBRIDGE_ROLE_ARN = `arn:aws:iam::${account}:role/openclaw-cron-scheduler-role-${region}`;
-    console.log(`[contract] Derived EVENTBRIDGE_ROLE_ARN from execution role (account=${account}, region=${region})`);
-  }
-}
-
-// OpenClaw process diagnostics (last N lines of stdout/stderr)
-const OPENCLAW_LOG_LIMIT = 50;
-let openclawLogs = [];
+// Child output is sensitive by construction. Only discarded byte counts survive.
 let openclawExitCode = null;
 let lastOpenClawEnv = null;
+
+const gatewayRuntimeBoundary = gatewayInvocation.createGatewayRuntimeBoundary({
+  getGatewayProcess: () => openclawProcess,
+  terminateGraceMs: 2_000,
+});
+const trustedInvocationRegistry =
+  gatewayInvocation.createTrustedInvocationRegistry({
+    ttlMs: 60 * 60 * 1_000,
+    maxSettledEntries: 64,
+    maxInFlightEntries: 8,
+  });
+const gatewayMessageExecutor =
+  gatewayInvocation.createBoundedSerialExecutor({ maxPending: 7 });
+const capabilityTurnExecutor =
+  gatewayInvocation.createBoundedSerialExecutor({ maxPending: 7 });
+
+let capabilityGatewayTransport = null;
+const capabilityRelay = new capabilityRelayModule.CapabilityRelay({
+  gatewayTransport: async (envelope) => {
+    if (!capabilityGatewayTransport) {
+      capabilityGatewayTransport =
+        capabilityRelayModule.createLambdaGatewayTransport({
+          functionArn: process.env.CAPABILITY_GATEWAY_FUNCTION_ARN,
+        });
+    }
+    return capabilityGatewayTransport(envelope);
+  },
+  logger: (event) => {
+    console.log(
+      `[capability] ${event.event} callId=${event.callId}` +
+        (event.status ? ` status=${event.status}` : ""),
+    );
+  },
+});
+const capabilityRelayServer =
+  capabilityRelayModule.createCapabilityRelayServer({
+    relay: capabilityRelay,
+    host: "127.0.0.1",
+    port: CAPABILITY_RELAY_PORT,
+  });
+let capabilityRelayReady = null;
+const runtimeCapabilityStartup = createCapabilityStartupGate({
+  validateRelease: () =>
+    capabilityCatalogModule.loadRuntimeCapabilityRelease(),
+  constructRuntime: () => require("./lightweight-agent"),
+});
 
 // OpenClaw auto-restart on crash
 let openclawRestartCount = 0;
 const OPENCLAW_MAX_RESTARTS = 3;
 const OPENCLAW_RESTART_DELAY_MS = 5000;
 
-// Active task tracking — HealthyBusy prevents AgentCore from terminating during long tasks
-let activeTaskCount = 0;
 // Last activity timestamp (epoch seconds) — reported in /ping so AgentCore can track idle time.
-// Initialized to startup time; updated on each chat/cron/warmup invocation.
+// Initialized to startup time; updated on each chat/warmup invocation.
 let lastActivityTime = Math.floor(Date.now() / 1000);
 
-// Message queue for serializing concurrent requests (OpenClaw WebSocket path)
-let messageQueue = [];
-let processingMessage = false;
-
-/**
- * Write current actorId and channel to a shared file so the proxy process
- * can pick up cross-channel identity changes (the proxy's env vars are
- * fixed at spawn time and cannot be updated for a running child process).
- */
-/**
- * Set up symlink from ~/.openclaw to session storage mount.
- * Returns true if session storage is available and symlink was created.
- */
-function setupSessionStorageSymlink() {
-  try {
-    // Check if session storage mount exists (only available during invocation)
-    if (!fs.existsSync(SESSION_STORAGE_MOUNT)) {
-      console.log("[contract] Session storage not available at", SESSION_STORAGE_MOUNT);
-      return false;
-    }
-
-    const mountedDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
-    fs.mkdirSync(mountedDir, { recursive: true });
-
-    // Check existing .openclaw — may be a symlink, directory, or missing
-    let existingType = null;
-    try {
-      const stat = fs.lstatSync(OPENCLAW_DIR);
-      if (stat.isSymbolicLink()) {
-        const target = fs.readlinkSync(OPENCLAW_DIR);
-        if (target === mountedDir) {
-          console.log("[contract] Session storage symlink already in place");
-          return true;
-        }
-        existingType = "symlink";
-        fs.unlinkSync(OPENCLAW_DIR);
-      } else if (stat.isDirectory()) {
-        existingType = "directory";
-        // Copy contents to session storage (cross-device, can't use rename)
-        const { execSync } = require("child_process");
-        execSync(`cp -a ${OPENCLAW_DIR}/. ${mountedDir}/ 2>/dev/null || true`);
-        fs.rmSync(OPENCLAW_DIR, { recursive: true, force: true });
-      } else {
-        existingType = "file";
-        fs.unlinkSync(OPENCLAW_DIR);
-      }
-    } catch {
-      // OPENCLAW_DIR doesn't exist yet — that's fine
-    }
-
-    fs.symlinkSync(mountedDir, OPENCLAW_DIR);
-    console.log(`[contract] Session storage symlink: ${OPENCLAW_DIR} -> ${mountedDir} (was: ${existingType || "missing"})`);
-    return true;
-  } catch (err) {
-    console.warn(`[contract] Session storage setup failed: ${err.message}`);
-    return false;
-  }
+function createRuntimeInvocationAdmission({
+  sessionBinding = new SessionBinding(),
+  handlers = {
+    status: (context) => context,
+    warmup: (context) => context,
+    chat: (context) => context,
+    snapshot: (context) => context,
+  },
+} = {}) {
+  return createInvocationHandler({ sessionBinding, handlers });
 }
 
-function updateIdentityFile(actorId, channel) {
-  try {
-    fs.writeFileSync(
-      IDENTITY_FILE,
-      JSON.stringify({ actorId, channel }),
-      "utf-8",
-    );
-  } catch (err) {
-    console.warn(`[contract] Failed to write identity file: ${err.message}`);
+function createWorkspaceReceipt(head) {
+  if (!head || !WORKSPACE_GENERATION_PATTERN.test(head.generation || "")) {
+    throw new TypeError("Workspace receipt requires a canonical generation");
   }
+  if (!SHA256_PATTERN.test(head.manifestSha256 || "")) {
+    throw new TypeError("Workspace receipt requires a canonical manifest digest");
+  }
+  return Object.freeze({
+    generation: head.generation,
+    manifestSha256: head.manifestSha256,
+  });
 }
 
-/**
- * Pre-fetch secrets from Secrets Manager at container boot.
- * Runs in the background — does not block /ping health checks.
- */
-async function prefetchSecrets() {
-  const region = process.env.AWS_REGION || "us-west-2";
-  const smClient = new SecretsManagerClient({ region });
-
-  const gatewaySecretId = process.env.GATEWAY_TOKEN_SECRET_ID;
-  if (gatewaySecretId) {
-    const resp = await smClient.send(
-      new GetSecretValueCommand({ SecretId: gatewaySecretId }),
-    );
-    if (resp.SecretString) {
-      GATEWAY_TOKEN = resp.SecretString;
-      console.log("[contract] Gateway token pre-fetched from Secrets Manager");
-    }
+async function persistWorkspaceOutcome({
+  workspaceLifecycle: lifecycle,
+  workspaceTurn,
+  outcome,
+} = {}) {
+  if (!lifecycle || typeof lifecycle.commitAfterTurn !== "function") {
+    throw new TypeError("Workspace outcome persistence requires a lifecycle");
   }
-
-  const cognitoSecretId = process.env.COGNITO_PASSWORD_SECRET_ID;
-  if (cognitoSecretId) {
-    const resp = await smClient.send(
-      new GetSecretValueCommand({ SecretId: cognitoSecretId }),
-    );
-    if (resp.SecretString) {
-      COGNITO_PASSWORD_SECRET = resp.SecretString;
-      console.log("[contract] Cognito password secret pre-fetched");
-    }
+  if (!outcome || typeof outcome !== "object" || Array.isArray(outcome)) {
+    throw new TypeError("Workspace outcome must be an object");
   }
+  const head = await lifecycle.commitAfterTurn(workspaceTurn);
+  const committedOutcome = Object.hasOwn(outcome, "status")
+    ? outcome
+    : { ...outcome, status: "ok" };
+  return Object.freeze({
+    ...committedOutcome,
+    workspaceReceipt: createWorkspaceReceipt(head),
+  });
+}
 
-  const telegramSecretId = process.env.TELEGRAM_CHANNEL_SECRET_ID;
-  if (telegramSecretId) {
-    try {
-      const resp = await smClient.send(
-        new GetSecretValueCommand({ SecretId: telegramSecretId }),
-      );
-      if (resp.SecretString) {
-        // Secret may be a plain token or JSON with bot_token/token key
-        try {
-          const parsed = JSON.parse(resp.SecretString);
-          TELEGRAM_BOT_TOKEN =
-            parsed.bot_token || parsed.token || resp.SecretString;
-        } catch {
-          TELEGRAM_BOT_TOKEN = resp.SecretString;
-        }
-        console.log(
-          "[contract] Telegram bot token pre-fetched from Secrets Manager",
+async function executeSnapshotAction({
+  initialize,
+  getWorkspaceLifecycle,
+} = {}) {
+  if (
+    typeof initialize !== "function" ||
+    typeof getWorkspaceLifecycle !== "function"
+  ) {
+    throw new TypeError("Snapshot action requires trusted runtime callbacks");
+  }
+  await initialize();
+  const lifecycle = getWorkspaceLifecycle();
+  if (!lifecycle || typeof lifecycle.requestManualSnapshot !== "function") {
+    throw new Error("Durable workspace lifecycle is unavailable");
+  }
+  const head = await lifecycle.requestManualSnapshot();
+  return Object.freeze({
+    status: "snapshotted",
+    workspaceReceipt: createWorkspaceReceipt(head),
+  });
+}
+
+function createRuntimeInitializationGuard() {
+  let attempted = false;
+  return Object.freeze({
+    get attempted() {
+      return attempted;
+    },
+    claim() {
+      if (attempted) {
+        const error = new Error(
+          "A runtime process cannot replace an initialized workspace in place",
         );
+        error.code = "RUNTIME_REINITIALIZATION_FORBIDDEN";
+        throw error;
       }
-    } catch (err) {
-      console.warn(
-        `[contract] Telegram secret fetch failed (streaming disabled): ${err.message}`,
-      );
-    }
-  }
-
-  secretsReady = true;
-  console.log("[contract] Secrets pre-fetch complete");
+      attempted = true;
+    },
+  });
 }
 
-/**
- * Clean up stale .lock files in the .openclaw directory (async, non-blocking).
- * Prevents "session file locked" errors after workspace restore from S3.
- */
-async function cleanupLockFiles() {
-  const fs = require("fs");
-  const path = require("path");
-  const homeDir = process.env.HOME || "/root";
-  const openclawDir = path.join(homeDir, ".openclaw");
+function createCapabilityStartupGate({
+  validateRelease,
+  constructRuntime,
+} = {}) {
+  if (
+    typeof validateRelease !== "function" ||
+    typeof constructRuntime !== "function"
+  ) {
+    throw new TypeError(
+      "Capability startup requires release validation and runtime construction",
+    );
+  }
+  let started = false;
+  let runtime = null;
+  return Object.freeze({
+    get started() {
+      return started;
+    },
+    start() {
+      if (started) return runtime;
+      const validatedRelease = validateRelease();
+      const candidate = constructRuntime(validatedRelease);
+      if (!candidate || typeof candidate !== "object") {
+        throw new TypeError("Capability runtime construction returned no runtime");
+      }
+      runtime = candidate;
+      started = true;
+      return runtime;
+    },
+  });
+}
 
+function createUnexpectedChildExitHandler({
+  label,
+  code,
+  isExpected,
+  markUnavailable,
+  quarantine,
+} = {}) {
+  if (
+    typeof label !== "string" ||
+    typeof code !== "string" ||
+    typeof isExpected !== "function" ||
+    typeof markUnavailable !== "function" ||
+    typeof quarantine !== "function"
+  ) {
+    throw new TypeError("Unexpected child exit handler requires exact callbacks");
+  }
+  return (exitCode, signal) => {
+    markUnavailable();
+    if (isExpected()) return;
+    const error = new Error(
+      `${label} exited unexpectedly (code=${exitCode ?? "none"}, signal=${signal ?? "none"})`,
+    );
+    quarantine(error, code);
+  };
+}
+
+function createActiveTaskTracker() {
+  let count = 0;
+  return Object.freeze({
+    get count() {
+      return count;
+    },
+    async run(task) {
+      if (typeof task !== "function") {
+        throw new TypeError("Active task tracker requires a task callback");
+      }
+      count += 1;
+      try {
+        return await task();
+      } finally {
+        count = Math.max(0, count - 1);
+      }
+    },
+  });
+}
+
+async function withCapabilityTurn({ grant, externalEffects, task } = {}) {
+  if (typeof task !== "function") {
+    throw new TypeError("Capability turn requires an exact task callback");
+  }
+  capabilityRelay.clear_turn();
+  if (grant !== undefined) {
+    if (externalEffects === false) {
+      capabilityRelay.bind_scheduled_turn(grant);
+    } else {
+      capabilityRelay.bind_turn(grant);
+    }
+  }
   try {
-    await fs.promises.access(openclawDir);
-  } catch {
-    return; // Directory doesn't exist yet — nothing to clean
+    return await task();
+  } finally {
+    capabilityRelay.clear_turn();
   }
-
-  async function walkAndClean(dir) {
-    let entries;
-    try {
-      entries = await fs.promises.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    const tasks = [];
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        tasks.push(walkAndClean(fullPath));
-      } else if (entry.name.endsWith(".lock")) {
-        tasks.push(
-          fs.promises.unlink(fullPath).catch(() => {}),
-        );
-      }
-    }
-    await Promise.all(tasks);
-  }
-
-  await walkAndClean(openclawDir);
-  console.log("[contract] Lock file cleanup complete (async)");
 }
+
+function ensureCapabilityRelayServer() {
+  if (!capabilityRelayReady) {
+    capabilityRelayReady = capabilityRelayServer.listen();
+  }
+  return capabilityRelayReady;
+}
+
+function hashBoundInvocation({ identity, delivery, request } = {}) {
+  const gatewayRunId = gatewayInvocation.deriveGatewayRunId({
+    invocationId: request?.invocationId,
+  });
+  const requestHash = gatewayInvocation.hashTrustedInvocationRequest({
+    // RH1's frozen canonical hash schema names this slot `userId`. Its value
+    // is exclusively the internal identity retained by SessionBinding.
+    userId: identity?.internalUserId,
+    actorId: delivery?.actorId || null,
+    channel: delivery?.channel || null,
+    message: request?.message,
+  });
+  return Object.freeze({ gatewayRunId, requestHash });
+}
+
+const runtimeInvocationHandler = createRuntimeInvocationAdmission();
 
 /**
  * Check if the proxy health endpoint responds.
@@ -395,236 +476,84 @@ async function waitForPort(port, label, timeoutMs = 300000, intervalMs = 3000) {
   return false;
 }
 
-// Distinct subagent model name — proxy uses this to detect and route subagent requests.
-// Must match the SUBAGENT_MODEL_NAME env var passed to the proxy.
-const SUBAGENT_MODEL_NAME = "bedrock-agentcore-subagent";
-
 /**
- * Write a headless OpenClaw config (no channels — messages bridged via WebSocket).
- * Full tool profile with deny list for unsafe/irrelevant tools.
- * Sub-agents enabled for deep-research-pro and task-decomposer skills.
- * Sandbox disabled — AgentCore microVMs provide per-user isolation.
+ * Write the frozen headless OpenClaw configuration and user-facing capability
+ * instructions. Policy construction is pure and covered independently.
  */
+function writeTrustedFileAtomically(targetPath, content) {
+  const directory = path.dirname(targetPath);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(directory, 0o700);
+  const temporaryPath = `${targetPath}.${randomUUID()}.tmp`;
+  const descriptor = fs.openSync(
+    temporaryPath,
+    fs.constants.O_CREAT |
+      fs.constants.O_EXCL |
+      fs.constants.O_WRONLY |
+      (fs.constants.O_NOFOLLOW || 0),
+    0o600,
+  );
+  let completed = false;
+  try {
+    fs.writeFileSync(descriptor, content);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    fs.renameSync(temporaryPath, targetPath);
+    const directoryDescriptor = fs.openSync(directory, fs.constants.O_RDONLY);
+    try {
+      fs.fsyncSync(directoryDescriptor);
+    } finally {
+      fs.closeSync(directoryDescriptor);
+    }
+    completed = true;
+  } finally {
+    if (!completed) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {}
+      try {
+        fs.unlinkSync(temporaryPath);
+      } catch {}
+    }
+  }
+}
+
 function writeOpenClawConfig() {
-  const fs = require("fs");
+  const config = runtimePolicy.buildOpenClawConfig({
+    gatewayToken: GATEWAY_TOKEN,
+    proxyPort: PROXY_PORT,
+    gatewayPort: OPENCLAW_PORT,
+  });
 
-  // Sub-agent model uses a distinct name so the proxy can identify subagent requests.
-  // The proxy maps this name → SUBAGENT_BEDROCK_MODEL_ID (or MODEL_ID fallback).
-  const subagentModel = `agentcore/${SUBAGENT_MODEL_NAME}`;
-
-  const config = {
-    models: {
-      providers: {
-        agentcore: {
-          baseUrl: `http://127.0.0.1:${PROXY_PORT}/v1`,
-          apiKey: "local",
-          api: "openai-completions",
-          models: [
-            { id: "bedrock-agentcore", name: "Bedrock AgentCore" },
-            { id: SUBAGENT_MODEL_NAME, name: "Bedrock AgentCore Subagent" },
-          ],
-        },
-      },
-    },
-    agents: {
-      defaults: {
-        model: { primary: "agentcore/bedrock-agentcore" },
-        subagents: {
-          model: subagentModel,
-          maxConcurrent: 2,
-          runTimeoutSeconds: 900,
-          archiveAfterMinutes: 60,
-        },
-        sandbox: {
-          mode: "off", // No Docker in AgentCore container; microVMs provide isolation
-        },
-      },
-    },
-    tools: {
-      profile: "full",
-      exec: {
-        host: "gateway",  // Run on container host — microVM provides isolation, no Docker sandbox
-        security: "full", // Full shell access; container is already isolated
-        ask: "off",       // Headless container — no approval UI
-      },
-      deny: [
-        "write", // Local writes don't persist — use S3 skill instead
-        "edit", // Local edits are ephemeral — use S3 skill instead
-        "apply_patch", // Code patching not needed for chat assistant
-        "read", // Blocks local file reads — prevents reading sibling process environ; use s3-user-files
-        "browser", // Deny built-in browser tool — use agentcore-browser skill instead (via exec)
-        "canvas", // No UI rendering in headless chat context
-        "cron", // EventBridge handles scheduling, not OpenClaw's built-in cron
-        "gateway", // Admin tool — not needed for end users
-      ],
-      // Note: `exec` is intentionally NOT denied — skills like clawhub-manage
-      // need Bash(node:*) to run scripts. Scoped STS credentials ensure
-      // OpenClaw only has access to the user's S3 namespace prefix.
-    },
-    skills: {
-      allowBundled: [],
-      load: { extraDirs: ["/skills"] },
-    },
-    gateway: {
-      mode: "local",
-      port: OPENCLAW_PORT,
-      trustedProxies: ["127.0.0.1"],
-      auth: { mode: "token", token: GATEWAY_TOKEN },
-      controlUi: {
-        enabled: false,
-        allowInsecureAuth: true,
-        dangerouslyDisableDeviceAuth: true,
-        dangerouslyAllowHostHeaderOriginFallback: true,
-        allowedOrigins: ["*"],
-      },
-    },
-    channels: {}, // No channels — messages bridged via WebSocket
-  };
-
-  const homeDir = process.env.HOME || "/root";
-  fs.mkdirSync(`${homeDir}/.openclaw`, { recursive: true });
-  fs.writeFileSync(
-    `${homeDir}/.openclaw/openclaw.json`,
+  writeTrustedFileAtomically(
+    OPENCLAW_CONFIG_PATH,
     JSON.stringify(config, null, 2),
   );
   console.log("[contract] OpenClaw headless config written");
 
-  // Write AGENTS.md — OpenClaw loads this as workspace bootstrap instructions.
-  // Always overwrite to ensure instructions match the current container version
-  // (workspace restore from S3 may carry stale AGENTS.md without new features like browser).
-  const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
+  // Always overwrite restored instructions so stale capability claims cannot
+  // widen the model-visible surface.
+  const agentsMdPath = `${OPENCLAW_WORKSPACE_DIR}/AGENTS.md`;
   {
-    fs.writeFileSync(
+    writeTrustedFileAtomically(
       agentsMdPath,
       [
         "# Agent Instructions",
         "",
         "You are a helpful AI assistant running in a per-user container on AWS.",
-        "You have built-in web tools, file storage, scheduling, and many community skills.",
+        "You have four bounded persistent workspace tools.",
         "",
         "## Response Formatting",
         "",
-        "Format responses for chat messaging apps (Telegram, Slack):",
+        "Format responses for a chat interface:",
         "- **No markdown tables** — use bullet lists or plain text paragraphs instead",
         "- Tables do not render in most chat apps; bullets always work",
         "- Keep responses concise and chat-appropriate",
         "",
-        "## Built-in Web Tools",
-        "",
-        "You have built-in **web_search** and **web_fetch** tools:",
-        "- **web_search**: Search the web for current information",
-        "- **web_fetch**: Fetch and read web page content as markdown",
-        "",
-        "Use these for real-time information, news, research, and reading web pages.",
-        "",
-        "## Scheduling & Cron Jobs",
-        "",
-        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to set up reminders,",
-        "recurring tasks, or cron jobs, use these commands via Bash. Do NOT say cron is disabled.",
-        "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
-        "",
-        "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
-        "",
-        "**Commands** (run via Bash):",
-        "- Create: `node /skills/eventbridge-cron/create.js <user_id> <cron_expression> <timezone> <message> [channel] [channel_target] [schedule_name]`",
-        "- List: `node /skills/eventbridge-cron/list.js <user_id>`",
-        "- Update: `node /skills/eventbridge-cron/update.js <user_id> <schedule_id> [--expression \"cron(...)\"] [--timezone \"TZ\"] [--message \"msg\"] [--enable] [--disable]`",
-        "- Delete: `node /skills/eventbridge-cron/delete.js <user_id> <schedule_id>`",
-        "",
-        "Cron format: `cron(min hour day-of-month month day-of-week year)` — e.g., `cron(0 9 * * ? *)` for daily at 9 AM.",
-        "Rate format: `rate(1 hour)`, `rate(5 minutes)`.",
-        "",
         "## File Storage",
         "",
-        "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
-        "",
-        "## Community Skills (ClawHub)",
-        "",
-        "The following community skills are pre-installed:",
-        "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)",
-        "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)",
-        "- **telegram-compose**: Rich HTML formatting for Telegram messages",
-        "- **transcript**: YouTube video transcript extraction",
-        "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)",
-        "",
-        "### Installing More Skills",
-        "",
-        "You have the **clawhub-manage** skill to install/uninstall additional community skills from the ClawHub marketplace.",
-        "When a user asks to install or add a skill, use this skill — do NOT say it's not possible or that exec is blocked.",
-        "**Use Bash to run the skill scripts** (Bash is available, only exec is denied):",
-        "- Install: `node /skills/clawhub-manage/install.js <skill-name>`",
-        "- Uninstall: `node /skills/clawhub-manage/uninstall.js <skill-name>`",
-        "- List: `node /skills/clawhub-manage/list.js`",
-        "",
-        "After install/uninstall, the skill will be available on the next session start (after idle timeout or new conversation).",
-        "",
-        "## API Key Storage",
-        "",
-        "You have the **api-keys** skill for secure API key storage.",
-        "",
-        "### Proactive Detection",
-        "",
-        "If a user message contains what looks like an API key or secret token — even without explicitly asking to save it — you MUST proactively offer to store it securely. Common patterns:",
-        "- `sk-...`, `sk-proj-...` (OpenAI)",
-        "- `key-...`, `pk-...` (generic)",
-        "- `ghp_...`, `gho_...` (GitHub)",
-        "- `xoxb-...`, `xoxp-...` (Slack)",
-        "- `AKIA...` (AWS access key)",
-        "- Any long alphanumeric string (20+ chars) that the user labels as a key, token, or secret",
-        "",
-        "When detected, say something like: *\"That looks like an API key. Let me store it securely so you don't lose it. I'll use Secrets Manager (recommended) — OK?\"* Then store it immediately using Secrets Manager unless the user prefers native storage. Infer the key name from context (e.g., `openai_api_key`, `github_token`).",
-        "",
-        "### Storage Options",
-        "",
-        "When a user explicitly asks to save an API key, present both options:",
-        "",
-        "**Option 1 — Native (file-based)**:",
-        "- `node /skills/api-keys/native.js <user_id> set <key_name> <key_value>`",
-        "- Stored in your workspace file, persists across sessions via S3 sync",
-        "- KMS-encrypted at rest in S3, isolated to your user namespace",
-        "",
-        "**Option 2 — Secure (AWS Secrets Manager)** (recommended):",
-        "- `node /skills/api-keys/secret.js <user_id> set <key_name> <key_value>`",
-        "- Stored in AWS Secrets Manager, KMS-encrypted, auditable via CloudTrail",
-        "- NOT stored in workspace files — stronger isolation",
-        "",
-        "**Unified retrieval** (checks SM first, falls back to native):",
-        "- `node /skills/api-keys/retrieve.js <user_id> <key_name>`",
-        "",
-        "**Migration** between backends:",
-        "- `node /skills/api-keys/migrate.js <user_id> <key_name> native-to-secure`",
-        "- `node /skills/api-keys/migrate.js <user_id> <key_name> secure-to-native`",
-        "",
-        "Actions for both native.js and secret.js: `set`, `get`, `list`, `delete`",
-        "",
-        "**Important**: The `<user_id>` is your namespace (e.g. `telegram_12345`). Never write API keys to regular user files (s3-user-files). Always use the api-keys skill.",
-        "",
-        ...(process.env.BROWSER_IDENTIFIER
-          ? [
-              "## Browser (AgentCore Browser)",
-              "",
-              "You have the **agentcore-browser** skill for headless Chromium browsing. Use it when users ask to:",
-              "- Visit or navigate to a web page",
-              "- Take a screenshot of a website",
-              "- Interact with page elements (click buttons, fill forms, scroll)",
-              "",
-              "**Commands** (run via Bash):",
-              '- Navigate: `node /skills/agentcore-browser/navigate.js \'{"url": "https://example.com"}\'`',
-              '- Screenshot: `node /skills/agentcore-browser/screenshot.js \'{"description": "Page screenshot"}\'`',
-              '- Click: `node /skills/agentcore-browser/interact.js \'{"action": "click", "selector": "#btn"}\'`',
-              '- Type: `node /skills/agentcore-browser/interact.js \'{"action": "type", "selector": "#input", "text": "hello"}\'`',
-              '- Scroll: `node /skills/agentcore-browser/interact.js \'{"action": "scroll"}\'`',
-              '- Wait: `node /skills/agentcore-browser/interact.js \'{"action": "wait", "selector": ".results"}\'`',
-              "",
-              "Screenshots are uploaded to S3 and delivered as images to the user's chat.",
-              "The browser session is pre-created at startup — no setup needed.",
-              "",
-            ]
-          : []),
-        "## Sub-agents",
-        "",
-        "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.",
-        "Sub-agents share the same model and capabilities. Sandbox is disabled (the container is already isolated).",
+        "Use only `po_file_list`, `po_file_read`, `po_file_write`, and `po_file_delete` for persistent files.",
+        "Paths are relative to this user's server-owned workspace. Never ask for or invent a user ID or namespace.",
         "",
       ].join("\n"),
     );
@@ -638,9 +567,9 @@ function writeOpenClawConfig() {
  */
 async function pollOpenClawReadiness(namespace) {
   const ready = await waitForPort(OPENCLAW_PORT, "OpenClaw", 300000, 5000);
-  if (ready) {
+  if (ready && !gatewayQuarantined) {
     openclawReady = true;
-    workspaceSync.startPeriodicSave(namespace);
+    workspaceLifecycle.startPeriodic(WORKSPACE_SYNC_INTERVAL_MS);
     console.log(
       "[contract] OpenClaw ready — switching from lightweight agent to full OpenClaw",
     );
@@ -652,138 +581,12 @@ async function pollOpenClawReadiness(namespace) {
 }
 
 /**
- * Generate SigV4-signed HTTP headers for a WebSocket CDP endpoint.
- * The browser automation stream requires IAM authentication — Playwright's
- * connectOverCDP sends these as HTTP upgrade request headers.
- *
- * @param {string} wsEndpoint - WebSocket URL (wss://...)
- * @returns {object} Signed headers (Authorization, X-Amz-Date, X-Amz-Security-Token, Host)
- */
-async function signBrowserEndpoint(wsEndpoint) {
-  const { SignatureV4 } = require("@smithy/signature-v4");
-  const { Sha256 } = require("@aws-crypto/sha256-js");
-  const { defaultProvider } = require("@aws-sdk/credential-provider-node");
-
-  const url = new URL(wsEndpoint.replace(/^wss:/, "https:"));
-  const region = process.env.AWS_REGION || "us-east-1";
-
-  const signer = new SignatureV4({
-    service: "bedrock-agentcore",
-    region,
-    credentials: defaultProvider(),
-    sha256: Sha256,
-  });
-
-  const signed = await signer.sign({
-    method: "GET",
-    protocol: url.protocol,
-    hostname: url.hostname,
-    port: url.port ? Number(url.port) : undefined,
-    path: url.pathname + url.search,
-    headers: {
-      host: url.host,
-    },
-  });
-
-  // Return only the auth-relevant headers
-  const result = {};
-  for (const [k, v] of Object.entries(signed.headers)) {
-    if (/^(authorization|x-amz-|host)$/i.test(k) || k.startsWith("x-amz-")) {
-      result[k] = v;
-    }
-  }
-  return result;
-}
-
-/**
- * Start an AgentCore Browser session for the given user.
- * Non-fatal — logs and continues if browser feature is not enabled or SDK fails.
- */
-async function initBrowserSession(userId) {
-  const browserIdentifier = process.env.BROWSER_IDENTIFIER;
-  if (!browserIdentifier) return; // Feature not enabled
-
-  // Per-user sessions use a single userId; check state vars directly
-  if (currentBrowserSessionId) return; // Already initialized
-
-  try {
-    const { BedrockAgentCoreClient, StartBrowserSessionCommand } =
-      await import("@aws-sdk/client-bedrock-agentcore");
-    const client = new BedrockAgentCoreClient({ region: process.env.AWS_REGION || "us-east-1" });
-
-    const response = await client.send(new StartBrowserSessionCommand({
-      browserIdentifier,
-      name: userId.replace(/[^a-zA-Z0-9-]/g, "-").slice(0, 64),
-      sessionTimeoutSeconds: BROWSER_SESSION_TIMEOUT_SECONDS,
-      viewportConfiguration: {
-        width: 1280,
-        height: 720,
-      },
-    }));
-
-    const endpoint = response.streams?.automationStream?.streamEndpoint;
-    if (!endpoint) throw new Error("No automation stream endpoint returned");
-
-    currentBrowserSessionId = response.sessionId;
-    currentBrowserEndpoint = endpoint;
-
-    // Generate SigV4 auth headers for the WebSocket CDP connection
-    const headers = await signBrowserEndpoint(endpoint);
-
-    // Write endpoint + headers to file for skill processes to read
-    fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify({
-      endpoint, sessionId: response.sessionId, headers,
-    }));
-
-    // Refresh SigV4 headers every 4 min (signatures expire after ~5 min)
-    browserHeaderRefreshTimer = setInterval(async () => {
-      try {
-        const refreshed = await signBrowserEndpoint(currentBrowserEndpoint);
-        const data = JSON.parse(fs.readFileSync(BROWSER_SESSION_FILE, "utf8"));
-        data.headers = refreshed;
-        fs.writeFileSync(BROWSER_SESSION_FILE, JSON.stringify(data));
-      } catch (e) {
-        console.error("[browser] Failed to refresh SigV4 headers:", e.message);
-      }
-    }, 4 * 60 * 1000);
-
-    console.log("[browser] Session started for", userId, "-", response.sessionId);
-  } catch (err) {
-    console.error("[browser] Failed to start session for", userId, "-", err.message);
-    // Non-fatal — continue without browser
-  }
-}
-
-/**
- * Stop all active browser sessions. Called during SIGTERM shutdown.
- */
-async function stopBrowserSessions() {
-  const browserIdentifier = process.env.BROWSER_IDENTIFIER;
-  if (!browserIdentifier) return;
-  if (!currentBrowserSessionId) return;
-
-  try {
-    const { BedrockAgentCoreClient, StopBrowserSessionCommand } =
-      await import("@aws-sdk/client-bedrock-agentcore");
-    const client = new BedrockAgentCoreClient({ region: process.env.AWS_REGION || "us-east-1" });
-
-    await client.send(new StopBrowserSessionCommand({
-      browserIdentifier,
-      sessionId: currentBrowserSessionId,
-    }));
-    console.log("[browser] Stopped session for user (sessionId:", currentBrowserSessionId + ")");
-  } catch (err) {
-    console.error("[browser] Stop failed (sessionId:", currentBrowserSessionId + ") -", err.message);
-  }
-}
-
-/**
  * Auto-restart OpenClaw if it crashes mid-session.
  * Uses linear backoff (5s, 10s, 15s) with a maximum of 3 retries.
  * Does not restart during shutdown or if OpenClaw recovered on its own.
  */
 function scheduleOpenClawRestart(namespace) {
-  if (shuttingDown) return;
+  if (shuttingDown || gatewayQuarantined) return;
   if (openclawRestartCount >= OPENCLAW_MAX_RESTARTS) {
     console.error(
       `[contract] OpenClaw crashed ${openclawRestartCount} times — giving up, lightweight agent will handle messages`,
@@ -796,7 +599,7 @@ function scheduleOpenClawRestart(namespace) {
     `[contract] Scheduling OpenClaw restart #${openclawRestartCount} in ${delay}ms...`,
   );
   setTimeout(() => {
-    if (shuttingDown || openclawReady) return;
+    if (shuttingDown || openclawReady || gatewayQuarantined) return;
     console.log(
       `[contract] Restarting OpenClaw (attempt #${openclawRestartCount})...`,
     );
@@ -805,23 +608,8 @@ function scheduleOpenClawRestart(namespace) {
       ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
       { stdio: ["ignore", "pipe", "pipe"], env: lastOpenClawEnv },
     );
-    const captureLog2 = (stream, label) => {
-      let buf = "";
-      stream.on("data", (chunk) => {
-        buf += chunk.toString();
-        const lines = buf.split("\n");
-        buf = lines.pop();
-        for (const line of lines) {
-          if (line.trim()) {
-            console.log(`[openclaw:${label}] ${line}`);
-            openclawLogs.push(`[${label}] ${line}`);
-            if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
-          }
-        }
-      });
-    };
-    captureLog2(openclawProcess.stdout, "out");
-    captureLog2(openclawProcess.stderr, "err");
+    cwLogger.drainChildOutput(openclawProcess.stdout, "OPENCLAW_STDOUT");
+    cwLogger.drainChildOutput(openclawProcess.stderr, "OPENCLAW_STDERR");
     openclawProcess.on("exit", (code2) => {
       console.log(
         `[contract] OpenClaw (restart #${openclawRestartCount}) exited with code ${code2}`,
@@ -842,160 +630,223 @@ function scheduleOpenClawRestart(namespace) {
 /**
  * Initialization — called on first /invocations request.
  *
- * Uses pre-fetched secrets. Starts proxy, OpenClaw, and workspace restore
- * in parallel. Only waits for proxy readiness (~5s), then returns.
+ * Mints scoped workspace credentials, restores and verifies the authoritative
+ * workspace, then starts the proxy and OpenClaw. Only waits for proxy
+ * readiness (~5s), then returns.
  * OpenClaw readiness is polled in the background.
  */
-async function init(userId, actorId, channel) {
+function quarantineRuntime(error, code = "RUNTIME_INITIALIZATION_FAILED") {
+  gatewayQuarantined = Object.freeze({
+    code,
+    message: "The trusted runtime boundary could not be maintained",
+  });
+  openclawReady = false;
+  proxyReady = false;
+  if (credentialRefreshTimer) {
+    clearInterval(credentialRefreshTimer);
+    credentialRefreshTimer = null;
+  }
+  credentialRefreshInProgress = false;
+  for (const child of [openclawProcess, proxyProcess]) {
+    try {
+      child?.kill("SIGTERM");
+    } catch {}
+  }
+  console.error(`[contract] Fatal runtime failure: ${error.message}`);
+  const fatalExitTimer = setTimeout(() => process.exit(1), 2_000);
+  fatalExitTimer.unref();
+}
+
+function stopChildProcess(child, label, graceMs = 5_000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let killTimer;
+    let failureTimer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      clearTimeout(failureTimer);
+      child.removeListener("exit", onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onExit = () => finish();
+    child.once("exit", onExit);
+    try {
+      child.kill("SIGTERM");
+    } catch (error) {
+      finish(error);
+      return;
+    }
+    killTimer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch (error) {
+        finish(error);
+      }
+    }, graceMs);
+    failureTimer = setTimeout(
+      () => finish(new Error(`${label} did not exit after SIGKILL`)),
+      graceMs + 2_000,
+    );
+  });
+}
+
+async function stopOpenClawForSnapshot() {
+  openclawReady = false;
+  await stopChildProcess(openclawProcess, "OpenClaw");
+  openclawProcess = null;
+}
+
+async function stopSupportProcesses() {
+  proxyReady = false;
+  await stopChildProcess(proxyProcess, "Bedrock proxy");
+  proxyProcess = null;
+  await cwLogger.shutdown();
+}
+
+async function init(
+  internalUserId,
+  namespace,
+  workspaceCapability,
+  { warmModel = true } = {},
+) {
+  if (
+    typeof workspaceCapability !== "string" ||
+    !workspaceCapability ||
+    workspaceCapability.length > 2_048
+  ) {
+    throw new Error("A trusted workspace capability is required");
+  }
+  currentWorkspaceCapability = workspaceCapability;
   if (proxyReady) return; // Already initialized
   if (initInProgress) return initPromise;
+  runtimeInitializationGuard.claim();
   initInProgress = true;
 
   initPromise = (async () => {
-    const namespace = actorId.replace(/:/g, "_");
-    currentUserId = userId;
-    currentNamespace = namespace;
-    await cwLogger.init(`${namespace}-${Date.now()}`);
-
-    // Expose USER_ID so child processes (OpenClaw skill scripts) inherit it
-    process.env.USER_ID = actorId;
-    // Expose INTERNAL_USER_ID for lightweight agent tool env (eventbridge-cron authorization)
-    process.env.INTERNAL_USER_ID = userId;
-    agent.TOOL_ENV.INTERNAL_USER_ID = userId;
-
-    // Write initial identity file for the proxy to read
-    updateIdentityFile(actorId, channel);
-
-    console.log(
-      `[contract] Init for user=${userId} actor=${actorId} namespace=${namespace}`,
+    console.log("[contract] Creating scoped S3 credentials");
+    const credentials = await scopedCreds.createScopedCredentials(
+      workspaceCapability,
     );
+    const credentialFiles = scopedCreds.writeCredentialFiles(
+      credentials,
+      SCOPED_CREDS_DIR,
+    );
+    const refreshingS3 = new RefreshingScopedS3();
+    refreshingS3.setCredentials(credentials);
 
-    // 0. Wait for pre-fetched secrets (should already be done by now)
-    if (!secretsReady && secretsPrefetchPromise) {
-      console.log("[contract] Waiting for secrets pre-fetch to complete...");
-      await secretsPrefetchPromise;
-    }
+    const scopedEnvironment = scopedCreds.buildOpenClawEnv({
+      credDir: SCOPED_CREDS_DIR,
+      baseEnv: process.env,
+    });
+    const workspaceEnvironment = {
+      AWS_REGION: RUNTIME_REGION,
+      AWS_DEFAULT_REGION: RUNTIME_REGION,
+      S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET,
+      PERSONAL_OPERATOR_WORKSPACE_PREFIX: namespace,
+      PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE:
+        credentialFiles.credentialsPath,
+    };
+    currentInternalUserId = internalUserId;
+    currentNamespace = namespace;
+    await cwLogger.init();
+    console.log(`[contract] Init for internalUserId=${internalUserId}`);
 
-    // Retry secrets fetch inline if pre-fetch failed (transient error recovery)
-    if (!GATEWAY_TOKEN) {
-      console.log(
-        "[contract] Gateway token missing — retrying secrets fetch...",
-      );
-      await prefetchSecrets();
-    }
-    if (!GATEWAY_TOKEN) {
-      throw new Error(
-        "Gateway token not available — cannot authenticate WebSocket connections",
-      );
-    }
-
-    // 1b. Create scoped S3 credentials (per-user IAM isolation)
-    // Restricts S3 access to the user's namespace prefix, preventing cross-user
-    // data access even through OpenClaw's bash/code execution tools.
-    let scopedCredsAvailable = false;
-    if (process.env.EXECUTION_ROLE_ARN) {
-      try {
-        console.log("[contract] Creating scoped S3 credentials for namespace=", namespace);
-        const creds = await scopedCreds.createScopedCredentials(namespace, { internalUserId: userId });
-        scopedCreds.writeCredentialFiles(creds, SCOPED_CREDS_DIR);
-        workspaceSync.configureCredentials(creds);
-        scopedCredsAvailable = true;
-        console.log("[contract] Scoped S3 credentials created and applied");
-
-        // Refresh credentials before expiry (45 min timer, max 1 hour session)
-        if (credentialRefreshTimer) clearInterval(credentialRefreshTimer);
-        credentialRefreshTimer = setInterval(async () => {
-          try {
-            console.log("[contract] Refreshing scoped S3 credentials...");
-            const refreshed = await scopedCreds.createScopedCredentials(namespace, { internalUserId: userId });
-            scopedCreds.writeCredentialFiles(refreshed, SCOPED_CREDS_DIR);
-            workspaceSync.configureCredentials(refreshed);
-            console.log("[contract] Scoped S3 credentials refreshed");
-          } catch (err) {
-            console.error(`[contract] Credential refresh failed: ${err.message}`);
-          }
-        }, 45 * 60 * 1000); // 45 minutes
-      } catch (err) {
-        console.warn(`[contract] Scoped credentials failed (falling back to full role): ${err.message}`);
-        // Non-fatal — fall back to full execution role credentials
-      }
-    } else {
-      console.log("[contract] EXECUTION_ROLE_ARN not set — skipping credential scoping");
-    }
-
-    // 1c. Clean up stale lock files restored from S3 (non-blocking)
-    // Runs in parallel with proxy startup — does not block init.
-    const lockCleanupPromise = cleanupLockFiles().catch((err) => {
-      console.warn(`[contract] Lock cleanup failed: ${err.message}`);
+    const snapshotStore = new workspaceSync.WorkspaceSnapshotStore({
+      s3: refreshingS3,
+      bucket: process.env.S3_USER_FILES_BUCKET,
+      namespace,
+      pathPolicy: new WorkspacePathPolicy(),
+      sqliteSnapshot: new SqliteSnapshot(),
+      fs,
+      clock: () => new Date(),
+      uuid: randomUUID,
+    });
+    workspaceLifecycle = new WorkspaceLifecycle({
+      snapshotStore,
+      namespace,
+      seedDir: WORKSPACE_SEED_DIR,
+      mountedDir: SESSION_STORAGE_MOUNT,
+      homeLinkPath: OPENCLAW_HOME_LINK,
+      stopOpenClaw: stopOpenClawForSnapshot,
+      stopSupportProcesses,
+    });
+    await workspaceLifecycle.initialize();
+    await ensureCapabilityRelayServer();
+    await agent.configureWorkspaceRuntime({
+      env: workspaceEnvironment,
+      capabilityAdapters: capabilityRelayModule.createCapabilityAdapters({
+        relay: capabilityRelay,
+      }),
     });
 
-    // 2. Start the Bedrock proxy with user identity env vars
-    // Only pass required env vars — avoid leaking secrets via process.env spread
+    if (credentialRefreshTimer) clearInterval(credentialRefreshTimer);
+    credentialRefreshInProgress = false;
+    credentialRefreshTimer = setInterval(async () => {
+      if (credentialRefreshInProgress) return;
+      credentialRefreshInProgress = true;
+      try {
+        const refreshed = await scopedCreds.createScopedCredentials(
+          currentWorkspaceCapability,
+        );
+        scopedCreds.writeCredentialFiles(refreshed, SCOPED_CREDS_DIR);
+        refreshingS3.setCredentials(refreshed);
+        console.log("[contract] Scoped S3 credentials refreshed");
+      } catch (error) {
+        quarantineRuntime(error, "SCOPED_CREDENTIAL_FAILURE");
+      } finally {
+        credentialRefreshInProgress = false;
+      }
+    }, 10 * 60 * 1000);
+    credentialRefreshTimer.unref?.();
+
+    writeOpenClawConfig();
+
     console.log("[contract] Starting Bedrock proxy...");
-    const proxyEnv = {
-      PATH: process.env.PATH,
-      HOME: process.env.HOME || "/root",
-      NODE_PATH: process.env.NODE_PATH || "/app/node_modules",
-      NODE_OPTIONS: process.env.NODE_OPTIONS || "",
-      AWS_REGION: process.env.AWS_REGION || "us-west-2",
-      BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "",
-      COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
-      COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
-      COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
-      S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
-      SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
-      SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
-      USER_ID: actorId,
-      INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
-      CHANNEL: channel,
-      OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
-    };
+    const proxyEnv = runtimePolicy.buildProxyChildEnv({
+      baseEnv: process.env,
+      internalUserId,
+      namespace,
+      scopedCredentialsFile: credentialFiles.credentialsPath,
+    });
     proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
       env: proxyEnv,
       stdio: ["inherit", "pipe", "pipe"],
     });
-    proxyProcess.stdout.on("data", (d) => {
-      d.toString().split("\n").filter(Boolean).forEach(line => console.log(`[proxy:out] ${line}`));
+    cwLogger.drainChildOutput(proxyProcess.stdout, "PROXY_STDOUT");
+    cwLogger.drainChildOutput(proxyProcess.stderr, "PROXY_STDERR");
+    const handleProxyExit = createUnexpectedChildExitHandler({
+      label: "Bedrock proxy",
+      code: "BEDROCK_PROXY_EXITED",
+      isExpected: () => shuttingDown || Boolean(gatewayQuarantined),
+      markUnavailable: () => {
+        proxyReady = false;
+      },
+      quarantine: quarantineRuntime,
     });
-    proxyProcess.stderr.on("data", (d) => {
-      d.toString().split("\n").filter(Boolean).forEach(line => console.error(`[proxy:err] ${line}`));
-    });
-    proxyProcess.on("exit", (code) => {
-      console.log(`[contract] Proxy exited with code ${code}`);
-      proxyReady = false;
-    });
-
-    // Wait for lock cleanup to complete before starting OpenClaw
-    await lockCleanupPromise;
-
-    // Write OpenClaw config and start gateway (non-blocking)
-    writeOpenClawConfig();
-    console.log("[contract] Starting OpenClaw gateway (headless)...");
-    // Build scoped env for OpenClaw — excludes container credentials,
-    // uses credential_process for scoped S3 access only.
-    // Falls back to full process.env if scoped credentials failed.
-    let openclawEnv;
-    if (scopedCredsAvailable) {
-      openclawEnv = scopedCreds.buildOpenClawEnv({
-        credDir: SCOPED_CREDS_DIR,
-        baseEnv: process.env,
-      });
-    } else {
-      // SECURITY: Never start OpenClaw with full execution role credentials.
-      // Build a safe env that strips ALL AWS credential sources.
-      // OpenClaw will have zero AWS access — tools fail gracefully.
-      console.error(
-        "[contract] WARNING: Scoped credentials failed — starting OpenClaw with zero AWS access",
+    proxyProcess.on("exit", (code, signal) => {
+      console.log(
+        `[contract] Proxy exited with code ${code} signal ${signal || "none"}`,
       );
-      openclawEnv = scopedCreds.buildOpenClawEnv({
-        credDir: null,
-        baseEnv: process.env,
-      });
-      openclawEnv.OPENCLAW_NO_AWS = "1";
-    }
-    // Propagate INTERNAL_USER_ID so OpenClaw skills (e.g., eventbridge-cron)
-    // can resolve the container's authorized userId for DynamoDB writes.
-    openclawEnv.INTERNAL_USER_ID = userId;
+      handleProxyExit(code, signal);
+    });
+    proxyProcess.on("error", (error) => {
+      proxyReady = false;
+      if (!shuttingDown && !gatewayQuarantined) {
+        quarantineRuntime(error, "BEDROCK_PROXY_PROCESS_ERROR");
+      }
+    });
+
+    console.log("[contract] Starting OpenClaw gateway (headless)...");
+    const openclawEnv = runtimePolicy.buildOpenClawChildEnv({
+      scopedEnv: scopedEnvironment,
+      workspacePrefix: namespace,
+    });
     openclawProcess = spawn(
       "openclaw",
       ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
@@ -1003,58 +854,20 @@ async function init(userId, actorId, channel) {
     );
     lastOpenClawEnv = openclawEnv;
     openclawRestartCount = 0;
-    // Capture OpenClaw stdout/stderr for diagnostics
-    const captureLog = (stream, label) => {
-      let buf = "";
-      stream.on("data", (chunk) => {
-        buf += chunk.toString();
-        const lines = buf.split("\n");
-        buf = lines.pop(); // keep incomplete line in buffer
-        for (const line of lines) {
-          if (line.trim()) {
-            console.log(`[openclaw:${label}] ${line}`);
-            openclawLogs.push(`[${label}] ${line}`);
-            if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
-          }
-        }
-      });
-    };
-    captureLog(openclawProcess.stdout, "out");
-    captureLog(openclawProcess.stderr, "err");
+    cwLogger.drainChildOutput(openclawProcess.stdout, "OPENCLAW_STDOUT");
+    cwLogger.drainChildOutput(openclawProcess.stderr, "OPENCLAW_STDERR");
     openclawProcess.on("exit", (code) => {
       console.log(`[contract] OpenClaw exited with code ${code}`);
       openclawExitCode = code;
       openclawReady = false;
       scheduleOpenClawRestart(currentNamespace);
     });
-
-    // Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available
-    const sessionStorageAvailable = setupSessionStorageSymlink();
-
-    // Restore workspace from S3 if session storage is empty or unavailable
-    if (sessionStorageAvailable) {
-      // Check if session storage .openclaw dir has content (non-empty = resumed session)
-      const mountedOpenclawDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
-      let hasContent = false;
-      try {
-        const entries = fs.readdirSync(mountedOpenclawDir);
-        hasContent = entries.length > 0;
-      } catch { /* dir doesn't exist yet */ }
-
-      if (hasContent) {
-        console.log("[contract] Session storage has existing data — skipping S3 restore");
-      } else {
-        console.log("[contract] Session storage is empty — restoring from S3 backup");
-        workspaceSync.restoreWorkspace(namespace).catch((err) => {
-          console.warn(`[contract] Workspace restore failed: ${err.message}`);
-        });
+    openclawProcess.on("error", (error) => {
+      openclawReady = false;
+      if (!shuttingDown && !gatewayQuarantined) {
+        quarantineRuntime(error, "OPENCLAW_PROCESS_ERROR");
       }
-    } else {
-      // No session storage — use S3 sync as primary (existing behavior)
-      workspaceSync.restoreWorkspace(namespace).catch((err) => {
-        console.warn(`[contract] Workspace restore failed: ${err.message}`);
-      });
-    }
+    });
 
     // 2. Wait only for proxy readiness (~5s)
     proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
@@ -1064,18 +877,15 @@ async function init(userId, actorId, channel) {
 
     // 2b. Warm proxy JIT — send a lightweight request to trigger V8 compilation
     // of the request handling path, so the first real user message is faster.
-    warmProxyJit().catch(() => {}); // non-blocking, fire-and-forget
+    if (warmModel) {
+      warmProxyJit().catch(() => {}); // non-blocking, fire-and-forget
+    }
 
     // 3. Poll for OpenClaw readiness in the background (don't block)
     pollOpenClawReadiness(namespace).catch((err) => {
       console.error(
         `[contract] OpenClaw readiness polling failed: ${err.message}`,
       );
-    });
-
-    // Start browser session in background (non-blocking, fire-and-forget)
-    initBrowserSession(userId).catch((err) => {
-      console.error(`[browser] Init error (non-fatal): ${err.message}`);
     });
 
     console.log(
@@ -1086,7 +896,7 @@ async function init(userId, actorId, channel) {
   try {
     await initPromise;
   } catch (err) {
-    // Reset initPromise on failure so concurrent requests don't await a stale rejected promise
+    quarantineRuntime(err);
     initPromise = null;
     throw err;
   } finally {
@@ -1098,8 +908,7 @@ async function init(userId, actorId, channel) {
  * Extract plain text from message content — handles string, array of content
  * blocks, JSON-serialized array of content blocks, or object with text/content.
  *
- * Recursively unwraps nested content blocks (common with subagent responses
- * where each layer wraps the previous one in content block JSON).
+ * Recursively unwraps nested content blocks.
  */
 function extractTextFromContent(content) {
   if (!content) return "";
@@ -1186,153 +995,15 @@ function extractTextFromContent(content) {
   return "";
 }
 
-// ---------------------------------------------------------------------------
-// Telegram progressive streaming helpers
-// ---------------------------------------------------------------------------
-
-const https = require("https");
-
 /**
- * Call the Telegram Bot API. Returns parsed JSON response.
- */
-function telegramApiCall(method, body) {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
-    const req = https.request(
-      {
-        hostname: "api.telegram.org",
-        path: `/bot${TELEGRAM_BOT_TOKEN}/${method}`,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-        timeout: 10000,
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(data));
-          } catch {
-            resolve({ ok: false, description: data });
-          }
-        });
-      },
-    );
-    req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("Telegram API timeout"));
-    });
-    req.end(payload);
-  });
-}
-
-/**
- * Create a Telegram streamer that shows "typing..." indicator while working,
- * then sends ONE clean final message when done. No intermediate edits.
- *
- * onDelta(text): starts a typing indicator loop (sendChatAction every 5s).
- * finalize(text): stops the typing loop and sends a single sendMessage.
- */
-function createTelegramStreamer(chatId) {
-  let typingInterval = null;
-  let typingStarted = false;
-
-  const sendTyping = async () => {
-    try {
-      await telegramApiCall("sendChatAction", {
-        chat_id: chatId,
-        action: "typing",
-      });
-    } catch (err) {
-      console.warn(`[telegram-stream] Typing indicator error: ${err.message}`);
-    }
-  };
-
-  const startTypingLoop = () => {
-    if (typingStarted) return;
-    typingStarted = true;
-    sendTyping();
-    typingInterval = setInterval(sendTyping, 5000);
-    console.log(`[telegram-stream] Typing indicator started for chat_id=${chatId}`);
-  };
-
-  const stopTypingLoop = () => {
-    if (typingInterval) {
-      clearInterval(typingInterval);
-      typingInterval = null;
-    }
-  };
-
-  const onDelta = (text) => {
-    if (!text || text.length < 60) return;
-    startTypingLoop();
-  };
-
-  const finalize = async (text) => {
-    stopTypingLoop();
-    if (!text) return { messageId: null };
-    try {
-      const resp = await telegramApiCall("sendMessage", {
-        chat_id: chatId,
-        text,
-      });
-      const messageId = resp.ok ? resp.result?.message_id : null;
-      if (messageId) {
-        console.log(`[telegram-stream] Final message sent: msg_id=${messageId}`);
-      }
-      return { messageId };
-    } catch (err) {
-      console.warn(`[telegram-stream] Final send error: ${err.message}`);
-      return { messageId: null };
-    }
-  };
-
-  return { onDelta, finalize };
-}
-
-/**
- * Process the message queue serially to prevent concurrent WebSocket race conditions.
- */
-async function processMessageQueue() {
-  if (processingMessage || messageQueue.length === 0) return;
-  processingMessage = true;
-
-  while (messageQueue.length > 0) {
-    const { message, onDelta, resolve, reject } = messageQueue.shift();
-    console.log(
-      `[contract] Processing queued message (${messageQueue.length} remaining)`,
-    );
-
-    try {
-      const response = await bridgeMessage(message, 620000, onDelta);
-      resolve(response);
-    } catch (err) {
-      reject(err);
-    }
-  }
-
-  processingMessage = false;
-}
-
-/**
- * Enqueue a message and wait for its response (serialized processing).
+ * Submit bounded serialized gateway work.
  * @param {string} message - The message to send
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-function enqueueMessage(message, onDelta) {
-  return new Promise((resolve, reject) => {
-    messageQueue.push({ message, onDelta, resolve, reject });
-    console.log(
-      `[contract] Message enqueued (queue length: ${messageQueue.length})`,
-    );
-    processMessageQueue().catch((err) => {
-      console.error(`[contract] Queue processing error: ${err.message}`);
-    });
-  });
+function enqueueMessage(message, runId, onDelta) {
+  return gatewayMessageExecutor.submit(() =>
+    bridgeMessage(message, 620000, onDelta, runId),
+  );
 }
 
 /**
@@ -1341,233 +1012,18 @@ function enqueueMessage(message, onDelta) {
  * @param {number} timeoutMs - Timeout in milliseconds
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  */
-async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
-  const { randomUUID } = require("crypto");
-  return new Promise((resolve) => {
-    const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
-    console.log(`[contract] Connecting to WebSocket: ${wsUrl}`);
-    const ws = new WebSocket(wsUrl, {
-      origin: `http://127.0.0.1:${OPENCLAW_PORT}`,
-    });
-    let responseText = "";
-    let authenticated = false;
-    let chatSent = false;
-    let resolved = false;
-    let connectReqId = null;
-    let chatReqId = null;
-    let unhandledMsgs = [];
-
-    const done = (text) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      try {
-        ws.close();
-      } catch {}
-      resolve(text);
-    };
-
-    const timer = setTimeout(() => {
-      const debugInfo =
-        unhandledMsgs.length > 0
-          ? ` unhandled=[${unhandledMsgs.slice(0, 5).join(" | ")}]`
-          : "";
-      console.warn(
-        `[contract] WebSocket timeout after ${timeoutMs}ms (auth=${authenticated}, chatSent=${chatSent}, responseLen=${responseText.length})${debugInfo}`,
-      );
-      // Return "" on timeout so caller can fall back to lightweight agent
-      done(responseText || "");
-    }, timeoutMs);
-
-    ws.on("open", () => {
-      console.log("[contract] WebSocket connected, waiting for challenge...");
-    });
-
-    ws.on("message", (data) => {
-      const raw = data.toString();
-      console.log(`[contract] WS rx: ${raw.slice(0, 500)}`);
-      let msg;
-      try {
-        msg = JSON.parse(raw);
-      } catch (e) {
-        console.log(`[contract] WS parse error: ${e.message}`);
-        return;
-      }
-
-      // Step 1: Server sends connect.challenge event -> client sends connect request
-      if (msg.type === "event" && msg.event === "connect.challenge") {
-        console.log(
-          "[contract] Received challenge, sending connect request...",
-        );
-        connectReqId = randomUUID();
-        ws.send(
-          JSON.stringify({
-            type: "req",
-            id: connectReqId,
-            method: "connect",
-            params: {
-              minProtocol: 3,
-              maxProtocol: 3,
-              client: {
-                id: "openclaw-control-ui",
-                mode: "backend",
-                version: "dev",
-                platform: "linux",
-              },
-              caps: [],
-              auth: { token: GATEWAY_TOKEN },
-              role: "operator",
-              scopes: ["operator.admin", "operator.read", "operator.write"],
-            },
-          }),
-        );
-        return;
-      }
-
-      // Step 2: Server responds to connect request -> send chat.send
-      if (msg.type === "res" && msg.id === connectReqId) {
-        if (!msg.ok) {
-          console.error(
-            `[contract] Connect rejected: ${JSON.stringify(msg.error || msg.payload)}`,
-          );
-          done(
-            `Auth failed: ${msg.error?.message || JSON.stringify(msg.payload)}`,
-          );
-          return;
-        }
-        authenticated = true;
-        console.log(
-          "[contract] Authenticated successfully, sending chat.send...",
-        );
-        chatReqId = randomUUID();
-        ws.send(
-          JSON.stringify({
-            type: "req",
-            id: chatReqId,
-            method: "chat.send",
-            params: {
-              sessionKey: "global",
-              message: message,
-              idempotencyKey: chatReqId,
-            },
-          }),
-        );
-        chatSent = true;
-        return;
-      }
-
-      // Helper: try all known content locations in a payload
-      const extractFromPayload = (pl) => {
-        return (
-          extractTextFromContent(pl.message?.content) ||
-          extractTextFromContent(pl.message) ||
-          extractTextFromContent(pl.text) ||
-          extractTextFromContent(pl.content)
-        );
-      };
-
-      // Step 3: Chat events — state: "delta" (streaming) or "final" (complete)
-      // OpenClaw puts content in payload.message.content (usual) or
-      // directly in payload.message (string or content-blocks array).
-      if (msg.type === "event" && msg.event === "chat") {
-        const payload = msg.payload || {};
-
-        if (payload.state === "delta") {
-          const text = extractFromPayload(payload);
-          if (text) {
-            responseText = text; // Delta replaces (accumulates progressively)
-            if (onDelta) onDelta(text);
-          }
-          return;
-        }
-
-        if (payload.state === "final") {
-          // Final message may include the complete text
-          const text = extractFromPayload(payload);
-          if (text) responseText = text;
-          console.log(`[contract] Chat final (${responseText.length} chars)`);
-          if (responseText) {
-            done(responseText);
-          } else {
-            // Empty final — log full payload for diagnostics and return ""
-            // to signal caller that the bridge got no content.
-            console.warn(
-              `[contract] Empty final event — payload: ${JSON.stringify(payload).slice(0, 1000)}`,
-            );
-            done("");
-          }
-          return;
-        }
-
-        if (payload.state === "error") {
-          console.error(
-            `[contract] Chat error event: ${payload.errorMessage || "unknown"}`,
-          );
-          done(
-            responseText || `Chat error: ${payload.errorMessage || "unknown"}`,
-          );
-          return;
-        }
-
-        if (payload.state === "aborted") {
-          done(responseText || "Chat aborted.");
-          return;
-        }
-        return;
-      }
-
-      // Step 4: Response to chat.send request (accepted/final)
-      if (msg.type === "res" && msg.id === chatReqId) {
-        if (!msg.ok) {
-          console.error(
-            `[contract] Chat error: ${JSON.stringify(msg.error || msg.payload)}`,
-          );
-          done(
-            responseText || `Chat error: ${msg.error?.message || "unknown"}`,
-          );
-          return;
-        }
-        // Log full payload for debugging
-        const status = msg.payload?.status;
-        console.log(
-          `[contract] Chat res status=${status} payload=${JSON.stringify(msg.payload).slice(0, 500)}`,
-        );
-        // "started" or "accepted" = in progress, wait for streaming events
-        if (status === "started" || status === "accepted") return;
-        // "final" or "done" = completed — return "" if no content (bridge empty)
-        if (responseText) {
-          done(responseText);
-        } else {
-          console.warn(
-            `[contract] Chat response completed with no streaming content — payload: ${JSON.stringify(msg.payload).slice(0, 500)}`,
-          );
-          done("");
-        }
-        return;
-      }
-
-      // Unhandled message — log for debugging
-      unhandledMsgs.push(raw.slice(0, 300));
-    });
-
-    ws.on("error", (err) => {
-      console.error(`[contract] WebSocket error: ${err.message}`);
-      // Return "" on error so caller can fall back to lightweight agent
-      done(responseText || "");
-    });
-
-    ws.on("close", (code, reason) => {
-      const reasonStr = reason ? reason.toString() : "";
-      const debugInfo =
-        unhandledMsgs.length > 0
-          ? ` unhandled=[${unhandledMsgs.slice(0, 3).join(" | ")}]`
-          : "";
-      console.warn(
-        `[contract] WebSocket closed: code=${code} reason=${reasonStr} auth=${authenticated} chatSent=${chatSent} responseLen=${responseText.length}${debugInfo}`,
-      );
-      // Return "" on unexpected close so caller can fall back to lightweight agent
-      done(responseText || "");
-    });
+async function bridgeMessage(message, timeoutMs = 620000, onDelta, runId) {
+  const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
+  console.log(`[contract] Invoking committed agent state machine: ${wsUrl}`);
+  return gatewayInvocation.invokeGatewayAgent({
+    WebSocketConstructor: WebSocket,
+    url: wsUrl,
+    token: GATEWAY_TOKEN,
+    message,
+    runId,
+    timeoutMs,
+    onDelta,
+    logger: console,
   });
 }
 
@@ -1605,17 +1061,17 @@ const server = http.createServer(async (req, res) => {
     const uptimeSec = Math.floor((now - startTime) / 1000);
     // HealthyBusy prevents AgentCore from terminating during active tasks.
     // Healthy allows natural idle termination when no tasks are running.
-    const status = activeTaskCount > 0 ? "HealthyBusy" : "Healthy";
+    const status = activeTaskTracker.count > 0 ? "HealthyBusy" : "Healthy";
     const responseBody = {
       status,
       time_of_last_update: lastActivityTime,
-      active_tasks: activeTaskCount,
+      active_tasks: activeTaskTracker.count,
     };
 
     // Log every ping for the first 5 minutes, then every 60s
     if (uptimeSec < 300 || now - lastPingLogTime >= PING_LOG_INTERVAL_MS) {
       console.log(
-        `[contract] /ping #${pingCount} uptime=${uptimeSec}s status=${responseBody.status} openclawReady=${openclawReady} proxyReady=${proxyReady} activeTasks=${activeTaskCount}`,
+        `[contract] /ping #${pingCount} uptime=${uptimeSec}s status=${responseBody.status} openclawReady=${openclawReady} proxyReady=${proxyReady} activeTasks=${activeTaskTracker.count}`,
       );
       lastPingLogTime = now;
     }
@@ -1626,7 +1082,7 @@ const server = http.createServer(async (req, res) => {
   }
 
 
-  // POST /invocations — Chat handler
+  // POST /invocations — trusted runtime actions
   if (req.method === "POST" && req.url === "/invocations") {
     let body = "";
     let bodySize = 0;
@@ -1646,27 +1102,43 @@ const server = http.createServer(async (req, res) => {
       if (aborted) return;
       try {
         const payload = body ? JSON.parse(body) : {};
-        const action = payload.action || "status";
+        const action = payload.action === undefined ? "status" : payload.action;
+        let boundInvocation;
+        try {
+          boundInvocation = runtimeInvocationHandler.handle(payload);
+        } catch (identityError) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              response: "This invocation does not match the bound runtime identity.",
+              status: "failed",
+              errorCode:
+                identityError.code || "INVALID_SESSION_IDENTITY",
+            }),
+          );
+          return;
+        }
+        const { identity, delivery, authority, request } = boundInvocation;
 
-        // Status check (no init needed)
         if (action === "status") {
-          // Fetch proxy /health for request counters (non-blocking — null on failure)
           const proxyHealth = await checkProxyHealth();
 
           const diag = {
             buildVersion: BUILD_VERSION,
             uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
-            currentUserId,
+            currentInternalUserId,
+            boundInternalUserId: identity.internalUserId,
             openclawReady,
+            gatewayQuarantined,
+            workspaceLifecycle: workspaceLifecycle?.status() || null,
             proxyReady,
-            secretsReady,
             openclawExitCode,
             openclawPid: openclawProcess?.pid || null,
-            openclawLogs: openclawLogs.slice(-20),
+            discardedChildOutputBytes: cwLogger.childOutputCounts(),
             totalRequestCount: proxyHealth?.total_requests ?? null,
-            subagentRequestCount: proxyHealth?.subagent_requests ?? null,
-            activeTaskCount,
-            pingStatus: activeTaskCount > 0 ? "HealthyBusy" : "Healthy",
+            activeTaskCount: activeTaskTracker.count,
+            pingStatus:
+              activeTaskTracker.count > 0 ? "HealthyBusy" : "Healthy",
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));
@@ -1675,16 +1147,30 @@ const server = http.createServer(async (req, res) => {
 
         // Warmup action — trigger lazy init without blocking for a chat response
         if (action === "warmup") {
+          if (gatewayQuarantined) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                status: "quarantined",
+                errorCode: "AGENT_RUNTIME_QUARANTINED",
+              }),
+            );
+            return;
+          }
+
           lastActivityTime = Math.floor(Date.now() / 1000);
-          const { userId, actorId, channel } = payload;
           if (openclawReady && proxyReady) {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "ready" }));
             return;
           }
           // Trigger init in background if not already running
-          if (!initInProgress && userId && actorId) {
-            init(userId, actorId, channel || "unknown").catch((err) => {
+          if (!initInProgress) {
+            init(
+              identity.internalUserId,
+              identity.namespace,
+              authority.workspaceCapability,
+            ).catch((err) => {
               console.error(`[contract] Warmup init failed: ${err.message}`);
             });
           }
@@ -1693,303 +1179,312 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        // Cron action — blocks until init completes, then bridges the message
-        if (action === "cron") {
-          const { userId, actorId, channel, message } = payload;
-          if (!userId || !actorId || !message) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({ error: "Missing userId, actorId, or message" }),
-            );
-            return;
-          }
-
-          // Update shared identity file so proxy picks up cross-channel changes
-          updateIdentityFile(actorId, channel || "unknown");
-
-          // Block until init completes (unlike chat which returns immediately)
-          if (!openclawReady || !proxyReady) {
-            try {
-              if (!initInProgress) {
-                await init(userId, actorId, channel || "unknown");
-              } else {
-                await initPromise;
-              }
-            } catch (err) {
-              console.error(`[contract] Cron init failed: ${err.message}`);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(
-                JSON.stringify({
-                  response: "Agent initialization failed for scheduled task.",
-                  status: "error",
-                }),
-              );
-              return;
-            }
-          }
-
-          if (!openclawReady || !proxyReady) {
+        // Snapshot action — initialize the bound workspace if necessary, then
+        // take one fair, exclusive snapshot without executing model work.
+        if (action === "snapshot") {
+          if (gatewayQuarantined) {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
               JSON.stringify({
-                response: "Agent not ready after initialization.",
-                status: "error",
+                status: "quarantined",
+                errorCode: "AGENT_RUNTIME_QUARANTINED",
               }),
             );
             return;
           }
 
-          // Track active task to prevent idle termination during cron processing
           lastActivityTime = Math.floor(Date.now() / 1000);
-          activeTaskCount++;
-          let responseText;
           try {
-            // Enqueue message (serialized with chat messages to prevent WebSocket races)
-            try {
-              responseText = await enqueueMessage(message);
-            } catch (bridgeErr) {
-              responseText = "";
-              console.error(
-                `[contract] Cron bridge error: ${bridgeErr.message}`,
-              );
-            }
-            // Belt-and-suspenders: strip any remaining content-block JSON wrappers
-            if (responseText) responseText = extractTextFromContent(responseText);
-
-            // If bridge returned empty, fall back to lightweight agent
-            if (!responseText || !responseText.trim()) {
-              console.warn(
-                "[contract] Cron bridge returned empty — falling back to lightweight agent",
-              );
-              try {
-                responseText = await agent.chat(message, actorId, Date.now() + 30000);
-              } catch (agentErr) {
-                responseText =
-                  "I couldn't process this scheduled task. Please check the configuration.";
+            const snapshotOutcome = await activeTaskTracker.run(() =>
+              executeSnapshotAction({
+                initialize: () =>
+                  init(
+                    identity.internalUserId,
+                    identity.namespace,
+                    authority.workspaceCapability,
+                    { warmModel: false },
+                  ),
+                getWorkspaceLifecycle: () => workspaceLifecycle,
+              }),
+            );
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                internalUserId: identity.internalUserId,
+                ...snapshotOutcome,
+              }),
+            );
+          } catch (snapshotError) {
+            const persistenceFailed =
+              snapshotError.code === "WORKSPACE_PERSISTENCE_FAILED";
+            if (persistenceFailed) {
+              gatewayQuarantined =
+                workspaceLifecycle?.status().quarantine ||
+                Object.freeze({
+                  code: "WORKSPACE_PERSISTENCE_FAILED",
+                  message: "Workspace persistence failed",
+                });
+              openclawReady = false;
+              void stopOpenClawForSnapshot().catch((stopError) => {
                 console.error(
-                  `[contract] Cron lightweight agent fallback error: ${agentErr.message}`,
+                  `[contract] OpenClaw quarantine stop failed: ${stopError.message}`,
                 );
-              }
+              });
             }
-          } finally {
-            activeTaskCount = Math.max(0, activeTaskCount - 1);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                internalUserId: identity.internalUserId,
+                status: persistenceFailed ? "retryable" : "failed",
+                errorCode:
+                  snapshotError.code || "WORKSPACE_SNAPSHOT_FAILED",
+              }),
+            );
           }
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              response: responseText,
-              userId: currentUserId,
-              sessionId: payload.sessionId || null,
-            }),
-          );
           return;
         }
 
         // Chat action — lazy init and bridge
         if (action === "chat") {
-          const { userId, actorId, channel, message } = payload;
-          if (!userId || !actorId || !message) {
+          const { message, invocationId } = request;
+          if (message === undefined) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(
-              JSON.stringify({ error: "Missing userId, actorId, or message" }),
+              JSON.stringify({ error: "Missing message" }),
             );
             return;
           }
 
-          // Update shared identity file so proxy picks up cross-channel changes
-          updateIdentityFile(actorId, channel || "unknown");
-
-          // Trigger init if not done yet (blocks until proxy is ready)
-          if (!proxyReady && !initInProgress) {
-            try {
-              await init(userId, actorId, channel || "unknown");
-            } catch (err) {
-              console.error(`[contract] Init failed: ${err.message}`);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(
-                JSON.stringify({
-                  response:
-                    "I'm having trouble starting up. Please try again in a moment.",
-                  userId,
-                  sessionId: payload.sessionId || null,
-                  status: "error",
-                }),
-              );
-              return;
-            }
-          } else if (!proxyReady && initInProgress) {
-            // Init already in progress — wait for it
-            try {
-              await initPromise;
-            } catch (err) {
-              console.error(
-                `[contract] Init (in-progress) failed: ${err.message}`,
-              );
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(
-                JSON.stringify({
-                  response:
-                    "I'm still starting up. Please try again in a moment.",
-                  userId,
-                  sessionId: payload.sessionId || null,
-                  status: "initializing",
-                }),
-              );
-              return;
-            }
-          }
-
-          const bridgeText = buildBridgeText(message);
-
-          // Set up progressive Telegram streaming if applicable
-          let telegramStreamer = null;
-          if (
-            TELEGRAM_BOT_TOKEN &&
-            channel === "telegram" &&
-            actorId
-          ) {
-            // actorId is "telegram:123456789" — extract numeric chat ID
-            const chatId = actorId.split(":")[1];
-            if (chatId) {
-              telegramStreamer = createTelegramStreamer(chatId);
-              console.log(
-                `[contract] Telegram streaming enabled for chat_id=${chatId}`,
-              );
-            }
-          }
-          const onDelta = telegramStreamer
-            ? telegramStreamer.onDelta
-            : undefined;
-
-          // Track active task to prevent idle termination during chat processing
-          lastActivityTime = Math.floor(Date.now() / 1000);
-          activeTaskCount++;
-          let responseText;
+          let gatewayRunId;
+          let requestHash;
           try {
-            // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
-            if (openclawReady) {
-              // Full OpenClaw path — WebSocket bridge
-              try {
-                responseText = await enqueueMessage(bridgeText, onDelta);
-              } catch (bridgeErr) {
-                console.error(
-                  `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
-                );
-                responseText = "";
-              }
-              // If bridge returned empty (OpenClaw sent no content), check whether
-              // OpenClaw is mid-run before falling back to lightweight agent.
-              // A tool-call-only response or concurrent subagent task can produce
-              // an empty bridge response that is NOT a failure.
-              if (!responseText || !responseText.trim()) {
-                // Brief retry — transient empty responses resolve quickly
-                await new Promise((r) => setTimeout(r, 300));
-
-                // Probe OpenClaw to see if it is still busy
-                let openclawBusy = false;
-                try {
-                  const pingData = await new Promise((resolve, reject) => {
-                    const pingReq = http.get(
-                      `http://127.0.0.1:${OPENCLAW_PORT}`,
-                      (pingRes) => {
-                        let data = "";
-                        pingRes.on("data", (c) => (data += c));
-                        pingRes.on("end", () => resolve(data));
-                      },
-                    );
-                    pingReq.on("error", reject);
-                    pingReq.setTimeout(2000, () => {
-                      pingReq.destroy();
-                      reject(new Error("ping timeout"));
-                    });
-                  });
-                  // OpenClaw may return JSON with activeTasks count
-                  try {
-                    const parsed = JSON.parse(pingData);
-                    if (parsed.activeTasks > 0) openclawBusy = true;
-                  } catch {
-                    // Non-JSON response — OpenClaw is alive but format unknown
-                  }
-                } catch {
-                  // OpenClaw not responding — not busy, allow fallback
-                }
-
-                // Also treat a still-running process (no exit code) as busy
-                if (openclawExitCode === null) openclawBusy = true;
-
-                if (openclawBusy) {
-                  console.log(
-                    "[contract] Bridge returned empty but OpenClaw is mid-run — returning busy message",
-                  );
-                  responseText =
-                    "I'm still working on your previous request — check back in a moment.";
-                } else {
-                  console.warn(
-                    "[contract] Bridge returned empty — falling back to lightweight agent",
-                  );
-                  try {
-                    responseText = await agent.chat(
-                      bridgeText,
-                      actorId,
-                      Date.now() + 30000,
-                    );
-                  } catch (agentErr) {
-                    responseText =
-                      "I'm having trouble right now. Please try again in a moment.";
-                    console.error(
-                      `[contract] Lightweight agent fallback error: ${agentErr.message}`,
-                    );
-                  }
-                }
-              }
-            } else if (proxyReady) {
-              // Warm-up shim path — lightweight agent via proxy
-              console.log("[contract] Routing via lightweight agent (warm-up)");
-              try {
-                responseText = await agent.chat(bridgeText, actorId, Date.now() + 620000);
-              } catch (agentErr) {
-                responseText = `I'm having trouble right now. Please try again in a moment.`;
-                console.error(
-                  `[contract] Lightweight agent error: ${agentErr.message}`,
-                );
-              }
-            } else {
-              // Proxy not ready yet (should be rare — init awaits proxy)
-              responseText = "I'm starting up — please try again in a moment.";
-            }
-          } finally {
-            activeTaskCount = Math.max(0, activeTaskCount - 1);
+            ({ gatewayRunId, requestHash } = hashBoundInvocation(
+              boundInvocation,
+            ));
+          } catch {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                response:
+                  "This request has no valid trusted invocation identity and was not executed.",
+                internalUserId: identity.internalUserId,
+                status: "failed",
+                errorCode: "INVALID_INVOCATION_IDENTITY",
+              }),
+            );
+            return;
           }
 
-          // Belt-and-suspenders: strip any remaining content-block JSON wrappers
-          if (responseText) responseText = extractTextFromContent(responseText);
+          let responseText;
+          let responseStatus;
+          let responseErrorCode;
+          let responseWorkspaceReceipt;
+          try {
+            const outcome = await trustedInvocationRegistry.invoke({
+              invocationId,
+              requestHash,
+              execute: async () => {
+                if (gatewayQuarantined) {
+                  return {
+                    responseText:
+                      "This runtime is quarantined because an earlier request could not be reconciled. Start a fresh runtime before sending more work.",
+                    status: "quarantined",
+                    errorCode: "AGENT_RUNTIME_QUARANTINED",
+                  };
+                }
 
-          // Finalize Telegram streaming (final edit without "..." suffix)
-          let telegramStreamed = false;
-          if (telegramStreamer && responseText) {
-            try {
-              const result = await telegramStreamer.finalize(responseText);
-              if (result.messageId) {
-                telegramStreamed = true;
-                console.log(
-                  `[contract] Telegram streaming finalized: msg_id=${result.messageId}`,
+                if (!proxyReady && !initInProgress) {
+                  try {
+                    await init(
+                      identity.internalUserId,
+                      identity.namespace,
+                      authority.workspaceCapability,
+                    );
+                  } catch (err) {
+                    console.error(`[contract] Init failed: ${err.message}`);
+                    return {
+                      responseText:
+                        "I'm having trouble starting up. Please try again in a moment.",
+                      status: "failed",
+                      errorCode: "RUNTIME_INIT_FAILED",
+                    };
+                  }
+                } else if (!proxyReady && initInProgress) {
+                  try {
+                    await initPromise;
+                  } catch (err) {
+                    console.error(
+                      `[contract] Init (in-progress) failed: ${err.message}`,
+                    );
+                    return {
+                      responseText:
+                        "I'm still starting up. Please try again in a moment.",
+                      status: "failed",
+                      errorCode: "RUNTIME_INIT_FAILED",
+                    };
+                  }
+                }
+
+                const bridgeText = buildBridgeText(message);
+                let workspaceTurn;
+                try {
+                  workspaceTurn = await workspaceLifecycle.acquireTurn();
+                } catch (workspaceError) {
+                  gatewayQuarantined =
+                    workspaceLifecycle?.status().quarantine ||
+                    Object.freeze({
+                      code: workspaceError.code || "WORKSPACE_TURN_REJECTED",
+                      message: "The durable workspace is unavailable",
+                    });
+                  return {
+                    responseText:
+                      "The durable workspace is unavailable, so this request was not run.",
+                    status: "quarantined",
+                    errorCode:
+                      workspaceError.code || "WORKSPACE_TURN_REJECTED",
+                  };
+                }
+                lastActivityTime = Math.floor(Date.now() / 1000);
+                let executionText;
+                let executionStatus;
+                let executionErrorCode;
+                return capabilityTurnExecutor.submit(() =>
+                  withCapabilityTurn({
+                    grant: authority.turnCapabilityGrant,
+                    externalEffects: authority.externalEffects,
+                    task: () => activeTaskTracker.run(async () => {
+                      try {
+                        if (openclawReady) {
+                          try {
+                            const gatewayOutcome =
+                              await gatewayRuntimeBoundary.invoke({
+                                invokePrimary: () =>
+                                  enqueueMessage(bridgeText, gatewayRunId),
+                                invokeFallback: () =>
+                                  agent.chat(bridgeText, Date.now() + 30000),
+                              });
+                            executionText = gatewayOutcome.text;
+                          } catch (bridgeErr) {
+                            gatewayQuarantined =
+                              gatewayRuntimeBoundary.getQuarantine();
+                            if (gatewayQuarantined) openclawReady = false;
+                            console.error(
+                              `[contract] Committed gateway invocation failed: ${bridgeErr.code || "UNKNOWN"} ${bridgeErr.message}`,
+                            );
+                            executionErrorCode =
+                              bridgeErr.code || "GATEWAY_INVOCATION_FAILED";
+                            if (bridgeErr.code === "UNCERTAIN_AGENT_RUN") {
+                              executionStatus = "uncertain";
+                              executionText =
+                                "I couldn't confirm whether that request stopped, so I won't run it again. Check its status before retrying.";
+                            } else {
+                              executionStatus = "failed";
+                              executionText =
+                                "The request failed without a committed response and was not run again.";
+                            }
+                          }
+                        } else if (proxyReady) {
+                          console.log(
+                            "[contract] Routing via lightweight agent (warm-up)",
+                          );
+                          try {
+                            executionText = await agent.chat(
+                              bridgeText,
+                              Date.now() + 620000,
+                            );
+                          } catch (agentErr) {
+                            executionText =
+                              "I'm having trouble right now. Please try again in a moment.";
+                            executionStatus = "failed";
+                            executionErrorCode = "LIGHTWEIGHT_AGENT_FAILED";
+                            console.error(
+                              `[contract] Lightweight agent error: ${agentErr.message}`,
+                            );
+                          }
+                        } else {
+                          executionText =
+                            "I'm starting up — please try again in a moment.";
+                          executionStatus = "failed";
+                          executionErrorCode = "RUNTIME_NOT_READY";
+                        }
+                      } catch (executionError) {
+                        console.error(
+                          `[contract] Unexpected agent execution failure: ${executionError.message}`,
+                        );
+                        executionText =
+                          "This request could not be executed safely.";
+                        executionStatus = "failed";
+                        executionErrorCode = "AGENT_EXECUTION_FAILED";
+                      }
+
+                      if (executionText) {
+                        executionText = extractTextFromContent(executionText);
+                      }
+                      const executionOutcome = {
+                        responseText: executionText,
+                        ...(executionStatus ? { status: executionStatus } : {}),
+                        ...(executionErrorCode
+                          ? { errorCode: executionErrorCode }
+                          : {}),
+                      };
+                      try {
+                        return await persistWorkspaceOutcome({
+                          workspaceLifecycle,
+                          workspaceTurn,
+                          outcome: executionOutcome,
+                        });
+                      } catch (workspaceError) {
+                        gatewayQuarantined =
+                          workspaceLifecycle.status().quarantine ||
+                          Object.freeze({
+                            code: "WORKSPACE_PERSISTENCE_FAILED",
+                            message: "Workspace persistence failed",
+                          });
+                        openclawReady = false;
+                        void stopOpenClawForSnapshot().catch((stopError) => {
+                          console.error(
+                            `[contract] OpenClaw quarantine stop failed: ${stopError.message}`,
+                          );
+                        });
+                        throw workspaceError;
+                      }
+                    }),
+                  }),
                 );
-              }
-            } catch (err) {
-              console.warn(
-                `[contract] Telegram streaming finalize error: ${err.message}`,
-              );
-            }
+              },
+            });
+            responseText = outcome.responseText;
+            responseStatus = outcome.status;
+            responseErrorCode = outcome.errorCode;
+            responseWorkspaceReceipt = outcome.workspaceReceipt;
+          } catch (invocationErr) {
+            console.error(
+              `[contract] Trusted invocation rejected: ${invocationErr.code || "UNKNOWN"} ${invocationErr.message}`,
+            );
+            responseText =
+              invocationErr.code === "INVOCATION_ID_CONFLICT"
+                ? "This request identity was already used for different work and was not executed."
+                : invocationErr.code === "WORKSPACE_PERSISTENCE_FAILED"
+                  ? "The request finished, but its state could not be saved durably. Start a fresh runtime before retrying."
+                  : "This request could not be executed safely.";
+            responseStatus =
+              invocationErr.code === "WORKSPACE_PERSISTENCE_FAILED"
+                ? "retryable"
+                : "failed";
+            responseErrorCode =
+              invocationErr.code || "TRUSTED_INVOCATION_FAILED";
           }
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               response: responseText,
-              userId: currentUserId,
-              sessionId: payload.sessionId || null,
-              streamed: telegramStreamed || undefined,
+              internalUserId: identity.internalUserId,
+              ...(responseStatus ? { status: responseStatus } : {}),
+              ...(responseErrorCode ? { errorCode: responseErrorCode } : {}),
+              ...(responseWorkspaceReceipt
+                ? { workspaceReceipt: responseWorkspaceReceipt }
+                : {}),
             }),
           );
           return;
@@ -2019,12 +1514,12 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
-// --- SIGTERM handler: save workspace and exit gracefully ---
-process.on("SIGTERM", async () => {
+// --- SIGTERM handler: drain, close WAL, snapshot, then stop support ---
+async function shutdownRuntime() {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(
-    "[contract] SIGTERM received — saving workspace and shutting down",
+    "[contract] SIGTERM received — draining and persisting workspace",
   );
 
   // Stop credential refresh timer
@@ -2032,59 +1527,56 @@ process.on("SIGTERM", async () => {
     clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = null;
   }
-  if (browserHeaderRefreshTimer) {
-    clearInterval(browserHeaderRefreshTimer);
-    browserHeaderRefreshTimer = null;
-  }
+  credentialRefreshInProgress = false;
 
-  // Save workspace to S3 (10s max)
-  const saveTimeout = setTimeout(() => {
-    console.warn("[contract] Workspace save timeout — exiting");
-    process.exit(0);
-  }, 10000);
-
+  let exitCode = 0;
   try {
-    await workspaceSync.cleanup(currentNamespace);
+    if (workspaceLifecycle) {
+      await workspaceLifecycle.shutdown();
+    } else {
+      await stopOpenClawForSnapshot();
+      await stopSupportProcesses();
+    }
+    await capabilityRelayServer.close();
   } catch (err) {
-    console.warn(`[contract] Workspace cleanup error: ${err.message}`);
+    exitCode = 1;
+    console.error(`[contract] Fatal shutdown error: ${err.message}`);
   }
+  console.log(`[contract] Shutdown complete (exit=${exitCode})`);
+  if (exitCode === 0) process.exit(0);
+  process.exit(1);
+}
 
-  // Stop browser sessions before exit
-  try {
-    await stopBrowserSessions();
-  } catch (err) {
-    console.warn(`[contract] Browser session cleanup error: ${err.message}`);
-  }
-
-  clearTimeout(saveTimeout);
-
-  // Kill child processes
-  if (openclawProcess) {
-    try {
-      openclawProcess.kill("SIGTERM");
-    } catch {}
-  }
-  if (proxyProcess) {
-    try {
-      proxyProcess.kill("SIGTERM");
-    } catch {}
-  }
-
-  await cwLogger.shutdown();
-  console.log("[contract] Shutdown complete");
-  process.exit(0);
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
-  );
-  console.log(
-    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron}",
-  );
-
-  // Pre-fetch secrets in background (saves ~2-3s from first-message critical path)
-  secretsPrefetchPromise = prefetchSecrets().catch((err) => {
-    console.warn(`[contract] Secret prefetch failed: ${err.message}`);
+function startContractServer() {
+  agent = runtimeCapabilityStartup.start();
+  process.once("SIGTERM", shutdownRuntime);
+  ensureCapabilityRelayServer().catch((error) => {
+    quarantineRuntime(error, "CAPABILITY_RELAY_START_FAILED");
   });
-});
+  return server.listen(PORT, "0.0.0.0", () => {
+    console.log(
+      `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
+    );
+    console.log(
+      "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|snapshot}",
+    );
+  });
+}
+
+if (require.main === module) {
+  startContractServer();
+}
+
+module.exports = {
+  createActiveTaskTracker,
+  createCapabilityStartupGate,
+  createRuntimeInvocationAdmission,
+  createRuntimeInitializationGuard,
+  createUnexpectedChildExitHandler,
+  createWorkspaceReceipt,
+  persistWorkspaceOutcome,
+  executeSnapshotAction,
+  hashBoundInvocation,
+  withCapabilityTurn,
+  startContractServer,
+};

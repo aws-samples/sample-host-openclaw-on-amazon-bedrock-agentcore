@@ -1,0 +1,78 @@
+{
+  "comment": "SHAPE ONLY networkless compute seccomp profile. The real Docker/ARM64/static-scan gates are OPEN and not run locally. Default-deny with a minimal allowlist; every network, namespace, mount, and tracing syscall is denied so the job cannot open sockets, join a new network namespace, mount filesystems, or trace other processes.",
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "socket",
+        "socketpair",
+        "connect",
+        "bind",
+        "listen",
+        "accept",
+        "accept4",
+        "sendto",
+        "recvfrom",
+        "sendmsg",
+        "recvmsg",
+        "getpeername",
+        "setsockopt",
+        "getsockopt",
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "setns",
+        "unshare",
+        "clone3",
+        "bpf",
+        "kexec_load",
+        "init_module",
+        "finit_module",
+        "delete_module"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "comment": "Deny all socket, tracing, mount, namespace, and module syscalls."
+    },
+    {
+      "names": [
+        "read",
+        "write",
+        "openat",
+        "close",
+        "fstat",
+        "lseek",
+        "mmap",
+        "munmap",
+        "mprotect",
+        "brk",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "getpid",
+        "getppid",
+        "exit",
+        "exit_group",
+        "clock_gettime",
+        "nanosleep",
+        "getrandom",
+        "set_tid_address",
+        "setrlimit",
+        "getrlimit",
+        "prlimit64",
+        "setsid",
+        "wait4",
+        "kill"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "comment": "Minimal allowlist for a networkless, file-in/file-out job."
+    }
+  ]
+}

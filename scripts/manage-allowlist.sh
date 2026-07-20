@@ -9,12 +9,20 @@
 #
 # Uses the openclaw-identity DynamoDB table.
 # Requires: aws cli, appropriate IAM permissions.
-# Set AWS_PROFILE and AWS_REGION as needed.
+# AWS region is fixed to eu-west-1. Set AWS_PROFILE as needed.
 
 set -euo pipefail
 
 TABLE_NAME="${IDENTITY_TABLE_NAME:-openclaw-identity}"
-REGION="${AWS_REGION:-us-west-2}"
+REQUIRED_REGION="eu-west-1"
+for region_variable in CDK_DEFAULT_REGION AWS_REGION AWS_DEFAULT_REGION; do
+    configured_region="${!region_variable:-}"
+    if [ -n "$configured_region" ] && [ "$configured_region" != "$REQUIRED_REGION" ]; then
+        echo "ERROR: $region_variable must be exactly $REQUIRED_REGION; got $configured_region." >&2
+        exit 1
+    fi
+done
+REGION="$REQUIRED_REGION"
 PROFILE_ARG=""
 if [ -n "${AWS_PROFILE:-}" ]; then
     PROFILE_ARG="--profile $AWS_PROFILE"
@@ -29,7 +37,8 @@ usage() {
     echo "  list                      — List all allowed users"
     echo ""
     echo "Environment:"
-    echo "  AWS_REGION   — AWS region (default: us-west-2)"
+    echo "  CDK_DEFAULT_REGION / AWS_REGION / AWS_DEFAULT_REGION"
+    echo "               — if set, must be eu-west-1"
     echo "  AWS_PROFILE  — AWS CLI profile (optional)"
     echo "  IDENTITY_TABLE_NAME — DynamoDB table (default: openclaw-identity)"
     exit 1

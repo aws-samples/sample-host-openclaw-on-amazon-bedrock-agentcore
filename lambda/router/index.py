@@ -18,8 +18,9 @@ import os
 import re
 import threading
 import time
-import hashlib
 import uuid
+from collections.abc import Mapping
+from contextlib import contextmanager
 from urllib import request as urllib_request
 from urllib.parse import quote
 
@@ -27,38 +28,237 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+from control.invites import DynamoPilotInvites, InviteRejected
+
+try:
+    from .event_identity import derive_event_trace
+    from .telegram_ingress import MAX_WEBHOOK_BYTES, TelegramWebhookIngress
+except ImportError:  # focused tests execute with lambda/router on sys.path
+    from event_identity import derive_event_trace
+    from telegram_ingress import MAX_WEBHOOK_BYTES, TelegramWebhookIngress
+
+class _MetadataOnlyRouterLogger:
+    """Drop every caller value before the record reaches CloudWatch.
+
+    Router observability is provided by bounded metrics. Log messages are only
+    a content-free health signal: no identity, payload, provider response,
+    path, exception text, or stack is retained even when a call site supplies
+    formatting arguments or ``exc_info=True``.
+    """
+
+    _SCHEMA = "personal-operator.log.v1"
+    _COMPONENT = "router"
+    _EVENT = "runtime_event"
+
+    def __init__(self, delegate: logging.Logger) -> None:
+        self._delegate = delegate
+
+    def _emit(self, level: int) -> None:
+        payload = json.dumps(
+            {
+                "component": self._COMPONENT,
+                "event": self._EVENT,
+                "level": logging.getLevelName(level),
+                "schema": self._SCHEMA,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self._delegate.log(level, payload, exc_info=None, stack_info=False)
+
+    def info(self, _message: object, *_args: object, **_kwargs: object) -> None:
+        self._emit(logging.INFO)
+
+    def warning(self, _message: object, *_args: object, **_kwargs: object) -> None:
+        self._emit(logging.WARNING)
+
+    def error(self, _message: object, *_args: object, **_kwargs: object) -> None:
+        self._emit(logging.ERROR)
+
+
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+logger = _MetadataOnlyRouterLogger(_root_logger)
+
+_STANDARD_LOG_RECORD_FIELDS = frozenset(
+    logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+)
+_PLATFORM_LOG_FIELDS = frozenset({"aws_request_id", "aws_trace_id"})
+_LOGGING_BOUNDARY_LOCK = threading.RLock()
+_METADATA_ONLY_FORMATTER = logging.Formatter("%(message)s")
+_LOGGING_BOUNDARY_DEPTH = 0
+
+
+class _MetadataOnlyDependencyFilter(logging.Filter):
+    """Sanitize propagated SDK/dependency records at every active handler."""
+
+    _LEVELS = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARNING",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "CRITICAL",
+    }
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        level = self._LEVELS.get(record.levelno, "ERROR")
+        record.msg = json.dumps(
+            {
+                "component": "router",
+                "event": "dependency_event",
+                "level": level,
+                "schema": "personal-operator.log.v1",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+        for key in tuple(record.__dict__):
+            if key not in _STANDARD_LOG_RECORD_FIELDS and key not in _PLATFORM_LOG_FIELDS:
+                record.__dict__.pop(key, None)
+        for key in _PLATFORM_LOG_FIELDS:
+            if key in record.__dict__:
+                record.__dict__[key] = "redacted"
+        return True
+
+
+@contextmanager
+def _metadata_only_dependency_logging():
+    """Close every Python logging sink for the duration of one Lambda turn."""
+
+    global _LOGGING_BOUNDARY_DEPTH
+    with _LOGGING_BOUNDARY_LOCK:
+        if _LOGGING_BOUNDARY_DEPTH:
+            _LOGGING_BOUNDARY_DEPTH += 1
+            try:
+                yield
+            finally:
+                _LOGGING_BOUNDARY_DEPTH -= 1
+            return
+
+        _LOGGING_BOUNDARY_DEPTH = 1
+        boundary = _MetadataOnlyDependencyFilter()
+        installed_handlers: set[logging.Handler] = set()
+        original_formatters: dict[logging.Handler, logging.Formatter | None] = {}
+        original_filters: dict[logging.Handler, tuple[logging.Filter, ...]] = {}
+
+        def secure_handler(handler_instance: logging.Handler) -> None:
+            if handler_instance not in installed_handlers:
+                original_formatters[handler_instance] = handler_instance.formatter
+                original_filters[handler_instance] = tuple(handler_instance.filters)
+                handler_instance.filters[:] = [boundary, *handler_instance.filters]
+                handler_instance.setFormatter(_METADATA_ONLY_FORMATTER)
+                installed_handlers.add(handler_instance)
+
+        root = logging.getLogger()
+        loggers = [root]
+        loggers.extend(
+            value
+            for value in logging.Logger.manager.loggerDict.values()
+            if isinstance(value, logging.Logger)
+        )
+        for candidate in loggers:
+            for handler_instance in candidate.handlers:
+                secure_handler(handler_instance)
+
+        original_factory = logging.getLogRecordFactory()
+        original_add_handler = logging.Logger.addHandler
+
+        def safe_factory(
+            name,
+            level,
+            pathname,
+            lineno,
+            _message,
+            _arguments,
+            _exc_info,
+            function=None,
+            _stack_info=None,
+            **kwargs,
+        ):
+            record = original_factory(
+                name,
+                level,
+                pathname,
+                lineno,
+                "",
+                (),
+                None,
+                function,
+                None,
+                **kwargs,
+            )
+            boundary.filter(record)
+            return record
+
+        def safe_add_handler(logger_instance, handler_instance):
+            secure_handler(handler_instance)
+            return original_add_handler(logger_instance, handler_instance)
+
+        logging.setLogRecordFactory(safe_factory)
+        logging.Logger.addHandler = safe_add_handler
+        try:
+            yield
+        finally:
+            logging.Logger.addHandler = original_add_handler
+            logging.setLogRecordFactory(original_factory)
+            for handler_instance in installed_handlers:
+                handler_instance.filters[:] = original_filters[handler_instance]
+                handler_instance.setFormatter(original_formatters[handler_instance])
+            _LOGGING_BOUNDARY_DEPTH = 0
 
 # --- Configuration ---
-AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
-AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
+UPDATE_QUEUE_URL = os.environ.get("UPDATE_QUEUE_URL", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
-AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+REQUIRED_REGION = "eu-west-1"
+
+
+def _require_region():
+    """Fail before any AWS client is created when a different region is explicit."""
+    for variable in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        configured = os.environ.get(variable)
+        if configured and configured != REQUIRED_REGION:
+            raise RuntimeError(
+                f"{variable} must be exactly {REQUIRED_REGION}; got {configured}"
+            )
+    return REQUIRED_REGION
+
+
+AWS_REGION = _require_region()
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
-LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
 # --- Clients (lazy init on cold start) ---
-dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
-identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
-agentcore_client = boto3.client(
-    "bedrock-agentcore",
+dynamodb = boto3.resource(
+    "dynamodb",
     region_name=AWS_REGION,
-    config=Config(
-        read_timeout=max(LAMBDA_TIMEOUT_SECONDS - 15, 60),
-        connect_timeout=10,
-        retries={"max_attempts": 0},
-    ),
+    config=Config(retries={"max_attempts": 0, "mode": "standard"}),
 )
+identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
+sqs_client = boto3.client(
+    "sqs",
+    region_name=AWS_REGION,
+    config=Config(retries={"max_attempts": 0}),
+)
+
+_telegram_ingress_cache = None
+_pilot_invites_cache = None
+
+
+def _get_runtime_driver():
+    """Reject legacy in-process execution; only the ordered worker may run it."""
+    raise RuntimeError("runtime execution authority belongs to the ordered worker")
 
 USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
 
@@ -67,6 +267,10 @@ _SECRET_CACHE_TTL_SECONDS = 900  # 15 minutes
 _token_cache = {}  # {secret_id: (value, fetched_at)}
 
 BIND_CODE_TTL_SECONDS = 600  # 10 minutes
+
+
+class SecretProviderUnavailable(RuntimeError):
+    """A configured secret could not be read from its authority."""
 
 
 def _get_secret(secret_id):
@@ -83,9 +287,14 @@ def _get_secret(secret_id):
         value = resp["SecretString"]
         _token_cache[secret_id] = (value, time.time())
         return value
-    except Exception as e:
-        logger.warning("Failed to fetch secret %s: %s", secret_id, e)
-        return ""
+    except Exception as error:
+        # Secret identifiers, provider endpoints, and exception text may contain
+        # deployment or credential material. Keep only a bounded error class.
+        logger.warning(
+            "Secret provider unavailable: error_type=%s",
+            type(error).__name__,
+        )
+        raise SecretProviderUnavailable("secret provider unavailable") from None
 
 
 def _get_telegram_token():
@@ -106,6 +315,42 @@ def _get_slack_tokens():
 
 def _get_webhook_secret():
     return _get_secret(WEBHOOK_SECRET_ID)
+
+
+def _get_telegram_ingress():
+    """Build the Telegram-to-FIFO boundary without initializing a runtime."""
+    global _telegram_ingress_cache
+    if _telegram_ingress_cache is not None:
+        return _telegram_ingress_cache
+    if not UPDATE_QUEUE_URL:
+        raise RuntimeError("UPDATE_QUEUE_URL is required")
+    _telegram_ingress_cache = TelegramWebhookIngress(
+        secret_provider=_get_webhook_secret,
+        resolve_user=resolve_user,
+        redeem_invite=_redeem_pilot_invite,
+        sqs_client=sqs_client,
+        queue_url=UPDATE_QUEUE_URL,
+    )
+    return _telegram_ingress_cache
+
+
+def _get_pilot_invites():
+    global _pilot_invites_cache
+    if _pilot_invites_cache is None:
+        _pilot_invites_cache = DynamoPilotInvites(identity_table)
+    return _pilot_invites_cache
+
+
+def _redeem_pilot_invite(token, channel, channel_user_id, display_name):
+    try:
+        return _get_pilot_invites().redeem(
+            token,
+            channel=channel,
+            channel_user_id=channel_user_id,
+            display_name=display_name,
+        ).user_id
+    except InviteRejected:
+        return None
 
 
 def _get_feishu_credentials():
@@ -161,6 +406,59 @@ def _get_feishu_tenant_token():
 # ---------------------------------------------------------------------------
 # Webhook validation helpers
 # ---------------------------------------------------------------------------
+
+
+def _telegram_preflight(body, headers):
+    """Authenticate and strictly parse Telegram input before any mutation.
+
+    The durable ingress deliberately owns identity resolution and enqueueing.
+    This outer preflight exists to preserve auth-before-parse ordering while
+    rejecting JSON objects whose duplicate keys would otherwise be silently
+    resolved by Python's last-key-wins decoder.
+    """
+    if not isinstance(headers, Mapping):
+        return {"statusCode": 401, "body": "Unauthorized"}
+    normalized = {
+        str(key).casefold(): value
+        for key, value in headers.items()
+        if isinstance(value, str)
+    }
+    supplied = normalized.get("x-telegram-bot-api-secret-token", "")
+    if not supplied:
+        return {"statusCode": 401, "body": "Unauthorized"}
+
+    expected = _get_webhook_secret()
+    if (
+        not isinstance(expected, str)
+        or not expected
+        or not hmac.compare_digest(expected, supplied)
+    ):
+        return {"statusCode": 401, "body": "Unauthorized"}
+
+    if not isinstance(body, str) or not body:
+        return {"statusCode": 400, "body": "Invalid update"}
+    try:
+        if len(body.encode("utf-8")) > MAX_WEBHOOK_BYTES:
+            return {"statusCode": 400, "body": "Invalid update"}
+    except UnicodeError:
+        return {"statusCode": 400, "body": "Invalid update"}
+
+    def reject_duplicate_keys(pairs):
+        parsed = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError("duplicate JSON key")
+            parsed[key] = value
+        return parsed
+
+    try:
+        parsed = json.loads(body, object_pairs_hook=reject_duplicate_keys)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {"statusCode": 400, "body": "Invalid update"}
+    if not isinstance(parsed, Mapping):
+        return {"statusCode": 400, "body": "Invalid update"}
+    return None
+
 
 def validate_telegram_webhook(headers):
     """Validate Telegram webhook using X-Telegram-Bot-Api-Secret-Token header.
@@ -395,7 +693,10 @@ def is_user_allowed(channel, channel_user_id):
         return True
     channel_key = f"{channel}:{channel_user_id}"
     try:
-        resp = identity_table.get_item(Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"})
+        resp = identity_table.get_item(
+            Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"},
+            ConsistentRead=True,
+        )
         if "Item" in resp:
             return True
     except ClientError as e:
@@ -403,28 +704,102 @@ def is_user_allowed(channel, channel_user_id):
     return False
 
 
+def _canonical_channel_key(channel, channel_user_id):
+    """Return the sole canonical identity string used by fences and mappings."""
+    if channel not in {"telegram", "slack", "feishu"}:
+        raise ValueError("unsupported identity channel")
+    if not isinstance(channel_user_id, str) or not channel_user_id:
+        raise ValueError("channel user identity is invalid")
+    if len(channel_user_id) > 256 or any(ord(char) < 32 for char in channel_user_id):
+        raise ValueError("channel user identity is invalid")
+    return f"{channel}:{channel_user_id}"
+
+
+def _channel_tombstone_pk(channel_key):
+    """Hash the canonical channel key so the permanent marker stores no raw ID."""
+    return f"CHANNEL_TOMBSTONE#{hashlib.sha256(channel_key.encode('utf-8')).hexdigest()}"
+
+
+def _user_tombstone_pk(user_id):
+    """Hash the internal user ID for the permanent identity-write fence."""
+    user_id = _canonical_namespace(user_id)
+    return f"USER_TOMBSTONE#{hashlib.sha256(user_id.encode('utf-8')).hexdigest()}"
+
+
+def _string_item(item):
+    """Encode a string-only record for the low-level DynamoDB transaction API."""
+    return {key: {"S": value} for key, value in item.items()}
+
+
+def _read_channel_mapping(channel_key):
+    """Strongly read and exactly validate the authoritative channel mapping."""
+    channel, channel_user_id = channel_key.split(":", 1)
+    expected_pk = f"CHANNEL#{channel_key}"
+    try:
+        response = identity_table.get_item(
+            Key={"PK": expected_pk, "SK": "PROFILE"},
+            ConsistentRead=True,
+        )
+    except Exception as error:
+        logger.error(
+            "Strong channel mapping read failed: error_type=%s",
+            type(error).__name__,
+        )
+        return None
+    item = response.get("Item") if isinstance(response, Mapping) else None
+    if not isinstance(item, Mapping):
+        return None
+    if (
+        item.get("PK") != expected_pk
+        or item.get("SK") != "PROFILE"
+        or item.get("channel") != channel
+        or item.get("channelUserId") != channel_user_id
+    ):
+        logger.error("Rejected inexact channel identity mapping")
+        return None
+    try:
+        user_id = _canonical_namespace(item["userId"])
+    except (KeyError, ValueError):
+        logger.error("Rejected corrupt channel identity mapping")
+        return None
+    try:
+        tombstone = identity_table.get_item(
+            Key={"PK": _user_tombstone_pk(user_id), "SK": "TOMBSTONE"},
+            ConsistentRead=True,
+        )
+    except Exception as error:
+        logger.error(
+            "Strong user-deletion fence read failed: error_type=%s",
+            type(error).__name__,
+        )
+        return None
+    if not isinstance(tombstone, Mapping) or tombstone.get("Item") is not None:
+        logger.warning("Rejected channel mapping behind a user-deletion fence")
+        return None
+    return user_id
+
+
 def resolve_user(channel, channel_user_id, display_name=""):
     """Look up or create a user for the given channel identity.
 
     Returns (user_id, is_new). Returns (None, False) if user is not allowed.
     """
-    channel_key = f"{channel}:{channel_user_id}"
+    try:
+        channel_key = _canonical_channel_key(channel, channel_user_id)
+    except ValueError:
+        return None, False
     pk = f"CHANNEL#{channel_key}"
 
-    # 1. Try to find existing mapping
-    try:
-        resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"})
-        if "Item" in resp:
-            return resp["Item"]["userId"], False
-    except ClientError as e:
-        logger.error("DynamoDB get_item failed: %s", e)
+    # A strong read avoids returning a stale historical mapping. It is not the
+    # registration authority: the transaction below rechecks both the invite
+    # and the permanent deletion fence at the exact commit point.
+    existing_user = _read_channel_mapping(channel_key)
+    if existing_user is not None:
+        return existing_user, False
 
-    # 2. Check allowlist before creating a new user
-    if not is_user_allowed(channel, channel_user_id):
-        logger.warning("User %s not on allowlist — rejecting registration", channel_key)
-        return None, False
-
-    # 3. Create new user (conditional write to handle race conditions)
+    # Create the complete bidirectional mapping in one transaction. A channel
+    # deletion tombstone permanently wins over both invite-only and open
+    # registration, closing registration/account-deletion interleavings.
     # STABILITY NOTE: userId is deterministic (SHA-256 of channel_key) so that
     # EventBridge schedules and DynamoDB CRON# records survive redeployments.
     # Existing users registered before this fix keep their random userIds —
@@ -434,102 +809,99 @@ def resolve_user(channel, channel_user_id, display_name=""):
     user_id = f"user_{hashlib.sha256(channel_key.encode()).hexdigest()[:16]}"
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    try:
-        # User profile
-        identity_table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": "PROFILE",
-                "userId": user_id,
-                "createdAt": now_iso,
-                "displayName": display_name or channel_user_id,
-            },
-            ConditionExpression="attribute_not_exists(PK)",
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            logger.error("Failed to create user profile: %s", e)
-
-    try:
-        # Channel -> user mapping (conditional to prevent race)
-        identity_table.put_item(
-            Item={
-                "PK": pk,
-                "SK": "PROFILE",
-                "userId": user_id,
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "displayName": display_name or channel_user_id,
-                "boundAt": now_iso,
-            },
-            ConditionExpression="attribute_not_exists(PK)",
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            # Another invocation created it first — read and return theirs
-            resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"})
-            if "Item" in resp:
-                return resp["Item"]["userId"], False
-        logger.error("Failed to create channel mapping: %s", e)
-
-    # User -> channel back-reference
-    try:
-        identity_table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": f"CHANNEL#{channel_key}",
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "boundAt": now_iso,
+    profile = {
+        "PK": f"USER#{user_id}",
+        "SK": "PROFILE",
+        "userId": user_id,
+        "createdAt": now_iso,
+        "displayName": display_name or channel_user_id,
+    }
+    forward = {
+        "PK": pk,
+        "SK": "PROFILE",
+        "userId": user_id,
+        "channel": channel,
+        "channelUserId": channel_user_id,
+        "displayName": display_name or channel_user_id,
+        "boundAt": now_iso,
+    }
+    backref = {
+        "PK": f"USER#{user_id}",
+        "SK": f"CHANNEL#{channel_key}",
+        "userId": user_id,
+        "channel": channel,
+        "channelUserId": channel_user_id,
+        "boundAt": now_iso,
+    }
+    transaction = []
+    if not REGISTRATION_OPEN:
+        transaction.append(
+            {
+                "ConditionCheck": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Key": _string_item(
+                        {"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"}
+                    ),
+                    "ConditionExpression": (
+                        "attribute_exists(PK) AND attribute_exists(SK)"
+                    ),
+                }
             }
         )
-    except ClientError:
-        pass  # Non-critical
+    transaction.append(
+        {
+            "ConditionCheck": {
+                "TableName": IDENTITY_TABLE_NAME,
+                "Key": _string_item(
+                    {"PK": _channel_tombstone_pk(channel_key), "SK": "TOMBSTONE"}
+                ),
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        }
+    )
+    transaction.append(
+        {
+            "ConditionCheck": {
+                "TableName": IDENTITY_TABLE_NAME,
+                "Key": _string_item(
+                    {"PK": _user_tombstone_pk(user_id), "SK": "TOMBSTONE"}
+                ),
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        }
+    )
+    for item in (profile, forward, backref):
+        transaction.append(
+            {
+                "Put": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Item": _string_item(item),
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            }
+        )
 
-    logger.info("New user created: %s for %s", user_id, channel_key)
+    try:
+        identity_table.meta.client.transact_write_items(TransactItems=transaction)
+    except Exception as error:
+        # Any cancellation, timeout, or ambiguous response is denied unless an
+        # exact strong read proves a complete mapping committed by a winner.
+        logger.warning(
+            "Identity registration transaction did not commit locally: error_type=%s",
+            type(error).__name__,
+        )
+        raced_user = _read_channel_mapping(channel_key)
+        if raced_user is not None:
+            return raced_user, False
+        return None, False
+
+    logger.info("New user mapping committed")
     return user_id, True
 
-
-
 def get_or_create_session(user_id):
-    """Get or create a session ID for the user. Session IDs must be >= 33 chars."""
-    pk = f"USER#{user_id}"
-
-    try:
-        resp = identity_table.get_item(Key={"PK": pk, "SK": "SESSION"})
-        if "Item" in resp:
-            # Update last activity
-            identity_table.update_item(
-                Key={"PK": pk, "SK": "SESSION"},
-                UpdateExpression="SET lastActivity = :now",
-                ExpressionAttributeValues={":now": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-            )
-            return resp["Item"]["sessionId"]
-    except ClientError as e:
-        logger.error("DynamoDB session lookup failed: %s", e)
-
-    # Create new session (>= 33 chars required by AgentCore)
-    session_id = f"ses_{user_id}_{uuid.uuid4().hex[:12]}"
-    if len(session_id) < 33:
-        session_id += "_" + uuid.uuid4().hex[: 33 - len(session_id)]
-    logger.info("New session created: %s for user %s", session_id, user_id)
-    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    try:
-        identity_table.put_item(
-            Item={
-                "PK": pk,
-                "SK": "SESSION",
-                "sessionId": session_id,
-                "createdAt": now_iso,
-                "lastActivity": now_iso,
-            }
-        )
-    except ClientError as e:
-        logger.error("Failed to create session: %s", e)
-
-    logger.info("New session created: %s for %s", session_id, user_id)
-    return session_id
+    """Return the driver's server-created session mapping for legacy handlers."""
+    user_id = _canonical_namespace(user_id)
+    return _get_runtime_driver().ensure(user_id).session_id
 
 
 # ---------------------------------------------------------------------------
@@ -537,20 +909,42 @@ def get_or_create_session(user_id):
 # ---------------------------------------------------------------------------
 
 def create_bind_code(user_id):
-    """Generate an 8-char bind code and store it in DynamoDB with TTL."""
+    """Generate a bind code only while the target user has no deletion fence."""
+    user_id = _canonical_namespace(user_id)
     code = uuid.uuid4().hex[:8].upper()  # 16^8 = 4.3B keyspace
     ttl = int(time.time()) + BIND_CODE_TTL_SECONDS
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    identity_table.put_item(
-        Item={
-            "PK": f"BIND#{code}",
-            "SK": "BIND",
-            "userId": user_id,
-            "createdAt": now_iso,
-            "ttl": ttl,
-        }
-    )
+    transaction = [
+        {
+            "ConditionCheck": {
+                "TableName": IDENTITY_TABLE_NAME,
+                "Key": _string_item(
+                    {"PK": _user_tombstone_pk(user_id), "SK": "TOMBSTONE"}
+                ),
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        },
+        {
+            "Put": {
+                "TableName": IDENTITY_TABLE_NAME,
+                "Item": {
+                    "PK": {"S": f"BIND#{code}"},
+                    "SK": {"S": "BIND"},
+                    "userId": {"S": user_id},
+                    "createdAt": {"S": now_iso},
+                    "ttl": {"N": str(ttl)},
+                },
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }
+        },
+    ]
+    try:
+        identity_table.meta.client.transact_write_items(TransactItems=transaction)
+    except Exception as error:
+        logger.warning(
+            "Bind-code creation denied: error_type=%s", type(error).__name__
+        )
+        raise RuntimeError("bind-code creation is unavailable") from error
     return code
 
 
@@ -561,47 +955,102 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
     """
     code = code.strip().upper()
     try:
-        resp = identity_table.get_item(Key={"PK": f"BIND#{code}", "SK": "BIND"})
+        if re.fullmatch(r"[A-F0-9]{8}", code) is None:
+            return None, False
+        resp = identity_table.get_item(
+            Key={"PK": f"BIND#{code}", "SK": "BIND"},
+            ConsistentRead=True,
+        )
         item = resp.get("Item")
-        if not item:
+        if not isinstance(item, Mapping):
             return None, False
         # Check TTL (DynamoDB TTL deletion is eventual)
-        if item.get("ttl", 0) < int(time.time()):
+        now = int(time.time())
+        ttl = item.get("ttl")
+        if (
+            item.get("PK") != f"BIND#{code}"
+            or item.get("SK") != "BIND"
+            or isinstance(ttl, bool)
+            or not isinstance(ttl, int)
+            or ttl < now
+        ):
             return None, False
 
-        user_id = item["userId"]
-        channel_key = f"{channel}:{channel_user_id}"
+        user_id = _canonical_namespace(item["userId"])
+        channel_key = _canonical_channel_key(channel, channel_user_id)
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        forward = {
+            "PK": f"CHANNEL#{channel_key}",
+            "SK": "PROFILE",
+            "userId": user_id,
+            "channel": channel,
+            "channelUserId": channel_user_id,
+            "displayName": display_name or channel_user_id,
+            "boundAt": now_iso,
+        }
+        backref = {
+            "PK": f"USER#{user_id}",
+            "SK": f"CHANNEL#{channel_key}",
+            "userId": user_id,
+            "channel": channel,
+            "channelUserId": channel_user_id,
+            "boundAt": now_iso,
+        }
+        transaction = [
+            {
+                "Delete": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Key": _string_item({"PK": f"BIND#{code}", "SK": "BIND"}),
+                    "ConditionExpression": (
+                        "userId = :userId AND ttl = :ttl AND ttl >= :now"
+                    ),
+                    "ExpressionAttributeValues": {
+                        ":userId": {"S": user_id},
+                        ":ttl": {"N": str(ttl)},
+                        ":now": {"N": str(now)},
+                    },
+                }
+            },
+            {
+                "ConditionCheck": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Key": _string_item(
+                        {"PK": _user_tombstone_pk(user_id), "SK": "TOMBSTONE"}
+                    ),
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            },
+            {
+                "ConditionCheck": {
+                    "TableName": IDENTITY_TABLE_NAME,
+                    "Key": _string_item(
+                        {
+                            "PK": _channel_tombstone_pk(channel_key),
+                            "SK": "TOMBSTONE",
+                        }
+                    ),
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }
+            },
+        ]
+        for record in (forward, backref):
+            transaction.append(
+                {
+                    "Put": {
+                        "TableName": IDENTITY_TABLE_NAME,
+                        "Item": _string_item(record),
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }
+                }
+            )
+        identity_table.meta.client.transact_write_items(TransactItems=transaction)
 
-        # Create channel -> user mapping
-        identity_table.put_item(
-            Item={
-                "PK": f"CHANNEL#{channel_key}",
-                "SK": "PROFILE",
-                "userId": user_id,
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "displayName": display_name or channel_user_id,
-                "boundAt": now_iso,
-            }
-        )
-        # Back-reference
-        identity_table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": f"CHANNEL#{channel_key}",
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "boundAt": now_iso,
-            }
-        )
-        # Delete the bind code
-        identity_table.delete_item(Key={"PK": f"BIND#{code}", "SK": "BIND"})
-
-        logger.info("Bind code %s redeemed: %s -> %s", code, channel_key, user_id)
+        logger.info("Bind code redeemed with a fenced identity transaction")
         return user_id, True
-    except ClientError as e:
-        logger.error("Bind code redemption failed: %s", e)
+    except Exception as error:
+        logger.warning(
+            "Bind code redemption denied: error_type=%s", type(error).__name__
+        )
         return None, False
 
 
@@ -609,50 +1058,36 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 # AgentCore invocation
 # ---------------------------------------------------------------------------
 
-def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
-    """Invoke the AgentCore Runtime with a per-user session.
+def _build_runtime_invocation_id(channel, platform_event_id, internal_user_id):
+    """Build the fixed trusted retry identity without using message content."""
+    return derive_event_trace(channel, internal_user_id, platform_event_id)
 
-    Message can be a plain string or a structured dict with text + images.
-    """
-    payload = json.dumps({
-        "action": "chat",
-        "userId": user_id,
-        "actorId": actor_id,
-        "channel": channel,
-        "message": message,
-    }).encode()
 
+def _canonical_namespace(internal_user_id):
+    """Return the exact validated server-resolved internal user identifier."""
+    user_id = str(internal_user_id or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}", user_id):
+        raise ValueError("invalid internal user identity")
+    return user_id
+
+
+def invoke_agent_runtime(session_id, user_id, actor_id, channel, message, invocation_id):
+    """Compatibility wrapper that validates, but never selects, a session ID."""
+    namespace = _canonical_namespace(user_id)
+    driver = _get_runtime_driver()
+    mapped_session = driver.ensure(namespace).session_id
+    if session_id != mapped_session:
+        raise RuntimeError("caller session does not match server session mapping")
     try:
-        logger.info("Invoking AgentCore: arn=%s qualifier=%s session=%s", AGENTCORE_RUNTIME_ARN, AGENTCORE_QUALIFIER, session_id)
-        resp = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
-            qualifier=AGENTCORE_QUALIFIER,
-            runtimeSessionId=session_id,
-            runtimeUserId=actor_id,
-            payload=payload,
-            contentType="application/json",
-            accept="application/json",
+        return driver.invoke(
+            namespace,
+            {
+                "actorId": actor_id,
+                "channel": channel,
+                "message": message,
+            },
+            invocation_id,
         )
-        status_code = resp.get("statusCode")
-        logger.info("AgentCore response status: %s", status_code)
-        MAX_RESPONSE_BYTES = 500_000  # 500 KB — prevents OOM from large subagent responses
-        body = resp.get("response")
-        if body:
-            if hasattr(body, "read"):
-                body_bytes = body.read(MAX_RESPONSE_BYTES + 1)
-                body_text = body_bytes.decode("utf-8", errors="replace")
-                if len(body_bytes) > MAX_RESPONSE_BYTES:
-                    logger.warning("AgentCore response truncated at %d bytes", MAX_RESPONSE_BYTES)
-                    body_text = body_text[:MAX_RESPONSE_BYTES]
-            else:
-                body_text = str(body)[:MAX_RESPONSE_BYTES]
-            logger.info("AgentCore response (len=%d, first 200 chars): %s", len(body_text), body_text[:200])
-            try:
-                return json.loads(body_text)
-            except json.JSONDecodeError:
-                return {"response": body_text}
-        logger.warning("AgentCore returned no response body")
-        return {"response": "No response from agent."}
     except Exception as e:
         logger.error("AgentCore invocation failed: %s", e, exc_info=True)
         return {"response": f"Sorry, I'm having trouble right now. Please try again later."}
@@ -676,6 +1111,20 @@ def _extract_text_from_content_blocks(text):
     if not text or not isinstance(text, str):
         return text
     result = text
+    # Recover the common one-block trailing-comma form before the truncated
+    # content fail-closed path strips it. The captured JSON string is decoded
+    # normally so escapes and control characters are handled consistently.
+    trailing_comma = re.fullmatch(
+        r'\s*\[\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*'
+        r'"((?:[^"\\]|\\.)*)"\s*\}\s*,\s*\]\s*',
+        result,
+        flags=re.DOTALL,
+    )
+    if trailing_comma:
+        try:
+            return json.loads('"' + trailing_comma.group(1) + '"')
+        except (json.JSONDecodeError, ValueError):
+            pass
     decoder = json.JSONDecoder(strict=False)
     for _ in range(10):
         prev = result
@@ -1063,6 +1512,11 @@ def _extract_screenshots(text: str) -> tuple:
 
 def _fetch_s3_image(s3_key: str, namespace: str):
     """Fetch image bytes from S3. Returns None on error or invalid key."""
+    try:
+        namespace = _canonical_namespace(namespace)
+    except ValueError:
+        logger.error("Rejected screenshot fetch without canonical internal user identity")
+        return None
     # Validate: reject path traversal
     if ".." in s3_key:
         logger.error("Rejected S3 screenshot key with path traversal: %s", s3_key)
@@ -1186,9 +1640,14 @@ def _get_secret(secret_id):
         value = resp["SecretString"]
         _token_cache[secret_id] = (value, time.time())
         return value
-    except Exception as e:
-        logger.warning("Failed to fetch secret %s: %s", secret_id, e)
-        return ""
+    except Exception as error:
+        # Secret identifiers, provider endpoints, and exception text may contain
+        # deployment or credential material. Keep only a bounded error class.
+        logger.warning(
+            "Secret provider unavailable: error_type=%s",
+            type(error).__name__,
+        )
+        raise SecretProviderUnavailable("secret provider unavailable") from None
 
 
 def _get_telegram_token():
@@ -1225,11 +1684,18 @@ CONTENT_TYPE_TO_EXT = {
 }
 
 
-def _upload_image_to_s3(image_bytes, namespace, content_type):
+def _upload_image_to_s3(image_bytes, namespace, content_type, invocation_id):
     """Upload image bytes to S3 and return the S3 key, or None on failure.
 
-    S3 key: {namespace}/_uploads/img_{timestamp}_{hex}.{ext}
+    The filename is deterministic for one trusted event and exact image bytes.
+    RH2 will migrate the still-current actor namespace atomically across every
+    router, proxy, credential, and runtime consumer.
     """
+    try:
+        namespace = _canonical_namespace(namespace)
+    except ValueError:
+        logger.warning("Rejected image upload without canonical internal user identity")
+        return None
     if not USER_FILES_BUCKET:
         logger.warning("USER_FILES_BUCKET not configured — cannot upload image")
         return None
@@ -1239,11 +1705,16 @@ def _upload_image_to_s3(image_bytes, namespace, content_type):
     if len(image_bytes) > MAX_IMAGE_BYTES:
         logger.warning("Rejected image: %d bytes exceeds limit of %d", len(image_bytes), MAX_IMAGE_BYTES)
         return None
+    if not re.fullmatch(r"po1_[0-9a-f]{64}", str(invocation_id or "")):
+        logger.warning("Rejected image upload without trusted invocation identity")
+        return None
 
     ext = CONTENT_TYPE_TO_EXT.get(content_type, "bin")
-    timestamp = int(time.time())
-    hex_suffix = uuid.uuid4().hex[:8]
-    s3_key = f"{namespace}/_uploads/img_{timestamp}_{hex_suffix}.{ext}"
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
+    s3_key = (
+        f"{namespace}/_uploads/"
+        f"img_{invocation_id}_{content_hash}.{ext}"
+    )
 
     try:
         s3_client.put_object(
@@ -1383,9 +1854,24 @@ def handle_telegram(body):
     update = json.loads(body) if isinstance(body, str) else body
     message = update.get("message", {})
     text = message.get("text", "") or message.get("caption", "")
-    chat_id = message.get("chat", {}).get("id")
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
     user = message.get("from", {})
-    user_id_tg = str(user.get("id", ""))
+    user_id = user.get("id")
+    if (
+        chat.get("type") != "private"
+        or isinstance(chat_id, bool)
+        or not isinstance(chat_id, int)
+        or isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or chat_id <= 0
+        or user_id <= 0
+        or chat_id != user_id
+        or len(str(chat_id)) > 20
+    ):
+        logger.info("Telegram: ignoring non-private or inexact actor chat")
+        return
+    user_id_tg = str(user_id)
     display_name = user.get("first_name", "") or user.get("username", "")
 
     # Detect image: photo array or document with image mime type
@@ -1429,6 +1915,13 @@ def handle_telegram(body):
         )
         return
 
+    try:
+        resolved_user_id = _canonical_namespace(resolved_user_id)
+    except ValueError:
+        logger.error("Telegram resolved a non-canonical internal user identity")
+        send_telegram_message(chat_id, "Sorry, your account mapping is invalid.", token)
+        return
+
     # Handle link-accounts command (generate bind code for existing users)
     if _is_link_command(text):
         code = create_bind_code(resolved_user_id)
@@ -1440,16 +1933,22 @@ def handle_telegram(body):
         )
         return
 
+    invocation_id = _build_runtime_invocation_id(
+        "telegram", update.get("update_id"), resolved_user_id
+    )
+
     # Send typing indicator
     send_telegram_typing(chat_id, token)
 
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
     if has_image:
-        namespace = actor_id.replace(":", "_")
+        namespace = _canonical_namespace(resolved_user_id)
         image_bytes, content_type, _ = _download_telegram_image(message, token)
         if image_bytes:
-            s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+            s3_key = _upload_image_to_s3(
+                image_bytes, namespace, content_type, invocation_id
+            )
             if s3_key:
                 agent_message = _build_structured_message(text, s3_key, content_type)
             else:
@@ -1477,7 +1976,14 @@ def handle_telegram(body):
     )
     typing_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message)
+        result = invoke_agent_runtime(
+            session_id,
+            resolved_user_id,
+            actor_id,
+            "telegram",
+            agent_message,
+            invocation_id,
+        )
     finally:
         stop_typing.set()
         typing_thread.join(timeout=2)
@@ -1578,6 +2084,13 @@ def handle_slack(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    try:
+        resolved_user_id = _canonical_namespace(resolved_user_id)
+    except ValueError:
+        logger.error("Slack resolved a non-canonical internal user identity")
+        send_slack_message(channel_id, "Sorry, your account mapping is invalid.", bot_token)
+        return {"statusCode": 200, "body": "ok"}
+
     # Handle link-accounts command (generate bind code for existing users)
     if _is_link_command(text):
         code = create_bind_code(resolved_user_id)
@@ -1589,15 +2102,21 @@ def handle_slack(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    invocation_id = _build_runtime_invocation_id(
+        "slack", event_data.get("event_id"), resolved_user_id
+    )
+
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
     if has_image:
-        namespace = actor_id.replace(":", "_")
+        namespace = _canonical_namespace(resolved_user_id)
         # Use first image file
         file_info = image_files[0]
         image_bytes, content_type, _ = _download_slack_file(file_info, bot_token)
         if image_bytes:
-            s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+            s3_key = _upload_image_to_s3(
+                image_bytes, namespace, content_type, invocation_id
+            )
             if s3_key:
                 agent_message = _build_structured_message(text, s3_key, content_type)
             else:
@@ -1624,7 +2143,14 @@ def handle_slack(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message)
+        result = invoke_agent_runtime(
+            session_id,
+            resolved_user_id,
+            actor_id,
+            "slack",
+            agent_message,
+            invocation_id,
+        )
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -1735,6 +2261,13 @@ def handle_feishu(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    try:
+        resolved_user_id = _canonical_namespace(resolved_user_id)
+    except ValueError:
+        logger.error("Feishu resolved a non-canonical internal user identity")
+        send_feishu_message(chat_id, "Sorry, your account mapping is invalid.")
+        return {"statusCode": 200, "body": "ok"}
+
     # Handle link-accounts command
     if _is_link_command(text):
         bind_code = create_bind_code(resolved_user_id)
@@ -1745,13 +2278,21 @@ def handle_feishu(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    invocation_id = _build_runtime_invocation_id(
+        "feishu",
+        header.get("event_id") or message.get("message_id"),
+        resolved_user_id,
+    )
+
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text or "hi"
     if has_image:
-        namespace = actor_id.replace(":", "_")
+        namespace = _canonical_namespace(resolved_user_id)
         image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
         if image_bytes:
-            s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+            s3_key = _upload_image_to_s3(
+                image_bytes, namespace, content_type, invocation_id
+            )
             if s3_key:
                 agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
             else:
@@ -1778,7 +2319,14 @@ def handle_feishu(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message)
+        result = invoke_agent_runtime(
+            session_id,
+            resolved_user_id,
+            actor_id,
+            "feishu",
+            agent_message,
+            invocation_id,
+        )
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -1793,7 +2341,7 @@ def handle_feishu(body, headers=None):
 # Lambda handler
 # ---------------------------------------------------------------------------
 
-def handler(event, context):
+def _handle_event(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
@@ -1834,14 +2382,30 @@ def handler(event, context):
 
     # Determine channel from path
     if path.endswith("/webhook/telegram"):
-        # Validate webhook secret before processing
-        if not validate_telegram_webhook(headers):
-            logger.warning("Telegram webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
-
-        # Self-invoke async and return immediately
-        _self_invoke_async("telegram", body, headers)
-        return {"statusCode": 200, "body": "ok"}
+        # Authentication, bounded parsing, identity resolution, and durable
+        # FIFO acceptance form one synchronous boundary. A 200 is returned
+        # only after SQS provides an exact acceptance receipt.
+        try:
+            rejected = _telegram_preflight(body, headers)
+        except Exception as error:
+            logger.warning(
+                "Telegram secret provider unavailable: error_type=%s",
+                type(error).__name__,
+            )
+            return {"statusCode": 503, "body": "service unavailable"}
+        if rejected is not None:
+            return rejected
+        try:
+            return _get_telegram_ingress().handle(body, headers)
+        except SecretProviderUnavailable:
+            logger.warning("Telegram secret provider unavailable")
+            return {"statusCode": 503, "body": "service unavailable"}
+        except Exception as error:
+            logger.warning(
+                "Telegram ingress unavailable: error_type=%s",
+                type(error).__name__,
+            )
+            return {"statusCode": 503, "body": "queue unavailable"}
 
     elif path.endswith("/webhook/slack"):
         # Slack url_verification — only allowed during initial setup
@@ -1903,6 +2467,13 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     return {"statusCode": 404, "body": "Not found"}
+
+
+def handler(event, context):
+    """Run the public handler inside the metadata-only dependency boundary."""
+
+    with _metadata_only_dependency_logging():
+        return _handle_event(event, context)
 
 
 def _self_invoke_async(channel, body, headers):

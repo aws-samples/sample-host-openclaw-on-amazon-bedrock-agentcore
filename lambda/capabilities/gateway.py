@@ -1,0 +1,482 @@
+"""Typed capability admission gateway with no production adapters enabled."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Protocol, Sequence
+
+from .admission import (
+    AdmissionDenied,
+    AdmissionGate,
+    AdmissionRepository,
+    AdmittedCall,
+)
+from .contracts import (
+    CapabilityCallV1,
+    CapabilityCatalogV1,
+    CapabilityResultV1,
+    ContractValidationError,
+    canonical_json_bytes,
+)
+from .ledger import (
+    CapabilityLedger,
+    LedgerDenied,
+    LedgerDisposition,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AdapterOutcome:
+    status: str
+    data: Mapping[str, Any] = field(default_factory=dict)
+    provenance_refs: Sequence[str] = ()
+    proposal_ref: str | None = None
+    receipt_ref: str | None = None
+    error_code: str | None = None
+    retry_policy: str = "NONE"
+
+
+class CapabilityAdapter(Protocol):
+    def invoke(self, admitted: AdmittedCall) -> AdapterOutcome: ...
+
+
+def _result(
+    call: CapabilityCallV1,
+    *,
+    status: str,
+    data: Mapping[str, Any] | None = None,
+    provenance_refs: Sequence[str] = (),
+    proposal_ref: str | None = None,
+    receipt_ref: str | None = None,
+    error_code: str | None = None,
+    retry_policy: str = "NONE",
+) -> CapabilityResultV1:
+    return CapabilityResultV1.from_mapping(
+        {
+            "schema": CapabilityResultV1.SCHEMA,
+            "callId": call.call_id,
+            "invocationId": call.invocation_id,
+            "toolUseId": call.tool_use_id,
+            "catalogDigest": call.catalog_digest,
+            "operationId": call.operation_id,
+            "toolName": call.tool_name,
+            "argsHash": call.args_hash,
+            "status": status,
+            "data": dict(data or {}),
+            "provenanceRefs": list(provenance_refs),
+            "proposalRef": proposal_ref,
+            "receiptRef": receipt_ref,
+            "errorCode": error_code,
+            "retryPolicy": retry_policy,
+        }
+    ).validate_against_call(call)
+
+
+def _denied(call: CapabilityCallV1, code: str) -> CapabilityResultV1:
+    safe_code = code if isinstance(code, str) and 0 < len(code) <= 128 else "DENIED"
+    return _result(call, status="DENIED", error_code=safe_code)
+
+
+def _ambiguous(
+    call: CapabilityCallV1,
+    retry_mode: str,
+    code: str,
+) -> CapabilityResultV1:
+    if retry_mode == "READ_ONLY":
+        return _result(
+            call,
+            status="FAILED_RETRYABLE",
+            error_code=code,
+            retry_policy="SAFE_RETRY",
+        )
+    return _result(
+        call,
+        status="UNCERTAIN",
+        error_code=code,
+        retry_policy="RECONCILE_ONLY",
+    )
+
+
+def _catalog_operation_ids(catalog: CapabilityCatalogV1) -> frozenset[str]:
+    return frozenset(
+        operation["operationId"]
+        for pack in catalog.packs
+        for operation in pack["operations"]
+    )
+
+
+class SchedulePort(Protocol):
+    """Read/propose surface of the trusted scheduler control plane.
+
+    Deliberately narrow: it exposes only the read view and the two proposal-only
+    entry points. Confirm/update/pause/cancel live on the trusted control plane
+    and are intentionally absent here, so the runtime can never reach them
+    through the gateway. That split is what keeps scheduled turns read-only.
+    """
+
+    def list_view(self, user_id: str) -> Mapping[str, Any]: ...
+
+    def propose(
+        self,
+        *,
+        user_id: str,
+        invocation_id: str,
+        task_type: str,
+        definition: Mapping[str, Any],
+    ) -> Mapping[str, Any]: ...
+
+    def cancel_propose(
+        self, *, user_id: str, invocation_id: str, schedule_id: str
+    ) -> Mapping[str, Any]: ...
+
+
+class _ScheduleListAdapter:
+    def __init__(self, port: SchedulePort) -> None:
+        self._port = port
+
+    def invoke(self, admitted: AdmittedCall) -> AdapterOutcome:
+        view = self._port.list_view(admitted.grant.sub)
+        return AdapterOutcome(
+            status="SUCCEEDED",
+            data=dict(view),
+            provenance_refs=("schedule:list",),
+        )
+
+
+class _ScheduleProposeAdapter:
+    """Returns a PENDING_APPROVAL proposal and never a live schedule."""
+
+    def __init__(self, port: SchedulePort) -> None:
+        self._port = port
+
+    def invoke(self, admitted: AdmittedCall) -> AdapterOutcome:
+        arguments = admitted.call.data["arguments"]
+        proposal = self._port.propose(
+            user_id=admitted.grant.sub,
+            invocation_id=admitted.grant.invocation_id,
+            task_type=arguments["taskType"],
+            definition=arguments["definition"],
+        )
+        return self._proposal_outcome(admitted, proposal)
+
+    @staticmethod
+    def _proposal_outcome(
+        admitted: AdmittedCall, proposal: Mapping[str, Any]
+    ) -> AdapterOutcome:
+        proposal_ref = proposal.get("proposalRef")
+        expires_at = proposal.get("expiresAt")
+        # The proposal binds the exact originating call arguments; a proposal
+        # can only be prepared, never dispatched.
+        data = {
+            "proposalRef": proposal_ref,
+            "argsHash": admitted.call.args_hash,
+            "expiresAt": expires_at,
+        }
+        return AdapterOutcome(
+            status="PENDING_APPROVAL",
+            data=data,
+            proposal_ref=proposal_ref,
+        )
+
+
+class _ScheduleCancelProposeAdapter(_ScheduleProposeAdapter):
+    def invoke(self, admitted: AdmittedCall) -> AdapterOutcome:
+        arguments = admitted.call.data["arguments"]
+        proposal = self._port.cancel_propose(
+            user_id=admitted.grant.sub,
+            invocation_id=admitted.grant.invocation_id,
+            schedule_id=arguments["scheduleId"],
+        )
+        return self._proposal_outcome(admitted, proposal)
+
+
+def build_schedule_adapters(port: SchedulePort) -> dict[str, CapabilityAdapter]:
+    """Bind the three schedule read/propose operations to the trusted port.
+
+    Only schedule.list (read-only), schedule.propose, and
+    schedule.cancel.propose (both proposal-only) are bound. Every dispatch-class
+    operation stays ADAPTER_DISABLED, and confirm/update/pause/cancel are not
+    catalog operations at all, so the runtime cannot reach a live schedule
+    mutation through the gateway.
+    """
+
+    return {
+        "schedule.list": _ScheduleListAdapter(port),
+        "schedule.propose": _ScheduleProposeAdapter(port),
+        "schedule.cancel.propose": _ScheduleCancelProposeAdapter(port),
+    }
+
+
+class CapabilityGateway:
+    """Admit, replay-protect, and dispatch one exact catalog operation."""
+
+    def __init__(
+        self,
+        *,
+        catalog: CapabilityCatalogV1,
+        repository: AdmissionRepository,
+        ledger: CapabilityLedger,
+        adapters: Mapping[str, CapabilityAdapter] | None = None,
+        allowed_caller_arn: str,
+        clock: Callable[[], int],
+    ) -> None:
+        if not isinstance(catalog, CapabilityCatalogV1):
+            raise TypeError("gateway requires a validated catalog")
+        configured = dict(adapters or {})
+        unknown = set(configured) - _catalog_operation_ids(catalog)
+        if unknown:
+            raise ValueError("gateway adapter is absent from the frozen catalog")
+        if any(
+            not callable(getattr(adapter, "invoke", None))
+            for adapter in configured.values()
+        ):
+            raise TypeError("gateway adapters must implement invoke")
+        self._admission = AdmissionGate(
+            catalog=catalog,
+            repository=repository,
+            allowed_caller_arn=allowed_caller_arn,
+            clock=clock,
+        )
+        self._ledger = ledger
+        self._adapters = configured
+
+    def invoke(
+        self,
+        call: CapabilityCallV1 | Mapping[str, Any],
+        iam_context: Mapping[str, Any],
+    ) -> CapabilityResultV1:
+        validated_call = (
+            call
+            if isinstance(call, CapabilityCallV1)
+            else CapabilityCallV1.from_mapping(call)
+        )
+        try:
+            admitted = self._admission.admit(validated_call, iam_context)
+        except AdmissionDenied as error:
+            return _denied(validated_call, error.code)
+
+        try:
+            claim = self._ledger.begin(
+                call=validated_call,
+                grant=admitted.grant,
+                pack_id=admitted.pack_id,
+                pack_max_calls=admitted.pack["quotaPolicy"]["maxCallsPerTurn"],
+                retry_mode=admitted.retry_mode,
+                retention_max_days=admitted.pack["retentionPolicy"]["maxDays"],
+            )
+        except LedgerDenied as error:
+            return _denied(validated_call, error.code)
+        except Exception:
+            return _denied(validated_call, "CAPABILITY_LEDGER_UNAVAILABLE")
+
+        if claim.disposition is LedgerDisposition.CACHED:
+            if claim.result is None:
+                raise RuntimeError("completed ledger entry has no typed result")
+            return claim.result
+        if claim.disposition is LedgerDisposition.IN_FLIGHT:
+            return _ambiguous(
+                validated_call,
+                admitted.retry_mode,
+                "CAPABILITY_CALL_IN_FLIGHT",
+            )
+        if claim.disposition is LedgerDisposition.LOGICAL_FENCE:
+            return _ambiguous(
+                validated_call,
+                admitted.retry_mode,
+                "CAPABILITY_LOGICAL_EFFECT_UNCERTAIN",
+            )
+        if claim.disposition is LedgerDisposition.RETRY_EXHAUSTED:
+            return _denied(
+                validated_call,
+                "CAPABILITY_READ_RETRY_EXHAUSTED",
+            )
+
+        adapter = self._adapters.get(validated_call.operation_id)
+        if adapter is None:
+            result = _denied(validated_call, "ADAPTER_DISABLED")
+            return self._complete_result(admitted, result, effect_dispatched=False)
+
+        try:
+            self._admission.claim_target(admitted)
+            self._admission.recheck_deletion_fence(admitted)
+        except AdmissionDenied as error:
+            result = _denied(validated_call, error.code)
+            return self._complete_result(admitted, result, effect_dispatched=False)
+
+        try:
+            outcome = adapter.invoke(admitted)
+            result = self._result_from_adapter(admitted, outcome)
+        except Exception:
+            result = _ambiguous(
+                validated_call,
+                admitted.retry_mode,
+                "ADAPTER_OUTCOME_UNAVAILABLE",
+            )
+        return self._complete_result(admitted, result, effect_dispatched=True)
+
+    def _complete_result(
+        self,
+        admitted: AdmittedCall,
+        result: CapabilityResultV1,
+        *,
+        effect_dispatched: bool,
+    ) -> CapabilityResultV1:
+        try:
+            self._ledger.complete(
+                call=admitted.call,
+                grant=admitted.grant,
+                result=result,
+            )
+            return result
+        except Exception:
+            if not effect_dispatched:
+                return result
+
+        ambiguous = _ambiguous(
+            admitted.call,
+            admitted.retry_mode,
+            "CAPABILITY_COMPLETION_UNAVAILABLE",
+        )
+        try:
+            # A transient post-dispatch completion failure must leave a durable
+            # typed fence. If persistence is still unavailable, the original
+            # IN_FLIGHT logical claim remains the conservative fence.
+            self._ledger.complete(
+                call=admitted.call,
+                grant=admitted.grant,
+                result=ambiguous,
+            )
+        except Exception:
+            pass
+        return ambiguous
+
+    @staticmethod
+    def _result_from_adapter(
+        admitted: AdmittedCall, outcome: AdapterOutcome
+    ) -> CapabilityResultV1:
+        if not isinstance(outcome, AdapterOutcome):
+            raise TypeError("adapter returned an untyped outcome")
+        output_size = len(canonical_json_bytes(outcome.data))
+        if output_size > admitted.pack["quotaPolicy"]["maxOutputBytes"]:
+            raise ValueError("adapter output exceeds the pack quota")
+        return _result(
+            admitted.call,
+            status=outcome.status,
+            data=outcome.data,
+            provenance_refs=outcome.provenance_refs,
+            proposal_ref=outcome.proposal_ref,
+            receipt_ref=outcome.receipt_ref,
+            error_code=outcome.error_code,
+            retry_policy=outcome.retry_policy,
+        )
+
+
+WEB_READ_OPERATION_ID = "web.exact.read"
+
+
+def build_web_read_adapter(
+    *,
+    resolver: Callable[[str], Any],
+    connect: Callable[..., Any],
+    clock: Callable[[], int],
+    max_redirects: int = 0,
+) -> "CapabilityAdapter":
+    """Build the gateway-mediated exact-target web reader adapter.
+
+    This is the single wiring point for the reader: it can only enter the
+    system as an ``adapters`` entry keyed by ``WEB_READ_OPERATION_ID`` on a
+    :class:`CapabilityGateway`, and it holds no network authority beyond the
+    explicit ``resolver``/``connect`` seams passed here. The production
+    composition never calls this, so ``web.exact.read`` stays a disabled
+    (fail-closed) adapter and the verifier remains offline and credential-free.
+    """
+
+    from .web_reader import build_web_read_adapter as _build
+
+    return _build(
+        resolver=resolver,
+        connect=connect,
+        clock=clock,
+        max_redirects=max_redirects,
+    )
+
+
+class ConnectorPlaneRegistry:
+    """Disabled-by-default registry for the curated connector plane.
+
+    The connector plane is deliberately SEPARATE from the frozen 10-op
+    model-facing catalog: its adapters are keyed by connector operationId and it
+    is empty in production composition. This registry keeps connectors behind
+    the same caller-pinned trusted boundary WITHOUT polluting the catalog and
+    proves runtime-unawareness: a connector operationId that collides with any
+    model-facing catalog operationId is refused at construction, so no connector
+    tool can ever be surfaced to the runtime as a model tool.
+    """
+
+    def __init__(
+        self,
+        *,
+        catalog: CapabilityCatalogV1,
+        adapters: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(catalog, CapabilityCatalogV1):
+            raise TypeError("connector registry requires a validated catalog")
+        self._model_operation_ids = _catalog_operation_ids(catalog)
+        configured = dict(adapters or {})
+        colliding = set(configured) & self._model_operation_ids
+        if colliding:
+            raise ValueError(
+                "connector operationId collides with a model-facing catalog tool"
+            )
+        # Every connector adapter must implement the Task 3 effect surface so an
+        # effect can only flow through the kernel's reload+fence discipline.
+        for adapter in configured.values():
+            if not callable(getattr(adapter, "dispatch", None)) or not callable(
+                getattr(adapter, "prepare", None)
+            ):
+                raise TypeError("connector adapters must implement the Task 3 surface")
+        self._adapters = configured
+
+    def is_disabled(self) -> bool:
+        return not self._adapters
+
+    def enabled_connector_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._adapters))
+
+    def get(self, operation_id: str) -> Any | None:
+        return self._adapters.get(operation_id)
+
+
+def lambda_handler(event: Any, _context: Any) -> dict[str, Any]:
+    """Invoke the cold-start verified, durable, disabled-adapter composition."""
+
+    if (
+        not isinstance(event, Mapping)
+        or set(event) != {"schema", "grant", "call"}
+        or event.get("schema") != "personal-operator.capability-relay-envelope.v1"
+    ):
+        raise ValueError("capability relay envelope is invalid")
+    try:
+        call = CapabilityCallV1.from_mapping(event["call"])
+    except (ContractValidationError, TypeError, ValueError) as error:
+        raise ValueError("capability relay call is invalid") from error
+    try:
+        from .composition import get_production_composition
+
+        composition = get_production_composition()
+    except Exception:
+        return _denied(call, "GATEWAY_CONFIGURATION_INVALID").to_mapping()
+    return composition.invoke(event).to_mapping()
+
+
+__all__ = [
+    "AdapterOutcome",
+    "CapabilityAdapter",
+    "CapabilityGateway",
+    "WEB_READ_OPERATION_ID",
+    "build_web_read_adapter",
+    "ConnectorPlaneRegistry",
+    "SchedulePort",
+    "build_schedule_adapters",
+    "lambda_handler",
+]

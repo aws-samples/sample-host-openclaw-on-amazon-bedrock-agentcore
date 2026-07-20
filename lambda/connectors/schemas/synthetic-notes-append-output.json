@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:synthetic-notes-append-output:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"text":{"maxLength":512,"minLength":1,"type":"string"}},"required":["text"],"title":"Synthetic notes append output","type":"object"}

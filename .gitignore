@@ -25,6 +25,7 @@ ENV/
 # Node.js
 # ──────────────────────────────────────────────
 node_modules/
+web/dist/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -82,6 +83,7 @@ docker-compose.override.yml
 *.bak
 SYNC.md
 .claude/skills/
+.superpowers/
 
 # Internal post-deploy script (not for GitHub)
 post-deploy.sh

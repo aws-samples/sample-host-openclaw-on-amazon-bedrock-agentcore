@@ -8,10 +8,10 @@ from unittest.mock import MagicMock, patch
 
 # Set required env vars before importing the module
 os.environ.setdefault("AGENTCORE_RUNTIME_ARN",
-    "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/test")
-os.environ.setdefault("AGENTCORE_QUALIFIER", "test-endpoint")
+    "arn:aws:bedrock-agentcore:eu-west-1:123456789012:runtime/test")
+os.environ.setdefault("AGENTCORE_QUALIFIER", "release_" + "a" * 40)
 os.environ.setdefault("IDENTITY_TABLE_NAME", "openclaw-identity")
-os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-us-west-2")
+os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-eu-west-1")
 os.environ.setdefault("SLACK_TOKEN_SECRET_ID", "openclaw/channels/slack")
 
 # Mock AWS SDK before importing the module
@@ -39,6 +39,7 @@ def _make_slack_message_event(text="Hello", user_id="U12345USER", channel_id="C1
     """Build a Slack message event payload."""
     event = {
         "type": "event_callback",
+        "event_id": "Ev1234567890",
         "event": {
             "type": "message",
             "user": user_id,
@@ -61,6 +62,7 @@ def _make_slack_app_mention_event(text="<@UBOT123> Hello", user_id="U12345USER",
     """Build a Slack app_mention event payload."""
     return {
         "type": "event_callback",
+        "event_id": "Ev1234567891",
         "event": {
             "type": "app_mention",
             "user": user_id,
@@ -97,6 +99,12 @@ class TestSlackEventTypeFiltering(unittest.TestCase):
         event = _make_slack_message_event()
         result = index.handle_slack(json.dumps(event))
         self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(
+            mock_invoke.call_args[0][5],
+            index._build_runtime_invocation_id(
+                "slack", "Ev1234567890", "user_abc123"
+            ),
+        )
 
     @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
@@ -146,6 +154,62 @@ class TestSlackEventTypeFiltering(unittest.TestCase):
         )
         result = index.handle_slack(json.dumps(event))
         self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(
+            mock_upload.call_args[0][3],
+            index._build_runtime_invocation_id(
+                "slack", "Ev1234567890", "user_abc123"
+            ),
+        )
+
+    @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
+    @patch.object(index, "resolve_user", return_value=("user_abc123", False))
+    @patch.object(index, "get_or_create_session", return_value="ses_test")
+    @patch.object(index, "_download_slack_file", return_value=(b"same-image", "image/png", "image.png"))
+    @patch.object(index, "invoke_agent_runtime", return_value={"response": "done"})
+    @patch.object(index, "send_slack_message")
+    @patch.object(index, "s3_client")
+    def test_duplicate_platform_image_event_has_identical_runtime_work(
+        self,
+        mock_s3,
+        mock_send,
+        mock_invoke,
+        mock_download,
+        mock_session,
+        mock_resolve,
+        mock_tokens,
+    ):
+        event = _make_slack_message_event(
+            text="Inspect",
+            subtype="file_share",
+            files=[
+                {
+                    "id": "F-stable",
+                    "mimetype": "image/png",
+                    "url_private_download": "https://example.com/image.png",
+                }
+            ],
+        )
+
+        index.handle_slack(json.dumps(event))
+        index.handle_slack(json.dumps(event))
+
+        first_upload = mock_s3.put_object.call_args_list[0].kwargs
+        retry_upload = mock_s3.put_object.call_args_list[1].kwargs
+        self.assertEqual(first_upload["Key"], retry_upload["Key"])
+        first_work = mock_invoke.call_args_list[0].args
+        retry_work = mock_invoke.call_args_list[1].args
+        self.assertEqual(first_work[5], retry_work[5])
+        self.assertEqual(first_work[4], retry_work[4])
+
+        changed = json.loads(json.dumps(event))
+        changed["event_id"] = "Ev-different"
+        mock_download.return_value = (b"changed-image", "image/png", "image.png")
+        index.handle_slack(json.dumps(changed))
+        changed_upload = mock_s3.put_object.call_args_list[2].kwargs
+        changed_work = mock_invoke.call_args_list[2].args
+        self.assertNotEqual(changed_upload["Key"], first_upload["Key"])
+        self.assertNotEqual(changed_work[5], first_work[5])
+        self.assertNotEqual(changed_work[4], first_work[4])
 
 
 class TestSlackMentionStripping(unittest.TestCase):

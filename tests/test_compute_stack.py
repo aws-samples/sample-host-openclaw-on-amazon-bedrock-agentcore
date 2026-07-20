@@ -1,0 +1,199 @@
+"""Inactive reference shape for a future networkless compute job runner.
+
+The real Docker build, ARM64 image, and static-scan gates are OPEN and not run
+here. This stack is not part of the active application and must not be treated
+as production or deployment evidence.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import aws_cdk as cdk
+from aws_cdk.assertions import Template
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+ACCOUNT = "123456789012"
+REGION = "eu-west-1"
+CMK_ARN = f"arn:aws:kms:{REGION}:{ACCOUNT}:key/test-compute-key"
+IMAGE_DIGEST = "sha256:" + "a" * 64
+OUTPUT_BUCKET = "personal-operator-compute-outputs"
+
+
+def _synth(region: str = REGION):
+    from stacks.compute_stack import ComputeStack
+
+    app = cdk.App()
+    stack = ComputeStack(
+        app,
+        "PersonalOperatorCompute",
+        cmk_arn=CMK_ARN,
+        image_digest=IMAGE_DIGEST,
+        env=cdk.Environment(account=ACCOUNT, region=region),
+    )
+    return stack, Template.from_stack(stack).to_json()
+
+
+def _resources(template: dict, resource_type: str) -> list[dict]:
+    return [
+        resource
+        for resource in template.get("Resources", {}).values()
+        if resource["Type"] == resource_type
+    ]
+
+
+def _actions(template: dict) -> set[str]:
+    result: set[str] = set()
+    for policy in _resources(template, "AWS::IAM::Policy"):
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+            actions = statement.get("Action", [])
+            result.update([actions] if isinstance(actions, str) else actions)
+    return result
+
+
+def test_compute_stack_has_an_isolated_networkless_job_runner():
+    stack, template = _synth()
+    # An ECS task definition running the pinned image as the job runner.
+    task_defs = _resources(template, "AWS::ECS::TaskDefinition")
+    assert len(task_defs) == 1
+    assert task_defs[0]["Properties"]["Family"] == "personal-operator-compute"
+    # The runner exposes a pinned image digest to the gateway environment.
+    assert stack.image_digest == IMAGE_DIGEST
+
+
+def test_compute_runner_has_no_routed_internet_or_aws_endpoints():
+    stack, template = _synth()
+    # No NAT gateways, no egress-only gateways, no VPC interface/gateway endpoints:
+    # the job VPC has no routed path to the internet or an AWS service.
+    assert _resources(template, "AWS::EC2::NatGateway") == []
+    assert _resources(template, "AWS::EC2::VPCEndpoint") == []
+    # Subnets used by the runner must not auto-assign public IPs.
+    for subnet in _resources(template, "AWS::EC2::Subnet"):
+        assert subnet["Properties"].get("MapPublicIpOnLaunch") in (False, None)
+    # Isolated subnets have no default route to an internet gateway.
+    for route in _resources(template, "AWS::EC2::Route"):
+        assert "GatewayId" not in route["Properties"]
+        assert "NatGatewayId" not in route["Properties"]
+
+
+def test_compute_workload_binding_has_explicit_zero_ingress_and_egress():
+    stack, template = _synth()
+    security_groups = _resources(template, "AWS::EC2::SecurityGroup")
+    assert len(security_groups) == 1
+    properties = security_groups[0]["Properties"]
+    assert properties.get("SecurityGroupIngress", []) == []
+    assert properties["SecurityGroupEgress"] == [
+        {
+            "CidrIp": "255.255.255.255/32",
+            "Description": "Disallow all traffic",
+            "FromPort": 252,
+            "IpProtocol": "icmp",
+            "ToPort": 86,
+        }
+    ]
+    assert len(stack.isolated_subnet_ids) == 2
+    assert stack.workload_security_group is not None
+    assert "ComputeWorkloadSecurityGroupId" in template["Outputs"]
+    assert "ComputeIsolatedSubnetIds" in template["Outputs"]
+    assert template["Outputs"]["ComputeAssignPublicIp"]["Value"] == "DISABLED"
+
+
+def test_compute_container_has_no_task_role_or_ambient_aws_credentials():
+    _, template = _synth()
+    task_definition = _resources(template, "AWS::ECS::TaskDefinition")[0]
+    assert "TaskRoleArn" not in task_definition["Properties"]
+    actions = _actions(template)
+    # The execution role is not exposed to the workload. The container itself
+    # receives no task role and therefore no ECS credential endpoint at all.
+    for forbidden in (
+        "sts:AssumeRole",
+        "sts:GetSessionToken",
+        "secretsmanager:GetSecretValue",
+        "s3:*",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "kms:Decrypt",
+        "kms:Encrypt",
+        "kms:GenerateDataKey*",
+        "kms:ReEncrypt*",
+        "ec2:CreateRoute",
+    ):
+        assert forbidden not in actions
+
+
+def test_compute_container_drops_every_linux_capability_and_uses_init():
+    _, template = _synth()
+    task_definition = _resources(template, "AWS::ECS::TaskDefinition")[0]
+    container = task_definition["Properties"]["ContainerDefinitions"][0]
+    assert container["LinuxParameters"] == {
+        "Capabilities": {"Drop": ["ALL"]},
+        "InitProcessEnabled": True,
+    }
+
+
+def test_inactive_reference_task_passes_only_runner_arguments_to_image_entrypoint():
+    _, template = _synth()
+    task_definition = _resources(template, "AWS::ECS::TaskDefinition")[0]
+    container = task_definition["Properties"]["ContainerDefinitions"][0]
+
+    # The image ENTRYPOINT already supplies ``python -m compute.runner``.
+    # Repeating it here would produce a malformed argv at an ECS launch.
+    assert container["Command"] == ["/job/input", "/job/output"]
+
+
+def test_inactive_image_shape_resolves_one_package_entrypoint_without_shim_recursion():
+    dockerfile = (ROOT / "compute/Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY lambda/compute /app/lambda/compute" in dockerfile
+    assert "COPY lambda/capabilities /app/lambda/capabilities" in dockerfile
+    assert "ENV PYTHONPATH=/app/lambda" in dockerfile
+    assert "COPY compute/runner.py" not in dockerfile
+    assert 'ENTRYPOINT ["python", "-m", "compute.runner"]' in dockerfile
+    assert 'CMD ["/job/input", "/job/output"]' in dockerfile
+
+
+def test_local_reference_shim_delegates_without_importing_itself():
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        [sys.executable, "-m", "compute.runner"],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stderr == "usage: runner.py <input_dir> <output_dir>\n"
+
+
+def test_compute_stack_rejects_a_non_pinned_image_digest():
+    from stacks.compute_stack import ComputeStack
+
+    app = cdk.App()
+    for bad in ("latest", "sha256:zz", "a" * 64):
+        with pytest.raises(ValueError):
+            ComputeStack(
+                app,
+                f"Bad{hash(bad) & 0xffff}",
+                cmk_arn=CMK_ARN,
+                image_digest=bad,
+                env=cdk.Environment(account=ACCOUNT, region=REGION),
+            )
+
+
+def test_compute_stack_rejects_every_noncanonical_region():
+    with pytest.raises(ValueError, match="eu-west-1"):
+        _synth("us-east-1")
+
+
+def test_active_app_does_not_instantiate_inactive_compute_reference():
+    app_source = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "ComputeStack" not in app_source
+    assert "compute_image_digest" not in app_source

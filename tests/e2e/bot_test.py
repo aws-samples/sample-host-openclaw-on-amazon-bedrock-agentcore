@@ -9,7 +9,6 @@ CLI usage:
     python -m tests.e2e.bot_test --subagent --tail-logs
     python -m tests.e2e.bot_test --skill-manage --tail-logs
     python -m tests.e2e.bot_test --api-keys --tail-logs
-    python -m tests.e2e.bot_test --cron --tail-logs
     python -m tests.e2e.bot_test --browser --tail-logs
     python -m tests.e2e.bot_test --guardrail --tail-logs
 
@@ -51,6 +50,13 @@ class TestSmoke:
         result = health_check(e2e_config)
         assert result.status_code == 200, f"Health check failed: {result.status_code} {result.body}"
         assert "ok" in result.body
+
+    def test_workspace_session_role_is_canonical(self, e2e_config):
+        """Deployment exposes the dedicated eu-west-1 workspace base role."""
+        assert re.fullmatch(
+            r"arn:aws:iam::\d{12}:role/openclaw-workspace-session-role-eu-west-1",
+            e2e_config.workspace_session_role_arn,
+        )
 
     def test_webhook_accepted(self, e2e_config):
         """Telegram webhook POST returns 200 (accepted for async processing)."""
@@ -1000,6 +1006,7 @@ class TestSkillManagement:
         print(f"  List response ({tail.response_len} chars): {tail.response_text[:300]}")
 
 
+@pytest.mark.skip(reason="Direct cron is disabled until the trusted FIFO scheduler in Task 4")
 class TestCronSchedule:
     """Verify eventbridge-cron skill: create, list, and delete schedules.
 
@@ -1251,6 +1258,7 @@ class TestCronSchedule:
             print(f"  EventBridge schedule confirmed deleted: {eb_name}")
 
 
+@pytest.mark.skip(reason="Direct cron is disabled until the trusted FIFO scheduler in Task 4")
 @pytest.mark.slow
 class TestCronExecution:
     """Verify cron execution pipeline: bot creates schedule, Lambda executes it.
@@ -2016,6 +2024,11 @@ def _cli_api_keys(cfg, tail):
 
 def _cli_cron(cfg, tail):
     """Test cron schedule lifecycle: create, verify DynamoDB, list, delete."""
+    del cfg, tail
+    print("Direct cron is disabled until the trusted FIFO scheduler in Task 4.")
+    return False
+
+    # Retained historical flow below for reference until Task 4 replaces it.
     schedule_name = "e2e-cron-test"
     schedule_expr = "cron(0 0 1 1 ? 2099)"
     schedule_tz = "UTC"
@@ -2239,7 +2252,7 @@ def main():
     parser.add_argument("--scoped-creds", action="store_true", help="Test S3 file ops via scoped credentials (requires full startup)")
     parser.add_argument("--skill-manage", action="store_true", help="Test skill management (list, install, uninstall)")
     parser.add_argument("--api-keys", action="store_true", help="Test API key management (native + Secrets Manager)")
-    parser.add_argument("--cron", action="store_true", help="Test cron schedule lifecycle (create, verify CRON# record, list, delete)")
+    parser.add_argument("--cron", action="store_true", help="Report that legacy direct cron is disabled")
     parser.add_argument("--browser", action="store_true", help="Test browser skill (navigate, screenshot, interact)")
     parser.add_argument("--guardrail", action="store_true", help="Test guardrail security (requires BEDROCK_GUARDRAIL_ID)")
     parser.add_argument("--reset", action="store_true", help="Reset session before sending")

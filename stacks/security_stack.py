@@ -1,4 +1,6 @@
-"""Security Stack — KMS CMK, Secrets Manager secrets, CloudTrail."""
+"""Security Stack — KMS CMK, exact-purpose secrets, and CloudTrail."""
+
+import json
 
 from aws_cdk import (
     Stack,
@@ -6,7 +8,6 @@ from aws_cdk import (
     aws_iam as iam,
     aws_kms as kms,
     aws_secretsmanager as secretsmanager,
-    aws_cognito as cognito,
     aws_s3 as s3,
     aws_cloudtrail as cloudtrail,
     aws_logs as logs,
@@ -17,9 +18,18 @@ from constructs import Construct
 from stacks import retention_days
 
 
+REQUIRED_REGION = "eu-west-1"
+
+
 class SecurityStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+
+        region = Stack.of(self).region
+        if region != REQUIRED_REGION:
+            raise ValueError(
+                f"SecurityStack must be deployed in {REQUIRED_REGION}; got {region}"
+            )
 
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
 
@@ -46,23 +56,8 @@ class SecurityStack(Stack):
                 resources=["*"],
             )
         )
-
-
-        # --- Gateway token (auto-generated 64-char) -----------------------
-        self.gateway_token_secret = secretsmanager.Secret(
-            self,
-            "GatewayTokenSecret",
-            secret_name="openclaw/gateway-token",
-            description="Token for CloudFront Web UI access",
-            encryption_key=self.cmk,
-            generate_secret_string=secretsmanager.SecretStringGenerator(
-                password_length=64,
-                exclude_punctuation=True,
-            ),
-        )
-
         # --- Channel bot token placeholders -------------------------------
-        channel_names = ["whatsapp", "telegram", "discord", "slack", "feishu"]
+        channel_names = ["telegram", "slack", "feishu"]
         self.channel_secrets: dict[str, secretsmanager.Secret] = {}
         for channel in channel_names:
             self.channel_secrets[channel] = secretsmanager.Secret(
@@ -116,41 +111,6 @@ class SecurityStack(Stack):
                 enable_file_validation=True,
             )
 
-        # --- Cognito User Pool (admin-provisioned identities) ---------------
-        self.user_pool = cognito.UserPool(
-            self,
-            "IdentityPool",
-            user_pool_name="openclaw-identity-pool",
-            self_sign_up_enabled=False,
-            sign_in_aliases=cognito.SignInAliases(username=True),
-            password_policy=cognito.PasswordPolicy(
-                min_length=16,
-                require_lowercase=False,
-                require_uppercase=False,
-                require_digits=False,
-                require_symbols=False,
-            ),
-            removal_policy=RemovalPolicy.RETAIN,
-            account_recovery=cognito.AccountRecovery.NONE,
-        )
-
-        self.user_pool_client = self.user_pool.add_client(
-            "ProxyClient",
-            user_pool_client_name="openclaw-proxy",
-            auth_flows=cognito.AuthFlow(
-                admin_user_password=True,
-            ),
-            generate_secret=False,
-        )
-
-        # Expose Cognito outputs for downstream stacks
-        self.user_pool_id = self.user_pool.user_pool_id
-        self.user_pool_client_id = self.user_pool_client.user_pool_client_id
-        self.cognito_issuer_url = (
-            f"https://cognito-idp.{Stack.of(self).region}.amazonaws.com/"
-            f"{self.user_pool.user_pool_id}"
-        )
-
         # --- Webhook validation secret (Telegram secret_token, Slack signing) --
         self.webhook_secret = secretsmanager.Secret(
             self,
@@ -165,21 +125,118 @@ class SecurityStack(Stack):
             ),
         )
 
-        # --- HMAC secret for deriving Cognito user passwords -----------------
-        self.cognito_password_secret = secretsmanager.Secret(
+        # Domain-separated control-plane signing keys. These never enter the
+        # OpenClaw runtime and are read only by their exact trusted Lambdas.
+        self.web_auth_secret = secretsmanager.Secret(
             self,
-            "CognitoPasswordSecret",
-            secret_name="openclaw/cognito-password-secret",
-            description="HMAC secret for deriving Cognito user passwords",
+            "WebAuthSecret",
+            secret_name="personal-operator/web-auth",
+            description="HMAC key for one-time connect tickets and opaque web sessions",
             encryption_key=self.cmk,
             generate_secret_string=secretsmanager.SecretStringGenerator(
                 password_length=64,
                 exclude_punctuation=True,
             ),
         )
+        self.approval_signing_secret = secretsmanager.Secret(
+            self,
+            "ApprovalSigningSecret",
+            secret_name="personal-operator/approval-signing",
+            description="HMAC key for exact founder approval grants",
+            encryption_key=self.cmk,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=64,
+                exclude_punctuation=True,
+            ),
+        )
+        self.workspace_capability_secret = secretsmanager.Secret(
+            self,
+            "WorkspaceCapabilitySecret",
+            secret_name="personal-operator/workspace-capability",
+            description=(
+                "HMAC key for exact user and AgentCore-session workspace capabilities"
+            ),
+            encryption_key=self.cmk,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=64,
+                exclude_punctuation=True,
+            ),
+        )
+        self.origin_verification_secret = secretsmanager.Secret(
+            self,
+            "OriginVerificationSecret",
+            secret_name="personal-operator/cloudfront-origin-verification",
+            description=(
+                "CloudFront-to-HTTP-API origin proof; never accepted from a viewer"
+            ),
+            encryption_key=self.cmk,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=64,
+                exclude_punctuation=True,
+                include_space=False,
+                require_each_included_type=False,
+            ),
+        )
+
+        def provider_placeholder(
+            construct_id: str,
+            *,
+            secret_name: str,
+            description: str,
+            fields: dict[str, str],
+        ) -> secretsmanager.Secret:
+            return secretsmanager.Secret(
+                self,
+                construct_id,
+                secret_name=secret_name,
+                description=description,
+                encryption_key=self.cmk,
+                generate_secret_string=secretsmanager.SecretStringGenerator(
+                    secret_string_template=json.dumps(fields),
+                    generate_string_key="bootstrap_nonce",
+                    password_length=32,
+                    exclude_punctuation=True,
+                ),
+            )
+
+        self.google_readonly_oauth_secret = provider_placeholder(
+            "GoogleReadonlyOAuthSecret",
+            secret_name="personal-operator/google-readonly-oauth",
+            description="Google OAuth client for the Gmail read-only pilot",
+            fields={"client_id": "REPLACE_ME", "client_secret": "REPLACE_ME"},
+        )
+        self.google_send_oauth_secret = provider_placeholder(
+            "GoogleSendOAuthSecret",
+            secret_name="personal-operator/google-send-oauth",
+            description="Separate founder-only Gmail send connection",
+            fields={
+                "client_id": "REPLACE_ME",
+                "client_secret": "REPLACE_ME",
+                "refresh_token": "REPLACE_ME",
+                "email": "REPLACE_ME",
+                "connection_id": "REPLACE_ME",
+                "user_id": "REPLACE_ME",
+            },
+        )
+        self.openai_api_key_secret = provider_placeholder(
+            "OpenAiApiKeySecret",
+            secret_name="personal-operator/openai-api-key",
+            description="OpenAI API key for non-retained opportunity ranking",
+            fields={"api_key": "REPLACE_ME"},
+        )
 
         # --- cdk-nag suppressions ---
-        all_secrets = [self.gateway_token_secret, self.cognito_password_secret, self.webhook_secret] + list(self.channel_secrets.values())
+        all_secrets = [
+            self.webhook_secret,
+            self.web_auth_secret,
+            self.approval_signing_secret,
+            self.workspace_capability_secret,
+            self.origin_verification_secret,
+            self.google_readonly_oauth_secret,
+            self.google_send_oauth_secret,
+            self.openai_api_key_secret,
+            *self.channel_secrets.values(),
+        ]
         cdk_nag.NagSuppressions.add_resource_suppressions(
             all_secrets,
             [
@@ -203,23 +260,3 @@ class SecurityStack(Stack):
                     ),
                 ],
             )
-        cdk_nag.NagSuppressions.add_resource_suppressions(
-            self.user_pool,
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-COG1",
-                    reason="Passwords are HMAC-derived by the proxy, not user-chosen. "
-                    "Complexity requirements are unnecessary for deterministic passwords.",
-                ),
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-COG2",
-                    reason="Users are service identities auto-provisioned from channel user IDs "
-                    "(e.g. telegram:12345). MFA is not applicable for non-interactive accounts.",
-                ),
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-COG3",
-                    reason="Advanced security mode (WAF integration) adds cost with no benefit "
-                    "for programmatic-only service identities. All auth is admin-initiated.",
-                ),
-            ],
-        )

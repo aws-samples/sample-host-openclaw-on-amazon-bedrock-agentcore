@@ -1,0 +1,1 @@
+{"$id":"urn:personal-operator:tool-schema:po-schedule-list-input:v1","$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{},"required":[],"title":"Schedule list input","type":"object"}

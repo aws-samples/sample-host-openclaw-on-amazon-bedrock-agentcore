@@ -1,22 +1,16 @@
-"""Observability Stack — Bedrock invocation logging, dashboards, alarms, SNS."""
+"""Metadata-only operational dashboards, alarms, and SNS notifications."""
 
 from aws_cdk import (
     Stack,
     Duration,
-    RemovalPolicy,
     aws_cloudwatch as cw,
     aws_cloudwatch_actions as cw_actions,
     aws_kms as kms,
-    aws_logs as logs,
-    aws_iam as iam,
     aws_sns as sns,
-    custom_resources as cr,
     CfnOutput,
 )
 import cdk_nag
 from constructs import Construct
-
-from stacks import retention_days
 
 
 class ObservabilityStack(Stack):
@@ -30,10 +24,6 @@ class ObservabilityStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        region = Stack.of(self).region
-        account = Stack.of(self).account
-        log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
-
         # --- SNS Topic for alarms -----------------------------------------
         alarm_cmk = kms.Key.from_key_arn(self, "AlarmTopicCmk", cmk_arn)
         self.alarm_topic = sns.Topic(
@@ -42,76 +32,6 @@ class ObservabilityStack(Stack):
             topic_name="openclaw-alarms",
             display_name="OpenClaw Alarms",
             master_key=alarm_cmk,
-        )
-
-        # --- Bedrock Invocation Log Group ---------------------------------
-        self.invocation_log_group = logs.LogGroup(
-            self,
-            "BedrockInvocationLogGroup",
-            log_group_name="/aws/bedrock/invocation-logs",
-            retention=retention_days(log_retention),
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-
-        # IAM role for Bedrock to write to CloudWatch Logs
-        bedrock_logging_role = iam.Role(
-            self,
-            "BedrockLoggingRole",
-            assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com"),
-        )
-        self.invocation_log_group.grant_write(bedrock_logging_role)
-
-        # Enable Bedrock Model Invocation Logging via custom resource
-        self.logging_cr = cr.AwsCustomResource(
-            self,
-            "EnableBedrockInvocationLogging",
-            on_create=cr.AwsSdkCall(
-                service="Bedrock",
-                action="PutModelInvocationLoggingConfiguration",
-                parameters={
-                    "loggingConfig": {
-                        "cloudWatchConfig": {
-                            "logGroupName": self.invocation_log_group.log_group_name,
-                            "roleArn": bedrock_logging_role.role_arn,
-                        },
-                        "textDataDeliveryEnabled": True,
-                        "imageDataDeliveryEnabled": False,
-                        "embeddingDataDeliveryEnabled": False,
-                    },
-                },
-                physical_resource_id=cr.PhysicalResourceId.of("bedrock-invocation-logging"),
-            ),
-            on_update=cr.AwsSdkCall(
-                service="Bedrock",
-                action="PutModelInvocationLoggingConfiguration",
-                parameters={
-                    "loggingConfig": {
-                        "cloudWatchConfig": {
-                            "logGroupName": self.invocation_log_group.log_group_name,
-                            "roleArn": bedrock_logging_role.role_arn,
-                        },
-                        "textDataDeliveryEnabled": True,
-                        "imageDataDeliveryEnabled": False,
-                        "embeddingDataDeliveryEnabled": False,
-                    },
-                },
-                physical_resource_id=cr.PhysicalResourceId.of("bedrock-invocation-logging"),
-            ),
-            policy=cr.AwsCustomResourcePolicy.from_statements(
-                [
-                    iam.PolicyStatement(
-                        actions=[
-                            "bedrock:PutModelInvocationLoggingConfiguration",
-                            "bedrock:GetModelInvocationLoggingConfiguration",
-                        ],
-                        resources=["*"],
-                    ),
-                    iam.PolicyStatement(
-                        actions=["iam:PassRole"],
-                        resources=[bedrock_logging_role.role_arn],
-                    ),
-                ]
-            ),
         )
 
         # --- Operations Dashboard -----------------------------------------
@@ -147,25 +67,25 @@ class ObservabilityStack(Stack):
             statistic="Sum",
         )
 
-        # AgentCore Runtime metrics
-        agentcore_invocations = cw.Metric(
-            namespace="AWS/BedrockAgentCore",
-            metric_name="Invocations",
-            period=Duration.minutes(5),
-            statistic="Sum",
-        )
-        agentcore_latency = cw.Metric(
-            namespace="AWS/BedrockAgentCore",
-            metric_name="InvocationLatency",
-            period=Duration.minutes(5),
-            statistic="p99",
-        )
-        agentcore_errors = cw.Metric(
-            namespace="AWS/BedrockAgentCore",
-            metric_name="InvocationErrors",
-            period=Duration.minutes(5),
-            statistic="Sum",
-        )
+        # AgentCore service metrics use the hyphenated AWS namespace. Search
+        # expressions intentionally cover every documented dimension set so a
+        # dashboard does not silently select a nonexistent dimensionless
+        # series for a particular runtime release.
+        def agentcore_metric(metric_name: str, statistic: str) -> cw.SearchExpression:
+            return cw.SearchExpression(
+                expression=(
+                    "SEARCH('{AWS/Bedrock-AgentCore} "
+                    f'MetricName="{metric_name}"\', \'{statistic}\', 300)'
+                ),
+                label=f"AgentCore {metric_name}",
+                period=Duration.minutes(5),
+            )
+
+        agentcore_invocations = agentcore_metric("Invocations", "Sum")
+        agentcore_system_errors = agentcore_metric("SystemErrors", "Sum")
+        agentcore_user_errors = agentcore_metric("UserErrors", "Sum")
+        agentcore_throttles = agentcore_metric("Throttles", "Sum")
+        agentcore_latency = agentcore_metric("Latency", "p99")
 
         # Router Lambda metrics
         router_invocations = cw.Metric(
@@ -213,7 +133,11 @@ class ObservabilityStack(Stack):
             cw.GraphWidget(
                 title="AgentCore Runtime Invocations & Errors",
                 left=[agentcore_invocations],
-                right=[agentcore_errors],
+                right=[
+                    agentcore_system_errors,
+                    agentcore_user_errors,
+                    agentcore_throttles,
+                ],
                 width=12,
             ),
             cw.GraphWidget(
@@ -279,6 +203,102 @@ class ObservabilityStack(Stack):
             treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
         ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
 
+        # Private-pilot custom metrics are declarations only. This stack does
+        # not create a publisher or grant PutMetricData. Until a reviewed live
+        # publisher exists, these five alarms can be exercised only with
+        # bounded synthetic evidence.
+        def pilot_event_metric(
+            component: str, operation: str, outcome: str
+        ) -> cw.Metric:
+            return cw.Metric(
+                namespace="PersonalOperator/Pilot",
+                metric_name="EventCount",
+                dimensions_map={
+                    "Environment": "preproduction",
+                    "Component": component,
+                    "Operation": operation,
+                    "Outcome": outcome,
+                },
+                period=Duration.minutes(5),
+                statistic="Sum",
+            )
+
+        for alarm_id, alarm_name, component, operation, outcome, threshold in (
+            (
+                "UncertainEffectAlarm",
+                "personal-operator-uncertain-effect",
+                "action_kernel",
+                "uncertain_effect",
+                "uncertain",
+                1,
+            ),
+            (
+                "RepeatedScanFailureAlarm",
+                "personal-operator-repeated-scan-failure",
+                "scan",
+                "scan",
+                "failed",
+                3,
+            ),
+            (
+                "AgedDeletionAlarm",
+                "personal-operator-aged-deletion",
+                "portable",
+                "deletion",
+                "aged",
+                1,
+            ),
+            (
+                "ConnectorDriftAlarm",
+                "personal-operator-connector-drift",
+                "connector",
+                "connector_drift",
+                "drifted",
+                1,
+            ),
+            (
+                "ComputeIsolationFailureAlarm",
+                "personal-operator-compute-isolation-failure",
+                "compute",
+                "compute_isolation",
+                "failed",
+                1,
+            ),
+        ):
+            cw.Alarm(
+                self,
+                alarm_id,
+                alarm_name=alarm_name,
+                metric=pilot_event_metric(component, operation, outcome),
+                threshold=threshold,
+                evaluation_periods=1,
+                comparison_operator=(
+                    cw.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD
+                ),
+                treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+            ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
+
+        # This is the only new live alarm: the existing hourly maintenance
+        # Lambda already publishes native AWS/Lambda Invocations. Missing data
+        # must therefore fail closed instead of being treated as healthy.
+        maintenance_invocations = cw.Metric(
+            namespace="AWS/Lambda",
+            metric_name="Invocations",
+            dimensions_map={"FunctionName": "personal-operator-maintenance"},
+            period=Duration.hours(1),
+            statistic="Sum",
+        )
+        cw.Alarm(
+            self,
+            "MissingMaintenanceHeartbeatAlarm",
+            alarm_name="personal-operator-missing-maintenance-heartbeat",
+            metric=maintenance_invocations,
+            threshold=1,
+            evaluation_periods=2,
+            comparison_operator=cw.ComparisonOperator.LESS_THAN_THRESHOLD,
+            treat_missing_data=cw.TreatMissingData.BREACHING,
+        ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
+
         CfnOutput(
             self,
             "AlarmTopicArn",
@@ -296,58 +316,6 @@ class ObservabilityStack(Stack):
                     "notifications. Publishers are AWS services (CloudWatch Alarms) "
                     "which use internal AWS service endpoints. SSL enforcement via "
                     "topic policy is not required for service-to-service communication.",
-                ),
-            ],
-        )
-        cdk_nag.NagSuppressions.add_resource_suppressions(
-            self.logging_cr,
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-IAM5",
-                    reason="Bedrock PutModelInvocationLoggingConfiguration is an account-level "
-                    "API that does not support resource-level ARNs; wildcard is required.",
-                    applies_to=["Resource::*"],
-                ),
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-IAM4",
-                    reason="CDK AwsCustomResource uses AWSLambdaBasicExecutionRole for its "
-                    "backing Lambda. This is a CDK-managed construct.",
-                    applies_to=[
-                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-                    ],
-                ),
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-L1",
-                    reason="Lambda runtime is managed by CDK AwsCustomResource and "
-                    "cannot be overridden to the latest version.",
-                ),
-            ],
-            apply_to_children=True,
-        )
-        # CDK AwsCustomResource singleton Lambda
-        cr_lambda_path = f"/{construct_id}/AWS679f53fac002430cb0da5b7982bd2287"
-        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
-            self,
-            f"{cr_lambda_path}/ServiceRole/Resource",
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-IAM4",
-                    reason="CDK AwsCustomResource singleton Lambda uses AWSLambdaBasicExecutionRole. "
-                    "This is managed by CDK and cannot be customised.",
-                    applies_to=[
-                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-                    ],
-                ),
-            ],
-        )
-        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
-            self,
-            f"{cr_lambda_path}/Resource",
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-L1",
-                    reason="Lambda runtime is managed by CDK AwsCustomResource singleton "
-                    "and cannot be overridden.",
                 ),
             ],
         )

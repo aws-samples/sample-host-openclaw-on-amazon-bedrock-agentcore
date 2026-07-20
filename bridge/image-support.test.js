@@ -7,6 +7,13 @@
 
 const { describe, it, beforeEach, mock } = require("node:test");
 const assert = require("node:assert/strict");
+process.env.AWS_REGION = "eu-west-1";
+process.env.AWS_DEFAULT_REGION = "eu-west-1";
+process.env.INTERNAL_USER_ID = "user_A";
+process.env.PERSONAL_OPERATOR_WORKSPACE_PREFIX = "user_A";
+process.env.PERSONAL_OPERATOR_SCOPED_CREDENTIALS_FILE = "/tmp/not-used";
+process.env.S3_USER_FILES_BUCKET = "personal-operator-workspace";
+const productionProxy = require("./agentcore-proxy");
 
 // We need to extract the functions from the proxy module.
 // Since the proxy starts a server on import, we'll extract the functions
@@ -24,27 +31,7 @@ const ALLOWED_IMAGE_TYPES = new Set([
 ]);
 const IMAGE_MARKER_REGEX = /\n?\n?\[OPENCLAW_IMAGES:(\[.*?\])\]\s*$/;
 
-function extractImageReferences(text) {
-  if (typeof text !== "string") return { cleanText: text, images: [] };
-
-  const match = text.match(IMAGE_MARKER_REGEX);
-  if (!match) return { cleanText: text, images: [] };
-
-  const cleanText = text.slice(0, match.index).trimEnd();
-  try {
-    const images = JSON.parse(match[1]);
-    if (!Array.isArray(images)) return { cleanText, images: [] };
-    const validImages = images.filter(
-      (img) =>
-        img.s3Key &&
-        img.contentType &&
-        ALLOWED_IMAGE_TYPES.has(img.contentType),
-    );
-    return { cleanText, images: validImages };
-  } catch {
-    return { cleanText, images: [] };
-  }
-}
+const { extractImageReferences } = productionProxy;
 
 describe("extractImageReferences", () => {
   it("returns original text when no marker present", () => {
@@ -242,36 +229,31 @@ describe("convertMessages with multimodal content", () => {
 // --- fetchImageFromS3 key validation (namespace-aware) ---
 
 describe("fetchImageFromS3 key validation", () => {
-  const namespace = "telegram_123";
+  const namespace = "user_A";
 
   it("accepts keys in the correct user namespace", () => {
-    const key = "telegram_123/_uploads/img_1234_abcd.jpeg";
-    const expectedPrefix = namespace + "/_uploads/";
-    assert.ok(key.startsWith(expectedPrefix));
-    assert.ok(!key.includes(".."));
+    const key = "user_A/_uploads/img_1234_abcd.jpeg";
+    assert.equal(productionProxy.isValidImageKey(key, namespace), true);
   });
 
   it("rejects keys from a different user namespace", () => {
-    const key = "telegram_999/_uploads/img_1234_abcd.jpeg";
-    const expectedPrefix = namespace + "/_uploads/";
-    assert.ok(!key.startsWith(expectedPrefix));
+    const key = "user_B/_uploads/img_1234_abcd.jpeg";
+    assert.equal(productionProxy.isValidImageKey(key, namespace), false);
   });
 
   it("rejects keys with path traversal", () => {
-    const key = "telegram_123/_uploads/../../other_user/_uploads/img.jpeg";
-    assert.ok(key.includes(".."));
+    const key = "user_A/_uploads/../../user_B/_uploads/img.jpeg";
+    assert.equal(productionProxy.isValidImageKey(key, namespace), false);
   });
 
   it("rejects keys without /_uploads/ segment", () => {
-    const key = "telegram_123/regular-file.txt";
-    const expectedPrefix = namespace + "/_uploads/";
-    assert.ok(!key.startsWith(expectedPrefix));
+    const key = "user_A/regular-file.txt";
+    assert.equal(productionProxy.isValidImageKey(key, namespace), false);
   });
 
   it("rejects crafted keys that contain /_uploads/ but wrong namespace", () => {
     // Attacker sends: other_ns/_uploads/stolen.jpeg
     const key = "other_ns/_uploads/stolen.jpeg";
-    const expectedPrefix = namespace + "/_uploads/";
-    assert.ok(!key.startsWith(expectedPrefix));
+    assert.equal(productionProxy.isValidImageKey(key, namespace), false);
   });
 });

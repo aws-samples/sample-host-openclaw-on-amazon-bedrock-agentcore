@@ -1,4 +1,9 @@
-"""Token Monitoring Stack — DynamoDB, Lambda, custom CW metrics, budget alarms."""
+"""Archived upstream reference for payload-derived token monitoring.
+
+Personal Operator does not wire or deploy this stack. It depends on Bedrock
+model-invocation payload logging, so it must not be instantiated by the active
+application or deployment script.
+"""
 
 import os
 from aws_cdk import (

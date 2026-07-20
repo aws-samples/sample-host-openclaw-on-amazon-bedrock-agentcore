@@ -167,25 +167,3 @@ describe("health endpoint shape", () => {
     assert.equal(healthResponse.subagent_model_name, SUBAGENT_MODEL_NAME);
   });
 });
-
-describe("contract writeOpenClawConfig subagent model", () => {
-  it("subagent model name is distinct from main model", () => {
-    // The contract sets subagentModel = "agentcore/bedrock-agentcore-subagent"
-    const SUBAGENT_MODEL_NAME_CONTRACT = "bedrock-agentcore-subagent";
-    const subagentModel = `agentcore/${SUBAGENT_MODEL_NAME_CONTRACT}`;
-
-    assert.notEqual(subagentModel, "agentcore/bedrock-agentcore");
-    assert.equal(subagentModel, `agentcore/${SUBAGENT_MODEL_NAME}`);
-  });
-
-  it("config models array includes both main and subagent entries", () => {
-    const models = [
-      { id: "bedrock-agentcore", name: "Bedrock AgentCore" },
-      { id: SUBAGENT_MODEL_NAME, name: "Bedrock AgentCore Subagent" },
-    ];
-
-    assert.equal(models.length, 2);
-    assert.equal(models[0].id, "bedrock-agentcore");
-    assert.equal(models[1].id, SUBAGENT_MODEL_NAME);
-  });
-});

@@ -1,6 +1,13 @@
 # Detailed Technical Architecture
 
-This document provides a detailed technical view of the OpenClaw on AgentCore architecture. For a high-level overview, see the [README](../README.md#architecture).
+> **Archived upstream architecture — not the Personal Operator v1 source of truth.**
+> This imported pre-hardening sample contains obsolete channel, credential,
+> runtime, IAM, tool, and deployment assumptions. Retain it for provenance
+> only; do not use it to deploy, operate, or assess v1. See the current
+> [README.md](../README.md), [v1 capability boundary](CAPABILITY-BOUNDARY.md),
+> and [V1-IMPLEMENTATION-EVIDENCE.md](V1-IMPLEMENTATION-EVIDENCE.md).
+
+The body below is the historical imported design and is not current guidance.
 
 ## Component Diagram
 

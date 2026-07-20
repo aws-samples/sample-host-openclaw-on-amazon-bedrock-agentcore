@@ -26,11 +26,11 @@ sys.modules.setdefault("botocore.config", _mock_botocore_config)
 sys.modules.setdefault("botocore.exceptions", _mock_botocore_exceptions)
 
 # Set required env vars before importing index
-os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock:us-west-2:123456789012:agentcore/test")
-os.environ.setdefault("AGENTCORE_QUALIFIER", "test-qualifier")
+os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock:eu-west-1:123456789012:agentcore/test")
+os.environ.setdefault("AGENTCORE_QUALIFIER", "release_" + "a" * 40)
 os.environ.setdefault("IDENTITY_TABLE_NAME", "test-identity")
 os.environ.setdefault("USER_FILES_BUCKET", "test-bucket")
-os.environ.setdefault("AWS_REGION", "us-west-2")
+os.environ.setdefault("AWS_REGION", "eu-west-1")
 os.environ.setdefault("S3_USER_FILES_BUCKET", "test-bucket")
 
 from index import (
@@ -74,9 +74,9 @@ class TestExtractScreenshots(unittest.TestCase):
 
     def test_marker_with_slashes_and_dots(self):
         text, keys = _extract_screenshots(
-            "Check [SCREENSHOT:telegram_123/_screenshots/page_2026-03-10_abc123.png]"
+            "Check [SCREENSHOT:user_123/_screenshots/page_2026-03-10_abc123.png]"
         )
-        self.assertEqual(keys, ["telegram_123/_screenshots/page_2026-03-10_abc123.png"])
+        self.assertEqual(keys, ["user_123/_screenshots/page_2026-03-10_abc123.png"])
 
     def test_empty_key_not_matched(self):
         """Empty brackets [SCREENSHOT:] should not match (requires 1+ chars)."""
@@ -127,18 +127,18 @@ class TestFetchS3Image(unittest.TestCase):
         mock_s3.get_object.assert_called_once_with(Bucket="custom-bucket", Key="ns/_screenshots/key.png")
 
     def test_rejects_path_traversal(self):
-        result = _fetch_s3_image("../../etc/passwd", namespace="telegram_123456")
+        result = _fetch_s3_image("../../etc/passwd", namespace="user_123456")
         self.assertIsNone(result)
 
     def test_rejects_cross_namespace(self):
-        result = _fetch_s3_image("other_user/_screenshots/shot.png", namespace="telegram_123456")
+        result = _fetch_s3_image("other_user/_screenshots/shot.png", namespace="user_123456")
         self.assertIsNone(result)
 
     @patch("index.s3_client")
     def test_accepts_valid_namespace_key(self, mock_s3):
         mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: b"data")}
         with patch.dict(os.environ, {"S3_USER_FILES_BUCKET": "bucket"}):
-            result = _fetch_s3_image("telegram_123456/_screenshots/screenshot_123.png", namespace="telegram_123456")
+            result = _fetch_s3_image("user_123456/_screenshots/screenshot_123.png", namespace="user_123456")
         self.assertEqual(result, b"data")
 
 

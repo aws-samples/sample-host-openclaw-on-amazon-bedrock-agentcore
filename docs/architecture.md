@@ -1,5 +1,12 @@
 # OpenClaw on AgentCore — Solution Architecture
 
+> **Archived upstream architecture — not the Personal Operator v1 source of truth.**
+> This imported pre-hardening sample contains obsolete channel, credential,
+> runtime, IAM, and deployment assumptions. Retain it for provenance only; do
+> not use it to deploy, operate, or assess v1. See the current
+> [README.md](../README.md), [v1 capability boundary](CAPABILITY-BOUNDARY.md),
+> and [V1-IMPLEMENTATION-EVIDENCE.md](V1-IMPLEMENTATION-EVIDENCE.md).
+
 ## High-Level Architecture
 
 ```

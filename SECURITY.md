@@ -1,21 +1,31 @@
-# Security
+# Personal Operator v1 security boundary
 
-## Security Architecture
+Personal Operator v1 is pre-production. Use public or synthetic data only. The
+current evidence and all open external gates are in
+`docs/V1-IMPLEMENTATION-EVIDENCE.md`; detailed contracts are in
+`docs/CAPABILITY-BOUNDARY.md`, `docs/PRIVACY-BOUNDARY.md`, and
+`docs/OPERATIONS.md`.
 
-This solution applies **defense-in-depth** across network, application, identity, and data layers:
+The model runtime is provider-credential-free and unprivileged. It has no STS,
+direct workspace S3, DynamoDB, Scheduler/EventBridge, Secrets Manager,
+connector, browser, or compute IAM authority. A trusted broker can exchange one
+admitted bearer capability for a short-lived AWS session restricted to one
+workspace namespace. The local plugin consumes that session; credential bytes
+must not enter model context, tool data, durable workspace state, or logs.
 
-- **Network isolation**: Private VPC subnets with 7 VPC endpoints; no direct internet exposure for containers
-- **Webhook authentication**: Cryptographic validation (Telegram secret token, Slack HMAC-SHA256 with replay protection)
-- **Per-user microVM isolation**: Each user runs in a dedicated Firecracker microVM on AgentCore Runtime
-- **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3, DynamoDB, Secrets Manager, and EventBridge to the user's namespace only
-- **Secure API key management**: Built-in `api-keys` skill stores user secrets in AWS Secrets Manager (KMS-encrypted, CloudTrail-auditable) — replaces insecure plaintext `.env` files
-- **Encryption**: All data encrypted at rest (KMS CMK) and in transit (TLS)
-- **Least-privilege IAM**: Tightly scoped permissions per component
-- **Tool hardening**: OpenClaw `read` tool denied to prevent credential access; `exec` allowed with STS-scoped blast radius
-- **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
+The effective model surface is exactly the ten catalogued `po_*` operations.
+Dynamic MCP, ClawHub, arbitrary plugins/skills, browser/computer tools, and
+local shell/process execution are forbidden. AgentCore's separate command and
+interactive-shell APIs are denied by retained resource policies on both the
+runtime and immutable release endpoint. External effects stay in the trusted
+Task-3 kernel; active connector/browser composition and production compute are
+disabled.
 
-For the complete security architecture — threat model, all 10 defense-in-depth layers, compliance details, operations runbook, and extension roadmap — see **[docs/security.md](docs/security.md)**.
+Local tests and offline synthesis do not prove live AWS IAM, networking,
+storage, signing, scanning, runtime behavior, provider effects, or pilot
+safety. Do not mutate AWS through the current release transaction; its
+composer/phase design must be replaced and independently reviewed first.
 
-## Reporting Security Issues
+## Reporting security issues
 
-See [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications) for information on reporting security vulnerabilities.
+See [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications).

@@ -1,100 +1,46 @@
-# AGENTS.md — openclaw-on-agentcore
+# Agent guidance — Personal Operator v1
 
-## Build & Validation Commands (Backpressure)
+Personal Operator v1 is a pre-production consumer assistant with a frozen,
+provider-credential-free AgentCore model runtime and a separate trusted control
+plane. Start with `README.md`, `docs/V1-IMPLEMENTATION-EVIDENCE.md`,
+`docs/OPERATIONS.md`, and the approved v1 design/plan under
+`docs/superpowers/`.
 
-### CDK (Python)
+## Non-negotiable boundary
+
+- Region is exactly `eu-west-1`.
+- Use public or synthetic data only until an external gate is separately
+  authorized and closed with exact live evidence.
+- The model-visible surface is the ten `po_*` tools in
+  `specs/capabilities/catalog-v1.json`; do not add dynamic MCP, ClawHub,
+  arbitrary plugins/skills, browser/computer tools, or shell execution.
+- Runtime code receives no durable provider, channel, browser, connector, or
+  approval credential. Its short-lived AWS workspace session is limited to one
+  server-derived namespace and must never enter model context or logs.
+- Connector and Browser Gateway composition stays disabled. Compute stays
+  `ADAPTER_DISABLED`. Scheduled turns require `externalEffects=false`.
+- Do not treat local tests, synthesis, or source shape as AWS deployment,
+  signing, scan, provider, compute-isolation, or pilot evidence.
+- The current eight-phase release CLI is not authorized for mutation. Replace
+  and independently review its transaction/composer path before deployment.
+
+## Working discipline
+
+- Preserve unrelated changes and use one writer per file.
+- Use RED -> GREEN -> REFACTOR for behavior changes.
+- Run bridge tests serially with Node 24.
+- Commit locally only when the task explicitly requests it; never push from the
+  pre-production audit workflow.
+
+Run the aggregate gate with the project interpreter and Node 24:
+
 ```bash
-# Synth — must pass before committing any CDK change
-cd /home/ec2-user/projects/openclaw-on-agentcore
-source .venv/bin/activate
-cdk synth 2>&1
-
-# Run Python unit tests
-pytest tests/ -v 2>&1
-
-# Type check (if mypy configured)
-mypy stacks/ --ignore-missing-imports 2>&1
+PYTHON=/Users/konstantin.tuzikov/Documents/personal-operator/.venv/bin/python \
+PATH="/opt/homebrew/opt/node@24/bin:$PATH" \
+./scripts/test-local.sh 2>&1 | tee /tmp/personal-operator-local.log
+grep -Fx 'All local checks passed.' /tmp/personal-operator-local.log
 ```
 
-### Bridge (Node.js)
-```bash
-# Syntax check — must pass before committing any .js change
-node --check bridge/agentcore-proxy.js
-node --check bridge/agentcore-contract.js
-node --check bridge/lightweight-agent.js
-
-# Run bridge tests (if any)
-cd bridge && npm test 2>&1 || echo "No tests yet"
-```
-
-### Red Team folder
-```bash
-# Validate promptfoo config (after creating redteam/)
-cd redteam && npm install && npx promptfoo eval --dry-run 2>&1
-```
-
-### E2E Tests
-```bash
-# Run existing E2E tests (must not regress)
-cd /home/ec2-user/projects/openclaw-on-agentcore
-pytest tests/e2e/ -v 2>&1
-
-# Key journeys that must pass after proxy/CDK changes:
-# - tests/e2e/bot_test.py — core message flow
-```
-
----
-
-## ECC Slash Commands (Claude Code built-ins)
-
-| Command | When to use |
-|---------|-------------|
-| `/tdd` | Before implementing any new function, class, or CDK construct |
-| `/verify` | After every change — build + type + lint check |
-| `/build-fix` | When `cdk synth` or `node --check` fails — do NOT manually guess |
-| `/e2e` | After proxy changes or CDK stack changes that touch the message flow |
-| `/security-review` | Before marking any CDK or proxy task complete |
-| `/update-docs` | Once ALL tasks done and E2E green — updates README, ENV vars, runbook |
-
----
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `stacks/agentcore_stack.py` | AgentCore Runtime container + IAM |
-| `stacks/security_stack.py` | KMS, Secrets Manager, Cognito |
-| `stacks/guardrails_stack.py` | NEW — Bedrock Guardrails (create this) |
-| `app.py` | CDK stack wiring |
-| `bridge/agentcore-proxy.js` | Bedrock ConverseStream proxy — inject guardrailConfig here |
-| `bridge/agentcore-contract.js` | Container entrypoint |
-| `bridge/lightweight-agent.js` | Warm-up shim |
-| `tests/e2e/bot_test.py` | E2E bot tests |
-| `docs/redteam-design.md` | Full design context |
-| `cdk.json` | CDK context flags (add enable_guardrails here) |
-
----
-
-## Commit Message Format
-```
-<type>(<scope>): <description>
-
-Types: feat, fix, docs, test, chore, refactor
-Scopes: cdk, bridge, redteam, docs
-
-Examples:
-feat(cdk): add GuardrailsStack with content filters and PII redaction
-feat(bridge): inject guardrailConfig into ConverseStream calls
-test(bridge): add unit tests for guardrail config injection
-docs(redteam): add promptfoo test suites for jailbreak attacks
-```
-
----
-
-## Learnings
-_(updated during loop — add lessons learned here)_
-
-- `cdk synth` must be run from the virtualenv: `source .venv/bin/activate && cdk synth`
-- `CfnGuardrail` is an L1 construct — use `aws_cdk.aws_bedrock.CfnGuardrail`
-- `guardrailConfig` must be `undefined` (not null) when no guardrail ID — use conditional spread
-- Check `enable_guardrails` context with `self.node.try_get_context("enable_guardrails")`, default to `True`
+The wrapper's shell status is not sufficient; require the literal acceptance
+line. The authoritative local evidence index is
+`docs/V1-IMPLEMENTATION-EVIDENCE.md`.
