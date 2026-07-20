@@ -27,6 +27,9 @@ from release_tools.aws_authority_v2 import (
     _authenticate_frozen_source,
     _validate_raw_client,
 )
+from release_tools.aws_cli_credentials_v2 import (
+    AWS_BOOTSTRAP_PROFILE,
+)
 from release_tools.contracts import ReleasePlanV2
 from release_tools.test_contracts import _release_plan_v2
 
@@ -125,6 +128,12 @@ class FakeClient:
             return {"method": name, "request": kwargs}
 
         return invoke
+
+
+class CloseRaisingClient(FakeClient):
+    def close(self) -> None:
+        super().close()
+        raise RuntimeError("synthetic close hook failure")
 
 
 class FrozenSession:
@@ -1366,3 +1375,314 @@ def test_closed_profile_rejects_substituted_final_service_endpoint(
             final_overrides={"s3": attacker},
         )
     assert attacker.closed is True
+
+
+def _write_direct_bootstrap_profiles(
+    root: Path,
+    *,
+    profile: str = AWS_BOOTSTRAP_PROFILE,
+    config_lines: list[str] | None = None,
+    credential_profile: str = AWS_BOOTSTRAP_PROFILE,
+    credential_lines: list[str] | None = None,
+) -> Path:
+    aws_directory = root / ".aws"
+    aws_directory.mkdir(mode=0o700)
+    config = aws_directory / "config"
+    credentials = aws_directory / "credentials"
+    config.write_text(
+        "\n".join(
+            [
+                f"[profile {profile}]",
+                *(config_lines or ["region = eu-west-1", "output = json"]),
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    credentials.write_text(
+        "\n".join(
+            [
+                f"[{credential_profile}]",
+                *(credential_lines or [
+                    f"aws_access_key_id = {'AKIA' + 'C' * 16}",
+                    f"aws_secret_access_key = {'u' * 40}",
+                ]),
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+    credentials.chmod(0o600)
+    return aws_directory
+
+
+def _direct_bootstrap_authority(
+    aws_directory: Path,
+    *,
+    account: str = ACCOUNT,
+    overrides: dict[str, object] | None = None,
+) -> tuple[AuthenticatedAwsAuthorityV2, SessionFactory, FrozenSession]:
+    frozen = FrozenSession(account=account, overrides=overrides)
+    factory = SessionFactory(frozen)
+    authority = aws_authority._authenticate_direct_bootstrap_profile(
+        _plan_v2(),
+        aws_directory=aws_directory,
+        frozen_session_factory=factory,
+        config_factory=_config_factory,
+        ca_bundle_path=CA_BUNDLE_PATH,
+    )
+    return authority, factory, frozen
+
+
+def test_direct_bootstrap_profile_builds_explicit_exact_account_authority(
+    tmp_path: Path,
+) -> None:
+    aws_directory = _write_direct_bootstrap_profiles(tmp_path)
+
+    authority, factory, frozen = _direct_bootstrap_authority(aws_directory)
+
+    assert factory.calls == [
+        {
+            "region_name": REGION,
+            "aws_access_key_id": "AKIA" + "C" * 16,
+            "aws_secret_access_key": "u" * 40,
+        }
+    ]
+    assert [service for service, _, _, _ in frozen.calls] == list(SERVICES)
+    assert authority.account == ACCOUNT
+    authority.close()
+
+
+def test_direct_bootstrap_accepts_region_only_existing_profile(
+    tmp_path: Path,
+) -> None:
+    aws_directory = _write_direct_bootstrap_profiles(
+        tmp_path,
+        config_lines=["region = eu-west-1"],
+    )
+
+    authority, _, _ = _direct_bootstrap_authority(aws_directory)
+
+    authority.close()
+
+
+def test_direct_bootstrap_rejects_cross_account_and_substituted_endpoint(
+    tmp_path: Path,
+) -> None:
+    aws_directory = _write_direct_bootstrap_profiles(tmp_path)
+    cross_account = FrozenSession(account="999999999999")
+    with pytest.raises(AwsAuthorityError, match="account"):
+        aws_authority._authenticate_direct_bootstrap_profile(
+            _plan_v2(),
+            aws_directory=aws_directory,
+            frozen_session_factory=SessionFactory(cross_account),
+            config_factory=_config_factory,
+            ca_bundle_path=CA_BUNDLE_PATH,
+        )
+    assert all(client.closed for client in cross_account.clients.values())
+
+    config = _config_factory(
+        region_name=REGION,
+        ignore_configured_endpoint_urls=True,
+        proxies={},
+        retries={"mode": "standard", "total_max_attempts": 1},
+    )
+    attacker = FakeClient("s3", config, account=ACCOUNT)
+    attacker.meta.endpoint_url = "https://attacker.invalid"
+    with pytest.raises(AwsAuthorityError, match="endpoint"):
+        _direct_bootstrap_authority(
+            aws_directory,
+            overrides={"s3": attacker},
+        )
+    assert attacker.closed is True
+
+
+@pytest.mark.parametrize(
+    ("profile", "config_lines", "credential_profile", "credential_lines"),
+    [
+        ("default", None, AWS_BOOTSTRAP_PROFILE, None),
+        (
+            AWS_BOOTSTRAP_PROFILE,
+            ["region = us-east-1", "output = json"],
+            AWS_BOOTSTRAP_PROFILE,
+            None,
+        ),
+        (
+            AWS_BOOTSTRAP_PROFILE,
+            [
+                "region = eu-west-1",
+                "output = json",
+                "credential_process = attacker",
+            ],
+            AWS_BOOTSTRAP_PROFILE,
+            None,
+        ),
+        (
+            AWS_BOOTSTRAP_PROFILE,
+            [
+                "region = eu-west-1",
+                "output = json",
+                "endpoint_url = https://attacker.invalid",
+            ],
+            AWS_BOOTSTRAP_PROFILE,
+            None,
+        ),
+        (AWS_BOOTSTRAP_PROFILE, None, "default", None),
+        (
+            AWS_BOOTSTRAP_PROFILE,
+            None,
+            AWS_BOOTSTRAP_PROFILE,
+            [
+                f"aws_access_key_id = {'ASIA' + 'C' * 16}",
+                f"aws_secret_access_key = {'u' * 40}",
+            ],
+        ),
+        (
+            AWS_BOOTSTRAP_PROFILE,
+            None,
+            AWS_BOOTSTRAP_PROFILE,
+            [
+                f"aws_access_key_id = {'AKIA' + 'C' * 16}",
+                f"aws_secret_access_key = {'u' * 40}",
+                "aws_session_token = attacker",
+            ],
+        ),
+    ],
+)
+def test_direct_bootstrap_rejects_profile_config_or_credential_substitution(
+    tmp_path: Path,
+    profile: str,
+    config_lines: list[str] | None,
+    credential_profile: str,
+    credential_lines: list[str] | None,
+) -> None:
+    aws_directory = _write_direct_bootstrap_profiles(
+        tmp_path,
+        profile=profile,
+        config_lines=config_lines,
+        credential_profile=credential_profile,
+        credential_lines=credential_lines,
+    )
+
+    with pytest.raises(AwsAuthorityError, match="bootstrap profile"):
+        _direct_bootstrap_authority(aws_directory)
+
+
+@pytest.mark.parametrize("filename", ["config", "credentials"])
+@pytest.mark.parametrize("attack", ["symlink", "mode", "hardlink"])
+def test_direct_bootstrap_files_are_owner_only_retained_regulars(
+    tmp_path: Path,
+    filename: str,
+    attack: str,
+) -> None:
+    aws_directory = _write_direct_bootstrap_profiles(tmp_path)
+    target = aws_directory / filename
+    if attack == "symlink":
+        replacement = aws_directory / f"{filename}.real"
+        target.rename(replacement)
+        target.symlink_to(replacement.name)
+    elif attack == "mode":
+        target.chmod(0o640)
+    else:
+        os.link(target, aws_directory / f"{filename}.hardlink")
+
+    with pytest.raises(AwsAuthorityError, match="profile"):
+        _direct_bootstrap_authority(aws_directory)
+
+
+def test_direct_bootstrap_directory_must_be_absolute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_direct_bootstrap_profiles(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(AwsAuthorityError, match="absolute"):
+        _direct_bootstrap_authority(Path(".aws"))
+
+
+def test_open_bootstrap_closes_everything_without_copying_static_material(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = _plan_v2()
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    aws_directory = _write_direct_bootstrap_profiles(tmp_path)
+    config = _config_factory(
+        region_name=REGION,
+        ignore_configured_endpoint_urls=True,
+        proxies={},
+        retries={"mode": "standard", "total_max_attempts": 1},
+    )
+    close_raising = CloseRaisingClient("sts", config, account=ACCOUNT)
+    frozen = FrozenSession(overrides={"sts": close_raising})
+    factory = SessionFactory(frozen)
+
+    def snapshot(_source: Path, *, destination: Path) -> str:
+        ca_directory = destination / "botocore"
+        ca_directory.mkdir(parents=True)
+        (ca_directory / "cacert.pem").write_bytes(b"synthetic retained CA")
+        return plan.evidence_runtime_sha256
+
+    def retained_import(name: str) -> object:
+        if name == "boto3":
+            return SimpleNamespace(Session=factory)
+        if name == "botocore.config":
+            return SimpleNamespace(Config=_config_factory)
+        raise AssertionError(f"unexpected retained SDK import: {name}")
+
+    monkeypatch.setattr(aws_authority, "snapshot_evidence_runtime", snapshot)
+    monkeypatch.setattr(aws_authority.importlib, "import_module", retained_import)
+    monkeypatch.setattr(aws_authority, "_SDK_MODULE_ROOTS", frozenset())
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-attacker")
+    prior_path = tuple(sys.path)
+    prior_dont_write = sys.dont_write_bytecode
+    descriptor_numbers: list[int] = []
+    original_descriptor_path = aws_authority._descriptor_path
+
+    def retained_descriptor_path(descriptor: int) -> str:
+        descriptor_numbers.append(descriptor)
+        return original_descriptor_path(descriptor)
+
+    monkeypatch.setattr(aws_authority, "_descriptor_path", retained_descriptor_path)
+    retained_mutation: AttestedAwsClientV2 | None = None
+
+    with AuthenticatedAwsAuthorityV2.open_bootstrap(
+        plan,
+        site_packages=site_packages,
+        aws_directory=aws_directory,
+    ) as authority:
+        retained_mutation = authority.mutation_client("s3")
+        assert "AWS_SECRET_ACCESS_KEY" not in os.environ
+
+    assert factory.calls == [{
+        "region_name": REGION,
+        "aws_access_key_id": "AKIA" + "C" * 16,
+        "aws_secret_access_key": "u" * 40,
+    }]
+    assert all(client.closed for client in frozen.clients.values())
+    assert all(client.close_calls == 1 for client in frozen.clients.values())
+    assert close_raising.close_calls == 1
+    assert os.environ["AWS_SECRET_ACCESS_KEY"] == "ambient-attacker"
+    assert tuple(sys.path) == prior_path
+    assert sys.dont_write_bytecode is prior_dont_write
+    assert capsys.readouterr() == ("", "")
+    assert {
+        path.relative_to(tmp_path)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == {Path(".aws/config"), Path(".aws/credentials")}
+    assert retained_mutation is not None
+    with pytest.raises(AwsAuthorityError, match="closed"):
+        retained_mutation.invoke(
+            "put_object",
+            Bucket="synthetic",
+            Key="forbidden-after-close",
+            Body=b"x",
+        )
+    assert len(descriptor_numbers) == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptor_numbers[0])

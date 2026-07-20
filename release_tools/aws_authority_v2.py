@@ -25,6 +25,12 @@ import threading
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
+from release_tools.aws_cli_credentials_v2 import (
+    AWS_BOOTSTRAP_PROFILE,
+    AwsBootstrapCredentialError,
+    FrozenAwsBootstrapCredentialsV1,
+    freeze_bootstrap_credentials,
+)
 from release_tools.contracts import ReleasePlanV2
 from release_tools.evidence_runtime import (
     EvidenceRuntimeError,
@@ -404,7 +410,12 @@ def _close_raw_id(raw_id: str) -> None:
         raw.client = None
         close = getattr(client, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception:
+                # Revocation is already durable in the registry.  One hostile
+                # SDK close hook must not retain siblings or abort cleanup.
+                pass
 
 
 def _close_scope(scope_id: str) -> None:
@@ -774,15 +785,123 @@ class AuthenticatedAwsAuthorityV2:
                         )
                         yield authority
                     finally:
-                        if authority is not None:
-                            authority.close()
-                        sys.dont_write_bytecode = previous_dont_write
                         try:
-                            sys.path.remove(retained_text)
-                        except ValueError:
-                            pass
+                            if authority is not None:
+                                authority.close()
+                        finally:
+                            sys.dont_write_bytecode = previous_dont_write
+                            try:
+                                sys.path.remove(retained_text)
+                            except ValueError:
+                                pass
+                            importlib.invalidate_caches()
+                            os.close(ca_descriptor)
+        except AwsAuthorityError:
+            raise
+        except (EvidenceRuntimeError, OSError) as error:
+            raise AwsAuthorityError(
+                "authenticated AWS authority is unavailable"
+            ) from error
+
+    @classmethod
+    @contextmanager
+    def open_bootstrap(
+        cls,
+        plan: ReleasePlanV2,
+        *,
+        site_packages: Path,
+        aws_directory: Path,
+    ) -> Iterator["AuthenticatedAwsAuthorityV2"]:
+        """Use the one static bootstrap profile without assuming a role."""
+
+        canonical_plan = ReleasePlanV2.from_bytes(plan.to_bytes())
+        if canonical_plan.region != REQUIRED_REGION:
+            raise AwsAuthorityError(
+                f"AWS authority region must be exactly {REQUIRED_REGION}"
+            )
+        preloaded = sorted(
+            name
+            for name in sys.modules
+            if name.partition(".")[0] in _SDK_MODULE_ROOTS
+        )
+        if preloaded:
+            raise AwsAuthorityError(
+                "AWS SDK modules were loaded before runtime authentication"
+            )
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="personal-operator-aws-authority-v2-"
+            ) as temporary_root:
+                retained = Path(temporary_root) / "sdk"
+                observed = snapshot_evidence_runtime(
+                    Path(site_packages),
+                    destination=retained,
+                )
+                if observed != canonical_plan.evidence_runtime_sha256:
+                    raise AwsAuthorityError(
+                        "AWS evidence runtime differs from the release plan"
+                    )
+                ca_file = retained / "botocore" / "cacert.pem"
+                ca_descriptor = os.open(
+                    ca_file,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                authority: AuthenticatedAwsAuthorityV2 | None = None
+                retained_text = str(retained)
+                path_inserted = False
+                previous_dont_write = sys.dont_write_bytecode
+                with _closed_aws_environment():
+                    try:
+                        locked_preloaded = sorted(
+                            name
+                            for name in sys.modules
+                            if name.partition(".")[0] in _SDK_MODULE_ROOTS
+                        )
+                        if locked_preloaded:
+                            raise AwsAuthorityError(
+                                "AWS SDK modules were loaded before runtime "
+                                "authentication"
+                            )
+                        os.set_inheritable(ca_descriptor, False)
+                        ca_stat = os.fstat(ca_descriptor)
+                        if (
+                            os.get_inheritable(ca_descriptor)
+                            or not stat.S_ISREG(ca_stat.st_mode)
+                            or ca_stat.st_size <= 0
+                        ):
+                            raise AwsAuthorityError("AWS CA bundle is invalid")
+                        ca_path = _descriptor_path(ca_descriptor)
+                        sys.path.insert(0, retained_text)
+                        path_inserted = True
+                        sys.dont_write_bytecode = True
                         importlib.invalidate_caches()
-                        os.close(ca_descriptor)
+                        boto3 = importlib.import_module("boto3")
+                        config_module = importlib.import_module(
+                            "botocore.config"
+                        )
+                        authority = _authenticate_direct_bootstrap_profile(
+                            canonical_plan,
+                            aws_directory=Path(aws_directory),
+                            frozen_session_factory=boto3.Session,
+                            config_factory=config_module.Config,
+                            ca_bundle_path=ca_path,
+                        )
+                        yield authority
+                    finally:
+                        try:
+                            if authority is not None:
+                                authority.close()
+                        finally:
+                            sys.dont_write_bytecode = previous_dont_write
+                            if path_inserted:
+                                try:
+                                    sys.path.remove(retained_text)
+                                except ValueError:
+                                    pass
+                            importlib.invalidate_caches()
+                            os.close(ca_descriptor)
         except AwsAuthorityError:
             raise
         except (EvidenceRuntimeError, OSError) as error:
@@ -1103,6 +1222,68 @@ def _closed_profile_static_credentials(
     return access_key, secret_key
 
 
+def _closed_direct_bootstrap_credentials(
+    plan: ReleasePlanV2,
+    *,
+    aws_directory: Path,
+) -> FrozenAwsBootstrapCredentialsV1:
+    """Read only the exact static bootstrap profile from retained files."""
+
+    if plan.region != REQUIRED_REGION:
+        raise AwsAuthorityError(
+            f"AWS authority region must be exactly {REQUIRED_REGION}"
+        )
+    directory = Path(aws_directory)
+    if not directory.is_absolute() or "\x00" in os.fspath(directory):
+        raise AwsAuthorityError(
+            "closed AWS bootstrap profile directory must be absolute"
+        )
+    config_bytes, credentials_bytes = _read_closed_profile_files(directory)
+    config = _parse_closed_ini(config_bytes, label="configuration")
+    credentials = _parse_closed_ini(credentials_bytes, label="credentials")
+    config_section = f"profile {AWS_BOOTSTRAP_PROFILE}"
+    config_aliases = {
+        AWS_BOOTSTRAP_PROFILE.casefold(),
+        config_section.casefold(),
+    }
+    for section in config.sections():
+        if section.casefold() in config_aliases and section != config_section:
+            raise AwsAuthorityError("closed AWS bootstrap profile is not exact")
+    credential_aliases = {
+        AWS_BOOTSTRAP_PROFILE.casefold(),
+        config_section.casefold(),
+    }
+    for section in credentials.sections():
+        if (
+            section.casefold() in credential_aliases
+            and section != AWS_BOOTSTRAP_PROFILE
+        ):
+            raise AwsAuthorityError("closed AWS bootstrap profile is not exact")
+    if not config.has_section(config_section) or not credentials.has_section(
+        AWS_BOOTSTRAP_PROFILE
+    ):
+        raise AwsAuthorityError("closed AWS bootstrap profile is missing")
+    configuration = dict(config.items(config_section, raw=True))
+    if configuration not in (
+        {"region": REQUIRED_REGION},
+        {"region": REQUIRED_REGION, "output": "json"},
+    ):
+        raise AwsAuthorityError("closed AWS bootstrap profile is not exact")
+    source = dict(credentials.items(AWS_BOOTSTRAP_PROFILE, raw=True))
+    if set(source) != {"aws_access_key_id", "aws_secret_access_key"}:
+        raise AwsAuthorityError("closed AWS bootstrap profile is not static")
+    try:
+        return freeze_bootstrap_credentials(
+            profile=AWS_BOOTSTRAP_PROFILE,
+            access_key=source.get("aws_access_key_id"),
+            secret_key=source.get("aws_secret_access_key"),
+        )
+    except AwsBootstrapCredentialError:
+        raise AwsAuthorityError(
+            "closed AWS bootstrap profile is invalid"
+        ) from None
+
+
 def _hardened_sdk_config(
     config_factory: Callable[..., object],
     *,
@@ -1290,6 +1471,33 @@ class _ExplicitFrozenCredentials:
         return "<explicit AWS credentials>"
 
 
+def _authenticate_direct_bootstrap_profile(
+    plan: ReleasePlanV2,
+    *,
+    aws_directory: Path,
+    frozen_session_factory: Callable[..., _FrozenSession],
+    config_factory: Callable[..., object],
+    ca_bundle_path: str,
+) -> AuthenticatedAwsAuthorityV2:
+    """Authenticate the fixed static profile directly against plan account."""
+
+    canonical_plan = ReleasePlanV2.from_bytes(plan.to_bytes())
+    retained_ca = _retained_ca_bundle_path(ca_bundle_path)
+    with _closed_aws_environment():
+        frozen = _closed_direct_bootstrap_credentials(
+            canonical_plan,
+            aws_directory=Path(aws_directory),
+        )
+        return _authenticate_frozen_source(
+            canonical_plan,
+            frozen_credentials=frozen,
+            frozen_session_factory=frozen_session_factory,
+            config_factory=config_factory,
+            ca_bundle_path=retained_ca,
+            require_exact_endpoints=True,
+        )
+
+
 def _authenticate_frozen_source(
     plan: ReleasePlanV2,
     *,
@@ -1298,6 +1506,7 @@ def _authenticate_frozen_source(
     config_factory: Callable[..., object],
     ca_bundle_path: str,
     expected_role_session: str | None = None,
+    require_exact_endpoints: bool = False,
 ) -> AuthenticatedAwsAuthorityV2:
     """Build exact clients from caller-retained, non-refreshable credentials."""
 
@@ -1353,7 +1562,7 @@ def _authenticate_frozen_source(
                 region=canonical_plan.region,
             )
             if (
-                expected_role_session is not None
+                (expected_role_session is not None or require_exact_endpoints)
                 and getattr(getattr(raw, "meta", None), "endpoint_url", None)
                 != _EXACT_SERVICE_ENDPOINTS[service]
             ):
