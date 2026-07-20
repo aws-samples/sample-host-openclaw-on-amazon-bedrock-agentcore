@@ -9,6 +9,7 @@ one-effect private request artifacts are immutable before registry mutation.
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import gzip
 import hashlib
@@ -17,9 +18,19 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
+import stat
 import struct
 import tarfile
-from typing import Any, Mapping, Protocol, Sequence
+from typing import (
+    Any,
+    BinaryIO,
+    Iterator,
+    Mapping,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 import zlib
 
 from release_tools.aws_authority_v2 import (
@@ -33,6 +44,11 @@ from release_tools.contracts import (
     VerifiedPrivateMutationV2,
     _completed_prefix_sha256,
     _release_operation_sha256,
+)
+from release_tools.dispatch_attempt_v2 import (
+    DispatchAttemptError,
+    FreshDispatchAuthorityV1,
+    ReleaseDispatchAttemptV1,
 )
 
 
@@ -335,25 +351,296 @@ class RuntimeDependencyBuilder(Protocol):
     def build_runtime(self, **kwargs: Any) -> Mapping[str, Any]: ...
 
 
+_ARTIFACT_STREAM_CHUNK = 1024 * 1024
+
+
+def _stream_reader_sha256_size(
+    reader: Any,
+    *,
+    chunk: int = _ARTIFACT_STREAM_CHUNK,
+    extra: Any = None,
+) -> tuple[str, int]:
+    """Consume a reader in bounded chunks; never issue an unbounded read.
+
+    This is the single bounded-read primitive for every retained-file stream.
+    Reads are always sized, so a full artifact can never be materialized by a
+    single ``read()`` call.  ``extra`` optionally receives the same chunks (for
+    a second digest) and must expose ``update``.
+    """
+
+    if not isinstance(chunk, int) or chunk <= 0:
+        raise RuntimeBuildClosureError("artifact stream chunk is invalid")
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        block = reader.read(chunk)
+        if not block:
+            break
+        digest.update(block)
+        if extra is not None:
+            extra.update(block)
+        size += len(block)
+    return digest.hexdigest(), size
+
+
+@runtime_checkable
+class ArtifactSource(Protocol):
+    """A validated, streamable package-manager artifact byte source."""
+
+    @property
+    def size(self) -> int: ...
+
+    @property
+    def sha256(self) -> str: ...
+
+    def open(self) -> Any: ...
+
+    def stream_into(self, dest_path: Path) -> None: ...
+
+
+class _InMemoryArtifactSource:
+    """Backward-compatible source for callers that still hold artifact bytes.
+
+    Only small, hostile-fixture and development-evidence callers supply bytes;
+    the production consumer path never materializes an artifact this way.
+    """
+
+    __slots__ = ("_payload", "_sha256")
+
+    def __init__(self, payload: bytes) -> None:
+        if not isinstance(payload, (bytes, bytearray)):
+            raise RuntimeBuildClosureError(
+                "package-manager artifact source bytes are invalid"
+            )
+        self._payload = bytes(payload)
+        self._sha256 = _sha256(self._payload)
+
+    @property
+    def size(self) -> int:
+        return len(self._payload)
+
+    @property
+    def sha256(self) -> str:
+        return self._sha256
+
+    @contextmanager
+    def open(self) -> Iterator[BinaryIO]:
+        stream = io.BytesIO(self._payload)
+        try:
+            yield stream
+        finally:
+            stream.close()
+
+    def stream_into(self, dest_path: Path) -> None:
+        with self.open() as reader:
+            _stream_copy_exclusive(reader, dest_path, self.size)
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedRegularFile:
+    """A large artifact referenced by a retained descriptor, never by bytes.
+
+    Establishment opens the caller path once with ``O_NOFOLLOW``, confirms a
+    regular file, streams its sha256 in bounded chunks, and keeps the exact
+    descriptor.  Every later read is of the *same* inode: the caller path is
+    never reopened.  Any post-validation size/inode/digest drift fails closed.
+    """
+
+    path: str
+    size: int
+    sha256: str
+    _dev: int
+    _ino: int
+    _fd: int
+
+    @classmethod
+    def establish(
+        cls, path: Path, *, label: str = "package-manager artifact"
+    ) -> "RetainedRegularFile":
+        try:
+            fd = os.open(
+                os.fspath(path),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as error:
+            raise RuntimeBuildClosureError(
+                f"{label} is unavailable"
+            ) from error
+        try:
+            meta = os.fstat(fd)
+            if (
+                not stat.S_ISREG(meta.st_mode)
+                or not 1 <= meta.st_size <= MAX_BLOB_BYTES
+            ):
+                raise RuntimeBuildClosureError(
+                    f"{label} is not a bounded regular file"
+                )
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                block = os.read(fd, _ARTIFACT_STREAM_CHUNK)
+                if not block:
+                    break
+                digest.update(block)
+                size += len(block)
+            if size != meta.st_size:
+                raise RuntimeBuildClosureError(
+                    f"{label} changed while being read"
+                )
+        except BaseException:
+            os.close(fd)
+            raise
+        return cls(
+            os.path.abspath(os.fspath(path)),
+            size,
+            digest.hexdigest(),
+            meta.st_dev,
+            meta.st_ino,
+            fd,
+        )
+
+    def _revalidate(self) -> None:
+        if self._fd < 0:
+            raise RuntimeBuildClosureError(
+                "retained package-manager artifact is closed"
+            )
+        try:
+            meta = os.fstat(self._fd)
+        except OSError as error:
+            raise RuntimeBuildClosureError(
+                "retained package-manager artifact is unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(meta.st_mode)
+            or meta.st_dev != self._dev
+            or meta.st_ino != self._ino
+            or meta.st_size != self.size
+        ):
+            raise RuntimeBuildClosureError(
+                "retained package-manager artifact inode differs"
+            )
+
+    @contextmanager
+    def open(self) -> Iterator[BinaryIO]:
+        self._revalidate()
+        duplicate = os.dup(self._fd)
+        try:
+            os.lseek(duplicate, 0, os.SEEK_SET)
+            stream = os.fdopen(duplicate, "rb", closefd=True)
+        except OSError as error:
+            os.close(duplicate)
+            raise RuntimeBuildClosureError(
+                "retained package-manager artifact cannot be read"
+            ) from error
+        try:
+            yield stream
+        finally:
+            stream.close()
+
+    def stream_into(self, dest_path: Path) -> None:
+        with self.open() as reader:
+            observed = _stream_copy_exclusive(reader, dest_path, self.size)
+        if observed != self.size:
+            raise RuntimeBuildClosureError(
+                "retained package-manager artifact stream is truncated"
+            )
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            object.__setattr__(self, "_fd", -1)
+
+    def __enter__(self) -> "RetainedRegularFile":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _stream_copy_exclusive(reader: Any, dest_path: Path, size: int) -> int:
+    descriptor = os.open(
+        os.fspath(dest_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    written = 0
+    try:
+        while True:
+            block = reader.read(_ARTIFACT_STREAM_CHUNK)
+            if not block:
+                break
+            view = memoryview(block)
+            while view:
+                count = os.write(descriptor, view)
+                if count <= 0:
+                    raise RuntimeBuildClosureError(
+                        "package-manager artifact stream write is short"
+                    )
+                view = view[count:]
+            written += len(block)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if written > size:
+        raise RuntimeBuildClosureError(
+            "package-manager artifact stream exceeds its bound"
+        )
+    return written
+
+
+def _coerce_artifact_source(source: Any) -> ArtifactSource:
+    if isinstance(source, RetainedRegularFile):
+        return source
+    if isinstance(source, (bytes, bytearray)):
+        return _InMemoryArtifactSource(bytes(source))
+    if (
+        hasattr(source, "open")
+        and hasattr(source, "stream_into")
+        and hasattr(source, "sha256")
+        and hasattr(source, "size")
+    ):
+        return source
+    raise RuntimeBuildClosureError(
+        "package-manager artifact source is invalid"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PackageManagerArtifact:
     manager: str
     version: str
-    payload: bytes
+    source: ArtifactSource
     reviewed_sha256: str
     distribution_sha512: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "source", _coerce_artifact_source(self.source)
+        )
 
 
 def reviewed_package_manager_artifact(
     *,
     component: str,
-    payload: bytes,
+    payload: Any,
 ) -> PackageManagerArtifact:
-    """Bind exact bytes to the committed production review input.
+    """Bind an exact artifact source to the committed production review input.
 
     The checked-in digest map intentionally remains open until real offline
-    artifacts are reviewed.  Supplying bytes or a digest on the command line
-    cannot close this gate.
+    artifacts are reviewed.  Supplying bytes, a retained file, or a digest on
+    the command line cannot close this gate.  The artifact digest is streamed,
+    never materialized, against the pinned ``reviewed_sha256``.
     """
 
     try:
@@ -372,7 +659,8 @@ def reviewed_package_manager_artifact(
         raise RuntimeBuildClosureError(
             f"reviewed package-manager artifact digest is not pinned: {component}"
         )
-    if not isinstance(payload, bytes) or _sha256(payload) != reviewed_sha256:
+    source = _coerce_artifact_source(payload)
+    if source.sha256 != reviewed_sha256:
         raise RuntimeBuildClosureError(
             f"reviewed package-manager artifact digest differs: {component}"
         )
@@ -384,7 +672,7 @@ def reviewed_package_manager_artifact(
     return PackageManagerArtifact(
         manager,
         version,
-        payload,
+        source,
         reviewed_sha256,
         distribution_sha512,
     )
@@ -2745,36 +3033,170 @@ def _offline_artifact_contract(
         raise RuntimeBuildClosureError(
             "offline dependency cache has no lock integrity inventory"
         )
-    files: dict[str, bytes] = {}
+    # Stream the outer tar directly from the retained artifact source; each
+    # member's sha256/size is computed in bounded chunks and the payload bytes
+    # are never retained.  Only the small integrity manifest is materialized.
+    inventory_by_name: dict[str, tuple[str, int]] = {}
+    manifest_payload: bytes | None = None
+    distribution_member: tarfile.TarInfo | None = None
     try:
-        with tarfile.open(fileobj=io.BytesIO(artifact.payload), mode="r:") as archive:
-            for member in archive.getmembers():
-                path = PurePosixPath(member.name)
+        with artifact.source.open() as fileobj:
+            with tarfile.open(fileobj=fileobj, mode="r:") as archive:
+                for member in archive.getmembers():
+                    path = PurePosixPath(member.name)
+                    if (
+                        path.is_absolute()
+                        or any(part in {"", ".", ".."} for part in path.parts)
+                        or member.issym()
+                        or member.islnk()
+                        or member.uid != 0
+                        or member.gid != 0
+                        or member.mtime != 0
+                    ):
+                        raise RuntimeBuildClosureError(
+                            "offline package-manager artifact is unsafe"
+                        )
+                    if member.isdir():
+                        continue
+                    if not member.isreg() or member.name in inventory_by_name:
+                        raise RuntimeBuildClosureError(
+                            "offline package-manager artifact inventory differs"
+                        )
+                    reader = archive.extractfile(member)
+                    if reader is None:
+                        raise RuntimeBuildClosureError(
+                            "offline package-manager artifact inventory differs"
+                        )
+                    if member.name == "integrity-manifest.json":
+                        manifest_payload = reader.read(member.size + 1)
+                        if len(manifest_payload) != member.size:
+                            raise RuntimeBuildClosureError(
+                                "offline package-manager artifact is truncated"
+                            )
+                        member_sha256 = _sha256(manifest_payload)
+                        member_size = len(manifest_payload)
+                    else:
+                        member_sha256, member_size = _stream_reader_sha256_size(
+                            reader
+                        )
+                    if member_size != member.size:
+                        raise RuntimeBuildClosureError(
+                            "offline package-manager artifact is truncated"
+                        )
+                    if member.name == "pnpm-distribution.tgz":
+                        distribution_member = member
+                    if member.name != "integrity-manifest.json":
+                        inventory_by_name[member.name] = (
+                            member_sha256,
+                            member_size,
+                        )
+
+                if manifest_payload is None:
+                    raise RuntimeBuildClosureError(
+                        "offline dependency cache integrity manifest is missing"
+                    )
+                manifest = _strict_json(
+                    manifest_payload,
+                    label="offline dependency cache integrity manifest",
+                )
+                inventory = [
+                    {"path": path, "sha256": sha256, "size": size}
+                    for path, (sha256, size) in sorted(
+                        inventory_by_name.items()
+                    )
+                ]
+                expected_manifest = {
+                    "schema": "personal-operator.offline-dependency-cache.v1",
+                    "component": component,
+                    "lockSha256": _sha256(lock_payload),
+                    "lockIntegrities": lock_integrities,
+                    "files": inventory,
+                }
                 if (
-                    path.is_absolute()
-                    or any(part in {"", ".", ".."} for part in path.parts)
-                    or member.issym()
-                    or member.islnk()
-                    or member.uid != 0
-                    or member.gid != 0
-                    or member.mtime != 0
+                    manifest != expected_manifest
+                    or _canonical_json(manifest) != manifest_payload
                 ):
                     raise RuntimeBuildClosureError(
-                        "offline package-manager artifact is unsafe"
+                        "offline dependency cache integrity binding differs"
                     )
-                if member.isdir():
-                    continue
-                if not member.isreg() or member.name in files:
-                    raise RuntimeBuildClosureError(
-                        "offline package-manager artifact inventory differs"
-                    )
-                reader = archive.extractfile(member)
-                payload = reader.read() if reader is not None else b""
-                if len(payload) != member.size:
-                    raise RuntimeBuildClosureError(
-                        "offline package-manager artifact is truncated"
-                    )
-                files[member.name] = payload
+                if component == "openclaw-runtime":
+                    if (
+                        distribution_member is None
+                        or not isinstance(artifact.distribution_sha512, str)
+                        or _SHA_128.fullmatch(artifact.distribution_sha512)
+                        is None
+                        or not any(
+                            name.startswith("store/")
+                            for name in inventory_by_name
+                        )
+                    ):
+                        raise RuntimeBuildClosureError(
+                            "reviewed pnpm distribution or offline store differs"
+                        )
+                    distribution_digest = hashlib.sha512()
+                    dist_reader = archive.extractfile(distribution_member)
+                    if dist_reader is None:
+                        raise RuntimeBuildClosureError(
+                            "reviewed pnpm distribution or offline store differs"
+                        )
+                    while True:
+                        block = dist_reader.read(_ARTIFACT_STREAM_CHUNK)
+                        if not block:
+                            break
+                        distribution_digest.update(block)
+                    if (
+                        distribution_digest.hexdigest()
+                        != artifact.distribution_sha512
+                    ):
+                        raise RuntimeBuildClosureError(
+                            "reviewed pnpm distribution or offline store differs"
+                        )
+                    observed_entry = False
+                    dist_stream = archive.extractfile(distribution_member)
+                    if dist_stream is None:
+                        raise RuntimeBuildClosureError(
+                            "reviewed pnpm distribution is invalid"
+                        )
+                    with tarfile.open(
+                        fileobj=dist_stream, mode="r:*"
+                    ) as pnpm:
+                        for member in pnpm.getmembers():
+                            path = PurePosixPath(member.name)
+                            if (
+                                path.is_absolute()
+                                or any(
+                                    part in {"", ".", ".."}
+                                    for part in path.parts
+                                )
+                                or member.issym()
+                                or member.islnk()
+                            ):
+                                raise RuntimeBuildClosureError(
+                                    "reviewed pnpm distribution is unsafe"
+                                )
+                            if (
+                                member.name == "package/bin/pnpm.cjs"
+                                and member.isreg()
+                            ):
+                                observed_entry = True
+                    if not observed_entry:
+                        raise RuntimeBuildClosureError(
+                            "reviewed pnpm distribution entry is missing"
+                        )
+                else:
+                    if (
+                        artifact.distribution_sha512 != ""
+                        or not inventory_by_name
+                        or any(
+                            not name.startswith("cache/")
+                            for name in inventory_by_name
+                        )
+                    ):
+                        raise RuntimeBuildClosureError(
+                            "bridge dependency artifact is not cache-only"
+                        )
+    except RuntimeBuildClosureError:
+        raise
     except UnicodeDecodeError as error:
         raise RuntimeBuildClosureError(
             "runtime lockfile is not UTF-8"
@@ -2783,73 +3205,6 @@ def _offline_artifact_contract(
         raise RuntimeBuildClosureError(
             "offline package-manager artifact is invalid"
         ) from error
-    manifest_payload = files.pop("integrity-manifest.json", None)
-    if not isinstance(manifest_payload, bytes):
-        raise RuntimeBuildClosureError(
-            "offline dependency cache integrity manifest is missing"
-        )
-    manifest = _strict_json(
-        manifest_payload, label="offline dependency cache integrity manifest"
-    )
-    inventory = [
-        {"path": path, "sha256": _sha256(payload), "size": len(payload)}
-        for path, payload in sorted(files.items())
-    ]
-    expected_manifest = {
-        "schema": "personal-operator.offline-dependency-cache.v1",
-        "component": component,
-        "lockSha256": _sha256(lock_payload),
-        "lockIntegrities": lock_integrities,
-        "files": inventory,
-    }
-    if manifest != expected_manifest or _canonical_json(manifest) != manifest_payload:
-        raise RuntimeBuildClosureError(
-            "offline dependency cache integrity binding differs"
-        )
-    if component == "openclaw-runtime":
-        distribution = files.get("pnpm-distribution.tgz")
-        if (
-            not isinstance(distribution, bytes)
-            or not isinstance(artifact.distribution_sha512, str)
-            or _SHA_128.fullmatch(artifact.distribution_sha512) is None
-            or hashlib.sha512(distribution).hexdigest()
-            != artifact.distribution_sha512
-            or not any(path.startswith("store/") for path in files)
-        ):
-            raise RuntimeBuildClosureError(
-                "reviewed pnpm distribution or offline store differs"
-            )
-        observed_entry = False
-        try:
-            with tarfile.open(fileobj=io.BytesIO(distribution), mode="r:*") as pnpm:
-                for member in pnpm.getmembers():
-                    path = PurePosixPath(member.name)
-                    if (
-                        path.is_absolute()
-                        or any(part in {"", ".", ".."} for part in path.parts)
-                        or member.issym()
-                        or member.islnk()
-                    ):
-                        raise RuntimeBuildClosureError(
-                            "reviewed pnpm distribution is unsafe"
-                        )
-                    if member.name == "package/bin/pnpm.cjs" and member.isreg():
-                        observed_entry = True
-        except (tarfile.TarError, OSError) as error:
-            raise RuntimeBuildClosureError(
-                "reviewed pnpm distribution is invalid"
-            ) from error
-        if not observed_entry:
-            raise RuntimeBuildClosureError(
-                "reviewed pnpm distribution entry is missing"
-            )
-    else:
-        if artifact.distribution_sha512 != "" or not files or any(
-            not path.startswith("cache/") for path in files
-        ):
-            raise RuntimeBuildClosureError(
-                "bridge dependency artifact is not cache-only"
-            )
     return _sha256(manifest_payload)
 
 
@@ -2891,8 +3246,8 @@ class TrustedRuntimeBuildMaterialProvider:
             if (
                 not isinstance(artifact, PackageManagerArtifact)
                 or (artifact.manager, artifact.version) != expected
-                or not isinstance(artifact.payload, bytes)
-                or not 1 <= len(artifact.payload) <= MAX_BLOB_BYTES
+                or not isinstance(artifact.source, ArtifactSource)
+                or not 1 <= artifact.source.size <= MAX_BLOB_BYTES
                 or not isinstance(artifact.distribution_sha512, str)
             ):
                 raise RuntimeBuildClosureError(
@@ -2901,7 +3256,7 @@ class TrustedRuntimeBuildMaterialProvider:
             if (
                 not isinstance(artifact.reviewed_sha256, str)
                 or _SHA_64.fullmatch(artifact.reviewed_sha256) is None
-                or _sha256(artifact.payload) != artifact.reviewed_sha256
+                or artifact.source.sha256 != artifact.reviewed_sha256
             ):
                 raise RuntimeBuildClosureError(
                     "reviewed package-manager artifact digest differs"
@@ -3018,8 +3373,8 @@ class TrustedRuntimeBuildMaterialProvider:
             source_tree=source_tree,
             source_archive=archive,
             source_archive_sha256=_sha256(archive),
-            package_manager_artifact=artifact.payload,
-            package_manager_artifact_sha256=_sha256(artifact.payload),
+            package_manager_artifact=artifact.source,
+            package_manager_artifact_sha256=artifact.source.sha256,
             package_manager_artifact_contract_sha256=(
                 artifact_contract_sha256
             ),
@@ -3092,7 +3447,7 @@ class TrustedRuntimeBuildMaterialProvider:
             "nodeVersion": "24.15.0",
             "packageManager": manager,
             "packageManagerVersion": version,
-            "packageManagerArtifactSha256": _sha256(artifact.payload),
+            "packageManagerArtifactSha256": artifact.source.sha256,
             "packageManagerArtifactContractSha256": (
                 artifact_contract_sha256
             ),
@@ -4948,9 +5303,15 @@ class EcrImagePublisher:
         self,
         verified: VerifiedPrivateMutationV2,
         preflight: VerifiedImagePublicationPreflightV1 | None = None,
-    ) -> dict[str, object]:
+        *,
+        fresh_authority: FreshDispatchAuthorityV1,
+    ) -> ReleaseDispatchAttemptV1:
         """Dispatch exactly the current journal-bound, preflight-closed effect."""
 
+        if type(fresh_authority) is not FreshDispatchAuthorityV1:
+            raise ArtifactSubstitutionError(
+                "image publication requires fresh dispatch authority"
+            )
         if not isinstance(verified, VerifiedPrivateMutationV2):
             raise ArtifactSubstitutionError(
                 "image publication requires a verified private mutation"
@@ -4971,20 +5332,47 @@ class EcrImagePublisher:
             raise ArtifactSubstitutionError(
                 "image effect differs from authenticated ECR authority"
             ) from error
-        dispatched = True
+        try:
+            operation_sha256 = (
+                verified.resolved_request.mutation_request.operation_sha256
+            )
+            resolved_request_sha256 = verified.resolved_request.digest()
+        except ContractError as error:
+            raise ArtifactSubstitutionError(
+                "image publication verified private mutation is invalid"
+            ) from error
         if effect.effect_kind == "ECR_BLOB_PUT":
             available = self._available_layers(
                 account=effect.account,
                 digests=(effect.digest,),
             )
-            dispatched = effect.digest not in available
-            if dispatched:
+            try:
+                attempt = fresh_authority.consume(
+                    provider="ECR",
+                    operation_sha256=operation_sha256,
+                    resolved_request_sha256=resolved_request_sha256,
+                )
+            except DispatchAttemptError as error:
+                raise ArtifactSubstitutionError(
+                    "image publication fresh dispatch authority differs"
+                ) from error
+            if effect.digest not in available:
                 self._upload_blob(
                     account=effect.account,
                     digest=effect.digest,
                     payload=effect.payload,
                 )
         else:
+            try:
+                attempt = fresh_authority.consume(
+                    provider="ECR",
+                    operation_sha256=operation_sha256,
+                    resolved_request_sha256=resolved_request_sha256,
+                )
+            except DispatchAttemptError as error:
+                raise ArtifactSubstitutionError(
+                    "image publication fresh dispatch authority differs"
+                ) from error
             self._put_manifest(
                 account=effect.account,
                 descriptor=OciDescriptor(
@@ -4995,11 +5383,4 @@ class EcrImagePublisher:
                 payload=effect.payload,
                 tag=effect.tag,
             )
-        return {
-            "schema": "personal-operator.image-publication-effect-ack.v1",
-            "publicationPlanSha256": effect.publication_plan_sha256,
-            "effectId": effect.effect_id,
-            "effectKind": effect.effect_kind,
-            "digest": effect.digest,
-            "dispatched": dispatched,
-        }
+        return attempt

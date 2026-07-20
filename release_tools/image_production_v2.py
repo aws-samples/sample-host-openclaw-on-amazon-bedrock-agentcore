@@ -45,7 +45,9 @@ from release_tools.image_publication import (
     ImagePublicationBundle,
     ImagePublicationError,
     PackageManagerArtifact,
+    RetainedRegularFile,
     TrustedRuntimeBuildMaterialProvider,
+    _coerce_artifact_source,
     _canonical_json,
     _digest,
     _require_digest,
@@ -63,6 +65,9 @@ from release_tools.image_publication import (
 PRODUCTION_BUILDER_ID = (
     "https://personal-operator.invalid/builders/offline-buildkit-v1"
 )
+# Build /work tmpfs must hold the extracted ~2.1 GiB offline artifact plus its
+# offline install expansion; 4 GiB is under that floor.
+BUILD_TMPFS_BYTES = 8 * 1024 * 1024 * 1024
 _SHA_40 = re.compile(r"[0-9a-f]{40}")
 _SHA_64 = re.compile(r"[0-9a-f]{64}")
 _CONTAINER_ID_OUTPUT = re.compile(rb"[0-9a-f]{64}\n?")
@@ -853,7 +858,11 @@ class ProductionHermeticRuntimeBuilderV2:
         component = kwargs["component"]
         attempt = kwargs["attempt"]
         source_archive = kwargs["source_archive"]
-        package_artifact = kwargs["package_manager_artifact"]
+        # The trusted provider hands the retained artifact source, never bytes;
+        # hostile fixtures may still pass bytes and are coerced in memory.
+        artifact_source = _coerce_artifact_source(
+            kwargs["package_manager_artifact"]
+        )
         recipe_payload = kwargs["build_recipe"]
         executor = kwargs["build_executor"]
         try:
@@ -872,7 +881,7 @@ class ProductionHermeticRuntimeBuilderV2:
             or executor != RUNTIME_BUILD_EXECUTOR
             or _sha256(executor) != kwargs["build_executor_sha256"]
             or _sha256(source_archive) != kwargs["source_archive_sha256"]
-            or _sha256(package_artifact)
+            or artifact_source.sha256
             != kwargs["package_manager_artifact_sha256"]
             or kwargs["builder_image"] != RUNTIME_BUILD_BUILDER_IMAGE
             or kwargs["fresh_root"] is not True
@@ -890,7 +899,7 @@ class ProductionHermeticRuntimeBuilderV2:
         artifact = PackageManagerArtifact(
             manager,
             version,
-            package_artifact,
+            artifact_source,
             kwargs["package_manager_artifact_sha256"],
             kwargs["package_manager_distribution_sha512"],
         )
@@ -923,8 +932,10 @@ class ProductionHermeticRuntimeBuilderV2:
             inputs.mkdir(mode=0o700)
             output.mkdir(mode=0o700)
             (inputs / "source.tar").write_bytes(source_archive)
-            (inputs / "offline-package-manager.tar").write_bytes(
-                package_artifact
+            # Stream the retained artifact into the fresh input root in bounded
+            # chunks; the ~2.1 GiB payload is never held in memory here.
+            artifact.source.stream_into(
+                inputs / "offline-package-manager.tar"
             )
             (inputs / "build-recipe.json").write_bytes(recipe_payload)
             command = [
@@ -938,7 +949,7 @@ class ProductionHermeticRuntimeBuilderV2:
                 "--security-opt=no-new-privileges",
                 f"--user={os.getuid()}:{os.getgid()}",
                 "--tmpfs",
-                "/work:rw,nosuid,nodev,size=4294967296",
+                f"/work:rw,nosuid,nodev,size={BUILD_TMPFS_BYTES}",
                 "--mount",
                 f"type=bind,src={inputs},dst=/input,readonly",
                 "--mount",
@@ -1033,8 +1044,8 @@ class TrustedRuntimeBuildClosureFactoryV2:
         release_tree: str,
         openclaw_commit: str,
         openclaw_tree: str,
-        openclaw_package_manager_artifact: bytes,
-        bridge_package_manager_artifact: bytes,
+        openclaw_package_manager_artifact: RetainedRegularFile | bytes,
+        bridge_package_manager_artifact: RetainedRegularFile | bytes,
     ) -> TrustedRuntimeBuildClosureV2:
         artifacts = {
             "openclaw-runtime": reviewed_package_manager_artifact(

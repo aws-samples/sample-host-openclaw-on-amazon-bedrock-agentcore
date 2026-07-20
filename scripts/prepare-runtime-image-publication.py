@@ -27,12 +27,11 @@ from release_tools.image_production_v2 import (
     OfflineContainerImageProbe,
     TrustedImageProducerV2,
     TrustedRuntimeBuildClosureFactoryV2,
-    _regular_bytes,
     open_reviewed_local_execution,
 )
 from release_tools.image_publication import (
-    MAX_BLOB_BYTES,
     ImagePublicationError,
+    RetainedRegularFile,
     RuntimeBuildClosureError,
 )
 
@@ -171,14 +170,12 @@ def main(argv: list[str] | None = None) -> int:
                 release_tree=arguments.source_tree,
                 openclaw_commit=arguments.openclaw_commit,
                 openclaw_tree=arguments.openclaw_tree,
-                openclaw_package_manager_artifact=_regular_bytes(
+                openclaw_package_manager_artifact=RetainedRegularFile.establish(
                     arguments.openclaw_package_manager_artifact,
-                    maximum=MAX_BLOB_BYTES,
                     label="OpenClaw package-manager artifact",
                 ),
-                bridge_package_manager_artifact=_regular_bytes(
+                bridge_package_manager_artifact=RetainedRegularFile.establish(
                     arguments.bridge_package_manager_artifact,
-                    maximum=MAX_BLOB_BYTES,
                     label="bridge package-manager artifact",
                 ),
             )

@@ -30,6 +30,12 @@ from release_tools.contracts import (
     VerifiedPrivateMutationV2,
     write_new_private_mutation_envelope,
 )
+from release_tools.dispatch_attempt_v2 import (
+    DispatchAttemptError,
+    FreshDispatchAuthorityV1,
+    ReleaseDispatchAttemptV1,
+    _mint_fresh_dispatch_authority,
+)
 from release_tools.ecr import EcrEvidenceAdapter
 from release_tools.image_publication import (
     ArtifactSubstitutionError,
@@ -79,6 +85,45 @@ EXPECTED_TOOLS = [
     "po_compute_run",
     "po_compute_status",
 ]
+
+
+def _fresh_dispatch(
+    verified: VerifiedPrivateMutationV2,
+    *,
+    provider: str = "ECR",
+    operation_sha256: str | None = None,
+    resolved_request_sha256: str | None = None,
+) -> tuple[FreshDispatchAuthorityV1, ReleaseDispatchAttemptV1]:
+    resolved = verified.resolved_request
+    request = resolved.mutation_request
+    attempt = ReleaseDispatchAttemptV1(
+        release_plan_sha256=request.plan_sha256,
+        evidence_store_sha256="1" * 64,
+        journal_path_sha256="2" * 64,
+        journal_execution_id="3" * 64,
+        journal_revision=1,
+        completed_prefix_sha256=request.completed_prefix_sha256,
+        step_id=request.step_id,
+        subject=request.subject,
+        operation_sha256=(operation_sha256 or request.operation_sha256),
+        resolved_request_sha256=(
+            resolved_request_sha256 or resolved.digest()
+        ),
+        provider=provider,
+    )
+    return _mint_fresh_dispatch_authority(attempt), attempt
+
+
+class _ForgedFreshDispatchAuthority(FreshDispatchAuthorityV1):
+    """Subclass that deliberately skips the token-gated base constructor."""
+
+    __slots__ = ("_forged_attempt",)
+
+    def __init__(self, attempt: ReleaseDispatchAttemptV1) -> None:
+        self._forged_attempt = attempt
+
+    def consume(self, **_kwargs: object) -> ReleaseDispatchAttemptV1:
+        return self._forged_attempt
 
 
 def _json(value: object) -> bytes:
@@ -1458,6 +1503,27 @@ def _publisher(
     return EcrImagePublisher(authority)
 
 
+def _publish_effect(
+    publisher: EcrImagePublisher,
+    verified: VerifiedPrivateMutationV2,
+    preflight: object,
+) -> ReleaseDispatchAttemptV1:
+    fresh_authority, expected_attempt = _fresh_dispatch(verified)
+    actual = publisher.publish_effect(
+        verified,
+        preflight,  # type: ignore[arg-type]
+        fresh_authority=fresh_authority,
+    )
+    assert actual == expected_attempt
+    with pytest.raises(DispatchAttemptError, match="already consumed"):
+        fresh_authority.consume(
+            provider="ECR",
+            operation_sha256=expected_attempt.operation_sha256,
+            resolved_request_sha256=expected_attempt.resolved_request_sha256,
+        )
+    return actual
+
+
 def test_publisher_dispatches_one_exact_blob_or_manifest_effect_per_invocation() -> None:
     bundle = _prepare()
     blob_fake = FakeEcrMutation()
@@ -1467,18 +1533,12 @@ def test_publisher_dispatches_one_exact_blob_or_manifest_effect_per_invocation()
         verified,
         preflight,
     ):
-        acknowledgement = _publisher(blob_fake).publish_effect(
-            verified, preflight
+        acknowledgement = _publish_effect(
+            _publisher(blob_fake), verified, preflight
         )
 
-    assert acknowledgement == {
-        "schema": "personal-operator.image-publication-effect-ack.v1",
-        "publicationPlanSha256": bundle.plan_sha256,
-        "effectId": blob_effect.effect_id,
-        "effectKind": "ECR_BLOB_PUT",
-        "digest": blob_effect.digest,
-        "dispatched": True,
-    }
+    assert acknowledgement.provider == "ECR"
+    assert acknowledgement.subject == blob_effect.provider_subject
     assert [name for name, _ in blob_fake.calls] == [
         "batch_check_layer_availability",
         "initiate_layer_upload",
@@ -1493,21 +1553,93 @@ def test_publisher_dispatches_one_exact_blob_or_manifest_effect_per_invocation()
             verified,
             preflight,
         ):
-            acknowledgement = _publisher(fake).publish_effect(
-                verified, preflight
+            acknowledgement = _publish_effect(
+                _publisher(fake), verified, preflight
             )
-        assert acknowledgement == {
-            "schema": "personal-operator.image-publication-effect-ack.v1",
-            "publicationPlanSha256": bundle.plan_sha256,
-            "effectId": effect.effect_id,
-            "effectKind": effect.effect_kind,
-            "digest": effect.digest,
-            "dispatched": True,
-        }
+        assert acknowledgement.provider == "ECR"
+        assert acknowledgement.subject == effect.provider_subject
         assert [name for name, _ in fake.calls] == ["put_image"]
         call = fake.calls[0][1]
         assert call["imageDigest"] == effect.digest
         assert call.get("imageTag") == effect.tag
+
+
+def test_image_dispatch_fence_rejects_missing_duck_crossed_or_consumed_authority() -> None:
+    bundle = _prepare()
+    with _verified_image_effect(bundle, -3) as (_, verified, preflight):
+        missing_fake = FakeEcrMutation()
+        with pytest.raises(TypeError, match="fresh_authority"):
+            _publisher(missing_fake).publish_effect(verified, preflight)
+        assert missing_fake.calls == []
+
+        crossed_provider, _ = _fresh_dispatch(
+            verified, provider="CLOUDFORMATION"
+        )
+        crossed_operation, _ = _fresh_dispatch(
+            verified,
+            operation_sha256="sha256:" + "f" * 64,
+        )
+        crossed_request, _ = _fresh_dispatch(
+            verified,
+            resolved_request_sha256="e" * 64,
+        )
+        consumed, consumed_attempt = _fresh_dispatch(verified)
+        _, forged_attempt = _fresh_dispatch(verified)
+        forged = _ForgedFreshDispatchAuthority(forged_attempt)
+        assert consumed.consume(
+            provider="ECR",
+            operation_sha256=consumed_attempt.operation_sha256,
+            resolved_request_sha256=consumed_attempt.resolved_request_sha256,
+        ) == consumed_attempt
+
+        for authority in (
+            object(),
+            crossed_provider,
+            crossed_operation,
+            crossed_request,
+            consumed,
+            forged,
+        ):
+            fake = FakeEcrMutation()
+            with pytest.raises(
+                ArtifactSubstitutionError,
+                match="dispatch authority",
+            ):
+                _publisher(fake).publish_effect(
+                    verified,
+                    preflight,
+                    fresh_authority=authority,  # type: ignore[arg-type]
+                )
+            assert fake.calls == []
+
+        with pytest.raises(DispatchAttemptError, match="already consumed"):
+            consumed.consume(
+                provider="ECR",
+                operation_sha256=consumed_attempt.operation_sha256,
+                resolved_request_sha256=(
+                    consumed_attempt.resolved_request_sha256
+                ),
+            )
+
+
+def test_image_blob_dispatch_fence_rejects_forged_authority_before_mutation() -> None:
+    bundle = _prepare()
+    with _verified_image_effect(bundle, 0) as (_, verified, preflight):
+        _, attempt = _fresh_dispatch(verified)
+        forged = _ForgedFreshDispatchAuthority(attempt)
+        fake = FakeEcrMutation()
+
+        with pytest.raises(
+            ArtifactSubstitutionError,
+            match="dispatch authority",
+        ):
+            _publisher(fake).publish_effect(
+                verified,
+                preflight,
+                fresh_authority=forged,
+            )
+
+        assert fake.calls == []
 
 
 def test_publisher_dispatches_one_reconstructed_effect_artifact(
@@ -1534,12 +1666,11 @@ def test_publisher_dispatches_one_reconstructed_effect_artifact(
             preflight,
         ):
             assert bound_effect == reconstructed
-            acknowledgement = _publisher(fake).publish_effect(
-                verified, preflight
+            acknowledgement = _publish_effect(
+                _publisher(fake), verified, preflight
             )
 
-        assert acknowledgement["effectId"] == effect.effect_id
-        assert acknowledgement["effectKind"] == effect.effect_kind
+        assert acknowledgement.subject == effect.provider_subject
         calls = [name for name, _ in fake.calls]
         if effect.effect_kind == "ECR_BLOB_PUT":
             assert calls == [
@@ -1579,7 +1710,7 @@ def test_partial_layer_upload_is_ambiguous_and_never_publishes_manifests() -> No
 
     with _verified_image_effect(bundle, 0) as (_, verified, preflight):
         with pytest.raises(ImagePublicationAmbiguous, match="partial"):
-            _publisher(fake).publish_effect(verified, preflight)
+            _publish_effect(_publisher(fake), verified, preflight)
 
     assert "put_image" not in [name for name, _ in fake.calls]
 
@@ -1603,11 +1734,11 @@ def test_available_blob_is_reconciled_without_a_registry_mutation() -> None:
             ],
             "failures": [],
         }
-        acknowledgement = _publisher(fake).publish_effect(
-            verified, preflight
+        acknowledgement = _publish_effect(
+            _publisher(fake), verified, preflight
         )
 
-    assert acknowledgement["dispatched"] is False
+    assert acknowledgement.provider == "ECR"
     assert [name for name, _ in fake.calls] == [
         "batch_check_layer_availability"
     ]
@@ -1673,7 +1804,7 @@ def test_layer_reconciliation_fails_closed_on_non_absent_states(response) -> Non
             json.dumps(response).replace("{digest}", effect.digest)
         )
         with pytest.raises(ImagePublicationError):
-            _publisher(fake).publish_effect(verified, preflight)
+            _publish_effect(_publisher(fake), verified, preflight)
 
 
 def test_immutable_tag_collision_fails_closed_before_referrer_publication() -> None:
@@ -1683,7 +1814,7 @@ def test_immutable_tag_collision_fails_closed_before_referrer_publication() -> N
 
     with _verified_image_effect(bundle, -3) as (_, verified, preflight):
         with pytest.raises(ImagePublicationCollision, match="collision"):
-            _publisher(fake).publish_effect(verified, preflight)
+            _publish_effect(_publisher(fake), verified, preflight)
 
     assert [name for name, _ in fake.calls].count("put_image") == 1
 
@@ -1695,7 +1826,7 @@ def test_put_image_response_substitution_is_uncertain_after_mutation() -> None:
 
     with _verified_image_effect(bundle, -3) as (_, verified, preflight):
         with pytest.raises(ImagePublicationAmbiguous, match="manifest"):
-            _publisher(fake).publish_effect(verified, preflight)
+            _publish_effect(_publisher(fake), verified, preflight)
 
 
 @pytest.mark.parametrize("stage", ["initiate", "upload", "complete", "put"])
@@ -1707,7 +1838,7 @@ def test_every_malformed_post_mutation_acknowledgement_is_uncertain(stage: str) 
 
     with _verified_image_effect(bundle, index) as (_, verified, preflight):
         with pytest.raises(ImagePublicationAmbiguous):
-            _publisher(fake).publish_effect(verified, preflight)
+            _publish_effect(_publisher(fake), verified, preflight)
 
 
 def test_publisher_construction_has_no_ambient_ecr_or_credential_access() -> None:
@@ -1737,7 +1868,7 @@ def test_publisher_rejects_a_free_self_consistent_unplanned_effect() -> None:
     effect.validate()
     fake = FakeEcrMutation()
 
-    with pytest.raises(ImagePublicationError, match="verified private mutation"):
+    with pytest.raises(TypeError, match="fresh_authority"):
         _publisher(fake).publish_effect(effect)
 
     assert fake.calls == []
@@ -1771,7 +1902,7 @@ def test_publisher_rejects_preflight_from_a_different_release_plan() -> None:
 
     with _verified_image_effect(bundle, 0) as (_, verified, _):
         with pytest.raises(ArtifactSubstitutionError, match="current step"):
-            _publisher(fake).publish_effect(verified, crossed_preflight)
+            _publish_effect(_publisher(fake), verified, crossed_preflight)
 
     assert fake.calls == []
 
@@ -1782,8 +1913,10 @@ def test_publisher_rejects_an_attested_client_for_a_different_account() -> None:
 
     with _verified_image_effect(bundle, 0) as (_, verified, preflight):
         with pytest.raises(ArtifactSubstitutionError, match="ECR authority"):
-            _publisher(fake, account="999999999999").publish_effect(
-                verified, preflight
+            _publish_effect(
+                _publisher(fake, account="999999999999"),
+                verified,
+                preflight,
             )
 
     assert fake.calls == []
@@ -2094,7 +2227,7 @@ def test_offline_cache_manifest_must_exactly_match_authenticated_lock_integritie
     )
     provider._artifacts["openclaw-runtime"] = replace(
         artifact,
-        payload=payload,
+        source=payload,
         reviewed_sha256=hashlib.sha256(payload).hexdigest(),
     )
 
@@ -2638,6 +2771,182 @@ def _offline_package_manager_tar(
             item.uid = item.gid = item.mtime = 0
             archive.addfile(item, io.BytesIO(payload))
     return output.getvalue()
+
+
+class _UnboundedReadRejected(AssertionError):
+    """Raised when a stream consumer issues an unbounded ``read()``."""
+
+
+class _BoundedOnlyReader:
+    """A file object that fails closed if asked for an unbounded read.
+
+    A correct streaming consumer always passes an explicit chunk size, so this
+    reader proves the retained-artifact tar is never slurped whole.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._stream = io.BytesIO(payload)
+        self.unbounded_reads = 0
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            self.unbounded_reads += 1
+            raise _UnboundedReadRejected(
+                "artifact stream issued an unbounded read"
+            )
+        return self._stream.read(size)
+
+    def seek(self, *args, **kwargs):
+        return self._stream.seek(*args, **kwargs)
+
+    def tell(self):
+        return self._stream.tell()
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def close(self):
+        self._stream.close()
+
+
+class _BoundedOnlyArtifactSource:
+    """An :class:`ArtifactSource` whose reads must all be bounded."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self.sha256 = hashlib.sha256(payload).hexdigest()
+        self.size = len(payload)
+        self.readers: list[_BoundedOnlyReader] = []
+
+    @contextmanager
+    def open(self):
+        reader = _BoundedOnlyReader(self._payload)
+        self.readers.append(reader)
+        try:
+            yield reader
+        finally:
+            reader.close()
+
+    def stream_into(self, dest_path) -> None:  # pragma: no cover - unused here
+        with self.open() as reader:
+            with open(dest_path, "xb") as handle:
+                while True:
+                    block = reader.read(1024 * 1024)
+                    if not block:
+                        break
+                    handle.write(block)
+
+
+def test_sentinel_reader_proves_unbounded_reads_are_detectable() -> None:
+    reader = _BoundedOnlyReader(b"payload-bytes")
+    assert reader.read(4) == b"payl"
+    with pytest.raises(_UnboundedReadRejected):
+        reader.read()
+
+
+def test_offline_artifact_contract_streams_the_tar_without_unbounded_reads() -> None:
+    lock_payload = _material("openclaw-runtime")["files"]["pnpm-lock.yaml"][
+        "payload"
+    ]
+    payload = _offline_package_manager_tar("openclaw-runtime", lock_payload)
+    source = _BoundedOnlyArtifactSource(payload)
+    artifact = image_publication.PackageManagerArtifact(
+        "pnpm",
+        "11.2.2",
+        source,
+        source.sha256,
+        hashlib.sha512(_test_pnpm_distribution_tar()).hexdigest(),
+    )
+
+    contract = image_publication._offline_artifact_contract(
+        component="openclaw-runtime",
+        artifact=artifact,
+        lock_payload=lock_payload,
+    )
+
+    assert len(contract) == 64
+    assert source.readers, "the contract must open the retained artifact"
+    assert all(
+        reader.unbounded_reads == 0 for reader in source.readers
+    ), "the contract issued an unbounded read of the whole artifact"
+
+
+def test_retained_regular_file_streams_the_same_inode_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    payload = b"reviewed-offline-artifact-bytes" * 4096
+    artifact_path = tmp_path / "offline.tar"
+    artifact_path.write_bytes(payload)
+
+    retained = image_publication.RetainedRegularFile.establish(artifact_path)
+    try:
+        assert retained.size == len(payload)
+        assert retained.sha256 == hashlib.sha256(payload).hexdigest()
+
+        with retained.open() as reader:
+            streamed = b""
+            while True:
+                block = reader.read(4096)
+                if not block:
+                    break
+                streamed += block
+        assert streamed == payload
+
+        destination = tmp_path / "copied.tar"
+        retained.stream_into(destination)
+        assert destination.read_bytes() == payload
+
+        # Replacing the caller path with a different inode must NOT change what
+        # the retained descriptor reads: reads are of the same, original inode.
+        artifact_path.unlink()
+        artifact_path.write_bytes(b"different inode contents")
+        with retained.open() as reader:
+            assert reader.read(len(payload) + 1) == payload
+    finally:
+        retained.close()
+
+
+def test_retained_regular_file_fails_closed_on_in_place_inode_drift(
+    tmp_path: Path,
+) -> None:
+    payload = b"reviewed-offline-artifact-bytes" * 4096
+    artifact_path = tmp_path / "offline.tar"
+    artifact_path.write_bytes(payload)
+
+    retained = image_publication.RetainedRegularFile.establish(artifact_path)
+    try:
+        # Truncating the retained inode in place must be caught on the next
+        # revalidation: the recorded size no longer matches the live fstat.
+        with open(artifact_path, "r+b") as handle:
+            handle.truncate(len(payload) // 2)
+        with pytest.raises(
+            RuntimeBuildClosureError, match="inode differs"
+        ):
+            with retained.open() as reader:
+                reader.read(16)
+    finally:
+        retained.close()
+
+
+def test_retained_regular_file_rejects_empty_and_symlink_inputs(
+    tmp_path: Path,
+) -> None:
+    empty = tmp_path / "empty.tar"
+    empty.write_bytes(b"")
+    with pytest.raises(
+        RuntimeBuildClosureError, match="bounded regular file"
+    ):
+        image_publication.RetainedRegularFile.establish(empty)
+
+    target = tmp_path / "target.tar"
+    target.write_bytes(b"payload")
+    link = tmp_path / "link.tar"
+    link.symlink_to(target)
+    with pytest.raises(RuntimeBuildClosureError, match="unavailable"):
+        image_publication.RetainedRegularFile.establish(link)
 
 
 def test_closure_preparer_exports_git_objects_and_runs_fresh_offline_builds(

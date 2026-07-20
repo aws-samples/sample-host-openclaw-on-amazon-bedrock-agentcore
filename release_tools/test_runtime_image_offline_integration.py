@@ -23,14 +23,13 @@ from release_tools.image_production_v2 import (
     OfflineContainerImageProbe,
     TrustedImageProducerV2,
     TrustedRuntimeBuildClosureFactoryV2,
-    _regular_bytes,
     open_reviewed_local_execution,
 )
 from release_tools.image_publication import (
     CAPABILITY_TOOL_NAMES,
-    MAX_BLOB_BYTES,
     OPENCLAW_RUNTIME_COMMIT,
     OPENCLAW_RUNTIME_TREE,
+    RetainedRegularFile,
     _compile_capability_catalog,
 )
 
@@ -174,14 +173,12 @@ def test_real_runtime_image_builds_twice_offline_and_passes_runtime_probe() -> N
             release_tree=release_tree,
             openclaw_commit=OPENCLAW_RUNTIME_COMMIT,
             openclaw_tree=OPENCLAW_RUNTIME_TREE,
-            openclaw_package_manager_artifact=_regular_bytes(
+            openclaw_package_manager_artifact=RetainedRegularFile.establish(
                 openclaw_artifact_path,
-                maximum=MAX_BLOB_BYTES,
                 label="OpenClaw package-manager artifact",
             ),
-            bridge_package_manager_artifact=_regular_bytes(
+            bridge_package_manager_artifact=RetainedRegularFile.establish(
                 bridge_artifact_path,
-                maximum=MAX_BLOB_BYTES,
                 label="bridge package-manager artifact",
             ),
         )
