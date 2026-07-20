@@ -24,10 +24,17 @@ from release_tools.contracts import (
     ReleasePlanV2,
     ReleaseStepFailureObservationV2,
     ReleaseStepObservationV2,
+    RetainedStepEvidenceV2,
     ResolvedMutationRequestV2,
     StagingTransactionV1,
     StagingTransactionV2,
     write_new_private_mutation_envelope,
+    _release_outcome_operation_sha256,
+)
+from release_tools.evidence_store_v2 import (
+    ReleaseEvidenceStoreV2,
+    _VERIFIED_STEP_OUTCOME_TOKEN,
+    _journal_path_sha256,
 )
 from release_tools.test_contracts import (
     _foundation_runtime_inputs_v1,
@@ -201,6 +208,12 @@ def _observation(
         if boundary or step.phase == "runtime"
         else {}
     )
+    if step.phase == "endpoint" and not boundary:
+        owned = {
+            "agent_core_stack_id": _phase_evidence("endpoint")[
+                "agent_core_stack_id"
+            ]
+        }
     if step.kind == "CHANGESET_CREATE":
         identity = {
             "OpenClawRouter": {
@@ -762,10 +775,259 @@ def test_transaction_module_has_no_aws_dependency() -> None:
     assert "subprocess" not in source
 
 
-def _create_v2(tmp_path: Path, plan: ReleasePlanV2 | None = None) -> TransactionJournalV2:
+def _create_v2(
+    tmp_path: Path,
+    plan: ReleasePlanV2 | None = None,
+    *,
+    evidence_store: ReleaseEvidenceStoreV2 | None = None,
+) -> TransactionJournalV2:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    store = evidence_store or ReleaseEvidenceStoreV2(
+        tmp_path / "release-evidence-v2"
+    )
     return TransactionJournalV2.create(
         tmp_path / "release-transaction-v2.json",
         plan=plan or _plan_v2(),
+        evidence_store=store,
+    )
+
+
+def _retained_present_evidence(
+    journal: TransactionJournalV2,
+    observation: ReleaseStepObservationV2,
+):
+    """Retain exact provider bytes before exercising a v2 PRESENT transition."""
+
+    return _retained_outcome(
+        journal,
+        ObservationDisposition.PRESENT,
+        observation=observation,
+    )
+
+
+def _retained_outcome(
+    journal: TransactionJournalV2,
+    disposition: ObservationDisposition,
+    *,
+    observation: ReleaseStepObservationV2 | None = None,
+    failure_evidence: FailedRetainedEvidenceV2 | None = None,
+    marker: str = "fixture",
+    service: str | None = None,
+    operation: str | None = None,
+    provider_status: str | None = None,
+):
+    """Build a test-only retained capability for every outcome disposition."""
+
+    step = journal.plan.steps[journal.current.completed_step_count]
+    if failure_evidence is not None and service is None:
+        service = {
+            "CLOUDFORMATION": "cloudformation",
+            "S3": "s3",
+            "ECR": "ecr",
+            "AGENTCORE": "bedrock-agentcore-control",
+            "LOCAL_FILESYSTEM": "local-filesystem",
+        }[failure_evidence.failure_observation.provider]
+    service = service or "cloudformation"
+    if operation is None:
+        operation = {
+            "s3": "head_object",
+            "ecr": "describe_image_scan_findings",
+            "bedrock-agentcore-control": "get_agent_runtime",
+            "local-filesystem": "retained_mutation_failure",
+        }.get(service, "describe_stacks")
+    if provider_status is None:
+        if (
+            disposition == ObservationDisposition.FAILED_RETAINED
+            and failure_evidence is not None
+        ):
+            provider_status = (
+                failure_evidence.failure_observation.terminal_status
+            )
+        else:
+            provider_status = {
+                ObservationDisposition.ABSENT: "TEST_ABSENT",
+                ObservationDisposition.PENDING: "TEST_PENDING",
+                ObservationDisposition.PRESENT: "TEST_PRESENT",
+                ObservationDisposition.FAILED_RETAINED: "CREATE_FAILED",
+            }[disposition]
+    fixture_projection = {
+        "fixtureMarker": marker,
+        "stepId": step.step_id,
+    }
+    if observation is not None:
+        fixture_projection["fixtureObserverEvidenceSha256"] = (
+            observation.observer_evidence_sha256
+        )
+    provider_mapping = {
+        "schema": RetainedStepEvidenceV2.OBSERVER_SCHEMA,
+        "service": service,
+        "operation": operation,
+        "subject": step.subject,
+        "disposition": disposition.value,
+        "providerStatus": provider_status,
+        "projection": fixture_projection,
+    }
+    provider_digest = hashlib.sha256(
+        contracts.canonical_json_bytes(provider_mapping)
+    ).hexdigest()
+    release_operation = (
+        journal.current.uncertain_operation_sha256
+        if journal.current.state == "UNCERTAIN"
+        else journal.operation_sha256()
+    )
+    if disposition == ObservationDisposition.PRESENT:
+        if observation is None:
+            raise AssertionError("PRESENT fixture requires a typed observation")
+        phase_fields = {
+            "router-cron-cs": "router_cron_changesets_sha256",
+            "router-cron": "router_cron_application_sha256",
+            "scheduler-cs": "scheduler_changeset_sha256",
+            "scheduler": "scheduler_application_sha256",
+            "web-cs": "web_changeset_sha256",
+            "web": "web_application_sha256",
+            "verify": "verification_sha256",
+        }
+        next_phase = (
+            journal.plan.steps[step.ordinal + 1].phase
+            if step.ordinal + 1 < len(journal.plan.steps)
+            else None
+        )
+        phase_field = phase_fields.get(step.phase)
+        if phase_field is not None and next_phase != step.phase:
+            inventory = {
+                item.digest(): item
+                for item in journal.evidence_store._all_records(
+                    plan_sha256=journal.plan.digest()
+                )
+            }
+            phase_start = step.ordinal
+            while (
+                phase_start > 0
+                and journal.plan.steps[phase_start - 1].phase == step.phase
+            ):
+                phase_start -= 1
+            phase_records = []
+            for ordinal in range(phase_start, step.ordinal):
+                completed = journal.current.completed_steps[ordinal]
+                retained = inventory[completed.evidence_sha256]
+                phase_records.append(
+                    {
+                        "stepId": retained.step_id,
+                        "subject": retained.subject,
+                        "operationSha256": retained.release_operation_sha256,
+                        "observerEvidenceSha256": (
+                            retained.observer_evidence_sha256
+                        ),
+                    }
+                )
+            phase_records.append(
+                {
+                    "stepId": step.step_id,
+                    "subject": step.subject,
+                    "operationSha256": release_operation,
+                    "observerEvidenceSha256": provider_digest,
+                }
+            )
+            observation = replace(
+                observation,
+                **{
+                    phase_field: hashlib.sha256(
+                        contracts.canonical_json_bytes(
+                            {
+                                "schema": (
+                                    "personal-operator.phase-evidence.v1"
+                                ),
+                                "planSha256": journal.plan.digest(),
+                                "phase": step.phase,
+                                "records": phase_records,
+                            }
+                        )
+                    ).hexdigest()
+                },
+            )
+        bound_observation = replace(
+            observation,
+            observer_evidence_sha256=provider_digest,
+        )
+    else:
+        if observation is not None:
+            raise AssertionError("non-PRESENT fixture cannot carry an observation")
+        bound_observation = None
+    if disposition == ObservationDisposition.FAILED_RETAINED:
+        evidence = failure_evidence or _failed_retained_evidence(journal)
+        bound_failure = replace(
+            evidence.failure_observation,
+            observer_evidence_sha256=provider_digest,
+        )
+    else:
+        if failure_evidence is not None:
+            raise AssertionError("non-failure fixture cannot carry failure evidence")
+        bound_failure = None
+    path_sha256 = _journal_path_sha256(journal.path)
+    record = RetainedStepEvidenceV2.from_mapping(
+        {
+            "schema": RetainedStepEvidenceV2.SCHEMA,
+            "planSha256": journal.plan.digest(),
+            "completedPrefixSha256": journal.completed_prefix_sha256(),
+            "evidenceStoreSha256": journal.evidence_store.identity_sha256,
+            "journalPathSha256": path_sha256,
+            "journalExecutionId": journal.journal_execution_id,
+            "journalRevision": journal.current.revision,
+            "stepId": step.step_id,
+            "subject": step.subject,
+            "operationSha256": _release_outcome_operation_sha256(
+                release_operation_sha256=release_operation,
+                journal_path_sha256=path_sha256,
+                journal_execution_id=journal.journal_execution_id,
+                journal_revision=journal.current.revision,
+            ),
+            "releaseOperationSha256": release_operation,
+            "disposition": disposition.value,
+            "observerEvidenceSha256": provider_digest,
+            "observerEvidence": provider_mapping,
+            "stepObservationSha256": (
+                bound_observation.digest() if bound_observation else ""
+            ),
+            "stepObservation": (
+                bound_observation.to_mapping() if bound_observation else {}
+            ),
+            "failureObservationSha256": (
+                bound_failure.digest() if bound_failure else ""
+            ),
+            "failureObservation": (
+                bound_failure.to_mapping() if bound_failure else {}
+            ),
+        }
+    )
+    record.validate_transaction(
+        journal.plan,
+        journal.current,
+        evidence_store_sha256=journal.evidence_store.identity_sha256,
+        journal_path_sha256=path_sha256,
+        journal_execution_id=journal.journal_execution_id,
+    )
+    return journal.evidence_store._retain_record(
+        record, _token=_VERIFIED_STEP_OUTCOME_TOKEN
+    )
+
+
+def _complete_v2_observation(
+    journal: TransactionJournalV2,
+    observation: ReleaseStepObservationV2,
+) -> StagingTransactionV2:
+    return journal.complete_observation(
+        outcome=_retained_present_evidence(journal, observation)
+    )
+
+
+def _reconcile_v2_present(
+    journal: TransactionJournalV2,
+    *,
+    operation_sha256: str,
+    observation: ReleaseStepObservationV2,
+) -> StagingTransactionV2:
+    return journal.reconcile_step(
+        outcome=_retained_present_evidence(journal, observation),
     )
 
 
@@ -793,13 +1055,13 @@ def _advance_v2_until_phase(
         )
         if step["mutation"]:
             journal.begin_step()
-            journal.reconcile_step(
-                disposition=ObservationDisposition.PRESENT,
+            _reconcile_v2_present(
+                journal,
                 operation_sha256=journal.current.uncertain_operation_sha256,
                 observation=observation,
             )
         else:
-            journal.complete_observation(observation=observation)
+            _complete_v2_observation(journal, observation)
 
 
 def test_v2_journal_binds_the_immutable_plan_before_preflight(tmp_path: Path) -> None:
@@ -828,7 +1090,11 @@ def test_v2_journal_reparses_hostile_replaced_plan_before_persistence(
     path = tmp_path / "forged-plan.json"
 
     with pytest.raises(TransactionError, match="release plan is invalid"):
-        TransactionJournalV2.create(path, plan=forged)
+        TransactionJournalV2.create(
+            path,
+            plan=forged,
+            evidence_store=ReleaseEvidenceStoreV2(tmp_path / "forged-evidence"),
+        )
 
     assert not path.exists()
 
@@ -837,12 +1103,15 @@ def test_v2_begin_step_persists_exact_plan_bound_uncertainty(tmp_path: Path) -> 
     plan = _plan_v2()
     journal = _create_v2(tmp_path, plan)
     journal.advance_preflight()
-    journal.complete_observation(
-        observation=_observation(journal, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        journal,
+        _observation(journal, observer_evidence_sha256="d" * 64),
     )
 
     uncertain = journal.begin_step()
-    reloaded = TransactionJournalV2.load(journal.path, plan=plan)
+    reloaded = TransactionJournalV2.load(
+        journal.path, plan=plan, evidence_store=journal.evidence_store
+    )
 
     assert uncertain.state == "UNCERTAIN"
     assert reloaded.current == uncertain
@@ -856,20 +1125,21 @@ def test_v2_absent_reconciliation_retries_the_same_step_without_advancing(
 ) -> None:
     journal = _create_v2(tmp_path)
     journal.advance_preflight()
-    journal.complete_observation(
-        observation=_observation(journal, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        journal,
+        _observation(journal, observer_evidence_sha256="d" * 64),
     )
     journal.begin_step()
     operation = journal.current.uncertain_operation_sha256
 
     restored = journal.reconcile_step(
-        disposition=ObservationDisposition.ABSENT,
-        operation_sha256=operation,
+        outcome=_retained_outcome(journal, ObservationDisposition.ABSENT),
     )
 
     assert restored.state == "PREFLIGHTED"
     assert restored.completed_step_count == 1
     assert restored.uncertain_step_id == ""
+    assert restored.revision == 4
     assert journal.operation_sha256() == operation
 
 
@@ -878,19 +1148,26 @@ def test_v2_pending_reconciliation_remains_uncertain_without_claiming_evidence(
 ) -> None:
     journal = _create_v2(tmp_path)
     journal.advance_preflight()
-    journal.complete_observation(
-        observation=_observation(journal, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        journal,
+        _observation(journal, observer_evidence_sha256="d" * 64),
     )
     journal.begin_step()
     before = journal.current
 
     pending = journal.reconcile_step(
-        disposition=ObservationDisposition.PENDING,
-        operation_sha256=before.uncertain_operation_sha256,
+        outcome=_retained_outcome(journal, ObservationDisposition.PENDING),
     )
 
-    assert pending == before
-    assert TransactionJournalV2.load(journal.path, plan=journal.plan).current == before
+    assert pending == replace(before, revision=before.revision + 1)
+    assert (
+        TransactionJournalV2.load(
+            journal.path,
+            plan=journal.plan,
+            evidence_store=journal.evidence_store,
+        ).current
+        == pending
+    )
 
 
 def test_v2_partial_phase_records_only_an_exact_completed_prefix(
@@ -904,14 +1181,18 @@ def test_v2_partial_phase_records_only_an_exact_completed_prefix(
     observation = _observation(
         journal, observer_evidence_sha256=baseline_evidence
     )
-    partial = journal.complete_observation(observation=observation)
+    retained = _retained_present_evidence(journal, observation)
+    partial = journal.complete_observation(outcome=retained)
 
     assert partial.state == "PREFLIGHTED"
     assert partial.last_stable_state == "PREFLIGHTED"
     assert partial.completed_step_count == 1
     assert partial.completed_steps[0].step_id == plan.to_mapping()["steps"][0]["id"]
-    assert partial.completed_steps[0].evidence_sha256 == observation.digest()
-    assert partial.rollback_baseline_sha256 == observation.digest()
+    assert (
+        partial.completed_steps[0].evidence_sha256
+        == retained.retained_evidence.digest()
+    )
+    assert partial.rollback_baseline_sha256 == retained.retained_evidence.digest()
     assert journal.resume_step()["phase"] == "foundation"
 
 
@@ -930,19 +1211,19 @@ def test_v2_phase_boundary_requires_only_its_exact_owned_evidence(
         )
         if step.mutation:
             journal.begin_step()
-            journal.reconcile_step(
-                disposition=ObservationDisposition.PRESENT,
+            _reconcile_v2_present(
+                journal,
                 operation_sha256=journal.current.uncertain_operation_sha256,
                 observation=observation,
             )
         else:
-            journal.complete_observation(observation=observation)
+            _complete_v2_observation(journal, observation)
     journal.begin_step()
     operation = journal.current.uncertain_operation_sha256
 
-    with pytest.raises(TransactionError, match="derived values"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.PRESENT,
+    with pytest.raises((ContractError, TransactionError), match="derived values"):
+        _reconcile_v2_present(
+            journal,
             operation_sha256=operation,
             observation=_observation(
                 journal,
@@ -950,9 +1231,9 @@ def test_v2_phase_boundary_requires_only_its_exact_owned_evidence(
                 foundation_inputs=None,
             ),
         )
-    with pytest.raises(TransactionError, match="derived values"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.PRESENT,
+    with pytest.raises((ContractError, TransactionError), match="derived values"):
+        _reconcile_v2_present(
+            journal,
             operation_sha256=operation,
             observation=_observation(
                 journal,
@@ -965,9 +1246,9 @@ def test_v2_phase_boundary_requires_only_its_exact_owned_evidence(
 
     crossed = _foundation_runtime_inputs_v1()
     crossed["sourceCommit"] = "d" * 40
-    with pytest.raises(TransactionError, match="identity differs"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.PRESENT,
+    with pytest.raises((ContractError, TransactionError), match="identity differs"):
+        _reconcile_v2_present(
+            journal,
             operation_sha256=operation,
             observation=_observation(
                 journal,
@@ -990,16 +1271,16 @@ def test_v2_phase_boundary_requires_only_its_exact_owned_evidence(
         foundation_runtime_inputs=forged_inputs,
     )
     before = journal.current
-    with pytest.raises(TransactionError, match="identity differs"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.PRESENT,
+    with pytest.raises((ContractError, TransactionError), match="identity differs"):
+        _reconcile_v2_present(
+            journal,
             operation_sha256=operation,
             observation=forged_observation,
         )
     assert journal.current == before
 
-    complete = journal.reconcile_step(
-        disposition=ObservationDisposition.PRESENT,
+    complete = _reconcile_v2_present(
+        journal,
         operation_sha256=operation,
         observation=_observation(
             journal,
@@ -1056,16 +1337,16 @@ def test_v2_agentcore_hardening_preserves_runtime_identity_and_version_order(
         ),
     )
     for derived, match in invalid:
-        with pytest.raises(TransactionError, match=match):
-            journal.reconcile_step(
-                disposition=ObservationDisposition.PRESENT,
+        with pytest.raises((ContractError, TransactionError), match=match):
+            _reconcile_v2_present(
+                journal,
                 operation_sha256=operation,
                 observation=_observation(journal, derived=derived),
             )
         assert journal.current == before
 
-    completed = journal.reconcile_step(
-        disposition=ObservationDisposition.PRESENT,
+    completed = _reconcile_v2_present(
+        journal,
         operation_sha256=operation,
         observation=_observation(
             journal,
@@ -1097,9 +1378,11 @@ def test_v2_agentcore_stack_id_rejects_same_name_replacement(
         agent_core_stack_id=AGENTCORE_STACK_ID[:-1] + "2",
     )
 
-    with pytest.raises(TransactionError, match="AgentCore stack ID"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.PRESENT,
+    with pytest.raises(
+        (ContractError, TransactionError), match="AgentCore stack ID"
+    ):
+        _reconcile_v2_present(
+            journal,
             operation_sha256=journal.current.uncertain_operation_sha256,
             observation=hostile,
         )
@@ -1272,10 +1555,18 @@ def test_v2_downstream_operations_bind_the_exact_completed_evidence_prefix(
         changed_derived,
     ) in enumerate(cases):
         baseline = TransactionJournalV2.create(
-            tmp_path / f"baseline-{case_index}.json", plan=plan
+            tmp_path / f"baseline-{case_index}.json",
+            plan=plan,
+            evidence_store=ReleaseEvidenceStoreV2(
+                tmp_path / f"baseline-{case_index}-evidence"
+            ),
         )
         changed = TransactionJournalV2.create(
-            tmp_path / f"changed-{case_index}.json", plan=plan
+            tmp_path / f"changed-{case_index}.json",
+            plan=plan,
+            evidence_store=ReleaseEvidenceStoreV2(
+                tmp_path / f"changed-{case_index}-evidence"
+            ),
         )
         baseline.advance_preflight()
         changed.advance_preflight()
@@ -1619,7 +1910,7 @@ def test_v2_resolved_mutation_request_rejects_mismatched_plan_inventory_size(
     )
     journal = _create_v2(tmp_path, plan)
     journal.advance_preflight()
-    journal.complete_observation(observation=_observation(journal))
+    _complete_v2_observation(journal, _observation(journal))
     resolved = _resolved_mutation_request(
         journal, request_artifact_size=len(request_payload)
     )
@@ -1636,7 +1927,7 @@ def test_v2_private_envelope_rejects_fifo_without_blocking(
     plan = _plan_v2_with_request_payload(step_ordinal=1, payload=request_payload)
     journal = _create_v2(tmp_path, plan)
     journal.advance_preflight()
-    journal.complete_observation(observation=_observation(journal))
+    _complete_v2_observation(journal, _observation(journal))
     resolved = _resolved_mutation_request(
         journal, request_artifact_size=len(request_payload)
     )
@@ -1676,7 +1967,7 @@ def test_v2_verified_envelope_rejects_oversize_and_source_snapshot_race(
     plan = _plan_v2_with_request_payload(step_ordinal=1, payload=request_payload)
     journal = _create_v2(tmp_path, plan)
     journal.advance_preflight()
-    journal.complete_observation(observation=_observation(journal))
+    _complete_v2_observation(journal, _observation(journal))
     resolved = _resolved_mutation_request(
         journal, request_artifact_size=len(request_payload)
     )
@@ -1729,7 +2020,7 @@ def test_v2_private_mutation_envelope_streams_artifacts_above_json_limit(
     plan = _plan_v2_with_request_payload(step_ordinal=1, payload=request_payload)
     journal = _create_v2(tmp_path, plan)
     journal.advance_preflight()
-    journal.complete_observation(observation=_observation(journal))
+    _complete_v2_observation(journal, _observation(journal))
     resolved = _resolved_mutation_request(
         journal, request_artifact_size=len(request_payload)
     )
@@ -1764,7 +2055,7 @@ def test_v2_private_mutation_envelope_rejects_operation_fields_in_artifact(
     plan = _plan_v2_with_request_payload(step_ordinal=1, payload=request_payload)
     journal = _create_v2(tmp_path, plan)
     journal.advance_preflight()
-    journal.complete_observation(observation=_observation(journal))
+    _complete_v2_observation(journal, _observation(journal))
     resolved = _resolved_mutation_request(
         journal, request_artifact_size=len(request_payload)
     )
@@ -1809,19 +2100,19 @@ def test_v2_exact_twelve_phase_progression_reaches_verified_without_rollback(
         )
         if step["mutation"]:
             journal.begin_step()
-            result = journal.reconcile_step(
-                disposition=ObservationDisposition.PRESENT,
+            result = _reconcile_v2_present(
+                journal,
                 operation_sha256=journal.current.uncertain_operation_sha256,
                 observation=observation,
             )
         else:
-            result = journal.complete_observation(observation=observation)
+            result = _complete_v2_observation(journal, observation)
         assert result.completed_step_count == index + 1
 
     assert journal.current.state == "VERIFIED"
     assert journal.current.last_stable_state == "VERIFIED"
     assert journal.current.runtime_image_digest == DIGEST
-    assert journal.current.verification_sha256 == "c" * 64
+    assert len(journal.current.verification_sha256) == 64
     assert journal.resume_step() is None
     assert not hasattr(journal, "begin_rollback")
     assert not hasattr(journal, "run_mutation")
@@ -1833,13 +2124,16 @@ def test_v2_abort_retained_is_auditable_terminal_stable_prefix(
     plan = _plan_v2()
     journal = _create_v2(tmp_path, plan)
     journal.advance_preflight()
-    journal.complete_observation(
-        observation=_observation(journal, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        journal,
+        _observation(journal, observer_evidence_sha256="d" * 64),
     )
 
     evidence = _abort_evidence(journal)
     aborted = journal.abort_retained(evidence=evidence)
-    reloaded = TransactionJournalV2.load(journal.path, plan=plan)
+    reloaded = TransactionJournalV2.load(
+        journal.path, plan=plan, evidence_store=journal.evidence_store
+    )
 
     assert aborted.state == "ABORTED_RETAINED"
     assert aborted.last_stable_state == "PREFLIGHTED"
@@ -1855,21 +2149,34 @@ def test_v2_abort_retained_rejects_new_uncertain_or_invalid_evidence(
     tmp_path: Path,
 ) -> None:
     plan = _plan_v2()
-    fresh = TransactionJournalV2.create(tmp_path / "fresh.json", plan=plan)
+    fresh = TransactionJournalV2.create(
+        tmp_path / "fresh.json",
+        plan=plan,
+        evidence_store=ReleaseEvidenceStoreV2(tmp_path / "fresh-evidence"),
+    )
     with pytest.raises(TransactionError, match="cannot abort"):
         fresh.abort_retained(evidence=_abort_evidence(fresh))
 
-    uncertain = TransactionJournalV2.create(tmp_path / "uncertain.json", plan=plan)
+    uncertain = TransactionJournalV2.create(
+        tmp_path / "uncertain.json",
+        plan=plan,
+        evidence_store=ReleaseEvidenceStoreV2(tmp_path / "uncertain-evidence"),
+    )
     uncertain.advance_preflight()
-    uncertain.complete_observation(
-        observation=_observation(uncertain, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        uncertain,
+        _observation(uncertain, observer_evidence_sha256="d" * 64),
     )
     abort_evidence = _abort_evidence(uncertain)
     uncertain.begin_step()
     with pytest.raises(TransactionError, match="reconcile before abort"):
         uncertain.abort_retained(evidence=abort_evidence)
 
-    stable = TransactionJournalV2.create(tmp_path / "stable.json", plan=plan)
+    stable = TransactionJournalV2.create(
+        tmp_path / "stable.json",
+        plan=plan,
+        evidence_store=ReleaseEvidenceStoreV2(tmp_path / "stable-evidence"),
+    )
     stable.advance_preflight()
     forged = replace(_abort_evidence(stable), plan_sha256="e" * 64)
     with pytest.raises(TransactionError, match="plan differs"):
@@ -1882,32 +2189,39 @@ def test_v2_failed_retained_reconciliation_atomically_aborts_exact_intent(
     plan = _plan_v2()
     journal = _create_v2(tmp_path, plan)
     journal.advance_preflight()
-    journal.complete_observation(
-        observation=_observation(journal, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        journal,
+        _observation(journal, observer_evidence_sha256="d" * 64),
     )
     uncertain = journal.begin_step()
     evidence = _failed_retained_evidence(journal)
-    failure_observation_sha256 = evidence.failure_observation.digest()
     assert contracts.parse_release_contract(evidence.to_bytes()) == evidence
     assert (
         contracts.parse_release_contract(evidence.failure_observation.to_bytes())
         == evidence.failure_observation
     )
 
-    retained = journal.reconcile_step(
-        disposition=ObservationDisposition.FAILED_RETAINED,
-        operation_sha256=uncertain.uncertain_operation_sha256,
+    outcome = _retained_outcome(
+        journal,
+        ObservationDisposition.FAILED_RETAINED,
         failure_evidence=evidence,
     )
-    reloaded = TransactionJournalV2.load(journal.path, plan=plan).current
+    retained = journal.reconcile_step(outcome=outcome)
+    failure = outcome.failure_observation
+    assert failure is not None
+    reloaded = TransactionJournalV2.load(
+        journal.path, plan=plan, evidence_store=journal.evidence_store
+    ).current
 
     assert retained.state == "ABORTED_RETAINED"
     assert retained.last_stable_state == "PREFLIGHTED"
     assert retained.completed_step_count == 1
     assert retained.completed_steps == uncertain.completed_steps
     assert retained.abort_evidence_sha256 == ""
-    assert retained.failed_retained_evidence_sha256 == evidence.digest()
-    assert retained.failure_observation_sha256 == failure_observation_sha256
+    assert retained.failed_retained_evidence_sha256 == (
+        outcome.retained_evidence.digest()
+    )
+    assert retained.failure_observation_sha256 == failure.digest()
     assert retained.failed_step_id == uncertain.uncertain_step_id
     assert retained.failed_subject == plan.steps[1].subject
     assert retained.failed_operation_sha256 == uncertain.uncertain_operation_sha256
@@ -1923,25 +2237,26 @@ def test_v2_failed_retained_requires_typed_exact_failure_and_never_aliases_absen
 ) -> None:
     journal = _create_v2(tmp_path)
     journal.advance_preflight()
-    journal.complete_observation(
-        observation=_observation(journal, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        journal,
+        _observation(journal, observer_evidence_sha256="d" * 64),
     )
     journal.begin_step()
     before = journal.current
     evidence = _failed_retained_evidence(journal)
 
-    with pytest.raises(TransactionError, match="FAILED_RETAINED.*evidence"):
+    with pytest.raises(TypeError, match="unexpected keyword"):
         journal.reconcile_step(
             disposition=ObservationDisposition.FAILED_RETAINED,
             operation_sha256=before.uncertain_operation_sha256,
         )
-    with pytest.raises(TransactionError, match="ABSENT.*failure"):
+    with pytest.raises(TypeError, match="unexpected keyword"):
         journal.reconcile_step(
             disposition=ObservationDisposition.ABSENT,
             operation_sha256=before.uncertain_operation_sha256,
             failure_evidence=evidence,
         )
-    with pytest.raises(TransactionError, match="operation"):
+    with pytest.raises(TypeError, match="unexpected keyword"):
         journal.reconcile_step(
             disposition=ObservationDisposition.FAILED_RETAINED,
             operation_sha256="sha256:" + "0" * 64,
@@ -1954,14 +2269,21 @@ def test_v2_failed_retained_requires_typed_exact_failure_and_never_aliases_absen
             subject="cfn:123456789012:eu-west-1:stack:Other:release:" + COMMIT,
         ),
     )
-    with pytest.raises(TransactionError, match="subject"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.FAILED_RETAINED,
-            operation_sha256=before.uncertain_operation_sha256,
+    with pytest.raises(ContractError, match="subject|identity"):
+        _retained_outcome(
+            journal,
+            ObservationDisposition.FAILED_RETAINED,
             failure_evidence=forged,
         )
 
-    assert TransactionJournalV2.load(journal.path, plan=journal.plan).current == before
+    assert (
+        TransactionJournalV2.load(
+            journal.path,
+            plan=journal.plan,
+            evidence_store=journal.evidence_store,
+        ).current
+        == before
+    )
 
 
 @pytest.mark.parametrize(
@@ -1988,8 +2310,17 @@ def test_v2_read_only_image_failure_atomically_retains_exact_stable_prefix(
         terminal_status=status,
     )
 
-    retained = journal.fail_observation_retained(evidence=evidence)
-    reloaded = TransactionJournalV2.load(journal.path, plan=journal.plan).current
+    outcome = _retained_outcome(
+        journal,
+        ObservationDisposition.FAILED_RETAINED,
+        failure_evidence=evidence,
+    )
+    retained = journal.complete_observation(outcome=outcome)
+    reloaded = TransactionJournalV2.load(
+        journal.path,
+        plan=journal.plan,
+        evidence_store=journal.evidence_store,
+    ).current
 
     assert retained.state == "ABORTED_RETAINED"
     assert retained.last_stable_state == before.last_stable_state
@@ -2011,15 +2342,19 @@ def test_v2_read_only_failure_rejects_mutation_prefix_and_hostile_evidence(
 ) -> None:
     mutation = _create_v2(tmp_path / "mutation")
     mutation.advance_preflight()
-    mutation.complete_observation(observation=_observation(mutation))
+    _complete_v2_observation(mutation, _observation(mutation))
     mutation_evidence = _failed_retained_evidence(
         mutation,
         failure_reason="CLOUDFORMATION_STACK_FAILED",
         provider="CLOUDFORMATION",
         terminal_status="CREATE_FAILED",
     )
-    with pytest.raises(TransactionError, match="read-only"):
-        mutation.fail_observation_retained(evidence=mutation_evidence)
+    with pytest.raises(ContractError, match="write-ahead intent|mutation"):
+        _retained_outcome(
+            mutation,
+            ObservationDisposition.FAILED_RETAINED,
+            failure_evidence=mutation_evidence,
+        )
 
     observed = _create_v2(tmp_path / "observed")
     observed.advance_preflight()
@@ -2031,7 +2366,16 @@ def test_v2_read_only_failure_rejects_mutation_prefix_and_hostile_evidence(
         terminal_status="SCAN_POLICY_FAILED",
     )
     for hostile, match in (
-        (replace(evidence, plan_sha256="f" * 64), "plan differs"),
+        (
+            replace(
+                evidence,
+                failure_observation=replace(
+                    evidence.failure_observation,
+                    plan_sha256="f" * 64,
+                ),
+            ),
+            "identity differs|plan",
+        ),
         (
             replace(
                 evidence,
@@ -2040,7 +2384,7 @@ def test_v2_read_only_failure_rejects_mutation_prefix_and_hostile_evidence(
                     operation_sha256="sha256:" + "0" * 64,
                 ),
             ),
-            "operation differs",
+            "identity differs|operation",
         ),
         (
             replace(
@@ -2050,12 +2394,16 @@ def test_v2_read_only_failure_rejects_mutation_prefix_and_hostile_evidence(
                     step_id=observed.plan.steps[0].step_id,
                 ),
             ),
-            "plan or step differs",
+            "identity differs|plan|step",
         ),
     ):
         before = observed.current
-        with pytest.raises(TransactionError, match=match):
-            observed.fail_observation_retained(evidence=hostile)
+        with pytest.raises(ContractError, match=match):
+            _retained_outcome(
+                observed,
+                ObservationDisposition.FAILED_RETAINED,
+                failure_evidence=hostile,
+            )
         assert observed.current == before
 
 
@@ -2078,8 +2426,12 @@ def test_v2_read_only_failure_is_closed_to_image_observation(
     )
     before = journal.current
 
-    with pytest.raises(TransactionError, match="step kind"):
-        journal.fail_observation_retained(evidence=evidence)
+    with pytest.raises(ContractError, match="step kind"):
+        _retained_outcome(
+            journal,
+            ObservationDisposition.FAILED_RETAINED,
+            failure_evidence=evidence,
+        )
 
     assert journal.current == before
 
@@ -2098,6 +2450,18 @@ def test_v2_read_only_failure_is_closed_to_image_observation(
             "CLOUDFORMATION_STACK_FAILED",
             "CLOUDFORMATION",
             "UPDATE_ROLLBACK_COMPLETE",
+        ),
+        (
+            "foundation:STACK_DRIFT_CHECK",
+            "CLOUDFORMATION_DRIFT_DETECTION_FAILED",
+            "CLOUDFORMATION",
+            "DETECTION_FAILED",
+        ),
+        (
+            "foundation:STACK_DRIFT_CHECK",
+            "CLOUDFORMATION_STACK_DRIFTED",
+            "CLOUDFORMATION",
+            "DRIFTED",
         ),
         (
             "router-cron-cs:CHANGESET_CREATE",
@@ -2166,6 +2530,12 @@ def test_v2_read_only_failure_is_closed_to_image_observation(
             "UPDATE_COMPLETE",
         ),
         (
+            "runtime:STACK_UPDATE",
+            "CF_SUBJECT_CONFLICT",
+            "CLOUDFORMATION",
+            "CREATE_COMPLETE",
+        ),
+        (
             "router-cron-cs:CHANGESET_CREATE",
             "CF_SUBJECT_CONFLICT",
             "CLOUDFORMATION",
@@ -2203,15 +2573,18 @@ def test_v2_failed_retained_reason_matrix_is_closed_by_exact_step_kind(
         terminal_status=status,
     )
 
-    result = journal.reconcile_step(
-        disposition=ObservationDisposition.FAILED_RETAINED,
-        operation_sha256=journal.current.uncertain_operation_sha256,
+    outcome = _retained_outcome(
+        journal,
+        ObservationDisposition.FAILED_RETAINED,
         failure_evidence=evidence,
     )
+    result = journal.reconcile_step(outcome=outcome)
+    failure = outcome.failure_observation
+    assert failure is not None
 
     assert result.state == "ABORTED_RETAINED"
     assert result.failure_reason == reason
-    assert result.failure_observation_sha256 == evidence.failure_observation.digest()
+    assert result.failure_observation_sha256 == failure.digest()
 
 
 def test_v2_failed_retained_rejects_reason_for_a_different_step_kind(
@@ -2219,8 +2592,9 @@ def test_v2_failed_retained_rejects_reason_for_a_different_step_kind(
 ) -> None:
     journal = _create_v2(tmp_path)
     journal.advance_preflight()
-    journal.complete_observation(
-        observation=_observation(journal, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        journal,
+        _observation(journal, observer_evidence_sha256="d" * 64),
     )
     journal.begin_step()
     evidence = _failed_retained_evidence(
@@ -2230,10 +2604,10 @@ def test_v2_failed_retained_rejects_reason_for_a_different_step_kind(
         terminal_status="UPDATE_FAILED",
     )
 
-    with pytest.raises(TransactionError, match="reason.*step kind"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.FAILED_RETAINED,
-            operation_sha256=journal.current.uncertain_operation_sha256,
+    with pytest.raises(ContractError, match="reason.*step kind"):
+        _retained_outcome(
+            journal,
+            ObservationDisposition.FAILED_RETAINED,
             failure_evidence=evidence,
         )
 
@@ -2252,10 +2626,10 @@ def test_v2_failed_retained_rejects_terminal_status_for_a_different_operation(
         terminal_status="CREATE_FAILED",
     )
 
-    with pytest.raises(TransactionError, match="status.*step kind"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.FAILED_RETAINED,
-            operation_sha256=journal.current.uncertain_operation_sha256,
+    with pytest.raises(ContractError, match="status.*step kind"):
+        _retained_outcome(
+            journal,
+            ObservationDisposition.FAILED_RETAINED,
             failure_evidence=evidence,
         )
 
@@ -2281,7 +2655,7 @@ def test_v2_subject_conflict_is_terminal_kind_specific_and_never_retryable(
         ObservationDisposition.ABSENT,
         ObservationDisposition.PENDING,
     ):
-        with pytest.raises(TransactionError, match=f"{disposition.value}.*failure"):
+        with pytest.raises(TypeError, match="unexpected keyword"):
             journal.reconcile_step(
                 disposition=disposition,
                 operation_sha256=journal.current.uncertain_operation_sha256,
@@ -2294,10 +2668,10 @@ def test_v2_subject_conflict_is_terminal_kind_specific_and_never_retryable(
             terminal_status="CREATE_COMPLETE",
         ),
     )
-    with pytest.raises(TransactionError, match="status.*step kind"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.FAILED_RETAINED,
-            operation_sha256=journal.current.uncertain_operation_sha256,
+    with pytest.raises(ContractError, match="status.*step kind"):
+        _retained_outcome(
+            journal,
+            ObservationDisposition.FAILED_RETAINED,
             failure_evidence=wrong_status,
         )
     wrong_provider = replace(
@@ -2307,18 +2681,19 @@ def test_v2_subject_conflict_is_terminal_kind_specific_and_never_retryable(
             provider="AGENTCORE",
         ),
     )
-    with pytest.raises(TransactionError, match="provider differs"):
-        journal.reconcile_step(
-            disposition=ObservationDisposition.FAILED_RETAINED,
-            operation_sha256=journal.current.uncertain_operation_sha256,
+    with pytest.raises(ContractError, match="provider differs"):
+        _retained_outcome(
+            journal,
+            ObservationDisposition.FAILED_RETAINED,
             failure_evidence=wrong_provider,
         )
 
-    retained = journal.reconcile_step(
-        disposition=ObservationDisposition.FAILED_RETAINED,
-        operation_sha256=journal.current.uncertain_operation_sha256,
+    outcome = _retained_outcome(
+        journal,
+        ObservationDisposition.FAILED_RETAINED,
         failure_evidence=conflict,
     )
+    retained = journal.reconcile_step(outcome=outcome)
     assert retained.state == "ABORTED_RETAINED"
     assert retained.failure_reason == "CF_SUBJECT_CONFLICT"
     assert retained.completed_steps == retained_prefix
@@ -2337,23 +2712,34 @@ def test_v2_plan_or_artifact_substitution_is_rejected_on_load(
     changed = _plan_v2(artifact_digest="f" * 64)
 
     assert changed.digest() != plan.digest()
-    with pytest.raises((ContractError, TransactionError), match="plan"):
-        TransactionJournalV2.load(journal.path, plan=changed)
+    with pytest.raises(
+        (ContractError, TransactionError), match="plan|binding"
+    ):
+        TransactionJournalV2.load(
+            journal.path,
+            plan=changed,
+            evidence_store=journal.evidence_store,
+        )
 
 
 def test_v2_nonprefix_or_replayed_completed_step_is_rejected(tmp_path: Path) -> None:
     plan = _plan_v2()
     journal = _create_v2(tmp_path, plan)
     journal.advance_preflight()
-    journal.complete_observation(
-        observation=_observation(journal, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        journal,
+        _observation(journal, observer_evidence_sha256="d" * 64),
     )
     value = journal.current.to_mapping()
     value["completedSteps"][0]["stepId"] = plan.to_mapping()["steps"][1]["id"]
     journal.path.write_bytes(contracts.canonical_json_bytes(value))
 
     with pytest.raises((ContractError, TransactionError), match="prefix"):
-        TransactionJournalV2.load(journal.path, plan=plan)
+        TransactionJournalV2.load(
+            journal.path,
+            plan=plan,
+            evidence_store=journal.evidence_store,
+        )
 
 
 def test_v2_reconciliation_requires_the_recorded_operation_and_shape(
@@ -2361,37 +2747,47 @@ def test_v2_reconciliation_requires_the_recorded_operation_and_shape(
 ) -> None:
     journal = _create_v2(tmp_path)
     journal.advance_preflight()
-    journal.complete_observation(
-        observation=_observation(journal, observer_evidence_sha256="d" * 64)
+    _complete_v2_observation(
+        journal,
+        _observation(journal, observer_evidence_sha256="d" * 64),
     )
     journal.begin_step()
     before = journal.current
     observation = _observation(journal, observer_evidence_sha256="f" * 64)
 
-    with pytest.raises(TransactionError, match="operation digest"):
+    with pytest.raises(TypeError, match="unexpected keyword"):
         journal.reconcile_step(
             disposition=ObservationDisposition.ABSENT,
             operation_sha256="sha256:" + "0" * 64,
         )
-    with pytest.raises(TransactionError, match="PRESENT.*observation"):
+    with pytest.raises(TypeError, match="unexpected keyword"):
         journal.reconcile_step(
             disposition=ObservationDisposition.PRESENT,
             operation_sha256=before.uncertain_operation_sha256,
         )
-    with pytest.raises(TransactionError, match="ABSENT.*observation"):
+    with pytest.raises(TypeError, match="unexpected keyword"):
         journal.reconcile_step(
             disposition=ObservationDisposition.ABSENT,
             operation_sha256=before.uncertain_operation_sha256,
             observation=observation,
         )
 
-    assert TransactionJournalV2.load(journal.path, plan=journal.plan).current == before
+    assert (
+        TransactionJournalV2.load(
+            journal.path,
+            plan=journal.plan,
+            evidence_store=journal.evidence_store,
+        ).current
+        == before
+    )
 
 
 def test_v2_stale_writer_cannot_overwrite_a_newer_revision(tmp_path: Path) -> None:
     plan = _plan_v2()
     current = _create_v2(tmp_path, plan)
-    stale = TransactionJournalV2.load(current.path, plan=plan)
+    stale = TransactionJournalV2.load(
+        current.path, plan=plan, evidence_store=current.evidence_store
+    )
     current.advance_preflight()
 
     with pytest.raises(TransactionError, match="changed concurrently"):

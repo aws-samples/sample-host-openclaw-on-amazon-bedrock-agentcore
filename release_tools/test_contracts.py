@@ -248,6 +248,22 @@ def _v2_steps_and_artifacts() -> tuple[list[dict[str, object]], list[dict[str, o
         ("web", "CHANGESET_EXECUTE", True, _stack_subject("PersonalOperatorWeb"), ""),
         ("verify", "VERIFY", False, _release_subject("verify"), ""),
     )
+    expanded_definitions: list[tuple[str, str, bool, str, str]] = []
+    stack_mutations = {
+        "BOOTSTRAP_STACK",
+        "STACK_CREATE",
+        "STACK_UPDATE",
+        "CHANGESET_EXECUTE",
+    }
+    for phase, kind, mutation, subject, content_override in definitions:
+        expanded_definitions.append(
+            (phase, kind, mutation, subject, content_override)
+        )
+        if kind in stack_mutations:
+            expanded_definitions.append(
+                (phase, "STACK_DRIFT_CHECK", True, f"{subject}:drift", "")
+            )
+    definitions = tuple(expanded_definitions)
     artifacts: list[dict[str, object]] = []
     steps: list[dict[str, object]] = []
     for ordinal, (phase, kind, mutation, subject, content_override) in enumerate(definitions):
@@ -1377,7 +1393,7 @@ def test_release_plan_v2_requires_clean_baseline_before_any_mutation() -> None:
     value = _release_plan_v2()
     steps = deepcopy(value["steps"])
     assert isinstance(steps, list)
-    steps[0], steps[1] = steps[1], steps[0]
+    steps[:3] = [steps[1], steps[2], steps[0]]
     for ordinal, step in enumerate(steps):
         step["ordinal"] = ordinal
 
@@ -1397,10 +1413,27 @@ def _remove_v2_step(
     assert isinstance(artifacts, list)
     removed = next(step for step in steps if predicate(step))
     steps.remove(removed)
+    removed_steps = [removed]
+    if removed["kind"] in {
+        "BOOTSTRAP_STACK",
+        "STACK_CREATE",
+        "STACK_UPDATE",
+        "CHANGESET_EXECUTE",
+    }:
+        drift = next(
+            step
+            for step in steps
+            if step["kind"] == "STACK_DRIFT_CHECK"
+            and step["phase"] == removed["phase"]
+            and step["subject"] == f"{removed['subject']}:drift"
+        )
+        steps.remove(drift)
+        removed_steps.append(drift)
+    removed_artifacts = {step["requestArtifact"] for step in removed_steps}
     artifacts[:] = [
         artifact
         for artifact in artifacts
-        if artifact["path"] != removed["requestArtifact"]
+        if artifact["path"] not in removed_artifacts
     ]
     for ordinal, step in enumerate(steps):
         step["ordinal"] = ordinal
@@ -1435,7 +1468,20 @@ def test_release_plan_v2_requires_exact_foundation_runtime_and_consumer_recipe()
             ReleasePlanV2.from_mapping(candidate)
 
     wrong_subject = deepcopy(value)
-    wrong_subject["steps"][3]["subject"] = _stack_subject("OtherVpc")
+    wrong_steps = wrong_subject["steps"]
+    assert isinstance(wrong_steps, list)
+    stack = next(
+        step
+        for step in wrong_steps
+        if step["subject"] == _stack_subject("OpenClawVpc")
+    )
+    drift = next(
+        step
+        for step in wrong_steps
+        if step["subject"] == f"{_stack_subject('OpenClawVpc')}:drift"
+    )
+    stack["subject"] = _stack_subject("OtherVpc")
+    drift["subject"] = f"{stack['subject']}:drift"
     with pytest.raises(ContractError, match="recipe"):
         ReleasePlanV2.from_mapping(wrong_subject)
 
@@ -1756,24 +1802,38 @@ def test_release_plan_v2_binds_step_kinds_requests_and_ordinals() -> None:
 
 
 @pytest.mark.parametrize(
-    ("ordinal", "field"),
+    ("phase", "kind", "field"),
     [
-        (0, "requestArtifact"),
-        (1, "requestSha256"),
-        (1, "expectedTemplateParameterSha256"),
-        (1, "expectedObservedRequestSha256"),
-        (2, "expectedContentSha256"),
-        (13, "expectedRequestSha256"),
+        ("foundation", "BASELINE_OBSERVE", "requestArtifact"),
+        ("foundation", "BOOTSTRAP_STACK", "requestSha256"),
+        (
+            "foundation",
+            "BOOTSTRAP_STACK",
+            "expectedTemplateParameterSha256",
+        ),
+        (
+            "foundation",
+            "BOOTSTRAP_STACK",
+            "expectedObservedRequestSha256",
+        ),
+        ("foundation", "ASSET_PUBLISH", "expectedContentSha256"),
+        ("image", "IMAGE_PUBLISH", "expectedRequestSha256"),
     ],
 )
 def test_release_plan_v2_requires_kind_specific_request_and_evidence_bindings(
-    ordinal: int,
+    phase: str,
+    kind: str,
     field: str,
 ) -> None:
     value = _release_plan_v2()
     steps = deepcopy(value["steps"])
     assert isinstance(steps, list)
-    steps[ordinal][field] = ""
+    step = next(
+        step
+        for step in steps
+        if step["phase"] == phase and step["kind"] == kind
+    )
+    step[field] = ""
 
     with pytest.raises(ContractError, match="binding"):
         ReleasePlanV2.from_mapping({**value, "steps": steps})

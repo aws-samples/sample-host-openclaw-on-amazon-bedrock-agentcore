@@ -1559,6 +1559,7 @@ RELEASE_V2_STEP_KINDS = frozenset(
         "AGENTCORE_HARDEN",
         "STACK_CREATE",
         "STACK_UPDATE",
+        "STACK_DRIFT_CHECK",
         "IMAGE_PUBLISH",
         "IMAGE_OBSERVE",
         "RUNTIME_CONTEXT_WRITE",
@@ -1574,18 +1575,26 @@ _RELEASE_V2_MUTATION_KINDS = RELEASE_V2_STEP_KINDS - {
 }
 _RELEASE_V2_PHASE_KINDS = {
     "foundation": frozenset(
-        {"BASELINE_OBSERVE", "BOOTSTRAP_STACK", "ASSET_PUBLISH", "STACK_CREATE"}
+        {
+            "BASELINE_OBSERVE",
+            "BOOTSTRAP_STACK",
+            "STACK_DRIFT_CHECK",
+            "ASSET_PUBLISH",
+            "STACK_CREATE",
+        }
     ),
     "image": frozenset({"IMAGE_PUBLISH", "IMAGE_OBSERVE"}),
-    "runtime": frozenset({"STACK_UPDATE", "AGENTCORE_HARDEN"}),
-    "endpoint": frozenset({"STACK_UPDATE"}),
+    "runtime": frozenset(
+        {"STACK_UPDATE", "STACK_DRIFT_CHECK", "AGENTCORE_HARDEN"}
+    ),
+    "endpoint": frozenset({"STACK_UPDATE", "STACK_DRIFT_CHECK"}),
     "context": frozenset({"RUNTIME_CONTEXT_WRITE"}),
     "router-cron-cs": frozenset({"CHANGESET_CREATE"}),
-    "router-cron": frozenset({"CHANGESET_EXECUTE"}),
+    "router-cron": frozenset({"CHANGESET_EXECUTE", "STACK_DRIFT_CHECK"}),
     "scheduler-cs": frozenset({"CHANGESET_CREATE"}),
-    "scheduler": frozenset({"CHANGESET_EXECUTE"}),
+    "scheduler": frozenset({"CHANGESET_EXECUTE", "STACK_DRIFT_CHECK"}),
     "web-cs": frozenset({"CHANGESET_CREATE"}),
-    "web": frozenset({"CHANGESET_EXECUTE"}),
+    "web": frozenset({"CHANGESET_EXECUTE", "STACK_DRIFT_CHECK"}),
     "verify": frozenset({"VERIFY"}),
 }
 _RELEASE_V2_TEMPLATE_BINDING_PHASE_KINDS = frozenset(
@@ -1663,6 +1672,44 @@ def _release_operation_sha256(
     ).hexdigest()
 
 
+def _release_outcome_operation_sha256(
+    *,
+    release_operation_sha256: str,
+    journal_path_sha256: str,
+    journal_execution_id: str,
+    journal_revision: int,
+) -> str:
+    """Bind one retained observation attempt to one journal execution state."""
+
+    release_operation = _text(
+        release_operation_sha256,
+        field="outcome release operation digest",
+        pattern=_DIGEST,
+    )
+    path_sha256 = _text(
+        journal_path_sha256,
+        field="outcome journal path digest",
+        pattern=_SHA_64,
+    )
+    execution_id = _text(
+        journal_execution_id,
+        field="outcome journal execution ID",
+        pattern=_SHA_64,
+    )
+    revision = _count(journal_revision, field="outcome journal revision")
+    return "sha256:" + hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "schema": "personal-operator.release-outcome-operation.v2",
+                "releaseOperationSha256": release_operation,
+                "journalPathSha256": path_sha256,
+                "journalExecutionId": execution_id,
+                "journalRevision": revision,
+            }
+        )
+    ).hexdigest()
+
+
 def _completed_prefix_sha256(
     completed_steps: Sequence[Mapping[str, Any]],
 ) -> str:
@@ -1708,6 +1755,41 @@ def _release_v2_stack_subject(
     return f"cfn:{account}:{region}:stack:{stack_name}:release:{commit}"
 
 
+_RELEASE_V2_STACK_MUTATION_KINDS = frozenset(
+    {"BOOTSTRAP_STACK", "STACK_CREATE", "STACK_UPDATE", "CHANGESET_EXECUTE"}
+)
+
+
+def _validate_release_v2_stack_drift_recipe(
+    steps: list["ReleaseStepV2"],
+) -> None:
+    """Require one exact planned drift detection after every stack write."""
+
+    for index, step in enumerate(steps):
+        if step.kind in _RELEASE_V2_STACK_MUTATION_KINDS:
+            drift = steps[index + 1] if index + 1 < len(steps) else None
+            if (
+                drift is None
+                or drift.kind != "STACK_DRIFT_CHECK"
+                or drift.phase != step.phase
+                or drift.subject != f"{step.subject}:drift"
+            ):
+                raise ContractError(
+                    "stack write lacks its exact immediate drift check"
+                )
+        elif step.kind == "STACK_DRIFT_CHECK":
+            write = steps[index - 1] if index > 0 else None
+            if (
+                write is None
+                or write.kind not in _RELEASE_V2_STACK_MUTATION_KINDS
+                or step.phase != write.phase
+                or step.subject != f"{write.subject}:drift"
+            ):
+                raise ContractError(
+                    "stack drift check lacks its exact preceding stack write"
+                )
+
+
 def _validate_release_v2_step_shape(
     steps: list["ReleaseStepV2"],
     *,
@@ -1718,6 +1800,8 @@ def _validate_release_v2_step_shape(
     image_digest: str,
 ) -> None:
     """Reject a phase-labelled list that is not the closed release recipe."""
+
+    _validate_release_v2_stack_drift_recipe(steps)
 
     by_phase = {
         phase: [step for step in steps if step.phase == phase]
@@ -1732,7 +1816,7 @@ def _validate_release_v2_step_shape(
         "BOOTSTRAP_STACK",
         _release_v2_stack_subject(account, region, commit, "CDKToolkit"),
     )
-    if len(foundation) < 3 or (
+    if len(foundation) < 4 or (
         foundation[0].kind,
         foundation[0].subject,
     ) != baseline or (
@@ -1743,13 +1827,13 @@ def _validate_release_v2_step_shape(
             "foundation baseline and bootstrap subjects must precede every mutation"
         )
 
-    asset_end = 2
+    asset_end = 3
     while (
         asset_end < len(foundation)
         and foundation[asset_end].kind == "ASSET_PUBLISH"
     ):
         asset_end += 1
-    assets = foundation[2:asset_end]
+    assets = foundation[3:asset_end]
     if not assets:
         raise ContractError("foundation requires at least one exact CDK asset")
     asset_subjects = [step.subject for step in assets]
@@ -1761,13 +1845,14 @@ def _validate_release_v2_step_shape(
         if re.fullmatch(r"cdk:asset:[0-9a-f]{64}", step.subject) is None:
             raise ContractError("foundation CDK asset subject is not exact")
 
-    expected_foundation_stacks = [
-        (
-            "STACK_CREATE",
-            _release_v2_stack_subject(account, region, commit, stack_name),
+    expected_foundation_stacks: list[tuple[str, str]] = []
+    for stack_name in FOUNDATION_RELEASE_STACKS:
+        subject = _release_v2_stack_subject(
+            account, region, commit, stack_name
         )
-        for stack_name in FOUNDATION_RELEASE_STACKS
-    ]
+        expected_foundation_stacks.extend(
+            (("STACK_CREATE", subject), ("STACK_DRIFT_CHECK", f"{subject}:drift"))
+        )
     actual_foundation_stacks = [
         (step.kind, step.subject) for step in foundation[asset_end:]
     ]
@@ -1842,9 +1927,14 @@ def _validate_release_v2_step_shape(
 
     def stack_subject(name: str) -> str:
         return _release_v2_stack_subject(account, region, commit, name)
+
+    def stack_write_with_drift(kind: str, name: str) -> list[tuple[str, str]]:
+        subject = stack_subject(name)
+        return [(kind, subject), ("STACK_DRIFT_CHECK", f"{subject}:drift")]
+
     exact_shapes: dict[str, list[tuple[str, str]]] = {
         "runtime": [
-            ("STACK_UPDATE", stack_subject("OpenClawAgentCore")),
+            *stack_write_with_drift("STACK_UPDATE", "OpenClawAgentCore"),
             (
                 "AGENTCORE_HARDEN",
                 (
@@ -1853,9 +1943,9 @@ def _validate_release_v2_step_shape(
                 ),
             ),
         ],
-        "endpoint": [
-            ("STACK_UPDATE", stack_subject("OpenClawAgentCore")),
-        ],
+        "endpoint": stack_write_with_drift(
+            "STACK_UPDATE", "OpenClawAgentCore"
+        ),
         "context": [
             (
                 "RUNTIME_CONTEXT_WRITE",
@@ -1869,21 +1959,21 @@ def _validate_release_v2_step_shape(
             ("CHANGESET_CREATE", stack_subject("OpenClawCron")),
         ],
         "router-cron": [
-            ("CHANGESET_EXECUTE", stack_subject("OpenClawRouter")),
-            ("CHANGESET_EXECUTE", stack_subject("OpenClawCron")),
+            *stack_write_with_drift("CHANGESET_EXECUTE", "OpenClawRouter"),
+            *stack_write_with_drift("CHANGESET_EXECUTE", "OpenClawCron"),
         ],
         "scheduler-cs": [
             ("CHANGESET_CREATE", stack_subject("PersonalOperatorScheduler")),
         ],
-        "scheduler": [
-            ("CHANGESET_EXECUTE", stack_subject("PersonalOperatorScheduler")),
-        ],
+        "scheduler": stack_write_with_drift(
+            "CHANGESET_EXECUTE", "PersonalOperatorScheduler"
+        ),
         "web-cs": [
             ("CHANGESET_CREATE", stack_subject("PersonalOperatorWeb")),
         ],
-        "web": [
-            ("CHANGESET_EXECUTE", stack_subject("PersonalOperatorWeb")),
-        ],
+        "web": stack_write_with_drift(
+            "CHANGESET_EXECUTE", "PersonalOperatorWeb"
+        ),
         "verify": [
             ("VERIFY", _release_v2_subject(account, region, commit, "verify")),
         ],
@@ -2778,7 +2868,7 @@ class ReleaseStepObservationV2:
             "agentcore_stack": step.phase in {"runtime", "endpoint"},
             "image": step.phase == "image" and phase_complete,
             "runtime": step.phase == "runtime",
-            "endpoint": step.phase == "endpoint",
+            "endpoint": step.phase == "endpoint" and phase_complete,
             "context": step.phase == "context",
             "router_cs": step.phase == "router-cron-cs" and phase_complete,
             "router_identity": (
@@ -2795,13 +2885,13 @@ class ReleaseStepObservationV2:
                 step.kind == "CHANGESET_CREATE"
                 and step.subject == stack_subject("PersonalOperatorScheduler")
             ),
-            "scheduler": step.phase == "scheduler",
+            "scheduler": step.phase == "scheduler" and phase_complete,
             "web_cs": step.phase == "web-cs",
             "web_identity": (
                 step.kind == "CHANGESET_CREATE"
                 and step.subject == stack_subject("PersonalOperatorWeb")
             ),
-            "web": step.phase == "web",
+            "web": step.phase == "web" and phase_complete,
             "verify": step.phase == "verify",
         }
         actual = {
@@ -3106,7 +3196,15 @@ _FAILED_RETAINED_KIND_REASON_STATUSES = {
                 "UPDATE_ROLLBACK_FAILED",
             }
         ),
-        "CF_SUBJECT_CONFLICT": frozenset({"UPDATE_COMPLETE"}),
+        "CF_SUBJECT_CONFLICT": frozenset(
+            {"CREATE_COMPLETE", "UPDATE_COMPLETE"}
+        ),
+    },
+    "STACK_DRIFT_CHECK": {
+        "CLOUDFORMATION_DRIFT_DETECTION_FAILED": frozenset(
+            {"DETECTION_FAILED"}
+        ),
+        "CLOUDFORMATION_STACK_DRIFTED": frozenset({"DRIFTED"}),
     },
     "CHANGESET_CREATE": {
         "CLOUDFORMATION_CHANGESET_FAILED": frozenset({"FAILED"}),
@@ -3152,6 +3250,8 @@ _FAILED_RETAINED_REASON_PROVIDERS = {
     "CLOUDFORMATION_STACK_FAILED": "CLOUDFORMATION",
     "CLOUDFORMATION_CHANGESET_FAILED": "CLOUDFORMATION",
     "CF_SUBJECT_CONFLICT": "CLOUDFORMATION",
+    "CLOUDFORMATION_DRIFT_DETECTION_FAILED": "CLOUDFORMATION",
+    "CLOUDFORMATION_STACK_DRIFTED": "CLOUDFORMATION",
     "ASSET_SUBJECT_CONFLICT": "S3",
     "AGENTCORE_UPDATE_FAILED": "AGENTCORE",
     "AGENTCORE_SUBJECT_CONFLICT": "AGENTCORE",
@@ -3992,6 +4092,286 @@ class StagingTransactionV2:
         return canonical_json_bytes(self.to_mapping())
 
 
+_JOURNAL_TRANSITION_KINDS = frozenset(
+    {
+        "PREFLIGHT",
+        "MUTATION_INTENT",
+        "OUTCOME_ABSENT",
+        "OUTCOME_PENDING",
+        "OUTCOME_PRESENT",
+        "OUTCOME_FAILED_RETAINED",
+        "ABORT_RETAINED",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseJournalTransitionV2:
+    """Append-only authorization for one exact v2 journal CAS."""
+
+    SCHEMA: ClassVar[str] = "personal-operator.release-journal-transition.v2"
+    FIELDS: ClassVar[set[str]] = {
+        "schema",
+        "planSha256",
+        "evidenceStoreSha256",
+        "journalPathSha256",
+        "journalExecutionId",
+        "transitionKind",
+        "evidenceSha256",
+        "priorJournalSha256",
+        "nextJournalSha256",
+        "priorTransaction",
+        "nextTransaction",
+    }
+
+    plan_sha256: str
+    evidence_store_sha256: str
+    journal_path_sha256: str
+    journal_execution_id: str
+    transition_kind: str
+    evidence_sha256: str
+    prior_journal_sha256: str
+    next_journal_sha256: str
+    prior_transaction: StagingTransactionV2
+    next_transaction: StagingTransactionV2
+
+    @classmethod
+    def from_mapping(
+        cls, raw: Mapping[str, Any]
+    ) -> "ReleaseJournalTransitionV2":
+        value = _exact_object(
+            raw, cls.FIELDS, label="release journal transition"
+        )
+        if value["schema"] != cls.SCHEMA:
+            raise ContractError("release journal transition schema is invalid")
+        plan_sha256 = _text(
+            value["planSha256"],
+            field="transition plan digest",
+            pattern=_SHA_64,
+        )
+        evidence_store_sha256 = _text(
+            value["evidenceStoreSha256"],
+            field="transition evidence store digest",
+            pattern=_SHA_64,
+        )
+        journal_path_sha256 = _text(
+            value["journalPathSha256"],
+            field="transition journal path digest",
+            pattern=_SHA_64,
+        )
+        journal_execution_id = _text(
+            value["journalExecutionId"],
+            field="transition journal execution ID",
+            pattern=_SHA_64,
+        )
+        transition_kind = _text(
+            value["transitionKind"], field="journal transition kind"
+        )
+        if transition_kind not in _JOURNAL_TRANSITION_KINDS:
+            raise ContractError("release journal transition kind is invalid")
+        evidence_sha256 = _optional_sha256(
+            value["evidenceSha256"], field="transition evidence digest"
+        )
+        if transition_kind in {"PREFLIGHT", "MUTATION_INTENT"}:
+            if evidence_sha256:
+                raise ContractError(
+                    "local journal transition contains external evidence"
+                )
+        elif not evidence_sha256:
+            raise ContractError(
+                "evidence-bearing journal transition lacks its digest"
+            )
+        prior_journal_sha256 = _text(
+            value["priorJournalSha256"],
+            field="prior journal digest",
+            pattern=_SHA_64,
+        )
+        next_journal_sha256 = _text(
+            value["nextJournalSha256"],
+            field="next journal digest",
+            pattern=_SHA_64,
+        )
+        prior = StagingTransactionV2.from_mapping(value["priorTransaction"])
+        next_transaction = StagingTransactionV2.from_mapping(
+            value["nextTransaction"]
+        )
+        if prior.plan_sha256 != plan_sha256 or (
+            next_transaction.plan_sha256 != plan_sha256
+        ):
+            raise ContractError("journal transition crosses its release plan")
+        if next_transaction.revision != prior.revision + 1:
+            raise ContractError("journal transition does not advance exactly once")
+        identity = (
+            "transaction_id",
+            "source_commit",
+            "source_tree",
+            "account",
+            "region",
+            "plan_sha256",
+        )
+        if any(
+            getattr(prior, field) != getattr(next_transaction, field)
+            for field in identity
+        ):
+            raise ContractError("journal transition changes immutable identity")
+        if hashlib.sha256(prior.to_bytes()).hexdigest() != prior_journal_sha256:
+            raise ContractError("prior journal transition digest differs")
+        if (
+            hashlib.sha256(next_transaction.to_bytes()).hexdigest()
+            != next_journal_sha256
+        ):
+            raise ContractError("next journal transition digest differs")
+        return cls(
+            plan_sha256,
+            evidence_store_sha256,
+            journal_path_sha256,
+            journal_execution_id,
+            transition_kind,
+            evidence_sha256,
+            prior_journal_sha256,
+            next_journal_sha256,
+            prior,
+            next_transaction,
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "ReleaseJournalTransitionV2":
+        return cls.from_mapping(parse_canonical_object(payload))
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "planSha256": self.plan_sha256,
+            "evidenceStoreSha256": self.evidence_store_sha256,
+            "journalPathSha256": self.journal_path_sha256,
+            "journalExecutionId": self.journal_execution_id,
+            "transitionKind": self.transition_kind,
+            "evidenceSha256": self.evidence_sha256,
+            "priorJournalSha256": self.prior_journal_sha256,
+            "nextJournalSha256": self.next_journal_sha256,
+            "priorTransaction": self.prior_transaction.to_mapping(),
+            "nextTransaction": self.next_transaction.to_mapping(),
+        }
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_mapping())
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseJournalTransitionCommitV2:
+    """Durable acknowledgement that one authorized journal CAS completed."""
+
+    SCHEMA: ClassVar[str] = (
+        "personal-operator.release-journal-transition-commit.v2"
+    )
+    FIELDS: ClassVar[set[str]] = {
+        "schema",
+        "planSha256",
+        "evidenceStoreSha256",
+        "journalPathSha256",
+        "journalExecutionId",
+        "fromRevision",
+        "toRevision",
+        "transitionSha256",
+        "nextJournalSha256",
+    }
+
+    plan_sha256: str
+    evidence_store_sha256: str
+    journal_path_sha256: str
+    journal_execution_id: str
+    from_revision: int
+    to_revision: int
+    transition_sha256: str
+    next_journal_sha256: str
+
+    @classmethod
+    def from_mapping(
+        cls, raw: Mapping[str, Any]
+    ) -> "ReleaseJournalTransitionCommitV2":
+        value = _exact_object(
+            raw, cls.FIELDS, label="release journal transition commit"
+        )
+        if value["schema"] != cls.SCHEMA:
+            raise ContractError(
+                "release journal transition commit schema is invalid"
+            )
+        plan_sha256 = _text(
+            value["planSha256"], field="commit plan digest", pattern=_SHA_64
+        )
+        store_sha256 = _text(
+            value["evidenceStoreSha256"],
+            field="commit evidence store digest",
+            pattern=_SHA_64,
+        )
+        path_sha256 = _text(
+            value["journalPathSha256"],
+            field="commit journal path digest",
+            pattern=_SHA_64,
+        )
+        execution_id = _text(
+            value["journalExecutionId"],
+            field="commit journal execution ID",
+            pattern=_SHA_64,
+        )
+        from_revision = _count(
+            value["fromRevision"], field="commit prior revision"
+        )
+        to_revision = _count(
+            value["toRevision"], field="commit next revision"
+        )
+        if to_revision != from_revision + 1:
+            raise ContractError("journal transition commit skips a revision")
+        transition_sha256 = _text(
+            value["transitionSha256"],
+            field="committed transition digest",
+            pattern=_SHA_64,
+        )
+        next_sha256 = _text(
+            value["nextJournalSha256"],
+            field="committed journal digest",
+            pattern=_SHA_64,
+        )
+        return cls(
+            plan_sha256,
+            store_sha256,
+            path_sha256,
+            execution_id,
+            from_revision,
+            to_revision,
+            transition_sha256,
+            next_sha256,
+        )
+
+    @classmethod
+    def from_bytes(
+        cls, payload: bytes
+    ) -> "ReleaseJournalTransitionCommitV2":
+        return cls.from_mapping(parse_canonical_object(payload))
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "planSha256": self.plan_sha256,
+            "evidenceStoreSha256": self.evidence_store_sha256,
+            "journalPathSha256": self.journal_path_sha256,
+            "journalExecutionId": self.journal_execution_id,
+            "fromRevision": self.from_revision,
+            "toRevision": self.to_revision,
+            "transitionSha256": self.transition_sha256,
+            "nextJournalSha256": self.next_journal_sha256,
+        }
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_mapping())
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+
 _ABORT_RETAINED_REASONS = frozenset(
     {
         "RELEASE_STOP_CONDITION",
@@ -4250,6 +4630,397 @@ class FailedRetainedEvidenceV2:
         if evidence.stable_state != transaction.last_stable_state:
             raise ContractError("failed retained evidence stable state differs")
         evidence.failure_observation.validate_transaction_step(plan, transaction)
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedStepEvidenceV2:
+    """One canonical provider outcome retained before a v2 journal CAS."""
+
+    SCHEMA: ClassVar[str] = "personal-operator.retained-step-evidence.v2"
+    OBSERVER_SCHEMA: ClassVar[str] = (
+        "personal-operator.canonical-read-observation.v2"
+    )
+    FIELDS: ClassVar[set[str]] = {
+        "schema",
+        "planSha256",
+        "completedPrefixSha256",
+        "evidenceStoreSha256",
+        "journalPathSha256",
+        "journalExecutionId",
+        "journalRevision",
+        "stepId",
+        "subject",
+        "operationSha256",
+        "releaseOperationSha256",
+        "disposition",
+        "observerEvidenceSha256",
+        "observerEvidence",
+        "stepObservationSha256",
+        "stepObservation",
+        "failureObservationSha256",
+        "failureObservation",
+    }
+    OBSERVER_FIELDS: ClassVar[set[str]] = {
+        "schema",
+        "service",
+        "operation",
+        "subject",
+        "disposition",
+        "providerStatus",
+        "projection",
+    }
+
+    plan_sha256: str
+    completed_prefix_sha256: str
+    evidence_store_sha256: str
+    journal_path_sha256: str
+    journal_execution_id: str
+    journal_revision: int
+    step_id: str
+    subject: str
+    operation_sha256: str
+    release_operation_sha256: str
+    disposition: str
+    observer_evidence_sha256: str
+    observer_evidence_bytes: bytes
+    step_observation_sha256: str
+    step_observation: ReleaseStepObservationV2 | None
+    failure_observation_sha256: str
+    failure_observation: ReleaseStepFailureObservationV2 | None
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "RetainedStepEvidenceV2":
+        value = _exact_object(raw, cls.FIELDS, label="retained step evidence")
+        if value["schema"] != cls.SCHEMA:
+            raise ContractError("retained step evidence schema is invalid")
+        plan_sha256 = _text(
+            value["planSha256"],
+            field="retained evidence plan digest",
+            pattern=_SHA_64,
+        )
+        completed_prefix_sha256 = _text(
+            value["completedPrefixSha256"],
+            field="retained evidence completed prefix digest",
+            pattern=_SHA_64,
+        )
+        evidence_store_sha256 = _text(
+            value["evidenceStoreSha256"],
+            field="retained evidence store digest",
+            pattern=_SHA_64,
+        )
+        journal_path_sha256 = _text(
+            value["journalPathSha256"],
+            field="retained evidence journal path digest",
+            pattern=_SHA_64,
+        )
+        journal_execution_id = _text(
+            value["journalExecutionId"],
+            field="retained evidence journal execution ID",
+            pattern=_SHA_64,
+        )
+        journal_revision = _count(
+            value["journalRevision"],
+            field="retained evidence journal revision",
+        )
+        step_id = _text(
+            value["stepId"], field="retained evidence step ID", pattern=_STEP_ID
+        )
+        subject = _release_subject(value["subject"])
+        operation_sha256 = _text(
+            value["operationSha256"],
+            field="retained evidence operation digest",
+            pattern=_DIGEST,
+        )
+        release_operation_sha256 = _text(
+            value["releaseOperationSha256"],
+            field="retained evidence release operation digest",
+            pattern=_DIGEST,
+        )
+        disposition = _text(
+            value["disposition"], field="retained evidence disposition"
+        )
+        if disposition not in {
+            "ABSENT",
+            "PENDING",
+            "PRESENT",
+            "FAILED_RETAINED",
+        }:
+            raise ContractError("retained evidence disposition is invalid")
+        observer_sha256 = _text(
+            value["observerEvidenceSha256"],
+            field="retained observer evidence digest",
+            pattern=_SHA_64,
+        )
+        raw_observer = _exact_object(
+            value["observerEvidence"],
+            cls.OBSERVER_FIELDS,
+            label="retained observer evidence",
+        )
+        if raw_observer["schema"] != cls.OBSERVER_SCHEMA:
+            raise ContractError("retained observer evidence schema is invalid")
+        for field, label in (
+            ("service", "retained observer service"),
+            ("operation", "retained observer operation"),
+            ("providerStatus", "retained observer provider status"),
+        ):
+            text = _text(raw_observer[field], field=label)
+            if not text or "\x00" in text:
+                raise ContractError(f"{label} is invalid")
+        observer_subject = _release_subject(raw_observer["subject"])
+        if observer_subject != subject:
+            raise ContractError("retained observer evidence subject differs")
+        if raw_observer["disposition"] != disposition:
+            raise ContractError("retained observer disposition differs")
+        projection = raw_observer["projection"]
+        if not isinstance(projection, Mapping):
+            raise ContractError("retained observer projection is malformed")
+        try:
+            projection_bytes = canonical_json_bytes(dict(projection))
+            parse_canonical_object(projection_bytes)
+            observer_bytes = canonical_json_bytes(raw_observer)
+            parse_canonical_object(observer_bytes)
+        except (ContractError, TypeError, ValueError) as error:
+            raise ContractError(
+                "retained observer evidence is not canonical"
+            ) from error
+        if hashlib.sha256(observer_bytes).hexdigest() != observer_sha256:
+            raise ContractError("retained observer evidence digest differs")
+
+        step_observation_sha256 = _optional_sha256(
+            value["stepObservationSha256"],
+            field="retained step observation digest",
+        )
+        raw_step_observation = value["stepObservation"]
+        if not isinstance(raw_step_observation, Mapping):
+            raise ContractError("retained step observation is malformed")
+        step_observation: ReleaseStepObservationV2 | None = None
+        if disposition == "PRESENT":
+            if not step_observation_sha256 or not raw_step_observation:
+                raise ContractError(
+                    "retained PRESENT evidence lacks a typed observation"
+                )
+            step_observation = ReleaseStepObservationV2.from_mapping(
+                raw_step_observation
+            )
+            if step_observation.digest() != step_observation_sha256:
+                raise ContractError("retained step observation digest differs")
+            if (
+                step_observation.plan_sha256 != plan_sha256
+                or step_observation.step_id != step_id
+                or step_observation.subject != subject
+            ):
+                raise ContractError(
+                    "retained step observation identity differs from its record"
+                )
+            if step_observation.observer_evidence_sha256 != observer_sha256:
+                raise ContractError(
+                    "retained step observation does not bind observer evidence"
+                )
+        elif step_observation_sha256 or raw_step_observation:
+            raise ContractError(
+                "non-PRESENT retained evidence contains a step observation"
+            )
+
+        failure_observation_sha256 = _optional_sha256(
+            value["failureObservationSha256"],
+            field="retained failure observation digest",
+        )
+        raw_failure_observation = value["failureObservation"]
+        if not isinstance(raw_failure_observation, Mapping):
+            raise ContractError("retained failure observation is malformed")
+        failure_observation: ReleaseStepFailureObservationV2 | None = None
+        if disposition == "FAILED_RETAINED":
+            if not failure_observation_sha256 or not raw_failure_observation:
+                raise ContractError(
+                    "retained failure evidence lacks a typed observation"
+                )
+            failure_observation = ReleaseStepFailureObservationV2.from_mapping(
+                raw_failure_observation
+            )
+            if failure_observation.digest() != failure_observation_sha256:
+                raise ContractError("retained failure observation digest differs")
+            if (
+                failure_observation.plan_sha256 != plan_sha256
+                or failure_observation.step_id != step_id
+                or failure_observation.subject != subject
+                or failure_observation.operation_sha256
+                != release_operation_sha256
+                or failure_observation.observer_evidence_sha256
+                != observer_sha256
+            ):
+                raise ContractError(
+                    "retained failure observation identity differs from its record"
+                )
+        elif failure_observation_sha256 or raw_failure_observation:
+            raise ContractError(
+                "non-failure retained evidence contains a failure observation"
+            )
+        return cls(
+            plan_sha256,
+            completed_prefix_sha256,
+            evidence_store_sha256,
+            journal_path_sha256,
+            journal_execution_id,
+            journal_revision,
+            step_id,
+            subject,
+            operation_sha256,
+            release_operation_sha256,
+            disposition,
+            observer_sha256,
+            observer_bytes,
+            step_observation_sha256,
+            step_observation,
+            failure_observation_sha256,
+            failure_observation,
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "RetainedStepEvidenceV2":
+        return cls.from_mapping(parse_canonical_object(payload))
+
+    def observer_evidence_mapping(self) -> dict[str, Any]:
+        return parse_canonical_object(self.observer_evidence_bytes)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "planSha256": self.plan_sha256,
+            "completedPrefixSha256": self.completed_prefix_sha256,
+            "evidenceStoreSha256": self.evidence_store_sha256,
+            "journalPathSha256": self.journal_path_sha256,
+            "journalExecutionId": self.journal_execution_id,
+            "journalRevision": self.journal_revision,
+            "stepId": self.step_id,
+            "subject": self.subject,
+            "operationSha256": self.operation_sha256,
+            "releaseOperationSha256": self.release_operation_sha256,
+            "disposition": self.disposition,
+            "observerEvidenceSha256": self.observer_evidence_sha256,
+            "observerEvidence": self.observer_evidence_mapping(),
+            "stepObservationSha256": self.step_observation_sha256,
+            "stepObservation": (
+                self.step_observation.to_mapping()
+                if self.step_observation is not None
+                else {}
+            ),
+            "failureObservationSha256": self.failure_observation_sha256,
+            "failureObservation": (
+                self.failure_observation.to_mapping()
+                if self.failure_observation is not None
+                else {}
+            ),
+        }
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_mapping())
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+    def validate_transaction(
+        self,
+        plan: ReleasePlanV2,
+        transaction: StagingTransactionV2,
+        *,
+        evidence_store_sha256: str,
+        journal_path_sha256: str,
+        journal_execution_id: str,
+        validate_step_observation: bool = True,
+    ) -> None:
+        evidence = RetainedStepEvidenceV2.from_bytes(self.to_bytes())
+        plan = _canonical_release_plan_v2(plan)
+        transaction = StagingTransactionV2.from_bytes(
+            transaction.to_bytes(), plan=plan
+        )
+        count = transaction.completed_step_count
+        if count >= len(plan.steps):
+            raise ContractError("retained evidence has no exact next step")
+        step = plan.steps[count]
+        expected_path_sha256 = _text(
+            journal_path_sha256,
+            field="journal path digest",
+            pattern=_SHA_64,
+        )
+        expected_store_sha256 = _text(
+            evidence_store_sha256,
+            field="evidence store digest",
+            pattern=_SHA_64,
+        )
+        expected_execution_id = _text(
+            journal_execution_id,
+            field="journal execution ID",
+            pattern=_SHA_64,
+        )
+        if step.mutation:
+            if (
+                transaction.state != "UNCERTAIN"
+                or transaction.uncertain_step_id != step.step_id
+            ):
+                raise ContractError(
+                    "retained mutation evidence lacks exact write-ahead intent"
+                )
+            release_operation_sha256 = transaction.uncertain_operation_sha256
+        else:
+            if transaction.state in {
+                "NEW",
+                "UNCERTAIN",
+                "VERIFIED",
+                "ABORTED_RETAINED",
+                "ROLLED_BACK",
+            }:
+                raise ContractError(
+                    "retained observation evidence has no stable next step"
+                )
+            release_operation_sha256 = _release_operation_sha256(
+                plan.digest(),
+                step,
+                _completed_prefix_sha256(
+                    [item.to_mapping() for item in transaction.completed_steps]
+                ),
+            )
+        expected_prefix = _completed_prefix_sha256(
+            [item.to_mapping() for item in transaction.completed_steps]
+        )
+        operation_sha256 = _release_outcome_operation_sha256(
+            release_operation_sha256=release_operation_sha256,
+            journal_path_sha256=expected_path_sha256,
+            journal_execution_id=expected_execution_id,
+            journal_revision=transaction.revision,
+        )
+        if (
+            evidence.plan_sha256 != plan.digest()
+            or evidence.completed_prefix_sha256 != expected_prefix
+            or evidence.evidence_store_sha256 != expected_store_sha256
+            or evidence.journal_path_sha256 != expected_path_sha256
+            or evidence.journal_execution_id != expected_execution_id
+            or evidence.journal_revision != transaction.revision
+            or evidence.step_id != step.step_id
+            or evidence.subject != step.subject
+            or evidence.operation_sha256 != operation_sha256
+            or evidence.release_operation_sha256
+            != release_operation_sha256
+        ):
+            raise ContractError(
+                "retained step evidence differs from the exact transaction step"
+            )
+        if validate_step_observation and evidence.disposition == "PRESENT":
+            if evidence.step_observation is None:
+                raise ContractError("retained PRESENT outcome is incomplete")
+            evidence.step_observation.validate_plan_step(
+                plan,
+                completed_step_count=count,
+                prior_agent_core_stack_id=transaction.agent_core_stack_id,
+                prior_runtime_id=transaction.runtime_id,
+                prior_runtime_version=transaction.runtime_version,
+                prior_runtime_arn=transaction.runtime_arn,
+            )
+        if evidence.disposition == "FAILED_RETAINED":
+            if evidence.failure_observation is None:
+                raise ContractError("retained failure outcome is incomplete")
+            evidence.failure_observation.validate_transaction_step(
+                plan, transaction
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -5139,10 +5910,13 @@ ReleaseContract = (
     | FoundationRuntimeInputsV1
     | MutationRequestV2
     | StagingTransactionV2
+    | ReleaseJournalTransitionV2
+    | ReleaseJournalTransitionCommitV2
     | ReleaseStepObservationV2
     | ReleaseStepFailureObservationV2
     | AbortRetainedEvidenceV2
     | FailedRetainedEvidenceV2
+    | RetainedStepEvidenceV2
     | ResolvedMutationRequestV2
 )
 
@@ -5164,12 +5938,19 @@ def parse_release_contract(payload: bytes) -> ReleaseContract:
         FoundationRuntimeInputsV1.SCHEMA: FoundationRuntimeInputsV1.from_mapping,
         MutationRequestV2.SCHEMA: MutationRequestV2.from_mapping,
         StagingTransactionV2.SCHEMA: StagingTransactionV2.from_mapping,
+        ReleaseJournalTransitionV2.SCHEMA: (
+            ReleaseJournalTransitionV2.from_mapping
+        ),
+        ReleaseJournalTransitionCommitV2.SCHEMA: (
+            ReleaseJournalTransitionCommitV2.from_mapping
+        ),
         ReleaseStepObservationV2.SCHEMA: ReleaseStepObservationV2.from_mapping,
         ReleaseStepFailureObservationV2.SCHEMA: (
             ReleaseStepFailureObservationV2.from_mapping
         ),
         AbortRetainedEvidenceV2.SCHEMA: AbortRetainedEvidenceV2.from_mapping,
         FailedRetainedEvidenceV2.SCHEMA: FailedRetainedEvidenceV2.from_mapping,
+        RetainedStepEvidenceV2.SCHEMA: RetainedStepEvidenceV2.from_mapping,
         ResolvedMutationRequestV2.SCHEMA: ResolvedMutationRequestV2.from_mapping,
     }
     parser = parsers.get(schema)
