@@ -371,6 +371,7 @@ def _resolved_mutation_request(
             "region": journal.plan.region,
             "stepPhase": next_step.phase,
             "requestArtifactSize": request_artifact_size,
+            "expectedTemplateSha256": next_step.expected_template_sha256,
             "expectedTemplateParameterSha256": (
                 next_step.expected_template_parameter_sha256
             ),
@@ -1287,6 +1288,37 @@ def test_v2_downstream_operations_bind_the_exact_completed_evidence_prefix(
         assert baseline.operation_sha256() != changed.operation_sha256()
 
 
+def test_v2_journal_operation_binds_exact_dynamic_update_template(
+    tmp_path: Path,
+) -> None:
+    baseline_value = _release_plan_v2()
+    changed_value = deepcopy(baseline_value)
+    changed_steps = changed_value["steps"]
+    assert isinstance(changed_steps, list)
+    changed_update = next(
+        step
+        for step in changed_steps
+        if step["phase"] == "runtime" and step["kind"] == "STACK_UPDATE"
+    )
+    changed_update["expectedTemplateSha256"] = "0" * 64
+    baseline = _create_v2(
+        tmp_path / "baseline-template",
+        ReleasePlanV2.from_mapping(baseline_value),
+    )
+    changed = _create_v2(
+        tmp_path / "changed-template",
+        ReleasePlanV2.from_mapping(changed_value),
+    )
+    baseline.advance_preflight()
+    changed.advance_preflight()
+    _advance_v2_until_phase(baseline, "runtime:STACK_UPDATE")
+    _advance_v2_until_phase(changed, "runtime:STACK_UPDATE")
+
+    assert baseline.plan.digest() != changed.plan.digest()
+    assert baseline.current.plan_sha256 != changed.current.plan_sha256
+    assert baseline.operation_sha256() != changed.operation_sha256()
+
+
 def test_v2_resolved_mutation_request_binds_precloud_plan_and_generated_inputs(
     tmp_path: Path,
 ) -> None:
@@ -1468,9 +1500,10 @@ def test_v2_resolved_mutation_request_binds_precloud_plan_and_generated_inputs(
         replace(resolved, source_commit="d" * 40),
         replace(resolved, source_tree="d" * 40),
         replace(resolved, account="999999999999"),
-        replace(resolved, region="us-east-1"),
-        replace(resolved, step_phase="endpoint"),
-        replace(resolved, expected_template_parameter_sha256="f" * 64),
+            replace(resolved, region="us-east-1"),
+            replace(resolved, step_phase="endpoint"),
+            replace(resolved, expected_template_sha256="f" * 64),
+            replace(resolved, expected_template_parameter_sha256="f" * 64),
         replace(resolved, expected_observed_request_sha256="f" * 64),
         replace(resolved, expected_content_sha256="f" * 64),
         replace(
@@ -1530,6 +1563,7 @@ def test_v2_resolved_mutation_request_binds_exact_next_step_expectations(
     resolved = ResolvedMutationRequestV2.from_mapping(base)
 
     resolved.validate_transaction(journal.plan, journal.current)
+    assert resolved.expected_template_sha256 == ""
     assert resolved.expected_template_parameter_sha256 == ""
     assert resolved.expected_observed_request_sha256 == ""
     assert resolved.expected_content_sha256 == next_step.expected_content_sha256
@@ -1537,6 +1571,35 @@ def test_v2_resolved_mutation_request_binds_exact_next_step_expectations(
         replace(
             resolved,
             expected_content_sha256="f" * 64,
+        ).validate_transaction(journal.plan, journal.current)
+
+
+def test_v2_resolved_runtime_update_binds_exact_plan_template_digest(
+    tmp_path: Path,
+) -> None:
+    journal = _create_v2(tmp_path)
+    journal.advance_preflight()
+    _advance_v2_until_phase(journal, "runtime:STACK_UPDATE")
+    next_step = journal.plan.steps[journal.current.completed_step_count]
+    artifact = next(
+        item
+        for item in journal.plan.artifacts
+        if item.path == next_step.request_artifact
+    )
+    resolved = _resolved_mutation_request(
+        journal,
+        request_artifact_size=artifact.size,
+    )
+
+    assert resolved.expected_template_sha256 == next_step.expected_template_sha256
+    assert resolved.expected_template_sha256
+    assert resolved.expected_template_parameter_sha256 == ""
+    assert ResolvedMutationRequestV2.from_bytes(resolved.to_bytes()) == resolved
+    resolved.validate_transaction(journal.plan, journal.current)
+    with pytest.raises(ContractError, match="expectations differ"):
+        replace(
+            resolved,
+            expected_template_sha256="f" * 64,
         ).validate_transaction(journal.plan, journal.current)
 
 

@@ -1597,6 +1597,12 @@ _RELEASE_V2_TEMPLATE_BINDING_PHASE_KINDS = frozenset(
         ("web-cs", "CHANGESET_CREATE"),
     }
 )
+_RELEASE_V2_DYNAMIC_TEMPLATE_BINDING_PHASE_KINDS = frozenset(
+    {
+        ("runtime", "STACK_UPDATE"),
+        ("endpoint", "STACK_UPDATE"),
+    }
+)
 _RELEASE_V2_OBSERVED_REQUEST_BINDING_KINDS = frozenset(
     {
         "BOOTSTRAP_STACK",
@@ -1908,6 +1914,7 @@ class ReleaseStepV2:
     mutation: bool
     request_artifact: str
     request_sha256: str
+    expected_template_sha256: str
     expected_template_parameter_sha256: str
     expected_request_sha256: str
     expected_observed_request_sha256: str
@@ -1923,6 +1930,7 @@ class ReleaseStepV2:
             "mutation": self.mutation,
             "requestArtifact": self.request_artifact,
             "requestSha256": self.request_sha256,
+            "expectedTemplateSha256": self.expected_template_sha256,
             "expectedTemplateParameterSha256": (
                 self.expected_template_parameter_sha256
             ),
@@ -2072,6 +2080,7 @@ class ReleasePlanV2:
             "mutation",
             "requestArtifact",
             "requestSha256",
+            "expectedTemplateSha256",
             "expectedTemplateParameterSha256",
             "expectedRequestSha256",
             "expectedObservedRequestSha256",
@@ -2116,6 +2125,10 @@ class ReleasePlanV2:
                     "step request artifact binding does not match the inventory"
                 )
             request_artifacts.append(request_artifact)
+            expected_template_sha256 = _optional_sha256(
+                step["expectedTemplateSha256"],
+                field="expected update template digest",
+            )
             expected_template = _optional_sha256(
                 step["expectedTemplateParameterSha256"],
                 field="expected template parameter digest",
@@ -2132,6 +2145,13 @@ class ReleasePlanV2:
                 step["expectedContentSha256"],
                 field="expected content digest",
             )
+            if bool(expected_template_sha256) != (
+                (phase, kind)
+                in _RELEASE_V2_DYNAMIC_TEMPLATE_BINDING_PHASE_KINDS
+            ):
+                raise ContractError(
+                    "step update template binding differs from its kind"
+                )
             if bool(expected_template) != (
                 (phase, kind) in _RELEASE_V2_TEMPLATE_BINDING_PHASE_KINDS
             ):
@@ -2156,11 +2176,21 @@ class ReleasePlanV2:
                 )
             if expected_observed_request and expected_observed_request in {
                 request_sha256,
+                expected_template_sha256,
                 expected_template,
                 expected_content,
             }:
                 raise ContractError(
                     "step expected observed request digest aliases another binding"
+                )
+            if expected_template_sha256 and expected_template_sha256 in {
+                request_sha256,
+                expected_template,
+                expected_observed_request,
+                expected_content,
+            }:
+                raise ContractError(
+                    "step update template digest aliases another binding"
                 )
             if kind == "IMAGE_OBSERVE" and (
                 expected_content != image_digest.removeprefix("sha256:")
@@ -2178,6 +2208,7 @@ class ReleasePlanV2:
                     mutation,
                     request_artifact,
                     request_sha256,
+                    expected_template_sha256,
                     expected_template,
                     expected_request,
                     expected_observed_request,
@@ -4186,6 +4217,7 @@ class ResolvedMutationRequestV2:
         "region",
         "stepPhase",
         "requestArtifactSize",
+        "expectedTemplateSha256",
         "expectedTemplateParameterSha256",
         "expectedObservedRequestSha256",
         "expectedContentSha256",
@@ -4220,6 +4252,7 @@ class ResolvedMutationRequestV2:
     region: str
     step_phase: str
     request_artifact_size: int
+    expected_template_sha256: str
     expected_template_parameter_sha256: str
     expected_observed_request_sha256: str
     expected_content_sha256: str
@@ -4270,6 +4303,10 @@ class ResolvedMutationRequestV2:
             value["requestArtifactSize"],
             field="request artifact size",
             minimum=1,
+        )
+        expected_template_sha256 = _optional_sha256(
+            value["expectedTemplateSha256"],
+            field="expected update template digest",
         )
         expected_template_parameter_sha256 = _optional_sha256(
             value["expectedTemplateParameterSha256"],
@@ -4397,6 +4434,7 @@ class ResolvedMutationRequestV2:
             region,
             step_phase,
             request_artifact_size,
+            expected_template_sha256,
             expected_template_parameter_sha256,
             expected_observed_request_sha256,
             expected_content_sha256,
@@ -4438,6 +4476,7 @@ class ResolvedMutationRequestV2:
             "region": self.region,
             "stepPhase": self.step_phase,
             "requestArtifactSize": self.request_artifact_size,
+            "expectedTemplateSha256": self.expected_template_sha256,
             "expectedTemplateParameterSha256": (
                 self.expected_template_parameter_sha256
             ),
@@ -4520,10 +4559,12 @@ class ResolvedMutationRequestV2:
         if self.step_phase != next_step.phase:
             raise ContractError("resolved mutation step phase differs from the plan")
         if (
+            self.expected_template_sha256,
             self.expected_template_parameter_sha256,
             self.expected_observed_request_sha256,
             self.expected_content_sha256,
         ) != (
+            next_step.expected_template_sha256,
             next_step.expected_template_parameter_sha256,
             next_step.expected_observed_request_sha256,
             next_step.expected_content_sha256,

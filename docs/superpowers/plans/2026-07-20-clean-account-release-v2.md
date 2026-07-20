@@ -122,6 +122,7 @@ The step digest fields have separate, closed meanings:
 | Field | Non-empty exactly for | Meaning |
 | --- | --- | --- |
 | `requestSha256` and `expectedRequestSha256` | every step | Two compatibility-preserving bindings to the same immutable raw request-artifact bytes; neither is live provider evidence. |
+| `expectedTemplateSha256` | Runtime and Endpoint `STACK_UPDATE` | SHA-256 of the exact reviewed raw UTF-8 update-template body bytes. It is plan-derived, excludes the completed-prefix-derived parameters, and is independent from both the request artifact and `expectedObservedRequestSha256`. |
 | `expectedObservedRequestSha256` | `BOOTSTRAP_STACK`, `STACK_CREATE`, `STACK_UPDATE`, `CHANGESET_CREATE`, and `CHANGESET_EXECUTE` | The precomputed canonical CloudFormation observer projection of persistent request/security fields. It excludes template parameters, idempotency tokens, AWS-generated IDs, and generated result content, and may not alias any artifact, template/parameter, or content digest. |
 | `expectedTemplateParameterSha256` | foundation `BOOTSTRAP_STACK`/`STACK_CREATE` and consumer `CHANGESET_CREATE` | The pre-cloud processed-template plus exact-parameter digest. Runtime and endpoint `STACK_UPDATE` leave it empty because their exact parameters are derived from typed completed-prefix inputs. |
 | `expectedContentSha256` | `ASSET_PUBLISH`, `IMAGE_PUBLISH`, and `IMAGE_OBSERVE` | Immutable pre-cloud content only. Asset content is the uploaded payload digest and is intentionally independent from the synthesized asset ID in its subject. Each image-publish content digest equals its exact effect-subject digest; the subject-manifest effect alone equals the hex payload of `runtimeImageDigest`. Aggregate image observation also binds that runtime-image digest. |
@@ -131,8 +132,9 @@ does not fabricate content digests for `AGENTCORE_HARDEN`,
 `RUNTIME_CONTEXT_WRITE`, change-set creation or execution, or `VERIFY`.
 Those results belong only to canonical `ReleaseStepObservationV2` evidence.
 Runtime and endpoint stack requests are reconstructed from the retained raw
-artifact plus journal-owned typed inputs; the resulting processed template and
-parameters are validated at dispatch and by the live observer. Change-set
+artifact plus journal-owned typed inputs. Their exact reviewed raw UTF-8
+template-body bytes must match `expectedTemplateSha256`, while the dynamic parameters are
+validated separately at dispatch and by the live observer. Change-set
 execution likewise reconciles the live application against the prior
 journal-owned change-set observation, not against a preplanned application
 hash.

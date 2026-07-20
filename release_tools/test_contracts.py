@@ -273,6 +273,15 @@ def _v2_steps_and_artifacts() -> tuple[list[dict[str, object]], list[dict[str, o
                 "mutation": mutation,
                 "requestArtifact": path,
                 "requestSha256": digest,
+                "expectedTemplateSha256": (
+                    hashlib.sha256(f"template-body:{step_id}".encode()).hexdigest()
+                    if (phase, kind)
+                    in {
+                        ("runtime", "STACK_UPDATE"),
+                        ("endpoint", "STACK_UPDATE"),
+                    }
+                    else ""
+                ),
                 "expectedTemplateParameterSha256": (
                     hashlib.sha256(f"template:{step_id}".encode()).hexdigest()
                     if kind
@@ -1357,6 +1366,7 @@ def test_release_plan_v2_requires_every_phase_as_one_contiguous_ordered_run() ->
     returned_phase[returned_index]["phase"] = "foundation"
     returned_phase[returned_index]["kind"] = "STACK_CREATE"
     returned_phase[returned_index]["mutation"] = True
+    returned_phase[returned_index]["expectedTemplateSha256"] = ""
     returned_phase[returned_index]["expectedTemplateParameterSha256"] = "f" * 64
     returned_phase[returned_index]["expectedContentSha256"] = ""
     with pytest.raises(ContractError, match="phase"):
@@ -1786,18 +1796,44 @@ def test_release_plan_v2_separates_artifact_and_observed_request_digests() -> No
         ReleasePlanV2.from_mapping({**value, "steps": steps})
 
 
-def test_release_plan_v2_does_not_preplan_generated_template_or_content() -> None:
+def test_release_plan_v2_separates_dynamic_update_template_from_static_parameters() -> None:
     value = _release_plan_v2()
-    steps = deepcopy(value["steps"])
-    assert isinstance(steps, list)
+    for phase in ("runtime", "endpoint"):
+        steps = deepcopy(value["steps"])
+        assert isinstance(steps, list)
+        update = next(
+            step
+            for step in steps
+            if step["phase"] == phase and step["kind"] == "STACK_UPDATE"
+        )
+        update["expectedTemplateSha256"] = ""
+        with pytest.raises(ContractError, match="template.*binding"):
+            ReleasePlanV2.from_mapping({**value, "steps": steps})
 
+    steps = deepcopy(value["steps"])
     runtime_update = next(
         step
         for step in steps
         if step["phase"] == "runtime" and step["kind"] == "STACK_UPDATE"
     )
-    runtime_update["expectedTemplateParameterSha256"] = "d" * 64
-    with pytest.raises(ContractError, match="template.*kind|template.*phase"):
+    runtime_update["expectedTemplateParameterSha256"] = "e" * 64
+    with pytest.raises(ContractError, match="template.*kind"):
+        ReleasePlanV2.from_mapping({**value, "steps": steps})
+
+    steps = deepcopy(value["steps"])
+    runtime_update = next(
+        step
+        for step in steps
+        if step["phase"] == "runtime" and step["kind"] == "STACK_UPDATE"
+    )
+    runtime_update["expectedTemplateSha256"] = "sha256:" + "e" * 64
+    with pytest.raises(ContractError, match="update template digest"):
+        ReleasePlanV2.from_mapping({**value, "steps": steps})
+
+    steps = deepcopy(value["steps"])
+    cross_kind = next(step for step in steps if step["kind"] == "AGENTCORE_HARDEN")
+    cross_kind["expectedTemplateSha256"] = "e" * 64
+    with pytest.raises(ContractError, match="template.*binding"):
         ReleasePlanV2.from_mapping({**value, "steps": steps})
 
     for kind in (
