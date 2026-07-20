@@ -671,6 +671,75 @@ class TransactionJournalV2:
             observation=observation,
         )
 
+    def _record_failed_retained(
+        self,
+        *,
+        evidence: FailedRetainedEvidenceV2,
+    ) -> StagingTransactionV2:
+        """Validate and persist one canonical terminal failure."""
+
+        if not isinstance(evidence, FailedRetainedEvidenceV2):
+            raise TransactionError("retained failure requires typed failure evidence")
+        try:
+            evidence = FailedRetainedEvidenceV2.from_bytes(evidence.to_bytes())
+            evidence.validate_transaction(self.plan, self.current)
+        except (AttributeError, ContractError, TypeError, ValueError) as error:
+            raise TransactionError(str(error)) from error
+        failure = evidence.failure_observation
+        mapping = self.current.to_mapping()
+        mapping.update(
+            {
+                "state": "ABORTED_RETAINED",
+                "abortEvidenceSha256": "",
+                "failedRetainedEvidenceSha256": evidence.digest(),
+                "failureObservationSha256": failure.digest(),
+                "failedStepId": failure.step_id,
+                "failedSubject": failure.subject,
+                "failedOperationSha256": failure.operation_sha256,
+                "failureReason": failure.failure_reason,
+                "uncertainStepId": "",
+                "uncertainOperationSha256": "",
+                "revision": self.current.revision + 1,
+            }
+        )
+        return self._persist(
+            StagingTransactionV2.from_mapping(mapping, plan=self.plan)
+        )
+
+    def fail_observation_retained(
+        self,
+        *,
+        evidence: FailedRetainedEvidenceV2,
+    ) -> StagingTransactionV2:
+        """Terminally retain a stable prefix after an exact read-only failure.
+
+        Read-only steps never acquire write-ahead mutation intent. Their closed,
+        terminal failures therefore transition directly from the stable prefix,
+        while preserving the same plan-bound operation identity used by an
+        authoritative observation.
+        """
+
+        if self.current.state in {
+            "NEW",
+            "UNCERTAIN",
+            "VERIFIED",
+            "ABORTED_RETAINED",
+            "ROLLED_BACK",
+        }:
+            raise TransactionError(
+                "v2 transaction cannot retain a read-only failure from this state"
+            )
+        step = self._next_step()
+        if step is None or step.get("mutation") is not False:
+            raise TransactionError(
+                "v2 next plan step is not a read-only observation"
+            )
+        if not isinstance(evidence, FailedRetainedEvidenceV2):
+            raise TransactionError(
+                "read-only retained failure requires typed failure evidence"
+            )
+        return self._record_failed_retained(evidence=evidence)
+
     def reconcile_step(
         self,
         *,
@@ -699,32 +768,8 @@ class TransactionJournalV2:
                 raise TransactionError(
                     "FAILED_RETAINED reconciliation requires typed failure evidence"
                 )
-            try:
-                failure_evidence = FailedRetainedEvidenceV2.from_bytes(
-                    failure_evidence.to_bytes()
-                )
-                failure_evidence.validate_transaction(self.plan, self.current)
-            except (AttributeError, ContractError, TypeError, ValueError) as error:
-                raise TransactionError(str(error)) from error
-            failure = failure_evidence.failure_observation
-            mapping = self.current.to_mapping()
-            mapping.update(
-                {
-                    "state": "ABORTED_RETAINED",
-                    "abortEvidenceSha256": "",
-                    "failedRetainedEvidenceSha256": failure_evidence.digest(),
-                    "failureObservationSha256": failure.digest(),
-                    "failedStepId": failure.step_id,
-                    "failedSubject": failure.subject,
-                    "failedOperationSha256": failure.operation_sha256,
-                    "failureReason": failure.failure_reason,
-                    "uncertainStepId": "",
-                    "uncertainOperationSha256": "",
-                    "revision": self.current.revision + 1,
-                }
-            )
-            return self._persist(
-                StagingTransactionV2.from_mapping(mapping, plan=self.plan)
+            return self._record_failed_retained(
+                evidence=failure_evidence,
             )
         if failure_evidence is not None:
             raise TransactionError(

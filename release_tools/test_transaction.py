@@ -307,13 +307,18 @@ def _failed_retained_evidence(
     observer_evidence_sha256: str = "e" * 64,
 ) -> FailedRetainedEvidenceV2:
     step = journal.plan.steps[journal.current.completed_step_count]
+    operation_sha256 = (
+        journal.current.uncertain_operation_sha256
+        if journal.current.state == "UNCERTAIN"
+        else journal.operation_sha256()
+    )
     observation = ReleaseStepFailureObservationV2.from_mapping(
         {
             "schema": ReleaseStepFailureObservationV2.SCHEMA,
             "planSha256": journal.plan.digest(),
             "stepId": step.step_id,
             "subject": step.subject,
-            "operationSha256": journal.current.uncertain_operation_sha256,
+            "operationSha256": operation_sha256,
             "provider": provider,
             "terminalStatus": terminal_status,
             "failureReason": failure_reason,
@@ -1960,6 +1965,126 @@ def test_v2_failed_retained_requires_typed_exact_failure_and_never_aliases_absen
 
 
 @pytest.mark.parametrize(
+    ("reason", "status"),
+    (
+        ("IMAGE_SCAN_FAILED", "SCAN_POLICY_FAILED"),
+        ("IMAGE_SIGNING_FAILED", "SIGNATURE_VERIFICATION_FAILED"),
+    ),
+)
+def test_v2_read_only_image_failure_atomically_retains_exact_stable_prefix(
+    tmp_path: Path,
+    reason: str,
+    status: str,
+) -> None:
+    journal = _create_v2(tmp_path)
+    journal.advance_preflight()
+    _advance_v2_until_phase(journal, "image:IMAGE_OBSERVE")
+    before = journal.current
+    operation_sha256 = journal.operation_sha256()
+    evidence = _failed_retained_evidence(
+        journal,
+        failure_reason=reason,
+        provider="ECR",
+        terminal_status=status,
+    )
+
+    retained = journal.fail_observation_retained(evidence=evidence)
+    reloaded = TransactionJournalV2.load(journal.path, plan=journal.plan).current
+
+    assert retained.state == "ABORTED_RETAINED"
+    assert retained.last_stable_state == before.last_stable_state
+    assert retained.completed_step_count == before.completed_step_count
+    assert retained.completed_steps == before.completed_steps
+    assert retained.failed_step_id == journal.plan.steps[
+        before.completed_step_count
+    ].step_id
+    assert retained.failed_operation_sha256 == operation_sha256
+    assert retained.failure_reason == reason
+    assert retained.uncertain_step_id == ""
+    assert retained.uncertain_operation_sha256 == ""
+    assert reloaded == retained
+    assert journal.resume_step() is None
+
+
+def test_v2_read_only_failure_rejects_mutation_prefix_and_hostile_evidence(
+    tmp_path: Path,
+) -> None:
+    mutation = _create_v2(tmp_path / "mutation")
+    mutation.advance_preflight()
+    mutation.complete_observation(observation=_observation(mutation))
+    mutation_evidence = _failed_retained_evidence(
+        mutation,
+        failure_reason="CLOUDFORMATION_STACK_FAILED",
+        provider="CLOUDFORMATION",
+        terminal_status="CREATE_FAILED",
+    )
+    with pytest.raises(TransactionError, match="read-only"):
+        mutation.fail_observation_retained(evidence=mutation_evidence)
+
+    observed = _create_v2(tmp_path / "observed")
+    observed.advance_preflight()
+    _advance_v2_until_phase(observed, "image:IMAGE_OBSERVE")
+    evidence = _failed_retained_evidence(
+        observed,
+        failure_reason="IMAGE_SCAN_FAILED",
+        provider="ECR",
+        terminal_status="SCAN_POLICY_FAILED",
+    )
+    for hostile, match in (
+        (replace(evidence, plan_sha256="f" * 64), "plan differs"),
+        (
+            replace(
+                evidence,
+                failure_observation=replace(
+                    evidence.failure_observation,
+                    operation_sha256="sha256:" + "0" * 64,
+                ),
+            ),
+            "operation differs",
+        ),
+        (
+            replace(
+                evidence,
+                failure_observation=replace(
+                    evidence.failure_observation,
+                    step_id=observed.plan.steps[0].step_id,
+                ),
+            ),
+            "plan or step differs",
+        ),
+    ):
+        before = observed.current
+        with pytest.raises(TransactionError, match=match):
+            observed.fail_observation_retained(evidence=hostile)
+        assert observed.current == before
+
+
+@pytest.mark.parametrize(
+    "step_selector",
+    ("foundation:BASELINE_OBSERVE", "verify:VERIFY"),
+)
+def test_v2_read_only_failure_is_closed_to_image_observation(
+    tmp_path: Path,
+    step_selector: str,
+) -> None:
+    journal = _create_v2(tmp_path)
+    journal.advance_preflight()
+    _advance_v2_until_phase(journal, step_selector)
+    evidence = _failed_retained_evidence(
+        journal,
+        failure_reason="IMAGE_SCAN_FAILED",
+        provider="ECR",
+        terminal_status="SCAN_POLICY_FAILED",
+    )
+    before = journal.current
+
+    with pytest.raises(TransactionError, match="step kind"):
+        journal.fail_observation_retained(evidence=evidence)
+
+    assert journal.current == before
+
+
+@pytest.mark.parametrize(
     ("step_selector", "reason", "provider", "status"),
     [
         (
@@ -2027,6 +2152,36 @@ def test_v2_failed_retained_requires_typed_exact_failure_and_never_aliases_absen
             "RUNTIME_CONTEXT_CONFLICT",
             "LOCAL_FILESYSTEM",
             "EXISTING_CONTENT_CONFLICT",
+        ),
+        (
+            "foundation:BOOTSTRAP_STACK",
+            "CF_SUBJECT_CONFLICT",
+            "CLOUDFORMATION",
+            "CREATE_COMPLETE",
+        ),
+        (
+            "runtime:STACK_UPDATE",
+            "CF_SUBJECT_CONFLICT",
+            "CLOUDFORMATION",
+            "UPDATE_COMPLETE",
+        ),
+        (
+            "router-cron-cs:CHANGESET_CREATE",
+            "CF_SUBJECT_CONFLICT",
+            "CLOUDFORMATION",
+            "CREATE_COMPLETE",
+        ),
+        (
+            "router-cron:CHANGESET_EXECUTE",
+            "CF_SUBJECT_CONFLICT",
+            "CLOUDFORMATION",
+            "CREATE_COMPLETE",
+        ),
+        (
+            "runtime:AGENTCORE_HARDEN",
+            "AGENTCORE_SUBJECT_CONFLICT",
+            "AGENTCORE",
+            "READY",
         ),
     ],
 )
@@ -2103,6 +2258,74 @@ def test_v2_failed_retained_rejects_terminal_status_for_a_different_operation(
             operation_sha256=journal.current.uncertain_operation_sha256,
             failure_evidence=evidence,
         )
+
+
+def test_v2_subject_conflict_is_terminal_kind_specific_and_never_retryable(
+    tmp_path: Path,
+) -> None:
+    journal = _create_v2(tmp_path)
+    journal.advance_preflight()
+    _advance_v2_until_phase(journal, "runtime:STACK_UPDATE")
+    uncertain = journal.begin_step()
+    retained_prefix = uncertain.completed_steps
+    retained_baseline = uncertain.rollback_baseline_sha256
+    retained_stable_state = uncertain.last_stable_state
+    conflict = _failed_retained_evidence(
+        journal,
+        failure_reason="CF_SUBJECT_CONFLICT",
+        provider="CLOUDFORMATION",
+        terminal_status="UPDATE_COMPLETE",
+    )
+
+    for disposition in (
+        ObservationDisposition.ABSENT,
+        ObservationDisposition.PENDING,
+    ):
+        with pytest.raises(TransactionError, match=f"{disposition.value}.*failure"):
+            journal.reconcile_step(
+                disposition=disposition,
+                operation_sha256=journal.current.uncertain_operation_sha256,
+                failure_evidence=conflict,
+            )
+    wrong_status = replace(
+        conflict,
+        failure_observation=replace(
+            conflict.failure_observation,
+            terminal_status="CREATE_COMPLETE",
+        ),
+    )
+    with pytest.raises(TransactionError, match="status.*step kind"):
+        journal.reconcile_step(
+            disposition=ObservationDisposition.FAILED_RETAINED,
+            operation_sha256=journal.current.uncertain_operation_sha256,
+            failure_evidence=wrong_status,
+        )
+    wrong_provider = replace(
+        conflict,
+        failure_observation=replace(
+            conflict.failure_observation,
+            provider="AGENTCORE",
+        ),
+    )
+    with pytest.raises(TransactionError, match="provider differs"):
+        journal.reconcile_step(
+            disposition=ObservationDisposition.FAILED_RETAINED,
+            operation_sha256=journal.current.uncertain_operation_sha256,
+            failure_evidence=wrong_provider,
+        )
+
+    retained = journal.reconcile_step(
+        disposition=ObservationDisposition.FAILED_RETAINED,
+        operation_sha256=journal.current.uncertain_operation_sha256,
+        failure_evidence=conflict,
+    )
+    assert retained.state == "ABORTED_RETAINED"
+    assert retained.failure_reason == "CF_SUBJECT_CONFLICT"
+    assert retained.completed_steps == retained_prefix
+    assert retained.rollback_baseline_sha256 == retained_baseline
+    assert retained.last_stable_state == retained_stable_state
+    assert retained.uncertain_step_id == ""
+    assert retained.uncertain_operation_sha256 == ""
 
 
 def test_v2_plan_or_artifact_substitution_is_rejected_on_load(

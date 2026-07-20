@@ -3089,12 +3089,14 @@ _FAILED_RETAINED_KIND_REASON_STATUSES = {
     "BOOTSTRAP_STACK": {
         "CLOUDFORMATION_STACK_FAILED": frozenset(
             {"CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED"}
-        )
+        ),
+        "CF_SUBJECT_CONFLICT": frozenset({"CREATE_COMPLETE"}),
     },
     "STACK_CREATE": {
         "CLOUDFORMATION_STACK_FAILED": frozenset(
             {"CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED"}
-        )
+        ),
+        "CF_SUBJECT_CONFLICT": frozenset({"CREATE_COMPLETE"}),
     },
     "STACK_UPDATE": {
         "CLOUDFORMATION_STACK_FAILED": frozenset(
@@ -3103,27 +3105,35 @@ _FAILED_RETAINED_KIND_REASON_STATUSES = {
                 "UPDATE_ROLLBACK_COMPLETE",
                 "UPDATE_ROLLBACK_FAILED",
             }
-        )
+        ),
+        "CF_SUBJECT_CONFLICT": frozenset({"UPDATE_COMPLETE"}),
     },
     "CHANGESET_CREATE": {
-        "CLOUDFORMATION_CHANGESET_FAILED": frozenset({"FAILED"})
+        "CLOUDFORMATION_CHANGESET_FAILED": frozenset({"FAILED"}),
+        "CF_SUBJECT_CONFLICT": frozenset({"CREATE_COMPLETE"}),
     },
     "CHANGESET_EXECUTE": {
         "CLOUDFORMATION_STACK_FAILED": frozenset(
             {"CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED"}
-        )
+        ),
+        "CF_SUBJECT_CONFLICT": frozenset({"CREATE_COMPLETE"}),
     },
     "ASSET_PUBLISH": {
         "ASSET_SUBJECT_CONFLICT": frozenset({"RETAINED_OBJECT_CONFLICT"})
     },
     "AGENTCORE_HARDEN": {
-        "AGENTCORE_UPDATE_FAILED": frozenset({"UPDATE_FAILED"})
+        "AGENTCORE_UPDATE_FAILED": frozenset({"UPDATE_FAILED"}),
+        "AGENTCORE_SUBJECT_CONFLICT": frozenset({"READY"}),
     },
     "IMAGE_PUBLISH": {
         "IMAGE_SCAN_FAILED": frozenset({"SCAN_POLICY_FAILED"}),
         "IMAGE_SIGNING_FAILED": frozenset({"SIGNATURE_VERIFICATION_FAILED"}),
         "IMAGE_SUBJECT_CONFLICT": frozenset({"IMMUTABLE_SUBJECT_CONFLICT"}),
         "IMAGE_PARTIAL_CLOSURE": frozenset({"RETAINED_PARTIAL_CLOSURE"}),
+    },
+    "IMAGE_OBSERVE": {
+        "IMAGE_SCAN_FAILED": frozenset({"SCAN_POLICY_FAILED"}),
+        "IMAGE_SIGNING_FAILED": frozenset({"SIGNATURE_VERIFICATION_FAILED"}),
     },
     "RUNTIME_CONTEXT_WRITE": {
         "RUNTIME_CONTEXT_CONFLICT": frozenset({"EXISTING_CONTENT_CONFLICT"})
@@ -3141,8 +3151,10 @@ _FAILED_RETAINED_REASONS = frozenset(
 _FAILED_RETAINED_REASON_PROVIDERS = {
     "CLOUDFORMATION_STACK_FAILED": "CLOUDFORMATION",
     "CLOUDFORMATION_CHANGESET_FAILED": "CLOUDFORMATION",
+    "CF_SUBJECT_CONFLICT": "CLOUDFORMATION",
     "ASSET_SUBJECT_CONFLICT": "S3",
     "AGENTCORE_UPDATE_FAILED": "AGENTCORE",
+    "AGENTCORE_SUBJECT_CONFLICT": "AGENTCORE",
     "IMAGE_SCAN_FAILED": "ECR",
     "IMAGE_SIGNING_FAILED": "ECR",
     "IMAGE_SUBJECT_CONFLICT": "ECR",
@@ -3282,11 +3294,33 @@ class ReleaseStepFailureObservationV2:
         transaction = StagingTransactionV2.from_bytes(
             transaction.to_bytes(), plan=plan
         )
-        if transaction.state != "UNCERTAIN":
-            raise ContractError("failure observation requires an UNCERTAIN transaction")
         if transaction.completed_step_count >= len(plan.steps):
             raise ContractError("failure observation has no exact next step")
         step = plan.steps[transaction.completed_step_count]
+        completed_prefix_sha256 = _completed_prefix_sha256(
+            [item.to_mapping() for item in transaction.completed_steps]
+        )
+        if transaction.state == "UNCERTAIN":
+            expected_operation_sha256 = transaction.uncertain_operation_sha256
+        elif transaction.state in {
+            "NEW",
+            "VERIFIED",
+            "ABORTED_RETAINED",
+            "ROLLED_BACK",
+        }:
+            raise ContractError(
+                "failure observation requires an active exact step"
+            )
+        elif step.mutation:
+            raise ContractError(
+                "stable failure observation requires a read-only next step"
+            )
+        else:
+            expected_operation_sha256 = _release_operation_sha256(
+                plan.digest(),
+                step,
+                completed_prefix_sha256,
+            )
         if (
             observation.plan_sha256 != plan.digest()
             or observation.step_id != step.step_id
@@ -3294,7 +3328,7 @@ class ReleaseStepFailureObservationV2:
             raise ContractError("failure observation plan or step differs")
         if observation.subject != step.subject:
             raise ContractError("failure observation subject differs")
-        if observation.operation_sha256 != transaction.uncertain_operation_sha256:
+        if observation.operation_sha256 != expected_operation_sha256:
             raise ContractError("failure observation operation differs")
         expected_statuses = _FAILED_RETAINED_KIND_REASON_STATUSES.get(
             step.kind, {}
@@ -4185,9 +4219,24 @@ class FailedRetainedEvidenceV2:
         transaction = StagingTransactionV2.from_bytes(
             transaction.to_bytes(), plan=plan
         )
-        if transaction.state != "UNCERTAIN":
+        if transaction.completed_step_count >= len(plan.steps):
+            raise ContractError("failed retained evidence has no exact next step")
+        next_step = plan.steps[transaction.completed_step_count]
+        stable_read_only = (
+            transaction.state
+            not in {
+                "NEW",
+                "UNCERTAIN",
+                "VERIFIED",
+                "ABORTED_RETAINED",
+                "ROLLED_BACK",
+            }
+            and not next_step.mutation
+        )
+        if transaction.state != "UNCERTAIN" and not stable_read_only:
             raise ContractError(
-                "failed retained evidence requires an UNCERTAIN transaction"
+                "failed retained evidence requires exact mutation intent or a "
+                "stable read-only next step"
             )
         expected_prefix = _completed_prefix_sha256(
             [step.to_mapping() for step in transaction.completed_steps]

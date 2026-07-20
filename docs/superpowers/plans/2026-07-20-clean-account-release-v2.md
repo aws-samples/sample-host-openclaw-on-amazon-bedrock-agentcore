@@ -223,24 +223,49 @@ state, and one closed stop reason. The journal validates those bytes and
 computes the stored abort digest in-package. An `UNCERTAIN` step must reconcile
 first; `ROLLED_BACK` remains impossible for `NO_PRIOR_RELEASE`.
 
-An authoritative terminal failure is never mapped to `ABSENT`. Reconciliation
-uses the separate `FAILED_RETAINED` disposition and a canonical nested
-`ReleaseStepFailureObservationV2`. `FailedRetainedEvidenceV2` binds those bytes
-to the plan, completed-prefix digest and count, stable state, exact failed step
-and subject, and exact uncertain operation. The journal computes the failure
-observation digest and failed-retained evidence digest in-package, preserves
-the failed step, subject, operation, and reason, leaves the completed prefix
-unchanged, clears uncertainty, and atomically enters `ABORTED_RETAINED`.
+An authoritative terminal failure is never mapped to `ABSENT` or `PENDING`.
+A mutation first enters `UNCERTAIN`; reconciliation then uses the separate
+`FAILED_RETAINED` disposition and a canonical nested
+`ReleaseStepFailureObservationV2`. A read-only next step never creates mutation
+intent. Its terminal scan or signing failure instead uses the atomic
+`fail_observation_retained` transition directly from the exact stable prefix.
+That transition accepts only the plan's exact read-only next step and derives
+the same plan-, step-, and prefix-bound operation identity; this digest is step
+identity, not write-ahead intent.
 
-The failure matrix is closed by operation: stack create, bootstrap, and
-change-set execution accept only `CREATE_FAILED`, `ROLLBACK_COMPLETE`, or
-`ROLLBACK_FAILED`; stack update accepts only `UPDATE_FAILED`,
-`UPDATE_ROLLBACK_COMPLETE`, or `UPDATE_ROLLBACK_FAILED`; change-set creation
-accepts only `FAILED`; AgentCore hardening accepts only `UPDATE_FAILED`.
-Image scan, signing, immutable-subject conflict, and retained partial-closure
-statuses are distinct, as are an S3 asset subject conflict and an existing
-runtime-context content conflict. Pending states and desired complete states
-cannot produce failure evidence.
+For both paths, `FailedRetainedEvidenceV2` binds the canonical observation to
+the plan, completed-prefix digest and count, stable state, exact failed step and
+subject, and exact operation. The journal computes the failure-observation and
+failed-retained-evidence digests in-package, preserves the failed step,
+subject, operation, reason, stable state, and completed prefix, clears any
+uncertainty, and atomically enters `ABORTED_RETAINED`. The clean-account
+`NO_PRIOR_RELEASE` posture never becomes a rollback claim.
+
+The failure matrix is closed by exact step kind, provider, reason, and terminal
+status:
+
+| Step kind | Provider | Failure reason | Exact terminal status |
+| --- | --- | --- | --- |
+| `BOOTSTRAP_STACK`, `STACK_CREATE`, `CHANGESET_EXECUTE` | `CLOUDFORMATION` | `CLOUDFORMATION_STACK_FAILED` | `CREATE_FAILED`, `ROLLBACK_COMPLETE`, or `ROLLBACK_FAILED` |
+| `STACK_UPDATE` | `CLOUDFORMATION` | `CLOUDFORMATION_STACK_FAILED` | `UPDATE_FAILED`, `UPDATE_ROLLBACK_COMPLETE`, or `UPDATE_ROLLBACK_FAILED` |
+| `CHANGESET_CREATE` | `CLOUDFORMATION` | `CLOUDFORMATION_CHANGESET_FAILED` | `FAILED` |
+| `BOOTSTRAP_STACK`, `STACK_CREATE`, `CHANGESET_CREATE`, `CHANGESET_EXECUTE` | `CLOUDFORMATION` | `CF_SUBJECT_CONFLICT` | `CREATE_COMPLETE` |
+| `STACK_UPDATE` | `CLOUDFORMATION` | `CF_SUBJECT_CONFLICT` | `UPDATE_COMPLETE` |
+| `AGENTCORE_HARDEN` | `AGENTCORE` | `AGENTCORE_UPDATE_FAILED` | `UPDATE_FAILED` |
+| `AGENTCORE_HARDEN` | `AGENTCORE` | `AGENTCORE_SUBJECT_CONFLICT` | `READY` |
+| `ASSET_PUBLISH` | `S3` | `ASSET_SUBJECT_CONFLICT` | `RETAINED_OBJECT_CONFLICT` |
+| `IMAGE_PUBLISH` | `ECR` | `IMAGE_SUBJECT_CONFLICT` | `IMMUTABLE_SUBJECT_CONFLICT` |
+| `IMAGE_PUBLISH` | `ECR` | `IMAGE_PARTIAL_CLOSURE` | `RETAINED_PARTIAL_CLOSURE` |
+| `IMAGE_PUBLISH`, `IMAGE_OBSERVE` | `ECR` | `IMAGE_SCAN_FAILED` | `SCAN_POLICY_FAILED` |
+| `IMAGE_PUBLISH`, `IMAGE_OBSERVE` | `ECR` | `IMAGE_SIGNING_FAILED` | `SIGNATURE_VERIFICATION_FAILED` |
+| `RUNTIME_CONTEXT_WRITE` | `LOCAL_FILESYSTEM` | `RUNTIME_CONTEXT_CONFLICT` | `EXISTING_CONTENT_CONFLICT` |
+
+`CF_SUBJECT_CONFLICT` and `AGENTCORE_SUBJECT_CONFLICT` mean the provider is in
+a nominally healthy status but the observed live identity or security-bearing
+configuration differs from the exact planned subject after intent. They are
+terminal retained conflicts, never absence and never retryable pending state.
+Healthy statuses are invalid for every other failure reason, and retryable,
+absent, unknown, or wrong-kind statuses cannot produce failure evidence.
 
 Numbered Bedrock guardrail versions use the same canonical form in foundation
 inputs and runtime configuration: `DRAFT` or `[1-9][0-9]{0,7}`. Before a real
@@ -276,9 +301,12 @@ Acceptance: committed independently with a clean tree and literal
   `AbortRetainedEvidenceV2`, `FailedRetainedEvidenceV2`, and
   `StagingTransactionV2` contracts beside v1, plus the streaming binary
   `PrivateMutationEnvelopeV2` framing outside the canonical-JSON parser.
-- Add a plan-prefix `TransactionJournalV2` with typed `ABSENT`, `PENDING`, and
-  `PRESENT` reconciliation. Only `PRESENT` accepts a typed observation; the
-  journal computes observation and abort digests internally.
+- Add a plan-prefix `TransactionJournalV2` with typed `ABSENT`, `PENDING`,
+  `PRESENT`, and terminal `FAILED_RETAINED` mutation reconciliation. Only
+  `PRESENT` accepts a success observation; `FAILED_RETAINED` accepts exact
+  failure evidence. A stable read-only failure uses the separate atomic
+  `fail_observation_retained` API without mutation intent. The journal computes
+  observation, failure, and abort digests internally.
 - Bind every operation to plan bytes, the exact next step, the completed
   evidence prefix, and referenced artifact bytes; never clear historical plan
   identity.
