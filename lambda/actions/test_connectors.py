@@ -423,6 +423,80 @@ def test_kernel_revocation_propagates_authority_revoker_failure_once():
     assert revoker.calls == ["google_conn_1234"]
 
 
+def test_kernel_exact_approval_revocation_is_durable_idempotent_and_blocks_dispatch():
+    record = action()
+    repository = Repository(record)
+    executor, repository, provider = gmail_fixtures.executor(
+        record,
+        repo=repository,
+    )
+    machine = machine_module.ActionStateMachine(
+        repository,
+        operation_id_factory=operation_ids(),
+    )
+    approvals = machine_module.ApprovalService(
+        state_machine=machine,
+        token_codec=machine_module.ApprovalTokenCodec(b"r" * 32),
+        founder_user_ids={record["userId"]},
+        now=lambda: NOW,
+    )
+    revoker = Revoker()
+    kernel = connectors_module.GenericConnectorKernel(
+        GmailConnectorAdapter(
+            executor=executor,
+            approval_service=approvals,
+            connection_revoker=revoker,
+        )
+    )
+    operation_id = "revoke_1234567890abcdef"
+
+    revoked = kernel.revoke(
+        record["connectionId"],
+        action_id=record["actionId"],
+        user_id=record["userId"],
+        revision=record["revision"],
+        operation_id=operation_id,
+    )
+
+    assert revoked["state"] == "CANCELLED"
+    assert revoked["cancellationReason"] == "approval-revoked"
+    assert revoked["lastTransitionId"] == operation_id
+    assert kernel.revoke(
+        record["connectionId"],
+        action_id=record["actionId"],
+        user_id=record["userId"],
+        revision=record["revision"],
+        operation_id=operation_id,
+    ) == revoked
+    assert len(repository.transitions) == 1
+    assert revoker.calls == []
+
+    with pytest.raises(send_module.SendValidationError, match="not approved"):
+        kernel.dispatch(record)
+    assert provider.send_calls == []
+
+
+def test_kernel_approval_revocation_requires_the_complete_exact_binding():
+    record = action()
+    approvals = object()
+    revoker = Revoker()
+    kernel = connectors_module.GenericConnectorKernel(
+        GmailConnectorAdapter(
+            executor=object(),
+            approval_service=approvals,
+            connection_revoker=revoker,
+        )
+    )
+
+    with pytest.raises(ValueError, match="complete exact approval binding"):
+        kernel.revoke(
+            record["connectionId"],
+            action_id=record["actionId"],
+        )
+
+    assert revoker.calls == []
+
+
 @pytest.mark.parametrize(
     ("action_id", "current_revision"),
     [("action_other_456", 2), ("action_target_123", 999)],

@@ -10,6 +10,14 @@ from actions.models import (
     CapabilityGrant,
     canonical_args_hash,
 )
+from actions.connectors import GenericConnectorKernel, GmailConnectorAdapter
+from actions.gmail_send import GmailSendExecutor, SendValidationError
+from actions.state_machine import (
+    ActionStateMachine,
+    ApprovalService as DurableApprovalService,
+    ApprovalTokenCodec,
+    ConcurrentActionUpdate,
+)
 
 from .retention import DeletionPending
 from .services import ApprovalWebService, RetentionSweepService, WorkspaceService
@@ -309,6 +317,182 @@ def test_reject_is_founder_and_exact_pending_revision_bound():
         )
     assert not [call for call in other_approvals.calls if call[0] == "reject"]
     assert other_events == []
+
+
+class DurableRevocationRepository:
+    def __init__(self):
+        self.record = pending(
+            state=ActionState.PREPARED.value,
+            revision=1,
+            ttl=int((NOW + timedelta(days=14)).timestamp()),
+        )
+        for field in (
+            "approvalId",
+            "approvalActionId",
+            "approvalDraftRevision",
+            "approvalArgsHash",
+            "approvalExpiresAt",
+        ):
+            self.record.pop(field, None)
+        self.transitions = []
+
+    def get(self, *, action_id, user_id):
+        if (
+            self.record["actionId"] != action_id
+            or self.record["userId"] != user_id
+        ):
+            return None
+        return dict(self.record)
+
+    def transition(self, **kwargs):
+        self.transitions.append(kwargs)
+        if (
+            self.record["actionId"] != kwargs["action_id"]
+            or self.record["userId"] != kwargs["user_id"]
+            or self.record["state"] != kwargs["expected_state"].value
+            or self.record["revision"] != kwargs["expected_revision"]
+        ):
+            raise ConcurrentActionUpdate("lost exact transition fence")
+        self.record.update(kwargs["updates"])
+        self.record["state"] = kwargs["target_state"].value
+        self.record["revision"] += 1
+        self.record["lastTransitionId"] = kwargs["transition_id"]
+        return dict(self.record)
+
+
+class NoSendProvider:
+    def __init__(self):
+        self.send_calls = []
+
+    def send_raw(self, **kwargs):
+        self.send_calls.append(kwargs)
+        raise AssertionError("a revoked action must never reach the provider")
+
+
+class NoConnectionRevoker:
+    @staticmethod
+    def revoke_all(_connection_ref):
+        raise AssertionError("one action revocation must not revoke the connection")
+
+
+def durable_revocation_service():
+    repository = DurableRevocationRepository()
+    machine = ActionStateMachine(
+        repository,
+        operation_id_factory=lambda: "transition_1234567890abcdef",
+    )
+    approvals = DurableApprovalService(
+        state_machine=machine,
+        token_codec=ApprovalTokenCodec(b"r" * 32),
+        founder_user_ids={USER},
+        now=lambda: NOW,
+        approval_id_factory=lambda: "approval_1234567890abcdef",
+    )
+    token = approvals.request_approval(
+        action_id=ACTION_ID,
+        revision=1,
+        acting_user_id=USER,
+        args=ARGS,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    provider = NoSendProvider()
+    executor = GmailSendExecutor(
+        state_machine=machine,
+        provider=provider,
+        founder_user_ids={USER},
+        connection_id="google_conn_1234",
+        account_email="founder@example.com",
+        sender_address="founder@example.com",
+        deletion_blocked=lambda _user_id: False,
+        now=lambda: NOW,
+    )
+    kernel = GenericConnectorKernel(
+        GmailConnectorAdapter(
+            executor=executor,
+            approval_service=approvals,
+            connection_revoker=NoConnectionRevoker(),
+        )
+    )
+    web = ApprovalWebService(
+        approval_service=approvals,
+        action_reader=repository,
+        executor_factory=lambda _action: kernel,
+        revocation_kernel=kernel,
+        founder_user_ids={USER},
+        now=lambda: NOW,
+    )
+    return web, approvals, repository, kernel, provider, token
+
+
+def test_revoke_reaches_kernel_as_one_durable_bound_idempotent_operation():
+    web, approvals, repository, kernel, provider, token = (
+        durable_revocation_service()
+    )
+    pending_revision = repository.record["revision"]
+
+    revoked = web.revoke(
+        action_id=ACTION_ID,
+        revision=pending_revision,
+        acting_user_id=USER,
+    )
+
+    assert revoked == {
+        "actionId": ACTION_ID,
+        "userId": USER,
+        "state": "CANCELLED",
+        "revision": pending_revision + 1,
+    }
+    operation_id = repository.record["lastTransitionId"]
+    assert operation_id.startswith("web_revoke_")
+    assert repository.record["cancellationReason"] == "approval-revoked"
+    assert len(repository.transitions) == 2
+
+    # The same authenticated request is a byte-stable logical retry.
+    assert web.revoke(
+        action_id=ACTION_ID,
+        revision=pending_revision,
+        acting_user_id=USER,
+    ) == revoked
+    assert repository.record["lastTransitionId"] == operation_id
+    assert len(repository.transitions) == 2
+
+    with pytest.raises(ConcurrentActionUpdate):
+        approvals.approve(
+            action_id=ACTION_ID,
+            revision=pending_revision,
+            acting_user_id=USER,
+            token=token,
+            args=ARGS,
+        )
+    with pytest.raises(SendValidationError):
+        kernel.dispatch(repository.record)
+    assert provider.send_calls == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"action_id": "action_other123"},
+        {"revision": 999},
+        {"acting_user_id": OTHER},
+    ],
+)
+def test_revoke_web_boundary_cannot_cross_action_revision_or_user(mutation):
+    web, _, repository, _, provider, _ = durable_revocation_service()
+    before = dict(repository.record)
+    call = {
+        "action_id": ACTION_ID,
+        "revision": repository.record["revision"],
+        "acting_user_id": USER,
+        **mutation,
+    }
+
+    with pytest.raises((CapabilityDenied, PermissionError, ValueError)):
+        web.revoke(**call)
+
+    assert repository.record == before
+    assert len(repository.transitions) == 1
+    assert provider.send_calls == []
 
 
 class WorkspaceStore:

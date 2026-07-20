@@ -40,7 +40,7 @@ MAX_QUERY_BYTES = 16 * 1024
 MAX_IMPORT_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_IMPORT_BODY_BYTES = 4 * ((MAX_IMPORT_BUNDLE_BYTES + 2) // 3) + 4_096
 _ACTION_ROUTE = re.compile(
-    r"/api/actions/(?P<action>[A-Za-z0-9_-]{8,128})/(?P<verb>approve|reject)"
+    r"/api/actions/(?P<action>[A-Za-z0-9_-]{8,128})/(?P<verb>approve|reject|revoke)"
 )
 _GMAIL_DRAFT_ROUTE = re.compile(
     r"/api/gmail/drafts/(?P<action>[A-Za-z0-9_-]{8,128})"
@@ -433,7 +433,8 @@ class WebApplication:
             if method == "POST" and action:
                 identity = self._identity(headers, mutate=True)
                 body = _json_body(event)
-                if action.group("verb") == "approve":
+                verb = action.group("verb")
+                if verb == "approve":
                     if set(body) != {"token", "revision", "args"}:
                         raise ValueError("approval request fields are invalid")
                     result = self._approvals.approve(
@@ -443,10 +444,18 @@ class WebApplication:
                         token=body["token"],
                         args=body["args"],
                     )
-                else:
+                elif verb == "reject":
                     if set(body) != {"revision"}:
                         raise ValueError("rejection request fields are invalid")
                     result = self._approvals.reject(
+                        action_id=action.group("action"),
+                        revision=body["revision"],
+                        acting_user_id=identity.user_id,
+                    )
+                else:
+                    if set(body) != {"revision"}:
+                        raise ValueError("revocation request fields are invalid")
+                    result = self._approvals.revoke(
                         action_id=action.group("action"),
                         revision=body["revision"],
                         acting_user_id=identity.user_id,

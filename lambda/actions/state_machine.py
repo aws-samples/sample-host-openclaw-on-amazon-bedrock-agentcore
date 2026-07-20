@@ -595,6 +595,117 @@ class ApprovalService:
             updates={"rejectedAt": now.isoformat()},
         )
 
+    def revoke(
+        self,
+        *,
+        action_id: str,
+        revision: int,
+        acting_user_id: str,
+        connection_ref: str,
+        operation_id: str,
+    ):
+        """Durably revoke one exact active approval/action generation.
+
+        ``operation_id`` is the trusted caller's stable retry identity.  The
+        action repository retains it as ``lastTransitionId``; an exact retry
+        therefore returns the already-committed terminal record, while another
+        operation cannot claim the revocation.  Only PREPARED, pending, or
+        APPROVED authority can be cancelled: once dispatch may have started,
+        reconciliation owns the outcome and this method fails closed.
+        """
+
+        self._founder(acting_user_id)
+        if (
+            not isinstance(operation_id, str)
+            or _OPERATION_ID.fullmatch(operation_id) is None
+        ):
+            raise ValueError("operation_id is invalid")
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+        ):
+            raise ValueError("revision is invalid")
+        record = self._machine.get(
+            action_id=action_id,
+            user_id=acting_user_id,
+        )
+        if not isinstance(record, Mapping):
+            raise ConcurrentActionUpdate("action does not exist")
+        if (
+            record.get("actionId") != action_id
+            or record.get("userId") != acting_user_id
+        ):
+            raise ConcurrentActionUpdate("action revocation binding changed")
+        args = record.get("args")
+        if not isinstance(args, Mapping):
+            raise CapabilityDenied("action has no exact revocable payload")
+        self._assert_exact_action(
+            record,
+            action_id=action_id,
+            user_id=acting_user_id,
+            args=args,
+        )
+        if record.get("connectionId") != connection_ref:
+            raise CapabilityDenied("revocation does not match the exact connection")
+        try:
+            state = ActionState(record.get("state"))
+        except (TypeError, ValueError):
+            raise CapabilityDenied("action has no exact revocable state") from None
+
+        # Exact retries reconcile without a second state mutation. The original
+        # expected revision is retained implicitly by the one-step increment.
+        if state is ActionState.CANCELLED:
+            if (
+                record.get("revision") == revision + 1
+                and record.get("lastTransitionId") == operation_id
+                and record.get("cancellationReason") == "approval-revoked"
+            ):
+                self._exact_time(record.get("cancelledAt"), "cancelledAt")
+                return dict(record)
+            raise ConcurrentActionUpdate(
+                "action was cancelled by another revocation operation"
+            )
+
+        if (
+            record.get("revision") != revision
+            or state
+            not in {
+                ActionState.PREPARED,
+                ActionState.APPROVAL_PENDING,
+                ActionState.APPROVED,
+            }
+        ):
+            raise ConcurrentActionUpdate("action cannot be revoked from this generation")
+        now = self._exact_time(self._now(), "now")
+        assert_action_retention_live(record, now=now)
+        cancelled_at = now.isoformat()
+        revoked = self._machine.transition(
+            action_id=action_id,
+            user_id=acting_user_id,
+            current=state,
+            target=ActionState.CANCELLED,
+            revision=revision,
+            operation_id=operation_id,
+            updates={
+                "cancelledAt": cancelled_at,
+                "cancellationReason": "approval-revoked",
+            },
+        )
+        if (
+            not isinstance(revoked, Mapping)
+            or revoked.get("actionId") != action_id
+            or revoked.get("userId") != acting_user_id
+            or revoked.get("connectionId") != connection_ref
+            or revoked.get("state") != ActionState.CANCELLED.value
+            or revoked.get("revision") != revision + 1
+            or revoked.get("lastTransitionId") != operation_id
+            or revoked.get("cancelledAt") != cancelled_at
+            or revoked.get("cancellationReason") != "approval-revoked"
+        ):
+            raise ConcurrentActionUpdate("action revocation outcome is unproven")
+        return revoked
+
     def expire(self, *, action_id: str, revision: int, user_id: str):
         record = self._record(
             action_id=action_id,

@@ -80,6 +80,12 @@ class LocalConnectionRevoker:
         self.events.append(("local", user_id))
 
 
+class ApprovalRevoker:
+    @staticmethod
+    def revoke(**_kwargs):
+        raise AssertionError("test setup must not revoke an approval")
+
+
 def test_founder_deletion_maps_exact_user_to_kernel_connection_once():
     class Kernel:
         def __init__(self):
@@ -476,6 +482,7 @@ def test_send_provider_secret_is_not_read_until_exact_executor_is_prepared():
         founder_user_ids={"founder-1"},
         deletion_blocked=lambda _user_id: False,
         connection_revoker=Revoker(),
+        approval_service=ApprovalRevoker(),
     )
     assert secrets.calls == []
 
@@ -505,6 +512,11 @@ def test_production_gmail_factory_requires_revocation_and_returns_kernel_dispatc
         def revoke_all(self, user_id):
             self.calls.append(user_id)
 
+    class Approvals:
+        @staticmethod
+        def revoke(**_kwargs):
+            raise AssertionError("construction must not revoke an approval")
+
     with pytest.raises((TypeError, ValueError)):
         composition.ProductionGmailExecutorFactory(
             secret_client=object(),
@@ -522,6 +534,7 @@ def test_production_gmail_factory_requires_revocation_and_returns_kernel_dispatc
         founder_user_ids={"founder-1"},
         deletion_blocked=lambda _user_id: False,
         connection_revoker=revoker,
+        approval_service=Approvals(),
     )
     monkeypatch.setattr(factory, "_assert_deletion_allows", lambda action: action["userId"])
     monkeypatch.setattr(
@@ -544,11 +557,25 @@ def test_production_gmail_factory_requires_revocation_and_returns_kernel_dispatc
 
     assert isinstance(dispatcher, GenericConnectorKernel)
     assert callable(dispatcher.dispatch)
+    assert isinstance(dispatcher._adapter._approvals, Approvals)
     dispatcher.revoke("google_conn_1234")
     assert revoker.calls == ["founder-1"]
     with pytest.raises(composition.CapabilityDenied, match="binding"):
         dispatcher.revoke("google_conn_other")
     assert revoker.calls == ["founder-1"]
+
+
+def test_production_gmail_factory_requires_a_durable_approval_revoker():
+    with pytest.raises(ValueError, match="approval revocation"):
+        composition.ProductionGmailExecutorFactory(
+            secret_client=object(),
+            secret_id="send",
+            state_machine=object(),
+            founder_user_ids={"founder-1"},
+            deletion_blocked=lambda _user_id: False,
+            connection_revoker=LocalConnectionRevoker([]),
+            approval_service=object(),
+        )
 
 
 def test_bound_connection_revoker_delegates_once_and_propagates_failure():
@@ -622,6 +649,7 @@ def test_deletion_intent_blocks_send_secret_and_oauth_before_provider_constructi
         founder_user_ids={"founder-1"},
         deletion_blocked=lambda user_id: user_id == "founder-1",
         connection_revoker=LocalConnectionRevoker([]),
+        approval_service=ApprovalRevoker(),
         token_client=tokens,
     )
     action = {
@@ -675,6 +703,7 @@ def test_uncertain_deletion_read_blocks_reconciliation_before_secret_or_oauth():
         founder_user_ids={"founder-1"},
         deletion_blocked=unavailable,
         connection_revoker=LocalConnectionRevoker([]),
+        approval_service=ApprovalRevoker(),
         token_client=tokens,
     )
     observers = composition.ProductionGmailReconcilerFactory(
@@ -715,6 +744,7 @@ def test_production_reconciliation_crosses_generic_connector_kernel_once(
 
     class Providers:
         _connection_revoker = AuthorityRevoker()
+        _approvals = ApprovalRevoker()
         _deletion_blocked = staticmethod(lambda _user_id: False)
 
         @staticmethod
@@ -804,6 +834,7 @@ def test_send_executor_rejects_cross_founder_secret_before_token_refresh():
         founder_user_ids={"founder-1", "founder-2"},
         deletion_blocked=lambda _user_id: False,
         connection_revoker=LocalConnectionRevoker([]),
+        approval_service=ApprovalRevoker(),
         token_client=tokens,
     )
 
@@ -1231,6 +1262,16 @@ def test_production_builder_reads_only_web_auth_secret_and_defers_provider_paths
     )
     assert application._gmail_workspace._enforce_connection_fence is True
     assert secrets.management_calls == []
+    assert secrets.calls == ["web-auth"]
+    control_kernel = application._gmail_workspace._approval_superseder
+    action_approvals = control_kernel._adapter._approvals
+    assert isinstance(action_approvals, composition.LazyActionApprovalPort)
+    assert action_approvals._value is None
+    web_approvals = application._approvals._get()
+    assert web_approvals._approvals is action_approvals
+    assert web_approvals._revocations is control_kernel
+    assert web_approvals._executor_factory._approvals is action_approvals
+    assert callable(application._approvals.revoke)
     assert secrets.calls == ["web-auth"]
     with pytest.raises(
         composition.ProductionConfigurationError, match="placeholder"

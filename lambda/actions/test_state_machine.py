@@ -412,6 +412,108 @@ def test_newer_draft_revision_atomically_stales_old_prepared_action():
         request_approval(service, record)
 
 
+def test_revoke_persists_one_exact_idempotent_terminal_operation_and_blocks_consumption():
+    record = prepared_action()
+    service, repo = approval_service(record)
+    token = request_approval(service, record)
+    pending_revision = repo.record["revision"]
+    operation_id = "revoke_1234567890abcdef"
+
+    revoked = service.revoke(
+        action_id=record["actionId"],
+        revision=pending_revision,
+        acting_user_id=record["userId"],
+        connection_ref=record["connectionId"],
+        operation_id=operation_id,
+    )
+
+    assert revoked["state"] == "CANCELLED"
+    assert revoked["revision"] == pending_revision + 1
+    assert revoked["cancelledAt"] == NOW.isoformat()
+    assert revoked["cancellationReason"] == "approval-revoked"
+    assert revoked["lastTransitionId"] == operation_id
+    assert len(repo.calls) == 2
+
+    # A lost response may retry the exact original command. It must reconcile
+    # to the same durable operation without another transition.
+    assert service.revoke(
+        action_id=record["actionId"],
+        revision=pending_revision,
+        acting_user_id=record["userId"],
+        connection_ref=record["connectionId"],
+        operation_id=operation_id,
+    ) == revoked
+    assert len(repo.calls) == 2
+
+    # The formerly live one-time bearer cannot be consumed after revocation.
+    with pytest.raises(machine_module.ConcurrentActionUpdate):
+        service.approve(
+            action_id=record["actionId"],
+            revision=pending_revision,
+            acting_user_id=record["userId"],
+            token=token,
+            args=record["args"],
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"action_id": "action_other123"},
+        {"revision": 999},
+        {"acting_user_id": "other-user"},
+        {"connection_ref": "google_conn_other"},
+    ],
+)
+def test_revoke_cannot_cross_action_revision_user_or_connection_binding(mutation):
+    record = prepared_action()
+    service, repo = approval_service(record)
+    request_approval(service, record)
+    before = dict(repo.record)
+    call = {
+        "action_id": record["actionId"],
+        "revision": repo.record["revision"],
+        "acting_user_id": record["userId"],
+        "connection_ref": record["connectionId"],
+        "operation_id": "revoke_1234567890abcdef",
+        **mutation,
+    }
+
+    with pytest.raises(
+        (models.CapabilityDenied, machine_module.ConcurrentActionUpdate)
+    ):
+        service.revoke(**call)
+
+    assert repo.record == before
+    assert len(repo.calls) == 1
+
+
+def test_revoke_replay_rejects_another_operation_identity():
+    record = prepared_action()
+    service, repo = approval_service(record)
+    request_approval(service, record)
+    pending_revision = repo.record["revision"]
+    service.revoke(
+        action_id=record["actionId"],
+        revision=pending_revision,
+        acting_user_id=record["userId"],
+        connection_ref=record["connectionId"],
+        operation_id="revoke_1234567890abcdef",
+    )
+    before = dict(repo.record)
+
+    with pytest.raises(machine_module.ConcurrentActionUpdate):
+        service.revoke(
+            action_id=record["actionId"],
+            revision=pending_revision,
+            acting_user_id=record["userId"],
+            connection_ref=record["connectionId"],
+            operation_id="revoke_fedcba0987654321",
+        )
+
+    assert repo.record == before
+
+
 class ConditionalFailure(Exception):
     response = {"Error": {"Code": "ConditionalCheckFailedException"}}
 

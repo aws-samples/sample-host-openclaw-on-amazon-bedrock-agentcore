@@ -47,6 +47,10 @@ class Approvals:
         self.calls.append(("reject", kwargs))
         return {"state": "REJECTED"}
 
+    def revoke(self, **kwargs):
+        self.calls.append(("revoke", kwargs))
+        return {"state": "CANCELLED"}
+
 
 class Workspace:
     def get(self, user_id):
@@ -1096,6 +1100,41 @@ def test_approval_get_only_previews_and_post_requires_csrf_and_same_session_user
     call = approvals.calls[-1]
     assert call[0] == "approve"
     assert call[1]["acting_user_id"] == USER
+
+
+def test_action_revoke_is_a_csrf_protected_exact_session_mutation():
+    app, tickets, _, approvals, _, _, _ = setup_app()
+    cookie, csrf = bootstrap(app, tickets)
+    path = "/api/actions/action_12345678/revoke"
+    body = {"revision": 3}
+
+    assert app.handle(event("POST", path, cookie=cookie, body=body))["statusCode"] == 401
+    assert not [call for call in approvals.calls if call[0] == "revoke"]
+
+    response = app.handle(
+        event("POST", path, cookie=cookie, csrf=csrf, body=body)
+    )
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["state"] == "CANCELLED"
+    assert approvals.calls[-1] == (
+        "revoke",
+        {
+            "action_id": "action_12345678",
+            "revision": 3,
+            "acting_user_id": USER,
+        },
+    )
+
+    assert app.handle(
+        event(
+            "POST",
+            path,
+            cookie=cookie,
+            csrf=csrf,
+            body={"revision": 3, "operationId": "caller-controlled"},
+        )
+    )["statusCode"] == 400
 
 
 def test_reject_export_workspace_and_confirmed_delete_are_session_scoped():

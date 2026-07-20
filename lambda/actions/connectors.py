@@ -87,8 +87,16 @@ class ConnectorAdapter(Protocol):
         """Reconcile a DISPATCHING/UNCERTAIN action; never re-dispatches."""
         ...
 
-    def revoke(self, connection_ref: str) -> None:
-        """Revoke the connection. The kernel never holds provider creds."""
+    def revoke(
+        self,
+        connection_ref: str,
+        *,
+        action_id: str | None = None,
+        user_id: str | None = None,
+        revision: int | None = None,
+        operation_id: str | None = None,
+    ):
+        """Revoke exact action authority or the whole bound connection."""
         ...
 
 
@@ -115,8 +123,8 @@ class GenericConnectorKernel:
     def reconcile(self, action):
         return self._adapter.reconcile(action)
 
-    def revoke(self, connection_ref):
-        return self._adapter.revoke(connection_ref)
+    def revoke(self, connection_ref, **binding):
+        return self._adapter.revoke(connection_ref, **binding)
 
     def supersede_pending(self, **kwargs):
         supersede = getattr(self._adapter, "supersede_pending", None)
@@ -219,9 +227,35 @@ class GmailConnectorAdapter:
             user_id=action["userId"],
         )
 
-    # --- revoke: kernel never holds provider creds ----------------------
-    def revoke(self, connection_ref: str) -> None:
-        self._connection_revoker.revoke_all(_connection_ref(connection_ref))
+    # --- revoke: persist action authority or revoke the whole connection -
+    def revoke(
+        self,
+        connection_ref: str,
+        *,
+        action_id: str | None = None,
+        user_id: str | None = None,
+        revision: int | None = None,
+        operation_id: str | None = None,
+    ):
+        connection_ref = _connection_ref(connection_ref)
+        action_binding = (action_id, user_id, revision, operation_id)
+        if any(value is not None for value in action_binding):
+            if any(value is None for value in action_binding):
+                raise ValueError("revocation requires a complete exact approval binding")
+            revoke = getattr(self._approvals, "revoke", None)
+            if not callable(revoke):
+                raise ValueError("approval revocation boundary is unavailable")
+            return revoke(
+                action_id=action_id,
+                revision=revision,
+                acting_user_id=user_id,
+                connection_ref=connection_ref,
+                operation_id=operation_id,
+            )
+        # Account deletion already owns a durable user fence before reaching
+        # this whole-connection path. The adapter still never holds provider
+        # credentials; it delegates only to the exact bound authority revoker.
+        return self._connection_revoker.revoke_all(connection_ref)
 
     # --- property 7: a newer draft atomically stales a pending approval -
     def supersede_pending(

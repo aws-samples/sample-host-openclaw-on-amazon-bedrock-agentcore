@@ -391,7 +391,22 @@ class SyntheticMcpConnectorAdapter:
         # there is no ambiguous provider evidence to reconcile.
         return None
 
-    def revoke(self, connection_ref: str) -> None:
+    def revoke(
+        self,
+        connection_ref: str,
+        *,
+        action_id: str | None = None,
+        user_id: str | None = None,
+        revision: int | None = None,
+        operation_id: str | None = None,
+    ) -> None:
+        if any(
+            value is not None
+            for value in (action_id, user_id, revision, operation_id)
+        ):
+            _fail(
+                "approval revocation is unavailable while the connector plane is disabled"
+            )
         # Drop the connection without the kernel ever holding provider creds.
         self._connection = None
 

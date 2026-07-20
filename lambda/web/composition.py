@@ -454,6 +454,28 @@ class LazyApprovalPort(_LazyPort):
     def reject(self, **kwargs):
         return self._get().reject(**kwargs)
 
+    def revoke(self, **kwargs):
+        return self._get().revoke(**kwargs)
+
+
+class LazyActionApprovalPort(_LazyPort):
+    """One cached durable ApprovalService shared by every Gmail kernel."""
+
+    def decode(self, token):
+        return self._get().decode(token)
+
+    def approve(self, **kwargs):
+        return self._get().approve(**kwargs)
+
+    def reject(self, **kwargs):
+        return self._get().reject(**kwargs)
+
+    def revoke(self, **kwargs):
+        return self._get().revoke(**kwargs)
+
+    def mark_stale(self, **kwargs):
+        return self._get().mark_stale(**kwargs)
+
 
 class _ExportSource:
     """Strong-read native plus active portable state for web/export surfaces."""
@@ -739,18 +761,22 @@ class ProductionGmailExecutorFactory:
         founder_user_ids: Iterable[str],
         deletion_blocked,
         connection_revoker,
+        approval_service,
         token_client=None,
     ) -> None:
         if not callable(deletion_blocked):
             raise ValueError("Gmail effect deletion fence is required")
         if not callable(getattr(connection_revoker, "revoke_all", None)):
             raise ValueError("Gmail connector revoker is required")
+        if not callable(getattr(approval_service, "revoke", None)):
+            raise ValueError("Gmail approval revocation boundary is required")
         self._secrets = secret_client
         self._secret_id = secret_id
         self._machine = state_machine
         self._founders = frozenset(founder_user_ids)
         self._deletion_blocked = deletion_blocked
         self._connection_revoker = connection_revoker
+        self._approvals = approval_service
         self._tokens = token_client or _GoogleSendTokenClient()
 
     def _assert_deletion_allows(self, action: Mapping[str, object]) -> str:
@@ -851,6 +877,7 @@ class ProductionGmailExecutorFactory:
             GmailConnectorAdapter(
                 executor=executor,
                 provider=provider,
+                approval_service=self._approvals,
                 connection_revoker=BoundConnectionAuthorityRevoker(
                     authority_revoker=self._connection_revoker,
                     connection_ref=connection_id,
@@ -935,6 +962,7 @@ class ProductionGmailReconcilerFactory:
                 executor=_UnavailableGmailExecutor(),
                 reconciler=reconciler,
                 provider=provider,
+                approval_service=self._providers._approvals,
                 connection_revoker=BoundConnectionAuthorityRevoker(
                     authority_revoker=self._providers._connection_revoker,
                     connection_ref=connection_id,
@@ -1043,6 +1071,19 @@ def build_production_application() -> WebApplication:
         secret_id=send_secret_id,
         founder_user_id=founder_user_id,
     )
+    action_approvals = LazyActionApprovalPort(
+        lambda: ApprovalService(
+            state_machine=action_machine,
+            token_codec=ApprovalTokenCodec(
+                _signing_secret(
+                    secrets,
+                    _required("APPROVAL_SIGNING_SECRET_ID"),
+                    purpose="approval signing",
+                )
+            ),
+            founder_user_ids=founders,
+        )
+    )
     gmail_provider_factory = ProductionGmailExecutorFactory(
         secret_client=secrets,
         secret_id=send_secret_id,
@@ -1052,6 +1093,7 @@ def build_production_application() -> WebApplication:
             web_store.get_deletion_intent(user_id) is not None
         ),
         connection_revoker=founder_connection_revoker,
+        approval_service=action_approvals,
     )
     gmail_control_kernel = GenericConnectorKernel(
         GmailConnectorAdapter(
@@ -1059,6 +1101,7 @@ def build_production_application() -> WebApplication:
             repository=action_repository,
             draft_editor=gmail_repository,
             state_machine=action_machine,
+            approval_service=action_approvals,
             connection_revoker=(
                 BoundConnectionAuthorityRevoker(
                     authority_revoker=founder_connection_revoker,
@@ -1103,21 +1146,11 @@ def build_production_application() -> WebApplication:
         )
 
     def approvals_factory():
-        approvals = ApprovalService(
-            state_machine=action_machine,
-            token_codec=ApprovalTokenCodec(
-                _signing_secret(
-                    secrets,
-                    _required("APPROVAL_SIGNING_SECRET_ID"),
-                    purpose="approval signing",
-                )
-            ),
-            founder_user_ids=founders,
-        )
         return ApprovalWebService(
-            approval_service=approvals,
+            approval_service=action_approvals,
             action_reader=action_repository,
             executor_factory=gmail_provider_factory,
+            revocation_kernel=gmail_control_kernel,
             founder_user_ids=founders,
         )
 

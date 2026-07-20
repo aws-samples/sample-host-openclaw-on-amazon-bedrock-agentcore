@@ -269,6 +269,23 @@ def test_revoke_drops_connection_without_touching_provider_creds():
     assert server.token_requests == 0
 
 
+def test_revoke_binding_kwargs_fail_closed_while_connector_plane_is_disabled():
+    server = synthetic_module.SyntheticMcpServer()
+    adapter = _adapter(server=server)
+
+    with pytest.raises(ContractValidationError, match="approval revocation"):
+        adapter.revoke(
+            CONNECTION_REF,
+            action_id="synthetic_prop_00000001",
+            user_id=USER_ID,
+            revision=1,
+            operation_id="revoke_1234567890abcdef",
+        )
+
+    assert adapter.read(_context(), "synthetic.notes.read-list", {})["notes"]
+    assert server.token_requests == 0
+
+
 # --- effect only through the kernel with a reloaded persisted record ------
 def test_prepare_performs_no_effect_and_dispatch_reloads_persisted_state():
     server = synthetic_module.SyntheticMcpServer()

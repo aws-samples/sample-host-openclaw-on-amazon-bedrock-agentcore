@@ -9,6 +9,7 @@ repository.  Only a later CSRF-protected POST may transition or execute.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import hmac
 from pathlib import PurePosixPath
 import re
@@ -95,6 +96,7 @@ class ApprovalWebService:
         approval_service,
         action_reader,
         executor_factory: Callable[[Mapping[str, object]], object],
+        revocation_kernel=None,
         founder_user_ids: Iterable[str],
         now: Callable[[], datetime] | None = None,
     ) -> None:
@@ -104,6 +106,11 @@ class ApprovalWebService:
         self._approvals = approval_service
         self._actions = action_reader
         self._executor_factory = executor_factory
+        if revocation_kernel is not None and not callable(
+            getattr(revocation_kernel, "revoke", None)
+        ):
+            raise TypeError("revocation kernel is invalid")
+        self._revocations = revocation_kernel
         self._founders = founders
         self._now = now or (lambda: datetime.now(timezone.utc))
 
@@ -337,6 +344,113 @@ class ApprovalWebService:
             "userId": user_id,
             "state": ActionState.REJECTED.value,
             "revision": _revision(rejected.get("revision")),
+        }
+
+    @staticmethod
+    def _revocation_operation_id(
+        *, action_id: str, user_id: str, revision: int, connection_ref: str
+    ) -> str:
+        digest = hashlib.sha256(
+            (
+                "personal-operator-web-approval-revocation-v1\0"
+                f"{user_id}\0{action_id}\0{revision}\0{connection_ref}"
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        return f"web_revoke_{digest}"
+
+    def revoke(
+        self,
+        *,
+        action_id: str,
+        revision: int,
+        acting_user_id: str,
+    ) -> dict[str, object]:
+        """Revoke one exact action through the production connector kernel."""
+
+        user_id = self._founder(acting_user_id)
+        action_id = _action_id(action_id)
+        revision = _revision(revision)
+        record = self._actions.get(action_id=action_id, user_id=user_id)
+        if not isinstance(record, Mapping):
+            raise CapabilityDenied("revocable action does not exist")
+        record = dict(record)
+        state = record.get("state")
+        record_revision = record.get("revision")
+        if (
+            record.get("actionId") != action_id
+            or record.get("userId") != user_id
+            or state
+            not in {
+                ActionState.PREPARED.value,
+                ActionState.APPROVAL_PENDING.value,
+                ActionState.APPROVED.value,
+                ActionState.CANCELLED.value,
+            }
+            or isinstance(record_revision, bool)
+            or not isinstance(record_revision, int)
+            or (
+                state != ActionState.CANCELLED.value
+                and record_revision != revision
+            )
+            or (
+                state == ActionState.CANCELLED.value
+                and record_revision != revision + 1
+            )
+        ):
+            raise CapabilityDenied(
+                "revocation does not reference the exact action generation"
+            )
+        args = record.get("args")
+        try:
+            exact_args = validate_email_args(args)
+            exact_hash = canonical_args_hash(exact_args)
+            connection_ref = record.get("connectionId")
+            account_email = record.get("accountEmail")
+            resource = gmail_resource(
+                connection_id=connection_ref,
+                account_email=account_email,
+            )
+        except (TypeError, ValueError) as error:
+            raise CapabilityDenied("revocable action binding is invalid") from error
+        if (
+            record.get("senderAddress") != account_email
+            or record.get("capability") != "gmail.send"
+            or not _same(record.get("resource"), resource)
+            or not _same(record.get("payloadHash"), exact_hash)
+        ):
+            raise CapabilityDenied("revocable action binding is invalid")
+        revoke = getattr(self._revocations, "revoke", None)
+        if not callable(revoke):
+            raise RuntimeError("approval revocation kernel is unavailable")
+        operation_id = self._revocation_operation_id(
+            action_id=action_id,
+            user_id=user_id,
+            revision=revision,
+            connection_ref=connection_ref,
+        )
+        revoked = revoke(
+            connection_ref,
+            action_id=action_id,
+            user_id=user_id,
+            revision=revision,
+            operation_id=operation_id,
+        )
+        if (
+            not isinstance(revoked, Mapping)
+            or revoked.get("actionId") != action_id
+            or revoked.get("userId") != user_id
+            or revoked.get("connectionId") != connection_ref
+            or revoked.get("state") != ActionState.CANCELLED.value
+            or revoked.get("revision") != revision + 1
+            or revoked.get("lastTransitionId") != operation_id
+            or revoked.get("cancellationReason") != "approval-revoked"
+        ):
+            raise RuntimeError("approval revocation outcome is unproven")
+        return {
+            "actionId": action_id,
+            "userId": user_id,
+            "state": ActionState.CANCELLED.value,
+            "revision": revision + 1,
         }
 
 
