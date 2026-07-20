@@ -22,6 +22,13 @@ from release_tools.contracts import (
     read_regular_bytes,
     write_new_contract,
 )
+from release_tools.evidence_store_v2 import (
+    EvidenceStoreV2Error,
+    ReleaseEvidenceStoreV2,
+    ReleaseOutcomeComposerV2,
+    VerifiedStepOutcomeV2,
+    _JOURNAL_TRANSITION_TOKEN,
+)
 
 
 Evidence = Mapping[str, str]
@@ -318,13 +325,7 @@ class TransactionJournal:
 
 
 class TransactionJournalV2:
-    """Plan-bound, prefix-recoverable clean-account release journal.
-
-    This class owns durable intent and reconciliation only. It deliberately has
-    no mutation callback, process launcher, provider client, or rollback-completion
-    surface. The caller dispatches one closed plan step after ``begin_step`` and
-    supplies only independently observed disposition/evidence.
-    """
+    """Plan-, execution-, and evidence-store-bound clean-account journal."""
 
     def __init__(
         self,
@@ -333,7 +334,11 @@ class TransactionJournalV2:
         plan: ReleasePlanV2,
         current: StagingTransactionV2,
         payload: bytes,
+        evidence_store: ReleaseEvidenceStoreV2,
+        journal_execution_id: str,
     ) -> None:
+        if not isinstance(evidence_store, ReleaseEvidenceStoreV2):
+            raise TransactionError("v2 journal requires a release evidence store")
         try:
             canonical_plan = _canonical_release_plan_v2(plan)
             canonical_current = StagingTransactionV2.from_bytes(
@@ -347,6 +352,9 @@ class TransactionJournalV2:
         self.plan = canonical_plan
         self.current = canonical_current
         self._payload = payload
+        self.evidence_store = evidence_store
+        self.journal_execution_id = journal_execution_id
+        self._audit()
 
     @classmethod
     def create(
@@ -354,9 +362,12 @@ class TransactionJournalV2:
         path: Path,
         *,
         plan: ReleasePlanV2,
+        evidence_store: ReleaseEvidenceStoreV2,
     ) -> "TransactionJournalV2":
         if not isinstance(plan, ReleasePlanV2):
             raise TransactionError("v2 transaction requires a typed release plan")
+        if not isinstance(evidence_store, ReleaseEvidenceStoreV2):
+            raise TransactionError("v2 transaction requires an evidence store")
         try:
             plan = _canonical_release_plan_v2(plan)
         except (AttributeError, ContractError, TypeError, ValueError) as error:
@@ -412,8 +423,23 @@ class TransactionJournalV2:
             },
             plan=plan,
         )
-        write_new_contract(Path(path), value)
-        return cls(Path(path), plan=plan, current=value, payload=value.to_bytes())
+        try:
+            execution_id = evidence_store.bind_new_journal(
+                journal_path=Path(path),
+                plan=plan,
+                initial_transaction=value,
+            )
+            write_new_contract(Path(path), value)
+        except (ContractError, EvidenceStoreV2Error, OSError) as error:
+            raise TransactionError(str(error)) from error
+        return cls(
+            Path(path),
+            plan=plan,
+            current=value,
+            payload=value.to_bytes(),
+            evidence_store=evidence_store,
+            journal_execution_id=execution_id,
+        )
 
     @classmethod
     def load(
@@ -421,20 +447,112 @@ class TransactionJournalV2:
         path: Path,
         *,
         plan: ReleasePlanV2,
+        evidence_store: ReleaseEvidenceStoreV2,
     ) -> "TransactionJournalV2":
         if not isinstance(plan, ReleasePlanV2):
             raise TransactionError("v2 transaction requires a typed release plan")
+        if not isinstance(evidence_store, ReleaseEvidenceStoreV2):
+            raise TransactionError("v2 transaction requires an evidence store")
         try:
             plan = _canonical_release_plan_v2(plan)
+            execution_id = evidence_store.bind_existing_journal(
+                journal_path=Path(path), plan=plan
+            )
             payload = read_regular_bytes(Path(path))
             current = StagingTransactionV2.from_bytes(payload, plan=plan)
-        except (AttributeError, ContractError, TypeError, ValueError) as error:
+        except (
+            AttributeError,
+            ContractError,
+            EvidenceStoreV2Error,
+            TypeError,
+            ValueError,
+        ) as error:
             if "regular file" in str(error):
                 raise TransactionError(str(error)) from error
             raise TransactionError(f"invalid v2 journal boundary: {error}") from error
         if current.plan_sha256 != plan.digest():
             raise TransactionError("v2 transaction plan differs from the journal")
-        return cls(Path(path), plan=plan, current=current, payload=payload)
+        journal = cls(
+            Path(path),
+            plan=plan,
+            current=current,
+            payload=payload,
+            evidence_store=evidence_store,
+            journal_execution_id=execution_id,
+        )
+        journal._recover_pending_transition()
+        return journal
+
+    def _recover_pending_transition(self) -> None:
+        """Finalize one already-retained transition without provider access."""
+
+        try:
+            transition = self.evidence_store.pending_recovery_transition(
+                plan=self.plan,
+                transaction=self.current,
+                journal_path=self.path,
+                journal_execution_id=self.journal_execution_id,
+                _token=_JOURNAL_TRANSITION_TOKEN,
+            )
+        except (ContractError, EvidenceStoreV2Error, OSError) as error:
+            raise TransactionError(
+                f"journal recovery audit failed: {error}"
+            ) from error
+        if transition is None:
+            return
+
+        prior_payload = transition.prior_transaction.to_bytes()
+        next_transaction = transition.next_transaction
+        next_payload = next_transaction.to_bytes()
+        if self._payload == prior_payload:
+            try:
+                atomic_replace_contract(
+                    self.path, prior_payload, next_transaction
+                )
+            except ContractError as error:
+                if "changed concurrently" in str(error):
+                    raise TransactionError(
+                        "staging transaction changed concurrently"
+                    ) from error
+                raise TransactionError(
+                    f"journal recovery CAS failed: {error}"
+                ) from error
+            self.current = next_transaction
+            self._payload = next_payload
+        elif self._payload != next_payload:
+            raise TransactionError(
+                "journal recovery state differs from its transition"
+            )
+
+        try:
+            self.evidence_store.commit_transition(
+                transition, _token=_JOURNAL_TRANSITION_TOKEN
+            )
+        except (ContractError, EvidenceStoreV2Error, OSError) as error:
+            raise TransactionError(
+                "journal recovery commit failed"
+            ) from error
+        self._audit()
+
+    def _audit(self) -> None:
+        try:
+            self.evidence_store.audit_prefix(
+                plan=self.plan,
+                transaction=self.current,
+                journal_path=self.path,
+                journal_execution_id=self.journal_execution_id,
+            )
+        except (ContractError, EvidenceStoreV2Error, OSError) as error:
+            try:
+                if read_regular_bytes(self.path) != self._payload:
+                    raise TransactionError(
+                        "staging transaction changed concurrently"
+                    ) from error
+            except TransactionError:
+                raise
+            except (ContractError, OSError):
+                pass
+            raise TransactionError(str(error)) from error
 
     def _persist(self, candidate: StagingTransactionV2) -> StagingTransactionV2:
         try:
@@ -442,8 +560,18 @@ class TransactionJournalV2:
             candidate = StagingTransactionV2.from_bytes(
                 candidate.to_bytes(), plan=canonical_plan
             )
+            transition = self.evidence_store.prepare_transition(
+                plan=canonical_plan,
+                prior=self.current,
+                next_transaction=candidate,
+                journal_path=self.path,
+                journal_execution_id=self.journal_execution_id,
+                _token=_JOURNAL_TRANSITION_TOKEN,
+            )
         except (AttributeError, ContractError, TypeError, ValueError) as error:
             raise TransactionError(f"invalid v2 journal candidate: {error}") from error
+        except (EvidenceStoreV2Error, OSError) as error:
+            raise TransactionError(str(error)) from error
         try:
             atomic_replace_contract(self.path, self._payload, candidate)
         except ContractError as error:
@@ -453,6 +581,15 @@ class TransactionJournalV2:
         self.current = candidate
         self.plan = canonical_plan
         self._payload = candidate.to_bytes()
+        try:
+            self.evidence_store.commit_transition(
+                transition, _token=_JOURNAL_TRANSITION_TOKEN
+            )
+        except (ContractError, EvidenceStoreV2Error, OSError) as error:
+            raise TransactionError(
+                "journal CAS completed but its transition commit failed"
+            ) from error
+        self._audit()
         return candidate
 
     def _steps(self) -> list[dict[str, object]]:
@@ -471,6 +608,7 @@ class TransactionJournalV2:
     def resume_step(self) -> dict[str, object] | None:
         """Return only the exact next plan step, never a caller-selected phase."""
 
+        self._audit()
         if self.current.state == "UNCERTAIN":
             raise TransactionError("UNCERTAIN v2 transaction must reconcile first")
         if self.current.state in {"VERIFIED", "ABORTED_RETAINED", "ROLLED_BACK"}:
@@ -480,6 +618,7 @@ class TransactionJournalV2:
         return self._next_step()
 
     def advance_preflight(self) -> StagingTransactionV2:
+        self._audit()
         if self.current.state != "NEW":
             raise TransactionError("v2 preflight cannot rewind or repeat")
         mapping = self.current.to_mapping()
@@ -497,6 +636,7 @@ class TransactionJournalV2:
     def operation_sha256(self) -> str:
         """Derive the one operation identity from plan bytes and next step."""
 
+        self._audit()
         if self.current.state == "UNCERTAIN":
             return self.current.uncertain_operation_sha256
         step = self._next_step()
@@ -512,6 +652,7 @@ class TransactionJournalV2:
     def completed_prefix_sha256(self) -> str:
         """Hash the exact canonical evidence prefix already retained."""
 
+        self._audit()
         return _completed_prefix_sha256(
             [step.to_mapping() for step in self.current.completed_steps]
         )
@@ -519,6 +660,7 @@ class TransactionJournalV2:
     def begin_step(self) -> StagingTransactionV2:
         """Write one exact next-step intent before any external dispatch."""
 
+        self._audit()
         if self.current.state == "UNCERTAIN":
             raise TransactionError("v2 transaction is already UNCERTAIN")
         if self.current.state in {"NEW", "VERIFIED", "ABORTED_RETAINED", "ROLLED_BACK"}:
@@ -544,14 +686,51 @@ class TransactionJournalV2:
             StagingTransactionV2.from_mapping(mapping, plan=self.plan)
         )
 
+    def outcome_composer(self) -> ReleaseOutcomeComposerV2:
+        """Return the sole production path for a retained provider outcome."""
+
+        self._audit()
+        return self.evidence_store.composer(
+            plan=self.plan,
+            journal_path=self.path,
+            journal_execution_id=self.journal_execution_id,
+        )
+
+    def _claim_outcome(
+        self,
+        *,
+        outcome: VerifiedStepOutcomeV2,
+    ):
+        if not isinstance(outcome, VerifiedStepOutcomeV2):
+            raise TransactionError("transition requires a verified retained outcome")
+        try:
+            plan = _canonical_release_plan_v2(self.plan)
+            retained = outcome._claim(
+                store=self.evidence_store,
+                plan=plan,
+                transaction=self.current,
+                journal_path=self.path,
+                journal_execution_id=self.journal_execution_id,
+            )
+        except (
+            AttributeError,
+            ContractError,
+            EvidenceStoreV2Error,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise TransactionError(str(error)) from error
+        return retained
+
     def _record_present(
         self,
         *,
         step: Mapping[str, object],
-        observation: ReleaseStepObservationV2,
+        retained,
     ) -> StagingTransactionV2:
-        if not isinstance(observation, ReleaseStepObservationV2):
-            raise TransactionError("PRESENT requires a typed release step observation")
+        observation = retained.step_observation
+        if observation is None or retained.disposition != "PRESENT":
+            raise TransactionError("retained outcome is not PRESENT")
         try:
             plan = _canonical_release_plan_v2(self.plan)
             observation = ReleaseStepObservationV2.from_bytes(
@@ -565,7 +744,12 @@ class TransactionJournalV2:
                 prior_runtime_version=self.current.runtime_version,
                 prior_runtime_arn=self.current.runtime_arn,
             )
-        except (AttributeError, ContractError, TypeError, ValueError) as error:
+        except (
+            AttributeError,
+            ContractError,
+            TypeError,
+            ValueError,
+        ) as error:
             raise TransactionError(str(error)) from error
         phase = step.get("phase")
         if not isinstance(phase, str) or phase not in _V2_PHASE_STATES:
@@ -576,7 +760,7 @@ class TransactionJournalV2:
             next_index == len(steps)
             or steps[next_index].get("phase") != phase
         )
-        evidence_sha256 = observation.digest()
+        evidence_sha256 = retained.digest()
 
         mapping = self.current.to_mapping()
         completed = list(mapping["completedSteps"])
@@ -648,50 +832,16 @@ class TransactionJournalV2:
             StagingTransactionV2.from_mapping(mapping, plan=plan)
         )
 
-    def complete_observation(
-        self,
-        *,
-        observation: ReleaseStepObservationV2,
-    ) -> StagingTransactionV2:
-        """Record a repeatable read-only plan step without an uncertain state."""
-
-        if self.current.state in {
-            "NEW",
-            "UNCERTAIN",
-            "VERIFIED",
-            "ABORTED_RETAINED",
-            "ROLLED_BACK",
-        }:
-            raise TransactionError("v2 transaction cannot record this observation")
-        step = self._next_step()
-        if step is None or step.get("mutation") is not False:
-            raise TransactionError("v2 next plan step is not a read-only observation")
-        return self._record_present(
-            step=step,
-            observation=observation,
-        )
-
-    def _record_failed_retained(
-        self,
-        *,
-        evidence: FailedRetainedEvidenceV2,
-    ) -> StagingTransactionV2:
-        """Validate and persist one canonical terminal failure."""
-
-        if not isinstance(evidence, FailedRetainedEvidenceV2):
-            raise TransactionError("retained failure requires typed failure evidence")
-        try:
-            evidence = FailedRetainedEvidenceV2.from_bytes(evidence.to_bytes())
-            evidence.validate_transaction(self.plan, self.current)
-        except (AttributeError, ContractError, TypeError, ValueError) as error:
-            raise TransactionError(str(error)) from error
-        failure = evidence.failure_observation
+    def _record_failed(self, *, retained) -> StagingTransactionV2:
+        failure = retained.failure_observation
+        if failure is None or retained.disposition != "FAILED_RETAINED":
+            raise TransactionError("retained outcome is not a terminal failure")
         mapping = self.current.to_mapping()
         mapping.update(
             {
                 "state": "ABORTED_RETAINED",
                 "abortEvidenceSha256": "",
-                "failedRetainedEvidenceSha256": evidence.digest(),
+                "failedRetainedEvidenceSha256": retained.digest(),
                 "failureObservationSha256": failure.digest(),
                 "failedStepId": failure.step_id,
                 "failedSubject": failure.subject,
@@ -706,19 +856,12 @@ class TransactionJournalV2:
             StagingTransactionV2.from_mapping(mapping, plan=self.plan)
         )
 
-    def fail_observation_retained(
-        self,
-        *,
-        evidence: FailedRetainedEvidenceV2,
+    def complete_observation(
+        self, *, outcome: VerifiedStepOutcomeV2
     ) -> StagingTransactionV2:
-        """Terminally retain a stable prefix after an exact read-only failure.
+        """Consume one retained outcome for the exact read-only next step."""
 
-        Read-only steps never acquire write-ahead mutation intent. Their closed,
-        terminal failures therefore transition directly from the stable prefix,
-        while preserving the same plan-bound operation identity used by an
-        authoritative observation.
-        """
-
+        self._audit()
         if self.current.state in {
             "NEW",
             "UNCERTAIN",
@@ -726,87 +869,80 @@ class TransactionJournalV2:
             "ABORTED_RETAINED",
             "ROLLED_BACK",
         }:
-            raise TransactionError(
-                "v2 transaction cannot retain a read-only failure from this state"
-            )
+            raise TransactionError("v2 transaction cannot record this observation")
         step = self._next_step()
         if step is None or step.get("mutation") is not False:
-            raise TransactionError(
-                "v2 next plan step is not a read-only observation"
-            )
-        if not isinstance(evidence, FailedRetainedEvidenceV2):
-            raise TransactionError(
-                "read-only retained failure requires typed failure evidence"
-            )
-        return self._record_failed_retained(evidence=evidence)
+            raise TransactionError("v2 next plan step is not a read-only observation")
+        retained = self._claim_outcome(outcome=outcome)
+        if retained.disposition == "PRESENT":
+            return self._record_present(step=step, retained=retained)
+        if retained.disposition == "FAILED_RETAINED":
+            return self._record_failed(retained=retained)
+        if retained.disposition not in {"ABSENT", "PENDING"}:
+            raise TransactionError("retained read-only outcome is invalid")
+        mapping = self.current.to_mapping()
+        mapping["revision"] = self.current.revision + 1
+        return self._persist(
+            StagingTransactionV2.from_mapping(mapping, plan=self.plan)
+        )
 
     def reconcile_step(
         self,
         *,
-        disposition: ObservationDisposition,
-        operation_sha256: str,
-        observation: ReleaseStepObservationV2 | None = None,
-        failure_evidence: FailedRetainedEvidenceV2 | None = None,
+        outcome: VerifiedStepOutcomeV2,
     ) -> StagingTransactionV2:
-        """Resolve one intent using only authoritative step observation."""
+        """Resolve one intent using one private retained outcome capability."""
 
+        self._audit()
         if self.current.state != "UNCERTAIN":
             raise TransactionError("only an UNCERTAIN v2 step can reconcile")
-        if not isinstance(disposition, ObservationDisposition):
-            raise TransactionError("v2 observation disposition is invalid")
-        if operation_sha256 != self.current.uncertain_operation_sha256:
-            raise TransactionError("reconciliation operation digest differs from the journal")
         step = self._next_step()
         if step is None or step.get("id") != self.current.uncertain_step_id:
             raise TransactionError("UNCERTAIN v2 step is not the exact plan prefix")
-        if disposition is ObservationDisposition.FAILED_RETAINED:
-            if observation is not None:
-                raise TransactionError(
-                    "FAILED_RETAINED reconciliation accepts no PRESENT observation"
+        retained = self._claim_outcome(outcome=outcome)
+        if retained.disposition == "FAILED_RETAINED":
+            return self._record_failed(retained=retained)
+        if retained.disposition == "PRESENT":
+            return self._record_present(step=step, retained=retained)
+        if retained.disposition in {"ABSENT", "PENDING"}:
+            try:
+                dispatch_state = self.evidence_store.dispatch_attempt_state(
+                    plan=self.plan,
+                    transaction=self.current,
+                    journal_path=self.path,
+                    journal_execution_id=self.journal_execution_id,
                 )
-            if not isinstance(failure_evidence, FailedRetainedEvidenceV2):
+            except (ContractError, EvidenceStoreV2Error, OSError) as error:
                 raise TransactionError(
-                    "FAILED_RETAINED reconciliation requires typed failure evidence"
-                )
-            return self._record_failed_retained(
-                evidence=failure_evidence,
-            )
-        if failure_evidence is not None:
-            raise TransactionError(
-                f"{disposition.value} reconciliation accepts no failure evidence"
-            )
-        if disposition is not ObservationDisposition.PRESENT:
-            if observation is not None:
-                raise TransactionError(
-                    f"{disposition.value} reconciliation accepts no observation"
-                )
-            if disposition is ObservationDisposition.PENDING:
+                    "dispatch-attempt audit failed during reconciliation"
+                ) from error
+            # Once an exact durable dispatch marker exists, neither eventual
+            # absence nor a retryable observation may advance the journal or
+            # erase write-ahead intent.  The same revision remains UNCERTAIN
+            # until authoritative PRESENT or FAILED_RETAINED evidence exists.
+            if dispatch_state.attempted:
                 return self.current
             mapping = self.current.to_mapping()
-            mapping.update(
-                {
-                    "state": self.current.last_stable_state,
-                    "uncertainStepId": "",
-                    "uncertainOperationSha256": "",
-                    "revision": self.current.revision + 1,
-                }
-            )
+            if retained.disposition == "ABSENT":
+                mapping.update(
+                    {
+                        "state": self.current.last_stable_state,
+                        "uncertainStepId": "",
+                        "uncertainOperationSha256": "",
+                    }
+                )
+            mapping["revision"] = self.current.revision + 1
             return self._persist(
                 StagingTransactionV2.from_mapping(mapping, plan=self.plan)
             )
-
-        if observation is None:
-            raise TransactionError("PRESENT reconciliation requires an observation")
-        return self._record_present(
-            step=step,
-            observation=observation,
-        )
+        raise TransactionError("retained mutation outcome is invalid")
 
     def abort_retained(
         self, *, evidence: AbortRetainedEvidenceV2
     ) -> StagingTransactionV2:
         """Terminally retain an exact stable clean-account prefix."""
 
+        self._audit()
         if self.current.state == "UNCERTAIN":
             raise TransactionError("UNCERTAIN v2 transaction must reconcile before abort")
         if self.current.state in {

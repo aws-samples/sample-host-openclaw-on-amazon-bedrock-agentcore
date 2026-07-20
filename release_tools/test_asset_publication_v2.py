@@ -24,6 +24,12 @@ from release_tools.contracts import (
     VerifiedPrivateMutationV2,
     write_new_private_mutation_envelope,
 )
+from release_tools.dispatch_attempt_v2 import (
+    DispatchAttemptError,
+    FreshDispatchAuthorityV1,
+    ReleaseDispatchAttemptV1,
+    _mint_fresh_dispatch_authority,
+)
 from release_tools.test_contracts import _release_plan_v2
 from release_tools.test_aws_authority_v2 import attested_test_client
 from release_tools.test_transaction import (
@@ -39,6 +45,45 @@ COMMIT = "a" * 40
 TREE = "b" * 40
 PAYLOAD = b'{"Resources":{}}'
 ASSET_ID = "d" * 64
+
+
+def _fresh_dispatch(
+    verified: VerifiedPrivateMutationV2,
+    *,
+    provider: str = "S3",
+    operation_sha256: str | None = None,
+    resolved_request_sha256: str | None = None,
+) -> tuple[FreshDispatchAuthorityV1, ReleaseDispatchAttemptV1]:
+    resolved = verified.resolved_request
+    request = resolved.mutation_request
+    attempt = ReleaseDispatchAttemptV1(
+        release_plan_sha256=request.plan_sha256,
+        evidence_store_sha256="1" * 64,
+        journal_path_sha256="2" * 64,
+        journal_execution_id="3" * 64,
+        journal_revision=1,
+        completed_prefix_sha256=request.completed_prefix_sha256,
+        step_id=request.step_id,
+        subject=request.subject,
+        operation_sha256=(operation_sha256 or request.operation_sha256),
+        resolved_request_sha256=(
+            resolved_request_sha256 or resolved.digest()
+        ),
+        provider=provider,
+    )
+    return _mint_fresh_dispatch_authority(attempt), attempt
+
+
+class _ForgedFreshDispatchAuthority(FreshDispatchAuthorityV1):
+    """Subclass that deliberately skips the token-gated base constructor."""
+
+    __slots__ = ("_forged_attempt",)
+
+    def __init__(self, attempt: ReleaseDispatchAttemptV1) -> None:
+        self._forged_attempt = attempt
+
+    def consume(self, **_kwargs: object) -> ReleaseDispatchAttemptV1:
+        return self._forged_attempt
 
 
 def _artifact(
@@ -242,10 +287,20 @@ def test_asset_publisher_streams_exact_verified_payload_to_one_s3_call(
         raw_artifact,
         content_sha256=content_sha256,
     ) as verified:
+        fresh_authority, expected_attempt = _fresh_dispatch(verified)
         with attested_test_client(fake, service="s3") as client:
-            acknowledgement = S3AssetPublisher(client).publish(verified)
+            acknowledgement = S3AssetPublisher(client).publish(
+                verified,
+                fresh_authority=fresh_authority,
+            )
 
-    assert acknowledgement == {"dispatched": True}
+    assert acknowledgement == expected_attempt
+    with pytest.raises(DispatchAttemptError, match="already consumed"):
+        fresh_authority.consume(
+            provider="S3",
+            operation_sha256=expected_attempt.operation_sha256,
+            resolved_request_sha256=expected_attempt.resolved_request_sha256,
+        )
     assert fake.payloads == [payload]
     assert len(fake.calls) == 1
     call = fake.calls[0]
@@ -308,8 +363,73 @@ def test_asset_header_rejects_substitution_or_cross_subject(
 
 
 def test_publisher_rejects_free_object_instead_of_verified_capability() -> None:
-    with pytest.raises(AssetPublicationError, match="verified"):
+    with pytest.raises(TypeError, match="fresh_authority"):
         S3AssetPublisher(FakeS3()).publish(object())  # type: ignore[arg-type]
+
+
+def test_asset_dispatch_fence_rejects_missing_duck_crossed_or_consumed_authority(
+    tmp_path: Path,
+) -> None:
+    raw_artifact = _artifact()
+    with _verified_asset(
+        tmp_path,
+        raw_artifact,
+        content_sha256=hashlib.sha256(PAYLOAD).hexdigest(),
+    ) as verified:
+        missing_fake = FakeS3()
+        with attested_test_client(missing_fake, service="s3") as client:
+            with pytest.raises(TypeError, match="fresh_authority"):
+                S3AssetPublisher(client).publish(verified)
+        assert missing_fake.calls == []
+
+        crossed_provider, _ = _fresh_dispatch(
+            verified, provider="CLOUDFORMATION"
+        )
+        crossed_operation, _ = _fresh_dispatch(
+            verified,
+            operation_sha256="sha256:" + "f" * 64,
+        )
+        crossed_request, _ = _fresh_dispatch(
+            verified,
+            resolved_request_sha256="e" * 64,
+        )
+        consumed, consumed_attempt = _fresh_dispatch(verified)
+        _, forged_attempt = _fresh_dispatch(verified)
+        forged = _ForgedFreshDispatchAuthority(forged_attempt)
+        assert consumed.consume(
+            provider="S3",
+            operation_sha256=consumed_attempt.operation_sha256,
+            resolved_request_sha256=consumed_attempt.resolved_request_sha256,
+        ) == consumed_attempt
+
+        for authority in (
+            object(),
+            crossed_provider,
+            crossed_operation,
+            crossed_request,
+            consumed,
+            forged,
+        ):
+            fake = FakeS3()
+            with attested_test_client(fake, service="s3") as client:
+                with pytest.raises(
+                    AssetPublicationError,
+                    match="dispatch authority",
+                ):
+                    S3AssetPublisher(client).publish(
+                        verified,
+                        fresh_authority=authority,  # type: ignore[arg-type]
+                    )
+            assert fake.calls == []
+
+        with pytest.raises(DispatchAttemptError, match="already consumed"):
+            consumed.consume(
+                provider="S3",
+                operation_sha256=consumed_attempt.operation_sha256,
+                resolved_request_sha256=(
+                    consumed_attempt.resolved_request_sha256
+                ),
+            )
 
 
 def test_raw_client_with_forgeable_account_marker_is_rejected(
@@ -322,8 +442,12 @@ def test_raw_client_with_forgeable_account_marker_is_rejected(
         raw_artifact,
         content_sha256=hashlib.sha256(PAYLOAD).hexdigest(),
     ) as verified:
+        fresh_authority, _ = _fresh_dispatch(verified)
         with pytest.raises(AssetPublicationError, match="attested"):
-            S3AssetPublisher(fake).publish(verified)
+            S3AssetPublisher(fake).publish(
+                verified,
+                fresh_authority=fresh_authority,
+            )
     assert fake.calls == []
 
 
@@ -339,9 +463,13 @@ def test_verified_artifact_identity_drift_fails_before_provider_call(
         raw_artifact,
         content_sha256=content_sha256,
     ) as verified:
+        fresh_authority, _ = _fresh_dispatch(verified)
         with attested_test_client(fake, service="s3") as client:
             with pytest.raises(AssetPublicationError, match="release identity"):
-                S3AssetPublisher(client).publish(verified)
+                S3AssetPublisher(client).publish(
+                    verified,
+                    fresh_authority=fresh_authority,
+                )
 
     assert fake.calls == []
 
@@ -357,9 +485,13 @@ def test_plan_expected_content_must_equal_verified_payload_before_put(
         raw_artifact,
         content_sha256="e" * 64,
     ) as verified:
+        fresh_authority, _ = _fresh_dispatch(verified)
         with attested_test_client(fake, service="s3") as client:
             with pytest.raises(AssetPublicationError, match="planned content"):
-                S3AssetPublisher(client).publish(verified)
+                S3AssetPublisher(client).publish(
+                    verified,
+                    fresh_authority=fresh_authority,
+                )
 
     assert fake.calls == []
 
@@ -385,8 +517,12 @@ def test_publisher_rejects_wrong_service_region_or_retrying_client_before_call(
         raw_artifact,
         content_sha256=content_sha256,
     ) as verified:
+        fresh_authority, _ = _fresh_dispatch(verified)
         with pytest.raises(AssetPublicationError, match="client"):
-            S3AssetPublisher(client).publish(verified)
+            S3AssetPublisher(client).publish(
+                verified,
+                fresh_authority=fresh_authority,
+            )
 
     assert client.calls == []
 
@@ -411,9 +547,13 @@ def test_provider_failure_or_incomplete_ack_is_ambiguous(
         raw_artifact,
         content_sha256=content_sha256,
     ) as verified:
+        fresh_authority, _ = _fresh_dispatch(verified)
         with attested_test_client(fake, service="s3") as client:
             with pytest.raises(AssetPublicationAmbiguous, match="reconciliation"):
-                S3AssetPublisher(client).publish(verified)
+                S3AssetPublisher(client).publish(
+                    verified,
+                    fresh_authority=fresh_authority,
+                )
 
     assert len(fake.calls) == 1
 

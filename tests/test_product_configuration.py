@@ -14,6 +14,13 @@ from pathlib import Path
 import pytest
 
 from release_tools.contracts import canonical_json_bytes
+from release_tools.image_publication import (
+    FORBIDDEN_RUNTIME_COMMANDS,
+    NODE_RUNTIME_BASE,
+    OPENCLAW_RUNTIME_COMMIT,
+    OPENCLAW_RUNTIME_VERSION,
+    PYTHON_RUNTIME_BASE,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -244,54 +251,108 @@ def test_bridge_runtime_versions_are_frozen() -> None:
     dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
 
     assert package["engines"]["node"] == ">=24.15.0"
-    pinned_node = (
-        "24.15.0-slim@sha256:"
-        "4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d"
-    )
-    assert re.findall(r"^FROM .*node:(\S+)", dockerfile, flags=re.MULTILINE) == [
-        pinned_node,
-        pinned_node,
+    assert re.findall(r"^FROM (\S+)$", dockerfile, flags=re.MULTILINE) == [
+        "scratch"
     ]
-    assert re.findall(
-        r"^ARG OPENCLAW_VERSION=([^\s]+)", dockerfile, flags=re.MULTILINE
-    ) == ["2026.7.2"]
-    assert re.findall(
-        r"^ARG OPENCLAW_SOURCE_COMMIT=([0-9a-f]+)", dockerfile, flags=re.MULTILINE
-    ) == ["4bfaccafd62ac2ff2e70ca1decc40fb1297ab438"]
-    assert 'git fetch --depth 1 origin "$OPENCLAW_SOURCE_COMMIT"' in dockerfile
-    assert 'test "$(git rev-parse HEAD)" = "$OPENCLAW_SOURCE_COMMIT"' in dockerfile
-    assert (
-        "test \"$(node -p 'require(\"./package.json\").version')\" "
-        '= "$OPENCLAW_VERSION"'
-    ) in dockerfile
-    assert "pnpm install --frozen-lockfile" in dockerfile
-    assert "COPY --from=builder /opt/openclaw /opt/openclaw" in dockerfile
+    for base_image in (NODE_RUNTIME_BASE, PYTHON_RUNTIME_BASE):
+        repository, digest = base_image.rsplit("@sha256:", 1)
+        assert f'"{repository}@sha256:"' in dockerfile
+        assert f'"{digest}"' in dockerfile
+    assert OPENCLAW_RUNTIME_VERSION == "2026.7.2"
+    assert OPENCLAW_RUNTIME_COMMIT == "4bfaccafd62ac2ff2e70ca1decc40fb1297ab438"
+    assert "ARG OPENCLAW_SOURCE_COMMIT" in dockerfile
+    assert "ARG OPENCLAW_SOURCE_TREE" in dockerfile
+    assert "ARG OPENCLAW_LOCK_SHA256" in dockerfile
+    assert "ARG OPENCLAW_TOOLCHAIN_SHA256" in dockerfile
+    assert "ARG OPENCLAW_OUTPUT_SHA256" in dockerfile
+    assert "ARG PYTHON_BASE_ROOTFS_SHA256" in dockerfile
+    assert "ARG NODE_BASE_BINARY_SHA256" in dockerfile
+    assert "ADD base/python-rootfs.tar /" in dockerfile
+    assert "COPY --chmod=0755 base/node /usr/local/bin/node" in dockerfile
     assert "ln -s /opt/openclaw/openclaw.mjs /usr/local/bin/openclaw" in dockerfile
+    assert "git fetch" not in dockerfile
+    assert "pnpm install" not in dockerfile
     assert "npm install -g openclaw@" not in dockerfile
 
 
-def test_bridge_image_installs_tls_roots_in_builder_and_runtime() -> None:
+def test_bridge_image_uses_only_retained_pinned_runtime_base_material() -> None:
     dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
-    builder_stage, runtime_stage = dockerfile.split(
-        "FROM --platform=linux/arm64", maxsplit=2
-    )[1:]
 
-    assert re.search(
-        r"apt-get install -y --no-install-recommends "
-        r"ca-certificates git python3(?:\s|&&)",
-        builder_stage,
-    )
-    assert re.search(
-        r"apt-get install -y --no-install-recommends "
-        r"ca-certificates python3(?:\s|&&)",
-        runtime_stage,
-    )
+    assert re.findall(r"^FROM (\S+)$", dockerfile, flags=re.MULTILINE) == [
+        "scratch"
+    ]
+    for base_image in (NODE_RUNTIME_BASE, PYTHON_RUNTIME_BASE):
+        repository, digest = base_image.rsplit("@sha256:", 1)
+        assert f'"{repository}@sha256:"' in dockerfile
+        assert f'"{digest}"' in dockerfile
+    assert "ADD base/python-rootfs.tar /" in dockerfile
+    assert "COPY --chmod=0755 base/node /usr/local/bin/node" in dockerfile
+    assert "test -f /etc/ssl/certs/ca-certificates.crt" in dockerfile
+    assert re.search(r"apt-get\s+(?:update|install)\b", dockerfile) is None
+
+
+def test_bridge_build_context_is_an_exact_production_allowlist() -> None:
+    dockerignore = ROOT / "bridge/.dockerignore"
+    assert dockerignore.is_file(), "runtime build context has no deny-by-default gate"
+    lines = {
+        line
+        for raw in dockerignore.read_text(encoding="utf-8").splitlines()
+        if (line := raw.strip()) and not line.startswith("#")
+    }
+    assert lines == {
+        "**",
+        "!Dockerfile",
+        "!package.json",
+        "!package-lock.json",
+        "!agentcore-contract.js",
+        "!agentcore-proxy.js",
+        "!lightweight-agent.js",
+        "!runtime-policy.js",
+        "!capability-catalog.js",
+        "!capability-relay.js",
+        "!capabilities/",
+        "!capabilities/catalog-v1.json",
+        "!capabilities/schemas/",
+        "!capabilities/schemas/*.json",
+        "!gateway-invocation.js",
+        "!session-binding.js",
+        "!invocation-handler.js",
+        "!workspace-path-policy.js",
+        "!workspace-manifest.js",
+        "!sqlite-snapshot.js",
+        "!workspace-sync.js",
+        "!workspace-lifecycle.js",
+        "!workspace-s3-client.js",
+        "!cloudwatch-logger.js",
+        "!scoped-credentials.js",
+        "!force-ipv4.js",
+        "!plugins/",
+        "!plugins/personal-operator/",
+        "!plugins/personal-operator/index.js",
+        "!plugins/personal-operator/openclaw.plugin.json",
+        "!plugins/personal-operator/package.json",
+        "!entrypoint.sh",
+        "!base/",
+        "base/**",
+        "!base/python-rootfs.tar",
+        "!base/node",
+        "!build-closure/",
+        "build-closure/**",
+        "!build-closure/runtime-build-closure.json",
+        "!build-closure/openclaw-runtime.manifest.json",
+        "!build-closure/openclaw-runtime.tar.gz",
+        "!build-closure/bridge-node-modules.manifest.json",
+        "!build-closure/bridge-node-modules.tar.gz",
+    }
+    assert "!base/**" not in lines
+    assert "!build-closure/**" not in lines
+    assert all("test" not in line.casefold() for line in lines)
 
 
 def test_bridge_runtime_uses_an_unprivileged_user_and_ephemeral_writes() -> None:
     dockerfile = (ROOT / "bridge/Dockerfile").read_text(encoding="utf-8")
     entrypoint = (ROOT / "bridge/entrypoint.sh").read_text(encoding="utf-8")
-    runtime_stage = dockerfile.split("FROM --platform=linux/arm64", maxsplit=2)[2]
+    runtime_stage = dockerfile.split("FROM scratch", maxsplit=1)[1]
 
     assert re.findall(r"^USER (\S+)$", dockerfile, flags=re.MULTILINE) == [
         "1000:1000"
@@ -300,9 +361,13 @@ def test_bridge_runtime_uses_an_unprivileged_user_and_ephemeral_writes() -> None
     assert "container runs as root" not in runtime_stage
     assert "chown -R 1000:1000 /app" not in runtime_stage
     assert "chown -R 1000:1000 /opt" not in runtime_stage
-    assert "chown -R 0:0 /home/node" in runtime_stage
+    assert "mkdir -p /app /home/node" in runtime_stage
     assert (
-        "chmod -R a-w /home/node /app /opt/openclaw /opt/personal-operator/seed"
+        "chown -R 0:0 /app /opt/openclaw /opt/personal-operator/seed /home"
+        in runtime_stage
+    )
+    assert (
+        "chmod -R a-w /app /opt/openclaw /opt/personal-operator/seed /home"
         in runtime_stage
     )
     assert "chmod a-w /var/tmp" in runtime_stage
@@ -429,10 +494,20 @@ def test_bridge_dependency_install_is_locked() -> None:
     assert lock["lockfileVersion"] == 3
     assert lock["packages"][""]["dependencies"] == package["dependencies"]
     assert lock["packages"][""]["engines"] == package["engines"]
-    assert "COPY package.json package-lock.json /app/" in dockerfile
-    assert "npm ci --omit=dev" in dockerfile
+    assert "COPY package.json package-lock.json /tmp/bridge-source/" in dockerfile
+    assert "ARG BRIDGE_LOCK_SHA256" in dockerfile
+    assert "ARG BRIDGE_TOOLCHAIN_SHA256" in dockerfile
+    assert "ARG BRIDGE_OUTPUT_SHA256" in dockerfile
+    assert 'manifest["dependencyMode"] != "production"' in dockerfile
+    assert 'digest(bridge_lock) != expected["lockSha"]' in dockerfile
+    assert 'manifest["toolchain"]' in dockerfile
+    assert 'manifest["files"]' in dockerfile
+    assert "npm ci" not in dockerfile
     assert "npm init" not in dockerfile
-    assert "npm install --omit=dev" not in dockerfile
+    assert "npm install" not in dockerfile
+    command_gate = " ".join(FORBIDDEN_RUNTIME_COMMANDS)
+    assert f"for command in {command_gate}; do" in dockerfile
+    assert 'if command -v "$command"' in dockerfile
 
 
 def test_readme_records_the_enforced_runtime_boundary() -> None:
@@ -1729,8 +1804,12 @@ def test_synthesized_runtime_trusts_only_agentcore_with_confused_deputy_guards()
 
     assert set(role["Properties"]) == {
         "AssumeRolePolicyDocument",
+        "MaxSessionDuration",
+        "Path",
         "RoleName",
     }
+    assert role["Properties"]["Path"] == "/"
+    assert role["Properties"]["MaxSessionDuration"] == 3600
     assert role["Properties"]["RoleName"] == (
         "openclaw-agentcore-execution-role-eu-west-1"
     )

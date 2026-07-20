@@ -15,6 +15,7 @@ from release_tools.contracts import (
     MutationRequestV2,
     ProductionObservationConfigV1,
     ReleasePlanV2,
+    ReleaseStepFailureObservationV2,
     ReleaseStepObservationV2,
     ResolvedMutationRequestV2,
     RuntimeConfigurationV1,
@@ -445,6 +446,42 @@ def _mutation_request_v2(plan: ReleasePlanV2, ordinal: int) -> dict[str, object]
         "subject": step["subject"],
         "requestArtifact": step["requestArtifact"],
         "requestSha256": step["requestSha256"],
+    }
+
+
+def _failure_observation_v2(
+    plan: ReleasePlanV2,
+    ordinal: int,
+    *,
+    provider: str = "CLOUDFORMATION",
+    terminal_status: str = "NONEMPTY_ACCOUNT",
+    failure_reason: str = "BASELINE_NOT_CLEAN",
+) -> dict[str, object]:
+    step = plan.to_mapping()["steps"][ordinal]
+    assert isinstance(step, dict)
+    completed_prefix_sha256 = _completed_prefix_sha256(
+        _completed_steps(plan, ordinal)
+    )
+    operation_sha256 = "sha256:" + hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "schema": "personal-operator.release-operation.v2",
+                "planSha256": plan.digest(),
+                "completedPrefixSha256": completed_prefix_sha256,
+                "step": step,
+            }
+        )
+    ).hexdigest()
+    return {
+        "schema": ReleaseStepFailureObservationV2.SCHEMA,
+        "planSha256": plan.digest(),
+        "stepId": step["id"],
+        "subject": step["subject"],
+        "operationSha256": operation_sha256,
+        "provider": provider,
+        "terminalStatus": terminal_status,
+        "failureReason": failure_reason,
+        "observerEvidenceSha256": "4" * 64,
     }
 
 
@@ -2098,6 +2135,63 @@ def test_release_step_observation_v2_binds_observer_and_derived_bytes() -> None:
     )
     with pytest.raises(ContractError, match="identity differs"):
         hostile.validate_plan_step(plan, completed_step_count=ordinal)
+
+
+def test_release_step_failure_observation_v2_accepts_exact_nonempty_baseline() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    transaction = StagingTransactionV2.from_mapping(
+        _staging_transaction_v2(plan),
+        plan=plan,
+    )
+    observation = ReleaseStepFailureObservationV2.from_mapping(
+        _failure_observation_v2(plan, 0)
+    )
+
+    observation.validate_transaction_step(plan, transaction)
+    assert parse_release_contract(observation.to_bytes()) == observation
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid", "match"),
+    (
+        ("provider", "ECR", "provider"),
+        ("terminalStatus", "CLEAN_ACCOUNT", "status"),
+        ("terminalStatus", "INVENTORY_CHANGED", "status"),
+        ("failureReason", "UNKNOWN_BASELINE_FAILURE", "canonical"),
+    ),
+)
+def test_release_step_failure_observation_v2_rejects_noncanonical_baseline_failure(
+    field: str,
+    invalid: str,
+    match: str,
+) -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    value = _failure_observation_v2(plan, 0)
+    value[field] = invalid
+
+    with pytest.raises(ContractError, match=match):
+        ReleaseStepFailureObservationV2.from_mapping(value)
+
+
+def test_release_step_failure_observation_v2_rejects_baseline_reason_for_wrong_kind() -> None:
+    plan = ReleasePlanV2.from_mapping(_release_plan_v2())
+    ordinal = next(
+        step.ordinal for step in plan.steps if step.kind == "IMAGE_OBSERVE"
+    )
+    transaction = StagingTransactionV2.from_mapping(
+        _staging_transaction_v2(
+            plan,
+            completed_step_count=ordinal,
+            state="FOUNDATION_READY",
+        ),
+        plan=plan,
+    )
+    observation = ReleaseStepFailureObservationV2.from_mapping(
+        _failure_observation_v2(plan, ordinal)
+    )
+
+    with pytest.raises(ContractError, match="step kind"):
+        observation.validate_transaction_step(plan, transaction)
 
 
 def test_mutation_request_v2_is_bound_to_the_exact_next_plan_step() -> None:

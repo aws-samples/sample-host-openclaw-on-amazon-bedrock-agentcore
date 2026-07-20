@@ -1758,6 +1758,48 @@ def _release_v2_stack_subject(
 _RELEASE_V2_STACK_MUTATION_KINDS = frozenset(
     {"BOOTSTRAP_STACK", "STACK_CREATE", "STACK_UPDATE", "CHANGESET_EXECUTE"}
 )
+_RELEASE_V2_STACK_DRIFT_SUBJECT = re.compile(
+    r"cfn:([0-9]{12}):([a-z0-9-]+):stack:"
+    r"([A-Za-z][A-Za-z0-9-]{0,127}):release:([0-9a-f]{40}):drift"
+)
+
+
+def _release_v2_stack_drift_identity(
+    value: Any,
+) -> tuple[str, str, str, str]:
+    """Parse one exact drift subject into account, region, stack, and commit."""
+
+    subject = _release_subject(value)
+    match = _RELEASE_V2_STACK_DRIFT_SUBJECT.fullmatch(subject)
+    if match is None:
+        raise ContractError("stack drift subject is invalid")
+    account = _account(match.group(1))
+    region = _region(match.group(2))
+    return account, region, match.group(3), match.group(4)
+
+
+def _release_v2_stack_predecessor_observer_binding(
+    step: "ReleaseStepV2",
+) -> tuple[str, str, str]:
+    """Return the only observer pair and StackId field for a stack write."""
+
+    if step.kind in {"BOOTSTRAP_STACK", "STACK_CREATE", "CHANGESET_EXECUTE"}:
+        return "cloudformation", "describe_stacks", "stackId"
+    if step.kind == "STACK_UPDATE" and step.phase == "runtime":
+        return (
+            "bedrock-agentcore-control",
+            "get_agent_runtime",
+            "agentCoreStackId",
+        )
+    if step.kind == "STACK_UPDATE" and step.phase == "endpoint":
+        return (
+            "bedrock-agentcore-control",
+            "get_agent_runtime_endpoint",
+            "agentCoreStackId",
+        )
+    raise ContractError(
+        "stack drift predecessor has no exact observer service and operation"
+    )
 
 
 def _validate_release_v2_stack_drift_recipe(
@@ -3176,6 +3218,9 @@ class CompletedReleaseStepV2:
 
 
 _FAILED_RETAINED_KIND_REASON_STATUSES = {
+    "BASELINE_OBSERVE": {
+        "BASELINE_NOT_CLEAN": frozenset({"NONEMPTY_ACCOUNT"}),
+    },
     "BOOTSTRAP_STACK": {
         "CLOUDFORMATION_STACK_FAILED": frozenset(
             {"CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED"}
@@ -3247,6 +3292,7 @@ _FAILED_RETAINED_REASONS = frozenset(
     for reason in reasons
 )
 _FAILED_RETAINED_REASON_PROVIDERS = {
+    "BASELINE_NOT_CLEAN": "CLOUDFORMATION",
     "CLOUDFORMATION_STACK_FAILED": "CLOUDFORMATION",
     "CLOUDFORMATION_CHANGESET_FAILED": "CLOUDFORMATION",
     "CF_SUBJECT_CONFLICT": "CLOUDFORMATION",
@@ -5063,6 +5109,9 @@ class ResolvedMutationRequestV2:
         "webChangeSetId",
         "webChangesetSha256",
         "webApplicationSha256",
+        "predecessorStackId",
+        "predecessorEvidenceSha256",
+        "predecessorObserverEvidenceSha256",
     }
 
     mutation_request: MutationRequestV2
@@ -5098,6 +5147,9 @@ class ResolvedMutationRequestV2:
     web_change_set_id: str
     web_changeset_sha256: str
     web_application_sha256: str
+    predecessor_stack_id: str
+    predecessor_evidence_sha256: str
+    predecessor_observer_evidence_sha256: str
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ResolvedMutationRequestV2":
@@ -5246,6 +5298,52 @@ class ResolvedMutationRequestV2:
             field: _optional_sha256(value[field], field=label)
             for field, label in digest_fields
         }
+        predecessor_stack_id = _text(
+            value["predecessorStackId"], field="predecessor stack ID"
+        )
+        predecessor_evidence_sha256 = _optional_sha256(
+            value["predecessorEvidenceSha256"],
+            field="predecessor retained evidence digest",
+        )
+        predecessor_observer_evidence_sha256 = _optional_sha256(
+            value["predecessorObserverEvidenceSha256"],
+            field="predecessor observer evidence digest",
+        )
+        predecessor_values = (
+            predecessor_stack_id,
+            predecessor_evidence_sha256,
+            predecessor_observer_evidence_sha256,
+        )
+        if request.kind == "STACK_DRIFT_CHECK":
+            if not all(predecessor_values):
+                raise ContractError(
+                    "resolved stack drift request lacks exact predecessor authority"
+                )
+            (
+                subject_account,
+                subject_region,
+                stack_name,
+                subject_commit,
+            ) = _release_v2_stack_drift_identity(request.subject)
+            if (
+                subject_account,
+                subject_region,
+                subject_commit,
+            ) != (account, region, source_commit):
+                raise ContractError(
+                    "resolved stack drift subject differs from release identity"
+                )
+            predecessor_stack_id = _cloudformation_stack_id(
+                predecessor_stack_id,
+                account=subject_account,
+                region=subject_region,
+                stack_name=stack_name,
+                field="predecessor stack ID",
+            )
+        elif any(predecessor_values):
+            raise ContractError(
+                "non-drift resolved request contains predecessor authority"
+            )
         return cls(
             request,
             source_commit,
@@ -5280,6 +5378,9 @@ class ResolvedMutationRequestV2:
             consumer_ids["webChangeSetId"],
             digests["webChangesetSha256"],
             digests["webApplicationSha256"],
+            predecessor_stack_id,
+            predecessor_evidence_sha256,
+            predecessor_observer_evidence_sha256,
         )
 
     @classmethod
@@ -5330,6 +5431,11 @@ class ResolvedMutationRequestV2:
             "webChangeSetId": self.web_change_set_id,
             "webChangesetSha256": self.web_changeset_sha256,
             "webApplicationSha256": self.web_application_sha256,
+            "predecessorStackId": self.predecessor_stack_id,
+            "predecessorEvidenceSha256": self.predecessor_evidence_sha256,
+            "predecessorObserverEvidenceSha256": (
+                self.predecessor_observer_evidence_sha256
+            ),
         }
 
     def to_bytes(self) -> bytes:
@@ -5378,6 +5484,30 @@ class ResolvedMutationRequestV2:
         next_step = plan.steps[transaction.completed_step_count]
         if self.step_phase != next_step.phase:
             raise ContractError("resolved mutation step phase differs from the plan")
+        if next_step.kind == "STACK_DRIFT_CHECK":
+            count = transaction.completed_step_count
+            if count < 1:
+                raise ContractError(
+                    "resolved stack drift request has no preceding stack write"
+                )
+            predecessor_step = plan.steps[count - 1]
+            predecessor_completed = transaction.completed_steps[-1]
+            if (
+                predecessor_step.kind not in _RELEASE_V2_STACK_MUTATION_KINDS
+                or predecessor_step.phase != next_step.phase
+                or next_step.subject != f"{predecessor_step.subject}:drift"
+                or predecessor_completed.step_id != predecessor_step.step_id
+            ):
+                raise ContractError(
+                    "resolved stack drift predecessor is not the immediate stack write"
+                )
+            if (
+                self.predecessor_evidence_sha256
+                != predecessor_completed.evidence_sha256
+            ):
+                raise ContractError(
+                    "resolved stack drift predecessor evidence differs from journal"
+                )
         if (
             self.expected_template_sha256,
             self.expected_template_parameter_sha256,
@@ -5468,6 +5598,342 @@ class ResolvedMutationRequestV2:
         )
         if actual_state != expected_state:
             raise ContractError("resolved mutation generated inputs differ from journal")
+
+
+@dataclass(frozen=True, slots=True)
+class StackDriftDispatchReceiptV1:
+    """Provider dispatch receipt for one exact write-ahead stack drift check."""
+
+    SCHEMA: ClassVar[str] = (
+        "personal-operator.stack-drift-dispatch-receipt.v1"
+    )
+    FIELDS: ClassVar[set[str]] = {
+        "schema",
+        "releasePlanSha256",
+        "evidenceStoreSha256",
+        "journalPathSha256",
+        "journalExecutionId",
+        "journalRevision",
+        "completedPrefixSha256",
+        "stepId",
+        "subject",
+        "releaseOperationSha256",
+        "stackId",
+        "predecessorEvidenceSha256",
+        "predecessorObserverEvidenceSha256",
+        "driftDetectionId",
+    }
+
+    release_plan_sha256: str
+    evidence_store_sha256: str
+    journal_path_sha256: str
+    journal_execution_id: str
+    journal_revision: int
+    completed_prefix_sha256: str
+    step_id: str
+    subject: str
+    release_operation_sha256: str
+    stack_id: str
+    predecessor_evidence_sha256: str
+    predecessor_observer_evidence_sha256: str
+    drift_detection_id: str
+
+    @classmethod
+    def from_mapping(
+        cls, raw: Mapping[str, Any]
+    ) -> "StackDriftDispatchReceiptV1":
+        value = _exact_object(raw, cls.FIELDS, label="stack drift dispatch receipt")
+        if value["schema"] != cls.SCHEMA:
+            raise ContractError("stack drift dispatch receipt schema is invalid")
+        plan_sha256 = _text(
+            value["releasePlanSha256"],
+            field="drift receipt release plan digest",
+            pattern=_SHA_64,
+        )
+        store_sha256 = _text(
+            value["evidenceStoreSha256"],
+            field="drift receipt evidence store digest",
+            pattern=_SHA_64,
+        )
+        path_sha256 = _text(
+            value["journalPathSha256"],
+            field="drift receipt journal path digest",
+            pattern=_SHA_64,
+        )
+        execution_id = _text(
+            value["journalExecutionId"],
+            field="drift receipt journal execution ID",
+            pattern=_SHA_64,
+        )
+        revision = _count(
+            value["journalRevision"],
+            field="drift receipt journal revision",
+            minimum=1,
+        )
+        completed_prefix_sha256 = _text(
+            value["completedPrefixSha256"],
+            field="drift receipt completed prefix digest",
+            pattern=_SHA_64,
+        )
+        step_id = _text(
+            value["stepId"], field="drift receipt step ID", pattern=_STEP_ID
+        )
+        subject = _release_subject(value["subject"])
+        account, region, stack_name, _ = _release_v2_stack_drift_identity(subject)
+        release_operation_sha256 = _text(
+            value["releaseOperationSha256"],
+            field="drift receipt release operation digest",
+            pattern=_DIGEST,
+        )
+        stack_id = _cloudformation_stack_id(
+            value["stackId"],
+            account=account,
+            region=region,
+            stack_name=stack_name,
+            field="drift receipt stack ID",
+        )
+        predecessor_evidence_sha256 = _text(
+            value["predecessorEvidenceSha256"],
+            field="drift receipt predecessor evidence digest",
+            pattern=_SHA_64,
+        )
+        predecessor_observer_evidence_sha256 = _text(
+            value["predecessorObserverEvidenceSha256"],
+            field="drift receipt predecessor observer digest",
+            pattern=_SHA_64,
+        )
+        drift_detection_id = _text(
+            value["driftDetectionId"], field="drift detection ID"
+        )
+        try:
+            parsed_detection_id = uuid.UUID(drift_detection_id)
+        except (AttributeError, ValueError) as error:
+            raise ContractError("drift detection ID is not a canonical UUID") from error
+        if str(parsed_detection_id) != drift_detection_id:
+            raise ContractError("drift detection ID is not a canonical UUID")
+        return cls(
+            plan_sha256,
+            store_sha256,
+            path_sha256,
+            execution_id,
+            revision,
+            completed_prefix_sha256,
+            step_id,
+            subject,
+            release_operation_sha256,
+            stack_id,
+            predecessor_evidence_sha256,
+            predecessor_observer_evidence_sha256,
+            drift_detection_id,
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "StackDriftDispatchReceiptV1":
+        return cls.from_mapping(parse_canonical_object(payload))
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "releasePlanSha256": self.release_plan_sha256,
+            "evidenceStoreSha256": self.evidence_store_sha256,
+            "journalPathSha256": self.journal_path_sha256,
+            "journalExecutionId": self.journal_execution_id,
+            "journalRevision": self.journal_revision,
+            "completedPrefixSha256": self.completed_prefix_sha256,
+            "stepId": self.step_id,
+            "subject": self.subject,
+            "releaseOperationSha256": self.release_operation_sha256,
+            "stackId": self.stack_id,
+            "predecessorEvidenceSha256": self.predecessor_evidence_sha256,
+            "predecessorObserverEvidenceSha256": (
+                self.predecessor_observer_evidence_sha256
+            ),
+            "driftDetectionId": self.drift_detection_id,
+        }
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_mapping())
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+    def validate_transaction(
+        self,
+        plan: ReleasePlanV2,
+        transaction: StagingTransactionV2,
+        *,
+        resolved_request: ResolvedMutationRequestV2,
+        predecessor_evidence: RetainedStepEvidenceV2,
+        evidence_store_sha256: str,
+        journal_path_sha256: str,
+        journal_execution_id: str,
+    ) -> None:
+        receipt = StackDriftDispatchReceiptV1.from_bytes(self.to_bytes())
+        plan = _canonical_release_plan_v2(plan)
+        transaction = StagingTransactionV2.from_bytes(
+            transaction.to_bytes(), plan=plan
+        )
+        resolved = ResolvedMutationRequestV2.from_bytes(
+            resolved_request.to_bytes()
+        )
+        predecessor = RetainedStepEvidenceV2.from_bytes(
+            predecessor_evidence.to_bytes()
+        )
+        resolved.validate_transaction(plan, transaction)
+        expected_store_sha256 = _text(
+            evidence_store_sha256,
+            field="evidence store digest",
+            pattern=_SHA_64,
+        )
+        expected_path_sha256 = _text(
+            journal_path_sha256,
+            field="journal path digest",
+            pattern=_SHA_64,
+        )
+        expected_execution_id = _text(
+            journal_execution_id,
+            field="journal execution ID",
+            pattern=_SHA_64,
+        )
+        count = transaction.completed_step_count
+        if count >= len(plan.steps):
+            raise ContractError("drift receipt has no exact transaction step")
+        step = plan.steps[count]
+        if step.kind != "STACK_DRIFT_CHECK":
+            raise ContractError("drift receipt transaction step is not a drift check")
+        if (
+            transaction.state != "UNCERTAIN"
+            or transaction.uncertain_step_id != step.step_id
+        ):
+            raise ContractError(
+                "drift receipt lacks exact UNCERTAIN write-ahead intent"
+            )
+        if count < 1:
+            raise ContractError("drift receipt has no preceding stack write")
+        predecessor_step = plan.steps[count - 1]
+        predecessor_completed = transaction.completed_steps[-1]
+        if (
+            predecessor_step.kind not in _RELEASE_V2_STACK_MUTATION_KINDS
+            or predecessor_step.phase != step.phase
+            or step.subject != f"{predecessor_step.subject}:drift"
+            or predecessor_completed.step_id != predecessor_step.step_id
+        ):
+            raise ContractError(
+                "drift receipt predecessor is not the immediate stack write"
+            )
+        subject_account, subject_region, stack_name, subject_commit = (
+            _release_v2_stack_drift_identity(step.subject)
+        )
+        if (
+            subject_account,
+            subject_region,
+            subject_commit,
+        ) != (plan.account, plan.region, plan.source_commit):
+            raise ContractError("drift receipt subject differs from release identity")
+        predecessor_prefix_sha256 = _completed_prefix_sha256(
+            [
+                item.to_mapping()
+                for item in transaction.completed_steps[:-1]
+            ]
+        )
+        predecessor_release_operation_sha256 = _release_operation_sha256(
+            plan.digest(), predecessor_step, predecessor_prefix_sha256
+        )
+        predecessor_outcome_operation_sha256 = (
+            _release_outcome_operation_sha256(
+                release_operation_sha256=(
+                    predecessor_release_operation_sha256
+                ),
+                journal_path_sha256=expected_path_sha256,
+                journal_execution_id=expected_execution_id,
+                journal_revision=predecessor.journal_revision,
+            )
+        )
+        if (
+            predecessor.digest() != predecessor_completed.evidence_sha256
+            or predecessor.digest() != resolved.predecessor_evidence_sha256
+            or predecessor.digest() != receipt.predecessor_evidence_sha256
+            or predecessor.plan_sha256 != plan.digest()
+            or predecessor.completed_prefix_sha256
+            != predecessor_prefix_sha256
+            or predecessor.evidence_store_sha256 != expected_store_sha256
+            or predecessor.journal_path_sha256 != expected_path_sha256
+            or predecessor.journal_execution_id != expected_execution_id
+            or predecessor.step_id != predecessor_step.step_id
+            or predecessor.subject != predecessor_step.subject
+            or predecessor.release_operation_sha256
+            != predecessor_release_operation_sha256
+            or predecessor.operation_sha256
+            != predecessor_outcome_operation_sha256
+        ):
+            raise ContractError(
+                "stack drift predecessor record differs from the immediate write"
+            )
+        if predecessor.disposition != "PRESENT":
+            raise ContractError(
+                "stack drift predecessor record is not PRESENT"
+            )
+        observer = predecessor.observer_evidence_mapping()
+        expected_service, expected_observer_operation, stack_field = (
+            _release_v2_stack_predecessor_observer_binding(predecessor_step)
+        )
+        if observer["service"] != expected_service:
+            raise ContractError(
+                "stack drift predecessor observer service differs"
+            )
+        if observer["operation"] != expected_observer_operation:
+            raise ContractError(
+                "stack drift predecessor observer operation differs"
+            )
+        projection = observer["projection"]
+        projected_stack_fields = {
+            field
+            for field in ("stackId", "agentCoreStackId")
+            if field in projection
+        }
+        if projected_stack_fields != {stack_field}:
+            raise ContractError(
+                "stack drift predecessor projection has ambiguous stack authority"
+            )
+        expected_stack_id = _cloudformation_stack_id(
+            projection[stack_field],
+            account=subject_account,
+            region=subject_region,
+            stack_name=stack_name,
+            field="predecessor projected stack ID",
+        )
+        expected_prefix_sha256 = _completed_prefix_sha256(
+            [item.to_mapping() for item in transaction.completed_steps]
+        )
+        expected_operation_sha256 = _release_operation_sha256(
+            plan.digest(), step, expected_prefix_sha256
+        )
+        if (
+            receipt.release_plan_sha256 != plan.digest()
+            or receipt.evidence_store_sha256 != expected_store_sha256
+            or receipt.journal_path_sha256 != expected_path_sha256
+            or receipt.journal_execution_id != expected_execution_id
+            or receipt.journal_revision != transaction.revision
+            or receipt.completed_prefix_sha256 != expected_prefix_sha256
+            or receipt.step_id != step.step_id
+            or receipt.subject != step.subject
+            or receipt.release_operation_sha256 != expected_operation_sha256
+            or receipt.release_operation_sha256
+            != transaction.uncertain_operation_sha256
+            or receipt.stack_id != expected_stack_id
+            or receipt.stack_id != resolved.predecessor_stack_id
+            or receipt.predecessor_evidence_sha256
+            != predecessor_completed.evidence_sha256
+            or receipt.predecessor_evidence_sha256
+            != resolved.predecessor_evidence_sha256
+            or receipt.predecessor_observer_evidence_sha256
+            != predecessor.observer_evidence_sha256
+            or receipt.predecessor_observer_evidence_sha256
+            != resolved.predecessor_observer_evidence_sha256
+        ):
+            raise ContractError(
+                "stack drift dispatch receipt differs from exact transaction authority"
+            )
 
 
 PRIVATE_MUTATION_ENVELOPE_MAGIC = b"PO-PRIVATE-MUTATION-V2\x00"
@@ -5918,6 +6384,7 @@ ReleaseContract = (
     | FailedRetainedEvidenceV2
     | RetainedStepEvidenceV2
     | ResolvedMutationRequestV2
+    | StackDriftDispatchReceiptV1
 )
 
 
@@ -5952,6 +6419,9 @@ def parse_release_contract(payload: bytes) -> ReleaseContract:
         FailedRetainedEvidenceV2.SCHEMA: FailedRetainedEvidenceV2.from_mapping,
         RetainedStepEvidenceV2.SCHEMA: RetainedStepEvidenceV2.from_mapping,
         ResolvedMutationRequestV2.SCHEMA: ResolvedMutationRequestV2.from_mapping,
+        StackDriftDispatchReceiptV1.SCHEMA: (
+            StackDriftDispatchReceiptV1.from_mapping
+        ),
     }
     parser = parsers.get(schema)
     if parser is None:

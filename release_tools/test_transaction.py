@@ -379,6 +379,17 @@ def _resolved_mutation_request(
 ) -> ResolvedMutationRequestV2:
     current = journal.current
     next_step = journal.plan.steps[current.completed_step_count]
+    is_drift = next_step.kind == "STACK_DRIFT_CHECK"
+    predecessor_stack_id = ""
+    if is_drift:
+        stack_name = next_step.subject.split(":stack:", 1)[1].split(
+            ":release:", 1
+        )[0]
+        predecessor_stack_id = (
+            f"arn:aws:cloudformation:{journal.plan.region}:"
+            f"{journal.plan.account}:stack/{stack_name}/"
+            "00000000-0000-0000-0000-000000000001"
+        )
     return ResolvedMutationRequestV2.from_mapping(
         {
             "schema": ResolvedMutationRequestV2.SCHEMA,
@@ -423,6 +434,11 @@ def _resolved_mutation_request(
             "webChangeSetId": current.web_change_set_id,
             "webChangesetSha256": current.web_changeset_sha256,
             "webApplicationSha256": current.web_application_sha256,
+            "predecessorStackId": predecessor_stack_id,
+            "predecessorEvidenceSha256": (
+                current.completed_steps[-1].evidence_sha256 if is_drift else ""
+            ),
+            "predecessorObserverEvidenceSha256": "e" * 64 if is_drift else "",
         }
     )
 

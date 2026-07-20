@@ -295,19 +295,46 @@ def test_runtime_image_and_source_metadata_are_immutable_at_local_boundary() -> 
 
     assert context["region"] == "eu-west-1"
     assert context["image_version"].isdecimal()
-    assert "ARG OPENCLAW_VERSION=2026.7.2" in dockerfile
+    assert 'AUDITED_OPENCLAW_VERSION = "2026.7.2"' in dockerfile
     assert (
-        "ARG OPENCLAW_SOURCE_COMMIT=4bfaccafd62ac2ff2e70ca1decc40fb1297ab438"
+        'AUDITED_OPENCLAW_COMMIT = "4bfaccafd62ac2ff2e70ca1decc40fb1297ab438"'
         in dockerfile
     )
-    assert 'test "$(git rev-parse HEAD)" = "$OPENCLAW_SOURCE_COMMIT"' in dockerfile
-    assert "pnpm install --frozen-lockfile" in dockerfile
+    assert 'expected["sourceCommit"] != AUDITED_OPENCLAW_COMMIT' in dockerfile
+    assert 'package.get("version") != AUDITED_OPENCLAW_VERSION' in dockerfile
+    assert "ARG OPENCLAW_SOURCE_COMMIT" in dockerfile
+    assert "ARG OPENCLAW_SOURCE_TREE" in dockerfile
+    assert "ARG OPENCLAW_LOCK_SHA256" in dockerfile
+    assert "ARG OPENCLAW_TOOLCHAIN_SHA256" in dockerfile
+    assert "ARG OPENCLAW_OUTPUT_SHA256" in dockerfile
+    assert "git fetch" not in dockerfile
+    assert "pnpm install" not in dockerfile
     assert "node:latest" not in dockerfile
     node_base = (
         "public.ecr.aws/docker/library/node:24.15.0-slim@sha256:"
         "4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d"
     )
-    assert dockerfile.count(node_base) == 2
+    python_base = (
+        "public.ecr.aws/docker/library/python:3.13-slim@sha256:"
+        "7f6f057c60bb4b050500ab319f5fd13f842bf2367b038b7362d1b3e416fa3d9d"
+    )
+    assert re.findall(r"^FROM (\S+)$", dockerfile, re.MULTILINE) == ["scratch"]
+    for base_image in (node_base, python_base):
+        repository, digest = base_image.rsplit("@sha256:", 1)
+        assert f'"{repository}@sha256:"' in dockerfile
+        assert f'"{digest}"' in dockerfile
+    assert "ARG PYTHON_BASE_ROOTFS_SHA256" in dockerfile
+    assert "ARG NODE_BASE_BINARY_SHA256" in dockerfile
+    assert "ADD base/python-rootfs.tar /" in dockerfile
+    assert "COPY --chmod=0755 base/node /usr/local/bin/node" in dockerfile
+    assert "runtime-build-closure.json" in dockerfile
+    assert "openclaw-runtime.tar.gz" in dockerfile
+    assert "bridge-node-modules.tar.gz" in dockerfile
+    assert all(
+        line.startswith("RUN --network=none ")
+        for line in dockerfile.splitlines()
+        if line.startswith("RUN ")
+    )
     assert "immutable ECR digest" in upstream
 
 

@@ -35,24 +35,26 @@ provider, Telegram-delivery, and pilot gates stay disabled.
 ## Phase graph
 
 1. `foundation`: live clean baseline; bootstrap; exact assets; VPC, security,
-   guardrails, capabilities, AgentCore foundation, observability; derive typed
+   guardrails, capabilities, AgentCore foundation, observability; run one
+   explicit drift check after every completed stack write; derive typed
    foundation runtime inputs.
 2. `image`: publish each plan-bound OCI blob as one journaled effect, then the
    subject manifest plus commit tag, SBOM referrer manifest, and provenance
    referrer manifest; reconcile exact signature and completed clean scan.
 3. `runtime`: update the existing AgentCore foundation stack to create Runtime
-   and its command-deny policy; then run one always-planned, separately journaled
-   MMDSv2 hardening/reconciliation step and retain its exact versioned ARN.
-4. `endpoint`: update the AgentCore stack to create the retained commit-bound
-   endpoint and its deny policy
+   and its command-deny policy; run its explicit drift check; then run one
+   always-planned, separately journaled MMDSv2 hardening/reconciliation step and
+   retain its exact versioned ARN.
+4. `endpoint`: update the AgentCore stack, run its explicit drift check, and
+   retain the commit-bound endpoint and its deny policy
    against the retained MMDSv2 runtime version.
 5. `context`: collect and atomically write `RuntimeContextV3` in-package.
 6. `router-cron-cs`: create exact Router and Cron change sets.
-7. `router-cron`: execute and verify Router, then Cron.
+7. `router-cron`: execute and drift-check Router, then Cron.
 8. `scheduler-cs`: create the exact Scheduler change set.
-9. `scheduler`: execute and verify Scheduler.
+9. `scheduler`: execute and drift-check Scheduler.
 10. `web-cs`: create the exact Web change set.
-11. `web`: execute and verify Web.
+11. `web`: execute and drift-check Web.
 12. `verify`: read-only aggregate verification.
 
 One CLI invocation crosses at most one internal mutation step.
@@ -64,6 +66,7 @@ exact forty-character source commit. Subjects use these canonical forms:
 
 - release subject: `release:A:R:C:<suffix>`;
 - stack subject: `cfn:A:R:stack:<stack-name>:release:C`;
+- stack-drift subject: `cfn:A:R:stack:<stack-name>:release:C:drift`;
 - image subject:
   `ecr:A:R:repository:personal-operator/bridge:release:C`;
 - image blob effect:
@@ -82,23 +85,35 @@ The ordered recipe is exact:
 
 | Phase | Kind and subject, in order |
 | --- | --- |
-| `foundation` | `BASELINE_OBSERVE release:A:R:C:baseline`; `BOOTSTRAP_STACK` for `CDKToolkit`; one or more `ASSET_PUBLISH cdk:asset:<sha256>` entries sorted uniquely by subject; then `STACK_CREATE` for `OpenClawVpc`, `OpenClawSecurity`, `OpenClawGuardrails`, `PersonalOperatorCapabilities`, `OpenClawAgentCore`, and `OpenClawObservability` |
+| `foundation` | `BASELINE_OBSERVE release:A:R:C:baseline`; `BOOTSTRAP_STACK` for `CDKToolkit`, then its `STACK_DRIFT_CHECK`; one or more `ASSET_PUBLISH cdk:asset:<sha256>` entries sorted uniquely by subject; then each `STACK_CREATE` for `OpenClawVpc`, `OpenClawSecurity`, `OpenClawGuardrails`, `PersonalOperatorCapabilities`, `OpenClawAgentCore`, and `OpenClawObservability`, with that stack's `STACK_DRIFT_CHECK` immediately after it |
 | `image` | one `IMAGE_PUBLISH` per OCI blob, sorted uniquely by subject; `IMAGE_PUBLISH` for the exact subject manifest and commit tag; `IMAGE_PUBLISH` for the SBOM referrer manifest; `IMAGE_PUBLISH` for the provenance referrer manifest; then `IMAGE_OBSERVE` against the aggregate release subject |
-| `runtime` | `STACK_UPDATE` for `OpenClawAgentCore`; then `AGENTCORE_HARDEN agentcore:A:R:runtime:personal_operator_bridge:release:C:mmdsv2` |
-| `endpoint` | `STACK_UPDATE` for `OpenClawAgentCore` |
+| `runtime` | `STACK_UPDATE` for `OpenClawAgentCore`; its `STACK_DRIFT_CHECK`; then `AGENTCORE_HARDEN agentcore:A:R:runtime:personal_operator_bridge:release:C:mmdsv2` |
+| `endpoint` | `STACK_UPDATE` for `OpenClawAgentCore`; then its `STACK_DRIFT_CHECK` |
 | `context` | `RUNTIME_CONTEXT_WRITE release:A:R:C:artifact:build/runtime-context.json` |
 | `router-cron-cs` | `CHANGESET_CREATE` for `OpenClawRouter`, then `OpenClawCron` |
-| `router-cron` | `CHANGESET_EXECUTE` for `OpenClawRouter`, then `OpenClawCron` |
+| `router-cron` | `CHANGESET_EXECUTE` for `OpenClawRouter`, its `STACK_DRIFT_CHECK`, then `CHANGESET_EXECUTE` for `OpenClawCron` and its `STACK_DRIFT_CHECK` |
 | `scheduler-cs` | `CHANGESET_CREATE` for `PersonalOperatorScheduler` |
-| `scheduler` | `CHANGESET_EXECUTE` for `PersonalOperatorScheduler` |
+| `scheduler` | `CHANGESET_EXECUTE` for `PersonalOperatorScheduler`; then its `STACK_DRIFT_CHECK` |
 | `web-cs` | `CHANGESET_CREATE` for `PersonalOperatorWeb` |
-| `web` | `CHANGESET_EXECUTE` for `PersonalOperatorWeb` |
+| `web` | `CHANGESET_EXECUTE` for `PersonalOperatorWeb`; then its `STACK_DRIFT_CHECK` |
 | `verify` | `VERIFY release:A:R:C:verify` |
 
 Every step owns one unique request artifact. `AGENTCORE_HARDEN` is always in
 the plan: authoritative observation may reconcile it as already present, but a
 required `UpdateAgentRuntime` can never be hidden inside the Runtime stack
 operation.
+
+`STACK_DRIFT_CHECK` is a real planned mutation because
+`DetectStackDrift` starts provider work. Its request binds the exact stack
+name; the resolved request adds only the predecessor-owned StackId and provider
+observation digest. Write-ahead intent precedes the single detection call. The
+dispatcher retains the returned drift-detection ID before reconciliation, and
+the observer selects only that ID with `DescribeStackDriftDetectionStatus` and
+`DescribeStackResourceDrifts`. A crash after dispatch but before retaining the
+ID remains `UNCERTAIN` and is never retried. Only terminal `DETECTION_COMPLETE`
+with `IN_SYNC`, no resource drifts, and a stable closing stack/template/policy
+read is `PRESENT`. Stack `DriftInformation` alone is historical metadata and
+cannot complete any release step.
 
 The image phase contains at least one blob effect. Blob subjects and digests
 are lexical and unique, followed by the three manifests in the fixed order
@@ -155,6 +170,17 @@ completed prefix, and copies generated state from those same canonical bytes.
 Changing a generated value therefore changes the observation digest, completed
 prefix, and every dependent operation even when observer evidence is unchanged.
 
+Generated phase digests are not caller-supplied hashes and never hash their own
+typed observation. `PhaseEvidenceV1` is canonical JSON containing its schema,
+the exact release-plan digest, the exact phase, and the phase's ordered retained
+records. Each record contains only `stepId`, `subject`, `operationSha256`, and
+the SHA-256 of the raw retained provider observation. The phase digest is the
+SHA-256 of those canonical bytes. The terminal step of `router-cron-cs`,
+`router-cron`, `scheduler-cs`, `scheduler`, `web-cs`, `web`, and `verify`
+derives its named aggregate from that exact sequence. Because the input uses
+the provider-observation digest rather than `ReleaseStepObservationV2.digest()`,
+the terminal step may own the aggregate without a digest cycle.
+
 CloudFormation IDs use the exact `eu-west-1` account-bound ARN, canonical stack
 name, and a bounded non-empty provider identifier. ChangeSetIds additionally
 contain exactly `release-C`. A consumer `CHANGESET_CREATE` must begin only from the
@@ -188,16 +214,30 @@ and immutable-content expectations. It carries the retained AgentCore StackId
 and the separately journal-owned Router, Cron, Scheduler, and Web target
 StackId/ChangeSetId pairs. Provider binders compare their typed request and
 payload to those plan-derived header fields and select only the exact relevant
-ARN identity before any call. It
-does not Base64-expand artifact bytes or impose the
+ARN identity before any call. It does not Base64-expand artifact bytes or impose the
 canonical-JSON size limit on an OCI closure. `PrivateMutationEnvelopeV2` is the
 single driver-visible binary file: fixed magic, a four-byte big-endian canonical
 header length, the `ResolvedMutationRequestV2` bytes, then the raw request
 artifact stream. Trusted assembly and parsing stream the artifact, cap it at
 8 GiB, and require its exact plan-bound length and SHA-256. The same framing
-accepts a normal request or the image content-store bundle. Artifact bytes may
-not contain the reserved `operationSha256` or `driverRequestSha256` fields, so
+accepts either one normal request artifact or one exact per-effect image
+publication artifact. The compound image content-store bundle is planning
+input only and has no private-envelope or dispatch API. Artifact bytes may not
+contain the reserved `operationSha256` or `driverRequestSha256` fields, so
 operation identity exists only in the post-plan header.
+
+The in-package release orchestrator, AWS authority module, provider adapters,
+and observers are one trusted Python-process TCB. No plugin, operator-selected
+driver, or runtime code is loaded into that process. Arbitrary code already
+executing there is outside the capability threat model because it could import
+an SDK or open a socket independently; private Python attributes are not
+claimed as a sandbox. The narrower enforceable boundary is still strict:
+caller-facing authority objects retain no SDK object or bound SDK callable,
+dispatch uses an internal closed method catalog rather than an exported
+mutable reference, and the credential-free effect driver receives only its
+single verified envelope in a separately scrubbed process. AWS SDK loading is
+confined to the retained evidence runtime with ambient profile, proxy, CA,
+endpoint, `HOME/.aws/models`, and `AWS_DATA_PATH` inputs disabled.
 
 `from_path` returns diagnostics only. An authority-bearing consumer must use
 `open_verified(..., scratch_dir=...)`: the source is opened nonblocking without
@@ -246,11 +286,14 @@ status:
 
 | Step kind | Provider | Failure reason | Exact terminal status |
 | --- | --- | --- | --- |
+| `BASELINE_OBSERVE` | `CLOUDFORMATION` | `BASELINE_NOT_CLEAN` | `NONEMPTY_ACCOUNT` |
 | `BOOTSTRAP_STACK`, `STACK_CREATE`, `CHANGESET_EXECUTE` | `CLOUDFORMATION` | `CLOUDFORMATION_STACK_FAILED` | `CREATE_FAILED`, `ROLLBACK_COMPLETE`, or `ROLLBACK_FAILED` |
 | `STACK_UPDATE` | `CLOUDFORMATION` | `CLOUDFORMATION_STACK_FAILED` | `UPDATE_FAILED`, `UPDATE_ROLLBACK_COMPLETE`, or `UPDATE_ROLLBACK_FAILED` |
 | `CHANGESET_CREATE` | `CLOUDFORMATION` | `CLOUDFORMATION_CHANGESET_FAILED` | `FAILED` |
 | `BOOTSTRAP_STACK`, `STACK_CREATE`, `CHANGESET_CREATE`, `CHANGESET_EXECUTE` | `CLOUDFORMATION` | `CF_SUBJECT_CONFLICT` | `CREATE_COMPLETE` |
-| `STACK_UPDATE` | `CLOUDFORMATION` | `CF_SUBJECT_CONFLICT` | `UPDATE_COMPLETE` |
+| `STACK_UPDATE` | `CLOUDFORMATION` | `CF_SUBJECT_CONFLICT` | `CREATE_COMPLETE` or `UPDATE_COMPLETE` |
+| `STACK_DRIFT_CHECK` | `CLOUDFORMATION` | `CLOUDFORMATION_DRIFT_DETECTION_FAILED` | `DETECTION_FAILED` |
+| `STACK_DRIFT_CHECK` | `CLOUDFORMATION` | `CLOUDFORMATION_STACK_DRIFTED` | `DRIFTED` |
 | `AGENTCORE_HARDEN` | `AGENTCORE` | `AGENTCORE_UPDATE_FAILED` | `UPDATE_FAILED` |
 | `AGENTCORE_HARDEN` | `AGENTCORE` | `AGENTCORE_SUBJECT_CONFLICT` | `READY` |
 | `ASSET_PUBLISH` | `S3` | `ASSET_SUBJECT_CONFLICT` | `RETAINED_OBJECT_CONFLICT` |

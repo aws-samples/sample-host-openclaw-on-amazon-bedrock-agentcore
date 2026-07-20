@@ -29,6 +29,12 @@ from release_tools.contracts import (
     canonical_json_bytes,
     write_new_private_mutation_envelope,
 )
+from release_tools.dispatch_attempt_v2 import (
+    DispatchAttemptError,
+    FreshDispatchAuthorityV1,
+    ReleaseDispatchAttemptV1,
+    _mint_fresh_dispatch_authority,
+)
 from release_tools.test_contracts import _release_plan_v2
 from release_tools.test_aws_authority_v2 import attested_test_client
 from release_tools.test_transaction import (
@@ -72,6 +78,45 @@ TEMPLATE_URL = (
     f"https://cdk-hnb659fds-assets-{ACCOUNT}-{REGION}.s3.{REGION}.amazonaws.com/"
     f"{TEMPLATE_ASSET_ID}.json"
 )
+
+
+def _fresh_dispatch(
+    verified: VerifiedPrivateMutationV2,
+    *,
+    provider: str = "CLOUDFORMATION",
+    operation_sha256: str | None = None,
+    resolved_request_sha256: str | None = None,
+) -> tuple[FreshDispatchAuthorityV1, ReleaseDispatchAttemptV1]:
+    resolved = verified.resolved_request
+    request = resolved.mutation_request
+    attempt = ReleaseDispatchAttemptV1(
+        release_plan_sha256=request.plan_sha256,
+        evidence_store_sha256="1" * 64,
+        journal_path_sha256="2" * 64,
+        journal_execution_id="3" * 64,
+        journal_revision=1,
+        completed_prefix_sha256=request.completed_prefix_sha256,
+        step_id=request.step_id,
+        subject=request.subject,
+        operation_sha256=(operation_sha256 or request.operation_sha256),
+        resolved_request_sha256=(
+            resolved_request_sha256 or resolved.digest()
+        ),
+        provider=provider,
+    )
+    return _mint_fresh_dispatch_authority(attempt), attempt
+
+
+class _ForgedFreshDispatchAuthority(FreshDispatchAuthorityV1):
+    """Subclass that deliberately skips the token-gated base constructor."""
+
+    __slots__ = ("_forged_attempt",)
+
+    def __init__(self, attempt: ReleaseDispatchAttemptV1) -> None:
+        self._forged_attempt = attempt
+
+    def consume(self, **_kwargs: object) -> ReleaseDispatchAttemptV1:
+        return self._forged_attempt
 
 
 def _operation(
@@ -365,12 +410,21 @@ def test_bootstrap_dispatches_exact_non_admin_same_account_request(
         token = "po-" + verified.resolved_request.mutation_request.operation_sha256.removeprefix(
             "sha256:"
         )
+        fresh_authority, expected_attempt = _fresh_dispatch(verified)
         with attested_test_client(fake, service="cloudformation") as client:
             acknowledgement = CloudFormationMutationDispatcher(client).dispatch(
-                verified, preflight
+                verified,
+                preflight,
+                fresh_authority=fresh_authority,
             )
 
-    assert acknowledgement == {"dispatched": True}
+    assert acknowledgement == expected_attempt
+    with pytest.raises(DispatchAttemptError, match="already consumed"):
+        fresh_authority.consume(
+            provider="CLOUDFORMATION",
+            operation_sha256=expected_attempt.operation_sha256,
+            resolved_request_sha256=expected_attempt.resolved_request_sha256,
+        )
     assert fake.calls == [
         (
             "create_stack",
@@ -423,12 +477,15 @@ def test_stack_create_uses_only_exact_plan_bound_template_url(
         token = "po-" + verified.resolved_request.mutation_request.operation_sha256.removeprefix(
             "sha256:"
         )
+        fresh_authority, expected_attempt = _fresh_dispatch(verified)
         with attested_test_client(fake, service="cloudformation") as client:
             acknowledgement = CloudFormationMutationDispatcher(client).dispatch(
-                verified, preflight
+                verified,
+                preflight,
+                fresh_authority=fresh_authority,
             )
 
-    assert acknowledgement == {"dispatched": True}
+    assert acknowledgement == expected_attempt
     assert fake.calls == [
         (
             "create_stack",
@@ -455,10 +512,15 @@ def test_runtime_update_has_no_parameters_and_endpoint_injects_only_observed_tup
     with _verified_operation(
         tmp_path / "runtime", runtime, phase="runtime"
     ) as (verified, preflight):
+        fresh_authority, _ = _fresh_dispatch(verified)
         with attested_test_client(
             runtime_fake, service="cloudformation"
         ) as client:
-            CloudFormationMutationDispatcher(client).dispatch(verified, preflight)
+            CloudFormationMutationDispatcher(client).dispatch(
+                verified,
+                preflight,
+                fresh_authority=fresh_authority,
+            )
     assert runtime_fake.calls[0][1]["Parameters"] == []
     assert runtime_fake.calls[0][1]["StackName"] == AGENTCORE_STACK_ID
 
@@ -468,10 +530,15 @@ def test_runtime_update_has_no_parameters_and_endpoint_injects_only_observed_tup
     with _verified_operation(
         tmp_path / "endpoint", endpoint, phase="endpoint"
     ) as (verified, preflight):
+        fresh_authority, _ = _fresh_dispatch(verified)
         with attested_test_client(
             endpoint_fake, service="cloudformation"
         ) as client:
-            CloudFormationMutationDispatcher(client).dispatch(verified, preflight)
+            CloudFormationMutationDispatcher(client).dispatch(
+                verified,
+                preflight,
+                fresh_authority=fresh_authority,
+            )
     assert endpoint_fake.calls[0][1]["Parameters"] == [
         {
             "ParameterKey": "HardenedRuntimeArn",
@@ -589,10 +656,15 @@ def test_change_set_create_and_execute_are_closed_and_commit_bound(
         token = "po-" + verified.resolved_request.mutation_request.operation_sha256.removeprefix(
             "sha256:"
         )
+        fresh_authority, _ = _fresh_dispatch(verified)
         with attested_test_client(
             create_fake, service="cloudformation"
         ) as client:
-            CloudFormationMutationDispatcher(client).dispatch(verified, preflight)
+            CloudFormationMutationDispatcher(client).dispatch(
+                verified,
+                preflight,
+                fresh_authority=fresh_authority,
+            )
     assert create_fake.calls == [
         (
             "create_change_set",
@@ -623,10 +695,15 @@ def test_change_set_create_and_execute_are_closed_and_commit_bound(
         token = "po-" + verified.resolved_request.mutation_request.operation_sha256.removeprefix(
             "sha256:"
         )
+        fresh_authority, _ = _fresh_dispatch(verified)
         with attested_test_client(
             execute_fake, service="cloudformation"
         ) as client:
-            CloudFormationMutationDispatcher(client).dispatch(verified, preflight)
+            CloudFormationMutationDispatcher(client).dispatch(
+                verified,
+                preflight,
+                fresh_authority=fresh_authority,
+            )
     assert execute_fake.calls == [
         (
             "execute_change_set",
@@ -672,7 +749,7 @@ def test_dispatch_rejects_a_free_operation_without_both_authorities() -> None:
     )
     fake = FakeCloudFormation()
 
-    with pytest.raises(CloudFormationMutationError, match="preflight"):
+    with pytest.raises(TypeError, match="fresh_authority"):
         CloudFormationMutationDispatcher(fake).dispatch(operation)  # type: ignore[arg-type]
 
     assert fake.calls == []
@@ -683,6 +760,74 @@ def test_dispatch_rejects_a_free_operation_without_both_authorities() -> None:
             request_sha256="2" * 64,
             operation=operation,
         )
+
+
+def test_dispatch_fence_rejects_missing_duck_crossed_or_consumed_authority(
+    tmp_path: Path,
+) -> None:
+    with _verified_operation(
+        tmp_path, _operation(), phase="foundation"
+    ) as (verified, preflight):
+        missing_fake = FakeCloudFormation()
+        with attested_test_client(
+            missing_fake, service="cloudformation"
+        ) as client:
+            with pytest.raises(TypeError, match="fresh_authority"):
+                CloudFormationMutationDispatcher(client).dispatch(
+                    verified,
+                    preflight,
+                )
+        assert missing_fake.calls == []
+
+        crossed_provider, _ = _fresh_dispatch(verified, provider="S3")
+        crossed_operation, _ = _fresh_dispatch(
+            verified,
+            operation_sha256="sha256:" + "f" * 64,
+        )
+        crossed_request, _ = _fresh_dispatch(
+            verified,
+            resolved_request_sha256="e" * 64,
+        )
+        consumed, consumed_attempt = _fresh_dispatch(verified)
+        _, forged_attempt = _fresh_dispatch(verified)
+        forged = _ForgedFreshDispatchAuthority(forged_attempt)
+        assert consumed.consume(
+            provider="CLOUDFORMATION",
+            operation_sha256=consumed_attempt.operation_sha256,
+            resolved_request_sha256=consumed_attempt.resolved_request_sha256,
+        ) == consumed_attempt
+
+        for authority in (
+            object(),
+            crossed_provider,
+            crossed_operation,
+            crossed_request,
+            consumed,
+            forged,
+        ):
+            fake = FakeCloudFormation()
+            with attested_test_client(
+                fake, service="cloudformation"
+            ) as client:
+                with pytest.raises(
+                    CloudFormationMutationError,
+                    match="dispatch authority",
+                ):
+                    CloudFormationMutationDispatcher(client).dispatch(
+                        verified,
+                        preflight,
+                        fresh_authority=authority,  # type: ignore[arg-type]
+                    )
+            assert fake.calls == []
+
+        with pytest.raises(DispatchAttemptError, match="already consumed"):
+            consumed.consume(
+                provider="CLOUDFORMATION",
+                operation_sha256=consumed_attempt.operation_sha256,
+                resolved_request_sha256=(
+                    consumed_attempt.resolved_request_sha256
+                ),
+            )
 
 
 @pytest.mark.parametrize("mutation", ["missing", "content"])
@@ -725,8 +870,13 @@ def test_raw_client_with_forgeable_account_marker_is_rejected(
     with _verified_operation(
         tmp_path, _operation(), phase="foundation"
     ) as (verified, preflight):
+        fresh_authority, _ = _fresh_dispatch(verified)
         with pytest.raises(CloudFormationMutationError, match="attested"):
-            CloudFormationMutationDispatcher(fake).dispatch(verified, preflight)
+            CloudFormationMutationDispatcher(fake).dispatch(
+                verified,
+                preflight,
+                fresh_authority=fresh_authority,
+            )
     assert fake.calls == []
 
 
@@ -854,8 +1004,13 @@ def test_dispatch_rejects_wrong_account_service_region_or_retrying_client(
     with _verified_operation(
         tmp_path, _operation(), phase="foundation"
     ) as (verified, preflight):
+        fresh_authority, _ = _fresh_dispatch(verified)
         with pytest.raises(CloudFormationMutationError, match="client"):
-            CloudFormationMutationDispatcher(client).dispatch(verified, preflight)
+            CloudFormationMutationDispatcher(client).dispatch(
+                verified,
+                preflight,
+                fresh_authority=fresh_authority,
+            )
     assert client.calls == []
 
 
@@ -873,12 +1028,15 @@ def test_provider_exception_or_malformed_acknowledgement_is_ambiguous(
     with _verified_operation(
         tmp_path, _operation(), phase="foundation"
     ) as (verified, preflight):
+        fresh_authority, _ = _fresh_dispatch(verified)
         with attested_test_client(fake, service="cloudformation") as client:
             with pytest.raises(
                 CloudFormationMutationAmbiguous, match="reconciliation"
             ):
                 CloudFormationMutationDispatcher(client).dispatch(
-                    verified, preflight
+                    verified,
+                    preflight,
+                    fresh_authority=fresh_authority,
                 )
     assert len(fake.calls) == 1
 

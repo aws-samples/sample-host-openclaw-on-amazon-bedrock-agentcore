@@ -26,6 +26,11 @@ from release_tools.contracts import (
     canonical_json_bytes,
     parse_canonical_object,
 )
+from release_tools.dispatch_attempt_v2 import (
+    DispatchAttemptError,
+    FreshDispatchAuthorityV1,
+    ReleaseDispatchAttemptV1,
+)
 
 
 REQUIRED_REGION = "eu-west-1"
@@ -485,7 +490,16 @@ class S3AssetPublisher:
     def __init__(self, client: S3MutationClient) -> None:
         self._client = client
 
-    def publish(self, verified: VerifiedPrivateMutationV2) -> dict[str, bool]:
+    def publish(
+        self,
+        verified: VerifiedPrivateMutationV2,
+        *,
+        fresh_authority: FreshDispatchAuthorityV1,
+    ) -> ReleaseDispatchAttemptV1:
+        if type(fresh_authority) is not FreshDispatchAuthorityV1:
+            raise AssetPublicationError(
+                "asset publication requires fresh dispatch authority"
+            )
         if not isinstance(verified, VerifiedPrivateMutationV2):
             raise AssetPublicationError(
                 "asset publication requires a verified private mutation"
@@ -504,6 +518,19 @@ class S3AssetPublisher:
             payload_offset=payload_offset,
             payload_size=asset.content_size,
         )
+        try:
+            attempt = fresh_authority.consume(
+                provider="S3",
+                operation_sha256=(
+                    verified.resolved_request.mutation_request.operation_sha256
+                ),
+                resolved_request_sha256=verified.resolved_request.digest(),
+            )
+        except DispatchAttemptError as error:
+            body.close()
+            raise AssetPublicationError(
+                "asset publication fresh dispatch authority differs"
+            ) from error
         try:
             response = client.invoke(
                 "put_object",
@@ -540,7 +567,7 @@ class S3AssetPublisher:
                 "asset acknowledgement is incomplete; authoritative "
                 "reconciliation is required"
             )
-        return {"dispatched": True}
+        return attempt
 
 
 __all__ = [

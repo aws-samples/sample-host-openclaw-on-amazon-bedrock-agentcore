@@ -26,6 +26,11 @@ from release_tools.contracts import (
     canonical_json_bytes,
     parse_canonical_object,
 )
+from release_tools.dispatch_attempt_v2 import (
+    DispatchAttemptError,
+    FreshDispatchAuthorityV1,
+    ReleaseDispatchAttemptV1,
+)
 
 
 REQUIRED_REGION = "eu-west-1"
@@ -1183,7 +1188,13 @@ class CloudFormationMutationDispatcher:
         self,
         verified: VerifiedPrivateMutationV2,
         preflight: VerifiedCloudFormationPreflightV2 | None = None,
-    ) -> dict[str, bool]:
+        *,
+        fresh_authority: FreshDispatchAuthorityV1,
+    ) -> ReleaseDispatchAttemptV1:
+        if type(fresh_authority) is not FreshDispatchAuthorityV1:
+            raise CloudFormationMutationError(
+                "CloudFormation dispatch requires fresh dispatch authority"
+            )
         if not isinstance(preflight, VerifiedCloudFormationPreflightV2):
             raise CloudFormationMutationError(
                 "CloudFormation dispatch requires verified preflight authority"
@@ -1219,6 +1230,16 @@ class CloudFormationMutationDispatcher:
             "Capabilities": list(operation.capabilities),
             "Tags": self._tags(operation),
         }
+        try:
+            attempt = fresh_authority.consume(
+                provider="CLOUDFORMATION",
+                operation_sha256=operation_sha256,
+                resolved_request_sha256=verified.resolved_request.digest(),
+            )
+        except DispatchAttemptError as error:
+            raise CloudFormationMutationError(
+                "CloudFormation fresh dispatch authority differs"
+            ) from error
         try:
             if operation.kind in {"BOOTSTRAP_STACK", "STACK_CREATE"}:
                 response = client.invoke(
@@ -1266,7 +1287,7 @@ class CloudFormationMutationDispatcher:
                 "CloudFormation acknowledgement is malformed; authoritative "
                 "reconciliation is required"
             )
-        return {"dispatched": True}
+        return attempt
 
 
 __all__ = [
