@@ -572,6 +572,7 @@ def test_exported_catalog_rebinding_cannot_widen_private_dispatch(
         "list_role_policies",
         "get_role_policy",
         "list_attached_role_policies",
+        "list_role_tags",
     ],
 )
 def test_iam_authority_is_read_only_and_supports_exact_role_policy_evidence(
@@ -611,6 +612,7 @@ def test_service_method_catalogs_are_exact_and_immutable() -> None:
             "list_role_policies",
             "get_role_policy",
             "list_attached_role_policies",
+            "list_role_tags",
         }
     )
     assert AWS_MUTATION_METHODS["iam"] == frozenset()

@@ -108,6 +108,7 @@ _OBSERVER_METHOD_CATALOG: Mapping[str, frozenset[str]] = MappingProxyType(
                 "list_role_policies",
                 "get_role_policy",
                 "list_attached_role_policies",
+                "list_role_tags",
             }
         ),
     }

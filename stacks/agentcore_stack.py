@@ -268,6 +268,8 @@ class AgentCoreStack(Stack):
             self,
             "OpenClawExecutionRole",
             role_name=execution_role_name,
+            path="/",
+            max_session_duration=Duration.hours(1),
             assumed_by=iam.ServicePrincipal(
                 "bedrock-agentcore.amazonaws.com"
             ).with_conditions(
