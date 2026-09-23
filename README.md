@@ -285,7 +285,7 @@ openclaw-on-agentcore/
     guardrails_stack.py           # Bedrock Guardrails (content filters, PII, topic denial)
     cron_stack.py                 # EventBridge Scheduler, Cron executor Lambda, IAM
   bridge/
-    Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
+    Dockerfile                    # Container image (node:24-slim, ARM64, OpenClaw 2026.9.5, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
     lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron + clawhub-manage tools)
@@ -298,7 +298,7 @@ openclaw-on-agentcore/
     workspace-sync.test.js        # Workspace sync credential tests (node:test, 7 tests)
     scoped-credentials.js         # Per-user STS session-scoped S3 credentials
     scoped-credentials.test.js    # Scoped credentials unit tests (node:test, 38 tests)
-    force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
+    force-ipv4.js                 # DNS patch for Node.js Happy Eyeballs IPv6 issue
     CLAUDE.md                     # Project instructions (for Claude Code IDE)
     skills/
       s3-user-files/              # Custom per-user file storage skill (S3-backed)
@@ -639,9 +639,11 @@ Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as p
 3. **At boot** (background): Pre-fetch secrets from Secrets Manager (~2s)
 4. **On first `/invocations` with `action: chat`, `action: warmup`, or `action: cron`** (parallel init):
    - Create STS scoped credentials restricting S3 to user's namespace prefix
+   - Symlink `~/.openclaw` to session storage (if mounted), clean stale lock files
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
+   - Restore `.openclaw/` from S3 via `workspace-sync.js` (awaited, bounded by `WORKSPACE_RESTORE_WAIT_MS`, default 45s)
+   - Write `openclaw.json` + `AGENTS.md`; if a pre-2.0 `sessions.json` is present, run `openclaw doctor --fix` to import it into SQLite (see [docs/openclaw-2.0-upgrade.md](docs/openclaw-2.0-upgrade.md))
    - Start OpenClaw gateway (port 18789) with scoped credentials (no container credentials)
-   - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
    - Start credential refresh timer (45 min interval)
    - Wait for proxy only (~5s)
 5. **Warm-up phase** (t=~10s to ~1-2min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, and clawhub-manage tools — users can manage files, schedules, and install skills immediately)
@@ -819,7 +821,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
 
-Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VPCs without IPv6, this causes connection failures. The `force-ipv4.js` script patches `dns.lookup()` to force IPv4 only, loaded via `NODE_OPTIONS`.
+Node.js's Happy Eyeballs (`autoSelectFamily`, Node 20+) tries both IPv4 and IPv6. In VPCs without IPv6, this causes connection failures. The `force-ipv4.js` script patches `dns.lookup()` to force IPv4 only, loaded via `NODE_OPTIONS`.
 
 ## Known Limitations
 
@@ -849,7 +851,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **Image version bumps are required**: After pushing a new bridge container image, you must bump `image_version` in `cdk.json` and redeploy `OpenClawAgentCore`. AgentCore caches images by digest and only re-pulls when the runtime endpoint configuration changes. Without the bump, existing sessions continue using the old image.
 - **Image upload size limit**: Bedrock Converse API limits images to 3.75 MB. The Router Lambda checks this before uploading to S3.
 - **agentcore CLI urllib3 warnings**: The `agentcore` CLI may emit a `RequestsDependencyWarning` to stdout before its JSON output. This is benign — `deploy.sh` handles mixed output gracefully.
-- **OpenClaw 2026.3.2 WebSocket origin enforcement**: OpenClaw enforces origin checks on all WebSocket connections carrying an `Origin` header. The `ws` Node.js library must use the `origin` **option** (not `headers.Origin`) to correctly set the header on the HTTP upgrade request. The `controlUi` config requires `allowedOrigins: ["*"]` to accept the origin. Without both the client `origin` option and config `allowedOrigins`, connections fail with: `Auth failed: origin not allowed`.
+- **OpenClaw 2.0 WebSocket identity (protocol v4)**: The bridge connects with `minProtocol: 4, maxProtocol: 4`, `client.id: "gateway-client"`, `client.mode: "backend"` and **no `Origin` header**. On OpenClaw 2.0 (2026.8.1+) any browser-style `Origin` header or a Control-UI client id requires a signed device identity; `gateway-client`/`backend` on loopback token auth is the only device-less path that keeps `operator.*` scopes. The old `allowInsecureAuth`/`dangerouslyDisableDeviceAuth` config keys are retired. Details: [docs/openclaw-2.0-upgrade.md](docs/openclaw-2.0-upgrade.md). (Pre-2.0 note, kept for history: OpenClaw 2026.3.2 enforced origin checks on connections carrying an `Origin` header; the `ws` library needed the `origin` option and `allowedOrigins: ["*"]`. Without both the client `origin` option and config `allowedOrigins`, connections fail with: `Auth failed: origin not allowed`.)
 
 ## Cleanup
 

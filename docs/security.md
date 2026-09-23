@@ -235,10 +235,10 @@ The lightweight agent's `web_fetch` tool implements multi-layer SSRF protection:
 
 | Control | Implementation |
 |---|---|
-| ARM64 minimal image | `node:22-slim` — minimal attack surface |
+| ARM64 minimal image | `node:24-slim` — minimal attack surface |
 | Multi-stage Docker build | Builder stage installs tools; runtime stage copies only needed artifacts (no git, pip, or build tools) |
 | ECR image scanning on push | `image_scan_on_push=True` — CVE detection on every push |
-| IPv4 DNS patch | `force-ipv4.js` patches `dns.lookup()` for VPC compatibility (Node.js 22 Happy Eyeballs IPv6 issue) |
+| IPv4 DNS patch | `force-ipv4.js` patches `dns.lookup()` for VPC compatibility (Node.js Happy Eyeballs IPv6 issue) |
 | V8 compile cache | Pre-warmed at build time for faster cold starts (no runtime compilation) |
 | No Docker-in-Docker | Sub-agent sandbox set to `off` — no Docker inside AgentCore microVMs (microVMs already provide isolation) |
 

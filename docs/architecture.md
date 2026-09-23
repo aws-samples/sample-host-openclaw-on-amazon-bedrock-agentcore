@@ -169,7 +169,7 @@
 
 ```
 +-----------------------------------------------------------------------+
-|  AgentCore Runtime Container (node:22-slim, ARM64, per-user)          |
+|  AgentCore Runtime Container (node:24-slim, ARM64, per-user)          |
 |                                                                       |
 |  entrypoint.sh starts contract server immediately:                    |
 |                                                                       |
