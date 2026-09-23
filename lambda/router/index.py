@@ -628,7 +628,6 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
             agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
             qualifier=AGENTCORE_QUALIFIER,
             runtimeSessionId=session_id,
-            runtimeUserId=actor_id,
             payload=payload,
             contentType="application/json",
             accept="application/json",

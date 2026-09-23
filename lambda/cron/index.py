@@ -183,7 +183,6 @@ def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=Non
             agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
             qualifier=AGENTCORE_QUALIFIER,
             runtimeSessionId=session_id,
-            runtimeUserId=actor_id,
             payload=payload,
             contentType="application/json",
             accept="application/json",

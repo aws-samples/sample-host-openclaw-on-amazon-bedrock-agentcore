@@ -120,7 +120,6 @@ class CronStack(Stack):
             iam.PolicyStatement(
                 actions=[
                     "bedrock-agentcore:InvokeAgentRuntime",
-                    "bedrock-agentcore:InvokeAgentRuntimeForUser",
                 ],
                 resources=[
                     runtime_arn,
