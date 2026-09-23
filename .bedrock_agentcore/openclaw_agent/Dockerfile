@@ -99,8 +99,19 @@ COPY --from=builder /app/node_modules /app/node_modules
 COPY --from=builder /app/package.json /app/package.json
 COPY --from=builder /app/.compile-cache /app/.compile-cache
 
-# Ensure skills can resolve npm packages from /app/node_modules
+# Ensure skills can resolve npm packages from /app/node_modules.
+# Skill scripts live in /skills/<name>/ — a sibling of /app, not a descendant —
+# so Node's parent-directory walk (/skills/<name>/node_modules, /skills/node_modules,
+# /node_modules) never reaches /app/node_modules on its own. NODE_PATH covers
+# processes we spawn ourselves (lightweight-agent, proxy), but OpenClaw's exec
+# tool (host=gateway) strips NODE_PATH and NODE_OPTIONS from the child env as a
+# hardening measure (openclaw src/infra/host-env-security-policy.json), so
+# `node /skills/<name>/<script>.js` run by the agent would otherwise fail with
+# MODULE_NOT_FOUND. The symlink puts /app/node_modules on the standard walk so
+# resolution works with no env var at all. OpenClaw's skill scanner skips
+# entries named node_modules, so this is invisible to skill discovery.
 ENV NODE_PATH=/app/node_modules
+RUN mkdir -p /skills && ln -s /app/node_modules /skills/node_modules
 
 WORKDIR /app
 

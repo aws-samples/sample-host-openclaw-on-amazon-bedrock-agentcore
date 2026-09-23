@@ -1,17 +1,6 @@
 "use strict";
 const fs = require("fs");
 
-// Ensure /app/node_modules is in the module search path — OpenClaw's exec tool
-// may not forward NODE_PATH to child processes, so playwright-core (installed in
-// /app/node_modules) would otherwise fail to resolve. Add it and re-init the
-// module resolver so subsequent require() calls pick it up.
-if (!process.env.NODE_PATH?.includes("/app/node_modules")) {
-  process.env.NODE_PATH = [process.env.NODE_PATH, "/app/node_modules"]
-    .filter(Boolean)
-    .join(":");
-  require("module").Module._initPaths();
-}
-
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const CONTENT_TRUNCATE_CHARS = 8000;
 const NAV_TIMEOUT_MS = 30000;
