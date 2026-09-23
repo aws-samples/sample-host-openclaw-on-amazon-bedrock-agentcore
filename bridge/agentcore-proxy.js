@@ -1419,6 +1419,7 @@ const server = http.createServer(async (req, res) => {
     let installedSkills = [];
     try {
       installedSkills = fs.readdirSync("/skills").filter((d) => {
+        if (d === "node_modules") return false; // symlink to /app/node_modules, not a skill
         try {
           return fs.statSync(`/skills/${d}`).isDirectory();
         } catch {
