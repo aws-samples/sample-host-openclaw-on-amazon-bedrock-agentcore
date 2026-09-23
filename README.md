@@ -85,6 +85,8 @@ This lets the system behave like a persistent server (continuous conversation hi
 
 When [Managed Session Storage](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-persistent-filesystems.html) is available, `.openclaw/` persists across stop/resume cycles via `/mnt/workspace`, with S3 as a cold backup. Configured automatically by `deploy.sh`. See [docs/session-storage.md](docs/session-storage.md).
 
+Operators can run one-off shell commands inside a live session (health checks, workspace inspection, CI assertions) with `scripts/agentcore-exec.py`, a boto3 wrapper around `InvokeAgentRuntimeCommand`. It runs with the **full execution-role credentials**, so it is operator-only and has no chat path. See [docs/execute-command.md](docs/execute-command.md).
+
 ### Security
 
 This solution applies **defense-in-depth** across network, application, identity, and data layers. Key controls include:
@@ -314,7 +316,9 @@ openclaw-on-agentcore/
     setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
     setup-slack.sh                # Slack Event Subscriptions + admin allowlist
     manage-allowlist.sh           # Add/remove/list users in the allowlist
+    agentcore-exec.py             # Operator CLI: run a shell command in a live session (InvokeAgentRuntimeCommand)
   tests/
+    test_agentcore_exec.py        # Unit tests for scripts/agentcore-exec.py (mocked boto3, no AWS)
     e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
       config.py                   # AWS config auto-discovery (CF outputs, Secrets Manager)
       webhook.py                  # Build + POST Telegram webhook payloads
@@ -327,6 +331,8 @@ openclaw-on-agentcore/
     architecture.md               # Detailed architecture diagram
     security.md                   # Complete security architecture
     guardrails.md                 # Bedrock Guardrails operational runbook
+    session-storage.md            # Persistent /mnt/workspace (Managed Session Storage)
+    execute-command.md            # Operator CLI for InvokeAgentRuntimeCommand + security boundary
 ```
 
 ## CDK Stacks

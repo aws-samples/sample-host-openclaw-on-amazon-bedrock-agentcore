@@ -30,3 +30,7 @@ Notably, session storage also retains files that S3 backup skips (caches, `node_
 Session storage is the primary durability layer: because `~/.openclaw` is a symlink into `/mnt/workspace`, writes land in persistent storage immediately and survive a normal stop/resume within the 14-day idle window.
 
 S3 is only a cold backup. In backup mode it syncs every 30 minutes, and `agentcore-contract.js` performs a final `saveWorkspace()` on `SIGTERM` (see `workspaceSync.cleanup()`). So on a graceful shutdown, S3 is current. On an **unexpected** container stop (no SIGTERM), the S3 backup can lag by up to the 30-minute interval — but session storage still holds the latest state, so this window only matters if session storage is also lost (e.g. the 14-day retention elapses or the endpoint version changes, which refreshes the mount).
+
+## Inspecting the mount directly
+
+Operators can verify what session storage holds for a live session (symlink present, restore skipped, workspace size) without a chat round-trip using `scripts/agentcore-exec.py`, which runs a shell command inside the same microVM via `InvokeAgentRuntimeCommand`. That path runs with the full execution-role credentials and is operator-only — see [docs/execute-command.md](execute-command.md).
