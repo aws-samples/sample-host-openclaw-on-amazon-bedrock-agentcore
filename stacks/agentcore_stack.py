@@ -105,6 +105,19 @@ class AgentCoreStack(Stack):
                 ],
             )
         )
+        # AWS Marketplace permissions — required so Bedrock can complete the
+        # foundation-model access / auto-subscription check on first invocation.
+        # aws-marketplace actions do not support resource-level permissions, so
+        # "*" is the only valid resource (see cdk-nag suppression below).
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "aws-marketplace:ViewSubscriptions",
+                    "aws-marketplace:Subscribe",
+                ],
+                resources=["*"],
+            )
+        )
 
         # Bedrock Guardrails — ApplyGuardrail permission (only when guardrails enabled)
         if guardrail_id:
@@ -378,6 +391,8 @@ class AgentCoreStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason="Bedrock foundation model ARNs require wildcard for model ID. "
                     "Bedrock guardrail ARNs require wildcard for guardrail version. "
+                    "aws-marketplace:ViewSubscriptions/Subscribe (Bedrock model access "
+                    "checks) do not support resource-level permissions and require '*'. "
                     "Logs, Metrics, X-Ray, and Secrets Manager APIs are scoped to "
                     "project prefix (openclaw/*) or do not support resource-level "
                     "permissions. Cognito scoped to specific user pool.",
