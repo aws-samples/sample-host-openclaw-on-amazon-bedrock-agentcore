@@ -252,6 +252,67 @@ describe("CREDENTIAL_SCAN_EXEMPT", () => {
   });
 });
 
+// --- setBackupMode / periodic-save interval selection ---
+
+describe("setBackupMode", () => {
+  let workspaceSync;
+  let realSetInterval;
+  let realClearInterval;
+  let capturedIntervalMs;
+
+  beforeEach(() => {
+    delete require.cache[require.resolve("./workspace-sync")];
+    process.env.AWS_REGION = "us-west-2";
+    process.env.S3_USER_FILES_BUCKET = "test-bucket";
+    delete process.env.WORKSPACE_SYNC_INTERVAL_MS;
+    workspaceSync = require("./workspace-sync");
+
+    // Capture the interval startPeriodicSave picks without actually scheduling.
+    capturedIntervalMs = null;
+    realSetInterval = global.setInterval;
+    realClearInterval = global.clearInterval;
+    global.setInterval = (_fn, ms) => {
+      capturedIntervalMs = ms;
+      return { unref() {} }; // fake handle; never fires
+    };
+    global.clearInterval = () => {};
+  });
+
+  afterEach(() => {
+    global.setInterval = realSetInterval;
+    global.clearInterval = realClearInterval;
+    delete process.env.S3_USER_FILES_BUCKET;
+  });
+
+  it("exports setBackupMode function", () => {
+    assert.equal(typeof workspaceSync.setBackupMode, "function");
+  });
+
+  it("uses the 5 min primary interval when backup mode is off (default)", () => {
+    workspaceSync.startPeriodicSave("test-namespace");
+    assert.equal(capturedIntervalMs, 5 * 60 * 1000);
+  });
+
+  it("uses the 30 min backup interval after setBackupMode(true)", () => {
+    workspaceSync.setBackupMode(true);
+    workspaceSync.startPeriodicSave("test-namespace");
+    assert.equal(capturedIntervalMs, 30 * 60 * 1000);
+  });
+
+  it("reverts to the 5 min primary interval after setBackupMode(false)", () => {
+    workspaceSync.setBackupMode(true);
+    workspaceSync.setBackupMode(false);
+    workspaceSync.startPeriodicSave("test-namespace");
+    assert.equal(capturedIntervalMs, 5 * 60 * 1000);
+  });
+
+  it("honors an explicit intervalMs override regardless of backup mode", () => {
+    workspaceSync.setBackupMode(true);
+    workspaceSync.startPeriodicSave("test-namespace", 1234);
+    assert.equal(capturedIntervalMs, 1234);
+  });
+});
+
 // --- AGENTS.md template validation ---
 
 describe("AGENTS.md template in agentcore-contract.js", () => {
