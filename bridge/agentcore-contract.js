@@ -443,9 +443,11 @@ function writeOpenClawConfig() {
     tools: {
       profile: "full",
       exec: {
-        host: "gateway",  // Run on container host — microVM provides isolation, no Docker sandbox
-        security: "full", // Full shell access; container is already isolated
-        ask: "off",       // Headless container — no approval UI
+        host: "gateway", // Run on container host — microVM provides isolation, no Docker sandbox
+        // "full" = security:full + ask:off. OpenClaw 2.0 made `mode` the canonical
+        // exec policy knob; the old `security`/`ask` pair is a legacy input that
+        // cannot be combined with `mode`. Container is already isolated and headless.
+        mode: "full",
       },
       deny: [
         "write", // Local writes don't persist — use S3 skill instead
@@ -456,6 +458,23 @@ function writeOpenClawConfig() {
         "canvas", // No UI rendering in headless chat context
         "cron", // EventBridge handles scheduling, not OpenClaw's built-in cron
         "gateway", // Admin tool — not needed for end users
+        // --- Tools added by OpenClaw 2.0 (2026.8.x+) that did not exist on 2026.3.8.
+        // Denied to keep the pre-2.0 tool surface: they either need a Control UI /
+        // human-in-the-loop that this headless bridge cannot provide, or add
+        // Bedrock spend for features this deployment does not use.
+        "terminal", // Shared operator terminal — Control UI only
+        "process", // Background process manager — exec via skills is the supported path
+        "plugins", // Agent-driven plugin install/enable — operator concern, not end users
+        "ask_user", // Structured human prompt — no UI to answer it here
+        "secrets", // Masked credential prompt — API keys are stored via the api-keys skill
+        "screen", // Control UI pane layout
+        "progress_card", // Control UI progress card
+        "nodes", // Paired device inspection — no nodes in this deployment
+        "heartbeat_respond", // Ambient heartbeat replies — no channel can receive them
+        "image_generate", // Media generation — not routed through the Bedrock proxy
+        "music_generate",
+        "video_generate",
+        "tts",
       ],
       // Note: `exec` is intentionally NOT denied — skills like clawhub-manage
       // need Bash(node:*) to run scripts. Scoped STS credentials ensure
@@ -464,6 +483,33 @@ function writeOpenClawConfig() {
     skills: {
       allowBundled: [],
       load: { extraDirs: ["/skills"] },
+      // OpenClaw 2.0 turns on autonomous self-learning (Skill Workshop) by
+      // default: extra model calls after runs plus new files under
+      // agents/main/agent/workshop-skills that would get synced to S3.
+      // Off preserves pre-2.0 behaviour and Bedrock spend.
+      workshop: { autonomous: { mode: "off" } },
+    },
+    // OpenClaw 2.0 default: "keep conversations across idle periods and day
+    // boundaries when no reset policy is configured". 2026.3.8 reset daily;
+    // keep that so upgraded users see the same conversation lifecycle.
+    session: {
+      reset: { mode: "daily", atHour: 4 },
+    },
+    // OpenClaw 2.0 defaults Active Memory cross-conversation recall ON for
+    // "personal installs". It adds a retrieval model pass before replies
+    // (Bedrock spend) and indexes transcripts. Off preserves pre-2.0 behaviour.
+    memory: {
+      search: { rememberAcrossConversations: false },
+    },
+    plugins: {
+      entries: {
+        // Active Memory plugin (advanced recall path) — off, see memory.search above.
+        "active-memory": { enabled: false },
+        // Grounded dreaming (background memory consolidation using the model) is
+        // on by default in 2.0. OPENCLAW_SKIP_CRON=1 already defers its cron job;
+        // disable explicitly so no consolidation runs land on Bedrock.
+        "memory-core": { config: { dreaming: { enabled: false } } },
+      },
     },
     gateway: {
       mode: "local",
@@ -472,8 +518,11 @@ function writeOpenClawConfig() {
       auth: { mode: "token", token: GATEWAY_TOKEN },
       controlUi: {
         enabled: false,
-        allowInsecureAuth: true,
-        dangerouslyDisableDeviceAuth: true,
+        // NOTE: `allowInsecureAuth` (removed from the schema) and
+        // `dangerouslyDisableDeviceAuth` (retired, ignored) were dropped for
+        // OpenClaw 2.0. Leaving them in makes the startup doctor rewrite
+        // openclaw.json (+ .bak ring) on every boot. Device-less auth is now
+        // handled by the bridge identifying as "gateway-client"/"backend".
         dangerouslyAllowHostHeaderOriginFallback: true,
         allowedOrigins: ["*"],
       },
@@ -1381,9 +1430,11 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
     console.log(`[contract] Connecting to WebSocket: ${wsUrl}`);
-    const ws = new WebSocket(wsUrl, {
-      origin: `http://127.0.0.1:${OPENCLAW_PORT}`,
-    });
+    // No Origin header: OpenClaw 2.0 treats any browser-style Origin as a
+    // Control-UI connection, which requires a signed device identity. A
+    // loopback "gateway-client"/"backend" connection WITHOUT Origin is the one
+    // shared-token path that keeps operator.* scopes (handshake.md, 2026.9.x).
+    const ws = new WebSocket(wsUrl);
     let responseText = "";
     let authenticated = false;
     let chatSent = false;
@@ -1441,10 +1492,13 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
             id: connectReqId,
             method: "connect",
             params: {
-              minProtocol: 3,
-              maxProtocol: 3,
+              // Gateway protocol v4 (MIN_CLIENT_PROTOCOL_VERSION=4 since 2026.5.12).
+              minProtocol: 4,
+              maxProtocol: 4,
               client: {
-                id: "openclaw-control-ui",
+                // "gateway-client" + "backend" is the only device-less token
+                // identity that keeps operator.* scopes on 2.0 (see handshake.md).
+                id: "gateway-client",
                 mode: "backend",
                 version: "dev",
                 platform: "linux",
