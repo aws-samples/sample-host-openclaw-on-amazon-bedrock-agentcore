@@ -64,7 +64,7 @@ preflight() {
 
   # Agentcore CLI
   if ! command -v "${AGENTCORE_CLI:-agentcore}" &>/dev/null && [ ! -x "$HOME/.local/bin/agentcore" ]; then
-    echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-cli"
+    echo "ERROR: agentcore CLI not found. Install with: pip install bedrock-agentcore-starter-toolkit"
     errors=$((errors + 1))
   fi
 
