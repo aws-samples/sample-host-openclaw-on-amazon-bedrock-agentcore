@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Builder — install all dependencies and tools
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim AS builder
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24-slim AS builder
 
 # Install system dependencies
 RUN apt-get update && \
@@ -15,7 +15,7 @@ RUN pip3 install --no-cache-dir --break-system-packages awscli
 # Pinned to tested versions — update intentionally to avoid unexpected breaking changes.
 # To upgrade: test the new version locally first, then bump both pins here.
 #   openclaw release notes: https://github.com/openclaw/openclaw/releases
-RUN npm install -g openclaw@2026.3.8 clawhub@0.8.0
+RUN npm install -g openclaw@2026.9.5 clawhub@0.23.3 --allow-scripts=openclaw
 
 # Install ClawHub community skills (5 high-value marketplace skills)
 # Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
@@ -72,7 +72,7 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 # Stage 2: Runtime — minimal image with only needed artifacts
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24-slim
 
 # Install only runtime system dependencies (no git, no pip, no build tools)
 RUN apt-get update && \
