@@ -1,11 +1,28 @@
 "use strict";
 const fs = require("fs");
 
+// Ensure /app/node_modules is in the module search path — OpenClaw's exec tool
+// may not forward NODE_PATH to child processes, so playwright-core (installed in
+// /app/node_modules) would otherwise fail to resolve. Add it and re-init the
+// module resolver so subsequent require() calls pick it up.
+if (!process.env.NODE_PATH?.includes("/app/node_modules")) {
+  process.env.NODE_PATH = [process.env.NODE_PATH, "/app/node_modules"]
+    .filter(Boolean)
+    .join(":");
+  require("module").Module._initPaths();
+}
+
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const CONTENT_TRUNCATE_CHARS = 8000;
 const NAV_TIMEOUT_MS = 30000;
 const INTERACT_TIMEOUT_MS = 10000;
 const WAIT_TIMEOUT_MS = 15000;
+
+// Accepting invalid TLS certificates is a security-posture change: it disables
+// certificate validation for ALL browsing in this context. Keep it OFF by
+// default and require an explicit opt-in via BROWSER_IGNORE_HTTPS_ERRORS=true,
+// intended only for VPC environments that terminate TLS with a private CA.
+const IGNORE_HTTPS_ERRORS = process.env.BROWSER_IGNORE_HTTPS_ERRORS === "true";
 
 function getBrowserSession() {
   if (!fs.existsSync(BROWSER_SESSION_FILE)) {
@@ -26,7 +43,7 @@ async function connectBrowser() {
     headers: session.headers || {},
   });
   const contexts = browser.contexts();
-  const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
+  const context = contexts.length > 0 ? contexts[0] : await browser.newContext({ ignoreHTTPSErrors: IGNORE_HTTPS_ERRORS });
   const pages = context.pages();
   const page = pages.length > 0 ? pages[0] : await context.newPage();
   return {

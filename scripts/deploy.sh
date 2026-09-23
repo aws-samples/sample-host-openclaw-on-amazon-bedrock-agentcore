@@ -188,6 +188,22 @@ read_cdk_outputs() {
     --query "Stacks[0].Outputs[?contains(OutputKey,'SecretsCmk')].OutputValue" \
     --output text)
 
+  # Read browser identifier (optional, only if enable_browser=true)
+  ENABLE_BROWSER=$(python3 -c "import json; print(str(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('enable_browser', False)).lower())")
+  BROWSER_IDENTIFIER=""
+  if [ "$ENABLE_BROWSER" = "true" ]; then
+    BROWSER_IDENTIFIER=$(aws cloudformation describe-stacks \
+      --stack-name OpenClawAgentCore --region "$REGION" \
+      --query "Stacks[0].Outputs[?OutputKey=='BrowserIdentifier'].OutputValue" \
+      --output text 2>/dev/null || echo "")
+    if [ -n "$BROWSER_IDENTIFIER" ] && [ "$BROWSER_IDENTIFIER" != "None" ]; then
+      echo "  Browser ID:     $BROWSER_IDENTIFIER"
+    else
+      echo "  Browser:        enable_browser=true but no BrowserIdentifier output found (region may not support it)"
+      BROWSER_IDENTIFIER=""
+    fi
+  fi
+
   # Read config values from cdk.json
   DEFAULT_MODEL_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('default_model_id','global.anthropic.claude-opus-4-6-v1'))")
   SUBAGENT_MODEL_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('subagent_model_id',''))")
@@ -290,7 +306,8 @@ phase2_toolkit() {
     --env "IDENTITY_TABLE_NAME=openclaw-identity" \
     --env "CRON_LEAD_TIME_MINUTES=$CRON_LEAD_TIME" \
     --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID" \
-    --env "TELEGRAM_CHANNEL_SECRET_ID=$TELEGRAM_CHANNEL_SECRET_ID"
+    --env "TELEGRAM_CHANNEL_SECRET_ID=$TELEGRAM_CHANNEL_SECRET_ID" \
+    ${BROWSER_IDENTIFIER:+--env "BROWSER_IDENTIFIER=$BROWSER_IDENTIFIER"}
 
   # --- Configure session storage (not supported by agentcore CLI yet) ---
   echo "--- Configuring session storage ---"
