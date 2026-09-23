@@ -104,6 +104,11 @@ let lastOpenClawEnv = null;
 let openclawRestartCount = 0;
 const OPENCLAW_MAX_RESTARTS = 3;
 const OPENCLAW_RESTART_DELAY_MS = 5000;
+// Max time init() waits for the S3 workspace restore before spawning the
+// gateway anyway (OpenClaw 2.0 must not open its SQLite store mid-restore).
+const RESTORE_WAIT_MS = parseInt(process.env.WORKSPACE_RESTORE_WAIT_MS || "45000", 10);
+// Max time allowed for the one-time legacy sessions.json -> SQLite import.
+const LEGACY_MIGRATION_TIMEOUT_MS = parseInt(process.env.OPENCLAW_MIGRATION_TIMEOUT_MS || "180000", 10);
 
 // Active task tracking — HealthyBusy prevents AgentCore from terminating during long tasks
 let activeTaskCount = 0;
@@ -281,6 +286,156 @@ async function cleanupLockFiles() {
 
   await walkAndClean(openclawDir);
   console.log("[contract] Lock file cleanup complete (async)");
+}
+
+/**
+ * Build the environment OpenClaw processes run with.
+ * Excludes container credentials and uses credential_process for scoped S3
+ * access only; falls back to a zero-AWS-access env if scoping failed.
+ */
+function openclawEnvFor(scopedCredsAvailable, userId) {
+  let openclawEnv;
+  if (scopedCredsAvailable) {
+    openclawEnv = scopedCreds.buildOpenClawEnv({
+      credDir: SCOPED_CREDS_DIR,
+      baseEnv: process.env,
+    });
+  } else {
+    // SECURITY: Never start OpenClaw with full execution role credentials.
+    // Build a safe env that strips ALL AWS credential sources.
+    // OpenClaw will have zero AWS access — tools fail gracefully.
+    console.error(
+      "[contract] WARNING: Scoped credentials failed — starting OpenClaw with zero AWS access",
+    );
+    openclawEnv = scopedCreds.buildOpenClawEnv({
+      credDir: null,
+      baseEnv: process.env,
+    });
+    openclawEnv.OPENCLAW_NO_AWS = "1";
+  }
+  // Propagate INTERNAL_USER_ID so OpenClaw skills (e.g., eventbridge-cron)
+  // can resolve the container's authorized userId for DynamoDB writes.
+  openclawEnv.INTERNAL_USER_ID = userId;
+  return openclawEnv;
+}
+
+/**
+ * Find pre-2.0 (file-backed) session stores in the state dir.
+ * OpenClaw <= 2026.7.x kept `~/.openclaw/agents/<id>/sessions/sessions.json`;
+ * 2.0 keeps rows in `~/.openclaw/agents/<id>/agent/openclaw-agent.sqlite`.
+ * Returns the list of legacy index paths found (empty when already migrated).
+ */
+function findLegacySessionStores(openclawDir = OPENCLAW_DIR) {
+  const found = [];
+  let agents = [];
+  try {
+    agents = fs.readdirSync(`${openclawDir}/agents`, { withFileTypes: true });
+  } catch {
+    return found; // No agents dir — fresh install
+  }
+  for (const entry of agents) {
+    if (!entry.isDirectory()) continue;
+    const legacyIndex = `${openclawDir}/agents/${entry.name}/sessions/sessions.json`;
+    if (fs.existsSync(legacyIndex)) found.push(legacyIndex);
+  }
+  return found;
+}
+
+/**
+ * Import a pre-2.0 sessions.json store into OpenClaw 2.0's SQLite store.
+ *
+ * 2.0's gateway does NOT migrate on its own: "If startup finds a legacy store,
+ * it refuses readiness and prints the Doctor command" (docs/concepts/session.md).
+ * Without this step an upgraded user with restored history would never get a
+ * ready gateway. Runs `openclaw doctor --fix --non-interactive` once, bounded
+ * by LEGACY_MIGRATION_TIMEOUT_MS, with the same scoped env as the gateway.
+ *
+ * Failure handling: a sessions.json that doctor cannot import (e.g. one that
+ * was uploaded to S3 mid-write by a pre-2.0 periodic sync — the R2 risk) is
+ * moved aside to `sessions.json.pre-2.0-unreadable-<ts>` so the gateway can
+ * start with empty history instead of refusing readiness forever. The
+ * transcript .jsonl files are left in place for a later manual
+ * `openclaw doctor --session-sqlite import`.
+ *
+ * @returns {Promise<boolean>} true when a legacy store was found and doctor
+ *   was run (the caller re-emits openclaw.json since doctor may rewrite it);
+ *   false when there was nothing to migrate.
+ */
+async function migrateLegacySessionStore(env) {
+  const legacy = findLegacySessionStores();
+  if (legacy.length === 0) return false; // nothing to migrate
+
+  console.log(
+    `[contract] Pre-2.0 session store found (${legacy.join(", ")}) — running openclaw doctor --fix to import into SQLite`,
+  );
+  const started = Date.now();
+  const result = await new Promise((resolve) => {
+    let out = "";
+    let settled = false;
+    const finish = (r) => {
+      if (!settled) {
+        settled = true;
+        resolve(r);
+      }
+    };
+    let child;
+    try {
+      child = spawn(
+        "openclaw",
+        ["doctor", "--fix", "--non-interactive"],
+        { stdio: ["ignore", "pipe", "pipe"], env },
+      );
+    } catch (err) {
+      return finish({ code: null, error: err.message, out: "" });
+    }
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish({ code: null, error: `timed out after ${LEGACY_MIGRATION_TIMEOUT_MS}ms`, out });
+    }, LEGACY_MIGRATION_TIMEOUT_MS);
+    const capture = (chunk) => {
+      out += chunk.toString();
+      if (out.length > 64 * 1024) out = out.slice(-64 * 1024);
+    };
+    child.stdout.on("data", capture);
+    child.stderr.on("data", capture);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      finish({ code: null, error: err.message, out });
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      finish({ code, error: null, out });
+    });
+  });
+
+  for (const line of result.out.split("\n").filter((l) => l.trim())) {
+    console.log(`[openclaw:doctor] ${line}`);
+  }
+
+  const remaining = findLegacySessionStores();
+  if (result.code === 0 && remaining.length === 0) {
+    console.log(
+      `[contract] Legacy session store imported into SQLite in ${Date.now() - started}ms`,
+    );
+    return true; // doctor ran (and succeeded)
+  }
+
+  // Import did not complete. Quarantine what is left so the gateway can boot.
+  console.warn(
+    `[contract] Legacy session import did not complete (exit=${result.code}${result.error ? `, ${result.error}` : ""}); ` +
+      `${remaining.length} legacy index file(s) remain — moving aside so the gateway can start`,
+  );
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const file of remaining) {
+    const quarantined = `${file}.pre-2.0-unreadable-${stamp}`;
+    try {
+      fs.renameSync(file, quarantined);
+      console.warn(`[contract] Moved ${file} -> ${quarantined} (history for this agent starts empty; transcripts kept)`);
+    } catch (err) {
+      console.error(`[contract] Could not move aside ${file}: ${err.message} — gateway may refuse readiness`);
+    }
+  }
+  return true; // doctor ran (import incomplete; leftovers quarantined)
 }
 
 /**
@@ -999,7 +1154,13 @@ async function init(userId, actorId, channel) {
       console.log("[contract] EXECUTION_ROLE_ARN not set — skipping credential scoping");
     }
 
-    // 1c. Clean up stale lock files restored from S3 (non-blocking)
+    // 1c. Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available.
+    // Must happen before anything touches ~/.openclaw (lock cleanup, S3 restore,
+    // config/AGENTS.md write, gateway spawn) so every write lands on the
+    // persistent mount and not in the ephemeral container filesystem.
+    const sessionStorageAvailable = setupSessionStorageSymlink();
+
+    // 1d. Clean up stale lock files restored from S3 / left on session storage (non-blocking)
     // Runs in parallel with proxy startup — does not block init.
     const lockCleanupPromise = cleanupLockFiles().catch((err) => {
       console.warn(`[contract] Lock cleanup failed: ${err.message}`);
@@ -1041,38 +1202,75 @@ async function init(userId, actorId, channel) {
       proxyReady = false;
     });
 
-    // Wait for lock cleanup to complete before starting OpenClaw
+    // Wait for lock cleanup to complete before touching the state dir further
     await lockCleanupPromise;
 
-    // NOTE: writeOpenClawConfig() is called AFTER setupSessionStorageSymlink()
-    // below, so that AGENTS.md is written to the symlinked path (session storage)
-    // and not overwritten by stale data from a previous session.
-    console.log("[contract] Starting OpenClaw gateway (headless)...");
-    // Build scoped env for OpenClaw — excludes container credentials,
-    // uses credential_process for scoped S3 access only.
-    // Falls back to full process.env if scoped credentials failed.
-    let openclawEnv;
-    if (scopedCredsAvailable) {
-      openclawEnv = scopedCreds.buildOpenClawEnv({
-        credDir: SCOPED_CREDS_DIR,
-        baseEnv: process.env,
-      });
+    // 1e. Restore workspace from S3 and configure sync mode based on session
+    // storage availability. This is awaited (bounded) BEFORE the gateway spawns:
+    // OpenClaw 2.0 opens its per-agent SQLite store and checks for a legacy
+    // sessions.json at startup, so restoring files underneath a booting gateway
+    // (the pre-2.0 behaviour) could hand it a half-restored state dir.
+    // The lightweight agent answers users during this window, as before.
+    let restorePromise = null;
+    if (sessionStorageAvailable) {
+      // Session storage is primary — S3 becomes a cold backup (30min instead of 5min)
+      workspaceSync.setBackupMode(true);
+
+      // Check if session storage already has data (resumed session)
+      const mountedOpenclawDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
+      let hasContent = false;
+      try {
+        const entries = fs.readdirSync(mountedOpenclawDir);
+        hasContent = entries.length > 0;
+      } catch { /* dir doesn't exist yet */ }
+
+      if (hasContent) {
+        console.log("[contract] Session storage has existing data — skipping S3 restore");
+      } else {
+        console.log("[contract] Session storage is empty — restoring from S3 backup");
+        restorePromise = workspaceSync.restoreWorkspace(namespace);
+      }
     } else {
-      // SECURITY: Never start OpenClaw with full execution role credentials.
-      // Build a safe env that strips ALL AWS credential sources.
-      // OpenClaw will have zero AWS access — tools fail gracefully.
-      console.error(
-        "[contract] WARNING: Scoped credentials failed — starting OpenClaw with zero AWS access",
-      );
-      openclawEnv = scopedCreds.buildOpenClawEnv({
-        credDir: null,
-        baseEnv: process.env,
-      });
-      openclawEnv.OPENCLAW_NO_AWS = "1";
+      // No session storage — use S3 sync as primary (existing behavior)
+      restorePromise = workspaceSync.restoreWorkspace(namespace);
     }
-    // Propagate INTERNAL_USER_ID so OpenClaw skills (e.g., eventbridge-cron)
-    // can resolve the container's authorized userId for DynamoDB writes.
-    openclawEnv.INTERNAL_USER_ID = userId;
+    if (restorePromise) {
+      await Promise.race([
+        restorePromise.catch((err) => {
+          console.warn(`[contract] Workspace restore failed: ${err.message}`);
+        }),
+        new Promise((resolve) =>
+          setTimeout(() => {
+            console.warn(
+              `[contract] Workspace restore still running after ${RESTORE_WAIT_MS}ms — starting gateway anyway`,
+            );
+            resolve();
+          }, RESTORE_WAIT_MS).unref(),
+        ),
+      ]);
+    }
+
+    // 1f. Write OpenClaw config + AGENTS.md AFTER the symlink (so they land on
+    // session storage and are not overwritten by stale restored data) and
+    // BEFORE the gateway spawns (2.0 validates config strictly at startup; the
+    // pre-2.0 code relied on gateway boot latency to win this race).
+    writeOpenClawConfig();
+
+    // 1g. OpenClaw 2.0 moved session state to per-agent SQLite. A pre-2.0
+    // sessions.json in the state dir makes the gateway REFUSE READINESS until
+    // `openclaw doctor --fix` imports it (docs/concepts/session.md, "Where state
+    // lives"). Run the import here, before spawn, so upgraded users keep their
+    // history and the gateway boots. No-op when no legacy store is present.
+    // Doctor needs the config above to exist; it may also rewrite it (dropping
+    // keys, rotating a .bak), so re-emit our config afterwards.
+    const openclawEnv = openclawEnvFor(scopedCredsAvailable, userId);
+    if (await migrateLegacySessionStore(openclawEnv)) {
+      writeOpenClawConfig();
+    }
+
+    console.log("[contract] Starting OpenClaw gateway (headless)...");
+    // openclawEnv: scoped env built above — excludes container credentials,
+    // uses credential_process for scoped S3 access only (see openclawEnvFor).
     openclawProcess = spawn(
       "openclaw",
       ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
@@ -1104,41 +1302,6 @@ async function init(userId, actorId, channel) {
       openclawReady = false;
       scheduleOpenClawRestart(currentNamespace);
     });
-
-    // Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available
-    const sessionStorageAvailable = setupSessionStorageSymlink();
-
-    // Write OpenClaw config AFTER symlink — ensures AGENTS.md lands in the
-    // symlinked path and is not overwritten by stale session storage data.
-    writeOpenClawConfig();
-
-    // Restore workspace from S3 and configure sync mode based on session storage availability
-    if (sessionStorageAvailable) {
-      // Session storage is primary — S3 becomes a cold backup (30min instead of 5min)
-      workspaceSync.setBackupMode(true);
-
-      // Check if session storage already has data (resumed session)
-      const mountedOpenclawDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
-      let hasContent = false;
-      try {
-        const entries = fs.readdirSync(mountedOpenclawDir);
-        hasContent = entries.length > 0;
-      } catch { /* dir doesn't exist yet */ }
-
-      if (hasContent) {
-        console.log("[contract] Session storage has existing data — skipping S3 restore");
-      } else {
-        console.log("[contract] Session storage is empty — restoring from S3 backup");
-        workspaceSync.restoreWorkspace(namespace).catch((err) => {
-          console.warn(`[contract] Workspace restore failed: ${err.message}`);
-        });
-      }
-    } else {
-      // No session storage — use S3 sync as primary (existing behavior)
-      workspaceSync.restoreWorkspace(namespace).catch((err) => {
-        console.warn(`[contract] Workspace restore failed: ${err.message}`);
-      });
-    }
 
     // 2. Wait only for proxy readiness (~5s)
     proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
