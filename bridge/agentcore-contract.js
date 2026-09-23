@@ -641,7 +641,9 @@ function writeOpenClawConfig() {
         try {
           const { PutObjectCommand } = require("@aws-sdk/client-s3");
           const { S3Client } = require("@aws-sdk/client-s3");
-          const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
+          // Use bare AWS_REGION (no hardcoded fallback) so the writer resolves the
+          // SAME region the proxy uses when it reads this object back via getS3Client().
+          const s3 = new S3Client({ region: process.env.AWS_REGION });
           await s3.send(new PutObjectCommand({
             Bucket: bucket,
             Key: `${namespace}/AGENTS.md`,
