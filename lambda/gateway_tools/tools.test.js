@@ -262,3 +262,19 @@ it("toolNameFromContext reads the lowercase custom key the runtime provides", ()
   );
   assert.equal(toolNameFromContext({}), "");
 });
+
+it("withErrorEnvelope logs a gateway_tool_error line and returns the envelope", async () => {
+  const { withErrorEnvelope } = require("./lib/mcp");
+  const lines = [];
+  const h = withErrorEnvelope(async () => {
+    const e = new Error("AccessDeniedException: kms:Decrypt");
+    e.name = "AccessDeniedException";
+    throw e;
+  }, (l) => lines.push(JSON.parse(l)));
+  const out = await h({}, { clientContext: { custom: { bedrockAgentCoreToolName: "schedules___create_schedule" } } });
+  assert.deepEqual(out, { error: "error", message: "AccessDeniedException: kms:Decrypt" });
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].event, "gateway_tool_error");
+  assert.equal(lines[0].tool, "create_schedule");
+  assert.equal(lines[0].name, "AccessDeniedException");
+});

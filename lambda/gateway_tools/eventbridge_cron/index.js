@@ -338,7 +338,7 @@ function createHandler(deps = {}) {
     const fn = tools[tool];
     if (!fn) return { error: "unknown_tool", message: `Unknown tool "${tool}"` };
     return fn(identity, args);
-  });
+  }, deps.log);
 }
 
 let _handler = null;

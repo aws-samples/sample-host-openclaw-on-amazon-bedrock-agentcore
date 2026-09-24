@@ -40,13 +40,25 @@ function sanitizeFilename(str) {
 }
 
 /** Wrap a handler so thrown errors become a JSON error object, not a Lambda fault. */
-function withErrorEnvelope(fn) {
+function withErrorEnvelope(fn, log = console.log) {
   return async (event, context) => {
     try {
       return await fn(event, context);
     } catch (err) {
       const code = err && err.name === "IdentityError" ? "unauthorized" : "error";
-      return { error: code, message: err && err.message ? err.message : String(err) };
+      const message = err && err.message ? err.message : String(err);
+      // One structured line so a failing tool is visible in CloudWatch, not
+      // only in the model's paraphrase of the result. No arguments are logged.
+      log(
+        JSON.stringify({
+          event: "gateway_tool_error",
+          tool: toolNameFromContext(context),
+          code,
+          name: err && err.name,
+          message,
+        }),
+      );
+      return { error: code, message };
     }
   };
 }
