@@ -45,84 +45,9 @@ Users can send **text and images** — photos sent via Telegram, Slack or Feishu
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph CH[Channels]
-        TG[Telegram]
-        SL[Slack]
-        FS[Feishu]
-    end
+![Architecture: users message Telegram, Slack or Feishu; webhooks reach API Gateway and the Router Lambda, which resolves the user in DynamoDB and invokes OpenClaw 2.0 on a per-user Bedrock AgentCore Runtime microVM; the runtime calls Amazon Bedrock (Claude with Guardrails), keeps state in S3, reads Secrets Manager and Cognito/STS scoped credentials, and schedules tasks through EventBridge Scheduler and a Cron Lambda; Bedrock invocation logs feed CloudWatch token monitoring](docs/images/architecture.png)
 
-    subgraph ING[Ingress]
-        APIGW[API Gateway<br/>HTTP API]
-        ROUTER[Router Lambda]
-    end
-
-    subgraph RT[AgentCore Runtime microVM - one per user]
-        direction LR
-        CONTRACT[Contract server<br/>:8080]
-        LWA[Lightweight agent<br/>warm-up fallback]
-        GW[OpenClaw gateway<br/>:18789]
-        PROXY[Bedrock proxy<br/>:18790]
-        CONTRACT -->|"until gateway ready"| LWA
-        CONTRACT -->|"WebSocket v4"| GW
-        LWA --> PROXY
-        GW -->|"OpenAI API"| PROXY
-    end
-
-    BR[Amazon Bedrock<br/>ConverseStream]
-
-    subgraph ST[State and storage]
-        LOCAL[Local disk<br/>~/.openclaw]
-        MNT[Session storage<br/>/mnt/workspace]
-        S3[S3 user-files bucket]
-        DDB[(DynamoDB<br/>openclaw-identity)]
-    end
-
-    subgraph SEC[Identity and security]
-        STS[STS scoped<br/>credentials]
-        COG[Cognito<br/>User Pool]
-        SM[Secrets Manager]
-        KMS[KMS CMK]
-    end
-
-    subgraph CRON[Scheduled tasks]
-        EB[EventBridge<br/>Scheduler]
-        CRONL[Cron Lambda]
-    end
-
-    subgraph OBS[Token monitoring]
-        LOGS[Bedrock invocation<br/>logs]
-        TOKL[token_metrics<br/>Lambda]
-        TOKDDB[(DynamoDB<br/>token usage)]
-        DASH[Dashboards<br/>+ alarms]
-    end
-
-    TG & SL & FS -->|webhook| APIGW --> ROUTER
-    ROUTER -->|InvokeAgentRuntime| CONTRACT
-    ROUTER <-->|users, sessions| DDB
-    ROUTER -->|images| S3
-    PROXY --> BR
-    BR -.->|logs| LOGS
-
-    CONTRACT <-->|mirror / restore| MNT
-    CONTRACT <-->|snapshot / restore| S3
-    CONTRACT --> LOCAL
-    LWA & GW -->|per-user files, schedules, keys| S3 & DDB & SM
-
-    CONTRACT -->|AssumeRole + session policy| STS
-    STS -.-> LWA & GW
-    PROXY -->|per-user JWT| COG
-    CONTRACT -->|tokens, channel secrets| SM
-    KMS -.->|encrypts| S3 & DDB & SM
-
-    GW -->|eventbridge-cron skill| EB
-    EB --> CRONL
-    CRONL -->|warmup + cron| CONTRACT
-    CRONL -->|reply| TG & SL
-
-    LOGS --> TOKL --> TOKDDB & DASH
-```
+The diagram shows the high-level request path. Container internals (contract server, lightweight agent, Bedrock proxy, session storage), KMS and networking are described in the component table below and in [docs/architecture-detailed.md](docs/architecture-detailed.md); the diagram source is `docs/diagrams/architecture.py`.
 
 Messages from a channel reach API Gateway and the Router Lambda, which validates the webhook, resolves the user in DynamoDB and calls `InvokeAgentRuntime` with a per-user session id. Inside the user's microVM the contract server answers immediately through the lightweight agent while the OpenClaw gateway boots, then bridges every later message to OpenClaw over WebSocket. Both paths call Bedrock through the local proxy. OpenClaw state lives on local disk, is mirrored to session storage and snapshotted to S3. Scheduled tasks and token monitoring run on their own Lambdas.
 
@@ -444,6 +369,8 @@ openclaw-on-agentcore/
       conftest.py                 # pytest fixtures, conversation scenarios
   redteam/                        # LLM red team testing (promptfoo, 62 test cases)
   docs/
+    images/architecture.png       # README architecture diagram (AWS icons)
+    diagrams/architecture.py      # Diagram source (python `diagrams` library)
     architecture.md               # Solution architecture (ASCII diagrams)
     architecture-detailed.md      # Sequence diagrams, container internals, data flows
     openclaw-2.0-upgrade.md       # 2026.3.8 -> 2026.9.5 upgrade notes, risks, validation
