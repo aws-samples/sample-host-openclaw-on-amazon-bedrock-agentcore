@@ -208,7 +208,12 @@ def test_lambda_iam_is_scoped():
         "scheduler:CreateSchedule", "scheduler:GetSchedule", "scheduler:UpdateSchedule", "scheduler:DeleteSchedule",
         "iam:PassRole",
         "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
+        "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey",
     }
+    # The identity table is SSE-KMS encrypted; the grant is pinned to the CMK and to DynamoDB as the caller.
+    kms_stmt = next(st for st in sched if "kms:Decrypt" in st["Action"])
+    assert kms_stmt["Condition"] == {"StringEquals": {"kms:ViaService": f"dynamodb.{_REGION}.amazonaws.com"}}
+    assert kms_stmt["Resource"] != "*"
     pass_role = next(st for st in sched if "iam:PassRole" in st["Action"])
     assert pass_role["Condition"] == {"StringEquals": {"iam:PassedToService": "scheduler.amazonaws.com"}}
     assert pass_role["Resource"] == f"arn:aws:iam::{_ACCOUNT}:role/openclaw-cron-scheduler-role-{_REGION}"

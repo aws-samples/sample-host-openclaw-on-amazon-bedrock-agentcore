@@ -226,6 +226,15 @@ class GatewayStack(Stack):
                 resources=[identity_table_arn],
             )
         )
+        # openclaw-identity is SSE-KMS encrypted with the security CMK; DynamoDB
+        # calls KMS on the caller's behalf, so the grant is pinned to that path.
+        self.schedules_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+                resources=[cmk_arn],
+                conditions={"StringEquals": {"kms:ViaService": f"dynamodb.{region}.amazonaws.com"}},
+            )
+        )
 
         # --- Gateway service role ---------------------------------------------
         # Trust policy per the Gateway prerequisites doc; SourceArn is added
