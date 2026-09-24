@@ -48,7 +48,8 @@ Authorization: Bearer <token>     REQUEST interceptor copies    with ":" -> "_" 
 in mcp.servers.agentcore.headers  the bearer to __caller_token  telegram_123), same as the proxy
 ```
 
-* The Lambda-target contract carries **no claims**: `context.clientContext.Custom` has only the
+* The Lambda-target contract carries **no claims**: `context.clientContext.custom` (lowercase in
+  the Node runtime; the docs' Python sample reads `client_context.custom`) has only the
   `bedrockAgentCore*` routing fields and `event` is the tool's own arguments. `Authorization` can
   never be allowlisted for header propagation. The documented way for verified identity to reach a
   Lambda target is therefore a REQUEST interceptor with `passRequestHeaders`, which is what this
@@ -175,7 +176,16 @@ Run: `pytest tests/test_gateway_stack_synth.py -v`; `cd bridge && node --test ga
    therefore exposes `getAccessToken()` (same `ADMIN_USER_PASSWORD_AUTH` call, both tokens cached
    together) and the contract server uses it for the MCP bearer; the proxy keeps using the ID token
    for its own purposes. `lib/identity.js` in the Lambdas already verified either type.
-2. **Does a bearer refresh break an in-flight tool call?** See the E2E report (forced refresh during
-   a long tool call).
+2. **Does a bearer refresh break an in-flight tool call? No.** The Gateway's Streamable-HTTP
+   endpoint is stateless per request: `initialize` returns no `Mcp-Session-Id`, and every
+   `tools/call` is authorised on the bearer it carries. Live probe: call with token A -> 200; mint
+   token B the way the refresh does; the same call with B -> 200; with A again -> 200 (issuing B does
+   not revoke A, which stays valid until its own `exp`); fresh `initialize` + call with B -> 200.
+   So a call already in flight when `openclaw.json` is rewritten completes on the request it sent,
+   and the next call carries the new header. The bridge refreshes 5 min before expiry and retries a
+   failed refresh every 60 s, so the old token is still valid for the whole retry window.
+3. **First live surprise:** the first deployed Lambdas read `clientContext.Custom` and got
+   `tool=""` (every call answered `unknown_tool`, which the model rendered as "no files"). Fixed to
+   read `custom` with `Custom` as fallback; the `gateway_tool_call` audit line now shows the tool.
 
 Both answers are recorded in the E2E report referenced from the PR.

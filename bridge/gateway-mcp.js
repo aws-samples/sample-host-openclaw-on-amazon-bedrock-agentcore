@@ -12,15 +12,17 @@
  * With the env var unset nothing is added and the config is byte-identical to
  * the pre-gateway build.
  *
- * Token refresh: the Cognito ID token lives 1 h. Shortly before expiry the
+ * Token refresh: the Cognito access token lives 1 h. Shortly before expiry the
  * contract server mints a fresh one and rewrites openclaw.json with the new
  * header. OpenClaw watches the file and hot-applies `mcp` changes without a
  * gateway restart; per the upstream hot-reload doc "MCP config changes retire
  * only changed or removed server connections ... active runs can continue
  * calling their tools" (docs/gateway/configuration/hot-reload.md,
- * docs/gateway/config-extensions.md). Whether an in-flight tool call really
- * survives the swap is one of the two things this prototype has NOT verified
- * live — see docs/gateway-mcp-tools.md.
+ * docs/gateway/config-extensions.md). Verified live against the Gateway: its
+ * Streamable-HTTP endpoint is stateless per request (no Mcp-Session-Id), each
+ * call is authorised on its own bearer, and the previous token stays valid
+ * until its own exp, so an in-flight call is unaffected — see
+ * docs/gateway-mcp-tools.md.
  */
 "use strict";
 
