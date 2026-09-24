@@ -253,6 +253,46 @@ class GatewayStack(Stack):
                 ],
             )
         )
+        # The Gateway encrypts its target configuration with the CMK using this
+        # role (the live create failed with "GenesisMCPTargetTargetEncryption is
+        # not authorized to perform: kms:GenerateDataKey" without it). Actions and
+        # conditions follow the customer-managed-key doc; the encryption context
+        # is the gateway ARN, which is not known before creation, hence the
+        # wildcard on the gateway id.
+        #   https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-encryption.html
+        gateway_arn_pattern = f"arn:aws:bedrock-agentcore:{region}:{account}:gateway/*"
+        via_service = {"kms:ViaService": f"bedrock-agentcore.{region}.amazonaws.com"}
+        self.gateway_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="GatewayCmkDescribe",
+                actions=["kms:DescribeKey"],
+                resources=[cmk_arn],
+                conditions={"StringEquals": via_service},
+            )
+        )
+        self.gateway_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="GatewayCmkDataKeys",
+                actions=["kms:Decrypt", "kms:GenerateDataKey"],
+                resources=[cmk_arn],
+                conditions={
+                    "StringEquals": via_service,
+                    "StringLike": {"kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn": gateway_arn_pattern},
+                },
+            )
+        )
+        self.gateway_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="GatewayCmkGrant",
+                actions=["kms:CreateGrant"],
+                resources=[cmk_arn],
+                conditions={
+                    "StringEquals": {**via_service, "kms:GrantConstraintType": "EncryptionContextSubset"},
+                    "ForAllValues:StringEquals": {"kms:GrantOperations": ["Decrypt", "GenerateDataKey"]},
+                    "StringLike": {"kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn": gateway_arn_pattern},
+                },
+            )
+        )
 
         # --- Gateway -----------------------------------------------------------
         discovery_url = f"{cognito_issuer_url}/.well-known/openid-configuration"
