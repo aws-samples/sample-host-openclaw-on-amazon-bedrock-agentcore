@@ -246,3 +246,19 @@ describe("schedules target", () => {
     assert.equal(scheduler.sent.length + ddb.sent.length, 0);
   });
 });
+
+// Regression: the live Node 22 runtime exposes the Gateway metadata under
+// clientContext.custom (lowercase); the first deployed build looked only at
+// `Custom` and logged tool="" / returned unknown_tool for every call.
+it("toolNameFromContext reads the lowercase custom key the runtime provides", () => {
+  const { toolNameFromContext } = require("./lib/mcp");
+  assert.equal(
+    toolNameFromContext({ clientContext: { custom: { bedrockAgentCoreToolName: "user-files___list_files" } } }),
+    "list_files",
+  );
+  assert.equal(
+    toolNameFromContext({ clientContext: { Custom: { bedrockAgentCoreToolName: "schedules___list_schedules" } } }),
+    "list_schedules",
+  );
+  assert.equal(toolNameFromContext({}), "");
+});

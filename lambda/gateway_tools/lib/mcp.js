@@ -12,10 +12,12 @@ const TOOL_NAME_DELIMITER = "___";
  *   https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-tool-naming.html
  */
 function toolNameFromContext(context) {
-  const custom =
-    (context && context.clientContext && context.clientContext.Custom) ||
-    (context && context.client_context && context.client_context.custom) ||
-    {};
+  // The Node runtime hands the decoded X-Amz-Client-Context through as-is, so
+  // the Gateway metadata lives under the lowercase `custom` key (the same key
+  // Python exposes as client_context.custom). Accept `Custom` too for callers
+  // and tests that use the capitalised spelling.
+  const cc = (context && (context.clientContext || context.client_context)) || {};
+  const custom = cc.custom || cc.Custom || {};
   const full = custom.bedrockAgentCoreToolName || "";
   const idx = full.indexOf(TOOL_NAME_DELIMITER);
   return idx === -1 ? full : full.slice(idx + TOOL_NAME_DELIMITER.length);

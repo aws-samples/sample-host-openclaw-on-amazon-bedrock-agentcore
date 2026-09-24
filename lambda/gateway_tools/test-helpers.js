@@ -60,11 +60,11 @@ function fakeFetchJwks() {
   return Promise.resolve(JWKS);
 }
 
-/** Lambda context as the Gateway sends it (clientContext.Custom). */
+/** Lambda context as the Node runtime exposes it (clientContext.custom). */
 function gatewayContext(targetName, toolName) {
   return {
     clientContext: {
-      Custom: {
+      custom: {
         bedrockAgentCoreMessageVersion: "1.0",
         bedrockAgentCoreAwsRequestId: "req-1",
         bedrockAgentCoreMcpMessageId: "1",
