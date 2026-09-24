@@ -10,7 +10,7 @@ endpoints, ECR) are intentionally left out — see docs/architecture-detailed.md
 from pathlib import Path
 
 from diagrams import Cluster, Diagram, Edge
-from diagrams.aws.compute import Compute, Lambda
+from diagrams.aws.compute import Lambda
 from diagrams.aws.database import Dynamodb
 from diagrams.aws.integration import EventbridgeScheduler
 from diagrams.aws.management import Cloudwatch
@@ -82,7 +82,7 @@ with Diagram(
         cron = Lambda("Cron Lambda")
 
     with Cluster("Per-user microVM"):
-        runtime = Compute("OpenClaw 2.0 on\nAgentCore Runtime")
+        runtime = Bedrock("OpenClaw 2.0 on\nAgentCore Runtime")
 
     with Cluster("Identity and secrets"):
         cognito = Cognito("Cognito + STS\nscoped credentials")
