@@ -256,20 +256,19 @@ class GatewayStack(Stack):
         # The Gateway encrypts its target configuration with the CMK using this
         # role (the live create failed with "GenesisMCPTargetTargetEncryption is
         # not authorized to perform: kms:GenerateDataKey" without it). Actions
-        # follow the customer-managed-key doc. Conditions: the statements are
-        # pinned to the one key and to calls made through the AgentCore service;
-        # the doc's extra kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn
-        # condition is NOT applied because the CreateGateway-time encryption call
-        # (session name GenesisMCPTargetTargetEncryption, CloudTrail 2026-09-24)
-        # was still denied with it present as a wildcard on the gateway id.
+        # follow the customer-managed-key doc; the statements are pinned to the
+        # one key. The doc's kms:ViaService and
+        # kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn conditions are
+        # NOT applied: the CreateGateway-time GenerateDataKey (role session
+        # GenesisMCPTargetTargetEncryption, invokedBy bedrock-agentcore.amazonaws.com,
+        # CloudTrail 2026-09-24) was denied with each of them present. The role
+        # itself is only assumable by the AgentCore service from this account.
         #   https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-encryption.html
-        via_service = {"kms:ViaService": f"bedrock-agentcore.{region}.amazonaws.com"}
         self.gateway_role.add_to_policy(
             iam.PolicyStatement(
                 sid="GatewayCmkDescribe",
                 actions=["kms:DescribeKey"],
                 resources=[cmk_arn],
-                conditions={"StringEquals": via_service},
             )
         )
         self.gateway_role.add_to_policy(
@@ -277,7 +276,6 @@ class GatewayStack(Stack):
                 sid="GatewayCmkDataKeys",
                 actions=["kms:Decrypt", "kms:GenerateDataKey"],
                 resources=[cmk_arn],
-                conditions={"StringEquals": via_service},
             )
         )
         self.gateway_role.add_to_policy(
@@ -286,7 +284,7 @@ class GatewayStack(Stack):
                 actions=["kms:CreateGrant"],
                 resources=[cmk_arn],
                 conditions={
-                    "StringEquals": {**via_service, "kms:GrantConstraintType": "EncryptionContextSubset"},
+                    "StringEquals": {"kms:GrantConstraintType": "EncryptionContextSubset"},
                     "ForAllValues:StringEquals": {"kms:GrantOperations": ["Decrypt", "GenerateDataKey"]},
                 },
             )
