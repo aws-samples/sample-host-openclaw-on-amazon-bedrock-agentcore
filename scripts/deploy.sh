@@ -189,6 +189,30 @@ read_cdk_outputs() {
   require_cdk_output EXECUTION_ROLE_ARN SECURITY_GROUP_ID PRIVATE_SUBNET_IDS USER_FILES_BUCKET \
     COGNITO_USER_POOL_ID COGNITO_CLIENT_ID CMK_ARN
 
+  # Bedrock Guardrails (issue #100). The proxy only injects guardrailConfig when
+  # BEDROCK_GUARDRAIL_ID is set on the runtime, so read the OpenClawGuardrails
+  # outputs here and pass them through in Phase 2. enable_guardrails defaults
+  # to true (stacks/guardrails_stack.py); when it is false the stack exports
+  # nothing and we deliberately leave both values empty.
+  ENABLE_GUARDRAILS=$(python3 -c "import json; print(str(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('enable_guardrails', True)).lower())")
+  GUARDRAIL_ID=""
+  GUARDRAIL_VERSION=""
+  if [ "$ENABLE_GUARDRAILS" = "true" ]; then
+    GUARDRAIL_ID=$(aws cloudformation describe-stacks \
+      --stack-name OpenClawGuardrails --region "$REGION" \
+      --query "Stacks[0].Outputs[?OutputKey=='GuardrailId'].OutputValue" \
+      --output text)
+    GUARDRAIL_VERSION=$(aws cloudformation describe-stacks \
+      --stack-name OpenClawGuardrails --region "$REGION" \
+      --query "Stacks[0].Outputs[?OutputKey=='GuardrailVersion'].OutputValue" \
+      --output text)
+    # An empty ID would silently deploy the runtime with guardrails OFF while
+    # the stack and docs say they are on — refuse, same as COGNITO_CLIENT_ID.
+    require_cdk_output GUARDRAIL_ID GUARDRAIL_VERSION
+  else
+    echo "  Guardrails:     disabled via enable_guardrails=false (BEDROCK_GUARDRAIL_ID not set)"
+  fi
+
   # Read browser identifier (optional, only if enable_browser=true)
   ENABLE_BROWSER=$(python3 -c "import json; print(str(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('enable_browser', False)).lower())")
   BROWSER_IDENTIFIER=""
@@ -220,12 +244,16 @@ read_cdk_outputs() {
   echo "  S3 Bucket:      $USER_FILES_BUCKET"
   echo "  Cognito Pool:   $COGNITO_USER_POOL_ID"
   echo "  Cognito Client: $COGNITO_CLIENT_ID"
+  if [ -n "$GUARDRAIL_ID" ]; then
+    echo "  Guardrail:      $GUARDRAIL_ID v$GUARDRAIL_VERSION"
+  fi
 }
 
 # Fail loudly if a required CDK output resolved empty or to "None" (the AWS CLI
 # prints "None" for a query that matched nothing). An empty value here would
 # otherwise be passed to the runtime as an env var and silently disable a
-# feature — e.g. an empty COGNITO_CLIENT_ID turns off per-user scoped credentials.
+# feature — e.g. an empty COGNITO_CLIENT_ID turns off per-user scoped credentials,
+# and an empty BEDROCK_GUARDRAIL_ID turns off Bedrock Guardrails in the proxy.
 require_cdk_output() {
   local name value missing=""
   for name in "$@"; do
@@ -236,7 +264,7 @@ require_cdk_output() {
   done
   if [ -n "$missing" ]; then
     echo "ERROR: required CDK stack output(s) resolved empty:$missing" >&2
-    echo "       Check 'aws cloudformation describe-stacks --stack-name OpenClawSecurity / OpenClawAgentCore --region $REGION'" >&2
+    echo "       Check 'aws cloudformation describe-stacks --stack-name OpenClawSecurity / OpenClawAgentCore / OpenClawGuardrails --region $REGION'" >&2
     echo "       and confirm the OutputKeys queried in scripts/deploy.sh exist in the deployed stacks." >&2
     echo "       Refusing to configure the runtime with empty values." >&2
     exit 1
@@ -331,6 +359,8 @@ phase2_toolkit() {
     --env "CRON_LEAD_TIME_MINUTES=$CRON_LEAD_TIME" \
     --env "SUBAGENT_BEDROCK_MODEL_ID=$SUBAGENT_MODEL_ID" \
     --env "TELEGRAM_CHANNEL_SECRET_ID=$TELEGRAM_CHANNEL_SECRET_ID" \
+    ${GUARDRAIL_ID:+--env "BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID"} \
+    ${GUARDRAIL_VERSION:+--env "BEDROCK_GUARDRAIL_VERSION=$GUARDRAIL_VERSION"} \
     ${BROWSER_IDENTIFIER:+--env "BROWSER_IDENTIFIER=$BROWSER_IDENTIFIER"}
 
   # --- Configure session storage (not supported by agentcore CLI yet) ---

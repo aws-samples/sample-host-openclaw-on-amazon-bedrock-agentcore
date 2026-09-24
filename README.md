@@ -775,7 +775,8 @@ pytest tests/e2e/bot_test.py -v -k conversation          # multi-turn + rapid-fi
 pytest tests/e2e/bot_test.py -v -k SkillManagement       # clawhub skill install/uninstall/list
 pytest tests/e2e/bot_test.py -v -k ApiKeyManagement      # API key storage (native + Secrets Manager)
 pytest tests/e2e/bot_test.py -v -k CronSchedule          # cron lifecycle + CRON# DynamoDB record check
-pytest tests/e2e/bot_test.py -v -k GuardrailSecurity     # guardrail content filtering (requires BEDROCK_GUARDRAIL_ID env var)
+pytest tests/e2e/bot_test.py -v -k GuardrailSecurity     # guardrail content filtering (requires BEDROCK_GUARDRAIL_ID env var, see below)
+pytest tests/e2e/test_guardrail_wiring.py -v             # guardrail WIRING: passes only on a logged guardrail intervention
 pytest tests/e2e/bot_test.py -v                          # all E2E tests
 ```
 
@@ -904,9 +905,24 @@ npx promptfoo@latest view
 
 **Results with guardrails enabled:** ~93% pass rate (up from ~77% baseline without guardrails). See [redteam/README.md](redteam/README.md) for details.
 
+### Guardrail wiring
+
+The guardrail is only applied if two things are true at once, and `scripts/deploy.sh` sets both:
+
+1. **IAM** — `app.py` passes the `OpenClawGuardrails` outputs into `AgentCoreStack`, which grants the runtime execution role `bedrock:ApplyGuardrail`. `tests/test_guardrail_wiring_synth.py` asserts this at synth time so a rebase cannot drop it again (it did once, in #30 — see #100).
+2. **Runtime env** — Phase 2 of `scripts/deploy.sh` reads the `GuardrailId` / `GuardrailVersion` outputs of `OpenClawGuardrails` (exact `OutputKey` match) and passes them to the runtime as `BEDROCK_GUARDRAIL_ID` / `BEDROCK_GUARDRAIL_VERSION`. `bridge/agentcore-proxy.js` only injects `guardrailConfig` into Bedrock calls when `BEDROCK_GUARDRAIL_ID` is set. With `enable_guardrails: true` (the default) the deploy **fails** if either output resolves empty rather than silently shipping a runtime without guardrails; with `enable_guardrails: false` the variables are simply not set.
+
+Exporting `BEDROCK_GUARDRAIL_ID` in your own shell does **not** configure the runtime — that only happens through `scripts/deploy.sh` (or `--runtime-only`). A runtime that has it set logs `[proxy] Bedrock Guardrails enabled: <id> v<version>` on startup.
+
 ### Guardrail E2E Tests
 
-The `TestGuardrailSecurity` test class (6 tests) validates guardrail behavior through the full Telegram webhook pipeline:
+`tests/e2e/test_guardrail_wiring.py` verifies the wiring end to end. `test_guardrail_blocks_harmful_content` passes only when the runtime log (`/aws/bedrock-agentcore/runtimes/<runtime_id>-<endpoint>`) contains the proxy's `[guardrail] intervention ...` line, i.e. Bedrock returned `stopReason: guardrail_intervened`. A refusal written by the model itself does not count, so this test fails on a deployment where the guardrail is deployed but not wired.
+
+```bash
+pytest tests/e2e/test_guardrail_wiring.py -v
+```
+
+The `TestGuardrailSecurity` test class in `bot_test.py` (6 tests) exercises guardrail behaviour through the full Telegram webhook pipeline. It is gated on `BEDROCK_GUARDRAIL_ID` being set **in the test runner's shell** (this only selects the tests; the runtime gets its value from the deploy):
 
 ```bash
 # Requires deployed stack + guardrail ID

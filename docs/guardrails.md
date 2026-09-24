@@ -88,7 +88,7 @@ source .venv/bin/activate
 cdk deploy OpenClawGuardrails OpenClawAgentCore --require-approval never
 ```
 
-When disabled, the `GuardrailsStack` creates no resources. The proxy receives empty guardrail env vars and skips `guardrailConfig` injection.
+When disabled, the `GuardrailsStack` creates no resources, `AgentCoreStack` skips the `bedrock:ApplyGuardrail` grant, and `scripts/deploy.sh` does not set `BEDROCK_GUARDRAIL_ID` on the runtime, so the proxy skips `guardrailConfig` injection. Re-run Phase 2 (`./scripts/deploy.sh --runtime-only`) after toggling so the runtime environment matches.
 
 ---
 
@@ -205,8 +205,10 @@ User message → Router Lambda → AgentCore → agentcore-proxy.js
                                     └───────────────────┘
 ```
 
-**Environment variables** (set by CDK on the container):
+**Environment variables** (set on the runtime by `scripts/deploy.sh` Phase 2, read from the `OpenClawGuardrails` stack outputs `GuardrailId` / `GuardrailVersion`):
 - `BEDROCK_GUARDRAIL_ID` — guardrail identifier
 - `BEDROCK_GUARDRAIL_VERSION` — pinned guardrail version
 
-**IAM**: Execution role has `bedrock:ApplyGuardrail` permission (scoped to `arn:aws:bedrock:{region}:{account}:guardrail/*`).
+The deploy fails if `enable_guardrails` is true and either output resolves empty, so a runtime is never configured with guardrails silently off. On startup the proxy logs `[proxy] Bedrock Guardrails enabled: <id> v<version>`; on a block it logs `[guardrail] intervention on streaming response` (or `non-streaming`).
+
+**IAM**: Execution role has `bedrock:ApplyGuardrail` permission (scoped to `arn:aws:bedrock:{region}:{account}:guardrail/*`), granted by `AgentCoreStack` from the `guardrail_id` that `app.py` passes in. `tests/test_guardrail_wiring_synth.py` asserts this at synth time.

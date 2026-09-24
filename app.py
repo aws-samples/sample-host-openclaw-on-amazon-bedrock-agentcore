@@ -59,6 +59,12 @@ agentcore_stack = AgentCoreStack(
     cognito_user_pool_id=security_stack.user_pool_id,
     cognito_password_secret_name=security_stack.cognito_password_secret.secret_name,
     gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
+    # Guardrail wiring (dropped by a rebase in 923189c / #30, restored in #100).
+    # GuardrailsStack exports None when enable_guardrails=false, so the
+    # AgentCoreStack `if guardrail_id:` branch (bedrock:ApplyGuardrail) is
+    # skipped cleanly in that case.
+    guardrail_id=guardrails_stack.guardrail_id or "",
+    guardrail_version=guardrails_stack.guardrail_version or "",
     env=env,
 )
 
