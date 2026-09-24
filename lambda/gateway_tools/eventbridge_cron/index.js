@@ -18,7 +18,7 @@
 
 const crypto = require("node:crypto");
 const { createVerifier, resolveCaller } = require("../lib/identity");
-const { toolNameFromContext, withErrorEnvelope } = require("../lib/mcp");
+const { toolNameFromContext, withErrorEnvelope, logToolCall } = require("../lib/mcp");
 
 // --- Validation (same rules as bridge/skills/eventbridge-cron/common.js) ---
 
@@ -334,6 +334,7 @@ function createHandler(deps = {}) {
   return withErrorEnvelope(async (event, context) => {
     const { identity, args } = await resolveCaller(event, verifier);
     const tool = toolNameFromContext(context);
+    logToolCall(tool, identity, deps.log);
     const fn = tools[tool];
     if (!fn) return { error: "unknown_tool", message: `Unknown tool "${tool}"` };
     return fn(identity, args);

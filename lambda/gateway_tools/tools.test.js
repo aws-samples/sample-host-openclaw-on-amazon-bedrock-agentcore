@@ -23,7 +23,7 @@ const TOKEN = h.idToken("telegram:123456");
 function filesHandler(answer) {
   const s3 = h.fakeClient(answer);
   const commands = h.fakeCommands("ListObjectsV2Command", "GetObjectCommand", "PutObjectCommand", "DeleteObjectCommand");
-  return { s3, handler: files.createHandler({ bucket: "test-bucket", verifier, s3, commands }) };
+  return { s3, handler: files.createHandler({ bucket: "test-bucket", verifier, s3, commands, log: () => {} }) };
 }
 
 describe("user_files target", () => {
@@ -108,6 +108,7 @@ function cronHandler({ ddbAnswer, schedAnswer, newId = () => "deadbeef" } = {}) 
   const scheduler = h.fakeClient(schedAnswer || {});
   const ddb = h.fakeClient(ddbAnswer || ((cmd) => (cmd.kind === "GetCommand" && cmd.input.Key.SK === "PROFILE" ? PROFILE : {})));
   const handler = cron.createHandler({
+    log: () => {},
     verifier,
     scheduler,
     schedulerCommands: h.fakeCommands("CreateScheduleCommand", "GetScheduleCommand", "UpdateScheduleCommand", "DeleteScheduleCommand"),

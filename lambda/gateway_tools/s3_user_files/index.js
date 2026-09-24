@@ -13,7 +13,7 @@
 "use strict";
 
 const { createVerifier, resolveCaller } = require("../lib/identity");
-const { toolNameFromContext, sanitizeFilename, withErrorEnvelope } = require("../lib/mcp");
+const { toolNameFromContext, sanitizeFilename, withErrorEnvelope, logToolCall } = require("../lib/mcp");
 
 const MAX_CONTENT_BYTES = 1 * 1024 * 1024;
 
@@ -108,6 +108,7 @@ function createHandler(deps = {}) {
   return withErrorEnvelope(async (event, context) => {
     const { identity, args } = await resolveCaller(event, verifier);
     const tool = toolNameFromContext(context);
+    logToolCall(tool, identity, deps.log);
     const fn = tools[tool];
     if (!fn) return { error: "unknown_tool", message: `Unknown tool "${tool}"` };
     return fn(identity.namespace, args);

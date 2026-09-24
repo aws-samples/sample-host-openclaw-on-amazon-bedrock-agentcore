@@ -49,4 +49,21 @@ function withErrorEnvelope(fn) {
   };
 }
 
-module.exports = { TOOL_NAME_DELIMITER, toolNameFromContext, sanitizeFilename, withErrorEnvelope };
+/**
+ * One structured line per tool call so CloudWatch shows which tool ran for
+ * which verified namespace and with which Cognito token type. The namespace is
+ * the channel identity already present in every other log of this project;
+ * no argument values are logged.
+ */
+function logToolCall(tool, identity, log = console.log) {
+  log(
+    JSON.stringify({
+      event: "gateway_tool_call",
+      tool,
+      namespace: identity && identity.namespace,
+      tokenUse: identity && identity.tokenUse,
+    }),
+  );
+}
+
+module.exports = { TOOL_NAME_DELIMITER, toolNameFromContext, sanitizeFilename, withErrorEnvelope, logToolCall };
