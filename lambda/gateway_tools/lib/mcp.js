@@ -1,0 +1,83 @@
+/**
+ * Small helpers shared by the Gateway Lambda tool targets.
+ */
+"use strict";
+
+const TOOL_NAME_DELIMITER = "___";
+
+/**
+ * The Gateway exposes tools as `${target_name}___${tool_name}` and passes the
+ * full name in clientContext.Custom.bedrockAgentCoreToolName. Return the bare
+ * tool name.
+ *   https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-tool-naming.html
+ */
+function toolNameFromContext(context) {
+  // The Node runtime hands the decoded X-Amz-Client-Context through as-is, so
+  // the Gateway metadata lives under the lowercase `custom` key (the same key
+  // Python exposes as client_context.custom). Accept `Custom` too for callers
+  // and tests that use the capitalised spelling.
+  const cc = (context && (context.clientContext || context.client_context)) || {};
+  const custom = cc.custom || cc.Custom || {};
+  const full = custom.bedrockAgentCoreToolName || "";
+  const idx = full.indexOf(TOOL_NAME_DELIMITER);
+  return idx === -1 ? full : full.slice(idx + TOOL_NAME_DELIMITER.length);
+}
+
+/**
+ * Sanitize a file name for use as an S3 key component. Mirrors
+ * bridge/skills/s3-user-files/common.js so both tool surfaces address the
+ * same objects.
+ */
+function sanitizeFilename(str) {
+  if (typeof str !== "string" || !str) throw new Error("filename is required");
+  let result = str;
+  while (result.includes("..")) result = result.replace(/\.\./g, "");
+  result = result.replace(/[^a-zA-Z0-9_\-.]/g, "_").slice(0, 256);
+  if (!result || result.startsWith(".") || result.endsWith(".")) {
+    throw new Error(`Invalid filename "${result}": leading/trailing dots not allowed`);
+  }
+  return result;
+}
+
+/** Wrap a handler so thrown errors become a JSON error object, not a Lambda fault. */
+function withErrorEnvelope(fn, log = console.log) {
+  return async (event, context) => {
+    try {
+      return await fn(event, context);
+    } catch (err) {
+      const code = err && err.name === "IdentityError" ? "unauthorized" : "error";
+      const message = err && err.message ? err.message : String(err);
+      // One structured line so a failing tool is visible in CloudWatch, not
+      // only in the model's paraphrase of the result. No arguments are logged.
+      log(
+        JSON.stringify({
+          event: "gateway_tool_error",
+          tool: toolNameFromContext(context),
+          code,
+          name: err && err.name,
+          message,
+        }),
+      );
+      return { error: code, message };
+    }
+  };
+}
+
+/**
+ * One structured line per tool call so CloudWatch shows which tool ran for
+ * which verified namespace and with which Cognito token type. The namespace is
+ * the channel identity already present in every other log of this project;
+ * no argument values are logged.
+ */
+function logToolCall(tool, identity, log = console.log) {
+  log(
+    JSON.stringify({
+      event: "gateway_tool_call",
+      tool,
+      namespace: identity && identity.namespace,
+      tokenUse: identity && identity.tokenUse,
+    }),
+  );
+}
+
+module.exports = { TOOL_NAME_DELIMITER, toolNameFromContext, sanitizeFilename, withErrorEnvelope, logToolCall };

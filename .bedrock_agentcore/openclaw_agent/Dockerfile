@@ -163,6 +163,8 @@ COPY state-storage.js /app/state-storage.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
+COPY cognito-token.js /app/cognito-token.js
+COPY gateway-mcp.js /app/gateway-mcp.js
 
 # Copy custom per-user file storage skill
 # /skills/ — scanned via extraDirs config (skills also copied to home dir during user setup below)

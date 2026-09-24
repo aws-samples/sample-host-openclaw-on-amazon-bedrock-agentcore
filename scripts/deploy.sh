@@ -127,12 +127,21 @@ phase1_cdk() {
   cd "$PROJECT_DIR"
   activate_venv
 
+  # AgentCore Gateway MCP tools (prototype, opt-in). The stack only exists in
+  # the app when enable_gateway=true, so it is only named here in that case.
+  ENABLE_GATEWAY=$(python3 -c "import json; print(str(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('enable_gateway', False)).lower())")
+  GATEWAY_STACK=""
+  if [ "$ENABLE_GATEWAY" = "true" ]; then
+    GATEWAY_STACK="OpenClawGateway"
+  fi
+
   cdk deploy \
     OpenClawVpc \
     OpenClawSecurity \
     OpenClawGuardrails \
     OpenClawAgentCore \
     OpenClawObservability \
+    $GATEWAY_STACK \
     --require-approval never
 
   echo "  Phase 1 complete."
@@ -213,6 +222,24 @@ read_cdk_outputs() {
     echo "  Guardrails:     disabled via enable_guardrails=false (BEDROCK_GUARDRAIL_ID not set)"
   fi
 
+  # AgentCore Gateway MCP tools (prototype). When enable_gateway=true the
+  # runtime gets AGENTCORE_GATEWAY_URL and the bridge adds mcp.servers.agentcore
+  # to openclaw.json; an empty value would silently leave the tools off, so it
+  # is required (same rule as COGNITO_CLIENT_ID / GUARDRAIL_ID). When the flag
+  # is off the variable is not passed and the runtime behaves exactly as before.
+  ENABLE_GATEWAY=$(python3 -c "import json; print(str(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('enable_gateway', False)).lower())")
+  AGENTCORE_GATEWAY_URL=""
+  if [ "$ENABLE_GATEWAY" = "true" ]; then
+    AGENTCORE_GATEWAY_URL=$(aws cloudformation describe-stacks \
+      --stack-name OpenClawGateway --region "$REGION" \
+      --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue" \
+      --output text)
+    require_cdk_output AGENTCORE_GATEWAY_URL
+    echo "  Gateway MCP:    $AGENTCORE_GATEWAY_URL"
+  else
+    echo "  Gateway MCP:    disabled via enable_gateway=false (AGENTCORE_GATEWAY_URL not set)"
+  fi
+
   # Read browser identifier (optional, only if enable_browser=true)
   ENABLE_BROWSER=$(python3 -c "import json; print(str(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('enable_browser', False)).lower())")
   BROWSER_IDENTIFIER=""
@@ -264,7 +291,7 @@ require_cdk_output() {
   done
   if [ -n "$missing" ]; then
     echo "ERROR: required CDK stack output(s) resolved empty:$missing" >&2
-    echo "       Check 'aws cloudformation describe-stacks --stack-name OpenClawSecurity / OpenClawAgentCore / OpenClawGuardrails --region $REGION'" >&2
+    echo "       Check 'aws cloudformation describe-stacks --stack-name OpenClawSecurity / OpenClawAgentCore / OpenClawGuardrails / OpenClawGateway --region $REGION'" >&2
     echo "       and confirm the OutputKeys queried in scripts/deploy.sh exist in the deployed stacks." >&2
     echo "       Refusing to configure the runtime with empty values." >&2
     exit 1
@@ -361,7 +388,8 @@ phase2_toolkit() {
     --env "TELEGRAM_CHANNEL_SECRET_ID=$TELEGRAM_CHANNEL_SECRET_ID" \
     ${GUARDRAIL_ID:+--env "BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID"} \
     ${GUARDRAIL_VERSION:+--env "BEDROCK_GUARDRAIL_VERSION=$GUARDRAIL_VERSION"} \
-    ${BROWSER_IDENTIFIER:+--env "BROWSER_IDENTIFIER=$BROWSER_IDENTIFIER"}
+    ${BROWSER_IDENTIFIER:+--env "BROWSER_IDENTIFIER=$BROWSER_IDENTIFIER"} \
+    ${AGENTCORE_GATEWAY_URL:+--env "AGENTCORE_GATEWAY_URL=$AGENTCORE_GATEWAY_URL"}
 
   # --- Configure session storage (not supported by agentcore CLI yet) ---
   echo "--- Configuring session storage ---"

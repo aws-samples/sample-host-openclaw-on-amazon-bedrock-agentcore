@@ -30,6 +30,8 @@ const stateStorage = require("./state-storage");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
+const gatewayMcp = require("./gateway-mcp");
+const { createCognitoTokenProvider } = require("./cognito-token");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -89,6 +91,11 @@ let shuttingDown = false;
 let sessionStorageActive = false;
 let credentialRefreshTimer = null;
 let browserHeaderRefreshTimer = null;
+// AgentCore Gateway MCP tools (prototype). Only active when
+// AGENTCORE_GATEWAY_URL is set; otherwise openclaw.json is unchanged.
+const AGENTCORE_GATEWAY_URL = (process.env.AGENTCORE_GATEWAY_URL || "").trim();
+let gatewayBearer = null; // { token, expiresAt } for the current user
+let gatewayBearerRefresh = null; // handle from gatewayMcp.scheduleBearerRefresh
 let currentBrowserSessionId = null;
 let currentBrowserEndpoint = null;
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
@@ -722,13 +729,23 @@ function writeOpenClawConfig() {
     channels: {}, // No channels — messages bridged via WebSocket
   };
 
+  // AgentCore Gateway MCP tools (prototype): add mcp.servers.agentcore with
+  // the per-user Cognito bearer when AGENTCORE_GATEWAY_URL is set. With the
+  // env var unset `applyGatewayMcp` returns `config` untouched.
+  const finalConfig = gatewayMcp.applyGatewayMcp(config, {
+    gatewayUrl: AGENTCORE_GATEWAY_URL,
+    token: gatewayBearer ? gatewayBearer.token : null,
+  });
+
   const homeDir = process.env.HOME || "/root";
   fs.mkdirSync(`${homeDir}/.openclaw`, { recursive: true });
   fs.writeFileSync(
     `${homeDir}/.openclaw/openclaw.json`,
-    JSON.stringify(config, null, 2),
+    JSON.stringify(finalConfig, null, 2),
   );
-  console.log("[contract] OpenClaw headless config written");
+  console.log(
+    `[contract] OpenClaw headless config written${finalConfig.mcp ? " (mcp.servers.agentcore enabled)" : ""}`,
+  );
 
   // Write AGENTS.md — OpenClaw loads this as workspace bootstrap instructions.
   // Always overwrite to ensure instructions match the current container version
@@ -1115,6 +1132,49 @@ function scheduleOpenClawRestart(namespace) {
 }
 
 /**
+ * Mint the per-user Cognito ID token for the AgentCore Gateway MCP server and
+ * schedule its refresh. Uses the same provider/derivation as the proxy
+ * (bridge/cognito-token.js) but the ACCESS token: the Gateway's CUSTOM_JWT
+ * authorizer refuses ID tokens with 403 insufficient_scope. Sets
+ * `gatewayBearer`; leaves it null on failure.
+ */
+async function setupGatewayBearer(actorId) {
+  const provider = createCognitoTokenProvider({
+    userPoolId: process.env.COGNITO_USER_POOL_ID || "",
+    clientId: process.env.COGNITO_CLIENT_ID || "",
+    passwordSecret: COGNITO_PASSWORD_SECRET || "",
+    region: process.env.AWS_REGION || "us-west-2",
+    log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[contract] Cognito")),
+  });
+  if (!provider.isConfigured()) {
+    console.warn(
+      "[contract] AGENTCORE_GATEWAY_URL set but Cognito is not configured — mcp.servers.agentcore omitted",
+    );
+    return;
+  }
+  try {
+    gatewayBearer = await provider.getAccessToken(actorId);
+    console.log(
+      `[contract] Gateway MCP bearer acquired for ${actorId} (expires ${new Date(gatewayBearer.expiresAt).toISOString()})`,
+    );
+  } catch (err) {
+    console.warn(`[contract] Gateway MCP bearer acquisition failed: ${err.message} — mcp.servers.agentcore omitted`);
+    gatewayBearer = null;
+    return;
+  }
+  if (gatewayBearerRefresh) gatewayBearerRefresh.stop();
+  gatewayBearerRefresh = gatewayMcp.scheduleBearerRefresh({
+    configPath: `${process.env.HOME || "/root"}/.openclaw/openclaw.json`,
+    getToken: (opts) => provider.getAccessToken(actorId, opts),
+    onRefresh: (entry) => {
+      gatewayBearer = entry;
+    },
+    log: (msg) => console.log(`[contract] ${msg}`),
+  });
+  gatewayBearerRefresh.start(gatewayBearer.expiresAt);
+}
+
+/**
  * Initialization — called on first /invocations request.
  *
  * Uses pre-fetched secrets. Starts proxy, OpenClaw, and workspace restore
@@ -1196,6 +1256,14 @@ async function init(userId, actorId, channel) {
       }
     } else {
       console.log("[contract] EXECUTION_ROLE_ARN not set — skipping credential scoping");
+    }
+
+    // 1b'. AgentCore Gateway MCP tools (prototype): mint the per-user Cognito
+    // ID token used as the bearer for mcp.servers.agentcore and keep it fresh.
+    // Non-fatal: without a token the MCP entry is omitted and the exec skills
+    // keep working exactly as before.
+    if (AGENTCORE_GATEWAY_URL) {
+      await setupGatewayBearer(actorId);
     }
 
     // 1c. Session storage: local ~/.openclaw including the agent workspace
@@ -2341,6 +2409,10 @@ process.on("SIGTERM", async () => {
   if (browserHeaderRefreshTimer) {
     clearInterval(browserHeaderRefreshTimer);
     browserHeaderRefreshTimer = null;
+  }
+  if (gatewayBearerRefresh) {
+    gatewayBearerRefresh.stop();
+    gatewayBearerRefresh = null;
   }
 
   // Save state to session storage + workspace to S3 (bounded)
