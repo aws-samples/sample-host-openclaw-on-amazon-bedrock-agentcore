@@ -21,13 +21,36 @@ RUN npm install -g openclaw@2026.9.5 clawhub@0.23.3 --allow-scripts=openclaw
 # Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
 # hackernews (niche), news-feed (niche) to reduce startup time.
 # --no-input --force: non-interactive, skip VirusTotal warnings
-RUN for skill in jina-reader deep-research-pro telegram-compose transcript task-decomposer; do \
+#
+# deep-research-pro, transcript and task-decomposer are installed as qualified
+# @owner/slug specs: ClawHub now hosts duplicate slugs for all three and
+# clawhub >= 0.23 refuses an ambiguous bare slug (the old retry loop then
+# silently produced an image with 2/5 skills). Owners and pinned versions are
+# the ones baked into the previously shipped image (/skills/<slug>/_meta.json
+# and .clawhub/origin.json). clawhub installs a qualified spec into
+# /skills/@owner/<slug>; flatten to /skills/<slug> because the runtime config
+# (extraDirs), the clawhub-manage skill and the system prompt all address
+# skills as /skills/<slug>. A missing skill fails the build.
+RUN set -e; \
+    install_skill() { spec="$1"; slug="$2"; ver="$3"; \
+      if [ -n "$ver" ]; then set -- "$spec" --version "$ver"; else set -- "$spec"; fi; \
       for attempt in 1 2 3 4 5; do \
-        clawhub install "$skill" --no-input --force && break; \
-        echo "Retry $attempt for $skill (waiting 15s)..."; \
+        clawhub install "$@" --no-input --force && break; \
+        [ "$attempt" = 5 ] && { echo "FAILED: could not install $spec"; exit 1; }; \
+        echo "Retry $attempt for $spec (waiting 15s)..."; \
         sleep 15; \
       done; \
-    done
+      case "$spec" in @*/*) owner_dir="/skills/${spec%/*}"; \
+        mv "$owner_dir/$slug" "/skills/$slug" && rmdir "$owner_dir" ;; esac; \
+      test -d "/skills/$slug" && test -f "/skills/$slug/SKILL.md" \
+        || { echo "FAILED: /skills/$slug missing after install of $spec"; exit 1; }; \
+    }; \
+    install_skill jina-reader                 jina-reader       ""; \
+    install_skill @parags/deep-research-pro   deep-research-pro 1.0.2; \
+    install_skill telegram-compose            telegram-compose  ""; \
+    install_skill @therohitdas/transcript     transcript        1.4.1; \
+    install_skill @10e9928a/task-decomposer   task-decomposer   1.0.0; \
+    echo "Installed ClawHub skills:"; ls -1 /skills
 
 # Create app directory
 RUN mkdir -p /app
