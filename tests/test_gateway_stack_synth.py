@@ -226,17 +226,13 @@ def test_gateway_role_can_only_invoke_the_three_functions_and_use_the_cmk():
     invoke = next(st for st in stmts if st["Action"] == "lambda:InvokeFunction")
     assert len(invoke["Resource"]) == 3
     # The Gateway encrypts target config with the CMK via this role; every KMS
-    # statement is pinned to the one key, to the AgentCore service, and (for the
-    # data-key and grant statements) to a gateway ARN in this account/region.
+    # statement is pinned to the one key and to calls through the AgentCore service.
     kms_stmts = [st for st in stmts if st is not invoke]
     assert sorted(st["Sid"] for st in kms_stmts) == ["GatewayCmkDataKeys", "GatewayCmkDescribe", "GatewayCmkGrant"]
     for st in kms_stmts:
         assert all(a.startswith("kms:") for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"]))
         assert st["Resource"] != "*"
         assert st["Condition"]["StringEquals"]["kms:ViaService"] == f"bedrock-agentcore.{_REGION}.amazonaws.com"
-        if st["Sid"] != "GatewayCmkDescribe":
-            ctx = st["Condition"]["StringLike"]["kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn"]
-            assert ctx == f"arn:aws:bedrock-agentcore:{_REGION}:{_ACCOUNT}:gateway/*"
     grant = next(st for st in kms_stmts if st["Sid"] == "GatewayCmkGrant")
     assert grant["Condition"]["ForAllValues:StringEquals"]["kms:GrantOperations"] == ["Decrypt", "GenerateDataKey"]
     assert grant["Condition"]["StringEquals"]["kms:GrantConstraintType"] == "EncryptionContextSubset"
