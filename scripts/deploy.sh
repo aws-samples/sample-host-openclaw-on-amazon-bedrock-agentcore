@@ -163,21 +163,19 @@ read_cdk_outputs() {
     --query "Stacks[0].Outputs[?OutputKey=='UserFilesBucketName'].OutputValue" \
     --output text)
 
-  GATEWAY_TOKEN_SECRET=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'GatewayTokenSecret')].OutputValue" \
-    --output text)
-  # Extract secret name from ARN (last segment after last colon, strip random suffix)
   GATEWAY_TOKEN_SECRET_ID="openclaw/gateway-token"
 
+  # OpenClawSecurity outputs use hand-chosen OutputKeys (stacks/security_stack.py).
+  # Match them exactly — never with contains() on a CDK-generated ExportsOutput*
+  # key, which embeds a logical-id hash and silently returns "" when it changes.
   COGNITO_USER_POOL_ID=$(aws cloudformation describe-stacks \
     --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'IdentityPoolEC8A1A0D')].OutputValue" \
+    --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue" \
     --output text)
 
   COGNITO_CLIENT_ID=$(aws cloudformation describe-stacks \
     --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'IdentityPoolProxyClient')].OutputValue" \
+    --query "Stacks[0].Outputs[?OutputKey=='CognitoProxyClientId'].OutputValue" \
     --output text)
 
   COGNITO_PASSWORD_SECRET_ID="openclaw/cognito-password-secret"
@@ -185,8 +183,11 @@ read_cdk_outputs() {
 
   CMK_ARN=$(aws cloudformation describe-stacks \
     --stack-name OpenClawSecurity --region "$REGION" \
-    --query "Stacks[0].Outputs[?contains(OutputKey,'SecretsCmk')].OutputValue" \
+    --query "Stacks[0].Outputs[?OutputKey=='SecretsCmkArn'].OutputValue" \
     --output text)
+
+  require_cdk_output EXECUTION_ROLE_ARN SECURITY_GROUP_ID PRIVATE_SUBNET_IDS USER_FILES_BUCKET \
+    COGNITO_USER_POOL_ID COGNITO_CLIENT_ID CMK_ARN
 
   # Read browser identifier (optional, only if enable_browser=true)
   ENABLE_BROWSER=$(python3 -c "import json; print(str(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('enable_browser', False)).lower())")
@@ -217,6 +218,29 @@ read_cdk_outputs() {
   echo "  Security Group: $SECURITY_GROUP_ID"
   echo "  Subnets:        $PRIVATE_SUBNET_IDS"
   echo "  S3 Bucket:      $USER_FILES_BUCKET"
+  echo "  Cognito Pool:   $COGNITO_USER_POOL_ID"
+  echo "  Cognito Client: $COGNITO_CLIENT_ID"
+}
+
+# Fail loudly if a required CDK output resolved empty or to "None" (the AWS CLI
+# prints "None" for a query that matched nothing). An empty value here would
+# otherwise be passed to the runtime as an env var and silently disable a
+# feature — e.g. an empty COGNITO_CLIENT_ID turns off per-user scoped credentials.
+require_cdk_output() {
+  local name value missing=""
+  for name in "$@"; do
+    eval "value=\${$name:-}"
+    if [ -z "$value" ] || [ "$value" = "None" ]; then
+      missing="$missing $name"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    echo "ERROR: required CDK stack output(s) resolved empty:$missing" >&2
+    echo "       Check 'aws cloudformation describe-stacks --stack-name OpenClawSecurity / OpenClawAgentCore --region $REGION'" >&2
+    echo "       and confirm the OutputKeys queried in scripts/deploy.sh exist in the deployed stacks." >&2
+    echo "       Refusing to configure the runtime with empty values." >&2
+    exit 1
+  fi
 }
 
 # --- Check ARM64 build capability (for local-build mode) ---

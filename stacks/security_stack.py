@@ -1,6 +1,7 @@
 """Security Stack — KMS CMK, Secrets Manager secrets, CloudTrail."""
 
 from aws_cdk import (
+    CfnOutput,
     Stack,
     RemovalPolicy,
     aws_iam as iam,
@@ -177,6 +178,15 @@ class SecurityStack(Stack):
                 exclude_punctuation=True,
             ),
         )
+
+        # --- Stack outputs consumed by scripts/deploy.sh ---------------------
+        # Stable, hand-chosen OutputKeys. deploy.sh matches these with an exact
+        # OutputKey== query; never rely on CDK's auto-generated ExportsOutput*
+        # keys (they embed a logical-id hash and only exist while another stack
+        # happens to reference the value).
+        CfnOutput(self, "SecretsCmkArn", value=self.cmk.key_arn)
+        CfnOutput(self, "CognitoUserPoolId", value=self.user_pool_id)
+        CfnOutput(self, "CognitoProxyClientId", value=self.user_pool_client_id)
 
         # --- cdk-nag suppressions ---
         all_secrets = [self.gateway_token_secret, self.cognito_password_secret, self.webhook_secret] + list(self.channel_secrets.values())
