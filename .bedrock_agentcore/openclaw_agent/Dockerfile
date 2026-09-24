@@ -59,6 +59,13 @@ WORKDIR /app
 
 # Install AWS SDK and WebSocket library (production only)
 # Skip browser binary download — we only need playwright-core for CDP client (connectOverCDP)
+#
+# @smithy/signature-v4, @aws-sdk/credential-provider-node and
+# @aws-crypto/sha256-js are require()d directly by agentcore-contract.js
+# (signBrowserEndpoint: SigV4 for the AgentCore Browser CDP WebSocket). They
+# used to arrive as transitive dependencies of the SDK clients; recent SDK
+# releases dropped @aws-crypto/sha256-js, so the browser skill failed with
+# "Cannot find module '@aws-crypto/sha256-js'". Declare all three explicitly.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install --omit=dev \
@@ -74,6 +81,9 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
                 playwright-core \
                 @aws-sdk/s3-request-presigner \
                 @aws-sdk/client-cloudwatch-logs \
+                @aws-sdk/credential-provider-node \
+                @smithy/signature-v4 \
+                @aws-crypto/sha256-js@5.2.0 \
                 ws
 
 # Pre-warm V8 compile cache for heavy AWS SDK modules.
@@ -88,6 +98,9 @@ RUN mkdir -p /app/.compile-cache && \
       require('@aws-sdk/client-dynamodb'); \
       require('@aws-sdk/client-sts'); \
       require('@aws-sdk/lib-dynamodb'); \
+      require('@aws-sdk/credential-provider-node'); \
+      require('@smithy/signature-v4'); \
+      require('@aws-crypto/sha256-js'); \
       require('ws'); \
       console.log('[build] V8 compile cache pre-warmed'); \
     "
