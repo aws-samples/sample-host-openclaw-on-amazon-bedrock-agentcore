@@ -202,7 +202,9 @@ describe("cognito-token.createCognitoTokenProvider", () => {
         sent.push(cmd.constructor.name);
         if (cmd.constructor.name === "AdminGetUserCommand") return {};
         if (cmd.constructor.name === "AdminInitiateAuthCommand") {
-          return { AuthenticationResult: { IdToken: `tok${sent.length}`, ExpiresIn: 3600 } };
+          return {
+            AuthenticationResult: { IdToken: `tok${sent.length}`, AccessToken: `acc${sent.length}`, ExpiresIn: 3600 },
+          };
         }
         return {};
       },
@@ -213,12 +215,29 @@ describe("cognito-token.createCognitoTokenProvider", () => {
     assert.ok(first.expiresAt > Date.now() + 3500 * 1000);
     const second = await provider.getIdToken("telegram:1");
     assert.equal(second, first, "cached");
+    // Both token types come from the same authentication and share the cache.
+    const access = await provider.getAccessToken("telegram:1");
+    assert.match(access.token, /^acc/);
+    assert.equal(access.expiresAt, first.expiresAt);
+    assert.equal(sent.filter((n) => n === "AdminInitiateAuthCommand").length, 1, "no extra auth for the access token");
     const forced = await provider.getIdToken("telegram:1", { force: true });
     assert.notEqual(forced.token, first.token, "force bypasses the cache");
     assert.deepEqual(
       sent.filter((n) => n === "AdminInitiateAuthCommand").length,
       2,
     );
+  });
+
+  it("getAccessToken refuses to hand out an empty bearer", async () => {
+    const client = {
+      send: async (cmd) => {
+        if (cmd.constructor.name === "AdminInitiateAuthCommand") return { AuthenticationResult: { IdToken: "t", ExpiresIn: 3600 } };
+        return {};
+      },
+    };
+    const provider = createCognitoTokenProvider({ ...cfg, client, log: () => {} });
+    await assert.rejects(provider.getAccessToken("telegram:1"), /no AccessToken/);
+    assert.equal(await createCognitoTokenProvider({ ...cfg, clientId: "" }).getAccessToken("a"), null);
   });
 
   it("provisions a missing user with a permanent password before authenticating", async () => {

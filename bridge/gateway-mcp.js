@@ -5,7 +5,7 @@
  *
  *   mcp.servers.agentcore = {
  *     url: <gateway url>, transport: "streamable-http",
- *     headers: { Authorization: "Bearer <per-user Cognito ID token>" }, ...
+ *     headers: { Authorization: "Bearer <per-user Cognito ACCESS token>" }, ...
  *   }
  *
  * to the generated openclaw.json (OpenClaw v2026.9.5 docs/gateway/config-extensions.md).

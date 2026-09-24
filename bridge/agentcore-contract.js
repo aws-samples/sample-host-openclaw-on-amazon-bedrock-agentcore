@@ -1134,7 +1134,9 @@ function scheduleOpenClawRestart(namespace) {
 /**
  * Mint the per-user Cognito ID token for the AgentCore Gateway MCP server and
  * schedule its refresh. Uses the same provider/derivation as the proxy
- * (bridge/cognito-token.js). Sets `gatewayBearer`; leaves it null on failure.
+ * (bridge/cognito-token.js) but the ACCESS token: the Gateway's CUSTOM_JWT
+ * authorizer refuses ID tokens with 403 insufficient_scope. Sets
+ * `gatewayBearer`; leaves it null on failure.
  */
 async function setupGatewayBearer(actorId) {
   const provider = createCognitoTokenProvider({
@@ -1151,7 +1153,7 @@ async function setupGatewayBearer(actorId) {
     return;
   }
   try {
-    gatewayBearer = await provider.getIdToken(actorId);
+    gatewayBearer = await provider.getAccessToken(actorId);
     console.log(
       `[contract] Gateway MCP bearer acquired for ${actorId} (expires ${new Date(gatewayBearer.expiresAt).toISOString()})`,
     );
@@ -1163,7 +1165,7 @@ async function setupGatewayBearer(actorId) {
   if (gatewayBearerRefresh) gatewayBearerRefresh.stop();
   gatewayBearerRefresh = gatewayMcp.scheduleBearerRefresh({
     configPath: `${process.env.HOME || "/root"}/.openclaw/openclaw.json`,
-    getToken: (opts) => provider.getIdToken(actorId, opts),
+    getToken: (opts) => provider.getAccessToken(actorId, opts),
     onRefresh: (entry) => {
       gatewayBearer = entry;
     },

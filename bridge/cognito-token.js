@@ -1,8 +1,12 @@
 /**
- * Per-user Cognito ID token minting, shared by the Bedrock proxy
- * (agentcore-proxy.js, where it originated) and the contract server
- * (agentcore-contract.js, which needs the same token as the bearer for the
- * AgentCore Gateway MCP server entry in openclaw.json).
+ * Per-user Cognito token minting, shared by the Bedrock proxy
+ * (agentcore-proxy.js, where it originated; it uses the ID token) and the
+ * contract server (agentcore-contract.js, which uses the ACCESS token as the
+ * bearer for the AgentCore Gateway MCP server entry in openclaw.json).
+ *
+ * The Gateway's CUSTOM_JWT authorizer accepts only the access token: an ID
+ * token is refused with 403 "insufficient_scope" (verified live 2026-09-24).
+ * One ADMIN_USER_PASSWORD_AUTH call returns both, so they are cached together.
  *
  * One Cognito user per actorId ("telegram:123"), created on first use with a
  * password derived as HMAC-SHA256(COGNITO_PASSWORD_SECRET, actorId). Both
@@ -30,7 +34,7 @@ function createCognitoTokenProvider(config) {
     if (!_commands) _commands = require("@aws-sdk/client-cognito-identity-provider");
     return _commands;
   }
-  const tokenCache = new Map(); // actorId -> { token, expiresAt }
+  const tokenCache = new Map(); // actorId -> { id: {token, expiresAt, expiresIn}, access: {...} }
 
   function isConfigured() {
     return Boolean(userPoolId && clientId && passwordSecret);
@@ -80,11 +84,11 @@ function createCognitoTokenProvider(config) {
   }
 
   /**
-   * Return `{ token, expiresAt, expiresIn }` for actorId (cached until 60 s
-   * before expiry; `{ force: true }` bypasses the cache), or null when Cognito
+   * Authenticate actorId and cache both tokens (until 60 s before expiry;
+   * `force` bypasses the cache). Returns the cache entry or null when Cognito
    * is not configured.
    */
-  async function getIdToken(actorId, { force = false } = {}) {
+  async function authenticate(actorId, { force = false } = {}) {
     if (!isConfigured()) return null;
     const cached = tokenCache.get(actorId);
     if (!force && cached && cached.expiresAt > Date.now()) return cached;
@@ -99,15 +103,38 @@ function createCognitoTokenProvider(config) {
         AuthParameters: { USERNAME: actorId, PASSWORD: derivePassword(actorId) },
       }),
     );
-    const token = response.AuthenticationResult.IdToken;
-    const expiresIn = response.AuthenticationResult.ExpiresIn || 3600;
-    const entry = { token, expiresAt: Date.now() + (expiresIn - 60) * 1000, expiresIn };
+    const result = response.AuthenticationResult;
+    const expiresIn = result.ExpiresIn || 3600;
+    const expiresAt = Date.now() + (expiresIn - 60) * 1000;
+    const entry = {
+      expiresAt,
+      id: { token: result.IdToken, expiresAt, expiresIn },
+      access: { token: result.AccessToken, expiresAt, expiresIn },
+    };
     tokenCache.set(actorId, entry);
     log(`[cognito] token acquired for ${actorId} (expires in ${expiresIn}s)`);
     return entry;
   }
 
-  return { isConfigured, derivePassword, ensureUser, getIdToken, _cache: tokenCache };
+  /** `{ token, expiresAt, expiresIn }` with the ID token (aud = client id). */
+  async function getIdToken(actorId, opts) {
+    const entry = await authenticate(actorId, opts);
+    return entry ? entry.id : null;
+  }
+
+  /**
+   * `{ token, expiresAt, expiresIn }` with the ACCESS token (client_id = client
+   * id, scope aws.cognito.signin.user.admin) — the only token type the
+   * AgentCore Gateway accepts as a bearer.
+   */
+  async function getAccessToken(actorId, opts) {
+    const entry = await authenticate(actorId, opts);
+    if (!entry) return null;
+    if (!entry.access.token) throw new Error("Cognito returned no AccessToken");
+    return entry.access;
+  }
+
+  return { isConfigured, derivePassword, ensureUser, getIdToken, getAccessToken, _cache: tokenCache };
 }
 
 module.exports = { createCognitoTokenProvider };
