@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Builder — install all dependencies and tools
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim AS builder
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24-slim AS builder
 
 # Install system dependencies
 RUN apt-get update && \
@@ -15,19 +15,42 @@ RUN pip3 install --no-cache-dir --break-system-packages awscli
 # Pinned to tested versions — update intentionally to avoid unexpected breaking changes.
 # To upgrade: test the new version locally first, then bump both pins here.
 #   openclaw release notes: https://github.com/openclaw/openclaw/releases
-RUN npm install -g openclaw@2026.3.8 clawhub@0.8.0
+RUN npm install -g openclaw@2026.9.5 clawhub@0.23.3 --allow-scripts=openclaw
 
 # Install ClawHub community skills (5 high-value marketplace skills)
 # Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
 # hackernews (niche), news-feed (niche) to reduce startup time.
 # --no-input --force: non-interactive, skip VirusTotal warnings
-RUN for skill in jina-reader deep-research-pro telegram-compose transcript task-decomposer; do \
+#
+# deep-research-pro, transcript and task-decomposer are installed as qualified
+# @owner/slug specs: ClawHub now hosts duplicate slugs for all three and
+# clawhub >= 0.23 refuses an ambiguous bare slug (the old retry loop then
+# silently produced an image with 2/5 skills). Owners and pinned versions are
+# the ones baked into the previously shipped image (/skills/<slug>/_meta.json
+# and .clawhub/origin.json). clawhub installs a qualified spec into
+# /skills/@owner/<slug>; flatten to /skills/<slug> because the runtime config
+# (extraDirs), the clawhub-manage skill and the system prompt all address
+# skills as /skills/<slug>. A missing skill fails the build.
+RUN set -e; \
+    install_skill() { spec="$1"; slug="$2"; ver="$3"; \
+      if [ -n "$ver" ]; then set -- "$spec" --version "$ver"; else set -- "$spec"; fi; \
       for attempt in 1 2 3 4 5; do \
-        clawhub install "$skill" --no-input --force && break; \
-        echo "Retry $attempt for $skill (waiting 15s)..."; \
+        clawhub install "$@" --no-input --force && break; \
+        [ "$attempt" = 5 ] && { echo "FAILED: could not install $spec"; exit 1; }; \
+        echo "Retry $attempt for $spec (waiting 15s)..."; \
         sleep 15; \
       done; \
-    done
+      case "$spec" in @*/*) owner_dir="/skills/${spec%/*}"; \
+        mv "$owner_dir/$slug" "/skills/$slug" && rmdir "$owner_dir" ;; esac; \
+      test -d "/skills/$slug" && test -f "/skills/$slug/SKILL.md" \
+        || { echo "FAILED: /skills/$slug missing after install of $spec"; exit 1; }; \
+    }; \
+    install_skill jina-reader                 jina-reader       ""; \
+    install_skill @parags/deep-research-pro   deep-research-pro 1.0.2; \
+    install_skill telegram-compose            telegram-compose  ""; \
+    install_skill @therohitdas/transcript     transcript        1.4.1; \
+    install_skill @10e9928a/task-decomposer   task-decomposer   1.0.0; \
+    echo "Installed ClawHub skills:"; ls -1 /skills
 
 # Create app directory
 RUN mkdir -p /app
@@ -36,6 +59,13 @@ WORKDIR /app
 
 # Install AWS SDK and WebSocket library (production only)
 # Skip browser binary download — we only need playwright-core for CDP client (connectOverCDP)
+#
+# @smithy/signature-v4, @aws-sdk/credential-provider-node and
+# @aws-crypto/sha256-js are require()d directly by agentcore-contract.js
+# (signBrowserEndpoint: SigV4 for the AgentCore Browser CDP WebSocket). They
+# used to arrive as transitive dependencies of the SDK clients; recent SDK
+# releases dropped @aws-crypto/sha256-js, so the browser skill failed with
+# "Cannot find module '@aws-crypto/sha256-js'". Declare all three explicitly.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install --omit=dev \
@@ -51,6 +81,9 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
                 playwright-core \
                 @aws-sdk/s3-request-presigner \
                 @aws-sdk/client-cloudwatch-logs \
+                @aws-sdk/credential-provider-node \
+                @smithy/signature-v4 \
+                @aws-crypto/sha256-js@5.2.0 \
                 ws
 
 # Pre-warm V8 compile cache for heavy AWS SDK modules.
@@ -65,6 +98,9 @@ RUN mkdir -p /app/.compile-cache && \
       require('@aws-sdk/client-dynamodb'); \
       require('@aws-sdk/client-sts'); \
       require('@aws-sdk/lib-dynamodb'); \
+      require('@aws-sdk/credential-provider-node'); \
+      require('@smithy/signature-v4'); \
+      require('@aws-crypto/sha256-js'); \
       require('ws'); \
       console.log('[build] V8 compile cache pre-warmed'); \
     "
@@ -72,7 +108,7 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 # Stage 2: Runtime — minimal image with only needed artifacts
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24-slim
 
 # Install only runtime system dependencies (no git, no pip, no build tools)
 RUN apt-get update && \
@@ -123,6 +159,7 @@ COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY workspace-sync.js /app/workspace-sync.js
+COPY state-storage.js /app/state-storage.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js

@@ -7,7 +7,10 @@
  *
  * Namespace format: {actorId.replace(/:/g, "_")} (e.g., "telegram_123456789")
  * S3 prefix: {namespace}/.openclaw/
- * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/)
+ * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/). On AgentCore this
+ * is a local directory whose `workspace/` entry is a symlink onto the session
+ * storage mount (state-storage.js); the walk follows it so workspace files are
+ * still backed up.
  */
 
 const fs = require("fs");
@@ -44,8 +47,43 @@ const SKIP_PATTERNS = [
   ".secrets/",
   "*.pem",
   "*.key",
+  // SQLite sidecars (OpenClaw 2.0 keeps session/auth state in per-agent SQLite
+  // databases, WAL mode). The -wal/-shm/-journal files are only meaningful
+  // together with the exact main-db bytes they were written against; copying
+  // them file-by-file yields a corrupt or rolled-back restore. The main *.sqlite
+  // file is NOT skipped — saveWorkspace() uploads a consistent snapshot of it
+  // instead of the raw live file (see snapshotSqlite()).
+  "*.sqlite-wal",
+  "*.sqlite-shm",
+  "*.sqlite-journal",
+  "*.sqlite-snapshot", // in-flight snapshotSqlite() staging files
+  // Rotated config backups written by `openclaw doctor` — regenerated, never restored.
+  "openclaw.json.bak",
+  "*.json.bak.1",
+  "*.json.bak.2",
+  "*.json.bak.3",
+  "*.json.bak.4",
 ];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+// Files with this extension are SQLite databases and are uploaded via
+// snapshotSqlite() rather than fs.readFileSync().
+const SQLITE_EXT = ".sqlite";
+
+// Lazy-require node:sqlite (Node >= 22.13 / 24 in the container image; absent on
+// older local Node, in which case SQLite files are skipped with a warning
+// rather than uploaded live).
+let _nodeSqlite;
+function getNodeSqlite() {
+  if (_nodeSqlite === undefined) {
+    try {
+      _nodeSqlite = require("node:sqlite");
+    } catch {
+      _nodeSqlite = null;
+    }
+  }
+  return _nodeSqlite;
+}
 
 // Credential patterns — detect potential secrets before S3 upload.
 // Files matching these are still uploaded (user's choice) but a warning is logged.
@@ -152,6 +190,55 @@ function shouldSkip(relativePath) {
 }
 
 /**
+ * Take a consistent point-in-time snapshot of a SQLite database that another
+ * process (the OpenClaw gateway) may be writing to, and return its bytes.
+ *
+ * Uses node:sqlite's online backup API from a read-only connection inside a
+ * read transaction — the same primitive OpenClaw's own `backup create` uses.
+ * In WAL mode a reader sees every committed transaction, including frames that
+ * are still in the -wal file and not yet checkpointed into the main db, so the
+ * snapshot is complete as of the moment it starts and never torn by a
+ * concurrent checkpoint. The result is a standalone db file (no sidecars).
+ *
+ * The snapshot is staged next to the source (same filesystem, so it works on
+ * the session-storage mount) under a dot-prefixed name and removed afterwards.
+ *
+ * @param {string} dbPath - Absolute path to the *.sqlite file
+ * @returns {Promise<Buffer>} snapshot bytes
+ * @throws when node:sqlite is unavailable or the backup fails (caller skips the file)
+ */
+async function snapshotSqlite(dbPath) {
+  const sqlite = getNodeSqlite();
+  if (!sqlite || typeof sqlite.backup !== "function") {
+    throw new Error("node:sqlite backup API unavailable on this Node runtime");
+  }
+  const stagePath = path.join(
+    path.dirname(dbPath),
+    `.${path.basename(dbPath)}.${process.pid}-${Date.now()}.sqlite-snapshot`,
+  );
+  const source = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+  try {
+    // Bounded wait if the writer is mid-commit rather than failing fast.
+    source.exec("PRAGMA busy_timeout = 5000");
+    source.exec("BEGIN");
+    try {
+      await sqlite.backup(source, stagePath);
+    } finally {
+      try { source.exec("ROLLBACK"); } catch { /* read-only txn */ }
+    }
+  } finally {
+    try { source.close(); } catch { /* already closed */ }
+  }
+  try {
+    return fs.readFileSync(stagePath);
+  } finally {
+    try { fs.unlinkSync(stagePath); } catch { /* best effort */ }
+    // backup() may leave a -journal next to the staged copy on some builds
+    try { fs.unlinkSync(`${stagePath}-journal`); } catch { /* none */ }
+  }
+}
+
+/**
  * Restore the .openclaw/ directory from S3 for a user namespace.
  * Downloads all objects under {namespace}/.openclaw/ to $HOME/.openclaw/.
  * Skips silently if no objects exist (new user).
@@ -241,16 +328,40 @@ async function restoreWorkspace(namespace) {
 
 /**
  * Recursively walk a directory and return all file paths (relative to root).
+ *
+ * Follows directory symlinks (with a realpath cycle guard): on AgentCore the
+ * state dir is local disk but `~/.openclaw/workspace` is a symlink onto the
+ * session storage mount (see state-storage.js), and the workspace files behind
+ * it must keep being backed up to S3.
  */
-function walkDir(dir, root = dir) {
+function walkDir(dir, root = dir, seen = new Set()) {
   const results = [];
   try {
+    let real;
+    try {
+      real = fs.realpathSync(dir);
+    } catch {
+      real = dir;
+    }
+    if (seen.has(real)) return results; // symlink cycle
+    seen.add(real);
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        results.push(...walkDir(fullPath, root));
-      } else if (entry.isFile()) {
+      let isDir = entry.isDirectory();
+      let isFile = entry.isFile();
+      if (entry.isSymbolicLink()) {
+        try {
+          const st = fs.statSync(fullPath);
+          isDir = st.isDirectory();
+          isFile = st.isFile();
+        } catch {
+          continue; // dangling link
+        }
+      }
+      if (isDir) {
+        results.push(...walkDir(fullPath, root, seen));
+      } else if (isFile) {
         results.push(path.relative(root, fullPath));
       }
     }
@@ -292,7 +403,28 @@ async function saveWorkspace(namespace) {
         continue;
       }
 
-      const content = fs.readFileSync(localFile);
+      let content;
+      if (relativePath.endsWith(SQLITE_EXT)) {
+        // Live database: upload a consistent snapshot, never the raw file.
+        try {
+          content = await snapshotSqlite(localFile);
+        } catch (err) {
+          console.warn(
+            `[workspace-sync] Skipping ${relativePath}: SQLite snapshot failed (${err.message})`,
+          );
+          skipped++;
+          continue;
+        }
+        if (content.length > MAX_FILE_SIZE) {
+          console.warn(
+            `[workspace-sync] Skipping ${relativePath} snapshot (${content.length} bytes > ${MAX_FILE_SIZE})`,
+          );
+          skipped++;
+          continue;
+        }
+      } else {
+        content = fs.readFileSync(localFile);
+      }
 
       // Credential detection: warn (but don't block) when secrets are found.
       // Exempt only the root-level native API key store — user made a conscious choice.
@@ -385,6 +517,8 @@ module.exports = {
   getS3Client,
   // Exported for testing
   shouldSkip,
+  walkDir,
   detectCredentials,
+  snapshotSqlite,
   CREDENTIAL_SCAN_EXEMPT,
 };

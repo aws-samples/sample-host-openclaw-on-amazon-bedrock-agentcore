@@ -110,7 +110,7 @@ openclaw-on-agentcore/
     token_monitoring_stack.py     # Lambda processor, DynamoDB, token analytics
     cron_stack.py                 # EventBridge Scheduler, Cron executor Lambda, IAM
   bridge/
-    Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
+    Dockerfile                    # Container image (node:24-slim, ARM64, OpenClaw 2026.9.5, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
     lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron + clawhub-manage + api-keys tools)
@@ -122,7 +122,7 @@ openclaw-on-agentcore/
     scoped-credentials.js         # Per-user STS session-scoped credentials (S3, Secrets Manager, DynamoDB)
     scoped-credentials.test.js    # Scoped credentials unit tests (node:test)
     workspace-sync.test.js        # Workspace sync credential tests (node:test)
-    force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
+    force-ipv4.js                 # DNS patch for Node.js Happy Eyeballs IPv6 issue
     skills/
       s3-user-files/              # Custom per-user file storage skill (S3-backed)
         SKILL.md                  # OpenClaw skill manifest
@@ -612,7 +612,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 ### AgentCore Runtime
 - **Hybrid deploy**: Runtime/Endpoint/ECR managed by Starter Toolkit (`agentcore deploy`), not CDK. CDK manages IAM Role, SG, S3, Lambda, etc. See `./scripts/deploy.sh` for the 3-phase flow
 - **ARM64 required**: Build with `--platform linux/arm64`. This machine is ARM64 native — use `--local-build` mode
-- **Docker Hub rate limit**: Dockerfile uses `public.ecr.aws/docker/library/node:22-slim` (ECR Public Gallery) instead of Docker Hub to avoid anonymous pull rate limits in CodeBuild
+- **Docker Hub rate limit**: Dockerfile uses `public.ecr.aws/docker/library/node:24-slim` (ECR Public Gallery) instead of Docker Hub to avoid anonymous pull rate limits in CodeBuild
 - **IAM role names are region-suffixed**: `openclaw-agentcore-execution-role-{region}` and `openclaw-cron-scheduler-role-{region}` to avoid cross-region conflicts (IAM roles are global)
 - **Trust policy self-assume**: Uses `AccountRootPrincipal()` + `ArnEquals` condition (not `ArnPrincipal`) to avoid chicken-and-egg during role creation
 - **`update-agent-runtime` is a FULL REPLACE**: Omitting `--environment-variables` wipes ALL env vars. Always include the full env vars JSON in every update call. This is the most common deployment mistake — the container starts but init fails because secrets/config env vars are missing
@@ -627,8 +627,8 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Cross-region inference**: Model `minimax.minimax-m2.1` uses a global cross-region inference profile that routes to any available region — IAM uses `arn:aws:bedrock:*::foundation-model/*` and inference-profile wildcards
 - **Inference profile ARN**: Separate from foundation model — `arn:aws:bedrock:{region}:{account}:inference-profile/*`
 
-### Node.js 22 + VPC
-- **IPv6 issue**: Node.js 22 Happy Eyeballs fails in VPCs without IPv6 — `force-ipv4.js` patches `dns.lookup()` to force IPv4
+### Node.js + VPC
+- **IPv6 issue**: Node.js Happy Eyeballs (20+) fails in VPCs without IPv6 — `force-ipv4.js` patches `dns.lookup()` to force IPv4
 - **NODE_OPTIONS**: `--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js`
 
 ### CDK
@@ -649,8 +649,8 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--no-input --force` for non-interactive Docker builds
 - **5 ClawHub skills installed**: jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer (reduced from 8 — duckduckgo-search, hackernews, news-feed removed to optimize cold start; web search handled by lightweight agent's built-in web_search tool)
 - **Image updates**: New sessions use new image automatically (no keepalive restart needed)
-- **WebSocket bridge protocol**: Connect → auth (type:req, method:connect, protocol:3, auth:{token}) → agent.chat → streaming deltas → final
-- **OpenClaw 2026.3.2 WebSocket origin enforcement**: OpenClaw enforces origin checks on all WebSocket connections that carry an `Origin` header. The `ws` Node.js library must use the `origin` **option** (not `headers.Origin`) to set the header correctly for the HTTP upgrade request. Config: `controlUi: { enabled: false, allowInsecureAuth: true, dangerouslyDisableDeviceAuth: true, allowedOrigins: ["*"] }`. Without both the `origin` option on the client and `allowedOrigins` in config, connections fail with "Auth failed: origin not allowed"
+- **WebSocket bridge protocol**: Connect → auth (type:req, method:connect, minProtocol/maxProtocol:4, client:{id:"gateway-client", mode:"backend"}, auth:{token}, NO Origin header) → chat.send → streaming deltas → final
+- **OpenClaw 2.0 WebSocket identity**: The bridge must connect WITHOUT an `Origin` header and identify as `client.id: "gateway-client"`, `client.mode: "backend"` on gateway protocol v4. Any `Origin` header or a Control-UI client id makes 2.0 demand a signed device identity (`reject-control-ui-insecure-auth`, close 1008), and other device-less token clients get their `operator.*` scopes cleared (`chat.send` then fails with a missing-scope error). `controlUi.allowInsecureAuth` (dead key) and `dangerouslyDisableDeviceAuth` (retired) must NOT be emitted — the startup doctor would rewrite `openclaw.json` + `.bak` every boot. Config still sets `controlUi: { enabled: false, dangerouslyAllowHostHeaderOriginFallback: true, allowedOrigins: ["*"] }`. See `docs/openclaw-2.0-upgrade.md`
 - **Workspace sync overwrites config**: The `.openclaw/` S3 sync can overwrite `openclaw.json` with stale configs. `openclaw.json` is excluded from sync via SKIP_PATTERNS — config is always programmatically generated by `writeOpenClawConfig()`
 
 ### Cognito Identity
@@ -785,7 +785,7 @@ To add a new messaging channel (e.g., WhatsApp, Discord, LINE), follow the Feish
 - **`update-agent-runtime` does NOT replace running containers**: Env var changes only apply to NEW sessions. Always `agentcore stop-session` after updating runtime env vars
 - **Starter Toolkit `--local-build` skips CodeBuild**: Useful for pre-pushed images. Default mode always triggers CodeBuild which rebuilds and overwrites the image tag
 - **Starter Toolkit VPC subnet changes**: "Immutable" via `agentcore configure`, but actually mutable via direct `aws bedrock-agentcore-control update-agent-runtime` API
-- **CodeBuild Docker Hub rate limit**: Dockerfile must use `public.ecr.aws/docker/library/node:22-slim` instead of Docker Hub
+- **CodeBuild Docker Hub rate limit**: Dockerfile must use `public.ecr.aws/docker/library/node:24-slim` instead of Docker Hub
 
 ### VPC + Bedrock
 - **Cross-region inference profiles work through VPC endpoints**: `global.anthropic.claude-opus-4-6-v1` works fine through `bedrock-runtime` VPC endpoint (despite initial suspicion otherwise)

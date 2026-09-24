@@ -10,7 +10,7 @@ This repo wraps it in `scripts/agentcore-exec.py`, an **operator-only** CLI for 
 
 | Aspect | Behaviour |
 |---|---|
-| Where it runs | The **same microVM, filesystem and session** as the OpenClaw session identified by `runtimeSessionId`. `/mnt/workspace` (and the `~/.openclaw` symlink from [session storage](session-storage.md)) is visible exactly as the agent left it — no sync step. |
+| Where it runs | The **same microVM, filesystem and session** as the OpenClaw session identified by `runtimeSessionId`. `/mnt/workspace` (the live `~/.openclaw/workspace` link and the state-dir mirror from [session storage](session-storage.md)) is visible exactly as the agent left it — no sync step. |
 | Input | `command` (1 byte – 64 KB, run by bash), optional `timeout` (1–3600 s, default 300). |
 | Output | An event stream: `contentStart` → `contentDelta { stdout \| stderr }` (many) → `contentStop { exitCode, status }`. `status` is `COMPLETED` or `TIMED_OUT`; `exitCode -1` means a platform error. |
 | Statefulness | **One-shot.** Every call is a fresh bash: no shell history, no env carry-over between calls. Chain steps with `&&`. |
@@ -37,11 +37,11 @@ Health check in a **new throwaway session** (default when `--session-id` is omit
 python3 scripts/agentcore-exec.py --command 'node --version && df -h /mnt/workspace'
 ```
 
-Verify the session-storage symlink and the workspace layout:
+Verify the session-storage layout (local state dir, live workspace link, mirror on the mount):
 
 ```bash
 python3 scripts/agentcore-exec.py \
-  --command 'test -L ~/.openclaw && readlink ~/.openclaw && ls -la /mnt/workspace/.openclaw'
+  --command 'test -d ~/.openclaw && test -L ~/.openclaw/workspace && readlink ~/.openclaw/workspace && ls -la /mnt/workspace/.openclaw'
 ```
 
 Inspect a **specific user's live session** (pass the same `ses_<user>_<hex>` id the router generates — this reads user data, so record why in your change/incident log):
@@ -140,7 +140,7 @@ That is why:
 
 ## Relationship to session storage
 
-Because the command runs in the same microVM as the session, it is the most direct way to verify what [session storage](session-storage.md) actually holds: whether `~/.openclaw` is the expected symlink, whether a resumed session skipped the S3 restore, or how large a workspace has grown against the 1 GB cap. Pass a router-generated `ses_…` id to look at that user's persistent mount; omit it to get an isolated, empty workspace for pure health checks.
+Because the command runs in the same microVM as the session, it is the most direct way to verify what [session storage](session-storage.md) actually holds: whether the mirror was restored to the local state dir, whether a resumed session skipped the S3 restore, or how large a workspace has grown against the 1 GB cap. Pass a router-generated `ses_…` id to look at that user's persistent mount; omit it to get an isolated, empty workspace for pure health checks.
 
 ## Testing
 
