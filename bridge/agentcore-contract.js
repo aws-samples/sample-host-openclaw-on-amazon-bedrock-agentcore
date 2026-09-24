@@ -41,7 +41,8 @@ const SESSION_STORAGE_MOUNT = stateStorage.DEFAULT_MOUNT;
 // OpenClaw 2.0 keeps sessions/auth/state in SQLite, and AgentCore session
 // storage is NFS with local_lock=none, on which SQLite cannot take a lock
 // ("database is locked" at gateway startup). Only ~/.openclaw/workspace is a
-// live symlink onto the mount; the rest is mirrored there by state-storage.js.
+// real local directory (SQLite locks + hard links both work); state-storage.js
+// mirrors it, workspace included, onto the mount.
 const OPENCLAW_DIR = stateStorage.resolvePaths().stateDir;
 // Cold mirror of OPENCLAW_DIR on the mount (also where a 1.x deployment left
 // its plain-file state dir).
@@ -142,10 +143,11 @@ let processingMessage = false;
  */
 /**
  * Set up the state storage layout (see state-storage.js): a real local
- * ~/.openclaw, ~/.openclaw/workspace symlinked onto the session storage
- * mount, and the mount's cold mirror (plain files + SQLite snapshots, or a
- * 1.x plain-file state dir) restored to local disk. Must run before anything
- * touches ~/.openclaw and before the gateway spawns.
+ * ~/.openclaw including ~/.openclaw/workspace (the NFS session storage mount
+ * supports neither SQLite locks nor the hard links OpenClaw 2.0 uses to
+ * publish workspace files), and the mount's mirror (plain files + workspace +
+ * SQLite snapshots, or a 1.x plain-file state dir) restored to local disk.
+ * Must run before anything touches ~/.openclaw and before the gateway spawns.
  * Returns true if session storage is available.
  */
 function setupSessionStorage() {
@@ -176,7 +178,7 @@ async function mirrorStateToSessionStorage(label) {
       log: console,
     });
     console.log(
-      `[contract] State mirror (${label}): ${r.files} file(s), ${r.sqlite} sqlite snapshot(s), ${r.skipped} skipped, ${r.pruned} pruned`,
+      `[contract] State mirror (${label}): ${r.files} file(s) copied, ${r.unchanged} unchanged, ${r.sqlite} sqlite snapshot(s), ${r.skipped} skipped, ${r.pruned} pruned`,
     );
     return r;
   } catch (err) {
@@ -1196,11 +1198,11 @@ async function init(userId, actorId, channel) {
       console.log("[contract] EXECUTION_ROLE_ARN not set — skipping credential scoping");
     }
 
-    // 1c. Session storage: local ~/.openclaw (SQLite must not live on the NFS
-    // mount), ~/.openclaw/workspace -> /mnt/workspace/.openclaw/workspace, and
-    // the mount's mirror restored to local disk. Must happen before anything
-    // touches ~/.openclaw (lock cleanup, S3 restore, config/AGENTS.md write,
-    // legacy import, gateway spawn).
+    // 1c. Session storage: local ~/.openclaw including the agent workspace
+    // (the NFS mount has no SQLite locks and no hard links; see
+    // state-storage.js), and the mount's mirror restored to local disk. Must
+    // happen before anything touches ~/.openclaw (lock cleanup, S3 restore,
+    // config/AGENTS.md write, legacy import, gateway spawn).
     const sessionStorageAvailable = setupSessionStorage();
     sessionStorageActive = sessionStorageAvailable;
 
@@ -1290,8 +1292,8 @@ async function init(userId, actorId, channel) {
       ]);
     }
 
-    // 1f. Write OpenClaw config + AGENTS.md AFTER the symlink (so they land on
-    // session storage and are not overwritten by stale restored data) and
+    // 1f. Write OpenClaw config + AGENTS.md AFTER the session-storage restore
+    // (so they are not overwritten by stale restored data) and
     // BEFORE the gateway spawns (2.0 validates config strictly at startup; the
     // pre-2.0 code relied on gateway boot latency to win this race).
     writeOpenClawConfig();
@@ -1306,6 +1308,18 @@ async function init(userId, actorId, channel) {
     const openclawEnv = openclawEnvFor(scopedCredsAvailable, userId);
     if (await migrateLegacySessionStore(openclawEnv)) {
       writeOpenClawConfig();
+    }
+
+    // 1h. Mirror workspace changes onto the mount within seconds of the
+    // gateway (or a skill) writing them; the periodic/shutdown mirrors cover
+    // the SQLite state. Started before spawn so the 2.0 bootstrap seeding
+    // (AGENTS.md, SOUL.md, ...) is captured too.
+    if (sessionStorageActive) {
+      stateStorage.startWorkspaceWatcher({
+        stateDir: OPENCLAW_DIR,
+        mountStateDir: MOUNTED_OPENCLAW_DIR,
+        log: console,
+      });
     }
 
     console.log("[contract] Starting OpenClaw gateway (headless)...");
@@ -2339,6 +2353,7 @@ process.on("SIGTERM", async () => {
   //    checkpointed, then take the shutdown snapshot onto the mount. The
   //    snapshot is what the next cold start restores before spawning.
   stateStorage.stopPeriodicMirror();
+  stateStorage.stopWorkspaceWatcher();
   if (sessionStorageActive) {
     const exited = await stopGateway(GATEWAY_STOP_WAIT_MS);
     console.log(
@@ -2347,7 +2362,7 @@ process.on("SIGTERM", async () => {
     await mirrorStateToSessionStorage("shutdown");
   }
 
-  // 2. S3 backup (workspace files via the live link + state dir snapshots)
+  // 2. S3 backup (workspace files + state dir snapshots, all from local disk)
   try {
     await workspaceSync.cleanup(currentNamespace);
   } catch (err) {

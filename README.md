@@ -639,7 +639,7 @@ Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as p
 3. **At boot** (background): Pre-fetch secrets from Secrets Manager (~2s)
 4. **On first `/invocations` with `action: chat`, `action: warmup`, or `action: cron`** (parallel init):
    - Create STS scoped credentials restricting S3 to user's namespace prefix
-   - Set up the state layout (local `~/.openclaw`, `workspace/` symlinked to session storage, mirror restored), clean stale lock files
+   - Set up the state layout (local `~/.openclaw` incl. `workspace/`, mirror restored from session storage), clean stale lock files
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
    - Restore `.openclaw/` from S3 via `workspace-sync.js` (awaited, bounded by `WORKSPACE_RESTORE_WAIT_MS`, default 45s)
    - Write `openclaw.json` + `AGENTS.md`; if a pre-2.0 `sessions.json` is present, run `openclaw doctor --fix` to import it into SQLite (see [docs/openclaw-2.0-upgrade.md](docs/openclaw-2.0-upgrade.md))

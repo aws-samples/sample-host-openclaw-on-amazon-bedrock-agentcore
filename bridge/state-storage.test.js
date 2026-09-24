@@ -1,7 +1,8 @@
 /**
  * Tests for state-storage.js — the OpenClaw 2.0 state layout on AgentCore
- * session storage: local SQLite state dir, live workspace symlink onto the
- * mount, cold mirror (plain copy + consistent SQLite snapshots) and restore.
+ * session storage: local state dir INCLUDING the workspace (the NFS mount has
+ * neither SQLite locks nor hard links), mirror onto the mount (plain copy +
+ * consistent SQLite snapshots + debounced workspace watcher) and restore.
  *
  * Run: cd bridge && node --test state-storage.test.js
  */
@@ -52,12 +53,19 @@ function readRows(file) {
 }
 
 describe("state-storage path helpers", () => {
-  it("resolvePaths derives local state dir, mounted state dir and workspace link", () => {
+  it("resolvePaths derives local state dir, mounted state dir and both workspace dirs", () => {
     const p = storage.resolvePaths({ homeDir: "/root", mountDir: "/mnt/workspace" });
     assert.equal(p.stateDir, "/root/.openclaw");
     assert.equal(p.mountStateDir, "/mnt/workspace/.openclaw");
-    assert.equal(p.workspaceLink, "/root/.openclaw/workspace");
-    assert.equal(p.workspaceTarget, "/mnt/workspace/.openclaw/workspace");
+    assert.equal(p.workspaceDir, "/root/.openclaw/workspace");
+    assert.equal(p.mountWorkspaceDir, "/mnt/workspace/.openclaw/workspace");
+  });
+
+  it("isTransientDir matches caches and OpenClaw's bootstrap staging dirs", () => {
+    assert.equal(storage.isTransientDir("node_modules"), true);
+    assert.equal(storage.isTransientDir("openclaw-bootstrap-GGFCIv"), true);
+    assert.equal(storage.isTransientDir("memory"), false);
+    assert.equal(storage.isTransientDir("agents"), false);
   });
 
   it("gatewayStateEnv points OPENCLAW_STATE_DIR at the local state dir", () => {
@@ -118,26 +126,30 @@ describe("setupSessionStorage", () => {
     assert.equal(fs.existsSync(path.join(home, ".openclaw")), false);
   });
 
-  it("creates a real local state dir with workspace symlinked onto the mount", () => {
+  it("creates a real local state dir AND a real local workspace dir (no symlinks)", () => {
     const r = storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
     assert.equal(r.available, true);
     const stateDir = path.join(home, ".openclaw");
     assert.equal(fs.lstatSync(stateDir).isDirectory(), true);
     assert.equal(fs.lstatSync(stateDir).isSymbolicLink(), false);
     const ws = path.join(stateDir, "workspace");
-    assert.equal(fs.lstatSync(ws).isSymbolicLink(), true);
-    assert.equal(fs.readlinkSync(ws), path.join(mount, ".openclaw", "workspace"));
+    assert.equal(fs.lstatSync(ws).isDirectory(), true);
+    assert.equal(fs.lstatSync(ws).isSymbolicLink(), false);
     assert.equal(fs.statSync(path.join(mount, ".openclaw", "workspace")).isDirectory(), true);
-    // Writes through the link land on the mount
-    write(path.join(ws, "memory", "note.md"), "hi");
-    assert.equal(fs.readFileSync(path.join(mount, ".openclaw", "workspace", "memory", "note.md"), "utf8"), "hi");
+    // OpenClaw 2.0 publishes bootstrap files with a hard link from a staging
+    // file in the workspace dir — this must work on the local workspace.
+    write(path.join(ws, "openclaw-bootstrap-abc", "AGENTS.md"), "seed");
+    fs.linkSync(path.join(ws, "openclaw-bootstrap-abc", "AGENTS.md"), path.join(ws, "AGENTS.md"));
+    assert.equal(fs.readFileSync(path.join(ws, "AGENTS.md"), "utf8"), "seed");
+    // Workspace writes do NOT land on the mount until mirrored
+    assert.equal(fs.existsSync(path.join(mount, ".openclaw", "workspace", "AGENTS.md")), false);
   });
 
   it("is idempotent", () => {
     storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
     const r = storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
     assert.equal(r.available, true);
-    assert.equal(r.workspaceWas, "linked");
+    assert.equal(r.workspaceWas, "directory");
     assert.equal(r.stateDirWas, "directory");
   });
 
@@ -154,19 +166,27 @@ describe("setupSessionStorage", () => {
     assert.equal(fs.existsSync(path.join(mountState, "openclaw.json")), true);
   });
 
-  it("merges a pre-existing local workspace dir onto the mount (mount wins on conflict)", () => {
-    write(path.join(home, ".openclaw", "workspace", "local-only.md"), "local");
-    write(path.join(home, ".openclaw", "workspace", "both.md"), "local");
-    write(path.join(mount, ".openclaw", "workspace", "both.md"), "mount");
-    const r = storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
-    assert.equal(r.workspaceWas, "directory");
+  it("replaces the intermediate layout's workspace symlink with a real dir and restores its files (local wins on conflict)", () => {
     const target = path.join(mount, ".openclaw", "workspace");
-    assert.equal(fs.readFileSync(path.join(target, "local-only.md"), "utf8"), "local");
-    assert.equal(fs.readFileSync(path.join(target, "both.md"), "utf8"), "mount");
-    assert.equal(fs.lstatSync(path.join(home, ".openclaw", "workspace")).isSymbolicLink(), true);
+    write(path.join(target, "mount-only.md"), "mount");
+    write(path.join(target, "both.md"), "mount");
+    fs.mkdirSync(path.join(home, ".openclaw"), { recursive: true });
+    fs.symlinkSync(target, path.join(home, ".openclaw", "workspace"));
+    const r = storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
+    assert.match(r.workspaceWas, /^symlink/);
+    const ws = path.join(home, ".openclaw", "workspace");
+    assert.equal(fs.lstatSync(ws).isSymbolicLink(), false);
+    assert.equal(fs.readFileSync(path.join(ws, "mount-only.md"), "utf8"), "mount");
+    assert.equal(r.restored.workspaceFiles, 2);
+    // A second boot with a locally modified file keeps the local copy
+    write(path.join(ws, "both.md"), "local");
+    const r2 = storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
+    assert.equal(fs.readFileSync(path.join(ws, "both.md"), "utf8"), "local");
+    assert.equal(r2.restored.workspaceFiles, 0);
+    assert.equal(r2.restored.skipped, 2);
   });
 
-  it("restores a 1.x mount layout (legacy sessions.json + transcripts) to local disk, leaving workspace live", () => {
+  it("restores a 1.x mount layout (legacy sessions.json + transcripts + workspace) to local disk", () => {
     const mountState = path.join(mount, ".openclaw");
     write(path.join(mountState, "agents/main/sessions/sessions.json"), '{"legacy":true}');
     write(path.join(mountState, "agents/main/sessions/abc.jsonl"), "{}\n");
@@ -174,12 +194,13 @@ describe("setupSessionStorage", () => {
     write(path.join(mountState, "agents/main/sessions/x.lock"), "");
     const r = storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
     assert.equal(r.restored.files, 2);
+    assert.equal(r.restored.workspaceFiles, 1);
     const local = path.join(home, ".openclaw");
     assert.equal(fs.readFileSync(path.join(local, "agents/main/sessions/sessions.json"), "utf8"), '{"legacy":true}');
     assert.equal(fs.existsSync(path.join(local, "agents/main/sessions/abc.jsonl")), true);
     assert.equal(fs.existsSync(path.join(local, "agents/main/sessions/x.lock")), false);
-    // workspace is the live link, not a copy
-    assert.equal(fs.lstatSync(path.join(local, "workspace")).isSymbolicLink(), true);
+    // workspace is a local copy, not a link
+    assert.equal(fs.lstatSync(path.join(local, "workspace")).isSymbolicLink(), false);
     assert.equal(fs.readFileSync(path.join(local, "workspace/AGENTS.md"), "utf8"), "ws");
   });
 
@@ -221,15 +242,20 @@ describe("mirrorStateDir / restoreStateDir", () => {
     fs.rmSync(mount, { recursive: true, force: true });
   });
 
-  it("copies plain files, skips sidecars/locks and never touches the live workspace", async () => {
+  it("copies plain files incl. the workspace, skips sidecars/locks/staging dirs, and skips unchanged files on rerun", async () => {
     write(path.join(stateDir, "openclaw.json"), "{}");
     write(path.join(stateDir, "agents/main/sessions/abc.jsonl"), "{}\n");
     write(path.join(stateDir, "agents/main/sessions/abc.lock"), "");
     write(path.join(stateDir, "state/openclaw.sqlite-wal"), "wal");
-    write(path.join(stateDir, "workspace/memory.md"), "m"); // through the link
+    write(path.join(stateDir, "workspace/memory.md"), "m");
+    write(path.join(stateDir, "workspace/openclaw-bootstrap-x/AGENTS.md"), "staging");
     const r = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log: quietLog, sqlite: null });
-    assert.equal(r.files, 2);
+    assert.equal(r.files, 3);
     assert.equal(r.sqlite, 0);
+    assert.equal(fs.existsSync(path.join(mountState, "workspace/openclaw-bootstrap-x")), false);
+    const r2 = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log: quietLog, sqlite: null });
+    assert.equal(r2.files, 0);
+    assert.equal(r2.unchanged, 3);
     assert.equal(fs.readFileSync(path.join(mountState, "openclaw.json"), "utf8"), "{}");
     assert.equal(fs.existsSync(path.join(mountState, "agents/main/sessions/abc.jsonl")), true);
     assert.equal(fs.existsSync(path.join(mountState, "agents/main/sessions/abc.lock")), false);
@@ -338,6 +364,85 @@ describe("mirrorStateDir / restoreStateDir", () => {
 });
 
 // --- wiring in agentcore-contract.js (source-level ordering guarantees) ---
+describe("mirrorWorkspaceDir / workspace watcher", () => {
+  let home, mount, stateDir, mountState, ws;
+  beforeEach(() => {
+    home = mkTmp("ss-ws-home-");
+    mount = mkTmp("ss-ws-mount-");
+    storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
+    stateDir = path.join(home, ".openclaw");
+    mountState = path.join(mount, ".openclaw");
+    ws = path.join(stateDir, "workspace");
+  });
+  afterEach(() => {
+    storage.stopWorkspaceWatcher();
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(mount, { recursive: true, force: true });
+  });
+
+  it("copies changed workspace files, prunes deleted ones, ignores the rest of the state dir", () => {
+    write(path.join(ws, "AGENTS.md"), "a");
+    write(path.join(ws, "memory/2026-09-24.md"), "m");
+    write(path.join(stateDir, "state/openclaw.sqlite"), "not-mirrored-here");
+    write(path.join(mountState, "workspace/stale.md"), "old");
+    const r = storage.mirrorWorkspaceDir({ stateDir, mountStateDir: mountState, log: quietLog });
+    assert.equal(r.files, 2);
+    assert.equal(r.pruned, 1);
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/AGENTS.md"), "utf8"), "a");
+    assert.equal(fs.existsSync(path.join(mountState, "workspace/stale.md")), false);
+    assert.equal(fs.existsSync(path.join(mountState, "state/openclaw.sqlite")), false);
+    const r2 = storage.mirrorWorkspaceDir({ stateDir, mountStateDir: mountState, log: quietLog });
+    assert.equal(r2.files, 0);
+    assert.equal(r2.unchanged, 2);
+    // A content change with a new mtime is picked up
+    const f = path.join(ws, "AGENTS.md");
+    fs.writeFileSync(f, "bb");
+    const t = new Date(Date.now() + 5000);
+    fs.utimesSync(f, t, t);
+    const r3 = storage.mirrorWorkspaceDir({ stateDir, mountStateDir: mountState, log: quietLog });
+    assert.equal(r3.files, 1);
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/AGENTS.md"), "utf8"), "bb");
+  });
+
+  it("the restored workspace round-trips: mirror -> fresh container -> setup restores it", () => {
+    write(path.join(ws, "AGENTS.md"), "a");
+    write(path.join(ws, "memory/note.md"), "n");
+    storage.mirrorWorkspaceDir({ stateDir, mountStateDir: mountState, log: quietLog });
+    const home2 = mkTmp("ss-ws-home2-");
+    try {
+      const r = storage.setupSessionStorage({ homeDir: home2, mountDir: mount, log: quietLog });
+      assert.equal(r.restored.workspaceFiles, 2);
+      assert.equal(fs.readFileSync(path.join(home2, ".openclaw/workspace/memory/note.md"), "utf8"), "n");
+    } finally {
+      fs.rmSync(home2, { recursive: true, force: true });
+    }
+  });
+
+  it("watcher mirrors a burst of changes once after the debounce, and stop() flushes pending work", async () => {
+    const started = storage.startWorkspaceWatcher(
+      { stateDir, mountStateDir: mountState, log: quietLog },
+      { debounceMs: 150, maxWaitMs: 2000 },
+    );
+    assert.ok(["watch", "poll"].includes(started.mode));
+    write(path.join(ws, "a.md"), "1");
+    write(path.join(ws, "sub/b.md"), "2");
+    await new Promise((r) => setTimeout(r, 900));
+    if (started.mode === "watch") {
+      assert.equal(fs.readFileSync(path.join(mountState, "workspace/a.md"), "utf8"), "1");
+      assert.equal(fs.readFileSync(path.join(mountState, "workspace/sub/b.md"), "utf8"), "2");
+    }
+    write(path.join(ws, "c.md"), "3");
+    await new Promise((r) => setTimeout(r, 20)); // event delivered, debounce still pending
+    storage.stopWorkspaceWatcher();
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/c.md"), "utf8"), "3");
+  });
+
+  it("flushWorkspaceMirror is a no-op after stop", () => {
+    storage.stopWorkspaceWatcher();
+    assert.equal(storage.flushWorkspaceMirror("test"), null);
+  });
+});
+
 describe("state storage wiring in agentcore-contract.js", () => {
   const source = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
   const idx = (needle) => {
@@ -377,5 +482,23 @@ describe("state storage wiring in agentcore-contract.js", () => {
   it("starts the periodic mirror once the gateway is ready", () => {
     const ready = idx("openclawReady = true;\n    workspaceSync.startPeriodicSave(namespace);");
     assert.ok(source.indexOf("stateStorage.startPeriodicMirror(", ready) > ready);
+  });
+
+  it("starts the workspace watcher after the legacy import and before the gateway spawns", () => {
+    const migrate = idx("if (await migrateLegacySessionStore(openclawEnv))");
+    const watcher = source.indexOf("stateStorage.startWorkspaceWatcher(", migrate);
+    const spawnGw = source.indexOf('["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"]', migrate);
+    assert.ok(watcher > migrate && watcher < spawnGw);
+  });
+
+  it("stops the workspace watcher (flushing pending changes) on SIGTERM before the shutdown snapshot", () => {
+    const sigterm = idx('process.on("SIGTERM", async () => {');
+    const stopW = source.indexOf("stateStorage.stopWorkspaceWatcher()", sigterm);
+    const mirror = source.indexOf('await mirrorStateToSessionStorage("shutdown")', sigterm);
+    assert.ok(stopW > sigterm && stopW < mirror);
+  });
+
+  it("never symlinks the workspace onto the mount", () => {
+    assert.equal(source.includes("symlinkSync"), false);
   });
 });

@@ -2,38 +2,47 @@
  * State storage layout for OpenClaw 2.0 on AgentCore session storage.
  *
  * Why this exists: AgentCore session storage (/mnt/workspace) is a loopback
- * NFSv4 export mounted with `local_lock=none`. SQLite cannot take even a
- * RESERVED lock on it, so the 2.0 gateway — which keeps sessions, auth and
- * shared state in SQLite — dies at startup with "database is locked" when its
- * state dir lives on the mount. The 1.x line only kept plain files there.
+ * NFSv4 export mounted with `local_lock=none`, and it refuses hard links
+ * (link(2) fails with -524 / ENOTSUPP). OpenClaw 2.0 needs both in its state
+ * dir: the gateway keeps sessions, auth and shared state in SQLite (which
+ * cannot take even a RESERVED lock there, so it dies at startup with
+ * "database is locked"), and it publishes workspace bootstrap files
+ * (AGENTS.md, SOUL.md, IDENTITY.md, USER.md, BOOTSTRAP.md) and other
+ * workspace artifacts atomically with `fs.linkSync` from a staging file in
+ * the same directory (which fails every chat turn with "Unknown system error
+ * -524"). The 1.x line only kept plain files there and wrote them in place.
  *
  * Layout
  *
  *   ~/.openclaw                        real directory on the container's local
  *                                      (overlay) disk = OPENCLAW_STATE_DIR.
- *                                      Every SQLite file the gateway creates
- *                                      (state/openclaw.sqlite, agents/<id>/agent/
- *                                      openclaw-agent.sqlite, flows/, tasks/ ...)
- *                                      lands here and can lock.
+ *                                      Everything the gateway touches lives
+ *                                      here: every SQLite file (state/
+ *                                      openclaw.sqlite, agents/<id>/agent/
+ *                                      openclaw-agent.sqlite, ...) and the
+ *                                      agent workspace ~/.openclaw/workspace
+ *                                      (memory, bootstrap files, user files).
+ *                                      Locks and hard links both work.
  *
- *   ~/.openclaw/workspace  ->  /mnt/workspace/.openclaw/workspace
- *                                      live symlink. Agent workspace files
- *                                      (memory, user files, ...) keep living on
- *                                      the persistent mount exactly as before.
- *
- *   /mnt/workspace/.openclaw/<rest>    cold MIRROR of the local state dir,
- *                                      written by mirrorStateDir(): plain files
- *                                      copied as-is, each *.sqlite replaced by a
- *                                      consistent snapshot (SQLite online backup
- *                                      API), -wal/-shm/-journal never copied.
- *                                      Restored to local disk by
- *                                      setupSessionStorage() BEFORE the gateway
- *                                      spawns.
+ *   /mnt/workspace/.openclaw/<rest>    MIRROR of the local state dir on the
+ *                                      persistent mount: plain files copied
+ *                                      as-is (mtime preserved), each *.sqlite
+ *                                      replaced by a consistent snapshot
+ *                                      (SQLite online backup API), -wal/-shm/
+ *                                      -journal never copied. Written by
+ *                                      mirrorStateDir() every few minutes and
+ *                                      at shutdown; the workspace/ subtree is
+ *                                      additionally mirrored within seconds of
+ *                                      any change by a debounced fs.watch
+ *                                      (mirrorWorkspaceDir()). Restored to
+ *                                      local disk by setupSessionStorage()
+ *                                      BEFORE the gateway spawns.
  *
  * The mount therefore still looks like a complete OpenClaw state dir. That
  * keeps it backward compatible with whatever previous deployments left there
  * (a 1.x `agents/<id>/sessions/sessions.json` is restored to local disk and
- * picked up by the legacy import; a 2.0 snapshot is restored and opened).
+ * picked up by the legacy import; a 1.x or 2.0 workspace/ is restored as the
+ * agent workspace; a 2.0 snapshot is restored and opened).
  *
  * Only the mount/mirror mechanics live here so they can be unit-tested with
  * temp directories; agentcore-contract.js decides when to call them.
@@ -50,6 +59,9 @@ const SQLITE_EXT = ".sqlite";
 
 // Directories never mirrored or restored (regenerated, large, or caches).
 const SKIP_DIR_NAMES = new Set(["node_modules", ".cache", ".npm"]);
+// Short-lived staging directories OpenClaw creates next to the file it is
+// about to publish (tempFile({ rootDir, prefix: "openclaw-bootstrap" })).
+const TRANSIENT_DIR_RE = /^openclaw-(bootstrap|publish|tmp)-/;
 
 // Lazy node:sqlite (Node >= 22.13 / 24 in the image; may be absent locally).
 let _nodeSqlite;
@@ -67,7 +79,8 @@ function getNodeSqlite() {
 /**
  * Files that are only meaningful next to the exact live database bytes they
  * were written against (SQLite sidecars), in-flight snapshot staging files,
- * lock files and logs. Never mirrored, never restored.
+ * our own atomic-copy temp files, lock files and logs. Never mirrored, never
+ * restored.
  */
 function isTransientFile(relativePath) {
   const name = path.basename(relativePath);
@@ -77,6 +90,10 @@ function isTransientFile(relativePath) {
     name.endsWith(".lock") ||
     name.endsWith(".log")
   );
+}
+
+function isTransientDir(name) {
+  return SKIP_DIR_NAMES.has(name) || TRANSIENT_DIR_RE.test(name);
 }
 
 function isWorkspacePath(relativePath) {
@@ -96,14 +113,14 @@ function resolvePaths({ homeDir = process.env.HOME || "/root", mountDir = DEFAUL
     mountDir,
     stateDir,
     mountStateDir,
-    workspaceLink: path.join(stateDir, WORKSPACE_SUBDIR),
-    workspaceTarget: path.join(mountStateDir, WORKSPACE_SUBDIR),
+    workspaceDir: path.join(stateDir, WORKSPACE_SUBDIR),
+    mountWorkspaceDir: path.join(mountStateDir, WORKSPACE_SUBDIR),
   };
 }
 
 /**
  * List regular files under `root` as relative paths. Does NOT follow symlinks
- * (so the live workspace link is never walked as part of the state dir).
+ * and skips caches and OpenClaw's transient staging directories.
  */
 function walkFiles(root, dir = root) {
   const out = [];
@@ -115,7 +132,7 @@ function walkFiles(root, dir = root) {
   }
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      if (SKIP_DIR_NAMES.has(entry.name)) continue;
+      if (isTransientDir(entry.name)) continue;
       out.push(...walkFiles(root, path.join(dir, entry.name)));
     } else if (entry.isFile()) {
       out.push(path.relative(root, path.join(dir, entry.name)));
@@ -130,7 +147,7 @@ function hasLocalSqlite(stateDir) {
 
 /**
  * True when the mounted state dir holds any persisted content (a mirrored
- * file or a workspace file) — i.e. this is a returning user and the S3
+ * state file or a workspace file) — i.e. this is a returning user and the S3
  * restore should be skipped. Empty directories (which setupSessionStorage
  * itself creates) do not count.
  */
@@ -191,13 +208,32 @@ async function snapshotSqliteToFile(dbPath, destPath, { sqlite = getNodeSqlite()
 }
 
 /**
- * Copy a plain file atomically (temp file in the destination dir + rename).
+ * Copy a plain file atomically (temp file in the destination dir + rename),
+ * preserving the source mtime so unchanged files can be detected later.
  */
 function copyFileAtomic(src, dest) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const tmp = `${dest}.tmp-${process.pid}`;
   fs.copyFileSync(src, tmp);
+  try {
+    const st = fs.statSync(src);
+    fs.utimesSync(tmp, st.atime, st.mtime);
+  } catch { /* best effort */ }
   fs.renameSync(tmp, dest);
+}
+
+/**
+ * True when `dest` already holds a copy of `src` (same size and mtime, to the
+ * second — NFS mtime granularity). Used to make the workspace mirror cheap.
+ */
+function sameSizeAndMtime(src, dest) {
+  try {
+    const a = fs.statSync(src);
+    const b = fs.statSync(dest);
+    return a.size === b.size && Math.floor(a.mtimeMs / 1000) === Math.floor(b.mtimeMs / 1000);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -205,22 +241,24 @@ function copyFileAtomic(src, dest) {
  *
  * Runs only while the local state dir holds no SQLite database yet (a cold
  * start in a fresh container); once the gateway has run locally the local
- * copy is the truth and must not be clobbered. Skips the live `workspace/`
- * subtree, transient files, and 0-byte *.sqlite files (a database that was
+ * copy is the truth and must not be clobbered. Workspace files are restored
+ * without overwriting anything already present locally (never destroys
+ * local work); transient files and 0-byte *.sqlite files (a database that was
  * created but never written — e.g. left behind by a gateway that crashed on
- * the mount — which would otherwise shadow a real snapshot).
+ * the mount — which would otherwise shadow a real snapshot) are skipped.
  *
- * @returns {{ files: number, skipped: number, reason?: string }}
+ * @returns {{ files: number, workspaceFiles: number, skipped: number, reason?: string }}
  */
 function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
   if (hasLocalSqlite(stateDir)) {
-    return { files: 0, skipped: 0, reason: "local state dir already holds SQLite state" };
+    return { files: 0, workspaceFiles: 0, skipped: 0, reason: "local state dir already holds SQLite state" };
   }
   const resolvedBase = path.resolve(stateDir);
   let files = 0;
+  let workspaceFiles = 0;
   let skipped = 0;
   for (const rel of walkFiles(mountStateDir)) {
-    if (isWorkspacePath(rel) || isTransientFile(rel)) continue;
+    if (isTransientFile(rel)) continue;
     const src = path.join(mountStateDir, rel);
     const dest = path.join(stateDir, rel);
     if (!insideBase(resolvedBase, dest)) {
@@ -229,6 +267,15 @@ function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
       continue;
     }
     try {
+      if (isWorkspacePath(rel)) {
+        if (fs.existsSync(dest)) {
+          skipped++;
+          continue;
+        }
+        copyFileAtomic(src, dest);
+        workspaceFiles++;
+        continue;
+      }
       if (rel.endsWith(SQLITE_EXT) && fs.statSync(src).size === 0) {
         log.warn(`[state-storage] Skipping 0-byte SQLite file on restore: ${rel}`);
         skipped++;
@@ -241,27 +288,26 @@ function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
       skipped++;
     }
   }
-  return { files, skipped };
+  return { files, workspaceFiles, skipped };
 }
 
 /**
- * Mirror the local state dir to the mount: plain files copied, each *.sqlite
- * written as a consistent snapshot, transient files skipped, and mirror files
- * that no longer exist locally removed (so e.g. a legacy sessions.json that
- * the import consumed does not come back on the next boot and re-trigger it).
- * The live `workspace/` subtree is never touched.
+ * Mirror the local state dir to the mount: plain files copied (unchanged
+ * files, by size+mtime, are skipped), each *.sqlite written as a consistent
+ * snapshot, transient files skipped, and mirror files that no longer exist
+ * locally removed (so e.g. a legacy sessions.json that the import consumed
+ * does not come back on the next boot and re-trigger it). Includes the
+ * workspace/ subtree.
  *
  * Safe to call while the gateway is running (snapshots are consistent), but
  * the caller should stop the gateway first on shutdown so the copy is fully
  * quiesced (all WAL frames checkpointed).
  *
- * @returns {Promise<{ files: number, sqlite: number, skipped: number, pruned: number }>}
+ * @returns {Promise<{ files: number, unchanged: number, sqlite: number, skipped: number, pruned: number }>}
  */
 async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite = getNodeSqlite(), stagingDir } = {}) {
-  const result = { files: 0, sqlite: 0, skipped: 0, pruned: 0 };
-  const localFiles = walkFiles(stateDir).filter(
-    (rel) => !isWorkspacePath(rel) && !isTransientFile(rel),
-  );
+  const result = { files: 0, unchanged: 0, sqlite: 0, skipped: 0, pruned: 0 };
+  const localFiles = walkFiles(stateDir).filter((rel) => !isTransientFile(rel));
   const localSet = new Set(localFiles);
   const staging = stagingDir || fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-state-mirror-"));
   try {
@@ -272,6 +318,8 @@ async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite =
         if (rel.endsWith(SQLITE_EXT)) {
           await snapshotSqliteToFile(src, dest, { sqlite, stagingDir: staging });
           result.sqlite++;
+        } else if (sameSizeAndMtime(src, dest)) {
+          result.unchanged++;
         } else {
           copyFileAtomic(src, dest);
           result.files++;
@@ -285,7 +333,7 @@ async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite =
     // produced something — an empty local set means we could not read it.
     if (localFiles.length > 0) {
       for (const rel of walkFiles(mountStateDir)) {
-        if (isWorkspacePath(rel) || localSet.has(rel)) continue;
+        if (localSet.has(rel)) continue;
         try {
           fs.unlinkSync(path.join(mountStateDir, rel));
           result.pruned++;
@@ -301,13 +349,52 @@ async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite =
 }
 
 /**
+ * Mirror only the workspace/ subtree (plain files, no SQLite) — the cheap
+ * path the change watcher runs: copies files whose size or mtime differ from
+ * the mirror and prunes workspace files deleted locally.
+ *
+ * @returns {{ files: number, unchanged: number, skipped: number, pruned: number }}
+ */
+function mirrorWorkspaceDir({ stateDir, mountStateDir, log = console } = {}) {
+  const result = { files: 0, unchanged: 0, skipped: 0, pruned: 0 };
+  const workspaceDir = path.join(stateDir, WORKSPACE_SUBDIR);
+  const mountWorkspaceDir = path.join(mountStateDir, WORKSPACE_SUBDIR);
+  if (!fs.existsSync(workspaceDir)) return result;
+  const localFiles = walkFiles(workspaceDir).filter((rel) => !isTransientFile(rel));
+  const localSet = new Set(localFiles);
+  for (const rel of localFiles) {
+    const src = path.join(workspaceDir, rel);
+    const dest = path.join(mountWorkspaceDir, rel);
+    try {
+      if (sameSizeAndMtime(src, dest)) {
+        result.unchanged++;
+      } else {
+        copyFileAtomic(src, dest);
+        result.files++;
+      }
+    } catch (err) {
+      log.warn(`[state-storage] Failed to mirror workspace/${rel}: ${err.message}`);
+      result.skipped++;
+    }
+  }
+  for (const rel of walkFiles(mountWorkspaceDir)) {
+    if (localSet.has(rel)) continue;
+    try {
+      fs.unlinkSync(path.join(mountWorkspaceDir, rel));
+      result.pruned++;
+    } catch { /* best effort */ }
+  }
+  return result;
+}
+
+/**
  * Prepare the state storage layout for a container boot. Idempotent.
  *
  *  1. `stateDir` (~/.openclaw) is a real local directory — a symlink onto the
  *     mount left by the previous layout is replaced.
- *  2. `stateDir/workspace` is a symlink to `mountStateDir/workspace`; a real
- *     local workspace dir is merged onto the mount first (mount wins on
- *     conflicts) and then replaced by the link.
+ *  2. `stateDir/workspace` is a real local directory too — the symlink onto
+ *     the mount used by an intermediate layout is replaced (its target on the
+ *     mount is the mirror and is restored in step 3).
  *  3. The mirror on the mount is restored to local disk (see restoreStateDir).
  *
  * Returns `{ available: false }` when the mount is absent (local-only mode:
@@ -318,7 +405,7 @@ function setupSessionStorage({ homeDir, mountDir, log = console } = {}) {
   if (!fs.existsSync(p.mountDir)) {
     return { available: false, ...p };
   }
-  fs.mkdirSync(p.workspaceTarget, { recursive: true });
+  fs.mkdirSync(p.mountWorkspaceDir, { recursive: true });
 
   // 1. Real local state dir.
   let stateDirWas = "missing";
@@ -336,40 +423,29 @@ function setupSessionStorage({ homeDir, mountDir, log = console } = {}) {
   } catch { /* missing */ }
   fs.mkdirSync(p.stateDir, { recursive: true });
 
-  // 2. Live workspace symlink onto the mount.
+  // 2. Real local workspace dir.
   let workspaceWas = "missing";
   try {
-    const st = fs.lstatSync(p.workspaceLink);
+    const st = fs.lstatSync(p.workspaceDir);
     if (st.isSymbolicLink()) {
-      const target = fs.readlinkSync(p.workspaceLink);
-      if (target === p.workspaceTarget) {
-        workspaceWas = "linked";
-      } else {
-        workspaceWas = `symlink -> ${target}`;
-        fs.unlinkSync(p.workspaceLink);
-      }
+      workspaceWas = `symlink -> ${fs.readlinkSync(p.workspaceDir)}`;
+      fs.unlinkSync(p.workspaceDir);
     } else if (st.isDirectory()) {
       workspaceWas = "directory";
-      // Merge local workspace files onto the mount without overwriting what
-      // is already persisted there, then drop the local copy.
-      fs.cpSync(p.workspaceLink, p.workspaceTarget, { recursive: true, force: false, errorOnExist: false });
-      fs.rmSync(p.workspaceLink, { recursive: true, force: true });
     } else {
       workspaceWas = "file";
-      fs.unlinkSync(p.workspaceLink);
+      fs.unlinkSync(p.workspaceDir);
     }
   } catch { /* missing */ }
-  if (workspaceWas !== "linked") {
-    fs.symlinkSync(p.workspaceTarget, p.workspaceLink);
-  }
+  fs.mkdirSync(p.workspaceDir, { recursive: true });
 
-  // 3. Restore the cold mirror to local disk.
+  // 3. Restore the mirror (state files + workspace) to local disk.
   const restored = restoreStateDir({ stateDir: p.stateDir, mountStateDir: p.mountStateDir, log });
 
   log.log(
     `[state-storage] Local state dir ${p.stateDir} (was: ${stateDirWas}); ` +
-      `workspace -> ${p.workspaceTarget} (was: ${workspaceWas}); ` +
-      `restored ${restored.files} file(s) from mirror` +
+      `local workspace ${p.workspaceDir} (was: ${workspaceWas}); ` +
+      `restored ${restored.files} state file(s) + ${restored.workspaceFiles} workspace file(s) from ${p.mountStateDir}` +
       (restored.skipped ? `, skipped ${restored.skipped}` : "") +
       (restored.reason ? ` (${restored.reason})` : ""),
   );
@@ -378,9 +454,8 @@ function setupSessionStorage({ homeDir, mountDir, log = console } = {}) {
 
 /**
  * Environment the gateway (and `openclaw doctor`) must run with so every
- * SQLite database resolves under the local state dir. With
- * OPENCLAW_STATE_DIR set, OpenClaw resolves the default agent workspace to
- * `<stateDir>/workspace`, i.e. the live symlink onto the mount.
+ * SQLite database and the default agent workspace (`<stateDir>/workspace`)
+ * resolve under the local state dir.
  */
 function gatewayStateEnv(stateDir) {
   return { OPENCLAW_STATE_DIR: stateDir };
@@ -415,7 +490,7 @@ function startPeriodicMirror(opts, intervalMs) {
   _mirrorTimer = setInterval(() => {
     mirrorNow(opts).then(
       (r) => (opts.log || console).log(
-        `[state-storage] Periodic mirror: ${r.files} file(s), ${r.sqlite} sqlite snapshot(s), ${r.skipped} skipped, ${r.pruned} pruned`,
+        `[state-storage] Periodic mirror: ${r.files} file(s) copied, ${r.unchanged} unchanged, ${r.sqlite} sqlite snapshot(s), ${r.skipped} skipped, ${r.pruned} pruned`,
       ),
       (err) => (opts.log || console).warn(`[state-storage] Periodic mirror failed: ${err.message}`),
     );
@@ -432,6 +507,104 @@ function stopPeriodicMirror() {
   }
 }
 
+// --- workspace change watcher ----------------------------------------------
+
+let _watcher = null;
+let _watchDebounce = null;
+let _watchDeadline = null;
+let _watchFallbackTimer = null;
+let _watchOpts = null;
+
+function flushWorkspaceMirror(reason = "flush") {
+  if (_watchDebounce) { clearTimeout(_watchDebounce); _watchDebounce = null; }
+  if (_watchDeadline) { clearTimeout(_watchDeadline); _watchDeadline = null; }
+  if (!_watchOpts) return null;
+  const log = _watchOpts.log || console;
+  try {
+    const r = mirrorWorkspaceDir(_watchOpts);
+    if (r.files || r.pruned || r.skipped) {
+      log.log(
+        `[state-storage] Workspace mirror (${reason}): ${r.files} file(s) copied, ${r.unchanged} unchanged, ${r.pruned} pruned` +
+          (r.skipped ? `, ${r.skipped} skipped` : ""),
+      );
+    }
+    return r;
+  } catch (err) {
+    log.warn(`[state-storage] Workspace mirror (${reason}) failed: ${err.message}`);
+    return null;
+  }
+}
+
+function scheduleWorkspaceMirror(debounceMs, maxWaitMs) {
+  if (_watchDebounce) clearTimeout(_watchDebounce);
+  _watchDebounce = setTimeout(() => flushWorkspaceMirror("change"), debounceMs);
+  if (typeof _watchDebounce.unref === "function") _watchDebounce.unref();
+  if (!_watchDeadline) {
+    // A stream of changes must not postpone the mirror forever.
+    _watchDeadline = setTimeout(() => flushWorkspaceMirror("deadline"), maxWaitMs);
+    if (typeof _watchDeadline.unref === "function") _watchDeadline.unref();
+  }
+}
+
+/**
+ * Watch the local workspace and mirror it onto the mount shortly after any
+ * change (debounced `debounceMs`, at most `maxWaitMs` after the first change
+ * of a burst). Uses fs.watch({ recursive: true }); if that is unavailable it
+ * falls back to a polling mirror every `fallbackIntervalMs`. Idempotent —
+ * calling again replaces the previous watcher.
+ *
+ * @returns {{ mode: "watch" | "poll" | "none" }}
+ */
+function startWorkspaceWatcher(opts, { debounceMs = 2000, maxWaitMs = 15000, fallbackIntervalMs = 30000 } = {}) {
+  stopWorkspaceWatcher();
+  _watchOpts = opts;
+  const log = opts.log || console;
+  const workspaceDir = path.join(opts.stateDir, WORKSPACE_SUBDIR);
+  try {
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    _watcher = fs.watch(workspaceDir, { recursive: true, persistent: false }, () => {
+      scheduleWorkspaceMirror(debounceMs, maxWaitMs);
+    });
+    _watcher.on("error", (err) => {
+      log.warn(`[state-storage] Workspace watcher error: ${err.message} — falling back to polling`);
+      try { _watcher.close(); } catch { /* already closed */ }
+      _watcher = null;
+      startWorkspacePollFallback(fallbackIntervalMs);
+    });
+    log.log(`[state-storage] Workspace watcher started on ${workspaceDir} (debounce ${debounceMs}ms)`);
+    return { mode: "watch" };
+  } catch (err) {
+    log.warn(`[state-storage] fs.watch unavailable (${err.message}) — polling workspace every ${fallbackIntervalMs / 1000}s`);
+    startWorkspacePollFallback(fallbackIntervalMs);
+    return { mode: "poll" };
+  }
+}
+
+function startWorkspacePollFallback(intervalMs) {
+  if (_watchFallbackTimer) clearInterval(_watchFallbackTimer);
+  _watchFallbackTimer = setInterval(() => flushWorkspaceMirror("poll"), intervalMs);
+  if (typeof _watchFallbackTimer.unref === "function") _watchFallbackTimer.unref();
+}
+
+/**
+ * Stop the watcher and mirror any pending change synchronously.
+ */
+function stopWorkspaceWatcher() {
+  const pending = Boolean(_watchDebounce || _watchDeadline);
+  if (_watcher) {
+    try { _watcher.close(); } catch { /* already closed */ }
+    _watcher = null;
+  }
+  if (_watchFallbackTimer) {
+    clearInterval(_watchFallbackTimer);
+    _watchFallbackTimer = null;
+  }
+  if (pending) flushWorkspaceMirror("stop");
+  if (_watchDebounce) { clearTimeout(_watchDebounce); _watchDebounce = null; }
+  if (_watchDeadline) { clearTimeout(_watchDeadline); _watchDeadline = null; }
+  _watchOpts = null;
+}
+
 module.exports = {
   DEFAULT_MOUNT,
   STATE_DIRNAME,
@@ -441,14 +614,19 @@ module.exports = {
   sessionStorageHasContent,
   restoreStateDir,
   mirrorStateDir,
+  mirrorWorkspaceDir,
   mirrorNow,
   snapshotSqliteToFile,
   gatewayStateEnv,
   startPeriodicMirror,
   stopPeriodicMirror,
+  startWorkspaceWatcher,
+  stopWorkspaceWatcher,
+  flushWorkspaceMirror,
   // Exported for testing
   walkFiles,
   isTransientFile,
+  isTransientDir,
   isWorkspacePath,
   getNodeSqlite,
 };

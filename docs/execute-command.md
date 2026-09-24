@@ -140,7 +140,7 @@ That is why:
 
 ## Relationship to session storage
 
-Because the command runs in the same microVM as the session, it is the most direct way to verify what [session storage](session-storage.md) actually holds: whether `~/.openclaw/workspace` is the expected symlink and the mirror was restored, whether a resumed session skipped the S3 restore, or how large a workspace has grown against the 1 GB cap. Pass a router-generated `ses_…` id to look at that user's persistent mount; omit it to get an isolated, empty workspace for pure health checks.
+Because the command runs in the same microVM as the session, it is the most direct way to verify what [session storage](session-storage.md) actually holds: whether the mirror was restored to the local state dir, whether a resumed session skipped the S3 restore, or how large a workspace has grown against the 1 GB cap. Pass a router-generated `ses_…` id to look at that user's persistent mount; omit it to get an isolated, empty workspace for pure health checks.
 
 ## Testing
 
