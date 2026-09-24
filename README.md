@@ -112,7 +112,7 @@ See [docs/security.md](docs/security.md) for the complete security architecture.
 - **Python** >= 3.11 (for CDK app)
 - **Docker** (for building the bridge container image; ARM64 support via Docker Desktop or buildx). Not required if using `BUILD_MODE=codebuild`
 - **AWS CDK** v2 (`npm install -g aws-cdk`)
-- **AgentCore Starter Toolkit** (`pip install bedrock-agentcore-toolkit`)
+- **AgentCore Starter Toolkit** (`pip install bedrock-agentcore-starter-toolkit`)
 - **Telegram Bot Token** from [@BotFather](https://t.me/BotFather)
 
 ## Quick Start
@@ -157,7 +157,7 @@ cdk bootstrap aws://$CDK_DEFAULT_ACCOUNT/$CDK_DEFAULT_REGION
 The project uses a **hybrid deployment model**: CDK manages infrastructure (VPC, Lambda, DynamoDB, S3, etc.) while the AgentCore Starter Toolkit manages the Runtime (container image, ECR, lifecycle config).
 
 ```bash
-pip install bedrock-agentcore-toolkit
+pip install bedrock-agentcore-starter-toolkit
 ```
 
 > After installing, ensure `agentcore` is in your PATH (`which agentcore` should succeed). On some systems, pip installs to `~/.local/bin` which may not be in PATH — add it with `export PATH="$HOME/.local/bin:$PATH"`.
