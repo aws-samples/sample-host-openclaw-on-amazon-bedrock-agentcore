@@ -539,3 +539,29 @@ describe("AGENTS.md template in agentcore-contract.js", () => {
     );
   });
 });
+
+// --- walkDir ---
+describe("walkDir", () => {
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  let workspaceSync;
+
+  beforeEach(() => {
+    delete require.cache[require.resolve("./workspace-sync")];
+    workspaceSync = require("./workspace-sync");
+  });
+
+  it("follows the workspace symlink onto session storage and guards against cycles", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ws-walk-"));
+    const mount = fs.mkdtempSync(path.join(os.tmpdir(), "ws-walk-mount-"));
+    fs.mkdirSync(path.join(mount, "memory"), { recursive: true });
+    fs.writeFileSync(path.join(mount, "memory", "note.md"), "m");
+    fs.writeFileSync(path.join(root, "openclaw.json"), "{}");
+    fs.symlinkSync(mount, path.join(root, "workspace"));
+    fs.symlinkSync(root, path.join(mount, "loop")); // cycle back to root
+    fs.symlinkSync(path.join(root, "missing"), path.join(root, "dangling"));
+    const files = workspaceSync.walkDir(root).sort();
+    assert.deepEqual(files, ["openclaw.json", "workspace/memory/note.md"]);
+  });
+});

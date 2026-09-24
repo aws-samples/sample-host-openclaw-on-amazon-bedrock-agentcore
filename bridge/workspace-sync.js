@@ -7,7 +7,10 @@
  *
  * Namespace format: {actorId.replace(/:/g, "_")} (e.g., "telegram_123456789")
  * S3 prefix: {namespace}/.openclaw/
- * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/)
+ * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/). On AgentCore this
+ * is a local directory whose `workspace/` entry is a symlink onto the session
+ * storage mount (state-storage.js); the walk follows it so workspace files are
+ * still backed up.
  */
 
 const fs = require("fs");
@@ -325,16 +328,40 @@ async function restoreWorkspace(namespace) {
 
 /**
  * Recursively walk a directory and return all file paths (relative to root).
+ *
+ * Follows directory symlinks (with a realpath cycle guard): on AgentCore the
+ * state dir is local disk but `~/.openclaw/workspace` is a symlink onto the
+ * session storage mount (see state-storage.js), and the workspace files behind
+ * it must keep being backed up to S3.
  */
-function walkDir(dir, root = dir) {
+function walkDir(dir, root = dir, seen = new Set()) {
   const results = [];
   try {
+    let real;
+    try {
+      real = fs.realpathSync(dir);
+    } catch {
+      real = dir;
+    }
+    if (seen.has(real)) return results; // symlink cycle
+    seen.add(real);
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        results.push(...walkDir(fullPath, root));
-      } else if (entry.isFile()) {
+      let isDir = entry.isDirectory();
+      let isFile = entry.isFile();
+      if (entry.isSymbolicLink()) {
+        try {
+          const st = fs.statSync(fullPath);
+          isDir = st.isDirectory();
+          isFile = st.isFile();
+        } catch {
+          continue; // dangling link
+        }
+      }
+      if (isDir) {
+        results.push(...walkDir(fullPath, root, seen));
+      } else if (isFile) {
         results.push(path.relative(root, fullPath));
       }
     }
@@ -490,6 +517,7 @@ module.exports = {
   getS3Client,
   // Exported for testing
   shouldSkip,
+  walkDir,
   detectCredentials,
   snapshotSqlite,
   CREDENTIAL_SCAN_EXEMPT,

@@ -19,7 +19,10 @@ keeps session/auth state in SQLite).
 | WS identity | `client.id: "openclaw-control-ui"`, `Origin` header set | `client.id: "gateway-client"`, `mode: "backend"`, **no `Origin`** | Control-UI-class clients now need a signed device identity; `gateway-client`/`backend` on loopback token auth is the only device-less path that keeps `operator.*` scopes. A browser-style `Origin` header disables that path |
 | Config `tools.exec` | `security: "full", ask: "off"` | `mode: "full"` | `mode` is the canonical exec policy knob; the legacy pair cannot be combined with it |
 | Config `gateway.controlUi` | `allowInsecureAuth: true, dangerouslyDisableDeviceAuth: true` | removed | Dead / retired keys. Keeping them makes the startup doctor rewrite `openclaw.json` (+ `.bak` ring) on every boot |
-| Startup order | spawn gateway → symlink → write config | symlink → lock cleanup → S3 restore (awaited) → write config → legacy import → spawn gateway | 2.0 validates config strictly and opens its SQLite store at startup; the state dir and config must be complete before spawn |
+| Startup order | spawn gateway → symlink → write config | state layout + mirror restore → lock cleanup → S3 restore (awaited) → write config → legacy import → spawn gateway | 2.0 validates config strictly and opens its SQLite store at startup; the state dir and config must be complete before spawn |
+| State dir | `~/.openclaw` symlinked onto `/mnt/workspace` | `~/.openclaw` on local disk (`OPENCLAW_STATE_DIR`), only `workspace/` symlinked onto the mount; the rest mirrored to the mount every 5 min and on `SIGTERM` (`bridge/state-storage.js`) | Session storage is NFS with `local_lock=none`: SQLite cannot lock there and the 2.0 gateway dies with `database is locked` |
+| Shutdown order | S3 save → kill gateway | stop gateway (≤5 s) → snapshot state dir to the mount → S3 save | A closed database gives a fully quiesced snapshot for the next cold start |
+| Skills | bare `clawhub install <slug>` | qualified `@owner/slug --version` for slugs ClawHub now hosts twice; flattened to `/skills/<slug>`; a missing skill fails the build | clawhub ≥ 0.23 refuses an ambiguous bare slug and the old retry loop shipped 2/5 skills silently |
 | Legacy sessions | n/a | `openclaw doctor --fix --non-interactive` runs once when `agents/<id>/sessions/sessions.json` exists | 2.0 does not migrate on its own: a legacy store makes the gateway **refuse readiness** |
 | S3 sync | copies every file | skips `*.sqlite-wal`/`-shm`/`-journal`, uploads a consistent **snapshot** of each `*.sqlite` | Copying a live WAL-mode database file-by-file yields torn/rolled-back restores |
 
@@ -79,13 +82,13 @@ timeout fallback. The lightweight agent still handles messages until the gateway
 - `docker buildx build --platform linux/arm64 -f bridge/Dockerfile .` — settles the native
   prebuilds (`koffi`, `@lydell/node-pty`, `tree-sitter-bash` on arm64) and `node:sqlite` on Node 24.
 - `cd bridge && node --test` (Node 24) — includes the SQLite snapshot tests in
-  `workspace-sync.test.js`, which skip on runtimes without `node:sqlite`.
+  `workspace-sync.test.js` and the state-dir relocate/mirror/restore tests in
+  `state-storage.test.js`, which skip on runtimes without `node:sqlite`.
 - Inside the image: `openclaw config validate` against a generated `openclaw.json` catches any key
   the strict 2.0 schema rejects.
 
 Things only a deployed container settles: whether AgentCore's loopback is classified `direct_local`
 (otherwise `chat.send` fails with a missing-scope error — fallback is a signed device identity),
 whether `sessionKey: "global"` still lands on agent `main`, gateway boot time versus the e2e
-`_OPENCLAW_STARTUP_TIMEOUT_S`, and the filesystem type of `/mnt/workspace` (2.0 forces SQLite into
-rollback-journal mode on `cifs`/`smb`/`virtiofs`/`9p` mounts and refuses SSHFS; the snapshot-based
-S3 sync works in either journal mode).
+and `_OPENCLAW_STARTUP_TIMEOUT_S`. The filesystem question is settled: `/mnt/workspace` is
+`nfs4` with `local_lock=none`, on which SQLite cannot lock at all — hence the local state dir above.

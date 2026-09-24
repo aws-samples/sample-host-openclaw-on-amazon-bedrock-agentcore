@@ -26,6 +26,7 @@ const {
   GetSecretValueCommand,
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
+const stateStorage = require("./state-storage");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
@@ -35,8 +36,20 @@ const PROXY_PORT = 18790;
 const OPENCLAW_PORT = 18789;
 
 // Session storage mount path (set via filesystemConfigurations on Runtime)
-const SESSION_STORAGE_MOUNT = "/mnt/workspace";
-const OPENCLAW_DIR = process.env.HOME ? `${process.env.HOME}/.openclaw` : "/root/.openclaw";
+const SESSION_STORAGE_MOUNT = stateStorage.DEFAULT_MOUNT;
+// OpenClaw state dir. Always a REAL directory on the container's local disk:
+// OpenClaw 2.0 keeps sessions/auth/state in SQLite, and AgentCore session
+// storage is NFS with local_lock=none, on which SQLite cannot take a lock
+// ("database is locked" at gateway startup). Only ~/.openclaw/workspace is a
+// live symlink onto the mount; the rest is mirrored there by state-storage.js.
+const OPENCLAW_DIR = stateStorage.resolvePaths().stateDir;
+// Cold mirror of OPENCLAW_DIR on the mount (also where a 1.x deployment left
+// its plain-file state dir).
+const MOUNTED_OPENCLAW_DIR = stateStorage.resolvePaths().mountStateDir;
+// Max time the SIGTERM handler waits for the gateway to exit before taking the
+// shutdown state snapshot (a closed database gives a fully quiesced copy; the
+// snapshot is consistent either way via the SQLite online backup API).
+const GATEWAY_STOP_WAIT_MS = parseInt(process.env.GATEWAY_STOP_WAIT_MS || "5000", 10);
 
 // Gateway token — fetched from Secrets Manager eagerly at boot.
 // No fallback — container will fail to authenticate WebSocket if not set.
@@ -71,6 +84,8 @@ let initPromise = null;
 let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
+// True once setupSessionStorage() found the mount; gates the state mirror.
+let sessionStorageActive = false;
 let credentialRefreshTimer = null;
 let browserHeaderRefreshTimer = null;
 let currentBrowserSessionId = null;
@@ -126,53 +141,70 @@ let processingMessage = false;
  * fixed at spawn time and cannot be updated for a running child process).
  */
 /**
- * Set up symlink from ~/.openclaw to session storage mount.
- * Returns true if session storage is available and symlink was created.
+ * Set up the state storage layout (see state-storage.js): a real local
+ * ~/.openclaw, ~/.openclaw/workspace symlinked onto the session storage
+ * mount, and the mount's cold mirror (plain files + SQLite snapshots, or a
+ * 1.x plain-file state dir) restored to local disk. Must run before anything
+ * touches ~/.openclaw and before the gateway spawns.
+ * Returns true if session storage is available.
  */
-function setupSessionStorageSymlink() {
+function setupSessionStorage() {
   try {
-    // Check if session storage mount exists (only available during invocation)
-    if (!fs.existsSync(SESSION_STORAGE_MOUNT)) {
+    const result = stateStorage.setupSessionStorage({ log: console });
+    if (!result.available) {
       console.log("[contract] Session storage not available at", SESSION_STORAGE_MOUNT);
       return false;
     }
-
-    const mountedDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
-    fs.mkdirSync(mountedDir, { recursive: true });
-
-    // Check existing .openclaw — may be a symlink, directory, or missing
-    let existingType = null;
-    try {
-      const stat = fs.lstatSync(OPENCLAW_DIR);
-      if (stat.isSymbolicLink()) {
-        const target = fs.readlinkSync(OPENCLAW_DIR);
-        if (target === mountedDir) {
-          console.log("[contract] Session storage symlink already in place");
-          return true;
-        }
-        existingType = "symlink";
-        fs.unlinkSync(OPENCLAW_DIR);
-      } else if (stat.isDirectory()) {
-        existingType = "directory";
-        // Copy contents to session storage (cross-device, can't use rename)
-        const { execSync } = require("child_process");
-        execSync(`cp -a ${OPENCLAW_DIR}/. ${mountedDir}/ 2>/dev/null || true`);
-        fs.rmSync(OPENCLAW_DIR, { recursive: true, force: true });
-      } else {
-        existingType = "file";
-        fs.unlinkSync(OPENCLAW_DIR);
-      }
-    } catch {
-      // OPENCLAW_DIR doesn't exist yet — that's fine
-    }
-
-    fs.symlinkSync(mountedDir, OPENCLAW_DIR);
-    console.log(`[contract] Session storage symlink: ${OPENCLAW_DIR} -> ${mountedDir} (was: ${existingType || "missing"})`);
     return true;
   } catch (err) {
     console.warn(`[contract] Session storage setup failed: ${err.message}`);
     return false;
   }
+}
+
+/**
+ * Snapshot the local state dir onto the session storage mount. Coalesced,
+ * never throws. Cheap (loopback NFS), so it is called at shutdown and on a
+ * timer while the gateway runs.
+ */
+async function mirrorStateToSessionStorage(label) {
+  if (!sessionStorageActive) return null;
+  try {
+    const r = await stateStorage.mirrorNow({
+      stateDir: OPENCLAW_DIR,
+      mountStateDir: MOUNTED_OPENCLAW_DIR,
+      log: console,
+    });
+    console.log(
+      `[contract] State mirror (${label}): ${r.files} file(s), ${r.sqlite} sqlite snapshot(s), ${r.skipped} skipped, ${r.pruned} pruned`,
+    );
+    return r;
+  } catch (err) {
+    console.warn(`[contract] State mirror (${label}) failed: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Ask the gateway to exit and wait (bounded) for it, so the shutdown state
+ * snapshot is taken from a closed, checkpointed database.
+ */
+function stopGateway(waitMs) {
+  return new Promise((resolve) => {
+    const proc = openclawProcess;
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return resolve(false);
+    const timer = setTimeout(() => resolve(false), waitMs);
+    proc.once("exit", () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      clearTimeout(timer);
+      resolve(false);
+    }
+  });
 }
 
 function updateIdentityFile(actorId, channel) {
@@ -316,6 +348,9 @@ function openclawEnvFor(scopedCredsAvailable, userId) {
   // Propagate INTERNAL_USER_ID so OpenClaw skills (e.g., eventbridge-cron)
   // can resolve the container's authorized userId for DynamoDB writes.
   openclawEnv.INTERNAL_USER_ID = userId;
+  // Pin the state dir (SQLite) to local disk; the default agent workspace then
+  // resolves to <stateDir>/workspace, the live symlink onto session storage.
+  Object.assign(openclawEnv, stateStorage.gatewayStateEnv(OPENCLAW_DIR));
   return openclawEnv;
 }
 
@@ -872,6 +907,13 @@ async function pollOpenClawReadiness(namespace) {
   if (ready) {
     openclawReady = true;
     workspaceSync.startPeriodicSave(namespace);
+    if (sessionStorageActive) {
+      stateStorage.startPeriodicMirror({
+        stateDir: OPENCLAW_DIR,
+        mountStateDir: MOUNTED_OPENCLAW_DIR,
+        log: console,
+      });
+    }
     console.log(
       "[contract] OpenClaw ready — switching from lightweight agent to full OpenClaw",
     );
@@ -1154,11 +1196,13 @@ async function init(userId, actorId, channel) {
       console.log("[contract] EXECUTION_ROLE_ARN not set — skipping credential scoping");
     }
 
-    // 1c. Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available.
-    // Must happen before anything touches ~/.openclaw (lock cleanup, S3 restore,
-    // config/AGENTS.md write, gateway spawn) so every write lands on the
-    // persistent mount and not in the ephemeral container filesystem.
-    const sessionStorageAvailable = setupSessionStorageSymlink();
+    // 1c. Session storage: local ~/.openclaw (SQLite must not live on the NFS
+    // mount), ~/.openclaw/workspace -> /mnt/workspace/.openclaw/workspace, and
+    // the mount's mirror restored to local disk. Must happen before anything
+    // touches ~/.openclaw (lock cleanup, S3 restore, config/AGENTS.md write,
+    // legacy import, gateway spawn).
+    const sessionStorageAvailable = setupSessionStorage();
+    sessionStorageActive = sessionStorageAvailable;
 
     // 1d. Clean up stale lock files restored from S3 / left on session storage (non-blocking)
     // Runs in parallel with proxy startup — does not block init.
@@ -1216,13 +1260,9 @@ async function init(userId, actorId, channel) {
       // Session storage is primary — S3 becomes a cold backup (30min instead of 5min)
       workspaceSync.setBackupMode(true);
 
-      // Check if session storage already has data (resumed session)
-      const mountedOpenclawDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
-      let hasContent = false;
-      try {
-        const entries = fs.readdirSync(mountedOpenclawDir);
-        hasContent = entries.length > 0;
-      } catch { /* dir doesn't exist yet */ }
+      // Check if session storage already has data (returning user). Empty
+      // directories created by setupSessionStorage() itself do not count.
+      const hasContent = stateStorage.sessionStorageHasContent(MOUNTED_OPENCLAW_DIR);
 
       if (hasContent) {
         console.log("[contract] Session storage has existing data — skipping S3 restore");
@@ -2289,12 +2329,25 @@ process.on("SIGTERM", async () => {
     browserHeaderRefreshTimer = null;
   }
 
-  // Save workspace to S3 (10s max)
+  // Save state to session storage + workspace to S3 (bounded)
   const saveTimeout = setTimeout(() => {
     console.warn("[contract] Workspace save timeout — exiting");
     process.exit(0);
-  }, 10000);
+  }, 10000 + (sessionStorageActive ? GATEWAY_STOP_WAIT_MS : 0));
 
+  // 1. Stop the gateway first so its SQLite databases are closed and
+  //    checkpointed, then take the shutdown snapshot onto the mount. The
+  //    snapshot is what the next cold start restores before spawning.
+  stateStorage.stopPeriodicMirror();
+  if (sessionStorageActive) {
+    const exited = await stopGateway(GATEWAY_STOP_WAIT_MS);
+    console.log(
+      `[contract] Gateway ${exited ? "stopped" : "still running"} before shutdown snapshot`,
+    );
+    await mirrorStateToSessionStorage("shutdown");
+  }
+
+  // 2. S3 backup (workspace files via the live link + state dir snapshots)
   try {
     await workspaceSync.cleanup(currentNamespace);
   } catch (err) {
