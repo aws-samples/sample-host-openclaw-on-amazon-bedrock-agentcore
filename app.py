@@ -21,6 +21,7 @@ from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.router_stack import RouterStack
 from stacks.guardrails_stack import GuardrailsStack
+from stacks.gateway_stack import GatewayStack
 from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
@@ -44,6 +45,20 @@ guardrails_stack = GuardrailsStack(
     cmk_arn=security_stack.cmk.key_arn,
     env=env,
 )
+
+# --- AgentCore Gateway MCP tools (prototype, opt-in via enable_gateway) ---
+# Only instantiated when the flag is on so that, with the default (false),
+# the synthesized templates of every existing stack are unchanged.
+gateway_stack = None
+if app.node.try_get_context("enable_gateway") is True:
+    gateway_stack = GatewayStack(
+        app,
+        "OpenClawGateway",
+        cognito_issuer_url=security_stack.cognito_issuer_url,
+        cognito_client_id=security_stack.user_pool_client_id,
+        cmk_arn=security_stack.cmk.key_arn,
+        env=env,
+    )
 
 # --- AgentCore base resources (Role, SG, S3) ---
 # Runtime/Endpoint created by Starter Toolkit; runtime_id/endpoint_id

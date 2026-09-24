@@ -393,6 +393,7 @@ openclaw-on-agentcore/
 | **OpenClawObservability** | Operations dashboard, alarms (errors, latency, throttles), SNS topic, Bedrock invocation logging | Security |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 3 GSIs), Lambda processor, analytics dashboard | Observability, Security |
 | **OpenClawCron** | EventBridge Scheduler group `openclaw-cron`, Cron executor Lambda `openclaw-cron-executor`, Scheduler IAM role | AgentCore, Security (identity table referenced by name) |
+| **OpenClawGateway** (opt-in, `enable_gateway`) | Prototype: AgentCore Gateway (MCP, Cognito JWT authorizer), REQUEST interceptor Lambda, two Lambda MCP targets for per-user files and schedules. Not instantiated with the default `enable_gateway: false`; see [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md) | Security |
 
 ## Configuration
 
@@ -425,6 +426,7 @@ All tunable parameters are in `cdk.json`:
 | `guardrails_content_filter_level` | `HIGH` | Content filter strength for all categories: `LOW`, `MEDIUM`, or `HIGH` |
 | `guardrails_pii_action` | `ANONYMIZE` | PII handling: `ANONYMIZE` (redact) or `BLOCK` (reject). Credit cards always BLOCK regardless |
 | `enable_browser` | `true` | Deploy an AgentCore Browser (`CfnBrowserCustom`) and pass its id to the runtime as `BROWSER_IDENTIFIER`. Only deployed in regions listed in `BROWSER_SUPPORTED_REGIONS` (`stacks/agentcore_stack.py`) |
+| `enable_gateway` | `false` | Prototype: deploy `OpenClawGateway` (AgentCore Gateway serving the per-user file and schedule tools as MCP tools) and pass `AGENTCORE_GATEWAY_URL` to the runtime. See [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md) |
 | `anomaly_band_width` | `2` | Standard-deviation band for the token-usage anomaly detector alarm |
 | `runtime_id` / `runtime_endpoint_id` | (written by `deploy.sh`) | AgentCore Runtime id and endpoint id from the Starter Toolkit. Phase 3 stacks read them from here; do not edit by hand |
 
@@ -749,6 +751,8 @@ Five ClawHub community skills are pre-installed at Docker build time with `clawh
 | `task-decomposer` | `@10e9928a/task-decomposer --version 1.0.0` | Break complex requests into subtasks (spawns sub-agents) |
 
 clawhub installs a qualified spec into `/skills/@owner/<slug>`; the Dockerfile moves it to the flat `/skills/<slug>` path that `skills.load.extraDirs`, the `clawhub-manage` skill and the system prompt all use.
+
+Prototype: with `enable_gateway: true` the `s3-user-files` and `eventbridge-cron` capabilities are additionally served as typed MCP tools by an AgentCore Gateway (identity from the verified Cognito JWT, least-privilege Lambdas). See [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md).
 
 During the warm-up phase (~first 1-2 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files`, `eventbridge-cron`, `clawhub-manage`, and `api-keys` skills. Users can manage files, schedules, skills, and API keys even during warm-up. ClawHub skills become available after OpenClaw fully starts.
 

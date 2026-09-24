@@ -1,0 +1,183 @@
+{
+  "_comment": "Single source of truth for the AgentCore Gateway Lambda MCP tool definitions. Read by stacks/gateway_stack.py (CfnGatewayTarget inlinePayload) and by the handler unit tests. Only the SchemaDefinition fields the Gateway accepts are used: type, description, properties, required, items. The reserved `__caller_token` property is present on every tool: the REQUEST interceptor overwrites it with the caller's verified bearer JWT, so any value the model supplies is discarded.",
+  "user-files": {
+    "description": "Per-user file storage in the OpenClaw user-files S3 bucket, scoped to the caller's namespace.",
+    "tools": [
+      {
+        "name": "list_files",
+        "description": "List the files stored for the current user. The user namespace is derived from the caller's identity; it cannot be chosen.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "__caller_token": {
+              "type": "string",
+              "description": "Reserved. Set by the gateway from the caller's verified identity; any value supplied here is discarded."
+            }
+          }
+        }
+      },
+      {
+        "name": "read_file",
+        "description": "Read a UTF-8 text file stored for the current user.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filename": {
+              "type": "string",
+              "description": "File name (letters, digits, '_', '-', '.'; no path separators)."
+            },
+            "__caller_token": {
+              "type": "string",
+              "description": "Reserved. Set by the gateway from the caller's verified identity; any value supplied here is discarded."
+            }
+          },
+          "required": ["filename"]
+        }
+      },
+      {
+        "name": "write_file",
+        "description": "Create or overwrite a UTF-8 text file for the current user (max 1 MiB).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filename": {
+              "type": "string",
+              "description": "File name (letters, digits, '_', '-', '.'; no path separators)."
+            },
+            "content": {
+              "type": "string",
+              "description": "Full file content."
+            },
+            "__caller_token": {
+              "type": "string",
+              "description": "Reserved. Set by the gateway from the caller's verified identity; any value supplied here is discarded."
+            }
+          },
+          "required": ["filename", "content"]
+        }
+      },
+      {
+        "name": "delete_file",
+        "description": "Delete a file stored for the current user.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filename": {
+              "type": "string",
+              "description": "File name to delete."
+            },
+            "__caller_token": {
+              "type": "string",
+              "description": "Reserved. Set by the gateway from the caller's verified identity; any value supplied here is discarded."
+            }
+          },
+          "required": ["filename"]
+        }
+      }
+    ]
+  },
+  "schedules": {
+    "description": "EventBridge Scheduler reminders owned by the current user (openclaw-cron schedule group).",
+    "tools": [
+      {
+        "name": "create_schedule",
+        "description": "Create a recurring or one-off schedule that sends a message to the current user. Expression: cron(6 fields), rate(N minutes|hours|days) with a 5-minute minimum, or at(YYYY-MM-DDTHH:MM:SS).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "expression": {
+              "type": "string",
+              "description": "EventBridge Scheduler expression, e.g. cron(0 9 * * ? *), rate(1 hour), at(2026-12-31T23:59:00)."
+            },
+            "timezone": {
+              "type": "string",
+              "description": "IANA timezone, e.g. Asia/Tokyo."
+            },
+            "message": {
+              "type": "string",
+              "description": "The message to deliver when the schedule fires."
+            },
+            "schedule_name": {
+              "type": "string",
+              "description": "Optional human-readable name."
+            },
+            "__caller_token": {
+              "type": "string",
+              "description": "Reserved. Set by the gateway from the caller's verified identity; any value supplied here is discarded."
+            }
+          },
+          "required": ["expression", "timezone", "message"]
+        }
+      },
+      {
+        "name": "list_schedules",
+        "description": "List the current user's schedules.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "__caller_token": {
+              "type": "string",
+              "description": "Reserved. Set by the gateway from the caller's verified identity; any value supplied here is discarded."
+            }
+          }
+        }
+      },
+      {
+        "name": "update_schedule",
+        "description": "Update one of the current user's schedules. Only the supplied fields change.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "schedule_id": {
+              "type": "string",
+              "description": "8-character schedule id from list_schedules."
+            },
+            "expression": {
+              "type": "string",
+              "description": "New schedule expression."
+            },
+            "timezone": {
+              "type": "string",
+              "description": "New IANA timezone."
+            },
+            "message": {
+              "type": "string",
+              "description": "New message."
+            },
+            "schedule_name": {
+              "type": "string",
+              "description": "New name."
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable or disable the schedule."
+            },
+            "__caller_token": {
+              "type": "string",
+              "description": "Reserved. Set by the gateway from the caller's verified identity; any value supplied here is discarded."
+            }
+          },
+          "required": ["schedule_id"]
+        }
+      },
+      {
+        "name": "delete_schedule",
+        "description": "Delete one of the current user's schedules.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "schedule_id": {
+              "type": "string",
+              "description": "8-character schedule id from list_schedules."
+            },
+            "__caller_token": {
+              "type": "string",
+              "description": "Reserved. Set by the gateway from the caller's verified identity; any value supplied here is discarded."
+            }
+          },
+          "required": ["schedule_id"]
+        }
+      }
+    ]
+  }
+}

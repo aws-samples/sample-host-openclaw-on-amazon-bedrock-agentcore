@@ -349,31 +349,16 @@ function extractSessionMetadata(parsed, headers) {
   return { sessionId, actorId, channel, idSource };
 }
 
-/**
- * Derive a deterministic password for a Cognito user from the HMAC secret.
- */
-function derivePassword(actorId) {
-  return crypto
-    .createHmac("sha256", COGNITO_PASSWORD_SECRET)
-    .update(actorId)
-    .digest("base64url")
-    .slice(0, 32);
-}
-
-// JWT token cache: actorId → { token, expiresAt }
-const tokenCache = new Map();
-
-// Lazily initialized Cognito client
-let _cognitoClient = null;
-function getCognitoClient() {
-  if (!_cognitoClient) {
-    const {
-      CognitoIdentityProviderClient,
-    } = require("@aws-sdk/client-cognito-identity-provider");
-    _cognitoClient = new CognitoIdentityProviderClient({ region: AWS_REGION });
-  }
-  return _cognitoClient;
-}
+// Per-user Cognito ID tokens (user provisioning, HMAC-derived password,
+// cache). Shared with agentcore-contract.js via bridge/cognito-token.js so
+// both processes derive the same password for the same actorId.
+const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
+  userPoolId: COGNITO_USER_POOL_ID,
+  clientId: COGNITO_CLIENT_ID,
+  passwordSecret: COGNITO_PASSWORD_SECRET,
+  region: AWS_REGION,
+  log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[proxy] Cognito")),
+});
 
 // Lazily initialized S3 client
 let _s3Client = null;
@@ -812,94 +797,12 @@ async function buildUserIdentityContext(actorId, channel) {
 }
 
 /**
- * Ensure a Cognito user exists for the given actorId. Creates one if not found.
- */
-async function ensureCognitoUser(actorId) {
-  const {
-    AdminGetUserCommand,
-    AdminCreateUserCommand,
-    AdminSetUserPasswordCommand,
-  } = require("@aws-sdk/client-cognito-identity-provider");
-  const client = getCognitoClient();
-
-  try {
-    await client.send(
-      new AdminGetUserCommand({
-        UserPoolId: COGNITO_USER_POOL_ID,
-        Username: actorId,
-      }),
-    );
-  } catch (err) {
-    if (err.name === "UserNotFoundException") {
-      const password = derivePassword(actorId);
-      await client.send(
-        new AdminCreateUserCommand({
-          UserPoolId: COGNITO_USER_POOL_ID,
-          Username: actorId,
-          MessageAction: "SUPPRESS",
-          TemporaryPassword: password,
-        }),
-      );
-      await client.send(
-        new AdminSetUserPasswordCommand({
-          UserPoolId: COGNITO_USER_POOL_ID,
-          Username: actorId,
-          Password: password,
-          Permanent: true,
-        }),
-      );
-      console.log(`[proxy] Cognito user provisioned: ${actorId}`);
-    } else {
-      throw err;
-    }
-  }
-}
-
-/**
- * Get a JWT token for the given actorId (cached, auto-refreshes).
+ * Get a JWT (ID token) for the given actorId (cached, auto-refreshes).
  * Returns null if Cognito is not configured.
  */
 async function getCognitoToken(actorId) {
-  if (!COGNITO_USER_POOL_ID || !COGNITO_CLIENT_ID || !COGNITO_PASSWORD_SECRET) {
-    return null;
-  }
-
-  // Check cache
-  const cached = tokenCache.get(actorId);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.token;
-  }
-
-  await ensureCognitoUser(actorId);
-
-  const {
-    AdminInitiateAuthCommand,
-  } = require("@aws-sdk/client-cognito-identity-provider");
-  const client = getCognitoClient();
-
-  const response = await client.send(
-    new AdminInitiateAuthCommand({
-      UserPoolId: COGNITO_USER_POOL_ID,
-      ClientId: COGNITO_CLIENT_ID,
-      AuthFlow: "ADMIN_USER_PASSWORD_AUTH",
-      AuthParameters: {
-        USERNAME: actorId,
-        PASSWORD: derivePassword(actorId),
-      },
-    }),
-  );
-
-  const token = response.AuthenticationResult.IdToken;
-  const expiresIn = response.AuthenticationResult.ExpiresIn || 3600;
-  tokenCache.set(actorId, {
-    token,
-    expiresAt: Date.now() + (expiresIn - 60) * 1000,
-  });
-
-  console.log(
-    `[proxy] Cognito token acquired for ${actorId} (expires in ${expiresIn}s)`,
-  );
-  return token;
+  const entry = await cognitoTokens.getIdToken(actorId);
+  return entry ? entry.token : null;
 }
 
 /**
