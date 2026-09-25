@@ -65,7 +65,7 @@ You have the **clawhub-manage** skill to install, uninstall, and list ClawHub co
 - "What skills do I have?" -> use `clawhub-manage` list_skills
 - "Remove transcript skill" -> use `clawhub-manage` uninstall_skill
 
-After install/uninstall, the new skill will be available on the next session start (after idle timeout or new conversation).
+Installed skills are recorded per user and reinstalled automatically a few seconds after each new session starts; OpenClaw loads them when it next refreshes its skill list (at the latest at the next session start). Installs never bypass ClawHub's security review — if `install.js` refuses a flagged skill, explain why and do not retry.
 
 ## API Key Storage
 
