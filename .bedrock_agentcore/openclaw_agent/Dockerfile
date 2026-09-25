@@ -3,9 +3,11 @@
 # ============================================================
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24-slim AS builder
 
-# Install system dependencies
+# Install system dependencies. ca-certificates is listed explicitly: with
+# --no-install-recommends only python3-pip pulls it in (git and libcurl4 merely
+# Recommend it), so it would silently vanish if the pip install ever went away.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq git python3 python3-pip && \
+    apt-get install -y --no-install-recommends ca-certificates curl jq git python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
 # Install AWS CLI (for Secrets Manager in entrypoint)
@@ -110,10 +112,17 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24-slim
 
-# Install only runtime system dependencies (no git, no pip, no build tools)
+# Install only runtime system dependencies (no git, no pip, no build tools).
+# node:24-slim ships no CA bundle and --no-install-recommends drops the one
+# curl would otherwise pull in, so ca-certificates must be listed explicitly or
+# every `curl https://` inside the container fails (rc=77, "error setting
+# certificate file: /etc/ssl/certs/ca-certificates.crt"). Node's fetch uses its
+# own bundled roots and is unaffected, which is why this went unnoticed. The
+# final test fails the build if a future edit drops the package again.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq python3 && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends ca-certificates curl jq python3 && \
+    rm -rf /var/lib/apt/lists/* && \
+    test -f /etc/ssl/certs/ca-certificates.crt
 
 # Copy AWS CLI from builder
 COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
@@ -165,6 +174,7 @@ COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
 COPY cognito-token.js /app/cognito-token.js
 COPY gateway-mcp.js /app/gateway-mcp.js
+COPY runtime-skills.js /app/runtime-skills.js
 
 # Copy custom per-user file storage skill
 # /skills/ — scanned via extraDirs config (skills also copied to home dir during user setup below)
@@ -175,8 +185,13 @@ RUN chmod +x /skills/s3-user-files/*.js
 COPY skills/eventbridge-cron /skills/eventbridge-cron
 RUN chmod +x /skills/eventbridge-cron/*.js
 
-# Copy ClawHub skill management skill
+# Copy ClawHub skill management skill. runtime-skills.js (manifest of
+# user-installed skills + cold-start reinstall) is shared with
+# agentcore-contract.js; the repo keeps a require() shim at
+# skills/clawhub-manage/runtime-skills.js, replaced here by the real module so
+# the skill scripts are self-contained under /skills.
 COPY skills/clawhub-manage /skills/clawhub-manage
+COPY runtime-skills.js /skills/clawhub-manage/runtime-skills.js
 RUN chmod +x /skills/clawhub-manage/*.js
 
 # Copy API key management skill (dual-mode: native file + Secrets Manager)
