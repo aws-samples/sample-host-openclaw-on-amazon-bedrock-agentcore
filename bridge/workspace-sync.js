@@ -340,6 +340,40 @@ async function restoreWorkspace(namespace) {
 }
 
 /**
+ * Await a workspace restore for at most `waitMs`.
+ *
+ * Resolves as soon as the restore settles (a failure is logged, not thrown).
+ * If the restore is still running after `waitMs`, logs a warning and resolves
+ * anyway so the caller can start the gateway. The wait timer is cleared once
+ * the restore settles, so the warning only fires on a genuine timeout (it
+ * used to fire on every boot, ~45s after a ~1s restore).
+ *
+ * Injectable `timers` lets tests use fake timers instead of sleeping.
+ */
+async function awaitRestore(restorePromise, waitMs, { log = console, timers = globalThis } = {}) {
+  let timer = null;
+  const settled = Promise.resolve(restorePromise)
+    .catch((err) => {
+      log.warn(`[contract] Workspace restore failed: ${err.message}`);
+    })
+    .then(() => "restored");
+  const timedOut = new Promise((resolve) => {
+    timer = timers.setTimeout(() => {
+      log.warn(
+        `[contract] Workspace restore still running after ${waitMs}ms — starting gateway anyway`,
+      );
+      resolve("timeout");
+    }, waitMs);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  try {
+    return await Promise.race([settled, timedOut]);
+  } finally {
+    timers.clearTimeout(timer);
+  }
+}
+
+/**
  * Recursively walk a directory and return all file paths (relative to root).
  *
  * Follows directory symlinks (with a realpath cycle guard): on AgentCore the
@@ -854,6 +888,7 @@ async function cleanup(namespace) {
 
 module.exports = {
   restoreWorkspace,
+  awaitRestore,
   saveWorkspace,
   saveFile,
   startPeriodicSave,

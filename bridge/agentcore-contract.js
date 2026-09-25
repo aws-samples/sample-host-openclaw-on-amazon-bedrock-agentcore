@@ -1424,19 +1424,9 @@ async function init(userId, actorId, channel) {
       restorePromise = workspaceSync.restoreWorkspace(namespace);
     }
     if (restorePromise) {
-      await Promise.race([
-        restorePromise.catch((err) => {
-          console.warn(`[contract] Workspace restore failed: ${err.message}`);
-        }),
-        new Promise((resolve) =>
-          setTimeout(() => {
-            console.warn(
-              `[contract] Workspace restore still running after ${RESTORE_WAIT_MS}ms — starting gateway anyway`,
-            );
-            resolve();
-          }, RESTORE_WAIT_MS).unref(),
-        ),
-      ]);
+      // Bounded wait; the timer is cleared once the restore settles so the
+      // "still running" warning only fires on a genuine timeout.
+      await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);
     }
 
     // 1f. Write OpenClaw config + AGENTS.md AFTER the session-storage restore
