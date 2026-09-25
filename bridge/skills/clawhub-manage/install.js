@@ -17,7 +17,14 @@
 const { execFileSync } = require("child_process");
 const { validateSkillName, runtimeSkills } = require("./common");
 
-const skillName = validateSkillName(process.argv[2]);
+let skillName;
+try {
+  skillName = validateSkillName(process.argv[2]);
+} catch (err) {
+  console.error(err.message);
+  console.error("Usage: node install.js <skill_name>");
+  process.exit(2);
+}
 const manifestFile = runtimeSkills.manifestPath();
 
 if (runtimeSkills.isSkillPresent(skillName)) {
