@@ -314,7 +314,13 @@ async function restoreWorkspace(namespace) {
         for await (const chunk of getResp.Body) {
           chunks.push(chunk);
         }
-        fs.writeFileSync(localFile, Buffer.concat(chunks));
+        const content = Buffer.concat(chunks);
+        fs.writeFileSync(localFile, content);
+        // What is on disk now IS what S3 holds, so the first save after a
+        // restore must not re-upload it. Without this seed every restored file
+        // was PUT again by the first full save (SIGTERM / periodic) of the
+        // session even when nothing had touched it.
+        _uploadedHashes.set(relativePath, contentHash(content));
         totalFiles++;
       } catch (err) {
         console.warn(

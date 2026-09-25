@@ -640,6 +640,112 @@ describe("saveFile", () => {
   });
 });
 
+// --- restore seeds the upload dedupe -----------------------------------------
+//
+// Staging (PR #114 test): the SIGTERM flush re-uploaded every file the cold
+// start had just restored (workspace/*.md, plugin-skills, runtime-skills.json)
+// although nothing had touched them, because the hash cache only learned about
+// files this process had uploaded. Restore must seed it with what it wrote.
+
+describe("restoreWorkspace seeds the upload hash cache", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const Module = require("node:module");
+  let workspaceSync;
+  let tmpDir;
+  let savedHome;
+  let realLoad;
+  let puts;
+  let objects;
+  let failGets;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ws-restore-"));
+    savedHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    fs.mkdirSync(path.join(tmpDir, ".openclaw"), { recursive: true });
+    delete require.cache[require.resolve("./workspace-sync")];
+    process.env.AWS_REGION = "us-west-2";
+    process.env.S3_USER_FILES_BUCKET = "test-bucket";
+    workspaceSync = require("./workspace-sync");
+    workspaceSync.configureCredentials({
+      accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    });
+    puts = [];
+    failGets = new Set();
+    objects = {
+      "telegram_1/.openclaw/workspace/SOUL.md": "soul v1\n",
+      "telegram_1/.openclaw/runtime-skills.json": '{"version":1,"skills":{}}\n',
+    };
+    const fakeS3 = {
+      send: async (cmd) => {
+        if (cmd.kind === "list") {
+          return {
+            Contents: Object.entries(objects).map(([Key, body]) => ({ Key, Size: Buffer.byteLength(body) })),
+            IsTruncated: false,
+          };
+        }
+        if (cmd.kind === "get") {
+          if (failGets.has(cmd.input.Key)) throw new Error("boom");
+          const body = Buffer.from(objects[cmd.input.Key]);
+          return { Body: (async function* () { yield body; })() };
+        }
+        puts.push(cmd);
+        return {};
+      },
+    };
+    realLoad = Module._load;
+    Module._load = function (request, ...rest) {
+      if (request === "@aws-sdk/client-s3") {
+        return {
+          S3Client: function () { return fakeS3; },
+          PutObjectCommand: function (input) { this.kind = "put"; this.input = input; },
+          GetObjectCommand: function (input) { this.kind = "get"; this.input = input; },
+          ListObjectsV2Command: function (input) { this.kind = "list"; this.input = input; },
+        };
+      }
+      return realLoad.call(this, request, ...rest);
+    };
+  });
+
+  afterEach(() => {
+    Module._load = realLoad;
+    process.env.HOME = savedHome;
+    delete process.env.S3_USER_FILES_BUCKET;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("does not re-upload restored files that were not modified", async () => {
+    await workspaceSync.restoreWorkspace("telegram_1");
+    assert.equal(fs.readFileSync(path.join(tmpDir, ".openclaw", "workspace", "SOUL.md"), "utf8"), "soul v1\n");
+    assert.equal(puts.length, 0, "restore itself must not PUT");
+
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.equal(puts.length, 0, "a full save right after restore has nothing new to upload");
+
+    // A real change is still uploaded, and only that file.
+    fs.writeFileSync(path.join(tmpDir, ".openclaw", "workspace", "SOUL.md"), "soul v2\n");
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/SOUL.md"]);
+    assert.equal(puts[0].input.Body.toString(), "soul v2\n");
+  });
+
+  it("does not seed the cache for a file whose download failed", async () => {
+    objects["telegram_1/.openclaw/workspace/BROKEN.md"] = "x";
+    failGets.add("telegram_1/.openclaw/workspace/BROKEN.md");
+    await workspaceSync.restoreWorkspace("telegram_1");
+    assert.equal(fs.existsSync(path.join(tmpDir, ".openclaw", "workspace", "BROKEN.md")), false);
+    assert.equal(fs.existsSync(path.join(tmpDir, ".openclaw", "workspace", "SOUL.md")), true);
+
+    // Something later creates that file locally with the same bytes: it must be uploaded.
+    fs.writeFileSync(path.join(tmpDir, ".openclaw", "workspace", "BROKEN.md"), "x");
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/BROKEN.md"]);
+  });
+});
+
 // --- change-driven backup (save changed state to S3 soon after it changes) ---
 //
 // AgentCore stops the container without a usable grace period (staging: gone
