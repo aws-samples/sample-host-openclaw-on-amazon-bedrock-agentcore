@@ -76,7 +76,7 @@ check therefore applies to Gateway-created schedules unchanged.
 | Principal | Allowed | Scoped to |
 |---|---|---|
 | `openclaw-gateway-userfiles` role | `s3:ListBucket`; `s3:GetObject/PutObject/DeleteObject`; `kms:Decrypt/GenerateDataKey` | the `openclaw-user-files-<acct>-<region>` bucket / its objects; the security CMK |
-| `openclaw-gateway-schedules` role | `scheduler:Create/Get/Update/DeleteSchedule`; `iam:PassRole` (`iam:PassedToService = scheduler.amazonaws.com`); `dynamodb:Get/Put/Update/DeleteItem, Query` | `schedule/openclaw-cron/*`; `openclaw-cron-scheduler-role-<region>`; table `openclaw-identity` |
+| `openclaw-gateway-schedules` role | `scheduler:Create/Get/Update/DeleteSchedule`; `iam:PassRole` (`iam:PassedToService = scheduler.amazonaws.com`); `dynamodb:Get/Put/Update/DeleteItem, Query`; `kms:Decrypt/GenerateDataKey/DescribeKey` (`kms:ViaService = dynamodb.<region>.amazonaws.com`) | `schedule/openclaw-cron/*`; `openclaw-cron-scheduler-role-<region>`; table `openclaw-identity` (SSE-KMS with the security CMK) |
 | `openclaw-gateway-interceptor` role | logs only | |
 | Gateway service role | `lambda:InvokeFunction` | exactly the three functions above; trust policy conditioned on `aws:SourceAccount` and `aws:SourceArn = gateway/*` |
 
@@ -133,7 +133,7 @@ BUILD_MODE=codebuild ./scripts/deploy.sh          # Phase 1 now includes OpenCla
 # verify
 aws cloudformation describe-stacks --stack-name OpenClawGateway \
   --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue" --output text
-python scripts/agentcore-exec.py --runtime-id <id> --user <ns> -- openclaw mcp doctor agentcore --probe
+python3 scripts/agentcore-exec.py --session-id <ses_...> --command 'openclaw mcp doctor agentcore --probe'
 # container log lines to look for:
 #   [contract] Gateway MCP bearer acquired for telegram:<id> (expires ...)
 #   [contract] OpenClaw headless config written (mcp.servers.agentcore enabled)
@@ -153,15 +153,45 @@ the `openclaw-cron` group, both still reachable through the exec skills.
 | Test | Proves |
 |---|---|
 | `tests/test_gateway_stack_synth.py` (10) | flag off -> 8 stacks, no Gateway resources or outputs; flag missing behaves as off; flag on -> 9 stacks with `GatewayUrl`/`GatewayId`; CUSTOM_JWT against the pool + interceptor with `PassRequestHeaders`; two targets whose tools match the JSON and the handlers, carry `__caller_token` and no identity argument; scoped IAM; Gateway role can only invoke the three functions and use the CMK (`kms:DescribeKey`/`Decrypt`/`GenerateDataKey`/`CreateGrant`, pinned to the AgentCore service and a gateway ARN in this account); cdk-nag has no errors |
-| `lambda/gateway_tools/identity.test.js` (RS256, real keys) | good ID and access tokens resolve; wrong issuer / audience / signature / expired / malformed are refused; namespace derivation |
-| `lambda/gateway_tools/tools.test.js` | each tool addresses `<namespace>/...` from the token only; spoofed `user_id`/`namespace` ignored; interceptor overwrites `__caller_token` and refuses calls with no bearer |
-| `bridge/gateway-mcp.test.js` (11) | no env var -> config untouched; env var -> exact `mcp.servers.agentcore` block; `rewriteBearer` atomic + idempotent; refresh scheduled at `expiresAt - 5 min`, forces a fresh token, retries on failure, stops cleanly |
+| `lambda/gateway_tools/identity.test.js` (15, RS256, real keys) | good ID and access tokens resolve; wrong issuer / audience / signature / expired / malformed are refused; namespace derivation |
+| `lambda/gateway_tools/tools.test.js` (16) | each tool addresses `<namespace>/...` from the token only; spoofed `user_id`/`namespace` ignored; interceptor overwrites `__caller_token` and refuses calls with no bearer |
+| `bridge/gateway-mcp.test.js` (12) | no env var -> config untouched; env var -> exact `mcp.servers.agentcore` block; `rewriteBearer` atomic + idempotent; refresh scheduled at `expiresAt - 5 min`, forces a fresh token, retries on failure, stops cleanly |
 
 Byte-identity of the eight existing templates with the flag off is checked by two hermetic synths
 (`main` vs branch, dummy account) diffed file by file; see the PR description.
 
 Run: `pytest tests/test_gateway_stack_synth.py -v`; `cd bridge && node --test gateway-mcp.test.js`;
 `node --test lambda/gateway_tools/*.test.js` (Node 24).
+
+## Performance (us-west-2 staging, 2026-09-24)
+
+Same harness and prompts for both phases, 10 cold-start iterations each (session record deleted and
+runtime session stopped before every iteration). Wall latency = webhook POST to the router's
+`Response to send` log line; tool round trip = container `embedded run tool start` to `tool end`.
+Baseline: runtime with `enable_gateway=false` (exec skills). Gateway: the rebuilt image with
+`AGENTCORE_GATEWAY_URL` set, measured after the `clientContext.custom` fix below.
+
+| Measure | exec skills p50 / p95 | Gateway tools p50 / p95 | Delta p50 |
+|---|---|---|---|
+| Cold start -> first reply (warm-up shim) | 4.61 s / 10.96 s | 5.41 s / 5.87 s | +0.80 s (baseline p95 was one 15 s outlier) |
+| Boot -> OpenClaw 2.0 ready | 10.25 s / 15.26 s | 10.59 s / 10.80 s | +0.34 s (bearer fetch + config write ~0.5 s of boot) |
+| First tool call after cold start (wall) | 7.80 s / 9.38 s | 8.21 s / 9.52 s | +0.41 s |
+| Plain chat reply (wall) | 3.42 s / 4.54 s | 3.69 s / 4.33 s | +0.27 s (larger tool list in every prompt) |
+| Repeat tool prompt (wall) | 5.50 s / 6.57 s | 4.74 s / 7.03 s | -0.76 s (5/10 repeats answered from context without re-calling) |
+| Tool round trip, first call | 483 ms / 627 ms | 300 ms / 323 ms | -183 ms (Lambda vs spawning `node` for the exec skill) |
+| Tool round trip, repeat call | 223 ms / 258 ms | 267 ms / 309 ms | +44 ms (warm exec process beats a second Gateway hop) |
+| Tools forwarded per model call / median input tokens | 38 / 27.2k | 51 / 29.0k | +13 tools / +1.8k (+6.6 %) |
+| Correct reply (first / repeat) | 10/10 / 10/10 | 10/10 / 10/10 | 0 |
+| Timeouts / errors | 0 / 0 | 0 / 0 | 0 |
+
+Net: chat and startup latency move by well under a second at p50, within the run-to-run noise of a
+10-sample set; the tool call itself is faster through the Gateway on a cold process and slightly
+slower than a warm exec process; every prompt carries ~1.8k more input tokens because 13 more tool
+definitions ride along. The model re-called the tool on a repeated prompt less often with the typed
+MCP tools (5/10 vs 9/10), answering from the earlier structured result instead.
+
+E2E on the same deployment: `tests/e2e/test_gateway_tools.py -m gateway` 4/4 after the Lambda fixes
+below; `full_startup` 1/1, `smoke` 4/4, `lifecycle` 1/1 unchanged against `main`.
 
 ## Questions settled by the live E2E (us-west-2 staging, 2026-09-24)
 
@@ -187,5 +217,11 @@ Run: `pytest tests/test_gateway_stack_synth.py -v`; `cd bridge && node --test ga
 3. **First live surprise:** the first deployed Lambdas read `clientContext.Custom` and got
    `tool=""` (every call answered `unknown_tool`, which the model rendered as "no files"). Fixed to
    read `custom` with `Custom` as fallback; the `gateway_tool_call` audit line now shows the tool.
+4. **Second live surprise:** `create_schedule` reached the schedules Lambda with the right namespace
+   but no schedule appeared: `openclaw-identity` is SSE-KMS encrypted with the security CMK and the
+   role had no KMS statement, so `PutItem` failed inside the tool's error envelope. Fixed by the
+   `kms:ViaService = dynamodb` grant in the IAM table above, and the Lambdas now also write a
+   `gateway_tool_error` line (tool, error name, message; no arguments) so the next such failure is
+   visible in CloudWatch. After both fixes `tests/e2e/test_gateway_tools.py -m gateway` passed 4/4.
 
-Both answers are recorded in the E2E report referenced from the PR.
+All answers are recorded in the E2E report referenced from the PR.
