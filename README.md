@@ -49,7 +49,7 @@ Users can send **text and images** — photos sent via Telegram, Slack or Feishu
 
 The diagram shows the high-level request path. Container internals (contract server, lightweight agent, Bedrock proxy, session storage), KMS and networking are described in the component table below and in [docs/architecture-detailed.md](docs/architecture-detailed.md); the diagram source is `docs/diagrams/architecture.py`.
 
-Messages from a channel reach API Gateway and the Router Lambda, which validates the webhook, resolves the user in DynamoDB and calls `InvokeAgentRuntime` with a per-user session id. Inside the user's microVM the contract server answers immediately through the lightweight agent while the OpenClaw gateway boots, then bridges every later message to OpenClaw over WebSocket. Both paths call Bedrock through the local proxy. OpenClaw state lives on local disk, is mirrored to session storage and snapshotted to S3. Scheduled tasks and token monitoring run on their own Lambdas.
+Messages from a channel reach API Gateway and the Router Lambda, which validates the webhook, resolves the user in DynamoDB and calls `InvokeAgentRuntime` with a per-user session id. Inside the user's microVM the contract server answers immediately through the lightweight agent while the OpenClaw gateway boots, then bridges every later message to OpenClaw over WebSocket. Both paths call Bedrock through the local proxy. OpenClaw state lives on local disk, is mirrored to session storage and snapshotted to S3. Scheduled tasks and token monitoring run on their own Lambdas. Not shown: with the opt-in `enable_gateway` flag, OpenClaw also calls an AgentCore Gateway (MCP) whose Lambda targets serve the per-user file and schedule tools; see [AgentCore Gateway MCP tools](#agentcore-gateway-mcp-tools-prototype).
 
 | Component | What it is | Code |
 |---|---|---|
@@ -64,12 +64,13 @@ Messages from a channel reach API Gateway and the Router Lambda, which validates
 | Session storage `/mnt/workspace` | AgentCore managed session storage; mirror of the state dir, restored before the gateway spawns | `bridge/state-storage.js`, `scripts/deploy.sh` |
 | S3 user-files bucket | Per-user files, image uploads, screenshots, and `~/.openclaw` snapshots (SQLite via online backup) | `stacks/agentcore_stack.py`, `bridge/workspace-sync.js` |
 | STS scoped credentials | Execution role re-assumed with a session policy limiting S3, DynamoDB, Secrets Manager and Scheduler to the user's namespace | `bridge/scoped-credentials.js` |
-| Cognito User Pool | Per-user Cognito user with an HMAC-derived password; the proxy acquires and caches an ID token per user (not consumed by a downstream call today) | `stacks/security_stack.py`, `bridge/agentcore-proxy.js` |
+| Cognito User Pool | Per-user Cognito user with an HMAC-derived password; the proxy acquires and caches an ID token per user. With `enable_gateway: true` the contract server mints the same user's **access** token as the bearer for the Gateway MCP server | `stacks/security_stack.py`, `bridge/agentcore-proxy.js`, `bridge/cognito-token.js` |
 | Secrets Manager | `openclaw/gateway-token`, `openclaw/channels/*`, `openclaw/webhook-secret`, `openclaw/cognito-password-secret`, per-user `openclaw/user/{ns}/*` | `stacks/security_stack.py`, `bridge/skills/api-keys/` |
 | KMS CMK | Encrypts S3, DynamoDB, SNS and Secrets Manager | `stacks/security_stack.py` |
 | EventBridge Scheduler + Cron Lambda | Schedule group `openclaw-cron`; `openclaw-cron-executor` warms the session, sends the `cron` action and posts the reply to Telegram/Slack | `stacks/cron_stack.py`, `lambda/cron/index.py`, `bridge/skills/eventbridge-cron/` |
 | Token monitoring | Bedrock invocation logs → CloudWatch subscription → `token_metrics` Lambda → DynamoDB (3 GSIs) + custom metrics, dashboards, budget alarms, SNS | `stacks/observability_stack.py`, `stacks/token_monitoring_stack.py`, `lambda/token_metrics/index.py` |
 | Bedrock Guardrails (optional) | `CfnGuardrail` + version; see [Security](#security) | `stacks/guardrails_stack.py` |
+| AgentCore Gateway (optional, prototype) | `enable_gateway: false` by default. When on: MCP Gateway `openclaw-tools` with a Cognito JWT authorizer, a REQUEST interceptor Lambda and two Lambda targets (`user-files`, `schedules`) that serve the file and schedule tools as typed MCP tools; see [AgentCore Gateway MCP tools](#agentcore-gateway-mcp-tools-prototype) | `stacks/gateway_stack.py`, `lambda/gateway_tools/`, `bridge/gateway-mcp.js` |
 | AgentCore Browser (optional) | `CfnBrowserCustom` in the VPC, used by the `agentcore-browser` skill | `stacks/agentcore_stack.py`, `bridge/skills/agentcore-browser/` |
 
 The AgentCore Runtime, its endpoint and the ECR repository are created by the **AgentCore Starter Toolkit** (`agentcore deploy`) in Phase 2 of `scripts/deploy.sh`, not by CDK. `OpenClawAgentCore` provides the execution role, security group and bucket, and the Phase 3 stacks read `runtime_id`/`runtime_endpoint_id` from `cdk.json` context.
@@ -203,6 +204,8 @@ The deploy script runs three phases automatically:
 
 The script runs pre-flight checks (AWS credentials, CDK CLI, Docker, agentcore CLI) before starting.
 
+With the opt-in `enable_gateway: true` in `cdk.json`, Phase 1 also deploys `OpenClawGateway` and Phase 2 reads its `GatewayUrl` output (exact `OutputKey`; the deploy fails if it is empty) and passes it to the runtime as `AGENTCORE_GATEWAY_URL`. With the default `false` the stack is not in the app and the variable is not set. See [AgentCore Gateway MCP tools](#agentcore-gateway-mcp-tools-prototype).
+
 **Note on Availability Zones:** Bedrock AgentCore Runtime may not be available in all AZs in a region. If deployment fails with an "unsupported availability zones" error, specify supported AZs in `cdk.json`:
 
 ```json
@@ -298,7 +301,7 @@ Send a message to your Telegram bot. The first message triggers a cold start —
 
 ```
 openclaw-on-agentcore/
-  app.py                          # CDK app entry point (8 stacks)
+  app.py                          # CDK app entry point (8 stacks + opt-in OpenClawGateway)
   cdk.json                        # Configuration (model, budgets, sessions, cron, guardrails)
   requirements.txt                # Python deps (aws-cdk-lib, cdk-nag)
   stacks/
@@ -311,10 +314,14 @@ openclaw-on-agentcore/
     token_monitoring_stack.py     # Lambda processor, DynamoDB (3 GSIs), token analytics dashboard
     guardrails_stack.py           # Bedrock Guardrails (content filters, PII, topic denial)
     cron_stack.py                 # EventBridge Scheduler, Cron executor Lambda, IAM
+    gateway_stack.py              # Prototype: AgentCore Gateway (MCP) + interceptor + tool Lambdas; only when enable_gateway=true
   bridge/
     Dockerfile                    # Container image (node:24-slim, ARM64, pinned openclaw@2026.9.5 + clawhub@0.23.3, 5 owner-pinned ClawHub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
+    gateway-mcp.js                # mcp.servers.agentcore config + bearer refresh (only when AGENTCORE_GATEWAY_URL is set)
+    gateway-mcp.test.js           # Gateway MCP config/refresh + Cognito token provider tests (node:test, 12 tests)
+    cognito-token.js              # Per-user Cognito ID/access token provider shared by proxy and contract server
     lightweight-agent.js          # Warm-up agent shim (17 tools: web, s3-user-files, eventbridge-cron, clawhub-manage, api-keys)
     lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 111 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
@@ -350,6 +357,14 @@ openclaw-on-agentcore/
     router/test_screenshot_handling.py # Screenshot marker delivery tests (pytest)
     router/test_formatting_integration.py # Formatting integration tests (pytest)
     cron/index.py                      # Cron executor (warmup, invoke, deliver)
+    gateway_tools/                     # Prototype Gateway MCP targets (Node 22 Lambdas)
+      tool-schemas.json                # MCP tool schemas consumed by CDK and the tests
+      interceptor/index.js             # REQUEST interceptor: copies the bearer JWT into __caller_token
+      s3_user_files/index.js           # user-files target: list/read/write/delete in the caller's S3 prefix
+      eventbridge_cron/index.js        # schedules target: create/list/update/delete the caller's schedules
+      lib/identity.js                  # JWT verification against the pool JWKS; namespace derivation
+      lib/mcp.js                       # Lambda-target event/context helpers
+      identity.test.js, tools.test.js  # Unit tests (node:test, 31 tests)
   scripts/
     setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
     setup-slack.sh                # Slack Event Subscriptions + admin allowlist
@@ -360,6 +375,7 @@ openclaw-on-agentcore/
     agentcore-exec.py             # Operator CLI: run a shell command in a live session (InvokeAgentRuntimeCommand)
   tests/
     test_agentcore_exec.py        # Unit tests for scripts/agentcore-exec.py (mocked boto3, no AWS)
+    test_gateway_stack_synth.py   # OpenClawGateway synth tests: flag off = unchanged templates, flag on = stack + IAM + cdk-nag (10 tests, no AWS)
     e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
       config.py                   # AWS config auto-discovery (CF outputs, Secrets Manager)
       webhook.py                  # Build + POST Telegram webhook payloads
@@ -367,6 +383,8 @@ openclaw-on-agentcore/
       log_tailer.py               # CloudWatch log tailing with pattern matching
       bot_test.py                 # CLI entrypoint + pytest test classes (46 tests, 15 classes)
       conftest.py                 # pytest fixtures, conversation scenarios
+      container_logs.py           # Container/Lambda log helpers for the Gateway E2E tests
+      test_gateway_tools.py       # Gateway MCP tools E2E (4 tests, `-m gateway`; skipped when the stack is not deployed)
   redteam/                        # LLM red team testing (promptfoo, 62 test cases)
   docs/
     images/architecture.png       # README architecture diagram (AWS icons)
@@ -379,6 +397,7 @@ openclaw-on-agentcore/
     guardrails.md                 # Bedrock Guardrails operational runbook
     session-storage.md            # Persistent /mnt/workspace (Managed Session Storage)
     execute-command.md            # Operator CLI for InvokeAgentRuntimeCommand + security boundary
+    gateway-mcp-tools.md          # Prototype: AgentCore Gateway MCP tools (design, identity flow, IAM, tests, live findings)
 ```
 
 ## CDK Stacks
@@ -752,9 +771,41 @@ Five ClawHub community skills are pre-installed at Docker build time with `clawh
 
 clawhub installs a qualified spec into `/skills/@owner/<slug>`; the Dockerfile moves it to the flat `/skills/<slug>` path that `skills.load.extraDirs`, the `clawhub-manage` skill and the system prompt all use.
 
-Prototype: with `enable_gateway: true` the `s3-user-files` and `eventbridge-cron` capabilities are additionally served as typed MCP tools by an AgentCore Gateway (identity from the verified Cognito JWT, least-privilege Lambdas). See [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md).
+Prototype: with `enable_gateway: true` the `s3-user-files` and `eventbridge-cron` capabilities are additionally served as typed MCP tools by an AgentCore Gateway; see [AgentCore Gateway MCP tools](#agentcore-gateway-mcp-tools-prototype) below.
 
 During the warm-up phase (~first 1-2 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files`, `eventbridge-cron`, `clawhub-manage`, and `api-keys` skills. Users can manage files, schedules, skills, and API keys even during warm-up. ClawHub skills become available after OpenClaw fully starts.
+
+### AgentCore Gateway MCP tools (prototype)
+
+Off by default: `enable_gateway` is `false` in `cdk.json`, the `OpenClawGateway` stack is then not in the CDK app, the eight existing templates synthesize unchanged and `openclaw.json` gets no `mcp` block (asserted by `tests/test_gateway_stack_synth.py` and `bridge/gateway-mcp.test.js`). With the flag on, the `s3-user-files` and `eventbridge-cron` capabilities are additionally served as **typed MCP tools by an Amazon Bedrock AgentCore Gateway**, so the model calls `list_files` or `create_schedule` instead of composing a shell command, and the tool runs in a Lambda with its own least-privilege role instead of inside the user's microVM. The exec skills stay installed; both surfaces operate on the same S3 prefixes and the same `openclaw-cron` schedules. `api-keys` is not ported. Design, identity flow, IAM and live findings: [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md).
+
+| Piece | What it does | Code |
+|---|---|---|
+| `OpenClawGateway` stack | `AWS::BedrockAgentCore::Gateway` `openclaw-tools` (protocol MCP, `CUSTOM_JWT` authorizer against the existing Cognito user pool and its `openclaw-proxy` client), REQUEST interceptor Lambda `openclaw-gateway-interceptor`, and two Lambda MCP targets: `user-files` (`list_files`, `read_file`, `write_file`, `delete_file`) and `schedules` (`create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`). Outputs `GatewayUrl`, `GatewayId`, `GatewayServiceRoleArn` | `stacks/gateway_stack.py`, `lambda/gateway_tools/` |
+| Bridge | When `AGENTCORE_GATEWAY_URL` is set, the contract server mints the per-user Cognito **access** token and writes `mcp.servers.agentcore` (`streamable-http`, `Authorization: Bearer ...`) into `openclaw.json`. A timer re-mints the token 5 min before expiry (Cognito tokens last 1 h), rewrites only the header (tmp file + rename) and retries a failed refresh every 60 s. If Cognito is not configured or the mint fails, the block is omitted with a warning and the exec skills keep working | `bridge/gateway-mcp.js`, `bridge/cognito-token.js`, `bridge/agentcore-contract.js` |
+| Deploy | Phase 1 also deploys `OpenClawGateway`; Phase 2 reads the `GatewayUrl` output and passes `AGENTCORE_GATEWAY_URL` to the runtime, both only when the flag is on | `scripts/deploy.sh` |
+
+**Auth and identity.** The Gateway accepts only the Cognito **access** token: the same user's ID token is refused with `403 insufficient_scope` (measured on us-west-2 staging, which is why the bridge uses `getAccessToken()`). Caller identity comes only from the verified JWT. The interceptor copies the bearer into the reserved tool argument `__caller_token`, overwriting anything the model sent, and refuses calls with no bearer; each tool Lambda re-verifies the signature against the pool JWKS (issuer, client id, expiry) and derives the S3 prefix / schedule owner from `cognito:username`. The tool schemas offer no `user_id` or `namespace` argument, and a model-supplied user or folder name is ignored (`lambda/gateway_tools/tools.test.js`, E2E `test_other_users_folder_is_never_reached`). Each Lambda role is scoped to the user-files bucket or to the `openclaw-cron` schedule group plus the identity table; the Gateway service role may invoke only these three functions.
+
+**Enable / disable**
+
+```bash
+# enable: set "enable_gateway": true in cdk.json, then deploy
+./scripts/deploy.sh                 # Phase 1 adds OpenClawGateway; Phase 2 passes AGENTCORE_GATEWAY_URL to the runtime
+aws cloudformation describe-stacks --stack-name OpenClawGateway \
+  --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue" --output text
+# inside a user's live session, list the tools the Gateway serves and prove the bearer is accepted
+# (operator tool, see docs/execute-command.md; the session id is the user's SESSION record):
+python3 scripts/agentcore-exec.py --session-id <ses_...> --command 'openclaw mcp doctor agentcore --probe'
+
+# disable: set "enable_gateway": false in cdk.json, then
+./scripts/deploy.sh --runtime-only  # redeploys the runtime without AGENTCORE_GATEWAY_URL (rebuilds the image)
+cdk destroy OpenClawGateway         # removes Gateway, targets, interceptor, tool Lambdas, log groups; files stay in S3, schedules in openclaw-cron
+```
+
+Container log lines to expect with the flag on: `[contract] Gateway MCP bearer acquired for telegram:<id> (expires ...)`, `[contract] OpenClaw headless config written (mcp.servers.agentcore enabled)`, and later `[contract] [gateway-mcp] bearer refreshed; next refresh before ...`. Tool calls appear in the container log as `tool=agentcore__user-files___list_files` (not `exec`) and in `/openclaw/lambda/gateway-userfiles` / `gateway-schedules` as `gateway_tool_call` audit lines carrying the caller's namespace and `tokenUse=access`.
+
+**Staging measurements** (us-west-2, 2026-09-24, 10 cold-start iterations per phase, same prompts; exec skills vs Gateway tools): every chat and startup p50 moved by less than a second (cold start to first reply 4.61 s vs 5.41 s; boot to OpenClaw ready 10.25 s vs 10.59 s; plain chat 3.42 s vs 3.69 s), within the noise of a 10-sample set. The tool hop itself was faster through the Gateway on a cold call (300 ms vs 483 ms p50) and slightly slower on a warm repeat (267 ms vs 223 ms). Each model call carried 51 tool definitions instead of 38, a median of 29.0k input tokens vs 27.2k (+6.6 %). Correct replies 10/10 in both phases, no timeouts or errors. The full table is in [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md#performance-us-west-2-staging-2026-09-24).
 
 ### Webhook Security
 
@@ -814,7 +865,7 @@ cdk deploy OpenClawAgentCore --require-approval never
 ### Run tests
 
 ```bash
-cd bridge && node --test *.test.js                     # all bridge unit tests (362 tests, Node 24)
+cd bridge && node --test *.test.js                     # all bridge unit tests (374 tests, Node 24)
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
 cd bridge && node --test image-support.test.js         # image upload + multimodal tests
 cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
@@ -823,12 +874,15 @@ cd bridge && node --test content-extraction.test.js    # recursive content block
 cd bridge && node --test scoped-credentials.test.js    # per-user STS credential scoping tests
 cd bridge && node --test workspace-sync.test.js        # workspace sync + SQLite snapshot tests
 cd bridge && node --test state-storage.test.js         # local state dir / session-storage mirror + restore tests
+cd bridge && node --test gateway-mcp.test.js           # Gateway MCP config, bearer refresh, Cognito token provider (12 tests)
+node --test lambda/gateway_tools/*.test.js             # Gateway tool Lambdas: JWT verification, namespace scoping, interceptor (31 tests, Node 24)
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 cd lambda/router && python -m pytest test_image_upload.py -v        # image upload unit tests
 cd lambda/router && python -m pytest test_content_extraction.py -v  # content block extraction tests
 cd lambda/router && python -m pytest test_markdown_html.py -v       # markdown-to-HTML conversion tests
 cd lambda/router && python -m pytest test_slack.py test_feishu.py -v # Slack + Feishu handler tests
 python -m pytest tests/test_agentcore_exec.py -v                     # operator CLI tests (mocked boto3)
+python -m pytest tests/test_gateway_stack_synth.py -v                # OpenClawGateway synth: flag off leaves the 8 templates unchanged, flag on adds the stack (10 tests, no AWS)
 
 # E2E tests (requires deployed stack + E2E_TELEGRAM_CHAT_ID/E2E_TELEGRAM_USER_ID env vars)
 pytest tests/e2e/bot_test.py -v -k smoke               # connectivity + webhook auth
@@ -843,6 +897,7 @@ pytest tests/e2e/bot_test.py -v -k ApiKeyManagement      # API key storage (nati
 pytest tests/e2e/bot_test.py -v -k CronSchedule          # cron lifecycle + CRON# DynamoDB record check
 pytest tests/e2e/bot_test.py -v -k GuardrailSecurity     # guardrail content filtering (requires BEDROCK_GUARDRAIL_ID env var, see below)
 pytest tests/e2e/test_guardrail_wiring.py -v             # guardrail WIRING: passes only on a logged guardrail intervention
+pytest tests/e2e/test_gateway_tools.py -v -m gateway     # Gateway MCP tools (4 tests; needs enable_gateway=true, skipped when OpenClawGateway is not deployed)
 pytest tests/e2e/bot_test.py -v                          # all E2E tests
 ```
 
@@ -946,7 +1001,7 @@ Node.js's Happy Eyeballs (`autoSelectFamily`, Node 20+) tries both IPv4 and IPv6
 cdk destroy --all
 ```
 
-Note: KMS keys and the Cognito User Pool have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed.
+Note: KMS keys and the Cognito User Pool have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`.
 
 ## Security
 
