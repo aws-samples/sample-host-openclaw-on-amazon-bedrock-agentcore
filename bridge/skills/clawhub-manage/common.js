@@ -1,21 +1,14 @@
 /**
  * Shared utilities for clawhub-manage skill.
+ *
+ * Slug validation, the skills directory and the persisted-install manifest all
+ * live in ./runtime-skills.js so agentcore-contract.js can reuse them at cold
+ * start; this file only re-exports what the scripts here need.
  */
+const runtimeSkills = require("./runtime-skills");
 
-/** Validate a ClawHub skill name — alphanumeric + hyphens only. */
-function validateSkillName(name) {
-  if (!name || typeof name !== "string") {
-    throw new Error("Skill name is required.");
-  }
-  if (!/^[a-zA-Z][a-zA-Z0-9-]{0,63}$/.test(name)) {
-    throw new Error(
-      `Invalid skill name: "${name}" — must start with a letter and contain only letters, numbers, and hyphens (max 64 chars).`,
-    );
-  }
-  return name.toLowerCase();
-}
-
-/** Path where ClawHub installs skills. */
-const SKILLS_DIR = "/skills";
-
-module.exports = { validateSkillName, SKILLS_DIR };
+module.exports = {
+  validateSkillName: runtimeSkills.validateSkillName,
+  SKILLS_DIR: runtimeSkills.SKILLS_DIR,
+  runtimeSkills,
+};

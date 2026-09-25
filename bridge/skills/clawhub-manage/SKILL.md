@@ -1,6 +1,6 @@
 ---
 name: clawhub-manage
-description: Install, uninstall, and list ClawHub community skills. Use when the user asks to install a new skill, remove an existing skill, or see what skills are available. Skills are installed globally in the container and available after OpenClaw restarts or on new sessions.
+description: Install, uninstall, and list ClawHub community skills. Use when the user asks to install a new skill, remove an existing skill, or see what skills are available. Installed skills are recorded per user and reinstalled automatically a few seconds after each new session starts.
 allowed-tools: Bash(node:*)
 ---
 
@@ -48,6 +48,8 @@ node {baseDir}/list.js
 
 ## Notes
 
-- After install/uninstall, the skill will be loaded/unloaded on the next session start (after idle timeout or new conversation) (web search, file storage, scheduling)
-- Only valid ClawHub skill names are accepted (letters, numbers, hyphens)
-- Pre-installed skills: jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer
+- Installs go to `/skills` and are recorded, with the installed version pinned, in the user's persistent state (`~/.openclaw/runtime-skills.json`). `/skills` itself does not survive a cold start, so a few seconds after a new session starts the bridge reinstalls every recorded skill in the background. Until that finishes (a few seconds per skill) a recorded skill may briefly be missing; `list_skills` shows any that are still pending or whose reinstall failed.
+- OpenClaw picks a newly installed or removed skill up when it next refreshes its skill list (on file change, or at the latest at the next session start).
+- Installs never bypass ClawHub's security review: a skill flagged as suspicious or malicious is refused with an explanation rather than installed. Tell the user why and do not retry with other flags.
+- Only valid ClawHub skill names are accepted (letters, numbers, hyphens; no `@owner/` prefix).
+- Pre-installed skills (`jina-reader`, `deep-research-pro`, `telegram-compose`, `transcript`, `task-decomposer`) ship with the container image and cannot be uninstalled persistently.
