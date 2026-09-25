@@ -261,6 +261,13 @@ read_cdk_outputs() {
   SUBAGENT_MODEL_ID=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('subagent_model_id',''))")
   IMAGE_VERSION=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('image_version','1'))")
   WORKSPACE_SYNC_MS=$(python3 -c "import json; print(int(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('workspace_sync_interval_seconds',300))*1000)")
+  # How long the bridge waits for the S3 workspace restore before spawning the
+  # OpenClaw gateway. The bridge default (45 s) is too short for a large state
+  # (~1,200 files / 220 MB restores in ~100-115 s): the gateway would start before
+  # the pre-2.0 sessions.json, memory and skills are on disk and the legacy
+  # import would be skipped. 180 s covers that with margin; the wait ends as
+  # soon as the restore settles, so small namespaces are not slowed down.
+  WORKSPACE_RESTORE_WAIT_MS=$(python3 -c "import json; print(int(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('workspace_restore_wait_seconds',180))*1000)")
   CRON_LEAD_TIME=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('cron_lead_time_minutes',5))")
   SESSION_IDLE=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('session_idle_timeout',1800))")
   SESSION_MAX=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('session_max_lifetime',28800))")
@@ -271,6 +278,7 @@ read_cdk_outputs() {
   echo "  S3 Bucket:      $USER_FILES_BUCKET"
   echo "  Cognito Pool:   $COGNITO_USER_POOL_ID"
   echo "  Cognito Client: $COGNITO_CLIENT_ID"
+  echo "  Restore wait:   ${WORKSPACE_RESTORE_WAIT_MS} ms"
   if [ -n "$GUARDRAIL_ID" ]; then
     echo "  Guardrail:      $GUARDRAIL_ID v$GUARDRAIL_VERSION"
   fi
@@ -376,6 +384,7 @@ phase2_toolkit() {
     --env "COGNITO_PASSWORD_SECRET_ID=$COGNITO_PASSWORD_SECRET_ID" \
     --env "S3_USER_FILES_BUCKET=$USER_FILES_BUCKET" \
     --env "WORKSPACE_SYNC_INTERVAL_MS=$WORKSPACE_SYNC_MS" \
+    --env "WORKSPACE_RESTORE_WAIT_MS=$WORKSPACE_RESTORE_WAIT_MS" \
     --env "IMAGE_VERSION=$IMAGE_VERSION" \
     --env "EXECUTION_ROLE_ARN=$EXECUTION_ROLE_ARN" \
     --env "CMK_ARN=$CMK_ARN" \
