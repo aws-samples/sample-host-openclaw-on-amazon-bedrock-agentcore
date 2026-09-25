@@ -45,9 +45,9 @@ Users can send **text and images** — photos sent via Telegram, Slack or Feishu
 
 ## Architecture
 
-![Architecture: users message Telegram, Slack or Feishu; webhooks reach API Gateway and the Router Lambda, which resolves the user in DynamoDB and invokes OpenClaw 2.0 on a per-user Bedrock AgentCore Runtime microVM; the runtime calls Amazon Bedrock (Claude with Guardrails), keeps state in S3, reads Secrets Manager and Cognito/STS scoped credentials, and schedules tasks through EventBridge Scheduler and a Cron Lambda; Bedrock invocation logs feed CloudWatch token monitoring](docs/images/architecture.png)
+![Architecture: users message Telegram, Slack or Feishu; webhooks reach API Gateway and the Router Lambda, which resolves the user in DynamoDB and invokes OpenClaw 2.0 on a per-user Bedrock AgentCore Runtime microVM; the runtime calls Amazon Bedrock (Claude with Guardrails), keeps state in S3, reads Secrets Manager and Cognito/STS scoped credentials, and schedules tasks through EventBridge Scheduler and a Cron Lambda; Bedrock invocation logs feed CloudWatch token monitoring](docs/images/architecture.svg)
 
-The diagram shows the high-level request path. Container internals (contract server, lightweight agent, Bedrock proxy, session storage), KMS and networking are described in the component table below and in [docs/architecture-detailed.md](docs/architecture-detailed.md); the diagram source is `docs/diagrams/architecture.py`.
+The diagram shows the high-level request path. Container internals (contract server, lightweight agent, Bedrock proxy, session storage), KMS and networking are described in the component table below and in [docs/architecture-detailed.md](docs/architecture-detailed.md).
 
 Messages from a channel reach API Gateway and the Router Lambda, which validates the webhook, resolves the user in DynamoDB and calls `InvokeAgentRuntime` with a per-user session id. Inside the user's microVM the contract server answers immediately through the lightweight agent while the OpenClaw gateway boots, then bridges every later message to OpenClaw over WebSocket. Both paths call Bedrock through the local proxy. OpenClaw state lives on local disk, is mirrored to session storage and snapshotted to S3. Scheduled tasks and token monitoring run on their own Lambdas. Not shown: with the opt-in `enable_gateway` flag, OpenClaw also calls an AgentCore Gateway (MCP) whose Lambda targets serve the per-user file and schedule tools; see [AgentCore Gateway MCP tools](#agentcore-gateway-mcp-tools-prototype).
 
@@ -387,8 +387,7 @@ openclaw-on-agentcore/
       test_gateway_tools.py       # Gateway MCP tools E2E (4 tests, `-m gateway`; skipped when the stack is not deployed)
   redteam/                        # LLM red team testing (promptfoo, 62 test cases)
   docs/
-    images/architecture.png       # README architecture diagram (AWS icons)
-    diagrams/architecture.py      # Diagram source (python `diagrams` library)
+    images/architecture.svg       # README architecture diagram (AWS icons)
     architecture.md               # Solution architecture (ASCII diagrams)
     architecture-detailed.md      # Sequence diagrams, container internals, data flows
     openclaw-2.0-upgrade.md       # 2026.3.8 -> 2026.9.5 upgrade notes, risks, validation
