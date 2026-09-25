@@ -9,7 +9,9 @@
  *         (debounce, max wait, per-flush cap, hash dedupe, SQLite sidecar
  *         mapping, SQLite-only throttle, failure handling), the upload gate
  *         (nothing uploaded before/without a completed restore), the
- *         fill-missing restore mode and the SIGTERM wiring in the contract.
+ *         fill-missing restore mode (incl. kept files verified against the
+ *         sha256 stored as S3 object metadata) and the SIGTERM wiring in the
+ *         contract.
  * Note: S3Client creation is tested implicitly (SDK only in Docker image).
  * Run: cd bridge && node --test workspace-sync.test.js
  */
@@ -772,8 +774,12 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
   let savedHome;
   let realLoad;
   let puts;
+  let heads;
   let objects;
+  let metadata; // Key -> { sha256 } as HeadObject would return it (absent = legacy object)
   let failGets;
+  let failHeads;
+  const sha256 = (body) => require("node:crypto").createHash("sha256").update(body).digest("hex");
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ws-restore-"));
@@ -789,11 +795,18 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
       secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
     });
     puts = [];
+    heads = [];
     failGets = new Set();
+    failHeads = new Set();
     objects = {
       "telegram_1/.openclaw/workspace/SOUL.md": "soul v1\n",
       "telegram_1/.openclaw/runtime-skills.json": '{"version":1,"skills":{}}\n',
     };
+    // Every object was uploaded by this code, so it carries the sha256 metadata,
+    // unless a test deletes the entry to model an object from before the fix.
+    metadata = Object.fromEntries(
+      Object.entries(objects).map(([Key, body]) => [Key, { sha256: sha256(body) }]),
+    );
     const fakeS3 = {
       send: async (cmd) => {
         if (cmd.kind === "list") {
@@ -807,7 +820,17 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
           const body = Buffer.from(objects[cmd.input.Key]);
           return { Body: (async function* () { yield body; })() };
         }
+        if (cmd.kind === "head") {
+          heads.push(cmd);
+          if (failHeads.has(cmd.input.Key)) throw new Error("head boom");
+          if (!(cmd.input.Key in objects)) throw new Error("NotFound");
+          const meta = metadata[cmd.input.Key];
+          return { ContentLength: Buffer.byteLength(objects[cmd.input.Key]), ...(meta ? { Metadata: meta } : {}) };
+        }
         puts.push(cmd);
+        // Uploads store the hash, exactly as S3 would keep it for the next HEAD.
+        objects[cmd.input.Key] = Buffer.from(cmd.input.Body);
+        metadata[cmd.input.Key] = cmd.input.Metadata;
         return {};
       },
     };
@@ -818,6 +841,7 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
           S3Client: function () { return fakeS3; },
           PutObjectCommand: function (input) { this.kind = "put"; this.input = input; },
           GetObjectCommand: function (input) { this.kind = "get"; this.input = input; },
+          HeadObjectCommand: function (input) { this.kind = "head"; this.input = input; },
           ListObjectsV2Command: function (input) { this.kind = "list"; this.input = input; },
         };
       }
@@ -836,15 +860,18 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
     await workspaceSync.restoreWorkspace("telegram_1");
     assert.equal(fs.readFileSync(path.join(tmpDir, ".openclaw", "workspace", "SOUL.md"), "utf8"), "soul v1\n");
     assert.equal(puts.length, 0, "restore itself must not PUT");
+    assert.equal(heads.length, 0, "a full restore downloads everything — nothing to compare");
 
     await workspaceSync.saveWorkspace("telegram_1");
     assert.equal(puts.length, 0, "a full save right after restore has nothing new to upload");
 
-    // A real change is still uploaded, and only that file.
+    // A real change is still uploaded, and only that file, with its sha256 as
+    // object metadata so a later fill-missing restore can verify a kept copy.
     fs.writeFileSync(path.join(tmpDir, ".openclaw", "workspace", "SOUL.md"), "soul v2\n");
     await workspaceSync.saveWorkspace("telegram_1");
     assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/SOUL.md"]);
     assert.equal(puts[0].input.Body.toString(), "soul v2\n");
+    assert.deepEqual(puts[0].input.Metadata, { [workspaceSync.UPLOAD_HASH_METADATA_KEY]: sha256("soul v2\n") });
   });
 
   it("does not seed the cache for a file whose download failed", async () => {
@@ -875,25 +902,157 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
     objects["telegram_1/.openclaw/state/openclaw.sqlite"] = "SQLite format 3\0fake-db-bytes";
 
     const r = await workspaceSync.restoreWorkspace("telegram_1", { overwrite: false });
-    assert.deepEqual(r, { restored: 2, kept: 1, failed: 0, hadState: true });
+    assert.deepEqual(r, { restored: 2, kept: 1, keptUnchanged: 0, failed: 0, hadState: true });
     assert.equal(fs.readFileSync(soul, "utf8"), "soul LOCAL (fresher, from the mount mirror)\n", "existing file kept");
     assert.equal(fs.readFileSync(path.join(tmpDir, ".openclaw", "state", "openclaw.sqlite"), "latin1"), "SQLite format 3\0fake-db-bytes");
     assert.equal(fs.readFileSync(path.join(tmpDir, ".openclaw", "runtime-skills.json"), "utf8"), '{"version":1,"skills":{}}\n');
     assert.equal(puts.length, 0, "restore never PUTs");
     assert.equal(workspaceSync.getRestoreState(), "ready");
 
-    // The kept file's hash was NOT seeded from S3: the local (fresher) copy is
-    // uploaded by the first save; the restored files are not.
+    // The kept file differs from S3 (its stored sha256 is that of "soul v1"),
+    // so it was NOT seeded: the local (fresher) copy is uploaded by the first
+    // save; the restored files are not.
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/SOUL.md"]);
+    assert.equal(puts[0].input.Body.toString(), "soul LOCAL (fresher, from the mount mirror)\n");
+  });
+
+  // --- kept files: seed the dedupe only with evidence that they match S3 -----
+  //
+  // Staging (PR #114 round 2, O1): a same-session restart found all 11 files on
+  // the mount ("0 restored, 11 kept") and the first 30-min save re-uploaded 9
+  // of them although they were identical to S3 — once per restart.
+
+  it("does not re-upload kept files whose bytes match the sha256 S3 holds for them", async () => {
+    // The mount mirror holds exact copies of both S3 objects.
+    const soul = path.join(tmpDir, ".openclaw", "workspace", "SOUL.md");
+    fs.mkdirSync(path.dirname(soul), { recursive: true });
+    fs.writeFileSync(soul, "soul v1\n");
+    fs.writeFileSync(path.join(tmpDir, ".openclaw", "runtime-skills.json"), '{"version":1,"skills":{}}\n');
+
+    const r = await workspaceSync.restoreWorkspace("telegram_1", { overwrite: false });
+    assert.deepEqual(r, { restored: 0, kept: 2, keptUnchanged: 2, failed: 0, hadState: true });
+    assert.equal(workspaceSync.getRestoreState(), "ready");
+    assert.deepEqual(
+      heads.map((h) => h.input.Key).sort(),
+      ["telegram_1/.openclaw/runtime-skills.json", "telegram_1/.openclaw/workspace/SOUL.md"],
+      "one HeadObject per kept file, no GetObject",
+    );
+    assert.equal(puts.length, 0, "restore never PUTs");
+
+    // The first full save has nothing to upload; neither does the change backup
+    // when the watcher merely touches an identical file.
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.equal(puts.length, 0, "kept-and-identical files are not re-uploaded");
+    workspaceSync.startChangeBackup("telegram_1", { debounceMs: 10, maxWaitMs: 100 });
+    workspaceSync.markChanged("workspace/SOUL.md");
+    await workspaceSync.flushPendingSaves("test", { force: true });
+    await workspaceSync.stopChangeBackup("test");
+    assert.equal(puts.length, 0);
+
+    // A later real change to one of them is still uploaded, and only that one.
+    fs.writeFileSync(soul, "soul v2\n");
     await workspaceSync.saveWorkspace("telegram_1");
     assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/SOUL.md"]);
   });
+
+  it("uploads kept files that differ from S3, and seeds only the identical ones", async () => {
+    const soul = path.join(tmpDir, ".openclaw", "workspace", "SOUL.md");
+    fs.mkdirSync(path.dirname(soul), { recursive: true });
+    fs.writeFileSync(soul, "soul v1 plus a line the mount has and S3 does not\n"); // differs
+    fs.writeFileSync(path.join(tmpDir, ".openclaw", "runtime-skills.json"), '{"version":1,"skills":{}}\n'); // identical
+
+    const r = await workspaceSync.restoreWorkspace("telegram_1", { overwrite: false });
+    assert.deepEqual(r, { restored: 0, kept: 2, keptUnchanged: 1, failed: 0, hadState: true });
+    assert.equal(heads.length, 2);
+
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/SOUL.md"]);
+    assert.equal(puts[0].input.Body.toString(), "soul v1 plus a line the mount has and S3 does not\n");
+    assert.equal(objects["telegram_1/.openclaw/workspace/SOUL.md"].toString(), puts[0].input.Body.toString());
+
+    // Next same-session restart: S3 now holds the uploaded bytes and their
+    // hash, so both kept files verify and nothing is re-uploaded.
+    delete require.cache[require.resolve("./workspace-sync")];
+    const fresh = require("./workspace-sync");
+    fresh.configureCredentials({ accessKeyId: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" });
+    const r2 = await fresh.restoreWorkspace("telegram_1", { overwrite: false });
+    assert.deepEqual(r2, { restored: 0, kept: 2, keptUnchanged: 2, failed: 0, hadState: true });
+    await fresh.saveWorkspace("telegram_1");
+    assert.equal(puts.length, 1, "no further uploads after the second restart");
+  });
+
+  it("uploads a kept file when S3 holds no hash for it (object from before the metadata was stored) — identical bytes are not assumed", async () => {
+    const soul = path.join(tmpDir, ".openclaw", "workspace", "SOUL.md");
+    fs.mkdirSync(path.dirname(soul), { recursive: true });
+    fs.writeFileSync(soul, "soul v1\n"); // byte-identical to S3, but S3 cannot prove it
+    delete metadata["telegram_1/.openclaw/workspace/SOUL.md"];
+
+    const r = await workspaceSync.restoreWorkspace("telegram_1", { overwrite: false });
+    assert.deepEqual(r, { restored: 1, kept: 1, keptUnchanged: 0, failed: 0, hadState: true });
+    assert.equal(workspaceSync.getRestoreState(), "ready");
+
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/SOUL.md"]);
+    // ...and that upload wrote the hash, so the next restart can verify it.
+    assert.deepEqual(metadata["telegram_1/.openclaw/workspace/SOUL.md"], { sha256: sha256("soul v1\n") });
+  });
+
+  it("a failed HeadObject leaves the kept file unseeded (uploaded later) without failing the restore", async () => {
+    const soul = path.join(tmpDir, ".openclaw", "workspace", "SOUL.md");
+    fs.mkdirSync(path.dirname(soul), { recursive: true });
+    fs.writeFileSync(soul, "soul v1\n");
+    failHeads.add("telegram_1/.openclaw/workspace/SOUL.md");
+
+    const r = await workspaceSync.restoreWorkspace("telegram_1", { overwrite: false });
+    assert.deepEqual(r, { restored: 1, kept: 1, keptUnchanged: 0, failed: 0, hadState: true });
+    assert.equal(workspaceSync.getRestoreState(), "ready", "a HEAD failure is not a restore failure — S3 is intact");
+
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/SOUL.md"]);
+  });
+
+  it(
+    "verifies a kept SQLite database by its snapshot hash (what the save would upload), not the raw file",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const { DatabaseSync } = require("node:sqlite");
+      const dbRel = "state/openclaw.sqlite";
+      const dbPath = path.join(tmpDir, ".openclaw", dbRel);
+      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+      const db = new DatabaseSync(dbPath);
+      db.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('a')");
+      // S3 holds the snapshot this code uploaded earlier in the session.
+      const snap = await workspaceSync.snapshotSqlite(dbPath);
+      objects["telegram_1/.openclaw/" + dbRel] = snap;
+      metadata["telegram_1/.openclaw/" + dbRel] = { sha256: sha256(snap) };
+
+      let r = await workspaceSync.restoreWorkspace("telegram_1", { overwrite: false });
+      assert.equal(r.kept, 1);
+      assert.equal(r.keptUnchanged, 1, "live DB whose snapshot matches S3 is seeded");
+      await workspaceSync.saveWorkspace("telegram_1");
+      assert.deepEqual(puts.map((p) => p.input.Key), [], "no snapshot re-uploaded");
+
+      // New commits since the snapshot: the kept DB now differs and must upload.
+      db.exec("INSERT INTO t VALUES ('b')");
+      delete require.cache[require.resolve("./workspace-sync")];
+      const fresh = require("./workspace-sync");
+      fresh.configureCredentials({ accessKeyId: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" });
+      r = await fresh.restoreWorkspace("telegram_1", { overwrite: false });
+      assert.equal(r.kept, 3, "the two files restored earlier are now kept too");
+      assert.equal(r.keptUnchanged, 2, "those two still match S3; the changed DB does not");
+      await fresh.saveWorkspace("telegram_1");
+      assert.equal(puts.filter((p) => p.input.Key.endsWith(".sqlite")).length, 1, "changed DB snapshot uploaded");
+      db.close();
+    },
+  );
 
   it("overwrite:true (default) still replaces existing local files", async () => {
     const soul = path.join(tmpDir, ".openclaw", "workspace", "SOUL.md");
     fs.mkdirSync(path.dirname(soul), { recursive: true });
     fs.writeFileSync(soul, "stale local\n");
     const r = await workspaceSync.restoreWorkspace("telegram_1");
-    assert.deepEqual(r, { restored: 2, kept: 0, failed: 0, hadState: true });
+    assert.deepEqual(r, { restored: 2, kept: 0, keptUnchanged: 0, failed: 0, hadState: true });
     assert.equal(fs.readFileSync(soul, "utf8"), "soul v1\n");
   });
 
@@ -948,7 +1107,7 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
     it("opens when S3 holds no state for the namespace (new user)", async () => {
       for (const k of Object.keys(objects)) delete objects[k];
       const r = await workspaceSync.restoreWorkspace("telegram_1");
-      assert.deepEqual(r, { restored: 0, kept: 0, failed: 0, hadState: false });
+      assert.deepEqual(r, { restored: 0, kept: 0, keptUnchanged: 0, failed: 0, hadState: false });
       assert.equal(workspaceSync.getRestoreState(), "ready");
       fs.writeFileSync(path.join(tmpDir, ".openclaw", "user-api-keys.json"), "{}");
       await workspaceSync.saveWorkspace("telegram_1");

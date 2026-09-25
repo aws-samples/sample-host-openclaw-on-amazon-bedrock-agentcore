@@ -13,7 +13,14 @@ AgentCore Runtime supports [Managed Session Storage](https://docs.aws.amazon.com
    locally (`restoreWorkspace(namespace, { overwrite: false })`) — files the mount did have are kept.
    The mount's mirror can be partial (a container lost mid-turn had mirrored the workspace within 2 s
    but not the state DBs, whose mirror runs every 5 min), and the state DBs and runtime-skills manifest
-   must then come from S3 rather than be recreated empty by the gateway
+   must then come from S3 rather than be recreated empty by the gateway. Kept files are checked against
+   S3 without downloading them: every upload stores the sha256 of its bytes as object metadata
+   (`x-amz-meta-sha256`), the restore issues one `HeadObject` per kept file, and a kept file whose local
+   bytes (a SQLite DB: its snapshot) hash to the stored value is seeded into the upload dedupe so the
+   first full save does not re-upload it. A kept file with a different hash, no stored hash (uploaded
+   before this was recorded) or a failed `HeadObject` is not seeded and is uploaded by the next save —
+   the local copy is never assumed to match S3 without evidence. (Before this, every same-session
+   restart re-uploaded the ~9 unchanged small files at the first 30-min save.)
 3. On new sessions (storage empty), workspace is restored from S3 once
 4. S3 sync switches to **backup mode** — session storage is primary. The full save runs every 30 min
    (vs 5 min), and on top of it a change-driven backup (`workspaceSync.startChangeBackup()`) uploads

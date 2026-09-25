@@ -302,18 +302,28 @@ function setRestoreState(state) {
  * mirror had not), and the state DBs, runtime-skills manifest etc. must then
  * come from S3 rather than be recreated empty by the gateway.
  *
+ * Kept files are compared against S3 without downloading them: every upload
+ * stores the sha256 of its bytes as object metadata (UPLOAD_HASH_METADATA_KEY),
+ * a HeadObject per kept file reads it back, and a kept file whose local bytes
+ * hash to the same value is seeded into the upload dedupe so the first full
+ * save does not PUT it again (on staging every same-session restart re-uploaded
+ * 9 unchanged files). A kept file with no stored hash, a different hash, or a
+ * failed HEAD is NOT seeded and is uploaded by the first save — the local copy
+ * is never assumed to match S3 without evidence.
+ *
  * Opens the upload gate on success (see above); on any failure the gate stays
  * closed and the error is rethrown after being recorded.
  *
  * @param {string} namespace
  * @param {{ overwrite?: boolean }} [opts]
- * @returns {Promise<{ restored: number, kept: number, failed: number, hadState: boolean }>}
+ * @returns {Promise<{ restored: number, kept: number, keptUnchanged: number, failed: number, hadState: boolean }>}
+ *   `keptUnchanged` counts the kept files verified identical to S3 (seeded).
  */
 async function restoreWorkspace(namespace, { overwrite = true } = {}) {
   if (!BUCKET || !namespace) {
     console.log("[workspace-sync] No bucket or namespace — skipping restore");
     setRestoreState("ready"); // nothing to protect: uploads are no-ops without a bucket
-    return { restored: 0, kept: 0, failed: 0, hadState: false };
+    return { restored: 0, kept: 0, keptUnchanged: 0, failed: 0, hadState: false };
   }
   setRestoreState("pending");
   try {
@@ -344,10 +354,10 @@ async function runRestore(namespace, overwrite) {
   );
 
   let totalFiles = 0;
-  let kept = 0;
   let failed = 0;
   let hadState = false;
   let continuationToken;
+  const keptFiles = []; // { key, relativePath } — compared against S3 after the listing
 
   do {
     const params = {
@@ -390,10 +400,10 @@ async function runRestore(namespace, overwrite) {
       }
 
       if (!overwrite && fs.existsSync(localFile)) {
-        // Local copy (restored from the session-storage mirror) wins. Its hash
-        // is deliberately NOT seeded: it may differ from S3, and the first
-        // save must then upload it.
-        kept++;
+        // Local copy (restored from the session-storage mirror) wins. Whether
+        // it matches S3 is checked below (seedKeptFiles); until proven
+        // identical its hash is NOT seeded and the first save uploads it.
+        keptFiles.push({ key: obj.Key, relativePath });
         continue;
       }
 
@@ -427,13 +437,84 @@ async function runRestore(namespace, overwrite) {
       : undefined;
   } while (continuationToken);
 
+  const kept = keptFiles.length;
+  const keptUnchanged = kept ? await seedKeptFiles(s3, keptFiles) : 0;
+
   console.log(
     `[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}` +
-      (kept ? `, kept ${kept} existing local file(s)` : "") +
+      (kept ? `, kept ${kept} existing local file(s) (${keptUnchanged} verified identical to S3)` : "") +
       (failed ? `, ${failed} failed` : "") +
       (hadState ? "" : " (no saved state in S3 — new user)"),
   );
-  return { restored: totalFiles, kept, failed, hadState };
+  return { restored: totalFiles, kept, keptUnchanged, failed, hadState };
+}
+
+// HeadObject calls in flight at once while verifying kept files.
+const KEPT_VERIFY_CONCURRENCY = 4;
+
+/**
+ * Seed the upload dedupe for the kept files that are provably identical to S3.
+ *
+ * Evidence is the sha256 every upload stores as object metadata
+ * (UPLOAD_HASH_METADATA_KEY), read back with one HeadObject per kept file (no
+ * body transfer; ListObjectsV2 returns neither user metadata nor checksums,
+ * and the bucket is SSE-KMS so the ETag is not a content MD5). The local side
+ * is hashed exactly as uploadStateFile() would upload it — a SQLite database as
+ * a snapshot — so a match means the next save would PUT the same bytes.
+ *
+ * Never fails the restore: an object without the metadata (uploaded before
+ * this was stored), a mismatch, an unreadable local file or a HEAD error just
+ * leaves the file unseeded, and the first save uploads it (which also writes
+ * the metadata, so the next restart can verify it).
+ *
+ * @returns {Promise<number>} files seeded
+ */
+async function seedKeptFiles(s3, keptFiles) {
+  let seeded = 0;
+  const queue = keptFiles.slice();
+  const worker = async () => {
+    for (let item = queue.shift(); item; item = queue.shift()) {
+      const { key, relativePath } = item;
+      let remoteHash;
+      try {
+        const head = await s3.send(new (getS3Sdk().HeadObjectCommand)({ Bucket: BUCKET, Key: key }));
+        remoteHash = head && head.Metadata ? head.Metadata[UPLOAD_HASH_METADATA_KEY] : undefined;
+      } catch (err) {
+        console.warn(
+          `[workspace-sync] Could not compare kept ${relativePath} with S3 (${err.message}) — it will be uploaded by the next save`,
+        );
+        continue;
+      }
+      if (!remoteHash) continue; // no stored hash: no evidence, upload later
+      const localHash = await localUploadHash(relativePath);
+      if (localHash && localHash === remoteHash) {
+        _uploadedHashes.set(relativePath, localHash);
+        seeded++;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(KEPT_VERIFY_CONCURRENCY, keptFiles.length) }, worker),
+  );
+  return seeded;
+}
+
+/**
+ * sha256 of the bytes uploadStateFile() would upload for `relativePath` right
+ * now (a SQLite database hashes as its snapshot), or null when that cannot be
+ * determined (missing, not a file, snapshot failure).
+ */
+async function localUploadHash(relativePath) {
+  const localFile = path.join(LOCAL_PATH, relativePath);
+  try {
+    if (!fs.statSync(localFile).isFile()) return null;
+    const content = relativePath.endsWith(SQLITE_EXT)
+      ? await snapshotSqlite(localFile)
+      : fs.readFileSync(localFile);
+    return contentHash(content);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -521,6 +602,12 @@ function walkDir(dir, root = dir, seen = new Set()) {
 // byte-identical to the previous one, so it dedupes those too.
 const _uploadedHashes = new Map();
 
+// Object metadata key under which every upload stores the sha256 (hex) of its
+// body. HeadObject returns it as Metadata[UPLOAD_HASH_METADATA_KEY]; the
+// fill-missing restore uses it to tell kept files that match S3 from those
+// that must be uploaded (see seedKeptFiles).
+const UPLOAD_HASH_METADATA_KEY = "sha256";
+
 function contentHash(content) {
   return crypto.createHash("sha256").update(content).digest("hex");
 }
@@ -595,6 +682,7 @@ async function uploadStateFile(namespace, relativePath, { force = false } = {}) 
       Bucket: BUCKET,
       Key: `${namespace}/${WORKSPACE_PREFIX}/${relativePath}`,
       Body: content,
+      Metadata: { [UPLOAD_HASH_METADATA_KEY]: hash },
     }),
   );
   _uploadedHashes.set(relativePath, hash);
@@ -1086,6 +1174,7 @@ module.exports = {
   uploadStateFile,
   CREDENTIAL_SCAN_EXEMPT,
   DEFAULT_SQLITE_MIN_INTERVAL_MS,
+  UPLOAD_HASH_METADATA_KEY,
   getRestoreState: () => _restoreState,
   // Tests exercise the save paths without a restore; production code must
   // only ever open the gate through restoreWorkspace().
