@@ -1404,7 +1404,11 @@ async function init(userId, actorId, channel) {
     // sessions.json at startup, so restoring files underneath a booting gateway
     // (the pre-2.0 behaviour) could hand it a half-restored state dir.
     // The lightweight agent answers users during this window, as before.
-    let restorePromise = null;
+    //
+    // The S3 restore ALWAYS runs: workspace-sync uploads nothing until it has
+    // completed (or S3 confirmed there is no saved state), and nothing at all
+    // from a container whose restore failed.
+    let restorePromise;
     if (sessionStorageAvailable) {
       // Session storage is primary — S3 becomes a cold backup (30min instead of 5min)
       workspaceSync.setBackupMode(true);
@@ -1414,7 +1418,14 @@ async function init(userId, actorId, channel) {
       const hasContent = stateStorage.sessionStorageHasContent(MOUNTED_OPENCLAW_DIR);
 
       if (hasContent) {
-        console.log("[contract] Session storage has existing data — skipping S3 restore");
+        // The mount's mirror may be partial: on staging a mid-turn restart found
+        // only the workspace files there (the 2 s workspace mirror had run, the
+        // 5 min state mirror had not), started with no state DBs or skill
+        // manifest, and the change backup then uploaded a fresh empty database
+        // over the good S3 copy. Fill in whatever is missing from S3 without
+        // touching the (fresher) files the mount did have.
+        console.log("[contract] Session storage has existing data — restoring only missing files from S3");
+        restorePromise = workspaceSync.restoreWorkspace(namespace, { overwrite: false });
       } else {
         console.log("[contract] Session storage is empty — restoring from S3 backup");
         restorePromise = workspaceSync.restoreWorkspace(namespace);
@@ -1423,11 +1434,9 @@ async function init(userId, actorId, channel) {
       // No session storage — use S3 sync as primary (existing behavior)
       restorePromise = workspaceSync.restoreWorkspace(namespace);
     }
-    if (restorePromise) {
-      // Bounded wait; the timer is cleared once the restore settles so the
-      // "still running" warning only fires on a genuine timeout.
-      await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);
-    }
+    // Bounded wait; the timer is cleared once the restore settles so the
+    // "still running" warning only fires on a genuine timeout.
+    await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);
 
     // 1f. Write OpenClaw config + AGENTS.md AFTER the session-storage restore
     // (so they are not overwritten by stale restored data) and
@@ -2498,7 +2507,7 @@ process.on("SIGTERM", async () => {
   //    with the gateway stop. On AgentCore the container is gone well under 5 s
   //    after SIGTERM (staging logs), so this is the step most likely to finish;
   //    everything below is best effort.
-  const urgentSave = workspaceSync.flushPendingSaves("sigterm");
+  const urgentSave = workspaceSync.flushPendingSaves("sigterm", { force: true });
 
   // 1. Stop the gateway so its SQLite databases are closed and checkpointed.
   //    Its own shutdown writes are seen by the change watcher (still running),
