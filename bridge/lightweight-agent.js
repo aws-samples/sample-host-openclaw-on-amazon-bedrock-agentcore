@@ -233,7 +233,9 @@ const TOOLS = [
       name: "install_skill",
       description:
         "Install a community skill from the ClawHub marketplace. " +
-        "The skill will be available after OpenClaw restarts (next session or idle timeout).",
+        "The install is recorded for the user and reinstalled automatically a few seconds after each new session starts; " +
+        "OpenClaw loads it when it next refreshes its skill list (at the latest at the next session start). " +
+        "A skill flagged by ClawHub's security review is refused — explain the refusal, do not retry.",
       parameters: {
         type: "object",
         properties: {
