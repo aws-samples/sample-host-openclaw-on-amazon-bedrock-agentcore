@@ -397,6 +397,7 @@ openclaw-on-agentcore/
     session-storage.md            # Persistent /mnt/workspace (Managed Session Storage)
     execute-command.md            # Operator CLI for InvokeAgentRuntimeCommand + security boundary
     gateway-mcp-tools.md          # Prototype: AgentCore Gateway MCP tools (design, identity flow, IAM, tests, live findings)
+    registry-pilot.md             # Plan: AWS Agent Registry as approval gate + shared catalogue for Gateway MCP tools (no code)
 ```
 
 ## CDK Stacks
@@ -776,7 +777,7 @@ During the warm-up phase (~first 1-2 min on cold start), the **lightweight agent
 
 ### AgentCore Gateway MCP tools (prototype)
 
-Off by default: `enable_gateway` is `false` in `cdk.json`, the `OpenClawGateway` stack is then not in the CDK app, the eight existing templates synthesize unchanged and `openclaw.json` gets no `mcp` block (asserted by `tests/test_gateway_stack_synth.py` and `bridge/gateway-mcp.test.js`). With the flag on, the `s3-user-files` and `eventbridge-cron` capabilities are additionally served as **typed MCP tools by an Amazon Bedrock AgentCore Gateway**, so the model calls `list_files` or `create_schedule` instead of composing a shell command, and the tool runs in a Lambda with its own least-privilege role instead of inside the user's microVM. The exec skills stay installed; both surfaces operate on the same S3 prefixes and the same `openclaw-cron` schedules. `api-keys` is not ported. Design, identity flow, IAM and live findings: [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md).
+Off by default: `enable_gateway` is `false` in `cdk.json`, the `OpenClawGateway` stack is then not in the CDK app, the eight existing templates synthesize unchanged and `openclaw.json` gets no `mcp` block (asserted by `tests/test_gateway_stack_synth.py` and `bridge/gateway-mcp.test.js`). With the flag on, the `s3-user-files` and `eventbridge-cron` capabilities are additionally served as **typed MCP tools by an Amazon Bedrock AgentCore Gateway**, so the model calls `list_files` or `create_schedule` instead of composing a shell command, and the tool runs in a Lambda with its own least-privilege role instead of inside the user's microVM. The exec skills stay installed; both surfaces operate on the same S3 prefixes and the same `openclaw-cron` schedules. `api-keys` is not ported. Design, identity flow, IAM and live findings: [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md). A plan for piloting AWS Agent Registry as the approval gate and shared catalogue for these Gateway tools (no code yet, behind a future `enable_registry` flag) is in [docs/registry-pilot.md](docs/registry-pilot.md).
 
 | Piece | What it does | Code |
 |---|---|---|
