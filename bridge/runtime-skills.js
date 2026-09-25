@@ -148,7 +148,9 @@ function writeManifest(file, manifest) {
     };
   }
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  // `.tmp-<digits>` is what state-storage.js / workspace-sync.js treat as a
+  // transient file, so a mirror that runs mid-write never copies it.
+  const tmp = `${file}.tmp-${Date.now()}${process.pid}`;
   fs.writeFileSync(tmp, `${JSON.stringify(out, null, 2)}\n`, "utf8");
   fs.renameSync(tmp, file);
   return out;
@@ -164,7 +166,7 @@ function mirrorManifest(file, mountStateDir = DEFAULT_MOUNT_STATE_DIR, { log = c
     if (!fs.existsSync(mountStateDir) || !fs.statSync(mountStateDir).isDirectory()) return false;
     if (!fs.existsSync(file)) return false;
     const dest = path.join(mountStateDir, path.basename(file));
-    const tmp = `${dest}.tmp-${process.pid}-${Date.now()}`;
+    const tmp = `${dest}.tmp-${Date.now()}${process.pid}`;
     fs.copyFileSync(file, tmp);
     fs.renameSync(tmp, dest);
     return true;
