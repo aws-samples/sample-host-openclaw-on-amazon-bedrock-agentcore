@@ -1,9 +1,16 @@
 /**
  * Workspace Sync — .openclaw/ directory persistence to/from S3.
  *
- * Restores a user's .openclaw/ directory from S3 on session start, and
- * periodically saves it back. Uses the same S3 bucket and client pattern
- * as the proxy's workspace files (readUserFileFromS3/writeUserFileToS3).
+ * Restores a user's .openclaw/ directory from S3 on session start, and saves
+ * it back: a full periodic save, a change-driven save of just the files that
+ * changed (debounced, see startChangeBackup()), and a best-effort final save
+ * on SIGTERM. Uses the same S3 bucket and client pattern as the proxy's
+ * workspace files (readUserFileFromS3/writeUserFileToS3).
+ *
+ * Nothing is uploaded until restoreWorkspace() has finished (or confirmed that
+ * S3 holds no state for the namespace), and nothing is uploaded from a
+ * container whose restore failed: a partially restored state dir must never
+ * overwrite the good copy in S3 (see the upload gate below).
  *
  * Namespace format: {actorId.replace(/:/g, "_")} (e.g., "telegram_123456789")
  * S3 prefix: {namespace}/.openclaw/
@@ -15,6 +22,8 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const stateStorage = require("./state-storage");
 
 // Lazy-require AWS SDK (only available inside Docker image, not in local dev/test)
 let _s3Sdk = null;
@@ -57,6 +66,9 @@ const SKIP_PATTERNS = [
   "*.sqlite-shm",
   "*.sqlite-journal",
   "*.sqlite-snapshot", // in-flight snapshotSqlite() staging files
+  // OpenClaw gateway lock files. SQLite-named but hold no state; snapshotting
+  // them fails ("not an error") on every save and they must never be restored.
+  "*.lock.sqlite",
   // Rotated config backups written by `openclaw doctor` — regenerated, never restored.
   "openclaw.json.bak",
   "*.json.bak.1",
@@ -238,25 +250,103 @@ async function snapshotSqlite(dbPath) {
   }
 }
 
+// --- upload gate ----------------------------------------------------------------
+//
+// State of the S3 restore for this process. Every upload path (change backup,
+// periodic save, single-file save, final save) is a no-op unless it is "ready":
+//   "unknown" — restoreWorkspace() has not been called yet
+//   "pending" — restore in flight (the gateway may already be running if the
+//               bounded pre-spawn wait timed out)
+//   "ready"   — every S3 object was restored, or S3 holds nothing for this
+//               namespace (new user), or there is no bucket/namespace at all
+//   "failed"  — the listing failed or at least one object could not be
+//               restored: local state may be partial, so this container never
+//               uploads (seen on staging: a same-session restart with no state
+//               DBs uploaded a fresh empty database over the good S3 copy
+//               within 20 s).
+let _restoreState = "unknown";
+
+function uploadsAllowed() {
+  return _restoreState === "ready";
+}
+
+let _gateWarned = false;
+function warnGated(what) {
+  if (_gateWarned) return;
+  _gateWarned = true;
+  console.warn(
+    `[workspace-sync] ${what} skipped: S3 restore is ${_restoreState} — uploads are disabled until it completes` +
+      (_restoreState === "failed" ? " (it failed, so they stay disabled in this container)" : ""),
+  );
+}
+
+function setRestoreState(state) {
+  _restoreState = state;
+  if (state === "ready") {
+    _gateWarned = false;
+    // Changes that arrived while the gate was closed are still dirty — upload them now.
+    if (_changeOpts && (_dirty.size > 0 || _sweepPending)) scheduleChangeFlush(0);
+  }
+}
+
 /**
  * Restore the .openclaw/ directory from S3 for a user namespace.
  * Downloads all objects under {namespace}/.openclaw/ to $HOME/.openclaw/.
  * Skips silently if no objects exist (new user).
+ *
+ * With `overwrite: false`, only files that are MISSING locally are downloaded
+ * and files that already exist are left untouched. This is the mode for a
+ * container whose session-storage mount already held some state: the mount's
+ * mirror may be partial (on staging a mid-turn restart found only the
+ * workspace files there — the 2 s workspace mirror had run, the 5 min state
+ * mirror had not), and the state DBs, runtime-skills manifest etc. must then
+ * come from S3 rather than be recreated empty by the gateway.
+ *
+ * Opens the upload gate on success (see above); on any failure the gate stays
+ * closed and the error is rethrown after being recorded.
+ *
+ * @param {string} namespace
+ * @param {{ overwrite?: boolean }} [opts]
+ * @returns {Promise<{ restored: number, kept: number, failed: number, hadState: boolean }>}
  */
-async function restoreWorkspace(namespace) {
+async function restoreWorkspace(namespace, { overwrite = true } = {}) {
   if (!BUCKET || !namespace) {
     console.log("[workspace-sync] No bucket or namespace — skipping restore");
-    return;
+    setRestoreState("ready"); // nothing to protect: uploads are no-ops without a bucket
+    return { restored: 0, kept: 0, failed: 0, hadState: false };
   }
+  setRestoreState("pending");
+  try {
+    const result = await runRestore(namespace, overwrite);
+    if (result.failed > 0) {
+      setRestoreState("failed");
+      console.warn(
+        `[workspace-sync] Restore incomplete (${result.failed} file(s) failed) — S3 uploads disabled for this container`,
+      );
+    } else {
+      setRestoreState("ready");
+    }
+    return result;
+  } catch (err) {
+    setRestoreState("failed");
+    console.warn(`[workspace-sync] Restore failed (${err.message}) — S3 uploads disabled for this container`);
+    throw err;
+  }
+}
 
+async function runRestore(namespace, overwrite) {
   const prefix = `${namespace}/${WORKSPACE_PREFIX}/`;
   const s3 = getS3Client();
 
   console.log(
-    `[workspace-sync] Restoring workspace from s3://${BUCKET}/${prefix}`,
+    `[workspace-sync] Restoring workspace from s3://${BUCKET}/${prefix}` +
+      (overwrite ? "" : " (missing files only — existing local files are kept)"),
   );
 
   let totalFiles = 0;
+  let kept = 0;
+  let failed = 0;
+  let hadState = false;
   let continuationToken;
 
   do {
@@ -273,6 +363,7 @@ async function restoreWorkspace(namespace) {
     for (const obj of objects) {
       const relativePath = obj.Key.slice(prefix.length);
       if (!relativePath || shouldSkip(relativePath)) continue;
+      hadState = true;
 
       // Validate object size before downloading (uses ListObjectsV2 Size field)
       if (obj.Size > MAX_FILE_SIZE) {
@@ -298,6 +389,14 @@ async function restoreWorkspace(namespace) {
         continue;
       }
 
+      if (!overwrite && fs.existsSync(localFile)) {
+        // Local copy (restored from the session-storage mirror) wins. Its hash
+        // is deliberately NOT seeded: it may differ from S3, and the first
+        // save must then upload it.
+        kept++;
+        continue;
+      }
+
       try {
         fs.mkdirSync(localDir, { recursive: true });
         const getResp = await s3.send(
@@ -307,9 +406,16 @@ async function restoreWorkspace(namespace) {
         for await (const chunk of getResp.Body) {
           chunks.push(chunk);
         }
-        fs.writeFileSync(localFile, Buffer.concat(chunks));
+        const content = Buffer.concat(chunks);
+        fs.writeFileSync(localFile, content);
+        // What is on disk now IS what S3 holds, so the first save after a
+        // restore must not re-upload it. Without this seed every restored file
+        // was PUT again by the first full save (SIGTERM / periodic) of the
+        // session even when nothing had touched it.
+        _uploadedHashes.set(relativePath, contentHash(content));
         totalFiles++;
       } catch (err) {
+        failed++;
         console.warn(
           `[workspace-sync] Failed to restore ${relativePath}: ${err.message}`,
         );
@@ -322,8 +428,12 @@ async function restoreWorkspace(namespace) {
   } while (continuationToken);
 
   console.log(
-    `[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}`,
+    `[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}` +
+      (kept ? `, kept ${kept} existing local file(s)` : "") +
+      (failed ? `, ${failed} failed` : "") +
+      (hadState ? "" : " (no saved state in S3 — new user)"),
   );
+  return { restored: totalFiles, kept, failed, hadState };
 }
 
 /**
@@ -405,19 +515,112 @@ function walkDir(dir, root = dir, seen = new Set()) {
   return results;
 }
 
+// Content hash (sha256) of the bytes last uploaded per relative path, for this
+// process. Lets the change-driven backup and the periodic save skip files that
+// were touched but not changed — a SQLite snapshot with no new commits is
+// byte-identical to the previous one, so it dedupes those too.
+const _uploadedHashes = new Map();
+
+function contentHash(content) {
+  return crypto.createHash("sha256").update(content).digest("hex");
+}
+
+/**
+ * Upload ONE file under $HOME/.openclaw/ to {namespace}/.openclaw/{relativePath}.
+ * Shared by saveWorkspace(), saveFile() and the change-driven backup.
+ *
+ * `relativePath` must already be normalised and inside the state dir; skip
+ * rules are the caller's job. Never throws on a per-file problem it can report
+ * (missing, oversized, snapshot failure) — those come back as an outcome — but
+ * lets S3 errors propagate so the caller can count and log them.
+ *
+ * @returns {Promise<"uploaded"|"unchanged"|"skipped"|"missing">}
+ */
+async function uploadStateFile(namespace, relativePath, { force = false } = {}) {
+  const localFile = path.join(LOCAL_PATH, relativePath);
+  let stat;
+  try {
+    stat = fs.statSync(localFile);
+  } catch {
+    _uploadedHashes.delete(relativePath);
+    return "missing"; // deleted between change and upload — nothing to do
+  }
+  if (!stat.isFile()) return "missing";
+  if (stat.size > MAX_FILE_SIZE) {
+    console.warn(
+      `[workspace-sync] Skipping ${relativePath} (${stat.size} bytes > ${MAX_FILE_SIZE})`,
+    );
+    return "skipped";
+  }
+
+  let content;
+  if (relativePath.endsWith(SQLITE_EXT)) {
+    // Live database: upload a consistent snapshot, never the raw file.
+    try {
+      content = await snapshotSqlite(localFile);
+    } catch (err) {
+      console.warn(
+        `[workspace-sync] Skipping ${relativePath}: SQLite snapshot failed (${err.message})`,
+      );
+      return "skipped";
+    }
+    if (content.length > MAX_FILE_SIZE) {
+      console.warn(
+        `[workspace-sync] Skipping ${relativePath} snapshot (${content.length} bytes > ${MAX_FILE_SIZE})`,
+      );
+      return "skipped";
+    }
+  } else {
+    content = fs.readFileSync(localFile);
+  }
+
+  const hash = contentHash(content);
+  if (!force && _uploadedHashes.get(relativePath) === hash) return "unchanged";
+
+  // Credential detection: warn (but don't block) when secrets are found.
+  // Exempt only the root-level native API key store — user made a conscious choice.
+  // Match exact relative path (not just basename) to prevent bypass via subdirectories.
+  if (relativePath !== CREDENTIAL_SCAN_EXEMPT) {
+    const detected = detectCredentials(content);
+    if (detected) {
+      console.warn(
+        `[workspace-sync] WARNING: Potential credential detected in ${relativePath} ` +
+        `(pattern: ${detected}). File will still be uploaded to S3.`,
+      );
+    }
+  }
+
+  await getS3Client().send(
+    new (getS3Sdk().PutObjectCommand)({
+      Bucket: BUCKET,
+      Key: `${namespace}/${WORKSPACE_PREFIX}/${relativePath}`,
+      Body: content,
+    }),
+  );
+  _uploadedHashes.set(relativePath, hash);
+  return "uploaded";
+}
+
 /**
  * Save the .openclaw/ directory to S3 for a user namespace.
  * Uploads all files under $HOME/.openclaw/ to {namespace}/.openclaw/.
- * Skips files matching SKIP_PATTERNS and files > MAX_FILE_SIZE.
+ * Skips files matching SKIP_PATTERNS, files > MAX_FILE_SIZE, and files whose
+ * content this process already uploaded (see _uploadedHashes).
  */
 async function saveWorkspace(namespace) {
   if (!BUCKET || !namespace) return;
+  if (!uploadsAllowed()) {
+    warnGated("Full save");
+    return;
+  }
 
-  const prefix = `${namespace}/${WORKSPACE_PREFIX}/`;
-  const s3 = getS3Client();
   const files = walkDir(LOCAL_PATH);
+  // A full save uploads every changed SQLite snapshot, so the change backup's
+  // SQLite throttle window restarts here.
+  if (files.some(isSqlitePath)) _lastSqliteFlushAt = Date.now();
 
   let uploaded = 0;
+  let unchanged = 0;
   let skipped = 0;
 
   for (const relativePath of files) {
@@ -425,62 +628,11 @@ async function saveWorkspace(namespace) {
       skipped++;
       continue;
     }
-
-    const localFile = path.join(LOCAL_PATH, relativePath);
     try {
-      const stat = fs.statSync(localFile);
-      if (stat.size > MAX_FILE_SIZE) {
-        console.warn(
-          `[workspace-sync] Skipping ${relativePath} (${stat.size} bytes > ${MAX_FILE_SIZE})`,
-        );
-        skipped++;
-        continue;
-      }
-
-      let content;
-      if (relativePath.endsWith(SQLITE_EXT)) {
-        // Live database: upload a consistent snapshot, never the raw file.
-        try {
-          content = await snapshotSqlite(localFile);
-        } catch (err) {
-          console.warn(
-            `[workspace-sync] Skipping ${relativePath}: SQLite snapshot failed (${err.message})`,
-          );
-          skipped++;
-          continue;
-        }
-        if (content.length > MAX_FILE_SIZE) {
-          console.warn(
-            `[workspace-sync] Skipping ${relativePath} snapshot (${content.length} bytes > ${MAX_FILE_SIZE})`,
-          );
-          skipped++;
-          continue;
-        }
-      } else {
-        content = fs.readFileSync(localFile);
-      }
-
-      // Credential detection: warn (but don't block) when secrets are found.
-      // Exempt only the root-level native API key store — user made a conscious choice.
-      // Match exact relative path (not just basename) to prevent bypass via subdirectories.
-      if (relativePath !== CREDENTIAL_SCAN_EXEMPT) {
-        const detected = detectCredentials(content);
-        if (detected) {
-          console.warn(
-            `[workspace-sync] WARNING: Potential credential detected in ${relativePath} ` +
-            `(pattern: ${detected}). File will still be uploaded to S3.`,
-          );
-        }
-      }
-
-      await s3.send(
-        new (getS3Sdk().PutObjectCommand)({
-          Bucket: BUCKET,
-          Key: `${prefix}${relativePath}`,
-          Body: content,
-        }),
-      );
-      uploaded++;
+      const outcome = await uploadStateFile(namespace, relativePath);
+      if (outcome === "uploaded") uploaded++;
+      else if (outcome === "unchanged") unchanged++;
+      else skipped++;
     } catch (err) {
       console.warn(
         `[workspace-sync] Failed to save ${relativePath}: ${err.message}`,
@@ -488,40 +640,51 @@ async function saveWorkspace(namespace) {
     }
   }
 
-  console.log(`[workspace-sync] Saved ${uploaded} file(s), skipped ${skipped}`);
+  console.log(
+    `[workspace-sync] Saved ${uploaded} file(s), ${unchanged} unchanged, skipped ${skipped}`,
+  );
+}
+
+/**
+ * Normalise a path relative to the state dir for S3 use, or return null when it
+ * escapes the state dir.
+ */
+function normalizeRelativePath(relativePath) {
+  const normalized = path.posix.normalize(String(relativePath).split(path.sep).join("/"));
+  if (
+    !normalized ||
+    normalized === "." ||
+    normalized === ".." ||
+    normalized.startsWith("../") ||
+    path.posix.isAbsolute(normalized)
+  ) {
+    return null;
+  }
+  return normalized;
 }
 
 /**
  * Back up ONE file under $HOME/.openclaw/ to S3 right away, outside the
  * periodic save. For small state that must survive a cold start that happens
  * before the next periodic save (the runtime-skills manifest). Same key layout
- * and skip rules as saveWorkspace(); resolves false when nothing was uploaded.
+ * and skip rules as saveWorkspace(); resolves false when nothing was uploaded
+ * (missing, skipped, or content unchanged since the last upload).
  */
 async function saveFile(namespace, relativePath) {
   if (!BUCKET || !namespace || !relativePath) return false;
-  const normalized = path.posix.normalize(relativePath.split(path.sep).join("/"));
-  if (normalized.startsWith("../") || normalized === ".." || path.posix.isAbsolute(normalized)) {
+  const normalized = normalizeRelativePath(relativePath);
+  if (!normalized) {
     console.warn(`[workspace-sync] Refusing to save path outside the state dir: ${relativePath}`);
     return false;
   }
   if (shouldSkip(normalized)) return false;
-  const localFile = path.join(LOCAL_PATH, normalized);
-  let content;
-  try {
-    const stat = fs.statSync(localFile);
-    if (!stat.isFile() || stat.size > MAX_FILE_SIZE) return false;
-    content = fs.readFileSync(localFile);
-  } catch {
-    return false; // deleted between change and upload — the periodic save will catch up
+  if (!uploadsAllowed()) {
+    warnGated(`Save of ${normalized}`);
+    return false;
   }
-  await getS3Client().send(
-    new (getS3Sdk().PutObjectCommand)({
-      Bucket: BUCKET,
-      Key: `${namespace}/${WORKSPACE_PREFIX}/${normalized}`,
-      Body: content,
-    }),
-  );
-  console.log(`[workspace-sync] Saved ${normalized} (${content.length} bytes)`);
+  const outcome = await uploadStateFile(namespace, normalized);
+  if (outcome !== "uploaded") return false;
+  console.log(`[workspace-sync] Saved ${normalized}`);
   return true;
 }
 
@@ -561,14 +724,339 @@ function startPeriodicSave(namespace, intervalMs) {
   );
 }
 
+
+// --- change-driven backup -----------------------------------------------------
+//
+// AgentCore stops a session's container (idle timeout, max lifetime,
+// StopRuntimeSession) without a usable grace period: on staging the process
+// was gone well under 5 s after SIGTERM, and idle terminations showed no
+// SIGTERM at all. Whatever is not in S3 by then is lost at the next cold start.
+// So instead of relying on the 30-minute periodic save or the SIGTERM save,
+// watch the state dir and upload each changed file a few seconds after it
+// changes — debounced, bounded, through the same skip rules and SQLite snapshot
+// path as saveWorkspace().
+
+const DEFAULT_CHANGE_DEBOUNCE_MS = 5000;
+const DEFAULT_CHANGE_MAX_WAIT_MS = 30000;
+const DEFAULT_CHANGE_MAX_FILES_PER_FLUSH = 100;
+const DEFAULT_CHANGE_POLL_INTERVAL_MS = 60000;
+const CHANGE_UPLOAD_CONCURRENCY = 4;
+// SQLite-only throttle. The gateway writes a lease heartbeat into
+// state/openclaw.sqlite every 30 s, so an IDLE session would otherwise upload a
+// ~4 MB snapshot ~116 times an hour (staging, round 1). When the only dirty
+// files are SQLite databases, their snapshots go up at most once per this
+// interval. A change to any non-SQLite file flushes the pending snapshots with
+// it, and the SIGTERM flush / stopChangeBackup() / the periodic full save
+// always include them. Cost: on a stop with no SIGTERM (idle timeout), up to
+// this much SQLite-only history (session rows that no memory/workspace write
+// accompanied) can be lost.
+const DEFAULT_SQLITE_MIN_INTERVAL_MS = 5 * 60 * 1000;
+// SQLite writes land in the sidecars first (WAL mode); a change to any of them
+// means the main database has new commits to snapshot.
+const SQLITE_SIDECAR_RE = /^(.*\.sqlite)-(wal|shm|journal)$/;
+// Our own / state-storage's atomic-copy temp files.
+const TMP_COPY_RE = /\.tmp-\d+$/;
+// OpenClaw's scratch dir at the state-dir root (gateway locks, staging files).
+const STATE_TMP_DIR = "tmp";
+
+let _changeOpts = null; // { namespace, debounceMs, maxWaitMs, maxFilesPerFlush }
+let _changeWatcher = null;
+let _changePollTimer = null;
+let _changeDebounce = null;
+let _changeDeadline = null;
+let _dirty = new Set();
+let _sweepPending = false;
+let _flushInFlight = null;
+let _lastFlushHadFailures = false;
+// When SQLite snapshots were last included in an upload pass (change flush or
+// full save). 0 = never, so the first SQLite change of a session is not held.
+let _lastSqliteFlushAt = 0;
+
+function isSqlitePath(rel) {
+  return rel.endsWith(SQLITE_EXT);
+}
+
 /**
- * Stop periodic saves and do a final save.
+ * Map a change event path (relative to the state dir) to the file that should
+ * be uploaded for it, or null when the change is not worth a backup: outside
+ * the state dir, a transient/staging file, or a SKIP_PATTERNS match. SQLite
+ * sidecar events map onto their main database.
+ */
+function changeTarget(relativePath) {
+  let rel = normalizeRelativePath(relativePath);
+  if (!rel) return null;
+  const sidecar = rel.match(SQLITE_SIDECAR_RE);
+  if (sidecar) rel = sidecar[1];
+  const parts = rel.split("/");
+  if (parts[0] === STATE_TMP_DIR) return null;
+  if (parts.slice(0, -1).some((dir) => stateStorage.isTransientDir(dir))) return null;
+  const name = parts[parts.length - 1];
+  if (TMP_COPY_RE.test(name) || name.endsWith(".sqlite-snapshot")) return null;
+  if (shouldSkip(rel)) return null;
+  return rel;
+}
+
+function clearChangeTimers() {
+  if (_changeDebounce) { clearTimeout(_changeDebounce); _changeDebounce = null; }
+  if (_changeDeadline) { clearTimeout(_changeDeadline); _changeDeadline = null; }
+}
+
+function scheduleChangeFlush(delayMs) {
+  if (!_changeOpts) return;
+  const { debounceMs, maxWaitMs } = _changeOpts;
+  if (_changeDebounce) clearTimeout(_changeDebounce);
+  _changeDebounce = setTimeout(() => {
+    flushPendingSaves("change").catch(() => {});
+  }, delayMs === undefined ? debounceMs : delayMs);
+  if (typeof _changeDebounce.unref === "function") _changeDebounce.unref();
+  if (!_changeDeadline) {
+    // A steady stream of changes must not postpone the upload forever. (A
+    // deliberate SQLite hold is longer than maxWaitMs; it is its own deadline.)
+    _changeDeadline = setTimeout(() => {
+      flushPendingSaves("deadline").catch(() => {});
+    }, Math.max(maxWaitMs, delayMs || 0));
+    if (typeof _changeDeadline.unref === "function") _changeDeadline.unref();
+  }
+}
+
+/**
+ * Record that `filename` (relative to the state dir, as fs.watch reports it)
+ * changed. A null filename (the platform could not say which) requests a full
+ * sweep of the state dir at the next flush.
+ */
+function markChanged(filename) {
+  if (!_changeOpts) return;
+  if (filename === null || filename === undefined || filename === "") {
+    _sweepPending = true;
+  } else {
+    const target = changeTarget(filename.toString());
+    if (!target) return;
+    _dirty.add(target);
+  }
+  scheduleChangeFlush();
+}
+
+async function uploadBatch(namespace, batch, result) {
+  let next = 0;
+  const worker = async () => {
+    while (next < batch.length) {
+      const rel = batch[next++];
+      try {
+        result[await uploadStateFile(namespace, rel)]++;
+      } catch (err) {
+        result.failed++;
+        _dirty.add(rel); // retried by the next flush (with a longer delay) or the periodic save
+        console.warn(`[workspace-sync] Change backup failed for ${rel}: ${err.message}`);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(CHANGE_UPLOAD_CONCURRENCY, batch.length) }, worker),
+  );
+}
+
+/**
+ * One upload pass over the dirty set. Non-SQLite files go first; SQLite
+ * snapshots follow only when `force` is set, the SQLite throttle interval has
+ * elapsed, or this pass actually changed something in S3 (a non-SQLite upload
+ * or a failed attempt at one) — otherwise they stay dirty and `held`/`holdMs`
+ * say for how long. `deferred` counts files left over by maxFilesPerFlush.
+ */
+async function runChangeFlush(reason, { force = false } = {}) {
+  const { namespace, maxFilesPerFlush, sqliteMinIntervalMs } = _changeOpts;
+  const result = { uploaded: 0, unchanged: 0, skipped: 0, missing: 0, failed: 0, deferred: 0, held: 0, holdMs: 0 };
+  if (!uploadsAllowed()) {
+    // Keep the dirty set (and the sweep request) for when the restore
+    // completes; setRestoreState("ready") schedules the flush.
+    warnGated(`Change backup (${reason})`);
+    result.deferred = _dirty.size;
+    return result;
+  }
+  if (_sweepPending) {
+    _sweepPending = false;
+    for (const rel of walkDir(LOCAL_PATH)) {
+      const target = changeTarget(rel);
+      if (target) _dirty.add(target);
+    }
+  }
+  const plain = [];
+  const sqlite = [];
+  for (const rel of _dirty) (isSqlitePath(rel) ? sqlite : plain).push(rel);
+
+  const plainBatch = plain.slice(0, maxFilesPerFlush);
+  for (const rel of plainBatch) _dirty.delete(rel);
+  if (plainBatch.length) await uploadBatch(namespace, plainBatch, result);
+
+  const now = Date.now();
+  const dueAt = _lastSqliteFlushAt + sqliteMinIntervalMs;
+  const includeSqlite = force || now >= dueAt || result.uploaded > 0 || result.failed > 0;
+  if (sqlite.length) {
+    if (includeSqlite) {
+      const sqliteBatch = sqlite.slice(0, Math.max(0, maxFilesPerFlush - plainBatch.length));
+      if (sqliteBatch.length) {
+        _lastSqliteFlushAt = now;
+        for (const rel of sqliteBatch) _dirty.delete(rel);
+        await uploadBatch(namespace, sqliteBatch, result);
+      }
+    } else {
+      result.held = sqlite.length;
+      result.holdMs = Math.max(1, dueAt - now);
+    }
+  }
+  result.deferred = _dirty.size - result.held;
+
+  _lastFlushHadFailures = result.failed > 0;
+  if (result.uploaded || result.failed || result.deferred) {
+    console.log(
+      `[workspace-sync] Change backup (${reason}): ${result.uploaded} uploaded, ${result.unchanged} unchanged, ` +
+        `${result.skipped} skipped, ${result.failed} failed, ${result.deferred} deferred` +
+        (result.held ? `, ${result.held} SQLite snapshot(s) held for ${Math.round(result.holdMs / 1000)}s` : ""),
+    );
+  }
+  return result;
+}
+
+/**
+ * Upload everything marked dirty now (coalescing onto an in-flight flush).
+ * `force` includes SQLite snapshots regardless of the throttle (SIGTERM, stop).
+ * Resolves with the flush result, or null when the change backup is not
+ * running. Never rejects.
+ */
+function flushPendingSaves(reason = "flush", { force = false } = {}) {
+  clearChangeTimers();
+  if (!_changeOpts) return Promise.resolve(null);
+  if (_flushInFlight) return _flushInFlight;
+  _flushInFlight = runChangeFlush(reason, { force })
+    .catch((err) => {
+      console.warn(`[workspace-sync] Change backup (${reason}) failed: ${err.message}`);
+      return null;
+    })
+    .then((result) => {
+      _flushInFlight = null;
+      if (_changeOpts && uploadsAllowed() && (_dirty.size > 0 || _sweepPending)) {
+        // Leftovers: deferred by maxFilesPerFlush, failed, held by the SQLite
+        // throttle, or changed mid-flush. Failed ones wait the longer
+        // maxWaitMs so a persistent S3 error does not turn into a hot retry
+        // loop; held snapshots wait until the throttle interval has elapsed.
+        let delay;
+        if (_lastFlushHadFailures) delay = _changeOpts.maxWaitMs;
+        else if (result && result.held > 0 && result.deferred === 0 && !_sweepPending) delay = result.holdMs;
+        scheduleChangeFlush(delay);
+      }
+      return result;
+    });
+  return _flushInFlight;
+}
+
+function startChangePollFallback(intervalMs) {
+  if (_changePollTimer) clearInterval(_changePollTimer);
+  _changePollTimer = setInterval(() => {
+    _sweepPending = true;
+    scheduleChangeFlush(0);
+  }, intervalMs);
+  if (typeof _changePollTimer.unref === "function") _changePollTimer.unref();
+}
+
+/**
+ * Watch $HOME/.openclaw/ and upload changed files to S3 shortly after they
+ * change: `debounceMs` after the last change, at most `maxWaitMs` after the
+ * first change of a burst, at most `maxFilesPerFlush` files per flush. Uses
+ * fs.watch({ recursive: true }); when that is unavailable, falls back to a
+ * full sweep every `fallbackIntervalMs`. Idempotent — calling again replaces
+ * the previous watcher but keeps the pending dirty set.
+ *
+ * @returns {{ mode: "watch" | "poll" | "none" }}
+ */
+function startChangeBackup(namespace, opts = {}) {
+  closeChangeWatcher();
+  if (!BUCKET || !namespace) {
+    console.log("[workspace-sync] No bucket or namespace — change backup disabled");
+    return { mode: "none" };
+  }
+  const debounceMs = opts.debounceMs ||
+    parseInt(process.env.WORKSPACE_SYNC_CHANGE_DEBOUNCE_MS || String(DEFAULT_CHANGE_DEBOUNCE_MS), 10);
+  const maxWaitMs = opts.maxWaitMs ||
+    parseInt(process.env.WORKSPACE_SYNC_CHANGE_MAX_WAIT_MS || String(DEFAULT_CHANGE_MAX_WAIT_MS), 10);
+  const sqliteMinIntervalMs = opts.sqliteMinIntervalMs !== undefined
+    ? opts.sqliteMinIntervalMs
+    : parseInt(process.env.WORKSPACE_SYNC_SQLITE_MIN_INTERVAL_MS || String(DEFAULT_SQLITE_MIN_INTERVAL_MS), 10);
+  _changeOpts = {
+    namespace,
+    debounceMs,
+    maxWaitMs: Math.max(maxWaitMs, debounceMs),
+    maxFilesPerFlush: opts.maxFilesPerFlush || DEFAULT_CHANGE_MAX_FILES_PER_FLUSH,
+    sqliteMinIntervalMs: Math.max(0, sqliteMinIntervalMs),
+  };
+  const fallbackIntervalMs = opts.fallbackIntervalMs || DEFAULT_CHANGE_POLL_INTERVAL_MS;
+  try {
+    fs.mkdirSync(LOCAL_PATH, { recursive: true });
+    _changeWatcher = fs.watch(LOCAL_PATH, { recursive: true, persistent: false }, (_event, filename) => {
+      markChanged(filename);
+    });
+    _changeWatcher.on("error", (err) => {
+      console.warn(`[workspace-sync] Change watcher error: ${err.message} — falling back to polling`);
+      try { _changeWatcher.close(); } catch { /* already closed */ }
+      _changeWatcher = null;
+      startChangePollFallback(fallbackIntervalMs);
+    });
+    console.log(
+      `[workspace-sync] Change backup started on ${LOCAL_PATH} (debounce ${debounceMs}ms, max wait ${_changeOpts.maxWaitMs}ms, ` +
+        `SQLite-only changes at most every ${_changeOpts.sqliteMinIntervalMs / 1000}s)`,
+    );
+    return { mode: "watch" };
+  } catch (err) {
+    console.warn(
+      `[workspace-sync] fs.watch unavailable (${err.message}) — sweeping ${LOCAL_PATH} every ${fallbackIntervalMs / 1000}s`,
+    );
+    startChangePollFallback(fallbackIntervalMs);
+    return { mode: "poll" };
+  }
+}
+
+function closeChangeWatcher() {
+  if (_changeWatcher) {
+    try { _changeWatcher.close(); } catch { /* already closed */ }
+    _changeWatcher = null;
+  }
+  if (_changePollTimer) {
+    clearInterval(_changePollTimer);
+    _changePollTimer = null;
+  }
+  clearChangeTimers();
+}
+
+/**
+ * Stop watching and upload whatever is still pending. Runs a full (hash-deduped)
+ * sweep of the state dir rather than trusting the dirty set alone, so writes
+ * whose watch events have not been delivered yet — the gateway's last writes
+ * before it exits — are caught too. Changes that arrive while that flush runs
+ * get one more flush. Bounded by the caller's shutdown budget, never rejects.
+ */
+async function stopChangeBackup(reason = "stop") {
+  if (!_changeOpts) {
+    closeChangeWatcher();
+    return null;
+  }
+  _sweepPending = true;
+  let result = await flushPendingSaves(reason, { force: true });
+  closeChangeWatcher();
+  if (uploadsAllowed() && (_dirty.size > 0 || _sweepPending)) {
+    result = await flushPendingSaves(`${reason}-2`, { force: true });
+  }
+  clearChangeTimers();
+  _changeOpts = null;
+  return result;
+}
+
+/**
+ * Stop periodic saves and the change backup, then do a final full save.
  */
 async function cleanup(namespace) {
   if (_saveInterval) {
     clearInterval(_saveInterval);
     _saveInterval = null;
   }
+  await stopChangeBackup("cleanup");
   if (namespace) {
     console.log("[workspace-sync] Final save before shutdown...");
     await saveWorkspace(namespace);
@@ -581,6 +1069,9 @@ module.exports = {
   saveWorkspace,
   saveFile,
   startPeriodicSave,
+  startChangeBackup,
+  stopChangeBackup,
+  flushPendingSaves,
   cleanup,
   configureCredentials,
   setBackupMode,
@@ -590,5 +1081,13 @@ module.exports = {
   walkDir,
   detectCredentials,
   snapshotSqlite,
+  changeTarget,
+  markChanged,
+  uploadStateFile,
   CREDENTIAL_SCAN_EXEMPT,
+  DEFAULT_SQLITE_MIN_INTERVAL_MS,
+  getRestoreState: () => _restoreState,
+  // Tests exercise the save paths without a restore; production code must
+  // only ever open the gate through restoreWorkspace().
+  _setRestoreStateForTests: setRestoreState,
 };

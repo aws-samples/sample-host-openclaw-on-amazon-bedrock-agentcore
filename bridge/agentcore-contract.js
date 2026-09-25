@@ -52,8 +52,10 @@ const OPENCLAW_DIR = stateStorage.resolvePaths().stateDir;
 const MOUNTED_OPENCLAW_DIR = stateStorage.resolvePaths().mountStateDir;
 // Max time the SIGTERM handler waits for the gateway to exit before taking the
 // shutdown state snapshot (a closed database gives a fully quiesced copy; the
-// snapshot is consistent either way via the SQLite online backup API).
-const GATEWAY_STOP_WAIT_MS = parseInt(process.env.GATEWAY_STOP_WAIT_MS || "5000", 10);
+// snapshot is consistent either way via the SQLite online backup API). Kept
+// short: on AgentCore the container was gone well under 5 s after SIGTERM
+// (staging logs), and an idle gateway reaches "shutdown started" within ~50 ms.
+const GATEWAY_STOP_WAIT_MS = parseInt(process.env.GATEWAY_STOP_WAIT_MS || "2000", 10);
 
 // Gateway token — fetched from Secrets Manager eagerly at boot.
 // No fallback — container will fail to authenticate WebSocket if not set.
@@ -933,6 +935,7 @@ async function pollOpenClawReadiness(namespace) {
   if (ready) {
     openclawReady = true;
     workspaceSync.startPeriodicSave(namespace);
+    workspaceSync.startChangeBackup(namespace);
     startRuntimeSkillManifestBackup(namespace);
     if (sessionStorageActive) {
       stateStorage.startPeriodicMirror({
@@ -1401,7 +1404,11 @@ async function init(userId, actorId, channel) {
     // sessions.json at startup, so restoring files underneath a booting gateway
     // (the pre-2.0 behaviour) could hand it a half-restored state dir.
     // The lightweight agent answers users during this window, as before.
-    let restorePromise = null;
+    //
+    // The S3 restore ALWAYS runs: workspace-sync uploads nothing until it has
+    // completed (or S3 confirmed there is no saved state), and nothing at all
+    // from a container whose restore failed.
+    let restorePromise;
     if (sessionStorageAvailable) {
       // Session storage is primary — S3 becomes a cold backup (30min instead of 5min)
       workspaceSync.setBackupMode(true);
@@ -1411,7 +1418,14 @@ async function init(userId, actorId, channel) {
       const hasContent = stateStorage.sessionStorageHasContent(MOUNTED_OPENCLAW_DIR);
 
       if (hasContent) {
-        console.log("[contract] Session storage has existing data — skipping S3 restore");
+        // The mount's mirror may be partial: on staging a mid-turn restart found
+        // only the workspace files there (the 2 s workspace mirror had run, the
+        // 5 min state mirror had not), started with no state DBs or skill
+        // manifest, and the change backup then uploaded a fresh empty database
+        // over the good S3 copy. Fill in whatever is missing from S3 without
+        // touching the (fresher) files the mount did have.
+        console.log("[contract] Session storage has existing data — restoring only missing files from S3");
+        restorePromise = workspaceSync.restoreWorkspace(namespace, { overwrite: false });
       } else {
         console.log("[contract] Session storage is empty — restoring from S3 backup");
         restorePromise = workspaceSync.restoreWorkspace(namespace);
@@ -1420,11 +1434,9 @@ async function init(userId, actorId, channel) {
       // No session storage — use S3 sync as primary (existing behavior)
       restorePromise = workspaceSync.restoreWorkspace(namespace);
     }
-    if (restorePromise) {
-      // Bounded wait; the timer is cleared once the restore settles so the
-      // "still running" warning only fires on a genuine timeout.
-      await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);
-    }
+    // Bounded wait; the timer is cleared once the restore settles so the
+    // "still running" warning only fires on a genuine timeout.
+    await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);
 
     // 1f. Write OpenClaw config + AGENTS.md AFTER the session-storage restore
     // (so they are not overwritten by stale restored data) and
@@ -2489,22 +2501,35 @@ process.on("SIGTERM", async () => {
   const saveTimeout = setTimeout(() => {
     console.warn("[contract] Workspace save timeout — exiting");
     process.exit(0);
-  }, 10000 + (sessionStorageActive ? GATEWAY_STOP_WAIT_MS : 0));
+  }, 10000 + GATEWAY_STOP_WAIT_MS);
 
-  // 1. Stop the gateway first so its SQLite databases are closed and
-  //    checkpointed, then take the shutdown snapshot onto the mount. The
-  //    snapshot is what the next cold start restores before spawning.
+  // 0. Upload what the change backup already knows is dirty — now, in parallel
+  //    with the gateway stop. On AgentCore the container is gone well under 5 s
+  //    after SIGTERM (staging logs), so this is the step most likely to finish;
+  //    everything below is best effort.
+  const urgentSave = workspaceSync.flushPendingSaves("sigterm", { force: true });
+
+  // 1. Stop the gateway so its SQLite databases are closed and checkpointed.
+  //    Its own shutdown writes are seen by the change watcher (still running),
+  //    so upload those last changes next, then ship the log lines so far.
   stateStorage.stopPeriodicMirror();
+  const exited = await stopGateway(GATEWAY_STOP_WAIT_MS);
+  console.log(
+    `[contract] Gateway ${exited ? "stopped" : "still running"} before shutdown snapshot`,
+  );
+  await urgentSave;
+  await workspaceSync.stopChangeBackup("sigterm");
+  cwLogger.flush().catch(() => {});
+
+  // 2. Snapshot the state dir onto the mount — what the next cold start
+  //    restores before spawning, when the mount survives the stop.
   stateStorage.stopWorkspaceWatcher();
   if (sessionStorageActive) {
-    const exited = await stopGateway(GATEWAY_STOP_WAIT_MS);
-    console.log(
-      `[contract] Gateway ${exited ? "stopped" : "still running"} before shutdown snapshot`,
-    );
     await mirrorStateToSessionStorage("shutdown");
   }
 
-  // 2. S3 backup (workspace files + state dir snapshots, all from local disk)
+  // 3. Full S3 backup (workspace files + state dir snapshots, all from local
+  //    disk). Files uploaded above are skipped by content hash.
   try {
     await workspaceSync.cleanup(currentNamespace);
   } catch (err) {
