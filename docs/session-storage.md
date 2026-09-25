@@ -11,7 +11,10 @@ AgentCore Runtime supports [Managed Session Storage](https://docs.aws.amazon.com
    mount's mirror of it (`/mnt/workspace/.openclaw`) to local disk before the gateway spawns
 2. On resumed sessions (storage has data), S3 restore is skipped
 3. On new sessions (storage empty), workspace is restored from S3 once
-4. S3 sync switches to **backup mode** (every 30 min vs 5 min) — session storage is primary
+4. S3 sync switches to **backup mode** — session storage is primary. The full save runs every 30 min
+   (vs 5 min), and on top of it a change-driven backup (`workspaceSync.startChangeBackup()`) uploads
+   each changed file a few seconds after it changes (5 s debounce, 30 s ceiling per burst, ≤100 files
+   per flush, content-hash deduped, `*.sqlite` as snapshots)
 5. While the gateway runs, the local state dir is mirrored onto the mount every 5 minutes
    (`STATE_MIRROR_INTERVAL_MS`) and once more on `SIGTERM`, after the gateway has been stopped;
    the `workspace/` subtree is additionally mirrored within a few seconds of any change by a
@@ -47,7 +50,7 @@ The whole state dir therefore lives on local disk and the mount holds a mirror o
   │              consistent snapshot (node:sqlite online backup API), -wal/-shm never copied
   └── everything restored from that mirror on the next cold start, before the gateway spawns
                                     │
-                              S3 cold backup (every 30 min, same snapshot rule)
+                              S3 backup: every changed file ~5 s after it changes + full save every 30 min (same snapshot rule)
 ```
 
 Workspace files persist as of the last watcher flush (seconds after the change). Everything else
@@ -65,7 +68,7 @@ Session storage is the primary durability layer: workspace writes reach persiste
 seconds, and the state mirror on the mount survives a normal stop/resume within the 14-day idle
 window.
 
-S3 is only a cold backup. In backup mode it syncs every 30 minutes, and `agentcore-contract.js` performs a final `saveWorkspace()` on `SIGTERM` (see `workspaceSync.cleanup()`). OpenClaw 2.0 keeps session state in per-agent SQLite databases (`agents/<id>/agent/openclaw-agent.sqlite`, WAL mode); `saveWorkspace()` uploads a consistent point-in-time snapshot of each `*.sqlite` file (node:sqlite online backup API) and skips the `-wal`/`-shm` sidecars, so an S3 restore never yields a torn database. See [openclaw-2.0-upgrade.md](openclaw-2.0-upgrade.md). So on a graceful shutdown, S3 is current. On an **unexpected** container stop (no SIGTERM), the S3 backup can lag by up to the 30-minute interval — but session storage still holds the latest state, so this window only matters if session storage is also lost (e.g. the 14-day retention elapses or the endpoint version changes, which refreshes the mount).
+S3 is the backup that has to be current at any moment, because AgentCore gives the container no usable grace period when it stops a session: on staging the process was gone well under 5 s after `SIGTERM` on an explicit `StopRuntimeSession`, and idle terminations showed no `SIGTERM` at all (see the lifecycle docs: "Termination can last up to 15 seconds due to logging and other process completion" — that is the platform's own teardown, not time given to the container). So `workspace-sync.js` does not wait for a timer or a signal: `startChangeBackup()` watches `~/.openclaw` (`fs.watch`, recursive) and uploads each changed file 5 s after its last change (30 s ceiling per burst, ≤100 files per flush, 4 uploads in parallel). A sha256 index of what was last uploaded skips touched-but-identical files, the same `SKIP_PATTERNS` apply, transient/staging paths (`tmp/`, `openclaw-bootstrap-*`, `.tmp-N`, `*.lock.sqlite`) are ignored, and a change to a `-wal`/`-shm` sidecar marks its main `*.sqlite` dirty, which is then uploaded as a consistent point-in-time snapshot (node:sqlite online backup API — never the raw live file, and only when the snapshot bytes differ from the last upload). OpenClaw 2.0 keeps session state in per-agent SQLite databases (`agents/<id>/agent/openclaw-agent.sqlite`, WAL mode); the same snapshot rule applies to the 30-minute full `saveWorkspace()` (which now also skips unchanged files) and to the final save on `SIGTERM`. On `SIGTERM` the contract first flushes whatever is already dirty (in parallel with stopping the gateway, ≤2 s `GATEWAY_STOP_WAIT_MS`), then sweeps the state dir once more for the gateway's last writes, then mirrors to the mount and runs the full save — best effort, since the container may be gone by then. See [openclaw-2.0-upgrade.md](openclaw-2.0-upgrade.md). Idle sessions cost no S3 requests (nothing changes); an active chat costs a few PUTs per turn.
 
 ## Inspecting the mount directly
 

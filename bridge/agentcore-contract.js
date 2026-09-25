@@ -52,8 +52,10 @@ const OPENCLAW_DIR = stateStorage.resolvePaths().stateDir;
 const MOUNTED_OPENCLAW_DIR = stateStorage.resolvePaths().mountStateDir;
 // Max time the SIGTERM handler waits for the gateway to exit before taking the
 // shutdown state snapshot (a closed database gives a fully quiesced copy; the
-// snapshot is consistent either way via the SQLite online backup API).
-const GATEWAY_STOP_WAIT_MS = parseInt(process.env.GATEWAY_STOP_WAIT_MS || "5000", 10);
+// snapshot is consistent either way via the SQLite online backup API). Kept
+// short: on AgentCore the container was gone well under 5 s after SIGTERM
+// (staging logs), and an idle gateway reaches "shutdown started" within ~50 ms.
+const GATEWAY_STOP_WAIT_MS = parseInt(process.env.GATEWAY_STOP_WAIT_MS || "2000", 10);
 
 // Gateway token — fetched from Secrets Manager eagerly at boot.
 // No fallback — container will fail to authenticate WebSocket if not set.
@@ -933,6 +935,7 @@ async function pollOpenClawReadiness(namespace) {
   if (ready) {
     openclawReady = true;
     workspaceSync.startPeriodicSave(namespace);
+    workspaceSync.startChangeBackup(namespace);
     startRuntimeSkillManifestBackup(namespace);
     if (sessionStorageActive) {
       stateStorage.startPeriodicMirror({
@@ -2499,22 +2502,35 @@ process.on("SIGTERM", async () => {
   const saveTimeout = setTimeout(() => {
     console.warn("[contract] Workspace save timeout — exiting");
     process.exit(0);
-  }, 10000 + (sessionStorageActive ? GATEWAY_STOP_WAIT_MS : 0));
+  }, 10000 + GATEWAY_STOP_WAIT_MS);
 
-  // 1. Stop the gateway first so its SQLite databases are closed and
-  //    checkpointed, then take the shutdown snapshot onto the mount. The
-  //    snapshot is what the next cold start restores before spawning.
+  // 0. Upload what the change backup already knows is dirty — now, in parallel
+  //    with the gateway stop. On AgentCore the container is gone well under 5 s
+  //    after SIGTERM (staging logs), so this is the step most likely to finish;
+  //    everything below is best effort.
+  const urgentSave = workspaceSync.flushPendingSaves("sigterm");
+
+  // 1. Stop the gateway so its SQLite databases are closed and checkpointed.
+  //    Its own shutdown writes are seen by the change watcher (still running),
+  //    so upload those last changes next, then ship the log lines so far.
   stateStorage.stopPeriodicMirror();
+  const exited = await stopGateway(GATEWAY_STOP_WAIT_MS);
+  console.log(
+    `[contract] Gateway ${exited ? "stopped" : "still running"} before shutdown snapshot`,
+  );
+  await urgentSave;
+  await workspaceSync.stopChangeBackup("sigterm");
+  cwLogger.flush().catch(() => {});
+
+  // 2. Snapshot the state dir onto the mount — what the next cold start
+  //    restores before spawning, when the mount survives the stop.
   stateStorage.stopWorkspaceWatcher();
   if (sessionStorageActive) {
-    const exited = await stopGateway(GATEWAY_STOP_WAIT_MS);
-    console.log(
-      `[contract] Gateway ${exited ? "stopped" : "still running"} before shutdown snapshot`,
-    );
     await mirrorStateToSessionStorage("shutdown");
   }
 
-  // 2. S3 backup (workspace files + state dir snapshots, all from local disk)
+  // 3. Full S3 backup (workspace files + state dir snapshots, all from local
+  //    disk). Files uploaded above are skipped by content hash.
   try {
     await workspaceSync.cleanup(currentNamespace);
   } catch (err) {

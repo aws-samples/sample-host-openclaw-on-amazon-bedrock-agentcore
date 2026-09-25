@@ -296,7 +296,7 @@ Container `cloudwatch:PutMetricData` permission is conditioned on `cloudwatch:na
 | DynamoDB TTL | Bind codes: 10 min; token records: 90 days; user files: 365 days |
 | Point-in-time recovery | Enabled on identity table and token usage table |
 | Pay-per-request billing | DynamoDB PAY_PER_REQUEST — no over-provisioned capacity |
-| SIGTERM grace period | 10s for final workspace save before exit (AgentCore gives 15s total) |
+| SIGTERM grace period | Not relied on — changed state is uploaded to S3 within seconds of a change; SIGTERM flushes what is still pending, hard exit after 10 s + `GATEWAY_STOP_WAIT_MS` (2 s) |
 | Workspace sync | Periodic saves every 5 min; `openclaw.json` excluded from sync (always programmatically generated) |
 
 ### 3.11 Bedrock Guardrails (Content Filtering)

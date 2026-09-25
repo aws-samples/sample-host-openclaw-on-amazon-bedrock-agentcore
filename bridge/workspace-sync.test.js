@@ -1,9 +1,13 @@
 /**
  * Tests for workspace-sync.js — credential configuration, skip patterns,
- * and credential detection guard for S3 isolation.
+ * credential detection guard for S3 isolation, SQLite snapshots, single-file
+ * saves and the change-driven backup.
  *
  * Covers: configureCredentials(), shouldSkip(), detectCredentials(),
- *         credential validation, client replacement.
+ *         credential validation, client replacement, snapshotSqlite(),
+ *         saveFile(), startChangeBackup()/flushPendingSaves()/stopChangeBackup()
+ *         (debounce, max wait, per-flush cap, hash dedupe, SQLite sidecar
+ *         mapping, failure handling) and the SIGTERM wiring in the contract.
  * Note: S3Client creation is tested implicitly (SDK only in Docker image).
  * Run: cd bridge && node --test workspace-sync.test.js
  */
@@ -633,5 +637,378 @@ describe("saveFile", () => {
     assert.equal(await workspaceSync.saveFile("telegram_1", "/etc/passwd"), false);
     assert.equal(await workspaceSync.saveFile("", "runtime-skills.json"), false);
     assert.equal(puts.length, 0);
+  });
+});
+
+// --- change-driven backup (save changed state to S3 soon after it changes) ---
+//
+// AgentCore stops the container without a usable grace period (staging: gone
+// under 5 s after SIGTERM; idle stops show no SIGTERM at all), so state must be
+// in S3 before the stop. These tests drive the watcher's bookkeeping directly
+// (markChanged) where timing must be deterministic, and the real fs.watch once.
+
+describe("change-driven backup", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const Module = require("node:module");
+  let workspaceSync;
+  let tmpDir;
+  let stateDir;
+  let savedHome;
+  let realLoad;
+  let puts;
+  let failKeys;
+  let warnings;
+  let realWarn;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const write = (rel, content) => {
+    const p = path.join(stateDir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content);
+  };
+  const keys = () => puts.map((c) => c.input.Key);
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ws-change-"));
+    stateDir = path.join(tmpDir, ".openclaw");
+    fs.mkdirSync(stateDir, { recursive: true });
+    savedHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    delete require.cache[require.resolve("./workspace-sync")];
+    process.env.AWS_REGION = "us-west-2";
+    process.env.S3_USER_FILES_BUCKET = "test-bucket";
+    workspaceSync = require("./workspace-sync");
+    workspaceSync.configureCredentials({
+      accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    });
+    puts = [];
+    failKeys = new Set();
+    const fakeS3 = {
+      send: async (cmd) => {
+        if (failKeys.has(cmd.input.Key)) throw new Error("S3 unavailable (test)");
+        puts.push(cmd);
+        return {};
+      },
+    };
+    realLoad = Module._load;
+    Module._load = function (request, ...rest) {
+      if (request === "@aws-sdk/client-s3") {
+        return {
+          S3Client: function () { return fakeS3; },
+          PutObjectCommand: function (input) { this.input = input; },
+          GetObjectCommand: function (input) { this.input = input; },
+          ListObjectsV2Command: function (input) { this.input = input; },
+        };
+      }
+      return realLoad.call(this, request, ...rest);
+    };
+    warnings = [];
+    realWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(" ")); };
+  });
+
+  afterEach(async () => {
+    await workspaceSync.stopChangeBackup("test-teardown");
+    console.warn = realWarn;
+    Module._load = realLoad;
+    process.env.HOME = savedHome;
+    delete process.env.S3_USER_FILES_BUCKET;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  describe("changeTarget (which change events are worth an upload)", () => {
+    it("keeps plain state and workspace files", () => {
+      assert.equal(workspaceSync.changeTarget("workspace/notes.md"), "workspace/notes.md");
+      assert.equal(workspaceSync.changeTarget("runtime-skills.json"), "runtime-skills.json");
+      assert.equal(workspaceSync.changeTarget("agents/main/agent/openclaw-agent.sqlite"), "agents/main/agent/openclaw-agent.sqlite");
+    });
+
+    it("maps SQLite sidecar events onto the main database (commits land in the -wal first)", () => {
+      assert.equal(workspaceSync.changeTarget("state/openclaw.sqlite-wal"), "state/openclaw.sqlite");
+      assert.equal(workspaceSync.changeTarget("state/openclaw.sqlite-shm"), "state/openclaw.sqlite");
+      assert.equal(workspaceSync.changeTarget("state/openclaw.sqlite-journal"), "state/openclaw.sqlite");
+    });
+
+    it("applies the existing skip rules", () => {
+      for (const rel of [
+        "node_modules/x/index.js",
+        "workspace/.cache/a",
+        "gateway.log",
+        "openclaw.json",
+        "AGENTS.md",
+        "workspace/AGENTS.md",
+        ".env",
+        "certs/x.pem",
+        "openclaw.json.bak",
+        "tmp/openclaw-0/gateway.a504a3cd.lock.sqlite",
+        "state/gateway.state.lock.sqlite",
+      ]) {
+        assert.equal(workspaceSync.changeTarget(rel), null, rel);
+      }
+    });
+
+    it("ignores transient and staging paths", () => {
+      for (const rel of [
+        "tmp/openclaw-0/anything.json",
+        "workspace/openclaw-bootstrap-abc123/AGENTS.md",
+        "workspace/openclaw-publish-x/file.md",
+        "workspace/notes.md.tmp-4242",
+        "state/.openclaw.sqlite.99-1.sqlite-snapshot",
+      ]) {
+        assert.equal(workspaceSync.changeTarget(rel), null, rel);
+      }
+    });
+
+    it("refuses paths that escape the state dir", () => {
+      assert.equal(workspaceSync.changeTarget("../outside.json"), null);
+      assert.equal(workspaceSync.changeTarget("/etc/passwd"), null);
+      assert.equal(workspaceSync.changeTarget(""), null);
+      assert.equal(workspaceSync.changeTarget("."), null);
+    });
+  });
+
+  it("does nothing when the change backup is not running", async () => {
+    workspaceSync.markChanged("workspace/notes.md");
+    assert.equal(await workspaceSync.flushPendingSaves("test"), null);
+    assert.equal(await workspaceSync.stopChangeBackup("test"), null);
+    assert.equal(puts.length, 0);
+  });
+
+  it("is disabled without a namespace", () => {
+    assert.deepEqual(workspaceSync.startChangeBackup(""), { mode: "none" });
+  });
+
+  it("uploads a burst of changes once, after the debounce, under the saveWorkspace key layout", async () => {
+    workspaceSync.startChangeBackup("telegram_1", { debounceMs: 60, maxWaitMs: 2000 });
+    write("workspace/notes.md", "hello");
+    write("agents/main/memory.json", "{}");
+    workspaceSync.markChanged("workspace/notes.md");
+    workspaceSync.markChanged("workspace/notes.md"); // duplicate event, same file
+    workspaceSync.markChanged("agents/main/memory.json");
+    assert.equal(puts.length, 0, "nothing uploaded before the debounce elapses");
+    await sleep(250);
+    assert.deepEqual(keys().sort(), [
+      "telegram_1/.openclaw/agents/main/memory.json",
+      "telegram_1/.openclaw/workspace/notes.md",
+    ]);
+    assert.equal(puts.find((c) => c.input.Key.endsWith("notes.md")).input.Body.toString(), "hello");
+  });
+
+  it("does not re-upload a file whose content did not change, and does upload a real change", async () => {
+    workspaceSync.startChangeBackup("telegram_1", { debounceMs: 30, maxWaitMs: 2000 });
+    write("workspace/notes.md", "v1");
+    workspaceSync.markChanged("workspace/notes.md");
+    let r = await workspaceSync.flushPendingSaves("test");
+    assert.equal(r.uploaded, 1);
+    write("workspace/notes.md", "v1"); // rewritten, identical bytes (mtime moved)
+    workspaceSync.markChanged("workspace/notes.md");
+    r = await workspaceSync.flushPendingSaves("test");
+    assert.equal(r.uploaded, 0);
+    assert.equal(r.unchanged, 1);
+    write("workspace/notes.md", "v2");
+    workspaceSync.markChanged("workspace/notes.md");
+    r = await workspaceSync.flushPendingSaves("test");
+    assert.equal(r.uploaded, 1);
+    assert.equal(puts.length, 2);
+    assert.equal(puts[1].input.Body.toString(), "v2");
+  });
+
+  it("flushes by the max-wait deadline while changes keep streaming in", async () => {
+    workspaceSync.startChangeBackup("telegram_1", { debounceMs: 200, maxWaitMs: 400 });
+    write("workspace/notes.md", "x");
+    const started = Date.now();
+    // Touch every 50 ms for ~700 ms: the debounce alone would never fire.
+    while (Date.now() - started < 700) {
+      workspaceSync.markChanged("workspace/notes.md");
+      await sleep(50);
+      if (puts.length > 0) break;
+    }
+    assert.ok(puts.length >= 1, "deadline flush happened");
+    assert.ok(Date.now() - started < 700, `flushed after ${Date.now() - started}ms`);
+  });
+
+  it("caps uploads per flush and drains the rest in a follow-up flush", async () => {
+    workspaceSync.startChangeBackup("telegram_1", { debounceMs: 30, maxWaitMs: 2000, maxFilesPerFlush: 2 });
+    for (const n of ["a", "b", "c"]) {
+      write(`workspace/${n}.md`, n);
+      workspaceSync.markChanged(`workspace/${n}.md`);
+    }
+    const r = await workspaceSync.flushPendingSaves("test");
+    assert.equal(r.uploaded, 2);
+    assert.equal(r.deferred, 1);
+    assert.equal(puts.length, 2);
+    await sleep(200); // the leftover is rescheduled automatically
+    assert.equal(puts.length, 3);
+    assert.deepEqual(keys().sort(), ["a", "b", "c"].map((n) => `telegram_1/.openclaw/workspace/${n}.md`));
+  });
+
+  it("drops files deleted before the flush and dirs reported by the watcher", async () => {
+    workspaceSync.startChangeBackup("telegram_1", { debounceMs: 30, maxWaitMs: 2000 });
+    fs.mkdirSync(path.join(stateDir, "workspace/sub"), { recursive: true });
+    workspaceSync.markChanged("workspace/gone.md");
+    workspaceSync.markChanged("workspace/sub");
+    const r = await workspaceSync.flushPendingSaves("test");
+    assert.equal(r.missing, 2);
+    assert.equal(r.uploaded, 0);
+    assert.equal(puts.length, 0);
+  });
+
+  it(
+    "uploads a consistent snapshot of a live WAL database when its sidecar changes, and only when it has new commits",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const { DatabaseSync } = require("node:sqlite");
+      fs.mkdirSync(path.join(stateDir, "state"), { recursive: true });
+      const dbPath = path.join(stateDir, "state/openclaw.sqlite");
+      const writer = new DatabaseSync(dbPath);
+      writer.exec("PRAGMA journal_mode = WAL");
+      writer.exec("PRAGMA wal_autocheckpoint = 100000");
+      writer.exec("CREATE TABLE sessions (id TEXT PRIMARY KEY, body TEXT)");
+      writer.prepare("INSERT INTO sessions VALUES (?, ?)").run("s1", "one");
+
+      workspaceSync.startChangeBackup("telegram_1", { debounceMs: 30, maxWaitMs: 2000 });
+      workspaceSync.markChanged("state/openclaw.sqlite-wal");
+      let r = await workspaceSync.flushPendingSaves("test");
+      assert.equal(r.uploaded, 1);
+      assert.equal(puts[0].input.Key, "telegram_1/.openclaw/state/openclaw.sqlite");
+      assert.equal(puts[0].input.Body.subarray(0, 15).toString(), "SQLite format 3");
+      // The snapshot holds the committed-but-uncheckpointed row (a raw copy would not).
+      const snapPath = path.join(tmpDir, "restored.sqlite");
+      fs.writeFileSync(snapPath, puts[0].input.Body);
+      const restored = new DatabaseSync(snapPath, { readOnly: true });
+      assert.equal(restored.prepare("SELECT COUNT(*) AS n FROM sessions").get().n, 1);
+      restored.close();
+
+      // Sidecar touched (e.g. a checkpoint) but no new commits: byte-identical snapshot, no PUT.
+      writer.exec("PRAGMA wal_checkpoint(PASSIVE)");
+      workspaceSync.markChanged("state/openclaw.sqlite-shm");
+      r = await workspaceSync.flushPendingSaves("test");
+      assert.equal(r.uploaded, 0);
+      assert.equal(r.unchanged, 1);
+
+      writer.prepare("INSERT INTO sessions VALUES (?, ?)").run("s2", "two");
+      workspaceSync.markChanged("state/openclaw.sqlite-wal");
+      r = await workspaceSync.flushPendingSaves("test");
+      assert.equal(r.uploaded, 1);
+      assert.equal(puts.length, 2);
+      writer.close();
+      // No -wal/-shm/-snapshot ever uploaded; no staging file left behind.
+      assert.ok(keys().every((k) => k.endsWith("/openclaw.sqlite")));
+      assert.deepEqual(fs.readdirSync(path.join(stateDir, "state")).filter((f) => f.includes("snapshot")), []);
+    },
+  );
+
+  it("logs an upload failure, keeps going, and retries the file on the next flush", async () => {
+    workspaceSync.startChangeBackup("telegram_1", { debounceMs: 30, maxWaitMs: 5000 });
+    write("workspace/ok.md", "ok");
+    write("workspace/bad.md", "bad");
+    failKeys.add("telegram_1/.openclaw/workspace/bad.md");
+    workspaceSync.markChanged("workspace/ok.md");
+    workspaceSync.markChanged("workspace/bad.md");
+    let r = await workspaceSync.flushPendingSaves("test");
+    assert.equal(r.uploaded, 1);
+    assert.equal(r.failed, 1);
+    assert.ok(warnings.some((w) => w.includes("Change backup failed for workspace/bad.md") && w.includes("S3 unavailable")));
+    assert.deepEqual(keys(), ["telegram_1/.openclaw/workspace/ok.md"]);
+
+    failKeys.clear();
+    r = await workspaceSync.flushPendingSaves("test"); // the failed file is still dirty
+    assert.equal(r.uploaded, 1);
+    assert.deepEqual(keys().sort(), [
+      "telegram_1/.openclaw/workspace/bad.md",
+      "telegram_1/.openclaw/workspace/ok.md",
+    ]);
+  });
+
+  it("stop sweeps the whole state dir (hash-deduped), catching writes whose events never arrived", async () => {
+    write("workspace/seen.md", "seen");
+    write("workspace/unseen.md", "unseen");
+    write("gateway.log", "never uploaded");
+    workspaceSync.startChangeBackup("telegram_1", { debounceMs: 30, maxWaitMs: 2000 });
+    workspaceSync.markChanged("workspace/seen.md");
+    await workspaceSync.flushPendingSaves("test");
+    assert.deepEqual(keys(), ["telegram_1/.openclaw/workspace/seen.md"]);
+
+    const r = await workspaceSync.stopChangeBackup("sigterm");
+    assert.equal(r.uploaded, 1, "only the file not uploaded yet");
+    assert.equal(r.unchanged, 1);
+    assert.deepEqual(keys().sort(), [
+      "telegram_1/.openclaw/workspace/seen.md",
+      "telegram_1/.openclaw/workspace/unseen.md",
+    ]);
+    // Stopped: later changes are ignored.
+    workspaceSync.markChanged("workspace/seen.md");
+    assert.equal(await workspaceSync.flushPendingSaves("test"), null);
+  });
+
+  it("watches the real state dir with fs.watch and uploads a changed file", async () => {
+    const started = workspaceSync.startChangeBackup("telegram_1", { debounceMs: 100, maxWaitMs: 2000 });
+    assert.ok(["watch", "poll"].includes(started.mode));
+    write("workspace/live.md", "live");
+    write("tmp/openclaw-0/gateway.state.lock.sqlite", "");
+    await sleep(600);
+    if (started.mode === "watch") {
+      assert.deepEqual(keys(), ["telegram_1/.openclaw/workspace/live.md"]);
+    }
+  });
+
+  it("saveWorkspace and saveFile share the content index (periodic save re-uploads only changes)", async () => {
+    write("workspace/a.md", "a");
+    write("workspace/b.md", "b");
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.equal(puts.length, 2);
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.equal(puts.length, 2, "second full save uploads nothing");
+    assert.equal(await workspaceSync.saveFile("telegram_1", "workspace/a.md"), false);
+    write("workspace/a.md", "a2");
+    assert.equal(await workspaceSync.saveFile("telegram_1", "workspace/a.md"), true);
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.equal(puts.length, 3);
+  });
+});
+
+describe("change backup wiring in agentcore-contract.js", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
+  const idx = (needle, from = 0) => {
+    const i = source.indexOf(needle, from);
+    assert.ok(i >= 0, `contract source should contain: ${needle}`);
+    return i;
+  };
+
+  it("starts the change backup once the gateway is ready, next to the periodic save", () => {
+    const periodic = idx("workspaceSync.startPeriodicSave(namespace);");
+    const change = idx("workspaceSync.startChangeBackup(namespace);");
+    assert.ok(change > periodic && change - periodic < 200);
+  });
+
+  it("on SIGTERM flushes dirty files first, then stops the gateway, then stops the change backup before the mount snapshot and the full S3 save", () => {
+    const sigterm = idx('process.on("SIGTERM", async () => {');
+    const urgent = idx('const urgentSave = workspaceSync.flushPendingSaves("sigterm");', sigterm);
+    const stop = idx("await stopGateway(GATEWAY_STOP_WAIT_MS)", sigterm);
+    const awaitUrgent = idx("await urgentSave;", sigterm);
+    const stopChange = idx('await workspaceSync.stopChangeBackup("sigterm");', sigterm);
+    const mirror = idx('await mirrorStateToSessionStorage("shutdown")', sigterm);
+    const s3 = idx("await workspaceSync.cleanup(currentNamespace)", sigterm);
+    assert.ok(urgent < stop, "dirty flush starts before waiting for the gateway");
+    assert.ok(stop < awaitUrgent && awaitUrgent < stopChange, "gateway stopped, then pending changes uploaded");
+    assert.ok(stopChange < mirror && mirror < s3);
+  });
+
+  it("stops the gateway on SIGTERM even without session storage", () => {
+    const sigterm = idx('process.on("SIGTERM", async () => {');
+    const stop = idx("const exited = await stopGateway(GATEWAY_STOP_WAIT_MS);", sigterm);
+    const guard = source.lastIndexOf("if (sessionStorageActive) {", stop);
+    // The nearest preceding session-storage guard must be closed before the stop call.
+    const guardClose = source.indexOf("\n  }\n", guard);
+    assert.ok(guard < 0 || guardClose < stop);
+  });
+
+  it("waits at most 2 s for the gateway by default (the container has no longer to live)", () => {
+    assert.ok(source.includes('process.env.GATEWAY_STOP_WAIT_MS || "2000"'));
   });
 });
