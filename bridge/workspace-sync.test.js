@@ -508,6 +508,108 @@ describe("setBackupMode", () => {
   });
 });
 
+// --- awaitRestore (bounded wait before the gateway spawns) ---
+
+describe("awaitRestore", () => {
+  const { mock } = require("node:test");
+  let workspaceSync;
+  let warnings;
+  let log;
+
+  beforeEach(() => {
+    delete require.cache[require.resolve("./workspace-sync")];
+    process.env.AWS_REGION = "us-west-2";
+    process.env.S3_USER_FILES_BUCKET = "test-bucket";
+    workspaceSync = require("./workspace-sync");
+    warnings = [];
+    log = { log() {}, warn: (m) => warnings.push(m), error() {} };
+    mock.timers.enable({ apis: ["setTimeout"] });
+  });
+
+  afterEach(() => {
+    mock.timers.reset();
+    delete process.env.S3_USER_FILES_BUCKET;
+  });
+
+  it("exports awaitRestore function", () => {
+    assert.equal(typeof workspaceSync.awaitRestore, "function");
+  });
+
+  it("fast restore: resolves without a warning, even after the wait elapses", async () => {
+    const result = await workspaceSync.awaitRestore(Promise.resolve(), 45000, { log });
+    assert.equal(result, "restored");
+    assert.deepEqual(warnings, []);
+
+    // The bug: the wait timer used to keep running after the restore won the
+    // race and logged "still running after 45000ms" on every boot.
+    mock.timers.tick(45000);
+    await Promise.resolve();
+    assert.deepEqual(warnings, [], "no timeout warning once the restore has settled");
+  });
+
+  it("failed restore: logs the failure, resolves, and never warns about a timeout", async () => {
+    const result = await workspaceSync.awaitRestore(Promise.reject(new Error("boom")), 45000, { log });
+    assert.equal(result, "restored");
+    assert.deepEqual(warnings, ["[contract] Workspace restore failed: boom"]);
+
+    mock.timers.tick(45000);
+    await Promise.resolve();
+    assert.equal(warnings.length, 1, "no timeout warning after a settled (failed) restore");
+  });
+
+  it("slow restore: warns after the wait and resolves so the gateway can start", async () => {
+    let finishRestore;
+    const slow = new Promise((resolve) => { finishRestore = resolve; });
+    const pending = workspaceSync.awaitRestore(slow, 45000, { log });
+
+    mock.timers.tick(44999);
+    await Promise.resolve();
+    assert.deepEqual(warnings, [], "no warning before the wait elapses");
+
+    mock.timers.tick(1);
+    const result = await pending;
+    assert.equal(result, "timeout");
+    assert.deepEqual(warnings, [
+      "[contract] Workspace restore still running after 45000ms — starting gateway anyway",
+    ]);
+
+    // A late-finishing restore must not produce any further output.
+    finishRestore();
+    await Promise.resolve();
+    assert.equal(warnings.length, 1);
+  });
+
+  it("does not keep the process alive while waiting (timer is unref'd)", async () => {
+    let unrefCalled = false;
+    let cleared = null;
+    const handle = { unref() { unrefCalled = true; } };
+    const timers = {
+      setTimeout() { return handle; },
+      clearTimeout(t) { cleared = t; },
+    };
+    await workspaceSync.awaitRestore(Promise.resolve(), 45000, { log, timers });
+    assert.equal(unrefCalled, true);
+    assert.equal(cleared, handle, "wait timer is cleared once the restore settles");
+  });
+});
+
+describe("restore wait wiring in agentcore-contract.js", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const source = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
+
+  it("uses awaitRestore for the bounded pre-spawn restore wait", () => {
+    assert.ok(
+      source.includes("await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);"),
+      "contract should await the restore via workspaceSync.awaitRestore",
+    );
+  });
+
+  it("no longer races an uncleared setTimeout against the restore", () => {
+    assert.equal(source.includes("Workspace restore still running after ${RESTORE_WAIT_MS}ms"), false);
+  });
+});
+
 // --- AGENTS.md template validation ---
 
 describe("AGENTS.md template in agentcore-contract.js", () => {
