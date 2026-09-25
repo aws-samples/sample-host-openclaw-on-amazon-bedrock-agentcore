@@ -755,7 +755,7 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 |---|---|
 | `eventbridge-cron` | Cron scheduling via EventBridge Scheduler — create, update, and delete recurring tasks |
 | `s3-user-files` | Per-user file storage (S3-backed) — read, write, list, and delete files |
-| `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills |
+| `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills. Runtime installs are recorded per user (`~/.openclaw/runtime-skills.json`) and reinstalled in the background after a cold start |
 | `api-keys` | Secure API key management — dual-mode storage with native file-based or AWS Secrets Manager backend (see [API Key Management](#api-key-management)) |
 | `agentcore-browser` | Headless Chromium browser — navigate, screenshot, interact with web pages (optional, see [Browser Support](#browser-support-optional)) |
 
@@ -865,7 +865,7 @@ cdk deploy OpenClawAgentCore --require-approval never
 ### Run tests
 
 ```bash
-cd bridge && node --test *.test.js                     # all bridge unit tests (374 tests, Node 24)
+cd bridge && node --test *.test.js                     # all bridge unit tests (412 tests, Node 24)
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
 cd bridge && node --test image-support.test.js         # image upload + multimodal tests
 cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
@@ -875,6 +875,7 @@ cd bridge && node --test scoped-credentials.test.js    # per-user STS credential
 cd bridge && node --test workspace-sync.test.js        # workspace sync + SQLite snapshot tests
 cd bridge && node --test state-storage.test.js         # local state dir / session-storage mirror + restore tests
 cd bridge && node --test gateway-mcp.test.js           # Gateway MCP config, bearer refresh, Cognito token provider (12 tests)
+cd bridge && node --test runtime-skills.test.js        # runtime skill manifest + cold-start reinstall (38 tests)
 node --test lambda/gateway_tools/*.test.js             # Gateway tool Lambdas: JWT verification, namespace scoping, interceptor (31 tests, Node 24)
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 cd lambda/router && python -m pytest test_image_upload.py -v        # image upload unit tests
@@ -986,8 +987,8 @@ Node.js's Happy Eyeballs (`autoSelectFamily`, Node 20+) tries both IPv4 and IPv6
 - **CDK RetentionDays**: `logs.RetentionDays` is an enum, not constructable from int. Use the helper in `stacks/__init__.py`.
 - **Cognito passwords**: HMAC-derived (`HMAC-SHA256(secret, actorId)`) — deterministic, never stored. Enables `AdminInitiateAuth` without per-user password storage.
 - **`skills.allowBundled` is an array**: OpenClaw expects an array (the bridge writes `[]` and loads everything from `skills.load.extraDirs`); a boolean causes config validation failure.
-- **ClawHub skills**: 5 community skills are pre-installed at Docker build time (jina-reader, `@parags/deep-research-pro`, telegram-compose, `@therohitdas/transcript`, `@10e9928a/task-decomposer`), flattened to `/skills/<slug>` next to the custom skills (s3-user-files, eventbridge-cron, clawhub-manage, api-keys) and loaded via `skills.load.extraDirs: ["/skills"]`. The build fails if any of the five is missing. Bare slugs that ClawHub now hosts under several owners are refused by clawhub >= 0.23 (`ambiguous`), so use `@owner/slug` and pin `--version`. Users can install/uninstall skills via the `clawhub-manage` skill — changes take effect on the next session start.
-- **ClawHub `--no-input --force`**: still required with clawhub 0.23.3 for non-interactive Docker builds (`--no-input` disables prompts; `--force` overrides the VirusTotal flag some skills carry for calling external APIs). Verified in the us-west-2 staging CodeBuild log: all five skills print `Installed <slug> v<version>`.
+- **ClawHub skills**: 5 community skills are pre-installed at Docker build time (jina-reader, `@parags/deep-research-pro`, telegram-compose, `@therohitdas/transcript`, `@10e9928a/task-decomposer`), flattened to `/skills/<slug>` next to the custom skills (s3-user-files, eventbridge-cron, clawhub-manage, api-keys) and loaded via `skills.load.extraDirs: ["/skills"]`. The build fails if any of the five is missing. Bare slugs that ClawHub now hosts under several owners are refused by clawhub >= 0.23 (`ambiguous`), so use `@owner/slug` and pin `--version`. Users can install/uninstall skills via the `clawhub-manage` skill. `/skills` is part of the image, not of the per-user state, so a runtime install is recorded (slug + pinned version) in `~/.openclaw/runtime-skills.json` — which is mirrored to session storage and backed up to S3 with the rest of the state dir — and `agentcore-contract.js` reinstalls every recorded skill in the background once the gateway is ready after a cold start (never on the `/ping` or first-reply path; a failed reinstall only logs and is retried at the next cold start). Runtime installs pass `--no-input` but never `--force`, so a skill ClawHub has flagged for security review is refused with an explanation.
+- **ClawHub `--no-input --force` at image build**: still required with clawhub 0.23.3 for non-interactive Docker builds of the five pinned, reviewed skills (`--no-input` disables prompts; `--force` overrides the VirusTotal flag some skills carry for calling external APIs). Verified in the us-west-2 staging CodeBuild log: all five skills print `Installed <slug> v<version>`.
 - **`default-user` fallback**: If identity resolution fails, requests fall back to `actorId = "default-user"` — meaning all such users share one S3 namespace. The `USER_ID` env var path (set by contract server) should prevent this in per-user mode.
 - **actorId vs namespace format**: The actorId uses colon format (`telegram:123456789`) while skill scripts expect namespace/underscore format (`telegram_123456789`). The lightweight agent's `chat()` function converts via `userId.replace(/:/g, "_")` before passing to tool scripts. The proxy and workspace sync also use namespace format for S3 keys.
 - **Image version bumps are required**: After pushing a new bridge container image, you must bump `image_version` in `cdk.json` and redeploy `OpenClawAgentCore`. AgentCore caches images by digest and only re-pulls when the runtime endpoint configuration changes. Without the bump, existing sessions continue using the old image.

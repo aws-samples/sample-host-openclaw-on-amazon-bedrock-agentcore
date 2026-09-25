@@ -457,6 +457,40 @@ async function saveWorkspace(namespace) {
   console.log(`[workspace-sync] Saved ${uploaded} file(s), skipped ${skipped}`);
 }
 
+/**
+ * Back up ONE file under $HOME/.openclaw/ to S3 right away, outside the
+ * periodic save. For small state that must survive a cold start that happens
+ * before the next periodic save (the runtime-skills manifest). Same key layout
+ * and skip rules as saveWorkspace(); resolves false when nothing was uploaded.
+ */
+async function saveFile(namespace, relativePath) {
+  if (!BUCKET || !namespace || !relativePath) return false;
+  const normalized = path.posix.normalize(relativePath.split(path.sep).join("/"));
+  if (normalized.startsWith("../") || normalized === ".." || path.posix.isAbsolute(normalized)) {
+    console.warn(`[workspace-sync] Refusing to save path outside the state dir: ${relativePath}`);
+    return false;
+  }
+  if (shouldSkip(normalized)) return false;
+  const localFile = path.join(LOCAL_PATH, normalized);
+  let content;
+  try {
+    const stat = fs.statSync(localFile);
+    if (!stat.isFile() || stat.size > MAX_FILE_SIZE) return false;
+    content = fs.readFileSync(localFile);
+  } catch {
+    return false; // deleted between change and upload — the periodic save will catch up
+  }
+  await getS3Client().send(
+    new (getS3Sdk().PutObjectCommand)({
+      Bucket: BUCKET,
+      Key: `${namespace}/${WORKSPACE_PREFIX}/${normalized}`,
+      Body: content,
+    }),
+  );
+  console.log(`[workspace-sync] Saved ${normalized} (${content.length} bytes)`);
+  return true;
+}
+
 // Periodic save state
 let _saveInterval = null;
 // Backup mode: when session storage is primary, S3 sync becomes a cold backup
@@ -510,6 +544,7 @@ async function cleanup(namespace) {
 module.exports = {
   restoreWorkspace,
   saveWorkspace,
+  saveFile,
   startPeriodicSave,
   cleanup,
   configureCredentials,

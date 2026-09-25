@@ -31,6 +31,7 @@ const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
 const gatewayMcp = require("./gateway-mcp");
+const runtimeSkills = require("./runtime-skills");
 const { createCognitoTokenProvider } = require("./cognito-token");
 
 const PORT = 8080;
@@ -89,6 +90,11 @@ let startTime = Date.now();
 let shuttingDown = false;
 // True once setupSessionStorage() found the mount; gates the state mirror.
 let sessionStorageActive = false;
+// Set when the cold-start reinstall of user-installed ClawHub skills has been
+// kicked off; once per container (gateway restarts keep /skills).
+let runtimeSkillReinstallStarted = false;
+// fs.watch handle that backs the runtime-skills manifest up to S3 on change.
+let runtimeSkillManifestWatcher = null;
 let credentialRefreshTimer = null;
 let browserHeaderRefreshTimer = null;
 // AgentCore Gateway MCP tools (prototype). Only active when
@@ -814,7 +820,8 @@ function writeOpenClawConfig() {
         "- Uninstall: `node /skills/clawhub-manage/uninstall.js <skill-name>`",
         "- List: `node /skills/clawhub-manage/list.js`",
         "",
-        "After install/uninstall, the skill will be available on the next session start (after idle timeout or new conversation).",
+        "Installed skills are recorded per user and reinstalled automatically a few seconds after each new session starts; OpenClaw loads them when it next refreshes its skill list (at the latest at the next session start).",
+        "Installs never bypass ClawHub's security review: if install.js refuses a flagged skill, explain why to the user and do not retry.",
         "",
         "## API Key Storage",
         "",
@@ -926,6 +933,7 @@ async function pollOpenClawReadiness(namespace) {
   if (ready) {
     openclawReady = true;
     workspaceSync.startPeriodicSave(namespace);
+    startRuntimeSkillManifestBackup(namespace);
     if (sessionStorageActive) {
       stateStorage.startPeriodicMirror({
         stateDir: OPENCLAW_DIR,
@@ -936,11 +944,79 @@ async function pollOpenClawReadiness(namespace) {
     console.log(
       "[contract] OpenClaw ready — switching from lightweight agent to full OpenClaw",
     );
+    startRuntimeSkillReinstall();
   } else {
     console.error(
       "[contract] OpenClaw failed to start — lightweight agent will continue handling messages",
     );
   }
+}
+
+/**
+ * Back up the runtime-skills manifest to S3 as soon as an install/uninstall
+ * rewrites it. The periodic save runs every 30 min and StopRuntimeSession /
+ * idle termination do not flush, so without this a skill installed (or
+ * removed) shortly before a cold start comes back in the old state — seen on
+ * staging: uninstall, cold start one minute later, skill reinstalled from the
+ * stale S3 manifest. Only the ~150-byte manifest is uploaded, from the
+ * contract process (the skill scripts have no AWS credentials).
+ */
+function startRuntimeSkillManifestBackup(namespace) {
+  if (runtimeSkillManifestWatcher || !namespace) return;
+  const manifestFile = runtimeSkills.manifestPath(OPENCLAW_DIR);
+  runtimeSkillManifestWatcher = runtimeSkills.watchManifest(
+    manifestFile,
+    async () => {
+      const saved = await workspaceSync.saveFile(namespace, runtimeSkills.MANIFEST_NAME);
+      if (saved) console.log("[contract] Runtime skill manifest changed — backed up to S3");
+    },
+    { log: console },
+  );
+  if (runtimeSkillManifestWatcher) {
+    console.log(`[contract] Watching ${manifestFile} for immediate S3 backup`);
+  }
+}
+
+/**
+ * Reinstall the ClawHub skills the user installed at runtime (clawhub-manage)
+ * from the per-user manifest in the state dir. /skills is part of the image,
+ * not of the persisted state, so those installs vanish at every cold start;
+ * the manifest (~/.openclaw/runtime-skills.json) survives via the session
+ * storage mirror / S3 backup that the rest of the state dir already gets.
+ *
+ * Runs in the background AFTER the gateway is ready — it is never on the
+ * cold-start path, never blocks /ping or the first reply, and a failure only
+ * logs (the entry stays in the manifest for the next cold start). Sequential
+ * per skill, bounded by runtimeSkills.REINSTALL_TIMEOUT_MS each. OpenClaw
+ * watches its skill dirs (skills.load.watch), so a reinstalled skill is
+ * picked up without a gateway restart.
+ */
+function startRuntimeSkillReinstall() {
+  if (runtimeSkillReinstallStarted || shuttingDown) return;
+  runtimeSkillReinstallStarted = true;
+  const manifestFile = runtimeSkills.manifestPath(OPENCLAW_DIR);
+  const manifest = runtimeSkills.readManifest(manifestFile, { log: console });
+  const count = Object.keys(manifest.skills).length;
+  if (count === 0) {
+    if (manifest.corrupt) {
+      console.warn("[contract] Runtime skill manifest unreadable — no skills reinstalled");
+    } else {
+      console.log("[contract] No runtime-installed skills recorded — nothing to reinstall");
+    }
+    return;
+  }
+  console.log(`[contract] Reinstalling ${count} runtime-installed skill(s) in the background...`);
+  const started = Date.now();
+  runtimeSkills
+    .reinstallFromManifest({ manifestFile, log: console })
+    .then((r) => {
+      console.log(
+        `[contract] Runtime skill reinstall done in ${Date.now() - started}ms: ${r.reinstalled} reinstalled, ${r.present} already present, ${r.failed} failed, ${r.invalid} invalid manifest entr${r.invalid === 1 ? "y" : "ies"} (of ${r.total})`,
+      );
+    })
+    .catch((err) => {
+      console.warn(`[contract] Runtime skill reinstall failed: ${err.message}`);
+    });
 }
 
 /**
@@ -2409,6 +2485,10 @@ process.on("SIGTERM", async () => {
   if (browserHeaderRefreshTimer) {
     clearInterval(browserHeaderRefreshTimer);
     browserHeaderRefreshTimer = null;
+  }
+  if (runtimeSkillManifestWatcher) {
+    runtimeSkillManifestWatcher.close();
+    runtimeSkillManifestWatcher = null;
   }
   if (gatewayBearerRefresh) {
     gatewayBearerRefresh.stop();

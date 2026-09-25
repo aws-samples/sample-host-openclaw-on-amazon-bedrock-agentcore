@@ -565,3 +565,73 @@ describe("walkDir", () => {
     assert.deepEqual(files, ["openclaw.json", "workspace/memory/note.md"]);
   });
 });
+
+// --- saveFile (single-file immediate backup, used for the runtime-skills manifest) ---
+
+describe("saveFile", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const Module = require("node:module");
+  let workspaceSync;
+  let tmpDir;
+  let savedHome;
+  let realLoad;
+  let puts;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ws-savefile-"));
+    savedHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    fs.mkdirSync(path.join(tmpDir, ".openclaw"), { recursive: true });
+    delete require.cache[require.resolve("./workspace-sync")];
+    process.env.AWS_REGION = "us-west-2";
+    process.env.S3_USER_FILES_BUCKET = "test-bucket";
+    workspaceSync = require("./workspace-sync");
+    workspaceSync.configureCredentials({
+      accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    });
+    puts = [];
+    const fakeS3 = { send: async (cmd) => { puts.push(cmd); return {}; } };
+    realLoad = Module._load;
+    Module._load = function (request, ...rest) {
+      if (request === "@aws-sdk/client-s3") {
+        return {
+          S3Client: function () { return fakeS3; },
+          PutObjectCommand: function (input) { this.input = input; },
+          GetObjectCommand: function (input) { this.input = input; },
+          ListObjectsV2Command: function (input) { this.input = input; },
+        };
+      }
+      return realLoad.call(this, request, ...rest);
+    };
+  });
+
+  afterEach(() => {
+    Module._load = realLoad;
+    process.env.HOME = savedHome;
+    delete process.env.S3_USER_FILES_BUCKET;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("uploads one file under the same {namespace}/.openclaw/ key as saveWorkspace", async () => {
+    fs.writeFileSync(path.join(tmpDir, ".openclaw", "runtime-skills.json"), '{"version":1,"skills":{}}\n');
+    assert.equal(await workspaceSync.saveFile("telegram_1", "runtime-skills.json"), true);
+    assert.equal(puts.length, 1);
+    assert.equal(puts[0].input.Bucket, "test-bucket");
+    assert.equal(puts[0].input.Key, "telegram_1/.openclaw/runtime-skills.json");
+    assert.equal(puts[0].input.Body.toString(), '{"version":1,"skills":{}}\n');
+  });
+
+  it("is a no-op for a missing file, a skipped pattern, or a path outside the state dir", async () => {
+    assert.equal(await workspaceSync.saveFile("telegram_1", "runtime-skills.json"), false);
+    fs.writeFileSync(path.join(tmpDir, ".openclaw", "x.log"), "log");
+    assert.equal(await workspaceSync.saveFile("telegram_1", "x.log"), false);
+    fs.writeFileSync(path.join(tmpDir, "outside.json"), "{}");
+    assert.equal(await workspaceSync.saveFile("telegram_1", "../outside.json"), false);
+    assert.equal(await workspaceSync.saveFile("telegram_1", "/etc/passwd"), false);
+    assert.equal(await workspaceSync.saveFile("", "runtime-skills.json"), false);
+    assert.equal(puts.length, 0);
+  });
+});
