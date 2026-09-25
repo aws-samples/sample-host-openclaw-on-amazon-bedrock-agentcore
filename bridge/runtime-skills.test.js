@@ -469,6 +469,58 @@ describe("runtime-skills.reinstallFromManifest", () => {
   });
 });
 
+describe("runtime-skills.watchManifest", () => {
+  let dir;
+  let watcher;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  beforeEach(() => { dir = mkTmp("rs-watch-"); });
+  afterEach(() => { if (watcher) watcher.close(); watcher = null; fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it("fires once (debounced) after recordInstall/recordUninstall rewrite the manifest, not for tmp files", async () => {
+    const file = path.join(dir, "runtime-skills.json");
+    const calls = [];
+    watcher = rs.watchManifest(file, (f) => calls.push(f), { debounceMs: 150, log: quietLog });
+    assert.ok(watcher, "fs.watch should be available on the test runtime");
+    rs.recordInstall(file, "baidu-search", "1.2.3", { log: quietLog });
+    rs.recordInstall(file, "hackernews", "1.0.0", { log: quietLog }); // burst → one callback
+    await sleep(500);
+    assert.deepEqual(calls, [file]);
+    fs.writeFileSync(path.join(dir, `runtime-skills.json.tmp-${Date.now()}1`), "partial"); // our own staging file
+    fs.writeFileSync(path.join(dir, "other.json"), "{}");
+    await sleep(400);
+    assert.equal(calls.length, 1, "unrelated / tmp files must not trigger a backup");
+    rs.recordUninstall(file, "hackernews", { log: quietLog });
+    await sleep(500);
+    assert.equal(calls.length, 2);
+  });
+
+  it("a rejecting handler is logged, not thrown, and the watcher keeps working", async () => {
+    const file = path.join(dir, "runtime-skills.json");
+    const log = collectingLog();
+    let n = 0;
+    watcher = rs.watchManifest(file, async () => { n++; if (n === 1) throw new Error("s3 down"); }, { debounceMs: 100, log });
+    rs.recordInstall(file, "a", "1.0.0", { log: quietLog });
+    await sleep(400);
+    assert.equal(n, 1);
+    assert.ok(log.lines.some((l) => /warn:.*Manifest change handler failed: s3 down/.test(l)), log.lines.join("\n"));
+    rs.recordInstall(file, "b", "1.0.0", { log: quietLog });
+    await sleep(400);
+    assert.equal(n, 2);
+  });
+
+  it("creates the state dir when missing and close() stops callbacks", async () => {
+    const file = path.join(dir, "nested", "state", "runtime-skills.json");
+    const calls = [];
+    watcher = rs.watchManifest(file, () => calls.push(1), { debounceMs: 100, log: quietLog });
+    assert.ok(fs.existsSync(path.dirname(file)));
+    watcher.close();
+    watcher = null;
+    rs.recordInstall(file, "a", "1.0.0", { log: quietLog });
+    await sleep(350);
+    assert.equal(calls.length, 0);
+  });
+});
+
 describe("agentcore-contract.js wiring", () => {
   const source = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
 
@@ -479,6 +531,17 @@ describe("agentcore-contract.js wiring", () => {
     assert.match(source, /if \(runtimeSkillReinstallStarted \|\| shuttingDown\) return;/);
     assert.match(source, /runtimeSkills\.manifestPath\(OPENCLAW_DIR\)/);
     assert.match(source, /reinstallFromManifest\(\{ manifestFile, log: console \}\)/);
+  });
+
+  it("backs the manifest up to S3 on change via watchManifest + workspaceSync.saveFile, started with the periodic save", () => {
+    assert.match(source, /runtimeSkills\.watchManifest\(/);
+    assert.match(source, /workspaceSync\.saveFile\(namespace, runtimeSkills\.MANIFEST_NAME\)/);
+    const periodic = source.indexOf("workspaceSync.startPeriodicSave(namespace);");
+    const backup = source.indexOf("startRuntimeSkillManifestBackup(namespace);");
+    assert.ok(periodic > 0 && backup > periodic && backup - periodic < 200, "manifest backup must start right after the periodic save (same namespace, only once OpenClaw is ready)");
+    const sync = fs.readFileSync(path.join(__dirname, "workspace-sync.js"), "utf-8");
+    assert.match(sync, /async function saveFile\(namespace, relativePath\)/);
+    assert.match(sync, /^\s*saveFile,$/m);
   });
 
   it("does not await the reinstall on the boot path (init/ping stay unblocked)", () => {

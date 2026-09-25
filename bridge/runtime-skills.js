@@ -199,6 +199,55 @@ function recordUninstall(file, slug, opts = {}) {
   return had;
 }
 
+/**
+ * Call `onChange(file)` shortly after the manifest is (re)written. The S3
+ * backup of the state dir runs every 30 minutes and StopRuntimeSession does
+ * not give the container a chance to flush, so an install/uninstall made
+ * less than 30 minutes before a cold start would otherwise be lost (verified
+ * on staging: uninstall → StopRuntimeSession → the stale S3 manifest
+ * reinstalled the skill). The caller uses this to back up just the manifest
+ * right away.
+ *
+ * Watches the manifest's directory (the file is replaced by rename, so a
+ * watcher on the file itself would go stale) and ignores our own
+ * `.tmp-*` files. Debounced. Returns `{ close() }`; `null` when fs.watch is
+ * unavailable (logged, non-fatal).
+ */
+function watchManifest(file, onChange, { debounceMs = 1500, log = console } = {}) {
+  const dir = path.dirname(file);
+  const name = path.basename(file);
+  let timer = null;
+  let watcher;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    watcher = fs.watch(dir, { persistent: false }, (_event, changed) => {
+      if (changed && changed.toString() !== name) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        try {
+          Promise.resolve(onChange(file)).catch((err) =>
+            log.warn(`[runtime-skills] Manifest change handler failed: ${err.message}`),
+          );
+        } catch (err) {
+          log.warn(`[runtime-skills] Manifest change handler failed: ${err.message}`);
+        }
+      }, debounceMs);
+    });
+    watcher.on("error", (err) => log.warn(`[runtime-skills] Manifest watcher error: ${err.message}`));
+  } catch (err) {
+    log.warn(`[runtime-skills] Cannot watch manifest (${err.message}) — changes are backed up only by the periodic save`);
+    return null;
+  }
+  return {
+    close() {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      watcher.close();
+    },
+  };
+}
+
 /** True when `<skillsDir>/<slug>/SKILL.md` exists. */
 function isSkillPresent(slug, skillsDir = SKILLS_DIR) {
   if (!isValidSlug(slug)) return false;
@@ -384,6 +433,7 @@ module.exports = {
   mirrorManifest,
   recordInstall,
   recordUninstall,
+  watchManifest,
   isSkillPresent,
   readInstalledVersion,
   installArgs,

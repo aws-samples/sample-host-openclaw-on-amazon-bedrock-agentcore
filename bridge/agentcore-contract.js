@@ -93,6 +93,8 @@ let sessionStorageActive = false;
 // Set when the cold-start reinstall of user-installed ClawHub skills has been
 // kicked off; once per container (gateway restarts keep /skills).
 let runtimeSkillReinstallStarted = false;
+// fs.watch handle that backs the runtime-skills manifest up to S3 on change.
+let runtimeSkillManifestWatcher = null;
 let credentialRefreshTimer = null;
 let browserHeaderRefreshTimer = null;
 // AgentCore Gateway MCP tools (prototype). Only active when
@@ -931,6 +933,7 @@ async function pollOpenClawReadiness(namespace) {
   if (ready) {
     openclawReady = true;
     workspaceSync.startPeriodicSave(namespace);
+    startRuntimeSkillManifestBackup(namespace);
     if (sessionStorageActive) {
       stateStorage.startPeriodicMirror({
         stateDir: OPENCLAW_DIR,
@@ -946,6 +949,31 @@ async function pollOpenClawReadiness(namespace) {
     console.error(
       "[contract] OpenClaw failed to start — lightweight agent will continue handling messages",
     );
+  }
+}
+
+/**
+ * Back up the runtime-skills manifest to S3 as soon as an install/uninstall
+ * rewrites it. The periodic save runs every 30 min and StopRuntimeSession /
+ * idle termination do not flush, so without this a skill installed (or
+ * removed) shortly before a cold start comes back in the old state — seen on
+ * staging: uninstall, cold start one minute later, skill reinstalled from the
+ * stale S3 manifest. Only the ~150-byte manifest is uploaded, from the
+ * contract process (the skill scripts have no AWS credentials).
+ */
+function startRuntimeSkillManifestBackup(namespace) {
+  if (runtimeSkillManifestWatcher || !namespace) return;
+  const manifestFile = runtimeSkills.manifestPath(OPENCLAW_DIR);
+  runtimeSkillManifestWatcher = runtimeSkills.watchManifest(
+    manifestFile,
+    async () => {
+      const saved = await workspaceSync.saveFile(namespace, runtimeSkills.MANIFEST_NAME);
+      if (saved) console.log("[contract] Runtime skill manifest changed — backed up to S3");
+    },
+    { log: console },
+  );
+  if (runtimeSkillManifestWatcher) {
+    console.log(`[contract] Watching ${manifestFile} for immediate S3 backup`);
   }
 }
 
@@ -2457,6 +2485,10 @@ process.on("SIGTERM", async () => {
   if (browserHeaderRefreshTimer) {
     clearInterval(browserHeaderRefreshTimer);
     browserHeaderRefreshTimer = null;
+  }
+  if (runtimeSkillManifestWatcher) {
+    runtimeSkillManifestWatcher.close();
+    runtimeSkillManifestWatcher = null;
   }
   if (gatewayBearerRefresh) {
     gatewayBearerRefresh.stop();
