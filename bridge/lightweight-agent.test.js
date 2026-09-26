@@ -688,6 +688,135 @@ describe("executeWebFetch", () => {
     const result = await executeWebFetch("http://172.16.0.1/internal");
     assert.ok(result.startsWith("Error:"), `should reject 172.16, got: ${result}`);
   });
+
+  it("rejects IPv6 literals for ::, NAT64 and IPv4-mapped CGNAT", async () => {
+    for (const u of [
+      "http://[::]/",
+      "http://[::1]/",
+      "http://[64:ff9b::7f00:1]/",
+      "http://[::ffff:100.64.0.1]/",
+      "http://[::ffff:7f00:1]/",
+    ]) {
+      const result = await executeWebFetch(u);
+      assert.ok(result.startsWith("Error:"), `should reject ${u}, got: ${result}`);
+    }
+  });
+});
+
+// --- executeWebFetch: DNS rebinding (time-of-check/time-of-use) ---
+
+describe("executeWebFetch DNS rebinding", () => {
+  const dns = require("dns");
+  const http = require("http");
+  const { EventEmitter } = require("events");
+  const { _guardedLookup } = require("./lightweight-agent");
+  let server;
+  let port;
+  let hits;
+  let origLookup;
+  let origPromisesLookup;
+  let origHttpGet;
+
+  // A TTL-0 rebinding name answers a public IP to one query and loopback to
+  // the next. Model it: the promise API sees a public IP, the callback API
+  // (the one net.connect uses) sees loopback.
+  const REBIND = new Set(["rebind.test", "rebind-redirect.test"]);
+
+  function stubLookup(addrs) {
+    dns.lookup = function (host, opts, cb) {
+      if (typeof opts === "function") { cb = opts; opts = {}; }
+      process.nextTick(() =>
+        opts && opts.all ? cb(null, addrs) : cb(null, addrs[0].address, addrs[0].family));
+    };
+  }
+
+  beforeEach(async () => {
+    hits = [];
+    server = http.createServer((req, res) => {
+      hits.push(req.url);
+      res.end("INTERNAL-SECRET");
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    port = server.address().port;
+    origLookup = dns.lookup;
+    origPromisesLookup = dns.promises.lookup;
+    origHttpGet = http.get;
+    dns.promises.lookup = async (host, opts) =>
+      REBIND.has(host) || host === "public-start.test" ? [{ address: "93.184.216.34", family: 4 }] : origPromisesLookup(host, opts);
+    dns.lookup = function (host, opts, cb) {
+      if (typeof opts === "function") { cb = opts; opts = {}; }
+      if (REBIND.has(host)) {
+        return process.nextTick(() =>
+          opts && opts.all ? cb(null, [{ address: "127.0.0.1", family: 4 }]) : cb(null, "127.0.0.1", 4));
+      }
+      return origLookup.call(dns, host, opts, cb);
+    };
+  });
+
+  afterEach(async () => {
+    dns.lookup = origLookup;
+    dns.promises.lookup = origPromisesLookup;
+    http.get = origHttpGet;
+    await new Promise((r) => server.close(r));
+  });
+
+  it("does not connect when the connect-time lookup rebinds to loopback", async () => {
+    const result = await executeWebFetch(`http://rebind.test:${port}/`);
+    assert.ok(result.startsWith("Error:"), `should block rebinding, got: ${result}`);
+    assert.ok(!result.includes("INTERNAL-SECRET"));
+    assert.deepEqual(hits, []);
+  });
+
+  it("does not connect when a redirect target rebinds to loopback", async () => {
+    // First hop: a public page (faked, no network) answers 302 to a
+    // rebinding host. The second hop goes through the real http.get.
+    let calls = 0;
+    http.get = function (url, opts, cb) {
+      calls += 1;
+      if (calls > 1) return origHttpGet.apply(http, arguments);
+      const req = new EventEmitter();
+      req.destroy = () => {};
+      process.nextTick(() => cb({
+        statusCode: 302,
+        headers: { location: `http://rebind-redirect.test:${port}/` },
+        resume() {},
+      }));
+      return req;
+    };
+    const result = await executeWebFetch("http://public-start.test/");
+    assert.ok(calls >= 1, "first hop should use http.get");
+    assert.ok(result.startsWith("Error:"), `should block redirect rebinding, got: ${result}`);
+    assert.ok(!result.includes("INTERNAL-SECRET"));
+    assert.deepEqual(hits, []);
+  });
+
+  it("guarded lookup passes public addresses through (all and single forms)", async () => {
+    assert.equal(typeof _guardedLookup, "function");
+    stubLookup([
+      { address: "93.184.216.34", family: 4 },
+      { address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 },
+    ]);
+    const all = await new Promise((r) => _guardedLookup("public.test", { all: true }, (e, a) => r({ e, a })));
+    assert.equal(all.e, null);
+    assert.deepEqual(all.a.map((x) => x.address), ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]);
+    const one = await new Promise((r) => _guardedLookup("public.test", {}, (e, a, f) => r({ e, a, f })));
+    assert.equal(one.e, null);
+    assert.equal(one.a, "93.184.216.34");
+    assert.equal(one.f, 4);
+  });
+
+  it("guarded lookup rejects when any resolved address is blocked", async () => {
+    assert.equal(typeof _guardedLookup, "function");
+    for (const bad of ["127.0.0.1", "10.1.2.3", "100.64.0.1", "::", "::1", "64:ff9b::a00:1", "::ffff:100.64.0.1", "::ffff:7f00:1", "fd12:3456::1", "fe80::1"]) {
+      stubLookup([
+        { address: "93.184.216.34", family: 4 },
+        { address: bad, family: bad.includes(":") ? 6 : 4 },
+      ]);
+      const err = await new Promise((res) => _guardedLookup("mixed.test", {}, (e) => res(e)));
+      assert.ok(err instanceof Error, `should reject ${bad}`);
+      assert.match(err.message, /Blocked resolved IP/);
+    }
+  });
 });
 
 // --- executeWebSearch ---
