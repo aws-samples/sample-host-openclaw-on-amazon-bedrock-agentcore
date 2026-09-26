@@ -45,3 +45,18 @@ describe("proxy guardrail env hand-off", () => {
     assert.doesNotMatch(proxyEnvBlock(), /\.\.\.process\.env/);
   });
 });
+
+describe("workspace AGENTS.md injection keeps the contract's Browser section", () => {
+  // The proxy injects the contract-written AGENTS.md (read from S3) into the system
+  // prompt, truncated to WORKSPACE_PER_FILE_MAX_CHARS. The Browser and Sub-agents
+  // sections sit past 5 KB, so a 4096 cap dropped them and the model denied having
+  // a browser skill while the browser session was up. Guard the cap here.
+  it("per-file cap is at least 8192 chars", () => {
+    const m = proxySrc.match(/const WORKSPACE_PER_FILE_MAX_CHARS = (\d+);/);
+    assert.ok(m, "proxy must define WORKSPACE_PER_FILE_MAX_CHARS");
+    assert.ok(Number(m[1]) >= 8192, `per-file cap ${m[1]} is too small for the contract AGENTS.md`);
+  });
+  it("contract still writes the Browser section the cap must cover", () => {
+    assert.match(contractSrc, /"## Browser \(AgentCore Browser\)"/);
+  });
+});

@@ -520,7 +520,11 @@ const WORKSPACE_FILES = [
     purpose: "freeform notes and memories",
   },
 ];
-const WORKSPACE_PER_FILE_MAX_CHARS = 4096;
+// Per-file cap must hold the whole contract-written AGENTS.md (~6.5 KB with the
+// Browser section): at 4096 the "## Browser (AgentCore Browser)" and
+// "## Sub-agents" sections were silently cut off and the model reported that it
+// had no browser skill even though the browser session was up.
+const WORKSPACE_PER_FILE_MAX_CHARS = 8192;
 const WORKSPACE_TOTAL_MAX_CHARS = 20000;
 
 // Default templates seeded into a user's S3 namespace on first interaction.

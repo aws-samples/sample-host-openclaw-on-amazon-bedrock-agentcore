@@ -469,7 +469,7 @@ const WORKSPACE_FILES = [
     purpose: "freeform notes and memories",
   },
 ];
-const WORKSPACE_PER_FILE_MAX_CHARS = 4096;
+const WORKSPACE_PER_FILE_MAX_CHARS = 8192;
 const WORKSPACE_TOTAL_MAX_CHARS = 20000;
 
 function sanitizeWorkspaceContent(raw) {
@@ -690,8 +690,8 @@ describe("Workspace: sanitization", () => {
     );
   });
 
-  it("truncates individual files to 4096 chars", () => {
-    const longContent = "x".repeat(5000);
+  it("truncates individual files to 8192 chars", () => {
+    const longContent = "x".repeat(9000);
     const result = buildIdentityText("telegram:123456789", "telegram", {
       "IDENTITY.md": longContent,
     });
