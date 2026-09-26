@@ -352,6 +352,7 @@ function extractSessionMetadata(parsed, headers) {
 // Per-user Cognito ID tokens (user provisioning, HMAC-derived password,
 // cache). Shared with agentcore-contract.js via bridge/cognito-token.js so
 // both processes derive the same password for the same actorId.
+const { scopeGuardrailToLatestUserTurn } = require("./guardrail-scope");
 const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
   userPoolId: COGNITO_USER_POOL_ID,
   clientId: COGNITO_CLIENT_ID,
@@ -986,7 +987,8 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
 
   const params = {
     modelId,
-    messages: bedrockMessages,
+    // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
+    messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
     ...(guardrailConfig && { guardrailConfig }),
@@ -1085,7 +1087,8 @@ async function invokeBedrockStreaming(
 
   const params = {
     modelId,
-    messages: bedrockMessages,
+    // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
+    messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
     ...(guardrailConfig && { guardrailConfig }),
