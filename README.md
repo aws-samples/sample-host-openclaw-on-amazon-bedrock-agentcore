@@ -431,6 +431,7 @@ All tunable parameters are in `cdk.json`:
 | `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |
 | `session_max_lifetime` | `28800` | Per-user session max lifetime (seconds) |
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
+| `workspace_restore_wait_seconds` | `180` | How long the bridge waits for the S3 `.openclaw/` restore before starting the OpenClaw gateway (passed as `WORKSPACE_RESTORE_WAIT_MS`). The wait ends as soon as the restore finishes; a large state (~1,200 files / 220 MB) restores in ~100-115 s, so keep this above that |
 | `router_lambda_timeout_seconds` | `600` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
@@ -727,8 +728,9 @@ Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as p
    - Create STS scoped credentials restricting S3 to user's namespace prefix
    - Set up the state layout (local `~/.openclaw` incl. `workspace/`, mirror restored from session storage), clean stale lock files
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
-   - Restore `.openclaw/` from S3 via `workspace-sync.js` (awaited, bounded by `WORKSPACE_RESTORE_WAIT_MS`, default 45s)
-   - Write `openclaw.json` + `AGENTS.md`; if a pre-2.0 `sessions.json` is present, run `openclaw doctor --fix` to import it into SQLite (see [docs/openclaw-2.0-upgrade.md](docs/openclaw-2.0-upgrade.md))
+   - Restore `.openclaw/` from S3 via `workspace-sync.js` (awaited, bounded by `WORKSPACE_RESTORE_WAIT_MS` — `deploy.sh` passes 180 s from `workspace_restore_wait_seconds`; the bridge falls back to 45 s when the variable is unset)
+   - Remove again any pre-2.0 file the restore brought back that `openclaw doctor --fix` already retired on the upgrade boot (byte-identical to the `.pre-2.0-retired-files.json` record; S3 keeps the originals for a rollback)
+   - Write `openclaw.json` + `AGENTS.md`; if a pre-2.0 `sessions.json` is present and not yet imported (no matching `.pre-2.0-import.json` receipt next to the SQLite store), or a retired file came back with different bytes, run `openclaw doctor --fix` to import it into SQLite (see [docs/openclaw-2.0-upgrade.md](docs/openclaw-2.0-upgrade.md))
    - Start the workspace change watcher, then the OpenClaw gateway (port 18789, `OPENCLAW_STATE_DIR=~/.openclaw`) with scoped credentials (no container credentials)
    - Start credential refresh timer (45 min interval)
    - Wait for proxy only (165 ms measured on us-west-2 staging)
@@ -912,7 +914,7 @@ cdk synth   # Runs cdk-nag AwsSolutions checks — should produce no errors
 
 This branch moves the image from OpenClaw 2026.3.8 / Node 22 to **OpenClaw 2026.9.5 ("2.0") / Node 24 / clawhub 0.23.3**. Existing deployments upgrade by pushing the new image and bumping `image_version`; per-user state carries over:
 
-- **Legacy sessions**: 2.0 stores sessions in per-agent SQLite and refuses readiness while a pre-2.0 `agents/<id>/sessions/sessions.json` is present. The contract runs `openclaw doctor --fix --non-interactive` once before the gateway spawns (bounded by `OPENCLAW_MIGRATION_TIMEOUT_MS`) to import it; an unreadable index is moved aside so the gateway still starts.
+- **Legacy sessions**: 2.0 stores sessions in per-agent SQLite and refuses readiness while a pre-2.0 `agents/<id>/sessions/sessions.json` is present. The contract runs `openclaw doctor --fix --non-interactive` once before the gateway spawns (bounded by `OPENCLAW_MIGRATION_TIMEOUT_MS`) to import it and records a receipt so later cold starts (which restore the 1.x index from S3 again) skip the import; an unreadable index is moved aside so the gateway still starts. The imported store can be hundreds of MB; SQLite databases over 10 MB are backed up as streamed gzip multipart objects, at most every 10 min (`WORKSPACE_SYNC_LARGE_SQLITE_MIN_INTERVAL_MS`), up to `WORKSPACE_SYNC_MAX_SQLITE_BYTES` (1 GiB) — see [docs/session-storage.md](docs/session-storage.md).
 - **Behaviour-preserving config knobs** written into `openclaw.json` so users see no change: `session.reset: { mode: "daily", atHour: 4 }` (2.0 stopped resetting daily); the new `tools.profile: "full"` tools that need a Control UI or a human answer (`terminal`, `process`, `plugins`, `ask_user`, `secrets`, `screen`, `progress_card`, `nodes`, `heartbeat_respond`, media generation) added to `tools.deny`; `skills.workshop.autonomous.mode: "off"` (autonomous Skill Workshop); Active Memory cross-conversation recall and grounded dreaming disabled (`memory.search.rememberAcrossConversations: false`, `plugins.entries["active-memory"].enabled: false`, `plugins.entries["memory-core"].config.dreaming.enabled: false`).
 - **WebSocket protocol 4** with `client.id: "gateway-client"`, `client.mode: "backend"` and no `Origin` header (see Gotchas).
 - **State on local disk**, mirrored to session storage, because the mount has neither SQLite locks nor hard links (see [Session Storage](#session-storage-persistent-filesystem)).
@@ -970,7 +972,7 @@ Node.js's Happy Eyeballs (`autoSelectFamily`, Node 20+) tries both IPv4 and IPv6
 
 | Limitation | Details |
 |---|---|
-| **Cold start time** | Lightweight agent answers first (23 s webhook-to-reply measured on us-west-2 staging, most of it Lambda + Bedrock); the 2.0 gateway is ready 2.6 s after spawn, but spawn waits up to `WORKSPACE_RESTORE_WAIT_MS` (45 s) for the S3 restore, so the first full-OpenClaw reply arrived ~70 s after the webhook |
+| **Cold start time** | Lightweight agent answers first (23 s webhook-to-reply measured on us-west-2 staging, most of it Lambda + Bedrock); the 2.0 gateway is ready 2.6 s after spawn, but spawn waits up to `WORKSPACE_RESTORE_WAIT_MS` (180 s via `deploy.sh`; 45 s bridge fallback) for the S3 restore, so the first full-OpenClaw reply arrived ~70 s after the webhook |
 | **Image size** | Max 3.75 MB per image (Bedrock Converse API limit) |
 | **Session timeout** | Sessions terminate after 30 min idle (configurable via `session_idle_timeout`) |
 | **ClawHub skills** | 5 pre-installed; available only after full OpenClaw startup. During warm-up, built-in web_fetch/web_search tools are available |

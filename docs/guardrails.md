@@ -4,6 +4,8 @@
 
 OpenClaw deploys AWS Bedrock Guardrails via the `OpenClawGuardrails` CDK stack to provide content-level defense on every Bedrock Converse/ConverseStream API call. The proxy (`agentcore-proxy.js`) injects `guardrailConfig` into every request — Bedrock evaluates the guardrail server-side.
 
+**Input scope.** The proxy wraps only the person's latest message in `guardContent` (`bridge/guardrail-scope.js`), so input filters assess that text and not the whole transcript: OpenClaw adds its own user-role blocks (a `Runtime: …` trailer, `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>` data) that together trip `PROMPT_ATTACK`, and a card number blocked earlier in the session would otherwise block every later turn. When the trailing user turn is only tool results (the model is mid tool-call), the most recent earlier user text is tagged instead — tool results cannot carry `guardContent`, and an untagged request falls back to assessing everything, which on us-west-2 staging blocked every turn in which the model used a tool once the history held a card number. Model output is always assessed in full. `PROMPT_ATTACK` at strength HIGH still blocks some imperative phrasings of the user's own text ("Using your browser tool, open … and tell me …" → `PROMPT_ATTACK:LOW` → blocked; "What is the title of the page at …? You can use the browser." passes) — that is filter tuning in `stacks/guardrails_stack.py`.
+
 **Stack**: `OpenClawGuardrails` (`stacks/guardrails_stack.py`)
 **Default**: Enabled (`enable_guardrails = true`)
 

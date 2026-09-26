@@ -27,6 +27,7 @@ const {
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
 const stateStorage = require("./state-storage");
+const legacySessionImport = require("./legacy-session-import");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
@@ -378,19 +379,7 @@ function openclawEnvFor(scopedCredsAvailable, userId) {
  * Returns the list of legacy index paths found (empty when already migrated).
  */
 function findLegacySessionStores(openclawDir = OPENCLAW_DIR) {
-  const found = [];
-  let agents = [];
-  try {
-    agents = fs.readdirSync(`${openclawDir}/agents`, { withFileTypes: true });
-  } catch {
-    return found; // No agents dir — fresh install
-  }
-  for (const entry of agents) {
-    if (!entry.isDirectory()) continue;
-    const legacyIndex = `${openclawDir}/agents/${entry.name}/sessions/sessions.json`;
-    if (fs.existsSync(legacyIndex)) found.push(legacyIndex);
-  }
-  return found;
+  return legacySessionImport.findLegacySessionStores(openclawDir);
 }
 
 /**
@@ -409,16 +398,60 @@ function findLegacySessionStores(openclawDir = OPENCLAW_DIR) {
  * transcript .jsonl files are left in place for a later manual
  * `openclaw doctor --session-sqlite import`.
  *
- * @returns {Promise<boolean>} true when a legacy store was found and doctor
- *   was run (the caller re-emits openclaw.json since doctor may rewrite it);
- *   false when there was nothing to migrate.
+ * Runs once per index: S3 keeps the 1.x files (no deletes are propagated, and
+ * they are the rollback path), so every cold start restores `sessions.json`
+ * again next to the 2.0 SQLite store that already holds the imported history.
+ * A receipt written after a successful import (legacy-session-import.js, the
+ * sha256 of the imported index next to the store) lets later boots recognise
+ * that index and move it aside instead of re-running doctor (~53 s for the
+ * live user) and re-writing imported entries over 2.0's. An index with no or a
+ * non-matching receipt, or whose store is missing, is imported as before.
+ *
+ * Doctor also retires the OTHER pre-2.0 state files (workspace-state.json,
+ * auth-profiles.json, exec-approvals.json, the imported .jsonl transcripts, …)
+ * and the 2.0 gateway refuses to run (exit 78, maintenance_required) while some
+ * of them exist. Those come back from S3 on every later restore too, so on a
+ * successful import the contract records which files doctor retired (path +
+ * sha256, `.pre-2.0-retired-files.json` at the state-dir root) and
+ * pruneResurrectedLegacyFiles() removes byte-identical copies after every
+ * restore. `forceDoctor` runs doctor even without a legacy index — used when a
+ * recorded file came back with DIFFERENT bytes (1.x rewrote it during a
+ * rollback), which needs migrating again rather than deleting.
+ *
+ * @returns {Promise<boolean>} true when a legacy store was found (or doctor was
+ *   forced) and doctor was run (the caller re-emits openclaw.json since doctor
+ *   may rewrite it); false when there was nothing to migrate (or everything
+ *   present had already been imported).
  */
-async function migrateLegacySessionStore(env) {
-  const legacy = findLegacySessionStores();
-  if (legacy.length === 0) return false; // nothing to migrate
+async function migrateLegacySessionStore(env, { forceDoctor = false } = {}) {
+  const plan = legacySessionImport.planLegacyImport(OPENCLAW_DIR);
+  for (const item of plan.alreadyImported) {
+    if (legacySessionImport.moveImportedIndexAside(item)) {
+      console.log(
+        `[contract] Pre-2.0 session store ${item.legacyIndex} was already imported into ${item.sqliteStore} (receipt matches) — moved aside, skipping doctor`,
+      );
+    } else {
+      plan.toImport.push(item.legacyIndex);
+    }
+  }
+  const legacy = plan.toImport;
+  if (legacy.length === 0 && !forceDoctor) return false; // nothing to migrate
 
+  if (legacy.length > 0) {
+    console.log(
+      `[contract] Pre-2.0 session store found (${legacy.join(", ")}) — running openclaw doctor --fix to import into SQLite`,
+    );
+  } else {
+    console.log("[contract] Running openclaw doctor --fix to re-migrate changed pre-2.0 state files");
+  }
+  // Hash the indexes now: doctor archives them away once imported.
+  const fingerprints = legacySessionImport.fingerprintIndexes(legacy);
+  // And fingerprint the whole state dir: the files that are gone after doctor
+  // are the ones every later restore must not resurrect (see the module).
+  const fingerprintStarted = Date.now();
+  const stateBeforeDoctor = legacySessionImport.fingerprintStateDir(OPENCLAW_DIR);
   console.log(
-    `[contract] Pre-2.0 session store found (${legacy.join(", ")}) — running openclaw doctor --fix to import into SQLite`,
+    `[contract] Fingerprinted ${stateBeforeDoctor.size} state file(s) before doctor in ${Date.now() - fingerprintStarted}ms`,
   );
   const started = Date.now();
   const result = await new Promise((resolve) => {
@@ -469,6 +502,25 @@ async function migrateLegacySessionStore(env) {
     console.log(
       `[contract] Legacy session store imported into SQLite in ${Date.now() - started}ms`,
     );
+    const receipts = legacySessionImport.writeReceipts(OPENCLAW_DIR, fingerprints);
+    if (receipts.length) {
+      console.log(`[contract] Recorded import receipt(s): ${receipts.join(", ")} — later cold starts skip this import`);
+    }
+    const retired = legacySessionImport.diffRetiredFiles(stateBeforeDoctor, OPENCLAW_DIR);
+    const manifest = legacySessionImport.writeRetiredManifest(OPENCLAW_DIR, retired);
+    if (manifest) {
+      console.log(
+        `[contract] Recorded ${retired.length} file(s) retired by doctor (${manifest.files.length} total) in ${manifest.path} — later restores remove them again`,
+      );
+    }
+    // Both records are only useful once they are in S3, and nothing else
+    // uploads them in time: this runs before the gateway spawns, so the change
+    // watcher (started on gateway readiness) never sees the writes, the
+    // periodic save is 30 min away in backup mode, and an idle stop sends no
+    // SIGTERM. On us-west-2 staging (F6) two full upgrade boots wrote both files
+    // and neither ever reached S3 — every later cold start re-ran doctor and the
+    // retired-files prune had no manifest to work from.
+    await backupImportRecords([...receipts, ...(manifest ? [manifest.path] : [])]);
     return true; // doctor ran (and succeeded)
   }
 
@@ -488,6 +540,54 @@ async function migrateLegacySessionStore(env) {
     }
   }
   return true; // doctor ran (import incomplete; leftovers quarantined)
+}
+
+/**
+ * Upload the import receipt(s) / retired-files manifest written by
+ * migrateLegacySessionStore() to S3 right away, one file at a time through the
+ * same path the runtime-skills manifest uses (workspaceSync.saveFile: skip
+ * rules, sha256 metadata, upload gate). Paths are absolute, inside OPENCLAW_DIR.
+ * Never throws: a failed upload is logged and the periodic/final save retries.
+ */
+async function backupImportRecords(absolutePaths) {
+  const namespace = currentNamespace;
+  if (!namespace) return 0;
+  let saved = 0;
+  for (const abs of absolutePaths) {
+    const prefix = OPENCLAW_DIR.endsWith("/") ? OPENCLAW_DIR : `${OPENCLAW_DIR}/`;
+    if (!abs.startsWith(prefix)) continue;
+    const rel = abs.slice(prefix.length);
+    if (!rel) continue;
+    try {
+      if (await workspaceSync.saveFile(namespace, rel)) saved++;
+    } catch (err) {
+      console.warn(`[contract] Could not back up ${rel} to S3 now (${err.message}) — the periodic save will retry`);
+    }
+  }
+  if (saved) console.log(`[contract] Backed up ${saved} import record(s) to S3`);
+  return saved;
+}
+
+/**
+ * Remove the pre-2.0 files a restore brought back that `openclaw doctor --fix`
+ * had retired on the upgrade boot, when their bytes still match the record
+ * (legacy-session-import.js, `.pre-2.0-retired-files.json`). Returns the
+ * module's result; `changed` non-empty means a recorded file came back with
+ * different bytes and the caller should run doctor again.
+ */
+function pruneResurrectedLegacyFiles() {
+  const result = legacySessionImport.pruneRetiredFiles(OPENCLAW_DIR);
+  if (result.pruned.length) {
+    console.log(
+      `[contract] Removed ${result.pruned.length} restored pre-2.0 file(s) that doctor had already retired (S3 keeps them for a rollback)`,
+    );
+  }
+  if (result.changed.length) {
+    console.warn(
+      `[contract] ${result.changed.length} retired pre-2.0 file(s) came back with different bytes (${result.changed.slice(0, 5).join(", ")}${result.changed.length > 5 ? ", …" : ""}) — running doctor again`,
+    );
+  }
+  return result;
 }
 
 /**
@@ -1375,6 +1475,10 @@ async function init(userId, actorId, channel) {
       S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
       SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
       SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
+      // Bedrock Guardrails: agentcore-proxy.js reads these at load time; without them the
+      // guardrailConfig is never attached to Converse calls even when the runtime has them.
+      BEDROCK_GUARDRAIL_ID: process.env.BEDROCK_GUARDRAIL_ID || "",
+      BEDROCK_GUARDRAIL_VERSION: process.env.BEDROCK_GUARDRAIL_VERSION || "",
       USER_ID: actorId,
       INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
       CHANNEL: channel,
@@ -1438,6 +1542,13 @@ async function init(userId, actorId, channel) {
     // "still running" warning only fires on a genuine timeout.
     await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);
 
+    // 1e'. The restore brings back every pre-2.0 file `openclaw doctor --fix`
+    // retired on the upgrade boot (S3 never sees deletes — that is the rollback
+    // path), and the 2.0 gateway refuses to run while they exist. Remove the
+    // ones whose bytes still match doctor's input; a changed one needs doctor
+    // again (F5, us-west-2 F1 staging test).
+    const resurrected = pruneResurrectedLegacyFiles();
+
     // 1f. Write OpenClaw config + AGENTS.md AFTER the session-storage restore
     // (so they are not overwritten by stale restored data) and
     // BEFORE the gateway spawns (2.0 validates config strictly at startup; the
@@ -1452,7 +1563,7 @@ async function init(userId, actorId, channel) {
     // Doctor needs the config above to exist; it may also rewrite it (dropping
     // keys, rotating a .bak), so re-emit our config afterwards.
     const openclawEnv = openclawEnvFor(scopedCredsAvailable, userId);
-    if (await migrateLegacySessionStore(openclawEnv)) {
+    if (await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 })) {
       writeOpenClawConfig();
     }
 

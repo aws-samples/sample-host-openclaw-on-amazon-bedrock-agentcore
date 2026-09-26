@@ -94,7 +94,9 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
     Statement: [
       {
         Effect: "Allow",
-        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+        // AbortMultipartUpload: workspace-sync uploads large SQLite snapshots
+        // as multipart uploads and aborts a failed one so no billed parts linger.
+        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
         Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
       },
       {
