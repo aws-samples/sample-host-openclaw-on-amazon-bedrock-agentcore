@@ -10,7 +10,9 @@
  *         mapping, SQLite-only throttle, failure handling), the upload gate
  *         (nothing uploaded before/without a completed restore), the
  *         fill-missing restore mode (incl. kept files verified against the
- *         sha256 stored as S3 object metadata) and the SIGTERM wiring in the
+ *         sha256 stored as S3 object metadata), large SQLite databases (gzip
+ *         multipart upload, streaming restore of gzip and legacy objects,
+ *         hash-skip, hard cap, longer cadence) and the SIGTERM wiring in the
  *         contract.
  * Note: S3Client creation is tested implicitly (SDK only in Docker image).
  * Run: cd bridge && node --test workspace-sync.test.js
@@ -1645,5 +1647,424 @@ describe("change backup wiring in agentcore-contract.js", () => {
 
   it("waits at most 2 s for the gateway by default (the container has no longer to live)", () => {
     assert.ok(source.includes('process.env.GATEWAY_STOP_WAIT_MS || "2000"'));
+  });
+});
+
+// --- large SQLite databases: gzip multipart backup, streaming restore, cap (F1) ---
+//
+// us-west-2 rehearsal, big-state boot: `openclaw doctor --fix` imported the live
+// user's 990 pre-2.0 sessions into one 299,360,256-byte openclaw-agent.sqlite,
+// which the 10 MB cap then skipped on EVERY save ("Skipping … (299360256 bytes
+// > 10485760)" at each flush). Everything the user said to 2.0 was lost at the
+// next cold start. These tests shrink the thresholds (_setLimitsForTests) so
+// the large-file paths run on a ~300 KB fixture.
+
+describe("large SQLite databases (gzip snapshot backup)", () => {
+  const Module = require("module");
+  const os = require("os");
+  const fs = require("fs");
+  const path = require("path");
+  const zlib = require("zlib");
+  const hasNodeSqlite = (() => {
+    try { return typeof require("node:sqlite").backup === "function"; } catch { return false; }
+  })();
+  const sha256 = (body) => require("node:crypto").createHash("sha256").update(body).digest("hex");
+  const NS = "telegram_1";
+  const REL = "agents/main/agent/openclaw-agent.sqlite";
+  const KEY = `${NS}/.openclaw/${REL}`;
+  // Fixture thresholds: "large" = snapshot > 64 KB, multipart parts of 32 KB.
+  const LIMITS = { maxFileSize: 64 * 1024, uploadPartSize: 32 * 1024 };
+
+  let tmpDir, savedHome, realLoad, workspaceSync;
+  let s3; // fake S3 state
+  let warnings, logs, realWarn, realLog;
+
+  function freshModule() {
+    delete require.cache[require.resolve("./workspace-sync")];
+    const m = require("./workspace-sync");
+    m.configureCredentials({ accessKeyId: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" });
+    m._setLimitsForTests({ ...LIMITS });
+    return m;
+  }
+
+  function makeFakeS3() {
+    const state = {
+      objects: {}, metadata: {}, encodings: {}, uploads: {}, aborted: [], calls: [],
+      failPart: null, // PartNumber whose UploadPart should throw
+    };
+    let nextUpload = 0;
+    state.client = {
+      send: async (cmd) => {
+        state.calls.push(cmd.kind);
+        const inp = cmd.input;
+        switch (cmd.kind) {
+          case "list":
+            return {
+              Contents: Object.entries(state.objects).map(([Key, body]) => ({ Key, Size: body.length })),
+              IsTruncated: false,
+            };
+          case "get": {
+            const body = state.objects[inp.Key];
+            if (!body) throw new Error("NoSuchKey");
+            const half = Math.ceil(body.length / 2);
+            return {
+              Body: (async function* () { yield body.subarray(0, half); yield body.subarray(half); })(),
+              ...(state.metadata[inp.Key] ? { Metadata: state.metadata[inp.Key] } : {}),
+              ...(state.encodings[inp.Key] ? { ContentEncoding: state.encodings[inp.Key] } : {}),
+            };
+          }
+          case "head":
+            if (!(inp.Key in state.objects)) throw new Error("NotFound");
+            return { ContentLength: state.objects[inp.Key].length, ...(state.metadata[inp.Key] ? { Metadata: state.metadata[inp.Key] } : {}) };
+          case "put":
+            state.objects[inp.Key] = Buffer.from(inp.Body);
+            state.metadata[inp.Key] = inp.Metadata;
+            if (inp.ContentEncoding) state.encodings[inp.Key] = inp.ContentEncoding; else delete state.encodings[inp.Key];
+            return {};
+          case "createMultipart": {
+            const id = `upload-${++nextUpload}`;
+            state.uploads[id] = { input: inp, parts: new Map() };
+            return { UploadId: id };
+          }
+          case "uploadPart": {
+            if (state.failPart === inp.PartNumber) throw new Error("part boom");
+            const up = state.uploads[inp.UploadId];
+            assert.ok(up, "part for an unknown upload");
+            assert.equal(inp.Body.length, inp.ContentLength);
+            up.parts.set(inp.PartNumber, Buffer.from(inp.Body));
+            return { ETag: `"etag-${inp.PartNumber}"` };
+          }
+          case "complete": {
+            const up = state.uploads[inp.UploadId];
+            assert.ok(up, "complete for an unknown upload");
+            const parts = inp.MultipartUpload.Parts;
+            assert.deepEqual(parts.map((p) => p.PartNumber), [...up.parts.keys()].sort((a, b) => a - b), "every uploaded part is listed, in order");
+            for (const p of parts) assert.equal(p.ETag, `"etag-${p.PartNumber}"`);
+            state.objects[inp.Key] = Buffer.concat(parts.map((p) => up.parts.get(p.PartNumber)));
+            state.metadata[inp.Key] = up.input.Metadata;
+            state.encodings[inp.Key] = up.input.ContentEncoding;
+            delete state.uploads[inp.UploadId];
+            return {};
+          }
+          case "abort":
+            state.aborted.push(inp.UploadId);
+            delete state.uploads[inp.UploadId];
+            return {};
+          default:
+            throw new Error(`unexpected command ${cmd.kind}`);
+        }
+      },
+    };
+    return state;
+  }
+
+  /** A WAL-mode SQLite db of roughly `rows` compressible rows (~300 KB for 1500). */
+  function makeDb(dbPath, rows = 1500, tag = "v1") {
+    const { DatabaseSync } = require("node:sqlite");
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    const db = new DatabaseSync(dbPath);
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("CREATE TABLE IF NOT EXISTS transcript_events (id INTEGER PRIMARY KEY, session_id TEXT, event_json TEXT)");
+    const ins = db.prepare("INSERT INTO transcript_events (session_id, event_json) VALUES (?, ?)");
+    db.exec("BEGIN");
+    for (let i = 0; i < rows; i++) {
+      // A random token per row keeps the gzip body large enough to need
+      // several parts at the test part size (real transcripts compress ~4-6x).
+      ins.run(`ses_${i % 17}`, JSON.stringify({ type: "message", role: i % 2 ? "assistant" : "user", tag, seq: i, id: require("node:crypto").randomBytes(48).toString("hex"), text: `row ${i} ${"lorem ipsum dolor sit amet ".repeat(4)}` }));
+    }
+    db.exec("COMMIT");
+    db.close();
+  }
+
+  function appendRows(dbPath, n, tag) {
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const ins = db.prepare("INSERT INTO transcript_events (session_id, event_json) VALUES (?, ?)");
+    for (let i = 0; i < n; i++) ins.run("ses_new", JSON.stringify({ tag, i, text: "something the user said to 2.0" }));
+    db.close();
+  }
+
+  function rowCount(dbPath) {
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try { return db.prepare("SELECT count(*) AS n FROM transcript_events").get().n; } finally { db.close(); }
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ws-large-"));
+    savedHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    fs.mkdirSync(path.join(tmpDir, ".openclaw"), { recursive: true });
+    process.env.AWS_REGION = "us-west-2";
+    process.env.S3_USER_FILES_BUCKET = "test-bucket";
+    s3 = makeFakeS3();
+    realLoad = Module._load;
+    Module._load = function (request, ...rest) {
+      if (request === "@aws-sdk/client-s3") {
+        const cmd = (kind) => function (input) { this.kind = kind; this.input = input; };
+        return {
+          S3Client: function () { return s3.client; },
+          PutObjectCommand: cmd("put"),
+          GetObjectCommand: cmd("get"),
+          HeadObjectCommand: cmd("head"),
+          ListObjectsV2Command: cmd("list"),
+          CreateMultipartUploadCommand: cmd("createMultipart"),
+          UploadPartCommand: cmd("uploadPart"),
+          CompleteMultipartUploadCommand: cmd("complete"),
+          AbortMultipartUploadCommand: cmd("abort"),
+        };
+      }
+      return realLoad.call(this, request, ...rest);
+    };
+    warnings = []; logs = [];
+    realWarn = console.warn; realLog = console.log;
+    console.warn = (...a) => { warnings.push(a.join(" ")); };
+    console.log = (...a) => { logs.push(a.join(" ")); };
+    workspaceSync = freshModule();
+    workspaceSync._setRestoreStateForTests("ready");
+  });
+
+  afterEach(async () => {
+    try { await workspaceSync.stopChangeBackup("test"); } catch { /* not started */ }
+    console.warn = realWarn; console.log = realLog;
+    Module._load = realLoad;
+    process.env.HOME = savedHome;
+    delete process.env.S3_USER_FILES_BUCKET;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it(
+    "uploads a database above the buffered cap as a gzip multipart object keyed by its uncompressed sha256, never in memory whole",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const dbPath = path.join(tmpDir, ".openclaw", REL);
+      makeDb(dbPath);
+      const raw = fs.statSync(dbPath).size;
+      assert.ok(raw > LIMITS.maxFileSize, `fixture must exceed the buffered cap (${raw} bytes)`);
+
+      await workspaceSync.saveWorkspace(NS);
+
+      // Multipart, not a single PUT: create + >= 2 parts + complete, no abort.
+      assert.deepEqual(s3.calls.filter((c) => c !== "uploadPart"), ["createMultipart", "complete"]);
+      assert.ok(s3.calls.filter((c) => c === "uploadPart").length >= 2, `expected several parts, got ${s3.calls}`);
+      assert.deepEqual(s3.aborted, []);
+      assert.ok(KEY in s3.objects, "the database is in S3");
+
+      // The body is gzip; decompressed it is the exact snapshot the old path
+      // would have uploaded, and the metadata records THAT hash (so #115's
+      // kept-file HeadObject comparison keeps working), the encoding and the
+      // uncompressed size.
+      const gz = s3.objects[KEY];
+      assert.ok(gz.length < raw / 2, `gzip should shrink the fixture (${gz.length} vs ${raw})`);
+      const plain = zlib.gunzipSync(gz);
+      const snapshot = await workspaceSync.snapshotSqlite(dbPath);
+      assert.equal(sha256(plain), sha256(snapshot), "decompressed body == consistent snapshot");
+      assert.equal(s3.encodings[KEY], "gzip");
+      assert.deepEqual(s3.metadata[KEY], {
+        [workspaceSync.UPLOAD_HASH_METADATA_KEY]: sha256(snapshot),
+        [workspaceSync.UPLOAD_ENCODING_METADATA_KEY]: "gzip",
+        [workspaceSync.UPLOAD_SIZE_METADATA_KEY]: String(snapshot.length),
+      });
+      assert.ok(logs.some((l) => /Uploaded agents\/main\/agent\/openclaw-agent\.sqlite as a gzip snapshot: \d+ -> \d+ bytes \(\d+ part\(s\)/.test(l)), logs.join("\n"));
+      assert.equal(warnings.filter((w) => /Skipping/.test(w)).length, 0, "nothing skipped");
+
+      // No snapshot / temp file left next to the database.
+      const leftovers = fs.readdirSync(path.dirname(dbPath)).filter((f) => f.includes("snapshot") || f.includes(".tmp-"));
+      assert.deepEqual(leftovers, []);
+    },
+  );
+
+  it(
+    "a small database still goes up as one uncompressed PUT (unchanged path)",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const dbPath = path.join(tmpDir, ".openclaw", REL);
+      makeDb(dbPath, 20); // a few KB
+      assert.ok(fs.statSync(dbPath).size <= LIMITS.maxFileSize);
+      await workspaceSync.saveWorkspace(NS);
+      assert.deepEqual(s3.calls, ["put"]);
+      assert.equal(s3.encodings[KEY], undefined);
+      assert.equal(Buffer.from(s3.objects[KEY]).subarray(0, 15).toString(), "SQLite format 3");
+      assert.deepEqual(Object.keys(s3.metadata[KEY]), [workspaceSync.UPLOAD_HASH_METADATA_KEY]);
+    },
+  );
+
+  it(
+    "restores a gzip snapshot object decompressed and a legacy uncompressed object as-is, seeding both hashes",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      // Build the two objects: one uploaded by this code (gzip), one by the
+      // pre-compression code (raw bytes, sha256 metadata from #115).
+      const src = path.join(tmpDir, "src.sqlite");
+      makeDb(src, 1500, "big");
+      const bigSnapshot = await workspaceSync.snapshotSqlite(src);
+      s3.objects[KEY] = zlib.gzipSync(bigSnapshot);
+      s3.metadata[KEY] = { sha256: sha256(bigSnapshot), encoding: "gzip", "uncompressed-size": String(bigSnapshot.length) };
+      s3.encodings[KEY] = "gzip";
+      const legacyKey = `${NS}/.openclaw/state/openclaw.sqlite`;
+      const legacySrc = path.join(tmpDir, "legacy.sqlite");
+      makeDb(legacySrc, 20, "small");
+      const legacyBytes = await workspaceSync.snapshotSqlite(legacySrc);
+      s3.objects[legacyKey] = Buffer.from(legacyBytes);
+      s3.metadata[legacyKey] = { sha256: sha256(legacyBytes) };
+      // And one from before any metadata existed at all.
+      s3.objects[`${NS}/.openclaw/workspace/MEMORY.md`] = Buffer.from("# memory\n");
+
+      const fresh = freshModule();
+      const r = await fresh.restoreWorkspace(NS);
+      assert.deepEqual(r, { restored: 3, kept: 0, keptUnchanged: 0, failed: 0, hadState: true });
+      assert.equal(fresh.getRestoreState(), "ready");
+
+      const restoredBig = path.join(tmpDir, ".openclaw", REL);
+      assert.equal(sha256(fs.readFileSync(restoredBig)), sha256(bigSnapshot), "gzip object restored decompressed, byte-exact");
+      assert.equal(rowCount(restoredBig), 1500, "restored database opens and has every row");
+      assert.equal(sha256(fs.readFileSync(path.join(tmpDir, ".openclaw", "state", "openclaw.sqlite"))), sha256(legacyBytes), "legacy object restored as-is");
+      assert.equal(fs.readFileSync(path.join(tmpDir, ".openclaw", "workspace", "MEMORY.md"), "utf8"), "# memory\n");
+      assert.deepEqual(fs.readdirSync(path.dirname(restoredBig)).filter((f) => f.includes(".tmp-")), [], "no temp file left");
+
+      // Every restored file is seeded: the first full save uploads nothing.
+      const before = s3.calls.length;
+      await fresh.saveWorkspace(NS);
+      assert.equal(s3.calls.length, before, `a full save right after restore must not upload (${s3.calls.slice(before)})`);
+    },
+  );
+
+  it(
+    "a downloaded object whose bytes do not match its recorded sha256 fails that file (and closes the upload gate)",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const src = path.join(tmpDir, "src.sqlite");
+      makeDb(src);
+      const snapshot = await workspaceSync.snapshotSqlite(src);
+      s3.objects[KEY] = zlib.gzipSync(snapshot);
+      s3.metadata[KEY] = { sha256: "0".repeat(64), encoding: "gzip" };
+      s3.encodings[KEY] = "gzip";
+      const fresh = freshModule();
+      const r = await fresh.restoreWorkspace(NS);
+      assert.equal(r.failed, 1);
+      assert.equal(fresh.getRestoreState(), "failed");
+      assert.equal(fs.existsSync(path.join(tmpDir, ".openclaw", REL)), false, "nothing handed to the gateway");
+      assert.ok(warnings.some((w) => /sha256 mismatch/.test(w)), warnings.join("\n"));
+    },
+  );
+
+  it(
+    "does not re-upload an unchanged large database (in-process hash, and HeadObject on a same-session restart), but uploads new commits",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const dbPath = path.join(tmpDir, ".openclaw", REL);
+      makeDb(dbPath);
+      await workspaceSync.saveWorkspace(NS);
+      assert.ok(s3.calls.includes("complete"));
+      const afterFirst = s3.calls.length;
+
+      // Same bytes: the second full save neither snapshots to S3 nor talks to it.
+      await workspaceSync.saveWorkspace(NS);
+      assert.equal(s3.calls.length, afterFirst, "unchanged database: no S3 traffic");
+
+      // Same-session restart with the database on the mount mirror (kept file):
+      // one HeadObject, hash from metadata == local snapshot hash, seeded.
+      const restarted = freshModule();
+      const r = await restarted.restoreWorkspace(NS, { overwrite: false });
+      assert.deepEqual(r, { restored: 0, kept: 1, keptUnchanged: 1, failed: 0, hadState: true });
+      assert.deepEqual(s3.calls.slice(afterFirst), ["list", "head"]);
+      await restarted.saveWorkspace(NS);
+      assert.equal(s3.calls.length, afterFirst + 2, "kept-and-identical: not re-uploaded");
+
+      // New commits -> a new gzip object with the new hash.
+      appendRows(dbPath, 50, "post-upgrade");
+      await restarted.saveWorkspace(NS);
+      assert.ok(s3.calls.slice(afterFirst + 2).includes("complete"), `expected a multipart upload, got ${s3.calls.slice(afterFirst + 2)}`);
+      const plain = zlib.gunzipSync(s3.objects[KEY]);
+      const check = path.join(tmpDir, "check.sqlite");
+      fs.writeFileSync(check, plain);
+      assert.equal(rowCount(check), 1550);
+      assert.equal(s3.metadata[KEY].sha256, sha256(plain));
+    },
+  );
+
+  it(
+    "skips a database above the hard cap with a clear warning and no S3 traffic",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const dbPath = path.join(tmpDir, ".openclaw", REL);
+      makeDb(dbPath);
+      workspaceSync._setLimitsForTests({ maxSqliteFileSize: 100 * 1024 }); // fixture is ~300 KB
+      const outcome = await workspaceSync.uploadStateFile(NS, REL);
+      assert.equal(outcome, "skipped");
+      assert.deepEqual(s3.calls, []);
+      const w = warnings.find((x) => /Skipping agents\/main\/agent\/openclaw-agent\.sqlite: SQLite database is \d+ bytes, above the 102400-byte backup cap \(WORKSPACE_SYNC_MAX_SQLITE_BYTES\) — its changes are NOT backed up to S3/.test(x));
+      assert.ok(w, warnings.join("\n"));
+      // The cap is also applied to the listing on restore.
+      s3.objects[KEY] = Buffer.alloc(101 * 1024);
+      const fresh = freshModule();
+      fresh._setLimitsForTests({ maxSqliteFileSize: 100 * 1024 });
+      const r = await fresh.restoreWorkspace(NS);
+      assert.equal(r.restored, 0);
+      assert.ok(warnings.some((x) => /Skipping oversized file/.test(x)));
+    },
+  );
+
+  it(
+    "aborts the multipart upload when a part fails, leaves no object, and the save reports the failure",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const dbPath = path.join(tmpDir, ".openclaw", REL);
+      makeDb(dbPath);
+      s3.failPart = 2;
+      await workspaceSync.saveWorkspace(NS);
+      assert.deepEqual(s3.aborted, ["upload-1"]);
+      assert.equal(KEY in s3.objects, false);
+      assert.deepEqual(Object.keys(s3.uploads), [], "no incomplete upload left");
+      assert.ok(warnings.some((w) => /Failed to save agents\/main\/agent\/openclaw-agent\.sqlite: part boom/.test(w)), warnings.join("\n"));
+      // The next save retries (hash was not recorded).
+      s3.failPart = null;
+      await workspaceSync.saveWorkspace(NS);
+      assert.ok(KEY in s3.objects);
+    },
+  );
+
+  it(
+    "change backup: a large database follows its own longer cadence, is held (not pulled along by other files) and force-flushed on stop",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const dbPath = path.join(tmpDir, ".openclaw", REL);
+      makeDb(dbPath);
+      // Small-database throttle off; large databases at most every 60 s.
+      workspaceSync.startChangeBackup(NS, { debounceMs: 10, maxWaitMs: 100, sqliteMinIntervalMs: 0, largeSqliteMinIntervalMs: 60_000 });
+
+      // First change of the session: never uploaded before -> goes up now.
+      workspaceSync.markChanged(REL);
+      let r = await workspaceSync.flushPendingSaves("test");
+      assert.equal(r.uploaded, 1);
+      assert.equal(r.held, 0);
+      const v1 = s3.objects[KEY];
+
+      // New commits a moment later: held for the rest of the 60 s window, even
+      // though a non-SQLite file is uploaded in the same pass.
+      appendRows(dbPath, 10, "t2");
+      fs.mkdirSync(path.join(tmpDir, ".openclaw", "workspace"), { recursive: true });
+      fs.writeFileSync(path.join(tmpDir, ".openclaw", "workspace", "MEMORY.md"), "note\n");
+      workspaceSync.markChanged(REL);
+      workspaceSync.markChanged("workspace/MEMORY.md");
+      r = await workspaceSync.flushPendingSaves("test");
+      assert.equal(r.uploaded, 1, "MEMORY.md went up");
+      assert.equal(r.held, 1, "the large database is held");
+      assert.ok(r.holdMs > 50_000 && r.holdMs <= 60_000, `holdMs ${r.holdMs}`);
+      assert.equal(s3.objects[KEY], v1, "database not re-uploaded yet");
+      assert.ok(logs.some((l) => /1 SQLite snapshot\(s\) held for \d+s/.test(l)), logs.join("\n"));
+
+      // Stop (SIGTERM path) forces it out.
+      r = await workspaceSync.stopChangeBackup("test");
+      assert.equal(r.held, 0);
+      assert.notEqual(s3.objects[KEY], v1, "held snapshot uploaded on stop");
+      assert.equal(rowCount((() => { const p = path.join(tmpDir, "chk.sqlite"); fs.writeFileSync(p, zlib.gunzipSync(s3.objects[KEY])); return p; })()), 1510);
+    },
+  );
+
+  it("large cadence is never shorter than the SQLite throttle and defaults to 10 min", () => {
+    assert.equal(workspaceSync.DEFAULT_LARGE_SQLITE_MIN_INTERVAL_MS, 10 * 60 * 1000);
+    workspaceSync.startChangeBackup(NS, { debounceMs: 10, maxWaitMs: 100, sqliteMinIntervalMs: 90_000, largeSqliteMinIntervalMs: 1_000 });
+    assert.ok(logs.some((l) => /databases over 65536 bytes at most every 90s, gzip'd/.test(l)), logs.join("\n"));
   });
 });

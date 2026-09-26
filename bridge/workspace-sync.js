@@ -23,6 +23,8 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const zlib = require("zlib");
+const { pipeline } = require("stream/promises");
 const stateStorage = require("./state-storage");
 
 // Lazy-require AWS SDK (only available inside Docker image, not in local dev/test)
@@ -75,8 +77,40 @@ const SKIP_PATTERNS = [
   "*.json.bak.2",
   "*.json.bak.3",
   "*.json.bak.4",
+  // `openclaw doctor --fix` moves the pre-2.0 sessions.json + .jsonl transcripts
+  // here once it has imported them into the agent SQLite store. S3 still holds
+  // the originals (deletes are never propagated), so backing the archive up
+  // would only double the small-file restore time of every cold start.
+  "session-sqlite-import-archive/",
+  // The pre-2.0 index the bridge moves aside once its import receipt matches
+  // (legacy-session-import.js). S3 keeps the original sessions.json.
+  "sessions.json.pre-2.0-imported",
 ];
+
+// Per-file size limits.
+//
+// Non-SQLite files are read into memory whole and PUT as-is, so they keep the
+// 10 MB cap. SQLite databases are handled differently: their snapshot is
+// streamed (snapshot file -> gzip -> S3 multipart) and may be far larger. The
+// live user's imported 1.x history is one ~299 MB openclaw-agent.sqlite, which
+// the 10 MB cap skipped on EVERY save — so all post-upgrade 2.0 history was
+// lost at each cold start and each cold start re-ran the 1.x import (F1,
+// us-west-2 rehearsal). A snapshot up to `maxFileSize` still goes up buffered
+// and uncompressed, exactly as before; above it the gzip path is used; above
+// `maxSqliteFileSize` (uncompressed) the database is skipped with a clear log.
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const DEFAULT_MAX_SQLITE_FILE_SIZE = 1024 * 1024 * 1024; // 1 GiB
+// One multipart part per this many gzip'd bytes (S3 minimum is 5 MiB); at most
+// ~2 parts are ever held in memory, whatever the database size.
+const DEFAULT_UPLOAD_PART_SIZE = 8 * 1024 * 1024;
+const _limits = {
+  maxFileSize: MAX_FILE_SIZE,
+  maxSqliteFileSize: parseInt(
+    process.env.WORKSPACE_SYNC_MAX_SQLITE_BYTES || String(DEFAULT_MAX_SQLITE_FILE_SIZE),
+    10,
+  ),
+  uploadPartSize: DEFAULT_UPLOAD_PART_SIZE,
+};
 
 // Files with this extension are SQLite databases and are uploaded via
 // snapshotSqlite() rather than fs.readFileSync().
@@ -220,6 +254,21 @@ function shouldSkip(relativePath) {
  * @throws when node:sqlite is unavailable or the backup fails (caller skips the file)
  */
 async function snapshotSqlite(dbPath) {
+  const stagePath = await snapshotSqliteToFile(dbPath);
+  try {
+    return fs.readFileSync(stagePath);
+  } finally {
+    removeSnapshotFile(stagePath);
+  }
+}
+
+/**
+ * Same snapshot as snapshotSqlite(), left on disk: returns the path of the
+ * staged copy, which the caller must remove with removeSnapshotFile(). This is
+ * the form the large-database path uses so a multi-hundred-MB snapshot is
+ * hashed and compressed as a stream and never held in memory whole.
+ */
+async function snapshotSqliteToFile(dbPath) {
   const sqlite = getNodeSqlite();
   if (!sqlite || typeof sqlite.backup !== "function") {
     throw new Error("node:sqlite backup API unavailable on this Node runtime");
@@ -238,15 +287,37 @@ async function snapshotSqlite(dbPath) {
     } finally {
       try { source.exec("ROLLBACK"); } catch { /* read-only txn */ }
     }
+  } catch (err) {
+    removeSnapshotFile(stagePath);
+    throw err;
   } finally {
     try { source.close(); } catch { /* already closed */ }
   }
+  return stagePath;
+}
+
+function removeSnapshotFile(stagePath) {
+  try { fs.unlinkSync(stagePath); } catch { /* best effort */ }
+  // backup() may leave a -journal next to the staged copy on some builds
+  try { fs.unlinkSync(`${stagePath}-journal`); } catch { /* none */ }
+}
+
+/** sha256 (hex) of a file's bytes, streamed. */
+async function hashFile(filePath) {
+  const hash = crypto.createHash("sha256");
+  await pipeline(fs.createReadStream(filePath), hash);
+  return hash.digest("hex");
+}
+
+/** First `bytes` of a file (for the credential scan of a large snapshot). */
+function readFileHead(filePath, bytes) {
+  const fd = fs.openSync(filePath, "r");
   try {
-    return fs.readFileSync(stagePath);
+    const buf = Buffer.alloc(bytes);
+    const n = fs.readSync(fd, buf, 0, bytes, 0);
+    return buf.subarray(0, n);
   } finally {
-    try { fs.unlinkSync(stagePath); } catch { /* best effort */ }
-    // backup() may leave a -journal next to the staged copy on some builds
-    try { fs.unlinkSync(`${stagePath}-journal`); } catch { /* none */ }
+    fs.closeSync(fd);
   }
 }
 
@@ -375,10 +446,13 @@ async function runRestore(namespace, overwrite) {
       if (!relativePath || shouldSkip(relativePath)) continue;
       hadState = true;
 
-      // Validate object size before downloading (uses ListObjectsV2 Size field)
-      if (obj.Size > MAX_FILE_SIZE) {
+      // Validate object size before downloading (uses ListObjectsV2 Size field).
+      // A SQLite object may be a gzip snapshot, so its listed size is at most
+      // the uncompressed one — the SQLite cap applies to it.
+      const sizeCap = relativePath.endsWith(SQLITE_EXT) ? _limits.maxSqliteFileSize : _limits.maxFileSize;
+      if (obj.Size > sizeCap) {
         console.warn(
-          `[workspace-sync] Skipping oversized file: ${obj.Key} (${obj.Size} bytes)`,
+          `[workspace-sync] Skipping oversized file: ${obj.Key} (${obj.Size} bytes > ${sizeCap})`,
         );
         continue;
       }
@@ -412,17 +486,12 @@ async function runRestore(namespace, overwrite) {
         const getResp = await s3.send(
           new (getS3Sdk().GetObjectCommand)({ Bucket: BUCKET, Key: obj.Key }),
         );
-        const chunks = [];
-        for await (const chunk of getResp.Body) {
-          chunks.push(chunk);
-        }
-        const content = Buffer.concat(chunks);
-        fs.writeFileSync(localFile, content);
+        const hash = await writeRestoredObject(getResp, localFile);
         // What is on disk now IS what S3 holds, so the first save after a
         // restore must not re-upload it. Without this seed every restored file
         // was PUT again by the first full save (SIGTERM / periodic) of the
         // session even when nothing had touched it.
-        _uploadedHashes.set(relativePath, contentHash(content));
+        _uploadedHashes.set(relativePath, hash);
         totalFiles++;
       } catch (err) {
         failed++;
@@ -447,6 +516,48 @@ async function runRestore(namespace, overwrite) {
       (hadState ? "" : " (no saved state in S3 — new user)"),
   );
   return { restored: totalFiles, kept, keptUnchanged, failed, hadState };
+}
+
+/**
+ * Stream one GetObject response to `localFile` and return the sha256 of the
+ * bytes written. A gzip snapshot (UPLOAD_ENCODING_METADATA_KEY / the
+ * ContentEncoding header — see uploadCompressedFile) is decompressed on the
+ * way; objects written before compression existed have neither marker and are
+ * copied as-is, so they keep restoring. Nothing is buffered whole: a 299 MB
+ * database passes through in stream chunks. The bytes land in a temp file that
+ * is renamed into place only once complete, and when the object carries a
+ * sha256 (every upload since #115) it must match the bytes written or the
+ * restore of this file fails — a torn or mis-decoded download must never be
+ * handed to the gateway as its state.
+ */
+async function writeRestoredObject(getResp, localFile) {
+  const meta = getResp.Metadata || {};
+  const gzipped =
+    getResp.ContentEncoding === GZIP_ENCODING || meta[UPLOAD_ENCODING_METADATA_KEY] === GZIP_ENCODING;
+  const expected = meta[UPLOAD_HASH_METADATA_KEY];
+  const tmpFile = `${localFile}.tmp-${Date.now()}`;
+  const hash = crypto.createHash("sha256");
+  const stages = [getResp.Body];
+  if (gzipped) stages.push(zlib.createGunzip());
+  stages.push(async function* (source) {
+    for await (const chunk of source) {
+      hash.update(chunk);
+      yield chunk;
+    }
+  });
+  stages.push(fs.createWriteStream(tmpFile));
+  try {
+    await pipeline(...stages);
+    const digest = hash.digest("hex");
+    if (expected && expected !== digest) {
+      throw new Error(`sha256 mismatch after download (S3 says ${expected.slice(0, 12)}…, got ${digest.slice(0, 12)}…)`);
+    }
+    fs.renameSync(tmpFile, localFile);
+    return digest;
+  } catch (err) {
+    try { fs.unlinkSync(tmpFile); } catch { /* not created */ }
+    throw err;
+  }
 }
 
 // HeadObject calls in flight at once while verifying kept files.
@@ -508,10 +619,14 @@ async function localUploadHash(relativePath) {
   const localFile = path.join(LOCAL_PATH, relativePath);
   try {
     if (!fs.statSync(localFile).isFile()) return null;
-    const content = relativePath.endsWith(SQLITE_EXT)
-      ? await snapshotSqlite(localFile)
-      : fs.readFileSync(localFile);
-    return contentHash(content);
+    if (!relativePath.endsWith(SQLITE_EXT)) return contentHash(fs.readFileSync(localFile));
+    // Hash the snapshot from disk: the database may be hundreds of MB.
+    const stagePath = await snapshotSqliteToFile(localFile);
+    try {
+      return await hashFile(stagePath);
+    } finally {
+      removeSnapshotFile(stagePath);
+    }
   } catch {
     return null;
   }
@@ -607,6 +722,14 @@ const _uploadedHashes = new Map();
 // fill-missing restore uses it to tell kept files that match S3 from those
 // that must be uploaded (see seedKeptFiles).
 const UPLOAD_HASH_METADATA_KEY = "sha256";
+// Set to GZIP_ENCODING on objects whose body is a gzip stream of the file (large
+// SQLite snapshots, see uploadCompressedFile). UPLOAD_HASH_METADATA_KEY is the
+// sha256 of the UNCOMPRESSED bytes in every case, so seedKeptFiles() compares
+// like with like and the restore can verify what it wrote. The S3
+// ContentEncoding header is set too; the restore honours either.
+const UPLOAD_ENCODING_METADATA_KEY = "encoding";
+const UPLOAD_SIZE_METADATA_KEY = "uncompressed-size";
+const GZIP_ENCODING = "gzip";
 
 function contentHash(content) {
   return crypto.createHash("sha256").update(content).digest("hex");
@@ -633,67 +756,209 @@ async function uploadStateFile(namespace, relativePath, { force = false } = {}) 
     return "missing"; // deleted between change and upload — nothing to do
   }
   if (!stat.isFile()) return "missing";
-  if (stat.size > MAX_FILE_SIZE) {
+  const key = `${namespace}/${WORKSPACE_PREFIX}/${relativePath}`;
+  if (relativePath.endsWith(SQLITE_EXT)) {
+    return uploadSqliteFile(key, localFile, relativePath, stat, force);
+  }
+  if (stat.size > _limits.maxFileSize) {
     console.warn(
-      `[workspace-sync] Skipping ${relativePath} (${stat.size} bytes > ${MAX_FILE_SIZE})`,
+      `[workspace-sync] Skipping ${relativePath} (${stat.size} bytes > ${_limits.maxFileSize})`,
     );
     return "skipped";
   }
-
-  let content;
-  if (relativePath.endsWith(SQLITE_EXT)) {
-    // Live database: upload a consistent snapshot, never the raw file.
-    try {
-      content = await snapshotSqlite(localFile);
-    } catch (err) {
-      console.warn(
-        `[workspace-sync] Skipping ${relativePath}: SQLite snapshot failed (${err.message})`,
-      );
-      return "skipped";
-    }
-    if (content.length > MAX_FILE_SIZE) {
-      console.warn(
-        `[workspace-sync] Skipping ${relativePath} snapshot (${content.length} bytes > ${MAX_FILE_SIZE})`,
-      );
-      return "skipped";
-    }
-  } else {
-    content = fs.readFileSync(localFile);
-  }
-
+  const content = fs.readFileSync(localFile);
   const hash = contentHash(content);
   if (!force && _uploadedHashes.get(relativePath) === hash) return "unchanged";
-
-  // Credential detection: warn (but don't block) when secrets are found.
-  // Exempt only the root-level native API key store — user made a conscious choice.
-  // Match exact relative path (not just basename) to prevent bypass via subdirectories.
-  if (relativePath !== CREDENTIAL_SCAN_EXEMPT) {
-    const detected = detectCredentials(content);
-    if (detected) {
-      console.warn(
-        `[workspace-sync] WARNING: Potential credential detected in ${relativePath} ` +
-        `(pattern: ${detected}). File will still be uploaded to S3.`,
-      );
-    }
-  }
-
-  await getS3Client().send(
-    new (getS3Sdk().PutObjectCommand)({
-      Bucket: BUCKET,
-      Key: `${namespace}/${WORKSPACE_PREFIX}/${relativePath}`,
-      Body: content,
-      Metadata: { [UPLOAD_HASH_METADATA_KEY]: hash },
-    }),
-  );
+  scanForCredentials(relativePath, content);
+  await putObject(key, content, hash);
   _uploadedHashes.set(relativePath, hash);
   return "uploaded";
 }
 
 /**
+ * Credential detection: warn (but don't block) when secrets are found.
+ * Exempt only the root-level native API key store — user made a conscious choice.
+ * Match exact relative path (not just basename) to prevent bypass via subdirectories.
+ */
+function scanForCredentials(relativePath, content) {
+  if (relativePath === CREDENTIAL_SCAN_EXEMPT) return;
+  const detected = detectCredentials(content);
+  if (detected) {
+    console.warn(
+      `[workspace-sync] WARNING: Potential credential detected in ${relativePath} ` +
+      `(pattern: ${detected}). File will still be uploaded to S3.`,
+    );
+  }
+}
+
+/** Single PUT of an in-memory body, with its sha256 as object metadata. */
+async function putObject(key, content, hash) {
+  await getS3Client().send(
+    new (getS3Sdk().PutObjectCommand)({
+      Bucket: BUCKET,
+      Key: key,
+      Body: content,
+      Metadata: { [UPLOAD_HASH_METADATA_KEY]: hash },
+    }),
+  );
+}
+
+/**
+ * Upload a live SQLite database as a consistent snapshot, never the raw file.
+ *
+ * A snapshot up to `maxFileSize` is read into memory and PUT uncompressed —
+ * the pre-existing path, unchanged. A larger one (the imported 1.x history is
+ * ~299 MB) is hashed from disk, then streamed gzip-compressed through
+ * uploadCompressedFile(); the uncompressed sha256 is stored as metadata either
+ * way, so the hash-skip and the kept-file check (#115) work across both. Above
+ * `maxSqliteFileSize` (WORKSPACE_SYNC_MAX_SQLITE_BYTES) the database is skipped
+ * and the log says so at every attempt: its changes are not being backed up.
+ */
+async function uploadSqliteFile(key, localFile, relativePath, stat, force) {
+  const cap = _limits.maxSqliteFileSize;
+  const warnCap = (bytes) => console.warn(
+    `[workspace-sync] Skipping ${relativePath}: SQLite database is ${bytes} bytes, above the ` +
+      `${cap}-byte backup cap (WORKSPACE_SYNC_MAX_SQLITE_BYTES) — its changes are NOT backed up to S3`,
+  );
+  if (stat.size > cap) {
+    warnCap(stat.size);
+    return "skipped";
+  }
+  let stagePath;
+  try {
+    stagePath = await snapshotSqliteToFile(localFile);
+  } catch (err) {
+    console.warn(
+      `[workspace-sync] Skipping ${relativePath}: SQLite snapshot failed (${err.message})`,
+    );
+    return "skipped";
+  }
+  try {
+    const size = fs.statSync(stagePath).size;
+    if (size > cap) {
+      warnCap(size);
+      return "skipped";
+    }
+    if (size <= _limits.maxFileSize) {
+      const content = fs.readFileSync(stagePath);
+      const hash = contentHash(content);
+      if (!force && _uploadedHashes.get(relativePath) === hash) return "unchanged";
+      scanForCredentials(relativePath, content);
+      await putObject(key, content, hash);
+      _uploadedHashes.set(relativePath, hash);
+      return "uploaded";
+    }
+    // Large database: never in memory whole.
+    const hash = await hashFile(stagePath);
+    if (!force && _uploadedHashes.get(relativePath) === hash) return "unchanged";
+    scanForCredentials(relativePath, readFileHead(stagePath, 64 * 1024));
+    const started = Date.now();
+    const { bytes, parts } = await uploadCompressedFile(key, stagePath, { hash, size });
+    _uploadedHashes.set(relativePath, hash);
+    _lastLargeUploadAt.set(relativePath, Date.now());
+    console.log(
+      `[workspace-sync] Uploaded ${relativePath} as a gzip snapshot: ${size} -> ${bytes} bytes ` +
+        `(${parts} part(s), ${Date.now() - started}ms)`,
+    );
+    return "uploaded";
+  } finally {
+    removeSnapshotFile(stagePath);
+  }
+}
+
+/**
+ * Stream `filePath` gzip-compressed to S3 as a multipart upload (a single PUT
+ * when the compressed body fits in one part). Memory is bounded by ~2 parts
+ * whatever the file size, and gzip runs in the libuv threadpool, so the
+ * contract server keeps answering while a large snapshot goes up. Object
+ * metadata records the uncompressed sha256 and size and the gzip encoding
+ * (plus the ContentEncoding header) so the restore knows to decompress.
+ *
+ * @returns {Promise<{ bytes: number, parts: number }>} compressed bytes sent
+ */
+async function uploadCompressedFile(key, filePath, { hash, size }) {
+  const s3 = getS3Client();
+  const sdk = getS3Sdk();
+  const base = {
+    Bucket: BUCKET,
+    Key: key,
+    ContentEncoding: GZIP_ENCODING,
+    Metadata: {
+      [UPLOAD_HASH_METADATA_KEY]: hash,
+      [UPLOAD_ENCODING_METADATA_KEY]: GZIP_ENCODING,
+      [UPLOAD_SIZE_METADATA_KEY]: String(size),
+    },
+  };
+  const gzip = zlib.createGzip({ level: 6 });
+  const source = fs.createReadStream(filePath);
+  source.on("error", (err) => gzip.destroy(err));
+  source.pipe(gzip);
+
+  let uploadId = null;
+  const completed = [];
+  let pending = [];
+  let pendingBytes = 0;
+  let total = 0;
+  const sendPart = async (body) => {
+    if (!uploadId) {
+      const created = await s3.send(new sdk.CreateMultipartUploadCommand(base));
+      uploadId = created.UploadId;
+    }
+    const partNumber = completed.length + 1;
+    const res = await s3.send(new sdk.UploadPartCommand({
+      Bucket: BUCKET,
+      Key: key,
+      UploadId: uploadId,
+      PartNumber: partNumber,
+      Body: body,
+      ContentLength: body.length,
+    }));
+    completed.push({ ETag: res.ETag, PartNumber: partNumber });
+  };
+  try {
+    for await (const chunk of gzip) {
+      pending.push(chunk);
+      pendingBytes += chunk.length;
+      total += chunk.length;
+      if (pendingBytes >= _limits.uploadPartSize) {
+        const body = Buffer.concat(pending);
+        pending = [];
+        pendingBytes = 0;
+        await sendPart(body); // the gzip stream is paused meanwhile (backpressure)
+      }
+    }
+    const tail = Buffer.concat(pending);
+    if (!uploadId) {
+      await s3.send(new sdk.PutObjectCommand({ ...base, Body: tail }));
+      return { bytes: total, parts: 1 };
+    }
+    if (tail.length > 0) await sendPart(tail);
+    await s3.send(new sdk.CompleteMultipartUploadCommand({
+      Bucket: BUCKET,
+      Key: key,
+      UploadId: uploadId,
+      MultipartUpload: { Parts: completed },
+    }));
+    return { bytes: total, parts: completed.length };
+  } catch (err) {
+    if (uploadId) {
+      // Leave no incomplete upload behind (they are billed until aborted).
+      try {
+        await s3.send(new sdk.AbortMultipartUploadCommand({ Bucket: BUCKET, Key: key, UploadId: uploadId }));
+      } catch (abortErr) {
+        console.warn(`[workspace-sync] Could not abort multipart upload of ${key}: ${abortErr.message}`);
+      }
+    }
+    throw err;
+  }
+}
+
+/**
  * Save the .openclaw/ directory to S3 for a user namespace.
  * Uploads all files under $HOME/.openclaw/ to {namespace}/.openclaw/.
- * Skips files matching SKIP_PATTERNS, files > MAX_FILE_SIZE, and files whose
- * content this process already uploaded (see _uploadedHashes).
+ * Skips files matching SKIP_PATTERNS, files over their size cap (see
+ * _limits), and files whose content this process already uploaded (see
+ * _uploadedHashes).
  */
 async function saveWorkspace(namespace) {
   if (!BUCKET || !namespace) return;
@@ -839,6 +1104,17 @@ const CHANGE_UPLOAD_CONCURRENCY = 4;
 // this much SQLite-only history (session rows that no memory/workspace write
 // accompanied) can be lost.
 const DEFAULT_SQLITE_MIN_INTERVAL_MS = 5 * 60 * 1000;
+// Large SQLite databases (snapshot above _limits.maxFileSize, i.e. the ones
+// that go up gzip'd) have their own, longer cadence, measured per file from
+// its last upload. The imported 1.x history is ~299 MB (~45-75 MB gzip'd):
+// at the 5 min cadence an active session would push ~0.55-0.9 GB/h into a
+// versioned bucket with no noncurrent-version expiry; 10 min halves that.
+// Cost: up to this much 2.0 history lost on a stop with no SIGTERM. The idle
+// timeout is 15 min, so a held snapshot is still uploaded before an idle
+// stop; only an abrupt kill (max lifetime, host loss) can lose the window.
+// Non-SQLite changes do NOT pull a held large snapshot along with them (they
+// do for small ones); the SIGTERM flush and the 30-min full save always do.
+const DEFAULT_LARGE_SQLITE_MIN_INTERVAL_MS = 10 * 60 * 1000;
 // SQLite writes land in the sidecars first (WAL mode); a change to any of them
 // means the main database has new commits to snapshot.
 const SQLITE_SIDECAR_RE = /^(.*\.sqlite)-(wal|shm|journal)$/;
@@ -859,9 +1135,20 @@ let _lastFlushHadFailures = false;
 // When SQLite snapshots were last included in an upload pass (change flush or
 // full save). 0 = never, so the first SQLite change of a session is not held.
 let _lastSqliteFlushAt = 0;
+// Per large database: when its gzip snapshot was last uploaded (any path).
+const _lastLargeUploadAt = new Map();
 
 function isSqlitePath(rel) {
   return rel.endsWith(SQLITE_EXT);
+}
+
+/** A SQLite database whose upload would take the gzip path (see uploadSqliteFile). */
+function isLargeSqlite(rel) {
+  try {
+    return fs.statSync(path.join(LOCAL_PATH, rel)).size > _limits.maxFileSize;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -951,7 +1238,7 @@ async function uploadBatch(namespace, batch, result) {
  * say for how long. `deferred` counts files left over by maxFilesPerFlush.
  */
 async function runChangeFlush(reason, { force = false } = {}) {
-  const { namespace, maxFilesPerFlush, sqliteMinIntervalMs } = _changeOpts;
+  const { namespace, maxFilesPerFlush, sqliteMinIntervalMs, largeSqliteMinIntervalMs } = _changeOpts;
   const result = { uploaded: 0, unchanged: 0, skipped: 0, missing: 0, failed: 0, deferred: 0, held: 0, holdMs: 0 };
   if (!uploadsAllowed()) {
     // Keep the dirty set (and the sweep request) for when the restore
@@ -978,18 +1265,32 @@ async function runChangeFlush(reason, { force = false } = {}) {
   const now = Date.now();
   const dueAt = _lastSqliteFlushAt + sqliteMinIntervalMs;
   const includeSqlite = force || now >= dueAt || result.uploaded > 0 || result.failed > 0;
-  if (sqlite.length) {
-    if (includeSqlite) {
-      const sqliteBatch = sqlite.slice(0, Math.max(0, maxFilesPerFlush - plainBatch.length));
-      if (sqliteBatch.length) {
-        _lastSqliteFlushAt = now;
-        for (const rel of sqliteBatch) _dirty.delete(rel);
-        await uploadBatch(namespace, sqliteBatch, result);
-      }
+  const ready = [];
+  let holdUntil = Infinity;
+  for (const rel of sqlite) {
+    if (!force && isLargeSqlite(rel)) {
+      // Large databases follow their own cadence (see DEFAULT_LARGE_SQLITE_MIN_INTERVAL_MS).
+      const largeDueAt = (_lastLargeUploadAt.get(rel) || 0) + largeSqliteMinIntervalMs;
+      if (now >= largeDueAt) ready.push(rel);
+      else holdUntil = Math.min(holdUntil, largeDueAt);
+    } else if (includeSqlite) {
+      ready.push(rel);
     } else {
-      result.held = sqlite.length;
-      result.holdMs = Math.max(1, dueAt - now);
+      holdUntil = Math.min(holdUntil, dueAt);
     }
+  }
+  if (ready.length) {
+    const sqliteBatch = ready.slice(0, Math.max(0, maxFilesPerFlush - plainBatch.length));
+    if (sqliteBatch.length) {
+      _lastSqliteFlushAt = now;
+      for (const rel of sqliteBatch) _dirty.delete(rel);
+      await uploadBatch(namespace, sqliteBatch, result);
+    }
+  }
+  const held = sqlite.length - ready.length;
+  if (held) {
+    result.held = held;
+    result.holdMs = Math.max(1, holdUntil - now);
   }
   result.deferred = _dirty.size - result.held;
 
@@ -1068,12 +1369,17 @@ function startChangeBackup(namespace, opts = {}) {
   const sqliteMinIntervalMs = opts.sqliteMinIntervalMs !== undefined
     ? opts.sqliteMinIntervalMs
     : parseInt(process.env.WORKSPACE_SYNC_SQLITE_MIN_INTERVAL_MS || String(DEFAULT_SQLITE_MIN_INTERVAL_MS), 10);
+  const largeSqliteMinIntervalMs = opts.largeSqliteMinIntervalMs !== undefined
+    ? opts.largeSqliteMinIntervalMs
+    : parseInt(process.env.WORKSPACE_SYNC_LARGE_SQLITE_MIN_INTERVAL_MS || String(DEFAULT_LARGE_SQLITE_MIN_INTERVAL_MS), 10);
   _changeOpts = {
     namespace,
     debounceMs,
     maxWaitMs: Math.max(maxWaitMs, debounceMs),
     maxFilesPerFlush: opts.maxFilesPerFlush || DEFAULT_CHANGE_MAX_FILES_PER_FLUSH,
     sqliteMinIntervalMs: Math.max(0, sqliteMinIntervalMs),
+    // Never shorter than the small-database cadence.
+    largeSqliteMinIntervalMs: Math.max(0, sqliteMinIntervalMs, largeSqliteMinIntervalMs),
   };
   const fallbackIntervalMs = opts.fallbackIntervalMs || DEFAULT_CHANGE_POLL_INTERVAL_MS;
   try {
@@ -1089,7 +1395,8 @@ function startChangeBackup(namespace, opts = {}) {
     });
     console.log(
       `[workspace-sync] Change backup started on ${LOCAL_PATH} (debounce ${debounceMs}ms, max wait ${_changeOpts.maxWaitMs}ms, ` +
-        `SQLite-only changes at most every ${_changeOpts.sqliteMinIntervalMs / 1000}s)`,
+        `SQLite-only changes at most every ${_changeOpts.sqliteMinIntervalMs / 1000}s, ` +
+        `databases over ${_limits.maxFileSize} bytes at most every ${_changeOpts.largeSqliteMinIntervalMs / 1000}s, gzip'd)`,
     );
     return { mode: "watch" };
   } catch (err) {
@@ -1174,9 +1481,15 @@ module.exports = {
   uploadStateFile,
   CREDENTIAL_SCAN_EXEMPT,
   DEFAULT_SQLITE_MIN_INTERVAL_MS,
+  DEFAULT_LARGE_SQLITE_MIN_INTERVAL_MS,
   UPLOAD_HASH_METADATA_KEY,
+  UPLOAD_ENCODING_METADATA_KEY,
+  UPLOAD_SIZE_METADATA_KEY,
   getRestoreState: () => _restoreState,
   // Tests exercise the save paths without a restore; production code must
   // only ever open the gate through restoreWorkspace().
   _setRestoreStateForTests: setRestoreState,
+  // Tests shrink the size thresholds so the large-file paths run on small
+  // fixtures; production values come from the constants above / the env.
+  _setLimitsForTests: (overrides) => Object.assign(_limits, overrides),
 };
