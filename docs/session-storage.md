@@ -157,6 +157,16 @@ before. Doctor's own archive of the imported files, `agents/<id>/session-sqlite-
 excluded from the backup: S3 already holds the originals, and uploading the archive would double
 the small-file restore time of every cold start.
 
+The same never-delete rule resurrects every other pre-2.0 file doctor retired (`workspace-state.json`,
+`auth-profiles.json`, `exec-approvals.json`, the imported `.jsonl` transcripts, …) on each restore —
+both the cold-start restore and the fill-missing restore of a same-session restart — and the 2.0
+gateway refuses to run while they exist (exit 78, `gateway.maintenance_required`). So a successful
+import also records the files doctor retired (state-dir-relative path + sha256, a before/after diff
+of the state dir) in `.pre-2.0-retired-files.json` at the state-dir root, and after every restore the
+contract deletes a restored file again when its bytes match the record, before the config write
+and the gateway spawn. A recorded file with different bytes is kept and doctor is run again. The S3
+copy is untouched, so this changes nothing for a rollback to 1.x.
+
 **Nothing is uploaded before the restore has completed.** `restoreWorkspace()` gates every upload path (change backup, periodic save, single-file save, `SIGTERM` save): uploads start only once every S3 object has been restored, or S3 confirmed it holds nothing for the namespace (new user). If the listing fails or any object cannot be downloaded, uploads stay disabled in that container — the local state dir may be partial and must not overwrite the S3 copy (on staging a same-session restart with no state DBs had uploaded a fresh empty database over the good one within 20 s). The session-storage mirror keeps running, so a same-session restart still recovers the state; the next new session restores the last good S3 copy.
 
 ## Inspecting the mount directly

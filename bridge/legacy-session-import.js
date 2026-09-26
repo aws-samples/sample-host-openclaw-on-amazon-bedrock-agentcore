@@ -199,14 +199,223 @@ function writeReceipts(openclawDir, fingerprints, log = console) {
   return written;
 }
 
+// ---------------------------------------------------------------------------
+// Files doctor RETIRED during the import (F5, us-west-2 F1 staging test).
+//
+// `openclaw doctor --fix` does more than import sessions.json: it also
+// migrates and then removes/archives the other pre-2.0 state files —
+// `workspace/.openclaw/workspace-state.json`, `agents/<id>/agent/auth-profiles.json`,
+// `update-check.json`, `exec-approvals.json`, the imported `.jsonl`
+// transcripts, … — and the 2.0 gateway REFUSES to run while some of them exist
+// (`StartupMaintenanceRequiredError: Legacy workspace setup state requires
+// migration`, exit 78; `Auth profile store … requires legacy credential
+// migration`). The receipt above only covers `sessions.json`. Because the
+// bridge never deletes from S3, every later restore (cold start, and the
+// fill-missing restore of a same-session restart) brings the retired files
+// back next to the migrated 2.0 store, and doctor is only re-run when a
+// sessions.json without a receipt is present — so after the first successful
+// upgrade the gateway crash-loops on exit 78 and the shim answers forever.
+//
+// So, on a successful import, the contract also records WHICH files doctor
+// retired (state-dir-relative path + sha256 of the bytes it had) in a manifest
+// at the state-dir root, and after every restore deletes a restored file again
+// when its bytes still match that record — before the config write and the
+// gateway spawn. S3 keeps the originals (the rollback to 1.x is unchanged),
+// nothing about OpenClaw's file layout is hardcoded (the list is a before/after
+// diff of the state dir), and a file whose bytes differ from the record (1.x
+// rewrote it during a rollback, or the user recreated it) is left alone and
+// reported so the caller can run doctor again.
+// ---------------------------------------------------------------------------
+
+const RETIRED_MANIFEST_NAME = ".pre-2.0-retired-files.json";
+const RETIRED_MANIFEST_VERSION = 1;
+// Files above this size are not fingerprinted before doctor runs (doctor
+// retires small JSON/JSONL files; the SQLite stores it writes are far larger
+// and are never retired). Keeps the pre-doctor walk to a hash of ~200 MB of
+// small files for the live user rather than every large upload.
+const RETIRED_FINGERPRINT_MAX_BYTES = 64 * 1024 * 1024;
+
+function retiredManifestPath(openclawDir) {
+  return path.join(openclawDir, RETIRED_MANIFEST_NAME);
+}
+
+function toRelative(openclawDir, filePath) {
+  return path.relative(openclawDir, filePath).split(path.sep).join("/");
+}
+
+/**
+ * Walk the state dir and return relative path -> sha256 for every regular file
+ * up to RETIRED_FINGERPRINT_MAX_BYTES. Follows directory symlinks (the
+ * workspace dir is a symlink onto the session-storage mount on AgentCore) with
+ * a realpath cycle guard. Unreadable files are skipped (they cannot be
+ * fingerprinted, so they can never be pruned either — the safe side).
+ * @returns {Map<string, string>}
+ */
+function fingerprintStateDir(openclawDir, { maxBytes = RETIRED_FINGERPRINT_MAX_BYTES } = {}) {
+  const out = new Map();
+  const seen = new Set();
+  const walk = (dir) => {
+    let real;
+    try {
+      real = fs.realpathSync(dir);
+    } catch {
+      return;
+    }
+    if (seen.has(real)) return;
+    seen.add(real);
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      let st;
+      try {
+        st = fs.statSync(full); // follows symlinks
+      } catch {
+        continue; // dangling link
+      }
+      if (st.isDirectory()) {
+        walk(full);
+      } else if (st.isFile() && st.size <= maxBytes) {
+        try {
+          out.set(toRelative(openclawDir, full), sha256File(full));
+        } catch {
+          /* unreadable: never recorded, never pruned */
+        }
+      }
+    }
+  };
+  walk(openclawDir);
+  return out;
+}
+
+/**
+ * Files that were present before doctor and are gone (moved or deleted)
+ * afterwards. The manifest itself and the receipt are never listed.
+ * @param {Map<string, string>} before fingerprintStateDir() taken before doctor
+ * @param {string} openclawDir
+ * @returns {Array<{ path: string, sha256: string }>}
+ */
+function diffRetiredFiles(before, openclawDir) {
+  const retired = [];
+  for (const [rel, sha256] of before) {
+    if (rel === RETIRED_MANIFEST_NAME || path.basename(rel) === RECEIPT_NAME) continue;
+    if (!fs.existsSync(path.join(openclawDir, rel))) retired.push({ path: rel, sha256 });
+  }
+  retired.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return retired;
+}
+
+function readRetiredManifest(openclawDir) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(retiredManifestPath(openclawDir), "utf8"));
+    if (!manifest || manifest.version !== RETIRED_MANIFEST_VERSION || !Array.isArray(manifest.files)) {
+      return null;
+    }
+    return manifest;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * After a SUCCESSFUL doctor run, record the files it retired. Entries from an
+ * earlier manifest are kept (merged by path, newest hash wins) so a second
+ * import — 1.x wrote new sessions during a rollback and doctor ran again —
+ * extends the record instead of forgetting the files retired the first time.
+ * Written atomically; a write failure is logged and leaves any old manifest.
+ *
+ * @returns {{ path: string, files: Array<{ path: string, sha256: string }> } | null}
+ *   what was written, or null when nothing was retired and no manifest existed.
+ */
+function writeRetiredManifest(openclawDir, retired, log = console) {
+  const previous = readRetiredManifest(openclawDir);
+  if (retired.length === 0 && !previous) return null;
+  const byPath = new Map((previous ? previous.files : []).map((f) => [f.path, f.sha256]));
+  for (const f of retired) byPath.set(f.path, f.sha256);
+  const files = [...byPath].map(([p, sha256]) => ({ path: p, sha256 })).sort((a, b) => (a.path < b.path ? -1 : 1));
+  const manifest = {
+    version: RETIRED_MANIFEST_VERSION,
+    recordedAt: new Date().toISOString(),
+    files,
+  };
+  const target = retiredManifestPath(openclawDir);
+  try {
+    const tmp = `${target}.tmp-${Date.now()}`;
+    fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2) + "\n");
+    fs.renameSync(tmp, target);
+    return { path: target, files };
+  } catch (err) {
+    log.warn(`[legacy-import] Could not write retired-files manifest ${target}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * After a restore, remove again every file the manifest lists whose bytes
+ * still match the record (the restore resurrected doctor's input). A listed
+ * file with different bytes is reported in `changed` and left in place: 1.x
+ * wrote to it during a rollback (or the user recreated it), so it needs doctor
+ * again, not deletion. Paths that escape the state dir are ignored.
+ *
+ * @returns {{ pruned: string[], changed: string[], absent: number }}
+ */
+function pruneRetiredFiles(openclawDir, log = console) {
+  const result = { pruned: [], changed: [], absent: 0 };
+  const manifest = readRetiredManifest(openclawDir);
+  if (!manifest) return result;
+  const root = path.resolve(openclawDir);
+  for (const entry of manifest.files) {
+    if (!entry || typeof entry.path !== "string" || typeof entry.sha256 !== "string") continue;
+    const full = path.resolve(root, entry.path);
+    if (full !== root && !full.startsWith(root + path.sep)) continue; // outside the state dir
+    let st;
+    try {
+      st = fs.lstatSync(full);
+    } catch {
+      result.absent += 1;
+      continue;
+    }
+    if (!st.isFile()) continue;
+    let sha256;
+    try {
+      sha256 = sha256File(full);
+    } catch (err) {
+      log.warn(`[legacy-import] Could not read ${entry.path} to compare with the retired-files record: ${err.message}`);
+      continue;
+    }
+    if (sha256 !== entry.sha256) {
+      result.changed.push(entry.path);
+      continue;
+    }
+    try {
+      fs.unlinkSync(full);
+      result.pruned.push(entry.path);
+    } catch (err) {
+      log.warn(`[legacy-import] Could not remove resurrected legacy file ${entry.path}: ${err.message}`);
+    }
+  }
+  return result;
+}
+
 module.exports = {
   findLegacySessionStores,
   planLegacyImport,
   moveImportedIndexAside,
   fingerprintIndexes,
   writeReceipts,
+  fingerprintStateDir,
+  diffRetiredFiles,
+  writeRetiredManifest,
+  readRetiredManifest,
+  pruneRetiredFiles,
+  retiredManifestPath,
   agentPaths,
   IMPORTED_INDEX_NAME,
   RECEIPT_NAME,
+  RETIRED_MANIFEST_NAME,
   SQLITE_STORE_NAME,
 };

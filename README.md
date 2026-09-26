@@ -729,7 +729,8 @@ Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as p
    - Set up the state layout (local `~/.openclaw` incl. `workspace/`, mirror restored from session storage), clean stale lock files
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
    - Restore `.openclaw/` from S3 via `workspace-sync.js` (awaited, bounded by `WORKSPACE_RESTORE_WAIT_MS` — `deploy.sh` passes 180 s from `workspace_restore_wait_seconds`; the bridge falls back to 45 s when the variable is unset)
-   - Write `openclaw.json` + `AGENTS.md`; if a pre-2.0 `sessions.json` is present and not yet imported (no matching `.pre-2.0-import.json` receipt next to the SQLite store), run `openclaw doctor --fix` to import it into SQLite (see [docs/openclaw-2.0-upgrade.md](docs/openclaw-2.0-upgrade.md))
+   - Remove again any pre-2.0 file the restore brought back that `openclaw doctor --fix` already retired on the upgrade boot (byte-identical to the `.pre-2.0-retired-files.json` record; S3 keeps the originals for a rollback)
+   - Write `openclaw.json` + `AGENTS.md`; if a pre-2.0 `sessions.json` is present and not yet imported (no matching `.pre-2.0-import.json` receipt next to the SQLite store), or a retired file came back with different bytes, run `openclaw doctor --fix` to import it into SQLite (see [docs/openclaw-2.0-upgrade.md](docs/openclaw-2.0-upgrade.md))
    - Start the workspace change watcher, then the OpenClaw gateway (port 18789, `OPENCLAW_STATE_DIR=~/.openclaw`) with scoped credentials (no container credentials)
    - Start credential refresh timer (45 min interval)
    - Wait for proxy only (165 ms measured on us-west-2 staging)

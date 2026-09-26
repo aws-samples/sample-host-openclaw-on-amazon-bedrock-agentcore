@@ -71,6 +71,23 @@ timeout fallback. The lightweight agent still handles messages until the gateway
    changed index or a missing store imports as on the first boot. The imported store itself
    (~299 MB for the live user) is backed up gzip-compressed — see `docs/session-storage.md`,
    "Large SQLite databases".
+
+   Doctor retires more than `sessions.json`: on the live user's state it also migrated and then
+   removed or archived `workspace/.openclaw/workspace-state.json`, `agents/main/agent/auth-profiles.json`,
+   `update-check.json`, `exec-approvals.json`, `subagents/runs.json`, the Telegram update offset and
+   the 990 imported `.jsonl` transcripts — and the 2.0 gateway refuses to run while some of those
+   exist (`StartupMaintenanceRequiredError: Legacy workspace setup state requires migration`, exit 78;
+   `Auth profile store … requires legacy credential migration`). Every later restore brings them
+   back from S3 too, and the receipt alone would then skip doctor, so on the us-west-2 F1 test a
+   same-session restart of the upgraded container crash-looped the gateway (3 x exit 78) and left
+   the shim answering. The contract therefore also records, on a successful import, which files
+   doctor retired — a before/after diff of the state dir, path + sha256, in
+   `~/.openclaw/.pre-2.0-retired-files.json` (backed up with everything else) — and after every
+   restore removes a restored file again when its bytes still match that record (`[contract]
+   Removed N restored pre-2.0 file(s) that doctor had already retired`). A recorded file that comes
+   back with different bytes (1.x rewrote it during a rollback) is left in place and doctor is run
+   again (`… came back with different bytes … — running doctor again`). S3 is never touched, so
+   the rollback to 1.x is unchanged.
 3. **If the import fails** (exit ≠ 0, timeout, or `sessions.json` still present), the leftover index
    is moved aside to `sessions.json.pre-2.0-unreadable-<timestamp>` and the gateway starts with
    empty history for that agent. Transcripts (`.jsonl`) are left in place, so an operator can retry

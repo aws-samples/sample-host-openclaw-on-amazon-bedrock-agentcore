@@ -463,7 +463,7 @@ describe("state storage wiring in agentcore-contract.js", () => {
   it("restores the mirror before config write, legacy import and gateway spawn (in that order)", () => {
     const setup = idx("const sessionStorageAvailable = setupSessionStorage();");
     const config = idx("    writeOpenClawConfig();\n\n    // 1g. OpenClaw 2.0 moved session state");
-    const migrate = idx("if (await migrateLegacySessionStore(openclawEnv))");
+    const migrate = idx("if (await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 }))");
     // The restart path also spawns the gateway; take the spawn that follows the import.
     const spawnGw = source.indexOf('["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"]', migrate);
     assert.ok(setup < config, "setup before config write");
@@ -485,7 +485,7 @@ describe("state storage wiring in agentcore-contract.js", () => {
   });
 
   it("starts the workspace watcher after the legacy import and before the gateway spawns", () => {
-    const migrate = idx("if (await migrateLegacySessionStore(openclawEnv))");
+    const migrate = idx("if (await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 }))");
     const watcher = source.indexOf("stateStorage.startWorkspaceWatcher(", migrate);
     const spawnGw = source.indexOf('["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"]', migrate);
     assert.ok(watcher > migrate && watcher < spawnGw);
