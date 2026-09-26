@@ -173,6 +173,7 @@ COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
 COPY cognito-token.js /app/cognito-token.js
+COPY guardrail-scope.js /app/guardrail-scope.js
 COPY gateway-mcp.js /app/gateway-mcp.js
 COPY runtime-skills.js /app/runtime-skills.js
 

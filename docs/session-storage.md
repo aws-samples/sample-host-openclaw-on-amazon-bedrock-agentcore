@@ -21,7 +21,13 @@ AgentCore Runtime supports [Managed Session Storage](https://docs.aws.amazon.com
    before this was recorded) or a failed `HeadObject` is not seeded and is uploaded by the next save —
    the local copy is never assumed to match S3 without evidence. (Before this, every same-session
    restart re-uploaded the ~9 unchanged small files at the first 30-min save.)
-3. On new sessions (storage empty), workspace is restored from S3 once
+3. On new sessions (storage empty), workspace is restored from S3 once. The gateway spawn waits
+   for that restore up to `WORKSPACE_RESTORE_WAIT_MS` (`deploy.sh` passes 180 s from the
+   `workspace_restore_wait_seconds` cdk.json context; the bridge falls back to 45 s when unset). The
+   wait ends as soon as the restore settles, so it only costs time when the state is large: a
+   ~1,200-file / 220 MB namespace restores in ~100-115 s with sequential GETs, and the pre-2.0
+   `sessions.json`, memory and skills sit late in the S3 listing order, so a 45 s wait would start
+   the gateway before they are on disk and skip the legacy session import.
 4. S3 sync switches to **backup mode** — session storage is primary. The full save runs every 30 min
    (vs 5 min), and on top of it a change-driven backup (`workspaceSync.startChangeBackup()`) uploads
    each changed file a few seconds after it changes (5 s debounce, 30 s ceiling per burst, ≤100 files

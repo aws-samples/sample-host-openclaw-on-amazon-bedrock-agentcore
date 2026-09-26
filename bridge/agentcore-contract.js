@@ -1375,6 +1375,10 @@ async function init(userId, actorId, channel) {
       S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
       SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
       SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
+      // Bedrock Guardrails: agentcore-proxy.js reads these at load time; without them the
+      // guardrailConfig is never attached to Converse calls even when the runtime has them.
+      BEDROCK_GUARDRAIL_ID: process.env.BEDROCK_GUARDRAIL_ID || "",
+      BEDROCK_GUARDRAIL_VERSION: process.env.BEDROCK_GUARDRAIL_VERSION || "",
       USER_ID: actorId,
       INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
       CHANNEL: channel,
