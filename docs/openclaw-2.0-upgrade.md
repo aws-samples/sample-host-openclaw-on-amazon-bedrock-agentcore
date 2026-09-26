@@ -61,7 +61,16 @@ timeout fallback. The lightweight agent still handles messages until the gateway
    `openclaw doctor --fix --non-interactive` (bounded by `OPENCLAW_MIGRATION_TIMEOUT_MS`, default
    180 s) with the same scoped environment as the gateway. Successful import removes
    `sessions.json`; history carries over. Logs appear as `[openclaw:doctor] …` and
-   `[contract] Legacy session store imported into SQLite in Nms`.
+   `[contract] Legacy session store imported into SQLite in Nms`, followed by
+   `[contract] Recorded import receipt(s): …/agents/main/agent/.pre-2.0-import.json`. The receipt
+   (sha256 of the imported index, next to the SQLite store) is what stops the import from running
+   again on the next cold start: S3 still holds the 1.x `sessions.json` (deletes are never
+   propagated — that is the rollback path), so it is restored every time; when its bytes match the
+   receipt and the store is present the contract renames it to `sessions.json.pre-2.0-imported`
+   and logs `… was already imported into … (receipt matches) — moved aside, skipping doctor`. A
+   changed index or a missing store imports as on the first boot. The imported store itself
+   (~299 MB for the live user) is backed up gzip-compressed — see `docs/session-storage.md`,
+   "Large SQLite databases".
 3. **If the import fails** (exit ≠ 0, timeout, or `sessions.json` still present), the leftover index
    is moved aside to `sessions.json.pre-2.0-unreadable-<timestamp>` and the gateway starts with
    empty history for that agent. Transcripts (`.jsonl`) are left in place, so an operator can retry
@@ -69,8 +78,8 @@ timeout fallback. The lightweight agent still handles messages until the gateway
    the index. The lightweight agent covers the user during the migration window as during any
    cold start.
 4. **Risk to be aware of (R2):** a `sessions.json` that the pre-2.0 periodic S3 sync uploaded
-   mid-write (or one skipped by the 10 MB per-file cap — such files are *not* restored at all, so
-   only the transcripts come back) is exactly the "unreadable legacy index" case. Without step 3 the
+   mid-write (or one skipped by the 10 MB per-file cap on non-SQLite files — such files are *not*
+   restored at all, so only the transcripts come back) is exactly the "unreadable legacy index" case. Without step 3 the
    gateway would never become ready for that user; with it, they lose the pre-2.0 session index but
    keep the transcript files.
 5. Session storage is unaffected by the upgrade itself, but note that a new image version refreshes

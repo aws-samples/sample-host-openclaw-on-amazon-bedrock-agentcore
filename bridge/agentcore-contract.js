@@ -27,6 +27,7 @@ const {
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
 const stateStorage = require("./state-storage");
+const legacySessionImport = require("./legacy-session-import");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
@@ -378,19 +379,7 @@ function openclawEnvFor(scopedCredsAvailable, userId) {
  * Returns the list of legacy index paths found (empty when already migrated).
  */
 function findLegacySessionStores(openclawDir = OPENCLAW_DIR) {
-  const found = [];
-  let agents = [];
-  try {
-    agents = fs.readdirSync(`${openclawDir}/agents`, { withFileTypes: true });
-  } catch {
-    return found; // No agents dir — fresh install
-  }
-  for (const entry of agents) {
-    if (!entry.isDirectory()) continue;
-    const legacyIndex = `${openclawDir}/agents/${entry.name}/sessions/sessions.json`;
-    if (fs.existsSync(legacyIndex)) found.push(legacyIndex);
-  }
-  return found;
+  return legacySessionImport.findLegacySessionStores(openclawDir);
 }
 
 /**
@@ -409,17 +398,39 @@ function findLegacySessionStores(openclawDir = OPENCLAW_DIR) {
  * transcript .jsonl files are left in place for a later manual
  * `openclaw doctor --session-sqlite import`.
  *
+ * Runs once per index: S3 keeps the 1.x files (no deletes are propagated, and
+ * they are the rollback path), so every cold start restores `sessions.json`
+ * again next to the 2.0 SQLite store that already holds the imported history.
+ * A receipt written after a successful import (legacy-session-import.js, the
+ * sha256 of the imported index next to the store) lets later boots recognise
+ * that index and move it aside instead of re-running doctor (~53 s for the
+ * live user) and re-writing imported entries over 2.0's. An index with no or a
+ * non-matching receipt, or whose store is missing, is imported as before.
+ *
  * @returns {Promise<boolean>} true when a legacy store was found and doctor
  *   was run (the caller re-emits openclaw.json since doctor may rewrite it);
- *   false when there was nothing to migrate.
+ *   false when there was nothing to migrate (or everything present had
+ *   already been imported).
  */
 async function migrateLegacySessionStore(env) {
-  const legacy = findLegacySessionStores();
+  const plan = legacySessionImport.planLegacyImport(OPENCLAW_DIR);
+  for (const item of plan.alreadyImported) {
+    if (legacySessionImport.moveImportedIndexAside(item)) {
+      console.log(
+        `[contract] Pre-2.0 session store ${item.legacyIndex} was already imported into ${item.sqliteStore} (receipt matches) — moved aside, skipping doctor`,
+      );
+    } else {
+      plan.toImport.push(item.legacyIndex);
+    }
+  }
+  const legacy = plan.toImport;
   if (legacy.length === 0) return false; // nothing to migrate
 
   console.log(
     `[contract] Pre-2.0 session store found (${legacy.join(", ")}) — running openclaw doctor --fix to import into SQLite`,
   );
+  // Hash the indexes now: doctor archives them away once imported.
+  const fingerprints = legacySessionImport.fingerprintIndexes(legacy);
   const started = Date.now();
   const result = await new Promise((resolve) => {
     let out = "";
@@ -469,6 +480,10 @@ async function migrateLegacySessionStore(env) {
     console.log(
       `[contract] Legacy session store imported into SQLite in ${Date.now() - started}ms`,
     );
+    const receipts = legacySessionImport.writeReceipts(OPENCLAW_DIR, fingerprints);
+    if (receipts.length) {
+      console.log(`[contract] Recorded import receipt(s): ${receipts.join(", ")} — later cold starts skip this import`);
+    }
     return true; // doctor ran (and succeeded)
   }
 
