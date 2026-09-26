@@ -43,9 +43,20 @@ describe("scopeGuardrailToLatestUserTurn", () => {
     assert.deepEqual(out[0], msgs[0], "earlier user turn untouched");
   });
 
+  it("tags the latest earlier user text when the trailing turn is only tool results", () => {
+    // Mid tool-call: without a tag the guardrail would assess the whole conversation again,
+    // and a card number earlier in the transcript would block the tool result turn.
+    const onlyTool = [u("My card is 4539 1488 0343 6467"), a("I can't process that request."), u("open example.com"),
+      { role: "assistant", content: [{ toolUse: { toolUseId: "t1", name: "web_fetch", input: {} } }] },
+      { role: "user", content: [{ toolResult: { toolUseId: "t1", content: [{ text: "<h1>Example Domain</h1>" }] } }] }];
+    const out = scopeGuardrailToLatestUserTurn(onlyTool);
+    assert.deepEqual(out[0], onlyTool[0], "card-number turn stays untagged");
+    assert.deepEqual(out[2].content, [guarded("open example.com")]);
+    assert.deepEqual(out[4], onlyTool[4], "tool result untouched");
+  });
+
   it("returns the input unchanged when nothing is taggable", () => {
-    const onlyTool = [u("x"), { role: "assistant", content: [{ toolUse: { toolUseId: "t1", name: "exec", input: {} } }] },
-      { role: "user", content: [{ toolResult: { toolUseId: "t1", content: [{ text: "ok" }] } }] }];
+    const onlyTool = [{ role: "user", content: [{ toolResult: { toolUseId: "t1", content: [{ text: "ok" }] } }] }];
     assert.equal(scopeGuardrailToLatestUserTurn(onlyTool), onlyTool);
     const endsWithAssistant = [u("x"), a("y")];
     assert.equal(scopeGuardrailToLatestUserTurn(endsWithAssistant), endsWithAssistant);

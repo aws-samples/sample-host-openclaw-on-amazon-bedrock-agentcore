@@ -513,6 +513,14 @@ async function migrateLegacySessionStore(env, { forceDoctor = false } = {}) {
         `[contract] Recorded ${retired.length} file(s) retired by doctor (${manifest.files.length} total) in ${manifest.path} — later restores remove them again`,
       );
     }
+    // Both records are only useful once they are in S3, and nothing else
+    // uploads them in time: this runs before the gateway spawns, so the change
+    // watcher (started on gateway readiness) never sees the writes, the
+    // periodic save is 30 min away in backup mode, and an idle stop sends no
+    // SIGTERM. On us-west-2 staging (F6) two full upgrade boots wrote both files
+    // and neither ever reached S3 — every later cold start re-ran doctor and the
+    // retired-files prune had no manifest to work from.
+    await backupImportRecords([...receipts, ...(manifest ? [manifest.path] : [])]);
     return true; // doctor ran (and succeeded)
   }
 
@@ -532,6 +540,32 @@ async function migrateLegacySessionStore(env, { forceDoctor = false } = {}) {
     }
   }
   return true; // doctor ran (import incomplete; leftovers quarantined)
+}
+
+/**
+ * Upload the import receipt(s) / retired-files manifest written by
+ * migrateLegacySessionStore() to S3 right away, one file at a time through the
+ * same path the runtime-skills manifest uses (workspaceSync.saveFile: skip
+ * rules, sha256 metadata, upload gate). Paths are absolute, inside OPENCLAW_DIR.
+ * Never throws: a failed upload is logged and the periodic/final save retries.
+ */
+async function backupImportRecords(absolutePaths) {
+  const namespace = currentNamespace;
+  if (!namespace) return 0;
+  let saved = 0;
+  for (const abs of absolutePaths) {
+    const prefix = OPENCLAW_DIR.endsWith("/") ? OPENCLAW_DIR : `${OPENCLAW_DIR}/`;
+    if (!abs.startsWith(prefix)) continue;
+    const rel = abs.slice(prefix.length);
+    if (!rel) continue;
+    try {
+      if (await workspaceSync.saveFile(namespace, rel)) saved++;
+    } catch (err) {
+      console.warn(`[contract] Could not back up ${rel} to S3 now (${err.message}) — the periodic save will retry`);
+    }
+  }
+  if (saved) console.log(`[contract] Backed up ${saved} import record(s) to S3`);
+  return saved;
 }
 
 /**

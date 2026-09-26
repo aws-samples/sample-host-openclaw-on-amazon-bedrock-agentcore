@@ -18,7 +18,11 @@
  * Wrapping text in guardContent makes the guardrail assess only the wrapped
  * blocks (model output is still assessed in full). This tags the text blocks
  * of the trailing user turn — the messages after the last assistant turn —
- * and skips OpenClaw's internal-context blocks and tool results.
+ * and skips OpenClaw's internal-context blocks and tool results. When the
+ * trailing turn carries only tool results (the model is mid tool-call), the
+ * most recent earlier user text is tagged instead: tool results cannot carry
+ * guardContent, and leaving the request untagged would fall back to assessing
+ * the whole conversation — exactly the behaviour this module exists to avoid.
  */
 
 const INTERNAL_CONTEXT_MARKER = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
@@ -30,10 +34,10 @@ function isInternalContext(text) {
 /**
  * Return a copy of `bedrockMessages` where the text blocks of the trailing
  * user turn are wrapped in guardContent. Blocks that are tool results,
- * images, or OpenClaw internal context are left as they are. If nothing is
- * taggable (e.g. the turn is only tool results), the input is returned
- * unchanged so the guardrail keeps its default (assess everything) scope
- * rather than silently assessing nothing.
+ * images, or OpenClaw internal context are left as they are. If the trailing
+ * turn has no taggable text (e.g. it is only tool results), the nearest
+ * earlier user text block is tagged instead. Only when the conversation has
+ * no user text at all is the input returned unchanged (default scope).
  */
 function scopeGuardrailToLatestUserTurn(bedrockMessages) {
   if (!Array.isArray(bedrockMessages) || bedrockMessages.length === 0) return bedrockMessages;
@@ -43,18 +47,32 @@ function scopeGuardrailToLatestUserTurn(bedrockMessages) {
   while (start > 0 && bedrockMessages[start - 1].role === "user") start--;
   if (start === bedrockMessages.length) return bedrockMessages;
 
+  const taggable = (block) => typeof block.text === "string" && !isInternalContext(block.text);
+  const tagMessage = (msg) => ({
+    ...msg,
+    content: (msg.content || []).map((block) =>
+      taggable(block) ? { guardContent: { text: { text: block.text } } } : block,
+    ),
+  });
+
+  const out = bedrockMessages.slice();
   let tagged = 0;
-  const out = bedrockMessages.slice(0, start);
-  for (let i = start; i < bedrockMessages.length; i++) {
-    const msg = bedrockMessages[i];
-    const content = (msg.content || []).map((block) => {
-      if (typeof block.text !== "string" || isInternalContext(block.text)) return block;
+  for (let i = start; i < out.length; i++) {
+    if ((out[i].content || []).some(taggable)) {
+      out[i] = tagMessage(out[i]);
       tagged++;
-      return { guardContent: { text: { text: block.text } } };
-    });
-    out.push({ ...msg, content });
+    }
   }
-  return tagged > 0 ? out : bedrockMessages;
+  if (tagged > 0) return out;
+
+  // Trailing turn is tool results only: tag the latest earlier user text.
+  for (let i = start - 1; i >= 0; i--) {
+    if (out[i].role === "user" && (out[i].content || []).some(taggable)) {
+      out[i] = tagMessage(out[i]);
+      return out;
+    }
+  }
+  return bedrockMessages;
 }
 
 module.exports = { scopeGuardrailToLatestUserTurn, isInternalContext, INTERNAL_CONTEXT_MARKER };

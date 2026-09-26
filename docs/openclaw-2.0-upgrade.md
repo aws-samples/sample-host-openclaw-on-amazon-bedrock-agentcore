@@ -82,12 +82,19 @@ timeout fallback. The lightweight agent still handles messages until the gateway
    same-session restart of the upgraded container crash-looped the gateway (3 x exit 78) and left
    the shim answering. The contract therefore also records, on a successful import, which files
    doctor retired — a before/after diff of the state dir, path + sha256, in
-   `~/.openclaw/.pre-2.0-retired-files.json` (backed up with everything else) — and after every
+   `~/.openclaw/.pre-2.0-retired-files.json` — and after every
    restore removes a restored file again when its bytes still match that record (`[contract]
    Removed N restored pre-2.0 file(s) that doctor had already retired`). A recorded file that comes
    back with different bytes (1.x rewrote it during a rollback) is left in place and doctor is run
    again (`… came back with different bytes … — running doctor again`). S3 is never touched, so
    the rollback to 1.x is unchanged.
+
+   Both records — the receipt(s) and the manifest — are uploaded to S3 as soon as they are written
+   (`[contract] Backed up N import record(s) to S3`), not left to the change watcher or the periodic
+   save: they are written before the gateway spawns, i.e. before the change watcher starts, the
+   periodic save is 30 minutes away in backup mode, and an idle stop sends no SIGTERM. On the
+   us-west-2 F1 test two full upgrade boots wrote both files and neither reached S3, so every later
+   cold start re-ran doctor and the prune had nothing to work from.
 3. **If the import fails** (exit ≠ 0, timeout, or `sessions.json` still present), the leftover index
    is moved aside to `sessions.json.pre-2.0-unreadable-<timestamp>` and the gateway starts with
    empty history for that agent. Transcripts (`.jsonl`) are left in place, so an operator can retry

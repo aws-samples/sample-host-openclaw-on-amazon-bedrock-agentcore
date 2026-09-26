@@ -368,3 +368,37 @@ describe("retired-files wiring in agentcore-contract.js (F5)", () => {
     idx("if (legacy.length === 0 && !forceDoctor) return false; // nothing to migrate");
   });
 });
+
+describe("import records reach S3 immediately (F6)", () => {
+  // us-west-2 F1 staging test: two full upgrade boots each wrote the receipt and
+  // the retired-files manifest, and neither object ever appeared in S3. They are
+  // written before the gateway spawns, i.e. before the change watcher starts;
+  // the periodic save is 30 min away in backup mode; an idle stop sends no
+  // SIGTERM. So every later cold start re-ran doctor (39-52 s) and the F5 prune
+  // had no manifest — both fixes were inert on the cold-start path.
+  const source = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
+  const idx = (needle) => {
+    const i = source.indexOf(needle);
+    assert.ok(i >= 0, `contract source should contain: ${needle}`);
+    return i;
+  };
+
+  it("uploads the receipt(s) and the manifest through workspaceSync.saveFile right after writing them, inside the success branch", () => {
+    const success = idx("if (result.code === 0 && remaining.length === 0) {");
+    const receipts = idx("const receipts = legacySessionImport.writeReceipts(OPENCLAW_DIR, fingerprints);");
+    const manifest = idx("const manifest = legacySessionImport.writeRetiredManifest(OPENCLAW_DIR, retired);");
+    const backup = idx("await backupImportRecords([...receipts, ...(manifest ? [manifest.path] : [])]);");
+    const quarantine = idx("Import did not complete. Quarantine what is left");
+    assert.ok(success < receipts && receipts < manifest && manifest < backup && backup < quarantine);
+    const helper = idx("async function backupImportRecords(absolutePaths)");
+    assert.ok(source.slice(helper, helper + 1200).includes("workspaceSync.saveFile(namespace, rel)"));
+  });
+
+  it("the records are not on the skip list and are small enough for saveFile's single PUT", () => {
+    process.env.S3_USER_FILES_BUCKET = "test-bucket";
+    const { shouldSkip } = require("./workspace-sync");
+    delete process.env.S3_USER_FILES_BUCKET;
+    assert.equal(shouldSkip(".pre-2.0-retired-files.json"), false);
+    assert.equal(shouldSkip("agents/main/agent/.pre-2.0-import.json"), false);
+  });
+});
