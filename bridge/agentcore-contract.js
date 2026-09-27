@@ -34,6 +34,7 @@ const scopedCreds = require("./scoped-credentials");
 const gatewayMcp = require("./gateway-mcp");
 const runtimeSkills = require("./runtime-skills");
 const { createCognitoTokenProvider } = require("./cognito-token");
+const { readBody } = require("./read-body");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -2200,22 +2201,8 @@ const server = http.createServer(async (req, res) => {
 
   // POST /invocations — Chat handler
   if (req.method === "POST" && req.url === "/invocations") {
-    let body = "";
-    let bodySize = 0;
-    let aborted = false;
-    req.on("data", (chunk) => {
-      bodySize += chunk.length;
-      if (bodySize > MAX_BODY_SIZE) {
-        aborted = true;
-        res.writeHead(413, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Request body too large" }));
-        req.destroy();
-        return;
-      }
-      body += chunk;
-    });
-    req.on("end", async () => {
-      if (aborted) return;
+    // Decode once from Buffers so a UTF-8 character split across chunks survives.
+    readBody(req, MAX_BODY_SIZE).then(async (body) => {
       try {
         const payload = body ? JSON.parse(body) : {};
         const action = payload.action || "status";
@@ -2583,6 +2570,12 @@ const server = http.createServer(async (req, res) => {
           }),
         );
       }
+    }, (err) => {
+      if (err.code === "BODY_TOO_LARGE") {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+      }
+      req.destroy();
     });
     return;
   }

@@ -353,6 +353,7 @@ function extractSessionMetadata(parsed, headers) {
 // cache). Shared with agentcore-contract.js via bridge/cognito-token.js so
 // both processes derive the same password for the same actorId.
 const { scopeGuardrailToLatestUserTurn } = require("./guardrail-scope");
+const { readBody } = require("./read-body");
 const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
   userPoolId: COGNITO_USER_POOL_ID,
   clientId: COGNITO_CLIENT_ID,
@@ -1358,9 +1359,8 @@ const server = http.createServer(async (req, res) => {
 
   // Chat completions endpoint
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", async () => {
+    // Decode once from Buffers so a UTF-8 character split across chunks survives.
+    readBody(req).then(async (body) => {
       try {
         const parsed = JSON.parse(body);
         const messages = parsed.messages || [];
@@ -1536,7 +1536,7 @@ const server = http.createServer(async (req, res) => {
           );
         }
       }
-    });
+    }, () => req.destroy());
     return;
   }
 
