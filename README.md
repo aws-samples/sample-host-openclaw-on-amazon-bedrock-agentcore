@@ -373,8 +373,10 @@ openclaw-on-agentcore/
     e2e-deploy-and-test.sh        # Deploy then run the E2E suite
     manage-allowlist.sh           # Add/remove/list users in the allowlist
     agentcore-exec.py             # Operator CLI: run a shell command in a live session (InvokeAgentRuntimeCommand)
+    guardrail-eval.py             # Operator CLI: run fixture prompts through ApplyGuardrail, exit 1 on unexpected verdicts
   tests/
     test_agentcore_exec.py        # Unit tests for scripts/agentcore-exec.py (mocked boto3, no AWS)
+    test_guardrail_eval.py        # Unit tests for scripts/guardrail-eval.py (stubbed ApplyGuardrail, no AWS)
     test_gateway_stack_synth.py   # OpenClawGateway synth tests: flag off = unchanged templates, flag on = stack + IAM + cdk-nag (10 tests, no AWS)
     e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
       config.py                   # AWS config auto-discovery (CF outputs, Secrets Manager)
@@ -885,6 +887,7 @@ cd lambda/router && python -m pytest test_content_extraction.py -v  # content bl
 cd lambda/router && python -m pytest test_markdown_html.py -v       # markdown-to-HTML conversion tests
 cd lambda/router && python -m pytest test_slack.py test_feishu.py -v # Slack + Feishu handler tests
 python -m pytest tests/test_agentcore_exec.py -v                     # operator CLI tests (mocked boto3)
+python -m pytest tests/test_guardrail_eval.py -v                     # guardrail eval script tests (stubbed ApplyGuardrail)
 python -m pytest tests/test_gateway_stack_synth.py -v                # OpenClawGateway synth: flag off leaves the 8 templates unchanged, flag on adds the stack (10 tests, no AWS)
 
 # E2E tests (requires deployed stack + E2E_TELEGRAM_CHAT_ID/E2E_TELEGRAM_USER_ID env vars)
@@ -1056,6 +1059,10 @@ export BEDROCK_GUARDRAIL_ID=$(aws cloudformation describe-stacks \
   --output text --region ap-southeast-2)
 pytest tests/e2e/bot_test.py -v -k GuardrailSecurity
 ```
+
+### Guardrail prompt eval
+
+`scripts/guardrail-eval.py` sends the prompts in `tests/fixtures/guardrail_prompts.json` to a guardrail version through `ApplyGuardrail` (input side, no model call) and prints which policy fired for each one. It exits 1 when a verdict differs from the fixture's `expected` value, so you can compare two guardrail versions or check a new scheduled-task prompt before it reaches production. See [docs/guardrails.md](docs/guardrails.md#evaluating-prompts-against-a-guardrail-version).
 
 ## License
 
