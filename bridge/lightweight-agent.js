@@ -1322,6 +1322,12 @@ async function executeMigrateApiKey(args, namespace) {
     if (value.startsWith("Error:")) {
       return `Error: Key '${key_name}' not found in Secrets Manager.`;
     }
+    // SDK failures (access denied, no credentials, network) come back as
+    // "Error retrieving secret: ..."; never write that text to native storage
+    // or delete the SM secret on the strength of it.
+    if (value.startsWith("Error retrieving secret:")) {
+      return `Error: Could not read key '${key_name}' from Secrets Manager: ${value.slice("Error retrieving secret:".length).trim()}`;
+    }
     // Write to native
     executeManageApiKey({ action: "set", key_name, key_value: value });
     // Delete from Secrets Manager

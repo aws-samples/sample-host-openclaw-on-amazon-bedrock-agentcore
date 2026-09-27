@@ -1240,3 +1240,92 @@ describe("migrate_api_key", () => {
     assert.ok(result.startsWith("Error:"));
   });
 });
+
+describe("migrate_api_key secure-to-native", () => {
+  // Fake SDK with Get + Delete commands so a migration's delete step is
+  // observable. Nothing here reaches AWS.
+  class FakeDeleteSecretCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  const MIGRATE_SM_SDK = {
+    GetSecretValueCommand: FakeGetSecretValueCommand,
+    DeleteSecretCommand: FakeDeleteSecretCommand,
+  };
+
+  function makeMigrateSmClient({ secrets = {}, denyAll = false } = {}) {
+    const calls = [];
+    return {
+      calls,
+      async send(command) {
+        calls.push(command);
+        if (denyAll) {
+          throw smError("AccessDeniedException", "User is not authorized to perform this operation");
+        }
+        const id = command.input.SecretId;
+        if (!Object.prototype.hasOwnProperty.call(secrets, id)) {
+          throw smError("ResourceNotFoundException", "Secrets Manager can't find the specified secret.");
+        }
+        if (command instanceof FakeDeleteSecretCommand) {
+          delete secrets[id];
+          return {};
+        }
+        return { SecretString: secrets[id] };
+      },
+    };
+  }
+
+  let tmpDir;
+  let origHome;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "migrate-test-"));
+    origHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    fs.mkdirSync(path.join(tmpDir, ".openclaw"), { recursive: true });
+    _secretsCache.clear();
+  });
+
+  afterEach(() => {
+    _setSecretsManagerForTests(null, null);
+    _secretsCache.clear();
+    process.env.HOME = origHome;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("does not migrate the error text when SM denies access", async () => {
+    const smClient = makeMigrateSmClient({ denyAll: true });
+    _setSecretsManagerForTests(smClient, MIGRATE_SM_SDK);
+
+    const result = await executeMigrateApiKey(
+      { key_name: "testkey", direction: "secure-to-native" },
+      "telegram_123",
+    );
+
+    assert.ok(result.startsWith("Error:"), `expected an error, got: ${result}`);
+    assert.equal(readApiKeys().testkey, undefined, "native storage must not receive the error text");
+    assert.ok(
+      !smClient.calls.some((c) => c instanceof FakeDeleteSecretCommand),
+      "must not attempt to delete the SM secret",
+    );
+  });
+
+  it("moves the value to native storage and deletes the SM secret on success", async () => {
+    const smClient = makeMigrateSmClient({
+      secrets: { "openclaw/user/telegram_123/testkey": "sm-value-123" },
+    });
+    _setSecretsManagerForTests(smClient, MIGRATE_SM_SDK);
+
+    const result = await executeMigrateApiKey(
+      { key_name: "testkey", direction: "secure-to-native" },
+      "telegram_123",
+    );
+
+    assert.equal(result, "Migrated 'testkey' from Secrets Manager to native file storage.");
+    assert.equal(readApiKeys().testkey, "sm-value-123");
+    const deletes = smClient.calls.filter((c) => c instanceof FakeDeleteSecretCommand);
+    assert.equal(deletes.length, 1);
+    assert.equal(deletes[0].input.SecretId, "openclaw/user/telegram_123/testkey");
+  });
+});
