@@ -13,12 +13,29 @@ function getApiKeysPath() {
   return path.join(process.env.HOME || "/root", ".openclaw", API_KEYS_FILENAME);
 }
 
+// A missing file means "no keys yet". Any other read or parse failure means
+// the file holds data we cannot see, so we stop rather than overwrite it.
 function readApiKeys() {
+  const filePath = getApiKeysPath();
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(getApiKeysPath(), "utf-8"));
-  } catch {
-    return {};
+    raw = fs.readFileSync(filePath, "utf-8");
+  } catch (err) {
+    if (err.code === "ENOENT") return {};
+    console.error(`Error: native key file is unreadable (${err.code || err.name}); not modified.`);
+    process.exit(1);
   }
+  let keys;
+  try {
+    keys = JSON.parse(raw);
+  } catch {
+    keys = undefined;
+  }
+  if (!keys || typeof keys !== "object" || Array.isArray(keys)) {
+    console.error("Error: native key file is not a valid JSON object; not modified.");
+    process.exit(1);
+  }
+  return keys;
 }
 
 function writeApiKeys(keys) {
