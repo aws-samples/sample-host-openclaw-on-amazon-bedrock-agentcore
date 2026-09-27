@@ -70,7 +70,7 @@ def _get_secret(secret_id):
         _token_cache[secret_id] = (value, time.time())
         return value
     except Exception as e:
-        logger.warning("Failed to fetch secret %s: %s", secret_id, e)
+        logger.warning("Failed to fetch secret: %s", type(e).__name__)
         return ""
 
 
@@ -134,7 +134,7 @@ def _get_feishu_tenant_token():
             return token
         logger.error("Feishu token error: code=%s msg=%s", result.get("code"), result.get("msg", ""))
     except Exception as e:
-        logger.error("Failed to get Feishu tenant_access_token: %s", e)
+        logger.error("Failed to get Feishu tenant_access_token: %s", type(e).__name__)
     return ""
 
 
