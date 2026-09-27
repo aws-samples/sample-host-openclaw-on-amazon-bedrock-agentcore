@@ -107,6 +107,28 @@ When disabled, the `GuardrailsStack` creates no resources, `AgentCoreStack` skip
    ```bash
    cd redteam && npx promptfoo@latest eval --config evalconfig.yaml
    ```
+5. Run the prompt eval against the old and new versions (next section) to see which prompts changed verdict.
+
+---
+
+## Evaluating Prompts Against a Guardrail Version
+
+`scripts/guardrail-eval.py` calls `bedrock-runtime` `ApplyGuardrail` with `source=INPUT` for each prompt in a fixture file. No model is invoked. It prints one row per prompt (id, expected, actual, which policy fired, e.g. `contentPolicy PROMPT_ATTACK (confidence LOW, strength HIGH) BLOCKED` or `sensitiveInformation CREDIT_DEBIT_CARD_NUMBER BLOCKED`) and never prints prompt text or PII matches.
+
+```bash
+GUARDRAIL_ID=$(aws cloudformation describe-stacks --stack-name OpenClawGuardrails \
+  --query "Stacks[0].Outputs[?OutputKey=='GuardrailId'].OutputValue" --output text --region $CDK_DEFAULT_REGION)
+GUARDRAIL_VERSION=$(aws cloudformation describe-stacks --stack-name OpenClawGuardrails \
+  --query "Stacks[0].Outputs[?OutputKey=='GuardrailVersion'].OutputValue" --output text --region $CDK_DEFAULT_REGION)
+
+python3 scripts/guardrail-eval.py --guardrail-id "$GUARDRAIL_ID" --version "$GUARDRAIL_VERSION" \
+  --fixtures tests/fixtures/guardrail_prompts.json --region $CDK_DEFAULT_REGION
+```
+
+- Exit code `0`: every verdict matched; `1`: at least one mismatch; `2`: fixture or API error (for example a missing `bedrock:ApplyGuardrail` permission).
+- The shipped fixtures are synthetic. The `allow` entries imitate scheduled-brief prompts (persona rules, a news digest, a browser request); each one with a `schedule_name` is also sent as `<id>+cron` with the `[Scheduled task: <name>] ` prefix the cron Lambda adds, which shows whether the prefix changes the verdict. The `block` entries are probes (public test card number, CVV, the AWS documentation example access key, a prompt-injection string) that the default configuration must block.
+- To check your own schedule prompts, copy the fixture file outside the repository, add entries (`{"id": ..., "expected": "allow", "schedule_name": ..., "text": ...}`) and pass that path to `--fixtures`. Do not commit real users' prompts.
+- Each prompt is billed as a guardrail evaluation (see Cost Estimates).
 
 ---
 
