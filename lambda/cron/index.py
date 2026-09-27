@@ -444,11 +444,12 @@ def send_telegram_message(chat_id, text, token):
     """Send a message via Telegram Bot API.
 
     Converts Markdown to Telegram HTML for rich formatting. Falls back to
-    plain text if Telegram rejects the HTML.
+    plain text if Telegram rejects the HTML. Returns True if either send
+    was accepted, False otherwise.
     """
     if not token:
         logger.error("No Telegram token available")
-        return
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     html_text = _markdown_to_telegram_html(text)
@@ -460,7 +461,7 @@ def send_telegram_message(chat_id, text, token):
     req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
         urllib_request.urlopen(req, timeout=10)
-        return
+        return True
     except Exception as e:
         logger.warning("Telegram HTML send failed (retrying plain): %s", e)
 
@@ -469,8 +470,97 @@ def send_telegram_message(chat_id, text, token):
     req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
         urllib_request.urlopen(req, timeout=10)
+        return True
     except Exception as e:
         logger.error("Failed to send Telegram message to %s: %s", chat_id, e)
+        return False
+
+
+# Telegram's sendMessage limit is 4096 characters counted in UTF-16 code
+# units: an emoji or other astral character counts 2. Chunks are cut below
+# the limit to leave room for small growth in the Markdown->HTML conversion
+# (e.g. table rows turned into bullets).
+TELEGRAM_MAX_UTF16_UNITS = 4096
+TELEGRAM_CHUNK_UTF16_UNITS = 4000
+
+
+def _utf16_len(text):
+    """Length of text as Telegram counts it (UTF-16 code units)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _best_break(window):
+    """Index to cut window at: a paragraph, line or word boundary if one lies
+    in the second half, preferring cuts outside a ``` fence; else the end."""
+    fences = [m.start() for m in re.finditer(r"```", window)]
+    floor = len(window) // 2
+
+    def outside_fence(cut):
+        return sum(1 for f in fences if f + 3 <= cut) % 2 == 0
+
+    for require_fence_balance in (True, False):
+        for sep in ("\n\n", "\n", " "):
+            pos = window.rfind(sep)
+            while pos >= 0 and pos + len(sep) > floor:
+                cut = pos + len(sep)
+                if not require_fence_balance or outside_fence(cut):
+                    return cut
+                pos = window.rfind(sep, 0, pos)
+    return len(window)
+
+
+def _split_telegram_text(text, limit=TELEGRAM_CHUNK_UTF16_UNITS):
+    """Split text into chunks of at most `limit` UTF-16 code units.
+
+    Cuts only between code points, so a surrogate pair is never split, and
+    the chunks concatenate back to the original text.
+    """
+    chunks = []
+    rest = text or ""
+    while rest:
+        if _utf16_len(rest) <= limit:
+            chunks.append(rest)
+            break
+        units = 0
+        fit = 0
+        for ch in rest:
+            units += 2 if ord(ch) > 0xFFFF else 1
+            if units > limit:
+                break
+            fit += 1
+        cut = _best_break(rest[:fit]) if fit else 1
+        chunks.append(rest[:cut])
+        rest = rest[cut:]
+    return chunks
+
+
+def _send_telegram_chunks(chat_id, text, token, limit=TELEGRAM_CHUNK_UTF16_UNITS, retry=True):
+    """Send text as one or more Telegram messages within the UTF-16 limit.
+
+    A chunk Telegram rejects is re-sent once as pieces of half the size; a
+    chunk that still fails is logged as dropped. Returns True if every chunk
+    was delivered.
+    """
+    chunks = _split_telegram_text(text, limit)
+    delivered_all = True
+    for n, chunk in enumerate(chunks, 1):
+        if send_telegram_message(chat_id, chunk, token):
+            continue
+        size = _utf16_len(chunk)
+        if retry and size > limit // 2:
+            logger.warning(
+                "Telegram chunk %d/%d (%d UTF-16 units) rejected; retrying in smaller pieces",
+                n, len(chunks), size,
+            )
+            if _send_telegram_chunks(chat_id, chunk, token, limit // 2, retry=False):
+                continue
+        else:
+            logger.error(
+                "Dropped Telegram chunk %d/%d (%d UTF-16 units) for %s after send failed",
+                n, len(chunks), size, chat_id,
+            )
+        delivered_all = False
+    return delivered_all
 
 
 def send_slack_message(channel_id, text, bot_token):
@@ -535,11 +625,11 @@ def deliver_response(channel, channel_target, response_text):
 
     if channel == "telegram":
         token = _get_telegram_token()
-        if len(response_text) <= 4096:
-            send_telegram_message(channel_target, response_text, token)
-        else:
-            for i in range(0, len(response_text), 4096):
-                send_telegram_message(channel_target, response_text[i : i + 4096], token)
+        if not token:
+            logger.error("No Telegram token available; cron response not delivered")
+            return
+        if not _send_telegram_chunks(channel_target, response_text, token):
+            logger.error("Cron response to Telegram %s was not fully delivered", channel_target)
     elif channel == "slack":
         bot_token, _ = _get_slack_tokens()
         send_slack_message(channel_target, response_text, bot_token)
