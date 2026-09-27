@@ -12,7 +12,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs, stripHtml, parseSearchResults, executeWebFetch, executeWebSearch, executeManageApiKey, readApiKeys, writeApiKeys, getApiKeysPath, VALID_KEY_NAME, executeManageSecret, buildSecretName, _secretsCache, MAX_SECRETS_PER_USER, executeRetrieveApiKey, executeMigrateApiKey, SM_REQUEST_TIMEOUT_MS } = require("./lightweight-agent");
+const { TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs, stripHtml, parseSearchResults, executeWebFetch, executeWebSearch, executeManageApiKey, readApiKeys, writeApiKeys, getApiKeysPath, VALID_KEY_NAME, executeManageSecret, buildSecretName, _secretsCache, MAX_SECRETS_PER_USER, executeRetrieveApiKey, executeMigrateApiKey, SM_REQUEST_TIMEOUT_MS, _setSecretsManagerForTests } = require("./lightweight-agent");
 
 // --- TOOLS array ---
 
@@ -1051,18 +1051,68 @@ describe("manage_secret", () => {
 
 // --- retrieve_api_key (unified retrieval) ---
 
+// Hermetic Secrets Manager double: a fake SDK whose command classes only
+// record their input, and a fake client whose send() answers from an
+// in-memory map. No network or AWS credential lookup can happen.
+class FakeGetSecretValueCommand {
+  constructor(input) {
+    this.input = input;
+  }
+}
+const FAKE_SM_SDK = { GetSecretValueCommand: FakeGetSecretValueCommand };
+
+function smError(name, message) {
+  const err = new Error(message);
+  err.name = name;
+  return err;
+}
+
+function makeFakeSmClient({ secrets = {}, denyAll = false } = {}) {
+  const calls = [];
+  return {
+    calls,
+    async send(command) {
+      calls.push(command);
+      if (!(command instanceof FakeGetSecretValueCommand)) {
+        throw new Error(`unexpected command ${command?.constructor?.name}`);
+      }
+      if (denyAll) {
+        throw smError(
+          "AccessDeniedException",
+          "User is not authorized to perform: secretsmanager:GetSecretValue",
+        );
+      }
+      const id = command.input.SecretId;
+      if (!Object.prototype.hasOwnProperty.call(secrets, id)) {
+        throw smError(
+          "ResourceNotFoundException",
+          "Secrets Manager can't find the specified secret.",
+        );
+      }
+      return { SecretString: secrets[id] };
+    },
+  };
+}
+
 describe("retrieve_api_key", () => {
   let tmpDir;
   let origHome;
+  let smClient;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "retrieve-test-"));
     origHome = process.env.HOME;
     process.env.HOME = tmpDir;
     fs.mkdirSync(path.join(tmpDir, ".openclaw"), { recursive: true });
+    _secretsCache.clear();
+    // Default: Secrets Manager reachable but holds no secrets.
+    smClient = makeFakeSmClient();
+    _setSecretsManagerForTests(smClient, FAKE_SM_SDK);
   });
 
   afterEach(() => {
+    _setSecretsManagerForTests(null, null);
+    _secretsCache.clear();
     process.env.HOME = origHome;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -1076,24 +1126,82 @@ describe("retrieve_api_key", () => {
   it("rejects invalid key_name", async () => {
     const result = await executeRetrieveApiKey({ key_name: "123bad" }, "ns");
     assert.ok(result.startsWith("Error:"));
+    assert.equal(smClient.calls.length, 0, "validation must run before any SM call");
   });
 
   it("rejects missing key_name", async () => {
     const result = await executeRetrieveApiKey({}, "ns");
     assert.ok(result.startsWith("Error:"));
+    assert.equal(smClient.calls.length, 0, "validation must run before any SM call");
   });
 
-  it("falls back to native file when SM unavailable", async () => {
+  it("returns the Secrets Manager value when the secret exists", async () => {
+    smClient = makeFakeSmClient({
+      secrets: { "openclaw/user/telegram_123/testkey": "sm-value-456" },
+    });
+    _setSecretsManagerForTests(smClient, FAKE_SM_SDK);
+    // A native copy must not shadow the Secrets Manager value.
+    writeApiKeys({ testkey: "native-value-123" });
+
+    const result = await executeRetrieveApiKey({ key_name: "testkey" }, "telegram_123");
+
+    assert.equal(result, "sm-value-456");
+    assert.equal(smClient.calls.length, 1);
+    assert.deepStrictEqual(smClient.calls[0].input, {
+      SecretId: "openclaw/user/telegram_123/testkey",
+    });
+  });
+
+  it("caches a Secrets Manager hit for the session", async () => {
+    smClient = makeFakeSmClient({
+      secrets: { "openclaw/user/telegram_123/testkey": "sm-value-456" },
+    });
+    _setSecretsManagerForTests(smClient, FAKE_SM_SDK);
+
+    assert.equal(await executeRetrieveApiKey({ key_name: "testkey" }, "telegram_123"), "sm-value-456");
+    assert.equal(await executeRetrieveApiKey({ key_name: "testkey" }, "telegram_123"), "sm-value-456");
+    assert.equal(smClient.calls.length, 1, "second lookup should be served from cache");
+  });
+
+  it("falls back to native file when the secret is missing in SM", async () => {
     // Write a key to native store
     writeApiKeys({ testkey: "native-value-123" });
     const result = await executeRetrieveApiKey({ key_name: "testkey" }, "telegram_123");
     assert.equal(result, "native-value-123");
+    assert.equal(smClient.calls.length, 1, "SM is consulted first");
+    assert.equal(smClient.calls[0].input.SecretId, "openclaw/user/telegram_123/testkey");
+  });
+
+  it("falls back to native file when SM denies access", async () => {
+    smClient = makeFakeSmClient({ denyAll: true });
+    _setSecretsManagerForTests(smClient, FAKE_SM_SDK);
+    writeApiKeys({ testkey: "native-value-123" });
+
+    const result = await executeRetrieveApiKey({ key_name: "testkey" }, "telegram_123");
+
+    assert.equal(result, "native-value-123");
+    assert.equal(smClient.calls.length, 1);
+  });
+
+  it("returns a not-found error when SM denies access and no native key exists", async () => {
+    smClient = makeFakeSmClient({ denyAll: true });
+    _setSecretsManagerForTests(smClient, FAKE_SM_SDK);
+
+    const result = await executeRetrieveApiKey({ key_name: "testkey" }, "telegram_123");
+
+    assert.equal(
+      result,
+      "Error: No API key found with name 'testkey' in either Secrets Manager or native storage.",
+    );
   });
 
   it("returns error when key not found anywhere", async () => {
     const result = await executeRetrieveApiKey({ key_name: "nonexistent" }, "telegram_123");
-    assert.ok(result.startsWith("Error:"));
-    assert.ok(result.includes("nonexistent"));
+    assert.equal(
+      result,
+      "Error: No API key found with name 'nonexistent' in either Secrets Manager or native storage.",
+    );
+    assert.equal(smClient.calls.length, 1);
   });
 });
 
