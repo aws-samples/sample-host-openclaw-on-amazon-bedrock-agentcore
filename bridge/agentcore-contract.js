@@ -782,6 +782,14 @@ function writeOpenClawConfig() {
         "music_generate",
         "video_generate",
         "tts",
+        // Channel-delivery tools. OpenClaw runs with `channels: {}` and no bot
+        // tokens; the bridge returns the final reply text and the router/cron
+        // Lambda delivers it. A model call to these (e.g. "send the brief to
+        // Telegram") fails with missing_token and the content never reaches
+        // the reply, so the user receives nothing.
+        "message", // Channel send/actions (Telegram, Slack, ...)
+        "conversations_send", // Send to an external conversation address
+        "conversations_turn", // Send + wait for an external reply
       ],
       // Note: `exec` is intentionally NOT denied — skills like clawhub-manage
       // need Bash(node:*) to run scripts. Scoped STS credentials ensure
@@ -871,6 +879,7 @@ function writeOpenClawConfig() {
         "## Response Formatting",
         "",
         "Format responses for chat messaging apps (Telegram, Slack):",
+        "- Your final reply text is delivered to the user automatically (including scheduled tasks); do not try to send messages yourself — put the full answer in your reply",
         "- **No markdown tables** — use bullet lists or plain text paragraphs instead",
         "- Tables do not render in most chat apps; bullets always work",
         "- Keep responses concise and chat-appropriate",
