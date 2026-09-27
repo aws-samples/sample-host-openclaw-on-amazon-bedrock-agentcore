@@ -35,7 +35,7 @@ Examples
     python3 scripts/agentcore-exec.py --command 'node --version && df -h /mnt/workspace'
 
     # Inspect a specific user's persistent workspace (touches user data -- audit it)
-    python3 scripts/agentcore-exec.py --session-id ses_user_9dc5386ba1124fbd_0a1b2c3d4e5f \\
+    python3 scripts/agentcore-exec.py --session-id ses_user_0123456789abcdef_0a1b2c3d4e5f \\
         --command 'ls -la /mnt/workspace/.openclaw'
 
     # Machine-readable output for CI assertions

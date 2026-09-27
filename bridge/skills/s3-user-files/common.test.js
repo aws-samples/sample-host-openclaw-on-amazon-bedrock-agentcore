@@ -103,7 +103,7 @@ describe("validateUserId", () => {
   });
 
   it("accepts valid slack namespace with uppercase ID", () => {
-    assert.doesNotThrow(() => validateUserId("slack_U0AGD41CBGS"));
+    assert.doesNotThrow(() => validateUserId("slack_U0XXXXXXXX1"));
   });
 
   it("rejects empty userId", () => {

@@ -5,19 +5,31 @@ After userId rotation, some schedules lost their CRON# records (they were
 keyed under now-deleted stale userIds). This script reads each schedule's
 payload and expression from EventBridge, and creates CRON# records under
 the current userId so the ownership check passes.
+
+Usage:
+    python3 scripts/fix-missing-cron-records.py \\
+        --namespace telegram_<telegram_id> --user-id user_<16 hex> [--dry-run]
+
+--namespace / --user-id may also be set via OPENCLAW_NAMESPACE /
+OPENCLAW_USER_ID.
 """
-import boto3
 import json
-import sys
 import time
+
+from _ns_args import parse_args
+
+ARGS = parse_args(__doc__.splitlines()[0])
+
+import boto3  # noqa: E402
 
 REGION = "ap-southeast-2"
 SCHEDULE_GROUP = "openclaw-cron"
-NAMESPACE_PREFIX = "openclaw-telegram_6087229962-"
-CURRENT_USER_ID = "user_9dc5386ba1124fbd"
+NAMESPACE_PREFIX = f"openclaw-{ARGS.namespace}-"
+CURRENT_USER_ID = ARGS.user_id
+TELEGRAM_ID = ARGS.telegram_id
 TABLE_NAME = "openclaw-identity"
 
-DRY_RUN = "--dry-run" in sys.argv
+DRY_RUN = ARGS.dry_run
 
 scheduler = boto3.client("scheduler", region_name=REGION)
 ddb = boto3.resource("dynamodb", region_name=REGION)
@@ -64,9 +76,9 @@ for name in missing:
         "SK": f"CRON#{sid}",
         "scheduleId": sid,
         "scheduleName": payload.get("scheduleName", sid),
-        "actorId": payload.get("actorId", "telegram:6087229962"),
+        "actorId": payload.get("actorId", f"telegram:{TELEGRAM_ID}"),
         "channel": payload.get("channel", "telegram"),
-        "channelTarget": payload.get("channelTarget", "6087229962"),
+        "channelTarget": payload.get("channelTarget", TELEGRAM_ID),
         "message": payload.get("message", ""),
         "expression": expression,
         "timezone": timezone,

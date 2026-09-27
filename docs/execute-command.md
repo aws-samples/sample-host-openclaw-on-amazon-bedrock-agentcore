@@ -48,7 +48,7 @@ Inspect a **specific user's live session** (pass the same `ses_<user>_<hex>` id 
 
 ```bash
 python3 scripts/agentcore-exec.py \
-  --session-id ses_user_9dc5386ba1124fbd_0a1b2c3d4e5f \
+  --session-id ses_user_0123456789abcdef_0a1b2c3d4e5f \
   --command 'du -sh /mnt/workspace/.openclaw && ls /mnt/workspace/.openclaw/agents'
 ```
 

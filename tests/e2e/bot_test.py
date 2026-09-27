@@ -1266,7 +1266,7 @@ class TestCronExecution:
 
     This validates the full cron execution pipeline including the critical
     INTERNAL_USER_ID fix (v69): the CRON# record PK must use the internal
-    user ID (e.g. USER#user_9dc5386ba1124fbd), not the channel-prefixed
+    user ID (e.g. USER#user_0123456789abcdef), not the channel-prefixed
     actor ID (e.g. USER#telegram_123456789).
 
     Run with: pytest tests/e2e/bot_test.py -v -k TestCronExecution

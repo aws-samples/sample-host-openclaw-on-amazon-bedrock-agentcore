@@ -24,8 +24,8 @@ describe("identity.createVerifier", () => {
   });
 
   it("accepts a Cognito access token (client_id + username claims)", async () => {
-    const id = await verifier().verify(h.accessToken("slack:U0AGD41CBGS"));
-    assert.equal(id.namespace, "slack_U0AGD41CBGS");
+    const id = await verifier().verify(h.accessToken("slack:U0XXXXXXXX1"));
+    assert.equal(id.namespace, "slack_U0XXXXXXXX1");
     assert.equal(id.tokenUse, "access");
   });
 

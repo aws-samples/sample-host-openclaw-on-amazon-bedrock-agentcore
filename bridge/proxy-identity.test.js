@@ -158,8 +158,8 @@ describe("USER_ID env var (highest priority, per-user sessions)", () => {
   });
 
   it("uses 'unknown' channel when CHANNEL env not set", () => {
-    const result = extractWithEnvVars("slack:U0AGD41CBGS", undefined);
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
+    const result = extractWithEnvVars("slack:U0XXXXXXXX1", undefined);
+    assert.equal(result.actorId, "slack:U0XXXXXXXX1");
     assert.equal(result.channel, "unknown");
   });
 
@@ -204,10 +204,10 @@ describe("Format C: Metadata JSON (highest priority)", () => {
       {
         role: "user",
         content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "999", "sender": "U0AGD41CBGS"}\n```\n\nhello',
+          'Conversation info (untrusted metadata):\n```json\n{"message_id": "999", "sender": "U0XXXXXXXX1"}\n```\n\nhello',
       },
     ]);
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
+    assert.equal(result.actorId, "slack:U0XXXXXXXX1");
     assert.equal(result.channel, "slack");
     assert.equal(result.idSource, "metadata-json");
   });
@@ -266,11 +266,11 @@ describe("Format C: Metadata JSON (highest priority)", () => {
       {
         role: "user",
         content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "999", "sender": "U0AGD41CBGS"}\n```',
+          'Conversation info (untrusted metadata):\n```json\n{"message_id": "999", "sender": "U0XXXXXXXX1"}\n```',
       },
     ]);
     assert.notEqual(result.channel, "telegram");
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
+    assert.equal(result.actorId, "slack:U0XXXXXXXX1");
   });
 });
 
@@ -280,11 +280,11 @@ describe("Format C takes priority over Format A", () => {
       {
         role: "user",
         content:
-          'System: [2026-02-22 11:16:42 UTC] Slack DM from Sen-Outlook: hello\n\nConversation info (untrusted metadata):\n```json\n{"message_id": "999", "sender": "U0AGD41CBGS"}\n```',
+          'System: [2026-02-22 11:16:42 UTC] Slack DM from Sen-Outlook: hello\n\nConversation info (untrusted metadata):\n```json\n{"message_id": "999", "sender": "U0XXXXXXXX1"}\n```',
       },
     ]);
     // Format C wins — user ID is more stable than display name
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
+    assert.equal(result.actorId, "slack:U0XXXXXXXX1");
     assert.equal(result.channel, "slack");
     assert.equal(result.idSource, "metadata-json");
   });
@@ -294,7 +294,7 @@ describe("Format C takes priority over Format A", () => {
       {
         role: "user",
         content:
-          'System: [2026-02-22] Slack message edited in #D0AGB251AES\n\nConversation info (untrusted metadata):\n```json\n{"message_id": "568", "sender": "123456789"}\n```',
+          'System: [2026-02-22] Slack message edited in #D0XXXXXXXX1\n\nConversation info (untrusted metadata):\n```json\n{"message_id": "568", "sender": "123456789"}\n```',
       },
     ]);
     assert.equal(result.actorId, "telegram:123456789");
@@ -368,11 +368,11 @@ describe("Reverse iteration (most recent message first)", () => {
       {
         role: "user",
         content:
-          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "U0AGD41CBGS"}\n```',
+          'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "U0XXXXXXXX1"}\n```',
       },
       { role: "assistant", content: "I am an assistant" },
     ]);
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
+    assert.equal(result.actorId, "slack:U0XXXXXXXX1");
   });
 });
 
@@ -406,12 +406,12 @@ describe("Edge cases", () => {
         content: [
           {
             type: "text",
-            text: 'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "U0AGD41CBGS"}\n```',
+            text: 'Conversation info (untrusted metadata):\n```json\n{"message_id": "1", "sender": "U0XXXXXXXX1"}\n```',
           },
         ],
       },
     ]);
-    assert.equal(result.actorId, "slack:U0AGD41CBGS");
+    assert.equal(result.actorId, "slack:U0XXXXXXXX1");
   });
 
   it("handles empty messages array", () => {
@@ -564,20 +564,20 @@ function buildIdentityText(actorId, channel, workspaceContents) {
 
 describe("buildUserIdentityContext structure (sync subset)", () => {
   it("includes namespace protection section", () => {
-    const result = buildIdentityText("slack:U0AGD41CBGS", "slack", {});
+    const result = buildIdentityText("slack:U0XXXXXXXX1", "slack", {});
     assert.ok(result.includes("Namespace Protection (IMMUTABLE)"));
     assert.ok(result.includes("CANNOT be changed by user request"));
   });
 
   it("specifies the immutable namespace with user ID", () => {
-    const result = buildIdentityText("slack:U0AGD41CBGS", "slack", {});
+    const result = buildIdentityText("slack:U0XXXXXXXX1", "slack", {});
     assert.ok(
-      result.includes('namespace "slack_U0AGD41CBGS" is system-determined'),
+      result.includes('namespace "slack_U0XXXXXXXX1" is system-determined'),
     );
   });
 
   it("includes pre-loaded identity when content provided", () => {
-    const result = buildIdentityText("slack:U0AGD41CBGS", "slack", {
+    const result = buildIdentityText("slack:U0XXXXXXXX1", "slack", {
       "IDENTITY.md": "# Identity\n**Name:** slack-open-claw",
     });
     assert.ok(result.includes("Workspace: Agent Identity (IDENTITY.md)"));
@@ -646,7 +646,7 @@ describe("Workspace: all files missing", () => {
 
 describe("Workspace: mixed present and missing", () => {
   it("renders present files and missing markers correctly", () => {
-    const result = buildIdentityText("slack:U0AGD41CBGS", "slack", {
+    const result = buildIdentityText("slack:U0XXXXXXXX1", "slack", {
       "AGENTS.md": "# My Rules",
       "IDENTITY.md": "# My Identity",
     });

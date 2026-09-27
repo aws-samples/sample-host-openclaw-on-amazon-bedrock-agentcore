@@ -78,7 +78,7 @@ Mirror new pre-load behavior in `bridge/proxy-identity.test.js`. The `buildIdent
 
 ```javascript
 it("includes new file when content provided", () => {
-  const result = buildIdentityText("slack:U0AGD41CBGS", "slack", {
+  const result = buildIdentityText("slack:U0XXXXXXXX1", "slack", {
     "NEWFILE.md": "# Content\nSome data",
   });
   assert.ok(result.includes("Workspace: Display Label (NEWFILE.md)"));

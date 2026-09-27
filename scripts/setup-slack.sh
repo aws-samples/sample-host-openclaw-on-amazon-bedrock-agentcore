@@ -63,9 +63,9 @@ echo "To find your Slack user ID:"
 echo "  1. Open Slack → click your profile picture (bottom-left)"
 echo "  2. Click 'Profile'"
 echo "  3. Click the '...' (more) button → 'Copy member ID'"
-echo "  The ID looks like: U0AFVC4GEAE"
+echo "  The ID looks like: U0XXXXXXXX2"
 echo ""
-read -rp "Enter your Slack member ID (e.g. U0AFVC4GEAE): " SLACK_USER_ID
+read -rp "Enter your Slack member ID (e.g. U0XXXXXXXX2): " SLACK_USER_ID
 
 # Validate: must start with U and be alphanumeric
 if ! [[ "$SLACK_USER_ID" =~ ^U[A-Z0-9]+$ ]]; then
