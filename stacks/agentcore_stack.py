@@ -288,6 +288,17 @@ class AgentCoreStack(Stack):
         user_files_ttl_days = int(
             self.node.try_get_context("user_files_ttl_days") or "365"
         )
+        # Noncurrent versions: the bridge re-saves state often, so every save
+        # leaves a noncurrent version behind (prod reached ~915 GB / 7.6 M
+        # versions with no expiry). Expire them after N days, but always keep
+        # the newest few per key so a recent rollback / CopyObject restore of a
+        # previous version (e.g. a pre-2.0 sessions.json) stays possible.
+        user_files_noncurrent_days = int(
+            self.node.try_get_context("user_files_noncurrent_days") or "30"
+        )
+        user_files_noncurrent_keep = int(
+            self.node.try_get_context("user_files_noncurrent_keep") or "3"
+        )
         user_files_cmk = kms.Key.from_key_arn(self, "UserFilesCmk", cmk_arn)
         self.user_files_bucket = s3.Bucket(
             self,
@@ -301,6 +312,21 @@ class AgentCoreStack(Stack):
                 s3.LifecycleRule(
                     id="expire-old-user-files",
                     expiration=Duration.days(user_files_ttl_days),
+                ),
+                # Only touches NONCURRENT versions: current objects, delete
+                # markers and versioning itself are left alone.
+                s3.LifecycleRule(
+                    id="expire-noncurrent-versions",
+                    noncurrent_version_expiration=Duration.days(
+                        user_files_noncurrent_days
+                    ),
+                    noncurrent_versions_to_retain=user_files_noncurrent_keep,
+                ),
+                # The bridge uploads large SQLite backups with multipart upload;
+                # clean up parts left behind by a container killed mid-upload.
+                s3.LifecycleRule(
+                    id="abort-incomplete-multipart-uploads",
+                    abort_incomplete_multipart_upload_after=Duration.days(7),
                 ),
             ],
             enforce_ssl=True,
