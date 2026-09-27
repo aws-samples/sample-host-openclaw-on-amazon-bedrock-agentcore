@@ -213,7 +213,7 @@ function extractSessionMetadata(parsed, headers) {
               .slice(0, 64);
             // Determine channel from sender ID format:
             //   meta.channel field (most authoritative if present)
-            //   /^[UW][A-Z0-9]{8,}/i → Slack user ID (e.g., U0AGD41CBGS)
+            //   /^[UW][A-Z0-9]{8,}/i → Slack user ID (e.g., U0XXXXXXXX1)
             //   /^\d{15,}/ → Discord snowflake ID
             //   /^\d{5,14}/ → Telegram numeric ID
             let channelName = "";

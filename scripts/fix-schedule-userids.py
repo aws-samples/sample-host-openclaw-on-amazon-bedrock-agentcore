@@ -3,23 +3,30 @@
 
 Fixes schedules created with stale userIds (before deterministic userId fix).
 Safe to run multiple times — skips schedules already using the correct userId.
+
+Usage:
+    python3 scripts/fix-schedule-userids.py \\
+        --namespace telegram_<telegram_id> --user-id user_<16 hex> \\
+        [--stale-id user_<16 hex> ...] [--dry-run]
+
+--namespace / --user-id may also be set via OPENCLAW_NAMESPACE /
+OPENCLAW_USER_ID. The namespace itself is always treated as a stale userId.
 """
-import boto3
 import json
-import sys
+
+from _ns_args import parse_args
+
+ARGS = parse_args(__doc__.splitlines()[0], with_stale_ids=True)
+
+import boto3  # noqa: E402
 
 REGION = "ap-southeast-2"
 SCHEDULE_GROUP = "openclaw-cron"
-NAMESPACE_PREFIX = "openclaw-telegram_6087229962-"
-CURRENT_USER_ID = "user_9dc5386ba1124fbd"
-STALE_IDS = {
-    "user_ef1919b99b8140f9",
-    "user_a0f29e6ada0b4c26",
-    "user_723a07712e9847f5",
-    "telegram_6087229962",
-}
+NAMESPACE_PREFIX = f"openclaw-{ARGS.namespace}-"
+CURRENT_USER_ID = ARGS.user_id
+STALE_IDS = set(ARGS.stale_id) | {ARGS.namespace}
 
-DRY_RUN = "--dry-run" in sys.argv
+DRY_RUN = ARGS.dry_run
 
 scheduler = boto3.client("scheduler", region_name=REGION)
 
@@ -31,7 +38,7 @@ for page in paginator.paginate(GroupName=SCHEDULE_GROUP):
         if s["Name"].startswith(NAMESPACE_PREFIX):
             schedules.append(s["Name"])
 
-print(f"Found {len(schedules)} schedules for telegram_6087229962")
+print(f"Found {len(schedules)} schedules for {ARGS.namespace}")
 
 patched = 0
 skipped = 0
