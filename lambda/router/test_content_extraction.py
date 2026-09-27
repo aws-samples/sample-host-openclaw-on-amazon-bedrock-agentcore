@@ -208,6 +208,30 @@ class TestExtractTextFromContentBlocks(unittest.TestCase):
         result = index._extract_text_from_content_blocks('\n\n[{"type":"text","text":"hello')
         self.assertNotIn("[{", result)
 
+    def test_prose_mentioning_block_syntax_is_unchanged(self):
+        """Prose that quotes content-block syntax mid-reply keeps all its text."""
+        raw = (
+            'To send an image, the API expects content like '
+            '[{"type": "image", ...}]. After that, call the second endpoint '
+            'with the returned id.'
+        )
+        self.assertEqual(index._extract_text_from_content_blocks(raw), raw)
+
+    def test_malformed_block_mid_reply_keeps_suffix(self):
+        """A closed but malformed block (trailing comma) must not drop the text after it."""
+        result = index._extract_text_from_content_blocks(
+            'prefix [{"type":"text","text":"x"},] suffix'
+        )
+        self.assertTrue(result.startswith("prefix "), result)
+        self.assertTrue(result.endswith(" suffix"), result)
+
+    def test_trailing_partial_fragment_after_text_is_stripped(self):
+        """A genuine unterminated fragment at the end is still stripped; prefix kept."""
+        result = index._extract_text_from_content_blocks(
+            'Here is the answer.\n\n[{"type":"text","text":"partial'
+        )
+        self.assertEqual(result, "Here is the answer.\n\n")
+
 
 if __name__ == "__main__":
     unittest.main()

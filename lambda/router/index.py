@@ -661,6 +661,15 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
 # Channel message senders
 # ---------------------------------------------------------------------------
 
+# End of a (possibly malformed) content-block array: '}]' or '},]'.
+_BLOCK_CLOSE_RE = re.compile(r'\}\s*,?\s*\]')
+# Text value of a '{"type":"text","text":"..."}' block, for regex fallback.
+# Accepts ',' as well as ':' before the value (seen from models in the wild).
+_MALFORMED_TEXT_BLOCK_RE = re.compile(
+    r'"type"\s*:\s*"text"\s*,\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"'
+)
+
+
 def _extract_text_from_content_blocks(text):
     """Extract plain text from content blocks anywhere in the response.
 
@@ -705,12 +714,25 @@ def _extract_text_from_content_blocks(text):
                         continue
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
-            # Not a valid content block array — check if it looks like truncated
-            # content blocks (e.g., '[{"type":' ...) and strip them
+            # Not a valid content block array. If it looks like content-block
+            # JSON (e.g. '[{"type":' ...), only an unterminated fragment that
+            # runs to the end of the string is dropped (a partial stream tail).
+            # A closed but malformed array keeps the text around it.
             remainder = result[pos:]
             if re.match(r'^\[\{\s*"type"\s*:', remainder) or remainder.strip() == "[{":
-                # Truncated content block JSON — skip the rest
-                break
+                close = _BLOCK_CLOSE_RE.search(remainder)
+                if close is None:
+                    # Truncated content block JSON at the tail — skip the rest
+                    break
+                span = remainder[:close.end()]
+                texts = _MALFORMED_TEXT_BLOCK_RE.findall(span)
+                if texts:
+                    try:
+                        rebuilt.append("".join(json.loads('"' + t + '"') for t in texts))
+                        i = pos + close.end()
+                        continue
+                    except (json.JSONDecodeError, ValueError):
+                        pass
             rebuilt.append("[")
             i = pos + 1
         result = "".join(rebuilt)
