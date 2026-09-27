@@ -1329,3 +1329,113 @@ describe("migrate_api_key secure-to-native", () => {
     assert.equal(deletes[0].input.SecretId, "openclaw/user/telegram_123/testkey");
   });
 });
+
+describe("migrate_api_key native-to-secure", () => {
+  // Fake SDK with the commands the SM "set" path uses. Nothing reaches AWS.
+  class FakePutSecretValueCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  class FakeListSecretsCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  class FakeCreateSecretCommand {
+    constructor(input) {
+      this.input = input;
+    }
+  }
+  const SET_SM_SDK = {
+    PutSecretValueCommand: FakePutSecretValueCommand,
+    ListSecretsCommand: FakeListSecretsCommand,
+    CreateSecretCommand: FakeCreateSecretCommand,
+  };
+
+  // putError: thrown by PutSecretValue. createError: thrown by CreateSecret.
+  function makeSetSmClient({ putError, createError } = {}) {
+    const calls = [];
+    return {
+      calls,
+      async send(command) {
+        calls.push(command);
+        if (command instanceof FakePutSecretValueCommand) {
+          if (putError) throw putError;
+          return {};
+        }
+        if (command instanceof FakeListSecretsCommand) {
+          return { SecretList: [] };
+        }
+        if (command instanceof FakeCreateSecretCommand) {
+          if (createError) throw createError;
+          return {};
+        }
+        throw new Error(`unexpected command ${command?.constructor?.name}`);
+      },
+    };
+  }
+
+  let tmpDir;
+  let origHome;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "migrate-n2s-test-"));
+    origHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    fs.mkdirSync(path.join(tmpDir, ".openclaw"), { recursive: true });
+    _secretsCache.clear();
+    writeApiKeys({ testkey: "native-value-123" });
+  });
+
+  afterEach(() => {
+    _setSecretsManagerForTests(null, null);
+    _secretsCache.clear();
+    process.env.HOME = origHome;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const failures = [
+    {
+      label: "keeps the native key when the SM update fails",
+      opts: { putError: smError("AccessDeniedException", "not authorized") },
+    },
+    {
+      label: "keeps the native key when the SM create fails",
+      opts: {
+        putError: smError("ResourceNotFoundException", "Secrets Manager can't find the specified secret."),
+        createError: smError("AccessDeniedException", "not authorized"),
+      },
+    },
+  ];
+  for (const { label, opts } of failures) {
+    it(label, async () => {
+      _setSecretsManagerForTests(makeSetSmClient(opts), SET_SM_SDK);
+
+      const result = await executeMigrateApiKey(
+        { key_name: "testkey", direction: "native-to-secure" },
+        "test_user",
+      );
+
+      assert.ok(result.startsWith("Error"), `expected an error, got: ${result}`);
+      assert.ok(!result.startsWith("Migrated"), `must not report success, got: ${result}`);
+      assert.equal(readApiKeys().testkey, "native-value-123", "native key must be kept");
+    });
+  }
+
+  it("moves the key to SM and deletes it from native storage on success", async () => {
+    const smClient = makeSetSmClient();
+    _setSecretsManagerForTests(smClient, SET_SM_SDK);
+
+    const result = await executeMigrateApiKey(
+      { key_name: "testkey", direction: "native-to-secure" },
+      "test_user",
+    );
+
+    assert.equal(result, "Migrated 'testkey' from native file storage to Secrets Manager.");
+    assert.equal(readApiKeys().testkey, undefined);
+    const puts = smClient.calls.filter((c) => c instanceof FakePutSecretValueCommand);
+    assert.equal(puts.length, 1);
+    assert.equal(puts[0].input.SecretId, "openclaw/user/test_user/testkey");
+  });
+});

@@ -1124,6 +1124,63 @@ function buildSecretName(namespace, keyName) {
 }
 
 /**
+ * Write a secret value to Secrets Manager (update, or create if missing).
+ * Returns { ok, message } so callers can branch on success without parsing
+ * the message text: failures use several prefixes ("Error:", "Error updating
+ * secret:", "Error creating secret:").
+ */
+async function setSecretValue(namespace, key_name, key_value) {
+  if (!key_value) {
+    return { ok: false, message: "Error: key_value is required for 'set' action." };
+  }
+  const sdk = getSmSdk();
+  const client = getSmClient();
+  const secretName = buildSecretName(namespace, key_name);
+  try {
+    // Try to update existing secret first
+    await client.send(new sdk.PutSecretValueCommand({
+      SecretId: secretName,
+      SecretString: key_value,
+    }));
+    _secretsCache.set(secretName, key_value);
+    return { ok: true, message: `Secret '${key_name}' updated (Secrets Manager, KMS-encrypted).` };
+  } catch (err) {
+    if (err.name === "ResourceNotFoundException") {
+      // Check max secrets limit before creating
+      try {
+        const prefix = `${SECRET_PREFIX}${namespace}/`;
+        const listResp = await client.send(new sdk.ListSecretsCommand({
+          Filters: [{ Key: "name", Values: [prefix] }],
+          MaxResults: 100,
+        }));
+        if ((listResp.SecretList || []).length >= MAX_SECRETS_PER_USER) {
+          return { ok: false, message: `Error: Maximum ${MAX_SECRETS_PER_USER} secrets per user reached. Delete an existing secret first.` };
+        }
+      } catch {
+        // Continue with create attempt — worst case it fails at service limit
+      }
+
+      // Create new secret
+      try {
+        await client.send(new sdk.CreateSecretCommand({
+          Name: secretName,
+          SecretString: key_value,
+          Tags: [
+            { Key: "openclaw:user", Value: namespace },
+            { Key: "openclaw:managed", Value: "true" },
+          ],
+        }));
+        _secretsCache.set(secretName, key_value);
+        return { ok: true, message: `Secret '${key_name}' saved (Secrets Manager, KMS-encrypted, auditable via CloudTrail).` };
+      } catch (createErr) {
+        return { ok: false, message: `Error creating secret: ${createErr.message}` };
+      }
+    }
+    return { ok: false, message: `Error updating secret: ${err.message}` };
+  }
+}
+
+/**
  * Execute the manage_secret tool (AWS Secrets Manager backend).
  */
 async function executeManageSecret(args, namespace) {
@@ -1165,48 +1222,7 @@ async function executeManageSecret(args, namespace) {
   const secretName = buildSecretName(namespace, key_name);
 
   if (action === "set") {
-    try {
-      // Try to update existing secret first
-      await client.send(new sdk.PutSecretValueCommand({
-        SecretId: secretName,
-        SecretString: key_value,
-      }));
-      _secretsCache.set(secretName, key_value);
-      return `Secret '${key_name}' updated (Secrets Manager, KMS-encrypted).`;
-    } catch (err) {
-      if (err.name === "ResourceNotFoundException") {
-        // Check max secrets limit before creating
-        try {
-          const prefix = `${SECRET_PREFIX}${namespace}/`;
-          const listResp = await client.send(new sdk.ListSecretsCommand({
-            Filters: [{ Key: "name", Values: [prefix] }],
-            MaxResults: 100,
-          }));
-          if ((listResp.SecretList || []).length >= MAX_SECRETS_PER_USER) {
-            return `Error: Maximum ${MAX_SECRETS_PER_USER} secrets per user reached. Delete an existing secret first.`;
-          }
-        } catch {
-          // Continue with create attempt — worst case it fails at service limit
-        }
-
-        // Create new secret
-        try {
-          await client.send(new sdk.CreateSecretCommand({
-            Name: secretName,
-            SecretString: key_value,
-            Tags: [
-              { Key: "openclaw:user", Value: namespace },
-              { Key: "openclaw:managed", Value: "true" },
-            ],
-          }));
-          _secretsCache.set(secretName, key_value);
-          return `Secret '${key_name}' saved (Secrets Manager, KMS-encrypted, auditable via CloudTrail).`;
-        } catch (createErr) {
-          return `Error creating secret: ${createErr.message}`;
-        }
-      }
-      return `Error updating secret: ${err.message}`;
-    }
+    return (await setSecretValue(namespace, key_name, key_value)).message;
   }
 
   if (action === "get") {
@@ -1306,10 +1322,12 @@ async function executeMigrateApiKey(args, namespace) {
     if (value.startsWith("Error:")) {
       return `Error: Key '${key_name}' not found in native storage.`;
     }
-    // Write to Secrets Manager
-    const setResult = await executeManageSecret({ action: "set", key_name, key_value: value }, namespace);
-    if (setResult.startsWith("Error:")) {
-      return setResult;
+    // Write to Secrets Manager. Branch on the structured result: SDK failures
+    // come back as "Error updating/creating secret: ...", and deleting the
+    // native copy after one of those would lose the key.
+    const setResult = await setSecretValue(namespace, key_name, value);
+    if (!setResult.ok) {
+      return setResult.message;
     }
     // Delete from native
     executeManageApiKey({ action: "delete", key_name });
