@@ -622,7 +622,9 @@ async function readUserFileFromS3(namespace, filename) {
       console.log(`[proxy] No ${filename} for ${namespace} (not created yet)`);
     } else {
       console.warn(
-        `[proxy] Failed to read ${filename} for ${namespace}:`,
+        "[proxy] Failed to read %s for %s:",
+        filename,
+        namespace,
         err.message,
       );
     }
@@ -659,7 +661,9 @@ async function writeUserFileToS3(namespace, filename, content) {
     );
   } catch (err) {
     console.warn(
-      `[proxy] Failed to seed ${filename} for ${namespace}:`,
+      "[proxy] Failed to seed %s for %s:",
+      filename,
+      namespace,
       err.message,
     );
   }
@@ -1400,7 +1404,8 @@ const server = http.createServer(async (req, res) => {
           cognitoToken = await getCognitoToken(actorId);
         } catch (err) {
           console.warn(
-            `[proxy] Cognito token acquisition failed for ${actorId}:`,
+            "[proxy] Cognito token acquisition failed for %s:",
+            actorId,
             err.message,
           );
         }
