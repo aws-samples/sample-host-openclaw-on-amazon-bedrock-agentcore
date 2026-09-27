@@ -1100,6 +1100,17 @@ function getSmClient() {
   return _smClient;
 }
 
+/**
+ * Test-only seam: replace the lazily-created Secrets Manager client and SDK
+ * module so unit tests never touch the network or AWS credentials.
+ * Pass (null, null) to restore the default lazy behaviour.
+ * Not used in production code paths.
+ */
+function _setSecretsManagerForTests(client, sdk) {
+  _smClient = client || null;
+  _smSdk = sdk || null;
+}
+
 // In-memory cache for secrets during session (cleared on SIGTERM)
 const _secretsCache = new Map();
 const MAX_SECRETS_PER_USER = 10;
@@ -1257,7 +1268,11 @@ async function executeRetrieveApiKey(args, namespace) {
   // Try Secrets Manager first (secure mode)
   try {
     const smResult = await executeManageSecret({ action: "get", key_name }, namespace);
-    if (!smResult.startsWith("Error:")) {
+    // executeManageSecret reports SDK failures (access denied, no credentials,
+    // network) as "Error retrieving secret: ..." — treat those as a miss too,
+    // otherwise the error text is returned to the model as the key value.
+    const smFailed = smResult.startsWith("Error:") || smResult.startsWith("Error retrieving secret:");
+    if (!smFailed) {
       return smResult;
     }
   } catch {
@@ -1536,4 +1551,5 @@ module.exports = {
   executeMigrateApiKey,
   SM_REQUEST_TIMEOUT_MS,
   _guardedLookup: guardedLookup,
+  _setSecretsManagerForTests,
 };
