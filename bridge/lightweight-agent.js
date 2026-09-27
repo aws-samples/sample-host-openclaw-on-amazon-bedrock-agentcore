@@ -14,6 +14,8 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const https = require("https");
+const net = require("net");
+const dns = require("dns");
 const { execFile, spawn } = require("child_process");
 
 const PROXY_PORT = 18790;
@@ -493,6 +495,37 @@ const BLOCKED_IP_PATTERNS = [
   /^::ffff:0\./i, // IPv4-mapped 0.0.0.0/8
 ];
 
+// Address-level blocklist, checked on every address a hostname resolves to
+// at connect time (see guardedLookup) and on IP-literal hostnames.
+// IPv4 ranges are also added in IPv4-mapped IPv6 form (::ffff:a.b.c.d).
+const BLOCKED_IPV4_SUBNETS = [
+  ["0.0.0.0", 8], // "this network"
+  ["10.0.0.0", 8], // private
+  ["100.64.0.0", 10], // RFC 6598 shared address space
+  ["127.0.0.0", 8], // loopback
+  ["169.254.0.0", 16], // link-local (AWS IMDS)
+  ["172.16.0.0", 12], // private
+  ["192.168.0.0", 16], // private
+];
+const BLOCKED_ADDRESSES = new net.BlockList();
+for (const [addr, prefix] of BLOCKED_IPV4_SUBNETS) {
+  BLOCKED_ADDRESSES.addSubnet(addr, prefix, "ipv4");
+  BLOCKED_ADDRESSES.addSubnet(`::ffff:${addr}`, 96 + prefix, "ipv6");
+}
+BLOCKED_ADDRESSES.addAddress("::", "ipv6"); // unspecified
+BLOCKED_ADDRESSES.addAddress("::1", "ipv6"); // loopback
+BLOCKED_ADDRESSES.addSubnet("64:ff9b::", 96, "ipv6"); // NAT64 (embeds IPv4)
+BLOCKED_ADDRESSES.addSubnet("fc00::", 7, "ipv6"); // unique local (incl. AWS IMDS IPv6)
+BLOCKED_ADDRESSES.addSubnet("fe80::", 10, "ipv6"); // link-local
+
+/** True when `address` (an IP string) falls in a blocked range. */
+function isBlockedAddress(address) {
+  const family = net.isIP(address);
+  if (family === 4) return BLOCKED_ADDRESSES.check(address, "ipv4");
+  if (family === 6) return BLOCKED_ADDRESSES.check(address, "ipv6");
+  return false;
+}
+
 const BLOCKED_HOSTNAMES = new Set([
   "localhost",
   "metadata.google.internal",
@@ -530,6 +563,13 @@ function validateUrlSafety(urlStr) {
     if (pattern.test(hostname)) {
       return `Blocked IP address: ${hostname}`;
     }
+  }
+
+  // IP literals never go through DNS lookup, so check them here.
+  // URL keeps IPv6 literals bracketed and normalized (e.g. [::ffff:7f00:1]).
+  const literal = hostname.replace(/^\[|\]$/g, "");
+  if (isBlockedAddress(literal)) {
+    return `Blocked IP address: ${hostname}`;
   }
 
   return null; // safe
@@ -630,31 +670,54 @@ const MAX_REDIRECTS = 3;
 const MAX_SEARCH_QUERY_LENGTH = 500;
 
 /**
- * Resolve hostname and validate resolved IPs against SSRF blocklist.
- * Mitigates DNS rebinding attacks by checking the resolved IP, not just the hostname.
- * Returns null if safe, or an error message if blocked.
+ * DNS lookup used for the actual connection. It resolves the hostname once
+ * and refuses to connect if ANY resolved address is blocked. Because the
+ * socket connects to exactly the addresses validated here, a DNS-rebinding
+ * name (TTL 0, public IP for a pre-check, private IP at connect) cannot
+ * slip through. A separate pre-connect lookup would not help: http.get
+ * resolves the name again, and that second answer is the one it uses.
+ * Signature matches dns.lookup, including the { all: true } form used by
+ * net's autoSelectFamily.
  */
-async function validateResolvedIps(hostname) {
-  const dns = require("dns").promises;
-  try {
-    const addresses = await dns.lookup(hostname, { all: true });
+function guardedLookup(hostname, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  const opts = typeof options === "number" ? { family: options } : { ...options };
+  dns.lookup(hostname, { ...opts, all: true }, (err, addresses) => {
+    if (err) {
+      callback(err);
+      return;
+    }
     for (const addr of addresses) {
-      for (const pattern of BLOCKED_IP_PATTERNS) {
-        if (pattern.test(addr.address)) {
-          return `Blocked resolved IP: ${addr.address} for hostname ${hostname}`;
-        }
+      if (isBlockedAddress(addr.address)) {
+        const blocked = new Error(`Blocked resolved IP: ${addr.address} for hostname ${hostname}`);
+        blocked.code = "EBLOCKEDADDR";
+        callback(blocked);
+        return;
       }
     }
-  } catch (err) {
-    return `DNS resolution failed: ${err.message}`;
-  }
-  return null; // safe
+    if (addresses.length === 0) {
+      const none = new Error(`DNS resolution failed: no addresses for ${hostname}`);
+      none.code = "ENOTFOUND";
+      callback(none);
+      return;
+    }
+    if (opts.all) {
+      callback(null, addresses);
+    } else {
+      callback(null, addresses[0].address, addresses[0].family);
+    }
+  });
 }
 
 /**
  * Fetch a URL and return its content as plain text.
- * Validates URL safety (SSRF prevention including DNS rebinding),
- * enforces timeout, size limits, and redirect depth.
+ * Validates URL safety: hostname and IP-literal checks up front, and every
+ * resolved address at connect time via guardedLookup (blocks DNS rebinding,
+ * including on redirect targets). Enforces timeout, size limits, and
+ * redirect depth.
  */
 async function executeWebFetch(url, depth = 0) {
   if (depth > MAX_REDIRECTS) {
@@ -666,19 +729,13 @@ async function executeWebFetch(url, depth = 0) {
     return `Error: ${validationError}`;
   }
 
-  // DNS rebinding mitigation: resolve and validate IPs before connecting
-  const parsed = new URL(url);
-  const ipError = await validateResolvedIps(parsed.hostname);
-  if (ipError) {
-    return `Error: ${ipError}`;
-  }
-
   return new Promise((resolve) => {
     const protocol = url.startsWith("https") ? https : http;
     const req = protocol.get(
       url,
       {
         timeout: WEB_FETCH_TIMEOUT_MS,
+        lookup: guardedLookup, // validates every address actually connected to
         headers: {
           "User-Agent":
             "Mozilla/5.0 (compatible; OpenClawBot/1.0; +https://github.com/aws-samples)",
@@ -698,16 +755,10 @@ async function executeWebFetch(url, depth = 0) {
             resolve(`Error: Redirect blocked — ${redirectError}`);
             return;
           }
-          // DNS rebinding mitigation: validate resolved IPs on redirect targets
-          const redirectParsed = new URL(redirectUrl);
+          // The redirect hop goes through executeWebFetch again, so its
+          // resolved addresses are checked by guardedLookup at connect time.
           res.resume();
-          validateResolvedIps(redirectParsed.hostname).then((ipError) => {
-            if (ipError) {
-              resolve(`Error: Redirect blocked — ${ipError}`);
-              return;
-            }
-            resolve(executeWebFetch(redirectUrl, depth + 1));
-          });
+          resolve(executeWebFetch(redirectUrl, depth + 1));
           return;
         }
 
@@ -1484,4 +1535,5 @@ module.exports = {
   executeRetrieveApiKey,
   executeMigrateApiKey,
   SM_REQUEST_TIMEOUT_MS,
+  _guardedLookup: guardedLookup,
 };
