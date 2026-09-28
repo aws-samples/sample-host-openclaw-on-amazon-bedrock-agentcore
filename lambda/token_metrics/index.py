@@ -32,6 +32,9 @@ table = dynamodb.Table(TABLE_NAME)
 cloudwatch = boto3.client("cloudwatch")
 
 # --- Model pricing (per 1M tokens) ---
+# Keys are matched as substrings of the model ID, first match wins, so a
+# prefixed key (e.g. "global.") must come before its unprefixed base key.
+# The base key also covers geo profiles (au., us., eu., apac.).
 MODEL_PRICING = {
     # Amazon Nova
     "amazon.nova-2-lite-v1:0": {"input": 0.30, "output": 2.50},
@@ -45,6 +48,10 @@ MODEL_PRICING = {
     "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3.00, "output": 15.00},
     "anthropic.claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "anthropic.claude-opus-4-6": {"input": 15.00, "output": 75.00},
+    # Claude Opus 5.5: global cross-Region profile is cheaper than geo /
+    # in-Region (AWS Price List, AmazonBedrockFoundationModels, 2026-09-28).
+    "global.anthropic.claude-opus-5-5": {"input": 4.00, "output": 20.00},
+    "anthropic.claude-opus-5-5": {"input": 4.40, "output": 22.00},
     "minimax.minimax-m2": {"input": 1.00, "output": 5.00},
 }
 
