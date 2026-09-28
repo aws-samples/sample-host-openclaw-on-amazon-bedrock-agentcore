@@ -231,5 +231,14 @@ class SecurityStack(Stack):
                     reason="Advanced security mode (WAF integration) adds cost with no benefit "
                     "for programmatic-only service identities. All auth is admin-initiated.",
                 ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-COG8",
+                    reason="The Plus feature plan only adds threat protection (compromised-"
+                    "credential and adaptive-auth checks on sign-in). This pool has no "
+                    "user-facing sign-in: self sign-up is off, and the only client is the "
+                    "bridge, which provisions users and authenticates them via "
+                    "ADMIN_USER_PASSWORD_AUTH with HMAC-derived passwords. Same rationale "
+                    "as COG3, which Plus-tier threat protection replaces.",
+                ),
             ],
         )
