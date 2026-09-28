@@ -56,18 +56,18 @@ Messages from a channel reach API Gateway and the Router Lambda, which validates
 | API Gateway HTTP API | Routes `POST /webhook/{telegram,slack,feishu}` and `GET /health`; throttled (burst 50, rate 100) | `stacks/router_stack.py` |
 | Router Lambda | Webhook validation, identity resolution, image upload, `InvokeAgentRuntime`, reply delivery, typing/progress notices | `lambda/router/index.py` |
 | DynamoDB `openclaw-identity` | Users, channel bindings, sessions, allowlist, link codes, `CRON#` records | `stacks/router_stack.py` |
-| Contract server | AgentCore HTTP contract on port 8080 (`/ping`, `/invocations`); per-user init, state layout, gateway spawn, WebSocket bridge, SIGTERM snapshot | `bridge/agentcore-contract.js` |
+| Contract server | AgentCore HTTP contract on port 8080 (`/ping`, `/invocations`); per-user init, state layout, gateway spawn, WebSocket bridge, best-effort SIGTERM flush | `bridge/agentcore-contract.js` |
 | Lightweight agent | Warm-up agent with 17 tools (web, S3 files, schedules, ClawHub, API keys) used until the gateway is ready | `bridge/lightweight-agent.js` |
 | OpenClaw gateway | `openclaw@2026.9.5` on `node:24-slim`, gateway protocol v4, `gateway-client`/`backend` identity, 5 pinned ClawHub skills + 4 custom skills from `/skills` | `bridge/Dockerfile`, `bridge/skills/` |
 | Bedrock proxy | OpenAI-compatible endpoint on port 18790 → Bedrock `ConverseStream`; multimodal images, sub-agent model routing, per-user Cognito JWT | `bridge/agentcore-proxy.js` |
 | Local disk `~/.openclaw` | Authoritative OpenClaw state (SQLite sessions + workspace); the NFS mount cannot hold SQLite locks or hard links | `bridge/state-storage.js` |
 | Session storage `/mnt/workspace` | AgentCore managed session storage; mirror of the state dir, restored before the gateway spawns | `bridge/state-storage.js`, `scripts/deploy.sh` |
-| S3 user-files bucket | Per-user files, image uploads, screenshots, and `~/.openclaw` snapshots (SQLite via online backup) | `stacks/agentcore_stack.py`, `bridge/workspace-sync.js` |
+| S3 user-files bucket | Per-user files, image uploads, screenshots, and `~/.openclaw` snapshots (SQLite via online backup). Versioned; noncurrent versions expire after 30 days (the newest 3 per key are kept) and incomplete multipart uploads are aborted after 7 days | `stacks/agentcore_stack.py`, `bridge/workspace-sync.js` |
 | STS scoped credentials | Execution role re-assumed with a session policy limiting S3, DynamoDB, Secrets Manager and Scheduler to the user's namespace | `bridge/scoped-credentials.js` |
 | Cognito User Pool | Per-user Cognito user with an HMAC-derived password; the proxy acquires and caches an ID token per user. With `enable_gateway: true` the contract server mints the same user's **access** token as the bearer for the Gateway MCP server | `stacks/security_stack.py`, `bridge/agentcore-proxy.js`, `bridge/cognito-token.js` |
 | Secrets Manager | `openclaw/gateway-token`, `openclaw/channels/*`, `openclaw/webhook-secret`, `openclaw/cognito-password-secret`, per-user `openclaw/user/{ns}/*` | `stacks/security_stack.py`, `bridge/skills/api-keys/` |
 | KMS CMK | Encrypts S3, DynamoDB, SNS and Secrets Manager | `stacks/security_stack.py` |
-| EventBridge Scheduler + Cron Lambda | Schedule group `openclaw-cron`; `openclaw-cron-executor` warms the session, sends the `cron` action and posts the reply to Telegram/Slack | `stacks/cron_stack.py`, `lambda/cron/index.py`, `bridge/skills/eventbridge-cron/` |
+| EventBridge Scheduler + Cron Lambda | Schedule group `openclaw-cron`; `openclaw-cron-executor` warms the session, sends the `cron` action and posts the reply to Telegram, Slack or Feishu | `stacks/cron_stack.py`, `lambda/cron/index.py`, `bridge/skills/eventbridge-cron/` |
 | Token monitoring | Bedrock invocation logs → CloudWatch subscription → `token_metrics` Lambda → DynamoDB (3 GSIs) + custom metrics, dashboards, budget alarms, SNS | `stacks/observability_stack.py`, `stacks/token_monitoring_stack.py`, `lambda/token_metrics/index.py` |
 | Bedrock Guardrails (optional) | `CfnGuardrail` + version; see [Security](#security) | `stacks/guardrails_stack.py` |
 | AgentCore Gateway (optional, prototype) | `enable_gateway: false` by default. When on: MCP Gateway `openclaw-tools` with a Cognito JWT authorizer, a REQUEST interceptor Lambda and two Lambda targets (`user-files`, `schedules`) that serve the file and schedule tools as typed MCP tools; see [AgentCore Gateway MCP tools](#agentcore-gateway-mcp-tools-prototype) | `stacks/gateway_stack.py`, `lambda/gateway_tools/`, `bridge/gateway-mcp.js` |
@@ -103,7 +103,7 @@ See [docs/architecture-detailed.md](docs/architecture-detailed.md) for sequence 
 
 ### Why S3 Workspace Sync?
 
-AgentCore microVMs are ephemeral — they're destroyed when idle. OpenClaw stores conversation history (per-agent SQLite databases since 2.0), user profiles, and agent configuration in the `~/.openclaw/` directory. **S3-backed workspace sync** restores this directory on session start, saves it periodically (every 5 min, or 30 min when session storage is the primary store), and performs a final save on shutdown. Each `*.sqlite` file is uploaded as a consistent point-in-time snapshot (node:sqlite online backup), never as raw WAL-mode bytes. Each user's workspace is isolated under a unique S3 prefix derived from their channel identity.
+AgentCore microVMs are ephemeral — they're destroyed when idle. OpenClaw stores conversation history (per-agent SQLite databases since 2.0), user profiles, and agent configuration in the `~/.openclaw/` directory. **S3-backed workspace sync** restores this directory on session start and then uploads each changed file a few seconds after it changes (debounced 5 s, at most 30 s after the first change; when only SQLite databases changed, their snapshots go up at most every 5 min, or every 10 min for databases over 10 MB). A full save also runs every 5 min (30 min when session storage is the primary store). AgentCore gives no reliable shutdown window (on staging the container was gone well under 5 s after `SIGTERM`, and idle stops sent no `SIGTERM` at all), so the `SIGTERM` save is best effort, not the guarantee. Each `*.sqlite` file is uploaded as a consistent point-in-time snapshot (node:sqlite online backup), never as raw WAL-mode bytes; a snapshot over 10 MB is streamed gzip-compressed as an S3 multipart upload, and a database over 1 GiB (`WORKSPACE_SYNC_MAX_SQLITE_BYTES`) is skipped with a log line. The pre-2.0 session import therefore runs once: its receipt is backed up to S3 and later cold starts skip it. Each user's workspace is isolated under a unique S3 prefix derived from their channel identity.
 
 This lets the system behave like a persistent server (continuous conversation history) while benefiting from serverless economics (no idle compute costs).
 
@@ -127,7 +127,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **CloudTrail**: Optional dedicated trail (`enable_cloudtrail` in cdk.json). Off by default — most AWS accounts already have an organization or account-level trail. Enabling adds a dedicated S3 bucket + trail for this project's audit logs
 - **Least-privilege IAM**: Tightly scoped permissions per component
 - **Bedrock Guardrails**: Content filtering on every Bedrock API call — content filters (hate, violence, prompt attacks), topic denial (6 categories), PII redaction, word filters, and custom regex for credential patterns. Opt-out via `enable_guardrails: false` in `cdk.json`
-- **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
+- **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; OpenClaw's channel-delivery tools (`message`, `conversations_send`, `conversations_turn`) denied because OpenClaw has no bot tokens and replies are delivered by the Router/Cron Lambda; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
 See [docs/security.md](docs/security.md) for the complete security architecture.
@@ -319,11 +319,16 @@ openclaw-on-agentcore/
     Dockerfile                    # Container image (node:24-slim, ARM64, pinned openclaw@2026.9.5 + clawhub@0.23.3, 5 owner-pinned ClawHub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
+    openclaw-tool-deny.test.js    # openclaw.json tools.deny covers the channel-delivery tools (node:test, 7 tests)
+    read-body.js                  # Reads a request body as Buffers and decodes UTF-8 once (contract server keeps its 1 MB / 413 cap)
+    read-body.test.js             # Request body decoding + size cap tests (node:test, 8 tests)
+    legacy-session-import.js      # Pre-2.0 sessions.json import receipts (import runs once)
+    legacy-session-import.test.js # Import receipt tests (node:test, 23 tests)
     gateway-mcp.js                # mcp.servers.agentcore config + bearer refresh (only when AGENTCORE_GATEWAY_URL is set)
     gateway-mcp.test.js           # Gateway MCP config/refresh + Cognito token provider tests (node:test, 12 tests)
     cognito-token.js              # Per-user Cognito ID/access token provider shared by proxy and contract server
     lightweight-agent.js          # Warm-up agent shim (17 tools: web, s3-user-files, eventbridge-cron, clawhub-manage, api-keys)
-    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 111 tests)
+    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 125 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     proxy-identity.test.js        # Proxy identity resolution tests (node:test)
@@ -331,8 +336,8 @@ openclaw-on-agentcore/
     browser-lifecycle.test.js     # Browser session lifecycle tests (node:test)
     content-extraction.test.js    # Content block extraction tests (node:test)
     subagent-routing.test.js      # Subagent model routing + detection tests (node:test)
-    workspace-sync.js             # ~/.openclaw/ S3 sync (restore/save/periodic, SQLite snapshots)
-    workspace-sync.test.js        # Workspace sync tests (node:test, 48 tests)
+    workspace-sync.js             # ~/.openclaw/ S3 sync (restore, change-driven + periodic saves, SQLite snapshots, gzip multipart for large ones)
+    workspace-sync.test.js        # Workspace sync tests (node:test, 106 tests)
     state-storage.js              # Local state dir + session-storage mirror/restore (SQLite + workspace)
     state-storage.test.js         # State storage layout tests (node:test, 34 tests)
     scoped-credentials.js         # Per-user STS session-scoped S3 credentials
@@ -345,18 +350,22 @@ openclaw-on-agentcore/
       eventbridge-cron/           # Cron scheduling skill (EventBridge Scheduler)
       clawhub-manage/             # ClawHub skill installer (install/uninstall/list)
       api-keys/                   # Dual-mode API key management (native file + Secrets Manager)
+        migrate.test.js           # migrate.js/native.js key-loss tests with a stubbed Secrets Manager (node:test, 9 tests)
       agentcore-browser/          # Optional headless browser skill (navigate/screenshot/interact)
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py                    # Webhook router (Telegram + Slack + Feishu, image uploads)
     router/test_image_upload.py        # Image upload unit tests (pytest)
     router/test_content_extraction.py  # Content block extraction tests (pytest)
+    router/test_telegram_chunking.py   # Telegram UTF-16 chunking + retry tests (pytest)
     router/test_markdown_html.py       # Markdown-to-HTML conversion tests (pytest)
     router/test_slack.py               # Slack handler tests (pytest)
     router/test_feishu.py              # Feishu handler tests (pytest)
     router/test_screenshot_handling.py # Screenshot marker delivery tests (pytest)
     router/test_formatting_integration.py # Formatting integration tests (pytest)
-    cron/index.py                      # Cron executor (warmup, invoke, deliver)
+    cron/index.py                      # Cron executor (warmup, invoke, deliver to Telegram/Slack/Feishu)
+    cron/test_telegram_chunking.py     # Telegram UTF-16 chunking + retry tests (pytest)
+    cron/test_feishu_delivery.py       # Feishu delivery routing + tenant token tests (pytest)
     gateway_tools/                     # Prototype Gateway MCP targets (Node 22 Lambdas)
       tool-schemas.json                # MCP tool schemas consumed by CDK and the tests
       interceptor/index.js             # REQUEST interceptor: copies the bearer JWT into __caller_token
@@ -377,6 +386,7 @@ openclaw-on-agentcore/
   tests/
     test_agentcore_exec.py        # Unit tests for scripts/agentcore-exec.py (mocked boto3, no AWS)
     test_guardrail_eval.py        # Unit tests for scripts/guardrail-eval.py (stubbed ApplyGuardrail, no AWS)
+    test_state_bucket_lifecycle_synth.py # User-files bucket lifecycle rules synth test (no AWS)
     test_gateway_stack_synth.py   # OpenClawGateway synth tests: flag off = unchanged templates, flag on = stack + IAM + cdk-nag (10 tests, no AWS)
     e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
       config.py                   # AWS config auto-discovery (CF outputs, Secrets Manager)
@@ -440,6 +450,8 @@ All tunable parameters are in `cdk.json`:
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
 | `image_version` | (see `cdk.json`) | Bridge container version tag. Bump to force container redeploy |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
+| `user_files_noncurrent_days` | `30` | Days after which noncurrent S3 object versions expire (CDK context key, not set in `cdk.json`; add it there or pass `-c`) |
+| `user_files_noncurrent_keep` | `3` | Newest noncurrent versions always kept per key (CDK context key, not set in `cdk.json`; add it there or pass `-c`) |
 | `cron_lambda_timeout_seconds` | `900` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
@@ -556,7 +568,7 @@ Feishu (飞书 / Lark) uses the Events API with the Router Lambda as the webhook
    ./scripts/manage-allowlist.sh add feishu:YOUR_OPEN_ID
    ```
 
-Scheduled-task delivery (see [Scheduled Tasks](#scheduled-tasks-cron-jobs)) currently posts to Telegram and Slack only; `lambda/cron/index.py` has a Feishu sender but `deliver_response` does not route to it. Design notes: [docs/design-feishu-channel.md](docs/design-feishu-channel.md).
+Scheduled-task replies (see [Scheduled Tasks](#scheduled-tasks-cron-jobs)) are delivered to Feishu users too: `lambda/cron/index.py` routes `feishu` targets to the Feishu sender, using the same `openclaw/channels/feishu` app credentials and a cached tenant access token. Design notes: [docs/design-feishu-channel.md](docs/design-feishu-channel.md).
 
 ## How It Works
 
@@ -572,11 +584,11 @@ Each user gets their own AgentCore microVM. When a user sends a message:
    - Restores `~/.openclaw/` from session storage, or from S3 when the mount is empty (awaited, bounded)
    - Starts credential refresh timer (45 min interval)
    - Waits for proxy only (~5s), then the **lightweight agent** handles the message immediately
-3. **Lightweight agent** (warm-up phase; on us-west-2 staging the proxy was ready 165 ms after spawn and the first warm-up reply reached the E2E harness 23 s after the webhook) runs an agentic loop with 17 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), EventBridge cron scheduling (create/list/update/delete), ClawHub skill management (install/uninstall/list), and API key management (native CRUD, Secrets Manager CRUD, unified retrieval, migration). Web tools include SSRF prevention (IP blocklists, DNS rebinding mitigation). All responses include a deterministic warm-up footer
+3. **Lightweight agent** (warm-up phase; on us-west-2 staging the proxy was ready 165 ms after spawn and the first warm-up reply reached the E2E harness 23 s after the webhook) runs an agentic loop with 17 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), EventBridge cron scheduling (create/list/update/delete), ClawHub skill management (install/uninstall/list), and API key management (native CRUD, Secrets Manager CRUD, unified retrieval, migration). Web tools include SSRF prevention: `web_fetch` checks every address a hostname resolves to at connect time (and IP-literal hosts), and refuses the request if any is private, loopback, link-local or otherwise blocked, so a DNS-rebinding name cannot slip through. All responses include a deterministic warm-up footer
 4. **WebSocket bridge** (after OpenClaw ready; the 2.0 gateway logged `ready` 2.6 s after spawn on us-west-2 staging, but spawn itself waits for the S3 workspace restore, bounded by `WORKSPACE_RESTORE_WAIT_MS`, so the E2E harness measured 70 s from webhook to the first full-OpenClaw reply) takes over — messages route to OpenClaw which provides full tool profile, 5 ClawHub skills, and sub-agent support. Responses no longer have the warm-up footer
-5. **Router Lambda** sends the response back to the channel API (Telegram, Slack or Feishu). While waiting, it sends typing indicators (Telegram) and a one-time progress message after 30s (Telegram and Slack) for long-running requests
+5. **Router Lambda** sends the response back to the channel API (Telegram, Slack or Feishu). Telegram replies are split into chunks of at most 4,000 UTF-16 code units (Telegram's 4,096 limit counts emoji as 2), cut at paragraph, line or word boundaries and outside code fences where possible; a chunk Telegram rejects is re-sent once in half-size pieces. While waiting, it sends typing indicators (Telegram) and a one-time progress message after 30s (Telegram and Slack) for long-running requests
 
-When the session idles (default 30 min), AgentCore terminates the microVM. Before shutdown, the SIGTERM handler stops the gateway, snapshots `~/.openclaw/` (SQLite included) onto session storage and saves it to S3. The next message creates a fresh microVM and restores the state dir from session storage (or S3 when the mount is empty).
+When the session idles (default 30 min), AgentCore terminates the microVM. Changed state has normally reached S3 by then (see [Why S3 Workspace Sync?](#why-s3-workspace-sync)). If a `SIGTERM` arrives, the handler uploads pending changes, stops the gateway, snapshots `~/.openclaw/` (SQLite included) onto session storage and runs a full S3 save, all best effort. The next message creates a fresh microVM and restores the state dir from session storage (or S3 when the mount is empty).
 
 ### Image Uploads
 
@@ -637,7 +649,7 @@ To make the bot open to everyone, set `registration_open: true` in `cdk.json` an
 
 ### Scheduled Tasks (Cron Jobs)
 
-The agent can create, manage, and execute **recurring scheduled tasks** using Amazon EventBridge Scheduler. Schedules persist across sessions and fire even when the user is not chatting — the response is delivered to the user's Telegram or Slack channel automatically (Feishu delivery is not wired in the cron executor yet).
+The agent can create, manage, and execute **recurring scheduled tasks** using Amazon EventBridge Scheduler. Schedules persist across sessions and fire even when the user is not chatting — the response is delivered to the user's Telegram, Slack or Feishu channel automatically.
 
 **Just ask the bot in natural language.** Examples:
 
@@ -660,7 +672,7 @@ The bot will ask for your **timezone** (e.g., `Australia/Sydney`, `America/New_Y
 2. At the scheduled time, EventBridge invokes the Cron executor Lambda (`openclaw-cron-executor`)
 3. The Lambda warms up the user's AgentCore session (or waits for it to initialize if cold)
 4. The Lambda sends the scheduled message to the agent via AgentCore
-5. The agent processes the message and the Lambda delivers the response to the user's chat channel
+5. The agent processes the message and the Lambda delivers the response to the user's chat channel (Telegram responses are split by UTF-16 length like the Router's, see [Per-User Sessions](#per-user-sessions))
 
 Each user's schedules are isolated — no cross-user access. Schedule metadata is stored in the DynamoDB identity table alongside user profiles and session data.
 
@@ -693,6 +705,8 @@ The agent also **proactively detects API keys** — if you paste something that 
 - Per-user isolation via STS session-scoped credentials (each user can only access `openclaw/user/{their_namespace}/*`)
 - Max 10 secrets per user in Secrets Manager
 - Key names validated (alphanumeric, max 64 chars)
+- Migration never moves an error in place of a key: a Secrets Manager read failure is returned as an error (not written to native storage), a failed Secrets Manager write keeps the native key, and an unreadable or corrupt native key file is left untouched
+- Moving a key from Secrets Manager to native deletes the secret with a 7-day recovery window (no force delete), and only after the native write succeeded. Moving the same key name back to Secrets Manager within those 7 days fails (the secret is still scheduled for deletion) and the key stays native
 - Available immediately during warm-up phase — no need to wait for full OpenClaw startup
 
 ### Browser Support (Optional)
@@ -739,7 +753,7 @@ Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as p
 5. **Warm-up phase** (until the gateway is ready): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, and clawhub-manage tools — users can manage files, schedules, and install skills immediately)
 6. **Handoff**: OpenClaw becomes ready (2.6 s after spawn on us-west-2 staging; ~70 s after the first webhook once the bounded S3 restore wait is included), all subsequent messages route via WebSocket bridge
 7. **After handoff**: Full OpenClaw features — built-in web tools (`web_search`, `web_fetch`), 5 ClawHub skills (jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer), sub-agent support, session management
-8. **SIGTERM**: Stop the gateway, snapshot `~/.openclaw/` onto session storage, save it to S3, kill child processes, exit
+8. **SIGTERM** (best effort; AgentCore may stop the container without one): Upload pending changes, stop the gateway, snapshot `~/.openclaw/` onto session storage, run a full S3 save, kill child processes, exit
 
 ### Message Flow
 
@@ -749,7 +763,7 @@ Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as p
 4. Lambda calls `InvokeAgentRuntime` with per-user session ID
 5. Contract server triggers lazy init (first message) or bridges to OpenClaw directly
 6. Proxy converts to Bedrock ConverseStream API call (multimodal if images present)
-7. Response streams back → Lambda recursively unwraps nested content blocks (from subagent responses), converts markdown to Telegram HTML, sends to channel API
+7. Response streams back → Lambda recursively unwraps nested content blocks (from subagent responses), converts markdown to Telegram HTML, sends to channel API (long Telegram replies split into chunks under the 4,096-unit limit)
 
 ### Tools & Skills
 
@@ -869,7 +883,7 @@ cdk deploy OpenClawAgentCore --require-approval never
 ### Run tests
 
 ```bash
-cd bridge && node --test *.test.js                     # all bridge unit tests (412 tests, Node 24)
+cd bridge && node --test *.test.js                     # all bridge unit tests (539 tests, Node 24)
 cd bridge && node --test proxy-identity.test.js       # identity + workspace tests
 cd bridge && node --test image-support.test.js         # image upload + multimodal tests
 cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
@@ -878,6 +892,9 @@ cd bridge && node --test content-extraction.test.js    # recursive content block
 cd bridge && node --test scoped-credentials.test.js    # per-user STS credential scoping tests
 cd bridge && node --test workspace-sync.test.js        # workspace sync + SQLite snapshot tests
 cd bridge && node --test state-storage.test.js         # local state dir / session-storage mirror + restore tests
+cd bridge && node --test read-body.test.js             # UTF-8 request body decoding + size cap (8 tests)
+cd bridge && node --test openclaw-tool-deny.test.js    # channel-delivery tools denied in openclaw.json (7 tests)
+cd bridge/skills/api-keys && node --test migrate.test.js # api-keys migrate.js/native.js key-loss tests (9 tests)
 cd bridge && node --test gateway-mcp.test.js           # Gateway MCP config, bearer refresh, Cognito token provider (12 tests)
 cd bridge && node --test runtime-skills.test.js        # runtime skill manifest + cold-start reinstall (38 tests)
 node --test lambda/gateway_tools/*.test.js             # Gateway tool Lambdas: JWT verification, namespace scoping, interceptor (31 tests, Node 24)
@@ -886,8 +903,11 @@ cd lambda/router && python -m pytest test_image_upload.py -v        # image uplo
 cd lambda/router && python -m pytest test_content_extraction.py -v  # content block extraction tests
 cd lambda/router && python -m pytest test_markdown_html.py -v       # markdown-to-HTML conversion tests
 cd lambda/router && python -m pytest test_slack.py test_feishu.py -v # Slack + Feishu handler tests
+cd lambda/router && python -m pytest test_telegram_chunking.py -v   # Telegram UTF-16 chunking (router)
+cd lambda/cron && python -m pytest test_telegram_chunking.py test_feishu_delivery.py -v # cron Telegram chunking + Feishu delivery
 python -m pytest tests/test_agentcore_exec.py -v                     # operator CLI tests (mocked boto3)
 python -m pytest tests/test_guardrail_eval.py -v                     # guardrail eval script tests (stubbed ApplyGuardrail)
+python -m pytest tests/test_state_bucket_lifecycle_synth.py -v       # user-files bucket lifecycle rules (synth, no AWS)
 python -m pytest tests/test_gateway_stack_synth.py -v                # OpenClawGateway synth: flag off leaves the 8 templates unchanged, flag on adds the stack (10 tests, no AWS)
 
 # E2E tests (requires deployed stack + E2E_TELEGRAM_CHAT_ID/E2E_TELEGRAM_USER_ID env vars)
