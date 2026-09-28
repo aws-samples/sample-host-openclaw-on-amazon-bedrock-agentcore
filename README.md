@@ -378,7 +378,7 @@ Node.js's Happy Eyeballs (`autoSelectFamily`, Node 20+) tries both IPv4 and IPv6
 ### Deployment gotchas
 
 - **ARM64 required**: AgentCore Runtime runs ARM64 containers. Build with `--platform linux/arm64`.
-- **Push image after CDK deploy**: The CDK AgentCore stack creates the ECR repository. Do **not** manually create it beforehand (causes a `Resource already exists` error). Deploy CDK first, then push the image. AgentCore only pulls the image when a user session starts, not at deploy time.
+- **Push image after CDK deploy**: The AgentCore Starter Toolkit (`agentcore deploy`, Phase 2 of `scripts/deploy.sh`) creates the ECR repository; no CDK stack does. Do **not** manually create it beforehand (causes a `Resource already exists` error). Deploy CDK first, then push the image. AgentCore only pulls the image when a user session starts, not at deploy time.
 - **AgentCore resource names**: Must match `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` — use underscores, not hyphens.
 - **VPC endpoints**: The `bedrock-agentcore-runtime` VPC endpoint is not created by `stacks/vpc_stack.py` (the service is not available in every region). Runtime API calls from the Lambdas go out via NAT; the Bedrock Runtime endpoint is created with private DNS disabled so `global.*` inference profiles can route cross-region.
 - **CDK RetentionDays**: `logs.RetentionDays` is an enum, not constructable from int. Use the helper in `stacks/__init__.py`.
