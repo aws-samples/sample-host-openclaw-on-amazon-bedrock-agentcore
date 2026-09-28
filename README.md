@@ -126,7 +126,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Encryption**: All data encrypted at rest with customer-managed KMS key (S3, DynamoDB, SNS, Secrets Manager) and in transit (TLS)
 - **CloudTrail**: Optional dedicated trail (`enable_cloudtrail` in cdk.json). Off by default — most AWS accounts already have an organization or account-level trail. Enabling adds a dedicated S3 bucket + trail for this project's audit logs
 - **Least-privilege IAM**: Tightly scoped permissions per component
-- **Bedrock Guardrails**: Content filtering on every Bedrock API call — content filters (hate, violence, prompt attacks), topic denial (6 categories), PII redaction, word filters, and custom regex for credential patterns. Opt-out via `enable_guardrails: false` in `cdk.json`
+- **Bedrock Guardrails**: Content filtering on every Bedrock API call — content filters (hate, violence, prompt attacks), topic denial (6 categories), PII redaction, word filters, and custom regex for credential patterns. Opt-out via `enable_guardrails: false` in `cdk.json`. Known limitations (ordinary scheduled-task prompts blocked as prompt attacks, version pinning): see [Guardrails known limitations](#guardrails-known-limitations)
 - **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; OpenClaw's channel-delivery tools (`message`, `conversations_send`, `conversations_turn`) denied because OpenClaw has no bot tokens and replies are delivered by the Router/Cron Lambda; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
@@ -393,7 +393,7 @@ openclaw-on-agentcore/
       webhook.py                  # Build + POST Telegram webhook payloads
       session.py                  # DynamoDB session/user reset + AgentCore session stop
       log_tailer.py               # CloudWatch log tailing with pattern matching
-      bot_test.py                 # CLI entrypoint + pytest test classes (46 tests, 15 classes)
+      bot_test.py                 # CLI entrypoint + pytest test classes (50 tests, 15 classes)
       conftest.py                 # pytest fixtures, conversation scenarios
       container_logs.py           # Container/Lambda log helpers for the Gateway E2E tests
       test_gateway_tools.py       # Gateway MCP tools E2E (4 tests, `-m gateway`; skipped when the stack is not deployed)
@@ -457,7 +457,7 @@ All tunable parameters are in `cdk.json`:
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. Set `false` to disable (reduces safety but saves cost) |
-| `guardrails_content_filter_level` | `HIGH` | Content filter strength for all categories: `LOW`, `MEDIUM`, or `HIGH` |
+| `guardrails_content_filter_level` | `HIGH` | Not read by the stack: filter strengths are set per category in `stacks/guardrails_stack.py` (`PROMPT_ATTACK` input `HIGH`, `INSULTS` input `MEDIUM`, the rest `HIGH`) |
 | `guardrails_pii_action` | `ANONYMIZE` | PII handling: `ANONYMIZE` (redact) or `BLOCK` (reject). Credit cards always BLOCK regardless |
 | `enable_browser` | `true` | Deploy an AgentCore Browser (`CfnBrowserCustom`) and pass its id to the runtime as `BROWSER_IDENTIFIER`. Only deployed in regions listed in `BROWSER_SUPPORTED_REGIONS` (`stacks/agentcore_stack.py`) |
 | `enable_gateway` | `false` | Prototype: deploy `OpenClawGateway` (AgentCore Gateway serving the per-user file and schedule tools as MCP tools) and pass `AGENTCORE_GATEWAY_URL` to the runtime. See [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md) |
@@ -896,7 +896,7 @@ cd bridge && node --test read-body.test.js             # UTF-8 request body deco
 cd bridge && node --test openclaw-tool-deny.test.js    # channel-delivery tools denied in openclaw.json (7 tests)
 cd bridge/skills/api-keys && node --test migrate.test.js # api-keys migrate.js/native.js key-loss tests (9 tests)
 cd bridge && node --test gateway-mcp.test.js           # Gateway MCP config, bearer refresh, Cognito token provider (12 tests)
-cd bridge && node --test runtime-skills.test.js        # runtime skill manifest + cold-start reinstall (38 tests)
+cd bridge && node --test runtime-skills.test.js        # runtime skill manifest + cold-start reinstall (42 tests)
 node --test lambda/gateway_tools/*.test.js             # Gateway tool Lambdas: JWT verification, namespace scoping, interceptor (31 tests, Node 24)
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 cd lambda/router && python -m pytest test_image_upload.py -v        # image upload unit tests
@@ -937,7 +937,7 @@ cdk synth   # Runs cdk-nag AwsSolutions checks — should produce no errors
 
 This branch moves the image from OpenClaw 2026.3.8 / Node 22 to **OpenClaw 2026.9.5 ("2.0") / Node 24 / clawhub 0.23.3**. Existing deployments upgrade by pushing the new image and bumping `image_version`; per-user state carries over:
 
-- **Legacy sessions**: 2.0 stores sessions in per-agent SQLite and refuses readiness while a pre-2.0 `agents/<id>/sessions/sessions.json` is present. The contract runs `openclaw doctor --fix --non-interactive` once before the gateway spawns (bounded by `OPENCLAW_MIGRATION_TIMEOUT_MS`) to import it and records a receipt so later cold starts (which restore the 1.x index from S3 again) skip the import; an unreadable index is moved aside so the gateway still starts. The imported store can be hundreds of MB; SQLite databases over 10 MB are backed up as streamed gzip multipart objects, at most every 10 min (`WORKSPACE_SYNC_LARGE_SQLITE_MIN_INTERVAL_MS`), up to `WORKSPACE_SYNC_MAX_SQLITE_BYTES` (1 GiB) — see [docs/session-storage.md](docs/session-storage.md).
+- **Legacy sessions**: 2.0 stores sessions in per-agent SQLite and refuses readiness while a pre-2.0 `agents/<id>/sessions/sessions.json` is present. The contract runs `openclaw doctor --fix --non-interactive` once before the gateway spawns (bounded by `OPENCLAW_MIGRATION_TIMEOUT_MS`) to import it and records a receipt so later cold starts (which restore the 1.x index from S3 again) skip the import; an unreadable index is moved aside so the gateway still starts. The import runs after the S3 restore, so the first 2.0 boot of a large 1.x user waits for both: on staging a state dir of 1,000+ files took 80-115 s to restore and the import of ~1,000 sessions took ~50 s. `deploy.sh` sets the restore wait from `workspace_restore_wait_seconds` (180 s default); if you set `WORKSPACE_RESTORE_WAIT_MS` yourself, or run the image without `deploy.sh` (bridge fallback 45 s), raise it to about 180 s for such users, otherwise the gateway starts on a partly restored state dir. The imported store can be hundreds of MB; SQLite databases over 10 MB are backed up as streamed gzip multipart objects, at most every 10 min (`WORKSPACE_SYNC_LARGE_SQLITE_MIN_INTERVAL_MS`), up to `WORKSPACE_SYNC_MAX_SQLITE_BYTES` (1 GiB) — see [docs/session-storage.md](docs/session-storage.md).
 - **Behaviour-preserving config knobs** written into `openclaw.json` so users see no change: `session.reset: { mode: "daily", atHour: 4 }` (2.0 stopped resetting daily); the new `tools.profile: "full"` tools that need a Control UI or a human answer (`terminal`, `process`, `plugins`, `ask_user`, `secrets`, `screen`, `progress_card`, `nodes`, `heartbeat_respond`, media generation) added to `tools.deny`; `skills.workshop.autonomous.mode: "off"` (autonomous Skill Workshop); Active Memory cross-conversation recall and grounded dreaming disabled (`memory.search.rememberAcrossConversations: false`, `plugins.entries["active-memory"].enabled: false`, `plugins.entries["memory-core"].config.dreaming.enabled: false`).
 - **WebSocket protocol 4** with `client.id: "gateway-client"`, `client.mode: "backend"` and no `Origin` header (see Gotchas).
 - **State on local disk**, mirrored to session storage, because the mount has neither SQLite locks nor hard links (see [Session Storage](#session-storage-persistent-filesystem)).
@@ -1083,6 +1083,11 @@ pytest tests/e2e/bot_test.py -v -k GuardrailSecurity
 ### Guardrail prompt eval
 
 `scripts/guardrail-eval.py` sends the prompts in `tests/fixtures/guardrail_prompts.json` to a guardrail version through `ApplyGuardrail` (input side, no model call) and prints which policy fired for each one. It exits 1 when a verdict differs from the fixture's `expected` value, so you can compare two guardrail versions or check a new scheduled-task prompt before it reaches production. See [docs/guardrails.md](docs/guardrails.md#evaluating-prompts-against-a-guardrail-version).
+
+### Guardrails known limitations
+
+- **Scheduled-task prompts can be blocked.** `PROMPT_ATTACK` runs at input strength `HIGH`. At that strength ordinary scheduled-brief prompts, such as an instruction to send the brief to the user on a named channel or persona-style rules ("you are my assistant, always ..."), can be classified as prompt attacks and the task gets the guardrail's blocked message instead of a reply. A digest about cryptocurrency prices can also match the `CryptoScams` denied topic. Before enabling guardrails for existing users, run `scripts/guardrail-eval.py` against a copy of your own cron prompts (with the `[Scheduled task: <name>]` prefix the Cron Lambda adds) and adjust the prompts or `stacks/guardrails_stack.py`.
+- **The runtime is pinned to a numbered version.** `deploy.sh` passes the `GuardrailVersion` output of `OpenClawGuardrails` (the `CfnGuardrailVersion` resource) to the runtime as `BEDROCK_GUARDRAIL_VERSION`. Editing the policies in `stacks/guardrails_stack.py` and deploying updates only the guardrail's working draft; CloudFormation publishes a new version only when the `CfnGuardrailVersion` resource itself changes (for example its `description`). The runtime keeps the old version until a new version is published and the runtime is updated with `./scripts/deploy.sh --runtime-only`. See [docs/guardrails.md](docs/guardrails.md#updating-guardrail-policies).
 
 ## License
 

@@ -102,12 +102,13 @@ When disabled, the `GuardrailsStack` creates no resources, `AgentCoreStack` skip
    source .venv/bin/activate
    cdk deploy OpenClawGuardrails --require-approval never
    ```
-3. A new `CfnGuardrailVersion` is created automatically. The container picks up the new version on the next session start (or after redeploying `OpenClawAgentCore`)
-4. Run the red team eval to verify the change didn't regress pass rates:
+3. Publish a new version: CloudFormation only creates a new `CfnGuardrailVersion` when that resource changes, so also change its `description` (e.g. `"v2: lower prompt-attack strength"`). Policy edits alone update only the guardrail's working draft, and the runtime stays on the version it was deployed with.
+4. Update the runtime so it gets the new `BEDROCK_GUARDRAIL_VERSION`: `./scripts/deploy.sh --runtime-only`. The runtime logs `[proxy] Bedrock Guardrails enabled: <id> v<version>` on startup; check the new number there
+5. Run the red team eval to verify the change didn't regress pass rates:
    ```bash
    cd redteam && npx promptfoo@latest eval --config evalconfig.yaml
    ```
-5. Run the prompt eval against the old and new versions (next section) to see which prompts changed verdict.
+6. Run the prompt eval against the old and new versions (next section) to see which prompts changed verdict.
 
 ---
 
@@ -129,6 +130,10 @@ python3 scripts/guardrail-eval.py --guardrail-id "$GUARDRAIL_ID" --version "$GUA
 - The shipped fixtures are synthetic. The `allow` entries imitate scheduled-brief prompts (persona rules, a news digest, a browser request); each one with a `schedule_name` is also sent as `<id>+cron` with the `[Scheduled task: <name>] ` prefix the cron Lambda adds, which shows whether the prefix changes the verdict. The `block` entries are probes (public test card number, CVV, the AWS documentation example access key, a prompt-injection string) that the default configuration must block.
 - To check your own schedule prompts, copy the fixture file outside the repository, add entries (`{"id": ..., "expected": "allow", "schedule_name": ..., "text": ...}`) and pass that path to `--fixtures`. Do not commit real users' prompts.
 - Each prompt is billed as a guardrail evaluation (see Cost Estimates).
+
+### Known limitation: scheduled-task prompts
+
+At `PROMPT_ATTACK` input strength `HIGH`, ordinary scheduled-brief prompts can be blocked as prompt attacks: an instruction to deliver the brief to the user on a named channel, or persona-style rules at the start of the prompt. A digest about cryptocurrency prices can also match the `CryptoScams` denied topic. The cron task then returns the blocked message instead of the brief. Run this eval against your own cron prompts before enabling guardrails for existing users, then reword the prompts or tune `stacks/guardrails_stack.py` (and publish a new version, see above).
 
 ---
 
@@ -172,7 +177,7 @@ Pricing: ~$0.75 per 1,000 text units (input + output). See [AWS Bedrock Guardrai
 
 To reduce cost:
 - Set `"enable_guardrails": false` — removes all guardrail charges
-- Use `guardrails_content_filter_level: "MEDIUM"` or `"LOW"` for reduced sensitivity
+- Filter strength does not change the price (billing is per text unit). The `guardrails_content_filter_level` context key is not read by the stack; strengths are set in `stacks/guardrails_stack.py`
 
 ---
 
