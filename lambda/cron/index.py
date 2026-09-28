@@ -289,6 +289,18 @@ def warmup_and_wait(session_id, user_id, actor_id, channel):
 # Channel message senders (duplicated from router Lambda — small and stable)
 # ---------------------------------------------------------------------------
 
+# _BLOCK_CLOSE_RE, _MALFORMED_TEXT_BLOCK_RE and _extract_text_from_content_blocks
+# are copied from lambda/router/index.py (#118). Keep the two copies in sync.
+
+# End of a (possibly malformed) content-block array: '}]' or '},]'.
+_BLOCK_CLOSE_RE = re.compile(r'\}\s*,?\s*\]')
+# Text value of a '{"type":"text","text":"..."}' block, for regex fallback.
+# Accepts ',' as well as ':' before the value (seen from models in the wild).
+_MALFORMED_TEXT_BLOCK_RE = re.compile(
+    r'"type"\s*:\s*"text"\s*,\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"'
+)
+
+
 def _extract_text_from_content_blocks(text):
     """Extract plain text from content blocks anywhere in the response.
 
@@ -296,6 +308,9 @@ def _extract_text_from_content_blocks(text):
     1. Entire string is a JSON array: [{"type":"text","text":"..."}]
     2. Content blocks embedded in surrounding text: "prefix[{...}]suffix"
     3. Nested content blocks (subagent wrapping): recursively unwraps up to 10 levels
+
+    Scans for '[{' positions and attempts JSON parse at each to handle
+    complex nested/escaped content blocks from subagent responses.
     """
     if not text or not isinstance(text, str):
         return text
@@ -303,6 +318,7 @@ def _extract_text_from_content_blocks(text):
     decoder = json.JSONDecoder(strict=False)
     for _ in range(10):
         prev = result
+        # Scan for all '[{' positions and try to parse JSON arrays
         rebuilt = []
         i = 0
         while i < len(result):
@@ -311,53 +327,48 @@ def _extract_text_from_content_blocks(text):
                 rebuilt.append(result[i:])
                 break
             rebuilt.append(result[i:pos])
+            # Try to parse a JSON array starting at pos
             try:
                 blocks, end = decoder.raw_decode(result, pos)
-                if isinstance(blocks, list) and blocks:
-                    parts = [
-                        b.get("text", "")
-                        for b in blocks
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    ]
-                    if parts:
+                if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
+                    # Check if this looks like a content block array (dicts with "type" keys)
+                    has_typed_blocks = any(b.get("type") for b in blocks)
+                    if has_typed_blocks:
+                        parts = [
+                            b.get("text", "")
+                            for b in blocks
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        ]
+                        # Always advance past the block — image-only blocks produce empty text
                         rebuilt.append("".join(parts))
                         i = end
                         continue
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
+            # Not a valid content block array. If it looks like content-block
+            # JSON (e.g. '[{"type":' ...), only an unterminated fragment that
+            # runs to the end of the string is dropped (a partial stream tail).
+            # A closed but malformed array keeps the text around it.
+            remainder = result[pos:]
+            if re.match(r'^\[\{\s*"type"\s*:', remainder) or remainder.strip() == "[{":
+                close = _BLOCK_CLOSE_RE.search(remainder)
+                if close is None:
+                    # Truncated content block JSON at the tail — skip the rest
+                    break
+                span = remainder[:close.end()]
+                texts = _MALFORMED_TEXT_BLOCK_RE.findall(span)
+                if texts:
+                    try:
+                        rebuilt.append("".join(json.loads('"' + t + '"') for t in texts))
+                        i = pos + close.end()
+                        continue
+                    except (json.JSONDecodeError, ValueError):
+                        pass
             rebuilt.append("[")
             i = pos + 1
         result = "".join(rebuilt)
         if result == prev:
             break
-        try:
-            blocks = json.JSONDecoder(strict=False).decode(result)
-            if isinstance(blocks, list) and blocks:
-                parts = [
-                    b.get("text", "")
-                    for b in blocks
-                    if isinstance(b, dict) and b.get("type") == "text"
-                ]
-                if parts:
-                    unwrapped = "".join(parts)
-                    if unwrapped == result:
-                        break
-                    result = unwrapped
-                    continue
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-        break
-    # Regex fallback: handle cases where JSON parsing fails (encoding issues, etc.)
-    stripped_result = result.strip()
-    if stripped_result.startswith("[{") and '"type"' in stripped_result and '"text"' in stripped_result:
-        match = re.search(r'[,{]\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"', stripped_result)
-        if match:
-            try:
-                candidate = json.loads('"' + match.group(1) + '"')
-                if candidate and candidate != result:
-                    result = candidate
-            except (json.JSONDecodeError, ValueError):
-                pass
     return result
 
 
