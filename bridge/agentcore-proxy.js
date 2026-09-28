@@ -37,6 +37,17 @@ if (guardrailConfig) {
   console.log(`[proxy] Bedrock Guardrails enabled: ${GUARDRAIL_ID} v${GUARDRAIL_VERSION}`);
 }
 
+// Converse inferenceConfig — temperature per model, BEDROCK_TEMPERATURE overrides
+const { buildInferenceConfig, parseTemperatureOverride } = require("./inference-config");
+const temperatureOverride = parseTemperatureOverride(process.env.BEDROCK_TEMPERATURE);
+if (temperatureOverride.invalid !== undefined) {
+  console.warn("[proxy] Ignoring invalid BEDROCK_TEMPERATURE=%s (using per-model default)", temperatureOverride.invalid);
+} else if (temperatureOverride.mode === "omit") {
+  console.log("[proxy] BEDROCK_TEMPERATURE=none: temperature omitted for all models");
+} else if (temperatureOverride.mode === "set") {
+  console.log("[proxy] BEDROCK_TEMPERATURE=%s applied to all models", String(temperatureOverride.value));
+}
+
 // Cognito identity configuration
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
 const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID || "";
@@ -999,7 +1010,8 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
-    inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
+    // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
+    inferenceConfig: buildInferenceConfig(modelId, temperatureOverride),
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
@@ -1099,7 +1111,8 @@ async function invokeBedrockStreaming(
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
-    inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
+    // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
+    inferenceConfig: buildInferenceConfig(modelId, temperatureOverride),
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;

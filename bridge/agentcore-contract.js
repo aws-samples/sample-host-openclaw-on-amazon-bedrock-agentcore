@@ -1489,6 +1489,8 @@ async function init(userId, actorId, channel) {
       // guardrailConfig is never attached to Converse calls even when the runtime has them.
       BEDROCK_GUARDRAIL_ID: process.env.BEDROCK_GUARDRAIL_ID || "",
       BEDROCK_GUARDRAIL_VERSION: process.env.BEDROCK_GUARDRAIL_VERSION || "",
+      // Optional temperature override read by agentcore-proxy.js ("none" omits it; unset = per-model default).
+      BEDROCK_TEMPERATURE: process.env.BEDROCK_TEMPERATURE || "",
       USER_ID: actorId,
       INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
       CHANNEL: channel,
