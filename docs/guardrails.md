@@ -102,12 +102,13 @@ When disabled, the `GuardrailsStack` creates no resources, `AgentCoreStack` skip
    source .venv/bin/activate
    cdk deploy OpenClawGuardrails --require-approval never
    ```
-3. A new `CfnGuardrailVersion` is created automatically. The container picks up the new version on the next session start (or after redeploying `OpenClawAgentCore`)
-4. Run the red team eval to verify the change didn't regress pass rates:
+3. Publish a new version: CloudFormation only creates a new `CfnGuardrailVersion` when that resource changes, so also change its `description` (e.g. `"v2: lower prompt-attack strength"`). Policy edits alone update only the guardrail's working draft, and the runtime stays on the version it was deployed with.
+4. Update the runtime so it gets the new `BEDROCK_GUARDRAIL_VERSION`: `./scripts/deploy.sh --runtime-only`. The runtime logs `[proxy] Bedrock Guardrails enabled: <id> v<version>` on startup; check the new number there
+5. Run the red team eval to verify the change didn't regress pass rates:
    ```bash
    cd redteam && npx promptfoo@latest eval --config evalconfig.yaml
    ```
-5. Run the prompt eval against the old and new versions (next section) to see which prompts changed verdict.
+6. Run the prompt eval against the old and new versions (next section) to see which prompts changed verdict.
 
 ---
 
@@ -129,6 +130,44 @@ python3 scripts/guardrail-eval.py --guardrail-id "$GUARDRAIL_ID" --version "$GUA
 - The shipped fixtures are synthetic. The `allow` entries imitate scheduled-brief prompts (persona rules, a news digest, a browser request); each one with a `schedule_name` is also sent as `<id>+cron` with the `[Scheduled task: <name>] ` prefix the cron Lambda adds, which shows whether the prefix changes the verdict. The `block` entries are probes (public test card number, CVV, the AWS documentation example access key, a prompt-injection string) that the default configuration must block.
 - To check your own schedule prompts, copy the fixture file outside the repository, add entries (`{"id": ..., "expected": "allow", "schedule_name": ..., "text": ...}`) and pass that path to `--fixtures`. Do not commit real users' prompts.
 - Each prompt is billed as a guardrail evaluation (see Cost Estimates).
+
+### Known limitation: scheduled-task prompts
+
+At `PROMPT_ATTACK` input strength `HIGH`, ordinary scheduled-brief prompts can be blocked as prompt attacks: an instruction to deliver the brief to the user on a named channel, or persona-style rules at the start of the prompt. A digest about cryptocurrency prices can also match the `CryptoScams` denied topic. The cron task then returns the blocked message instead of the brief. Run this eval against your own cron prompts before enabling guardrails for existing users, then reword the prompts or tune `stacks/guardrails_stack.py` (and publish a new version, see above).
+
+---
+
+## Wiring and End-to-End Tests
+
+How the guardrail reaches the runtime and how the end-to-end tests prove it (moved from the README).
+
+### Guardrail wiring
+
+The guardrail is only applied if two things are true at once, and `scripts/deploy.sh` sets both:
+
+1. **IAM** — `app.py` passes the `OpenClawGuardrails` outputs into `AgentCoreStack`, which grants the runtime execution role `bedrock:ApplyGuardrail`. `tests/test_guardrail_wiring_synth.py` asserts this at synth time so a rebase cannot drop it again (it did once, in #30 — see #100).
+2. **Runtime env** — Phase 2 of `scripts/deploy.sh` reads the `GuardrailId` / `GuardrailVersion` outputs of `OpenClawGuardrails` (exact `OutputKey` match) and passes them to the runtime as `BEDROCK_GUARDRAIL_ID` / `BEDROCK_GUARDRAIL_VERSION`. `bridge/agentcore-proxy.js` only injects `guardrailConfig` into Bedrock calls when `BEDROCK_GUARDRAIL_ID` is set. With `enable_guardrails: true` (the default) the deploy **fails** if either output resolves empty rather than silently shipping a runtime without guardrails; with `enable_guardrails: false` the variables are simply not set.
+
+Exporting `BEDROCK_GUARDRAIL_ID` in your own shell does **not** configure the runtime — that only happens through `scripts/deploy.sh` (or `--runtime-only`). A runtime that has it set logs `[proxy] Bedrock Guardrails enabled: <id> v<version>` on startup.
+
+### Guardrail E2E Tests
+
+`tests/e2e/test_guardrail_wiring.py` verifies the wiring end to end. `test_guardrail_blocks_harmful_content` passes only when the runtime log (`/aws/bedrock-agentcore/runtimes/<runtime_id>-<endpoint>`) contains the proxy's `[guardrail] intervention ...` line, i.e. Bedrock returned `stopReason: guardrail_intervened`. A refusal written by the model itself does not count, so this test fails on a deployment where the guardrail is deployed but not wired.
+
+```bash
+pytest tests/e2e/test_guardrail_wiring.py -v
+```
+
+The `TestGuardrailSecurity` test class in `bot_test.py` (6 tests) exercises guardrail behaviour through the full Telegram webhook pipeline. It is gated on `BEDROCK_GUARDRAIL_ID` being set **in the test runner's shell** (this only selects the tests; the runtime gets its value from the deploy):
+
+```bash
+# Requires deployed stack + guardrail ID
+export BEDROCK_GUARDRAIL_ID=$(aws cloudformation describe-stacks \
+  --stack-name OpenClawGuardrails \
+  --query "Stacks[0].Outputs[?OutputKey=='GuardrailId'].OutputValue" \
+  --output text --region ap-southeast-2)
+pytest tests/e2e/bot_test.py -v -k GuardrailSecurity
+```
 
 ---
 
@@ -172,7 +211,7 @@ Pricing: ~$0.75 per 1,000 text units (input + output). See [AWS Bedrock Guardrai
 
 To reduce cost:
 - Set `"enable_guardrails": false` — removes all guardrail charges
-- Use `guardrails_content_filter_level: "MEDIUM"` or `"LOW"` for reduced sensitivity
+- Filter strength does not change the price (billing is per text unit). The `guardrails_content_filter_level` context key is not read by the stack; strengths are set in `stacks/guardrails_stack.py`
 
 ---
 
