@@ -1805,11 +1805,16 @@ function telegramApiCall(method, body) {
  * Create a Telegram streamer that shows a "typing..." indicator while working.
  *
  * onDelta(text): starts a typing indicator loop (sendChatAction every 5s).
- * finalize(text): stops the typing loop. It does NOT send the reply: the
- * router converts markdown to Telegram HTML (parse_mode HTML) and splits to
- * the 4096 UTF-16 limit. A plain {chat_id, text} send here succeeded for every
- * short reply, set `streamed`, made the router skip its send, and left users
- * with raw markdown. messageId is always null so `streamed` stays false.
+ * finalize(text, {callerGone}): stops the typing loop. Normally it does NOT
+ * send the reply: the router converts markdown to Telegram HTML (parse_mode
+ * HTML) and splits to the 4096 UTF-16 limit. A plain {chat_id, text} send here
+ * succeeded for every short reply, set `streamed`, made the router skip its
+ * send, and left users with raw markdown. messageId is null so `streamed`
+ * stays false.
+ *
+ * Exception: when the HTTP caller (the router) has already gone away, e.g. its
+ * invoke read timeout expired on a long turn, nobody will send the reply, so
+ * finalize sends it itself as plain text split to the UTF-16 limit.
  */
 function createTelegramStreamer(chatId) {
   let typingInterval = null;
@@ -1846,12 +1851,99 @@ function createTelegramStreamer(chatId) {
     startTypingLoop();
   };
 
-  const finalize = async (_text) => {
+  const sendOrphanedReply = async (text) => {
+    const chunks = splitTelegramText(text);
+    let lastId = null;
+    let sent = 0;
+    for (const chunk of chunks) {
+      try {
+        const resp = await telegramApiCall("sendMessage", {
+          chat_id: chatId,
+          text: chunk,
+        });
+        if (resp && resp.ok) {
+          sent++;
+          lastId = (resp.result && resp.result.message_id) || lastId;
+        } else {
+          console.warn(
+            "[telegram-stream] Orphaned reply chunk rejected: %s",
+            (resp && resp.description) || "unknown error",
+          );
+        }
+      } catch (err) {
+        console.warn("[telegram-stream] Orphaned reply chunk error: %s", err.message);
+      }
+    }
+    console.warn(
+      "[telegram-stream] Caller disconnected before reply; contract sent %s of %s chunk(s) for chat_id=%s",
+      sent,
+      chunks.length,
+      chatId,
+    );
+    return lastId;
+  };
+
+  const finalize = async (text, opts = {}) => {
     stopTypingLoop();
+    if (opts.callerGone && text && text.trim()) {
+      return { messageId: await sendOrphanedReply(text) };
+    }
     return { messageId: null };
   };
 
   return { onDelta, finalize };
+}
+
+// Telegram's sendMessage limit is 4096 characters counted in UTF-16 code
+// units. JS string length is already in UTF-16 units. Python equivalent:
+// _split_telegram_text in lambda/router/index.py.
+const TELEGRAM_MAX_UTF16_UNITS = 4096;
+
+/**
+ * Split text into chunks of at most `limit` UTF-16 code units, preferring a
+ * paragraph, line or word break in the second half of each window. Never cuts
+ * inside a surrogate pair; the chunks concatenate back to the original text.
+ */
+function splitTelegramText(text, limit = TELEGRAM_MAX_UTF16_UNITS) {
+  const chunks = [];
+  let rest = text || "";
+  while (rest) {
+    if (rest.length <= limit) {
+      chunks.push(rest);
+      break;
+    }
+    let fit = limit;
+    const code = rest.charCodeAt(fit - 1);
+    if (code >= 0xd800 && code <= 0xdbff) fit--; // keep the surrogate pair whole
+    const window = rest.slice(0, fit);
+    let cut = fit;
+    for (const sep of ["\n\n", "\n", " "]) {
+      const pos = window.lastIndexOf(sep);
+      if (pos >= 0 && pos + sep.length > fit / 2) {
+        cut = pos + sep.length;
+        break;
+      }
+    }
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  return chunks;
+}
+
+/**
+ * Watch an HTTP response for its caller going away before the response is
+ * written (client closed or reset the connection). Returns a function that
+ * reports whether that has happened.
+ */
+function trackCallerDisconnect(res) {
+  let gone = false;
+  res.on("close", () => {
+    if (!res.writableFinished) gone = true;
+  });
+  return () =>
+    gone ||
+    (!res.writableFinished &&
+      (res.destroyed || Boolean(res.socket && res.socket.destroyed)));
 }
 
 /**
@@ -2223,6 +2315,9 @@ const server = http.createServer(async (req, res) => {
 
   // POST /invocations — Chat handler
   if (req.method === "POST" && req.url === "/invocations") {
+    // If the router's invoke read timeout expires on a long turn, it drops the
+    // connection and will never send the Telegram reply; finalize() needs to know.
+    const callerGone = trackCallerDisconnect(res);
     // Decode once from Buffers so a UTF-8 character split across chunks survives.
     readBody(req, MAX_BODY_SIZE).then(async (body) => {
       try {
@@ -2547,11 +2642,14 @@ const server = http.createServer(async (req, res) => {
           if (responseText) responseText = extractTextFromContent(responseText);
 
           // Stop the Telegram typing loop. The router sends the formatted
-          // reply, so telegramStreamed stays false unless finalize sent one.
+          // reply, so telegramStreamed stays false unless finalize sent one,
+          // which it does only when the router has already disconnected.
           let telegramStreamed = false;
           if (telegramStreamer) {
             try {
-              const result = await telegramStreamer.finalize(responseText);
+              const result = await telegramStreamer.finalize(responseText, {
+                callerGone: callerGone(),
+              });
               if (result.messageId) {
                 telegramStreamed = true;
                 console.log(
