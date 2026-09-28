@@ -832,6 +832,123 @@ describe("executeWebSearch", () => {
   });
 });
 
+
+// --- UTF-8 characters split across socket reads ---
+
+describe("multi-byte UTF-8 split across chunks", () => {
+  const dns = require("dns");
+  const http = require("http");
+  const https = require("https");
+  const { EventEmitter } = require("events");
+  const { chat } = require("./lightweight-agent");
+  let origPromisesLookup;
+  let origHttpGet;
+  let origHttpsGet;
+  let origHttpRequest;
+
+  // Split `buf` into two chunks, cutting `offset` bytes into the first
+  // occurrence of `ch` (a multi-byte character).
+  function splitInside(buf, ch, offset) {
+    const cut = buf.indexOf(Buffer.from(ch, "utf8")) + offset;
+    assert.ok(cut > 0 && cut < buf.length);
+    return [buf.subarray(0, cut), buf.subarray(cut)];
+  }
+
+  // Fake http(s).get / http.request: answers 200 and emits `chunks` as raw
+  // Buffers, the way a real socket does when no encoding is set.
+  function fakeResponder(chunks) {
+    return function (url, opts, cb) {
+      if (typeof url === "object" && typeof opts === "function") cb = opts;
+      else if (typeof opts === "function") cb = opts;
+      const req = new EventEmitter();
+      req.destroy = () => {};
+      req.setTimeout = () => {};
+      req.write = () => {};
+      req.end = () => {};
+      process.nextTick(() => {
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        res.headers = { "content-type": "text/html; charset=utf-8" };
+        res.resume = () => {};
+        res.destroy = () => {};
+        cb(res);
+        for (const c of chunks) res.emit("data", c);
+        res.emit("end");
+      });
+      return req;
+    };
+  }
+
+  beforeEach(() => {
+    origPromisesLookup = dns.promises.lookup;
+    origHttpGet = http.get;
+    origHttpsGet = https.get;
+    origHttpRequest = http.request;
+    dns.promises.lookup = async () => [{ address: "93.184.216.34", family: 4 }];
+  });
+
+  afterEach(() => {
+    dns.promises.lookup = origPromisesLookup;
+    http.get = origHttpGet;
+    https.get = origHttpsGet;
+    http.request = origHttpRequest;
+  });
+
+  it("web_fetch keeps a CJK character split between two reads", async () => {
+    const text = "你好世界".repeat(10);
+    const buf = Buffer.from(`<html><body><p>${text}</p></body></html>`, "utf8");
+    http.get = fakeResponder(splitInside(buf, "好", 1));
+    const result = await executeWebFetch("http://public.test/");
+    assert.ok(!result.includes("\uFFFD"), `replacement char in: ${result}`);
+    assert.ok(result.includes(text), `original text missing: ${result}`);
+  });
+
+  it("web_fetch decodes a character split across three reads", async () => {
+    const text = "東京".repeat(5);
+    const buf = Buffer.from(`<p>${text}</p>`, "utf8");
+    const start = buf.indexOf(Buffer.from("京", "utf8"));
+    http.get = fakeResponder([buf.subarray(0, start + 1), buf.subarray(start + 1, start + 2), buf.subarray(start + 2)]);
+    const result = await executeWebFetch("http://public.test/");
+    assert.ok(!result.includes("\uFFFD"), `replacement char in: ${result}`);
+    assert.ok(result.includes(text));
+  });
+
+  it("web_fetch byte cap counts bytes, not characters", async () => {
+    // 3-byte characters: 200K chars = 600KB, over the 512KB byte cap even
+    // though the character count is under it.
+    const big = Buffer.from("字".repeat(200 * 1024), "utf8");
+    const chunks = [];
+    for (let i = 0; i < big.length; i += 64 * 1024 + 1) chunks.push(big.subarray(i, i + 64 * 1024 + 1));
+    http.get = fakeResponder(chunks);
+    const result = await executeWebFetch("http://public.test/");
+    assert.ok(result.includes("[Content truncated at size limit]"), "should hit the byte cap");
+    const body = result.split("\n\n[Content truncated")[0];
+    // Only the final character may be cut at the cap boundary.
+    assert.ok(!body.slice(0, -1).includes("\uFFFD"), "no replacement char before the cap boundary");
+  });
+
+  it("web_search keeps a CJK snippet split between two reads", async () => {
+    const snip = "東京の天気".repeat(4);
+    const html = Buffer.from(
+      `<div class="result"><a class="result__a" href="https://example.com/">T</a><a class="result__snippet">${snip}</a></div>`,
+      "utf8",
+    );
+    https.get = fakeResponder(splitInside(html, "天", 2));
+    const result = await executeWebSearch("tokyo weather");
+    assert.ok(!result.includes("\uFFFD"), `replacement char in: ${result}`);
+    assert.ok(result.includes(snip), `snippet missing: ${result}`);
+  });
+
+  it("chat() proxy reply keeps a CJK character split between two reads", async () => {
+    const answer = "こんにちは世界";
+    const body = Buffer.from(JSON.stringify({ choices: [{ message: { role: "assistant", content: answer } }] }), "utf8");
+    http.request = fakeResponder(splitInside(body, "世", 1));
+    const result = await chat("hi", "telegram:<telegram_id>");
+    assert.ok(!result.includes("\uFFFD"), `replacement char in: ${result}`);
+    assert.ok(result.startsWith(answer), `answer missing: ${result}`);
+  });
+});
+
 // --- manage_api_key (native file-based storage) ---
 
 describe("manage_api_key", () => {
