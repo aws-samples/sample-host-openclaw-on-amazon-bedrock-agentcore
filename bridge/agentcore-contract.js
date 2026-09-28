@@ -35,6 +35,7 @@ const gatewayMcp = require("./gateway-mcp");
 const runtimeSkills = require("./runtime-skills");
 const { createCognitoTokenProvider } = require("./cognito-token");
 const { readBody } = require("./read-body");
+const { createChatRunTracker } = require("./chat-run-filter");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -1927,6 +1928,8 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
     let resolved = false;
     let connectReqId = null;
     let chatReqId = null;
+    // Which gateway run this request owns; see chat-run-filter.js.
+    let chatRun = null;
     let unhandledMsgs = [];
 
     const done = (text) => {
@@ -2015,6 +2018,8 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           "[contract] Authenticated successfully, sending chat.send...",
         );
         chatReqId = randomUUID();
+        // The gateway uses idempotencyKey as the run id for chat.send.
+        chatRun = createChatRunTracker(chatReqId);
         ws.send(
           JSON.stringify({
             type: "req",
@@ -2046,6 +2051,31 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
       // directly in payload.message (string or content-blocks array).
       if (msg.type === "event" && msg.event === "chat") {
         const payload = msg.payload || {};
+
+        // The gateway broadcasts chat events for every run, including
+        // sub-agent sessions our run spawned. Only our own run (or its
+        // sessions_yield successor) may stream or end this request.
+        if (chatRun) {
+          const verdict = chatRun.classify(payload);
+          if (verdict.action === "ignore") {
+            console.log(
+              "[contract] Ignoring chat %s for runId=%s sessionKey=%s (%s)",
+              payload.state,
+              payload.runId,
+              payload.sessionKey,
+              verdict.reason,
+            );
+            return;
+          }
+          if (verdict.action === "yield") {
+            console.log(
+              "[contract] Run %s yielded; waiting for its successor in %s",
+              payload.runId,
+              payload.sessionKey,
+            );
+            return;
+          }
+        }
 
         if (payload.state === "delta") {
           const text = extractFromPayload(payload);
@@ -2102,6 +2132,7 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           );
           return;
         }
+        if (chatRun) chatRun.adoptAck(msg.payload);
         // Log full payload for debugging
         const status = msg.payload?.status;
         console.log(

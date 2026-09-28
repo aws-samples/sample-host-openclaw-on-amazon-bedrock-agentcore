@@ -25,6 +25,9 @@ openclaw-on-agentcore/
     openclaw-tool-deny.test.js    # openclaw.json tools.deny covers the channel-delivery tools (node:test, 7 tests)
     read-body.js                  # Reads a request body as Buffers and decodes UTF-8 once (contract server keeps its 1 MB / 413 cap)
     read-body.test.js             # Request body decoding + size cap tests (node:test, 8 tests)
+    chat-run-filter.js            # Chat-event ownership filter: only the run chat.send started (or its sessions_yield successor) ends a bridge request; sub-agent events are ignored
+    chat-run-filter.test.js       # Filter unit tests + contract/Dockerfile wiring (node:test, 18 tests)
+    chat-run-filter.bridge.test.js # Real bridgeMessage() against a fake protocol-v4 gateway (node:test, 5 tests; skips without ws)
     legacy-session-import.js      # Pre-2.0 sessions.json import receipts (import runs once)
     legacy-session-import.test.js # Import receipt tests (node:test, 23 tests)
     gateway-mcp.js                # mcp.servers.agentcore config + bearer refresh (only when AGENTCORE_GATEWAY_URL is set)
