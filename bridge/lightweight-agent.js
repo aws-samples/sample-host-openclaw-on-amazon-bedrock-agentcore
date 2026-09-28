@@ -576,6 +576,15 @@ function validateUrlSafety(urlStr) {
 }
 
 /**
+ * Decode collected response chunks as UTF-8 in one pass. Decoding each chunk
+ * on its own turns a multi-byte character split across two socket reads into
+ * U+FFFD, so callers collect raw Buffers and decode once at the end.
+ */
+function decodeChunks(chunks) {
+  return Buffer.concat(chunks.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(c, "utf8")))).toString("utf8");
+}
+
+/**
  * Strip HTML tags and return plain text.
  * Removes script/style content, decodes common entities, collapses whitespace.
  */
@@ -768,16 +777,16 @@ async function executeWebFetch(url, depth = 0) {
           return;
         }
 
-        let data = "";
+        const chunks = [];
         let bytes = 0;
         let resolved = false;
         res.on("data", (chunk) => {
-          bytes += chunk.length;
+          bytes += chunk.length; // Buffer length: counts bytes, not characters
           if (bytes > WEB_FETCH_MAX_BYTES) {
             // Resolve immediately with collected data before destroying
             if (!resolved) {
               resolved = true;
-              const text = stripHtml(data);
+              const text = stripHtml(decodeChunks(chunks));
               resolve(
                 (text.substring(0, WEB_FETCH_MAX_TEXT) || "(empty page)") +
                   "\n\n[Content truncated at size limit]",
@@ -786,12 +795,12 @@ async function executeWebFetch(url, depth = 0) {
             res.destroy();
             return;
           }
-          data += chunk;
+          chunks.push(chunk);
         });
         res.on("end", () => {
           if (!resolved) {
             resolved = true;
-            const text = stripHtml(data);
+            const text = stripHtml(decodeChunks(chunks));
             resolve(text.substring(0, WEB_FETCH_MAX_TEXT) || "(empty page)");
           }
         });
@@ -844,26 +853,26 @@ async function executeWebSearch(query) {
           return;
         }
 
-        let data = "";
+        const chunks = [];
         let bytes = 0;
         let resolved = false;
         res.on("data", (chunk) => {
-          bytes += chunk.length;
+          bytes += chunk.length; // Buffer length: counts bytes, not characters
           if (bytes > WEB_FETCH_MAX_BYTES) {
             // Resolve with what we have before destroying the stream
             if (!resolved) {
               resolved = true;
-              resolve(parseSearchResults(data));
+              resolve(parseSearchResults(decodeChunks(chunks)));
             }
             res.destroy();
             return;
           }
-          data += chunk;
+          chunks.push(chunk);
         });
         res.on("end", () => {
           if (!resolved) {
             resolved = true;
-            resolve(parseSearchResults(data));
+            resolve(parseSearchResults(decodeChunks(chunks)));
           }
         });
         res.on("error", (err) => {
@@ -1439,11 +1448,11 @@ function callProxy(messages) {
         timeout: HTTP_TIMEOUT_MS,
       },
       (res) => {
-        let body = "";
-        res.on("data", (chunk) => (body += chunk));
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
         res.on("end", () => {
           try {
-            const parsed = JSON.parse(body);
+            const parsed = JSON.parse(decodeChunks(chunks));
             resolve(parsed);
           } catch (e) {
             reject(new Error(`Proxy response parse error: ${e.message}`));
