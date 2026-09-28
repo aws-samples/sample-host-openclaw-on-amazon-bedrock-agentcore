@@ -51,7 +51,7 @@ timeout fallback. The lightweight agent still handles messages until the gateway
 ## Upgrade path for existing deployments
 
 1. Build and push the new bridge image, bump `image_version` in `cdk.json`, redeploy
-   `OpenClawAgentCore` (see README "Deploy new bridge version").
+   `OpenClawAgentCore` (see [Deploy new bridge version](operations.md#deploy-new-bridge-version)).
 2. **First boot per user — legacy session import.** Users who chatted on 2026.3.8 have
    `~/.openclaw/agents/main/sessions/sessions.json` (+ `.jsonl` transcripts) on their session-storage
    mount or in their S3 backup. 2.0 keeps session rows in
