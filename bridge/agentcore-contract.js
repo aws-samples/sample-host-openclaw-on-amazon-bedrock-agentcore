@@ -1802,11 +1802,14 @@ function telegramApiCall(method, body) {
 }
 
 /**
- * Create a Telegram streamer that shows "typing..." indicator while working,
- * then sends ONE clean final message when done. No intermediate edits.
+ * Create a Telegram streamer that shows a "typing..." indicator while working.
  *
  * onDelta(text): starts a typing indicator loop (sendChatAction every 5s).
- * finalize(text): stops the typing loop and sends a single sendMessage.
+ * finalize(text): stops the typing loop. It does NOT send the reply: the
+ * router converts markdown to Telegram HTML (parse_mode HTML) and splits to
+ * the 4096 UTF-16 limit. A plain {chat_id, text} send here succeeded for every
+ * short reply, set `streamed`, made the router skip its send, and left users
+ * with raw markdown. messageId is always null so `streamed` stays false.
  */
 function createTelegramStreamer(chatId) {
   let typingInterval = null;
@@ -1843,23 +1846,9 @@ function createTelegramStreamer(chatId) {
     startTypingLoop();
   };
 
-  const finalize = async (text) => {
+  const finalize = async (_text) => {
     stopTypingLoop();
-    if (!text) return { messageId: null };
-    try {
-      const resp = await telegramApiCall("sendMessage", {
-        chat_id: chatId,
-        text,
-      });
-      const messageId = resp.ok ? resp.result?.message_id : null;
-      if (messageId) {
-        console.log(`[telegram-stream] Final message sent: msg_id=${messageId}`);
-      }
-      return { messageId };
-    } catch (err) {
-      console.warn(`[telegram-stream] Final send error: ${err.message}`);
-      return { messageId: null };
-    }
+    return { messageId: null };
   };
 
   return { onDelta, finalize };
@@ -2557,9 +2546,10 @@ const server = http.createServer(async (req, res) => {
           // Belt-and-suspenders: strip any remaining content-block JSON wrappers
           if (responseText) responseText = extractTextFromContent(responseText);
 
-          // Finalize Telegram streaming (final edit without "..." suffix)
+          // Stop the Telegram typing loop. The router sends the formatted
+          // reply, so telegramStreamed stays false unless finalize sent one.
           let telegramStreamed = false;
-          if (telegramStreamer && responseText) {
+          if (telegramStreamer) {
             try {
               const result = await telegramStreamer.finalize(responseText);
               if (result.messageId) {
