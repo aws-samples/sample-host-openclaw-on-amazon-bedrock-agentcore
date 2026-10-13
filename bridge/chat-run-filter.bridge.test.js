@@ -1,12 +1,10 @@
 /**
- * End-to-end test of the contract's real bridgeMessage() against a fake
+ * Local test of the contract's gatewayTurn() against a fake
  * OpenClaw gateway speaking protocol v4 over WebSocket.
  * Run: node --test chat-run-filter.bridge.test.js
  *
- * bridgeMessage is not exported (agentcore-contract.js is a server entry
- * point), so we slice its source and extractTextFromContent's out of the file
- * and evaluate them with injected dependencies. This runs the shipped code,
- * not a mirror. Skips when the `ws` package is not installed.
+ * Text extraction comes from agentcore-contract.js. The transport is the
+ * shipped gateway-lifecycle module. Skips when `ws` is not installed.
  */
 const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert/strict");
@@ -31,29 +29,17 @@ function sliceFunction(src, signature) {
   return src.slice(start, end + 2);
 }
 
-function loadBridgeMessage(port, logs) {
+function loadGatewayTurn(port) {
   const src = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
-  const body = [
-    sliceFunction(src, "function extractTextFromContent("),
-    sliceFunction(src, "async function bridgeMessage("),
-    "return bridgeMessage;",
-  ].join("\n");
-  let createChatRunTracker;
-  try {
-    ({ createChatRunTracker } = require("./chat-run-filter"));
-  } catch {
-    createChatRunTracker = undefined; // main: module absent, contract does not use it
-  }
-  const quiet = {
-    log: (...a) => logs.push(a.join(" ")),
-    warn: (...a) => logs.push(a.join(" ")),
-    error: (...a) => logs.push(a.join(" ")),
-  };
-  const factory = new Function(
-    "WebSocket", "OPENCLAW_PORT", "GATEWAY_TOKEN", "createChatRunTracker", "require", "console",
-    body,
-  );
-  return factory(WebSocket, port, "test-token", createChatRunTracker, require, quiet);
+  const extractText = new Function(
+    sliceFunction(src, "function extractTextFromContent(") +
+    "\nreturn extractTextFromContent;",
+  )();
+  const { gatewayTurn } = require("./gateway-lifecycle");
+  return (message, timeoutMs, onDelta) => gatewayTurn({
+    url: `ws://127.0.0.1:${port}`, token: "test-token", message,
+    deadline: Date.now() + timeoutMs, onDelta, extractText,
+  });
 }
 
 /**
@@ -68,7 +54,13 @@ function startGateway() {
     sock.on("message", async (data) => {
       const req = JSON.parse(data.toString());
       if (req.method === "connect") {
-        sock.send(JSON.stringify({ type: "res", id: req.id, ok: true, payload: { type: "hello-ok" } }));
+        sock.send(JSON.stringify({ type: "res", id: req.id, ok: true, payload: {
+          type: "hello-ok", protocol: 4, features: { methods: ["chat.send", "last-heartbeat"] },
+        } }));
+        return;
+      }
+      if (req.method === "last-heartbeat") {
+        sock.send(JSON.stringify({ type: "res", id: req.id, ok: true, payload: null }));
         return;
       }
       if (req.method === "chat.send") {
@@ -85,7 +77,8 @@ function startGateway() {
       }
     });
   });
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    wss.once("error", reject);
     wss.on("listening", () =>
       resolve({
         port: wss.address().port,
@@ -100,7 +93,7 @@ function startGateway() {
 
 const textMsg = (text) => ({ role: "assistant", content: [{ type: "text", text }] });
 
-describe("bridgeMessage against a fake gateway", { skip: !WebSocket && "ws not installed" }, () => {
+describe("gatewayTurn against a fake gateway", { skip: !WebSocket && "ws not installed" }, () => {
   let gw;
   before(async () => {
     gw = await startGateway();
@@ -110,8 +103,7 @@ describe("bridgeMessage against a fake gateway", { skip: !WebSocket && "ws not i
   });
 
   it("does not resolve with a sub-agent final that arrives before the main final", async () => {
-    const logs = [];
-    const bridgeMessage = loadBridgeMessage(gw.port, logs);
+    const gatewayTurn = loadGatewayTurn(gw.port);
     gw.setScript((runId) => [
       { runId, sessionKey: MAIN_KEY, seq: 1, state: "delta", message: textMsg("Working on the brief") },
       { runId: "sub-run", sessionKey: SUB_KEY, spawnedBy: MAIN_KEY, seq: 1, state: "delta", message: textMsg("sub partial") },
@@ -120,47 +112,46 @@ describe("bridgeMessage against a fake gateway", { skip: !WebSocket && "ws not i
       { runId, sessionKey: MAIN_KEY, seq: 2, state: "final", message: textMsg("MAIN BRIEF") },
     ]);
     const deltas = [];
-    const text = await bridgeMessage("hello", 5000, (t) => deltas.push(t));
-    assert.equal(text, "MAIN BRIEF");
+    const result = await gatewayTurn("hello", 5000, (t) => deltas.push(t));
+    assert.equal(result.response, "MAIN BRIEF");
+    assert.equal(result.phase, "completed");
     assert.ok(!deltas.includes("sub partial"), "sub-agent delta must not stream");
-    assert.ok(logs.some((l) => l.includes("Ignoring chat")), "ignored events are logged");
   });
 
   it("sub-agent deltas do not replace responseText when the main run times out", async () => {
-    const logs = [];
-    const bridgeMessage = loadBridgeMessage(gw.port, logs);
+    const gatewayTurn = loadGatewayTurn(gw.port);
     gw.setScript((runId) => [
       { runId, sessionKey: MAIN_KEY, seq: 1, state: "delta", message: textMsg("main partial") },
       { runId: "sub-run", sessionKey: SUB_KEY, seq: 1, state: "delta", message: textMsg("sub partial") },
     ]);
-    const text = await bridgeMessage("hello", 300);
-    assert.equal(text, "main partial");
+    const result = await gatewayTurn("hello", 300);
+    assert.equal(result.response, "main partial");
+    assert.equal(result.phase, "unknown_outcome");
   });
 
   it("an empty final from the main run still resolves with an empty string", async () => {
-    const logs = [];
-    const bridgeMessage = loadBridgeMessage(gw.port, logs);
+    const gatewayTurn = loadGatewayTurn(gw.port);
     gw.setScript((runId) => [{ runId, sessionKey: MAIN_KEY, seq: 1, state: "final" }]);
-    const text = await bridgeMessage("hello", 5000);
-    assert.equal(text, "");
+    const result = await gatewayTurn("hello", 5000);
+    assert.equal(result.response, "");
+    assert.equal(result.phase, "completed");
   });
 
   it("a sub-agent error does not end the request; the main final does", async () => {
-    const logs = [];
-    const bridgeMessage = loadBridgeMessage(gw.port, logs);
+    const gatewayTurn = loadGatewayTurn(gw.port);
     gw.setScript((runId) => [
       { runId: "sub-run", sessionKey: SUB_KEY, seq: 1, state: "error", errorMessage: "sub failed" },
       { runId: "sub-run", sessionKey: SUB_KEY, seq: 2, state: "aborted" },
       null,
       { runId, sessionKey: MAIN_KEY, seq: 1, state: "final", message: textMsg("MAIN OK") },
     ]);
-    const text = await bridgeMessage("hello", 5000);
-    assert.equal(text, "MAIN OK");
+    const result = await gatewayTurn("hello", 5000);
+    assert.equal(result.response, "MAIN OK");
+    assert.equal(result.phase, "completed");
   });
 
   it("follows a sessions_yield handoff to the successor run", async () => {
-    const logs = [];
-    const bridgeMessage = loadBridgeMessage(gw.port, logs);
+    const gatewayTurn = loadGatewayTurn(gw.port);
     gw.setScript((runId) => [
       { runId, sessionKey: MAIN_KEY, seq: 1, state: "delta", message: textMsg("spawning helpers") },
       { runId, sessionKey: MAIN_KEY, seq: 2, state: "final", yielded: true, message: textMsg("spawning helpers") },
@@ -168,7 +159,8 @@ describe("bridgeMessage against a fake gateway", { skip: !WebSocket && "ws not i
       null,
       { runId: "successor-run", sessionKey: MAIN_KEY, seq: 1, state: "final", message: textMsg("FINAL BRIEF") },
     ]);
-    const text = await bridgeMessage("hello", 5000);
-    assert.equal(text, "FINAL BRIEF");
+    const result = await gatewayTurn("hello", 5000);
+    assert.equal(result.response, "FINAL BRIEF");
+    assert.equal(result.phase, "completed");
   });
 });

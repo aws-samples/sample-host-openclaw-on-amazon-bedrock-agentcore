@@ -1,5 +1,7 @@
 # Release Notes: OpenClaw us-west-2 Multi-Region Deployment + Feishu Channel
 
+> Historical AgentCore Runtime V1 release record; commands and timings are not current V2 instructions or performance evidence. Use the [AgentCore Runtime V2 runbook](runtime-v2.md).
+
 **Branch:** `deploy/starter-toolkit-hybrid`
 **Date:** 2026-03-12
 **Region:** us-west-2 (Oregon)
@@ -11,25 +13,25 @@
 ### Situation
 OpenClaw 之前仅部署在 us-east-1 单区域，使用纯 CDK 部署。纯 CDK 方案存在多个痛点：
 - **Docker 构建困难**：AgentCore Runtime 是 ARM64 机型，而一般开发机是 x86，本地交叉编译 ARM64 镜像慢且容易失败
-- **AgentCore 控制台不显示指标**：怀疑与纯 CDK 的 CfnRuntime 部署方式有关，控制台 GenAI Observability 页面看不到任何 Runtime 相关的指标和 traces
-- **Runtime 冷启动慢**：纯 CDK 部署下 Runtime 冷启动需要 **~60 秒**，用户体验差
+- **AgentCore 控制台不显示指标**：怀疑与纯 CDK 的 CfnRuntime 部署方式有关，控制台 GenAI Observability 页面看不到任何 AgentCore Runtime 相关的指标和 traces
+- **AgentCore Runtime 冷启动慢**：纯 CDK 部署下 AgentCore Runtime 冷启动需要 **~60 秒**，用户体验差
 - **跨区域部署受阻**：IAM Role 全局命名冲突、ECR 权限不匹配等问题阻止了多区域扩展
 
 ### Task
 设计并实施一套新的部署方案，解决 Docker 构建、控制台指标、冷启动性能和跨区域部署等问题，并将服务扩展到 us-west-2。
 
 ### Action
-- **采用 CDK + Starter Toolkit 混合部署架构**：CDK 管理基础设施（VPC、IAM、S3、Lambda、API Gateway、DynamoDB 等 7 个 stack），Starter Toolkit 管理 Runtime/Endpoint/ECR/Docker 构建
+- **采用 CDK + Starter Toolkit 混合部署架构**：CDK 管理基础设施（VPC、IAM、S3、Lambda、API Gateway、DynamoDB 等 7 个 stack），Starter Toolkit 管理 AgentCore Runtime/Endpoint/ECR/Docker 构建
 - **Docker 构建改进**：Starter Toolkit 支持两种模式——`--local-build`（本地 Docker 构建后推送）和默认 CodeBuild 模式（云端 ARM64 构建，无需本地 Docker），同时支持 `agentcore dev` 本地快速测试
 - **IAM Role 名称加 region 后缀**（`openclaw-agentcore-execution-role-us-west-2`），避免全局冲突
 - **CDK IAM Policy 适配 Starter Toolkit 的 ECR 命名规范**（`bedrock-agentcore-` 前缀），解决了一个导致"initialization exceeded 120s"误导性错误的权限问题
-- **实现 3 阶段部署流程**：Phase 1 CDK 基础 → Phase 2 Starter Toolkit Runtime → Phase 3 CDK 依赖 stack
+- **实现 3 阶段部署流程**：Phase 1 CDK 基础 → Phase 2 Starter Toolkit AgentCore Runtime → Phase 3 CDK 依赖 stack
 - **完善运维文档**：部署指南、操作手册、常用命令、踩坑记录
 
 ### Result
 - us-west-2 全部 7 个 CDK stack + AgentCore Runtime 部署成功并通过端到端验证
-- **AgentCore 控制台指标恢复正常**：切换到 Starter Toolkit 部署后，GenAI Observability Dashboard 能正确显示所有 Runtime 指标和 traces
-- **Runtime 冷启动时间从 ~60s 降到 ~1s**：部署方式改变后启动时间大幅缩短
+- **AgentCore 控制台指标恢复正常**：切换到 Starter Toolkit 部署后，GenAI Observability Dashboard 能正确显示所有 AgentCore Runtime 指标和 traces
+- **AgentCore Runtime 冷启动时间从 ~60s 降到 ~1s**：部署方式改变后启动时间大幅缩短
 - 冷启动首条消息响应 **~5 秒**（Lightweight Agent 直接回复），OpenClaw 完整就绪 **~10 秒**
 - 部署方案可复制到其他区域，已形成标准化的 3 阶段流程和文档
 
@@ -118,7 +120,7 @@ AgentCore Runtime 不会自动将容器 stdout 输出到 CloudWatch，导致容�
 
 ### Result
 - Warm Pool 技术方案验证成功，功能完整可用
-- **但发现不再需要**：切换到 Starter Toolkit 部署后，Runtime 冷启动从 ~60s 降到 ~1s。Lightweight Agent 在 **~5s** 内即可响应首条消息（包含 Bedrock 模型调用时间），用户体验已经足够好
+- **但发现不再需要**：切换到 Starter Toolkit 部署后，AgentCore Runtime 冷启动从 ~60s 降到 ~1s。Lightweight Agent 在 **~5s** 内即可响应首条消息（包含 Bedrock 模型调用时间），用户体验已经足够好
 - **决策：移除 Warm Pool**，减少不必要的复杂度（额外的 Lambda + EventBridge + DynamoDB 记录 + KMS 权限管理）
 - **保留了技术方案文档**，如未来有需要可快速恢复
 
@@ -130,7 +132,7 @@ AgentCore Runtime 不会自动将容器 stdout 输出到 CloudWatch，导致容�
 
 | 指标 | Before (纯 CDK) | After (混合部署) |
 |------|------------------|-------------------|
-| Runtime 冷启动 | ~60s | **~1s** |
+| AgentCore Runtime 冷启动 | ~60s | **~1s** |
 | 首条消息响应 | ~60s+ | **~5s**（Lightweight Agent） |
 | OpenClaw 完整就绪 | ~2-3 min | **~10s** |
 | 控制台指标显示 | 不可用 | 正常显示 |

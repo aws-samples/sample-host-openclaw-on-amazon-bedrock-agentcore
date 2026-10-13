@@ -1,7 +1,7 @@
 /**
  * Tests for runtime-skills.js — the per-user manifest of ClawHub skills a
  * user installs at runtime through the clawhub-manage skill, and the
- * background reinstall agentcore-contract.js runs from it after a cold start.
+ * required reinstall agentcore-contract.js runs before gateway activation.
  *
  * Run: cd bridge && node --test runtime-skills.test.js
  */
@@ -476,22 +476,43 @@ describe("runtime-skills.watchManifest", () => {
   beforeEach(() => { dir = mkTmp("rs-watch-"); });
   afterEach(() => { if (watcher) watcher.close(); watcher = null; fs.rmSync(dir, { recursive: true, force: true }); });
 
-  it("fires once (debounced) after recordInstall/recordUninstall rewrite the manifest, not for tmp files", async () => {
+  it("fires once (debounced) after recordInstall/recordUninstall rewrite the manifest, not for tmp files", (t) => {
     const file = path.join(dir, "runtime-skills.json");
     const calls = [];
+    let changed;
+    const handle = new (require("node:events").EventEmitter)();
+    handle.close = () => {};
+    // OS event delivery can follow a fixed sleep under load. Drive the
+    // notification boundary directly while retaining real manifest writes.
+    t.mock.method(fs, "watch", (directory, options, callback) => {
+      assert.equal(directory, dir);
+      assert.equal(options.persistent, false);
+      changed = callback;
+      return handle;
+    });
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     watcher = rs.watchManifest(file, (f) => calls.push(f), { debounceMs: 150, log: quietLog });
     assert.ok(watcher, "fs.watch should be available on the test runtime");
     rs.recordInstall(file, "baidu-search", "1.2.3", { log: quietLog });
+    changed("rename", "runtime-skills.json");
+    t.mock.timers.tick(100);
     rs.recordInstall(file, "hackernews", "1.0.0", { log: quietLog }); // burst → one callback
-    await sleep(500);
+    changed("rename", "runtime-skills.json");
+    t.mock.timers.tick(149);
+    assert.deepEqual(calls, [], "a second rewrite resets the debounce deadline");
+    t.mock.timers.tick(1);
     assert.deepEqual(calls, [file]);
-    fs.writeFileSync(path.join(dir, `runtime-skills.json.tmp-${Date.now()}1`), "partial"); // our own staging file
+    const stagingName = `runtime-skills.json.tmp-${Date.now()}1`;
+    fs.writeFileSync(path.join(dir, stagingName), "partial"); // our own staging file
+    changed("rename", stagingName);
     fs.writeFileSync(path.join(dir, "other.json"), "{}");
-    await sleep(400);
+    changed("rename", "other.json");
+    t.mock.timers.tick(400);
     assert.equal(calls.length, 1, "unrelated / tmp files must not trigger a backup");
     rs.recordUninstall(file, "hackernews", { log: quietLog });
-    await sleep(500);
-    assert.equal(calls.length, 2);
+    changed("rename", "runtime-skills.json");
+    t.mock.timers.tick(150);
+    assert.deepEqual(calls, [file, file]);
   });
 
   it("a rejecting handler is logged, not thrown, and the watcher keeps working", async () => {
@@ -524,13 +545,12 @@ describe("runtime-skills.watchManifest", () => {
 describe("agentcore-contract.js wiring", () => {
   const source = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
 
-  it("starts the reinstall only after the gateway is ready, guarded to run once", () => {
-    const readyIdx = source.indexOf("openclawReady = true;");
-    const startIdx = source.indexOf("startRuntimeSkillReinstall();");
-    assert.ok(readyIdx > 0 && startIdx > readyIdx, "startRuntimeSkillReinstall() must follow openclawReady = true in pollOpenClawReadiness");
-    assert.match(source, /if \(runtimeSkillReinstallStarted \|\| shuttingDown\) return;/);
+  it("awaits required skill restoration before activating the prepared gateway", () => {
+    const reinstall = source.indexOf("await runtimeSkills.reinstallFromManifest(");
+    const activate = source.indexOf("await preparedGateway.activate(");
+    assert.ok(reinstall > 0 && activate > reinstall);
     assert.match(source, /runtimeSkills\.manifestPath\(OPENCLAW_DIR\)/);
-    assert.match(source, /reinstallFromManifest\(\{ manifestFile, log: console \}\)/);
+    assert.match(source, /if \(skills\.failed \|\| skills\.corrupt \|\| skills\.invalid\) throw new Error/);
   });
 
   it("backs the manifest up to S3 on change via watchManifest + workspaceSync.saveFile, started with the periodic save", () => {
@@ -538,14 +558,10 @@ describe("agentcore-contract.js wiring", () => {
     assert.match(source, /workspaceSync\.saveFile\(namespace, runtimeSkills\.MANIFEST_NAME\)/);
     const periodic = source.indexOf("workspaceSync.startPeriodicSave(namespace);");
     const backup = source.indexOf("startRuntimeSkillManifestBackup(namespace);");
-    assert.ok(periodic > 0 && backup > periodic && backup - periodic < 200, "manifest backup must start right after the periodic save (same namespace, only once OpenClaw is ready)");
+    assert.ok(periodic > 0 && backup > periodic && backup - periodic < 300, "manifest backup must start after the periodic save and required change backup");
     const sync = fs.readFileSync(path.join(__dirname, "workspace-sync.js"), "utf-8");
     assert.match(sync, /async function saveFile\(namespace, relativePath\)/);
     assert.match(sync, /^\s*saveFile,$/m);
-  });
-
-  it("does not await the reinstall on the boot path (init/ping stay unblocked)", () => {
-    assert.equal(/await\s+(runtimeSkills\.)?reinstallFromManifest|await\s+startRuntimeSkillReinstall/.test(source), false);
   });
 
   it("the Dockerfile ships runtime-skills.js to /app and next to the skill scripts", () => {
@@ -557,8 +573,9 @@ describe("agentcore-contract.js wiring", () => {
 
   it("the system prompt and SKILL.md no longer promise plain 'available on next session start'", () => {
     const skillMd = fs.readFileSync(path.join(__dirname, "skills", "clawhub-manage", "SKILL.md"), "utf-8");
+    const agents = require("./gateway-config").renderAgents({ browserEnabled: true });
     assert.match(skillMd, /reinstall/i);
-    assert.match(source, /reinstalled automatically a few seconds after each new session starts/);
-    assert.equal(/After install\/uninstall, the skill will be available on the next session start/.test(source), false);
+    assert.match(agents, /restored before requests are accepted in each new session/);
+    assert.equal(/After install\/uninstall, the skill will be available on the next session start/.test(agents), false);
   });
 });

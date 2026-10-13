@@ -6,7 +6,7 @@
  *
  * Run: cd bridge && node --test state-storage.test.js
  */
-const { describe, it, beforeEach, afterEach } = require("node:test");
+const { describe, it, beforeEach, afterEach, mock } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
@@ -292,13 +292,14 @@ describe("mirrorStateDir / restoreStateDir", () => {
     assert.equal(fs.existsSync(path.join(mountState, "state/openclaw.sqlite")), false);
   });
 
-  it("restore is a no-op once the local state dir already holds SQLite state", () => {
+  it("fills missing files while preserving existing local SQLite state", sqliteOnly, () => {
     write(path.join(mountState, "openclaw.json"), "{}");
-    write(path.join(stateDir, "state/openclaw.sqlite"), "x");
+    const dbPath = path.join(stateDir, "state/openclaw.sqlite");
+    makeDb(dbPath, ["local"]).close();
     const r = storage.restoreStateDir({ stateDir, mountStateDir: mountState, log: quietLog });
-    assert.equal(r.files, 0);
-    assert.match(r.reason, /already holds SQLite/);
-    assert.equal(fs.existsSync(path.join(stateDir, "openclaw.json")), false);
+    assert.equal(r.files, 1);
+    assert.equal(fs.existsSync(path.join(stateDir, "openclaw.json")), true);
+    assert.deepEqual(readRows(dbPath), ["local"]);
   });
 
   it(
@@ -328,6 +329,7 @@ describe("mirrorStateDir / restoreStateDir", () => {
         assert.equal(r2.restored.files, 1);
         const restored = path.join(home2, ".openclaw/agents/main/agent/openclaw-agent.sqlite");
         assert.deepEqual(readRows(restored), ["one", "two"]);
+        assert.deepEqual(fs.readdirSync(path.dirname(restored)).filter((file) => file.includes(".tmp-")), []);
         // A second setup on the same container must not clobber the local DB.
         const r3 = storage.setupSessionStorage({ homeDir: home2, mountDir: mount, log: quietLog });
         assert.equal(r3.restored.files, 0);
@@ -419,22 +421,33 @@ describe("mirrorWorkspaceDir / workspace watcher", () => {
   });
 
   it("watcher mirrors a burst of changes once after the debounce, and stop() flushes pending work", async () => {
-    const started = storage.startWorkspaceWatcher(
-      { stateDir, mountStateDir: mountState, log: quietLog },
-      { debounceMs: 150, maxWaitMs: 2000 },
-    );
-    assert.ok(["watch", "poll"].includes(started.mode));
-    write(path.join(ws, "a.md"), "1");
-    write(path.join(ws, "sub/b.md"), "2");
-    await new Promise((r) => setTimeout(r, 900));
-    if (started.mode === "watch") {
+    let changed;
+    const watcher = new (require("node:events").EventEmitter)();
+    watcher.close = () => {};
+    const watch = mock.method(fs, "watch", (_dir, _opts, callback) => {
+      changed = callback;
+      return watcher;
+    });
+    try {
+      const started = storage.startWorkspaceWatcher(
+        { stateDir, mountStateDir: mountState, log: quietLog },
+        { debounceMs: 150, maxWaitMs: 2000 },
+      );
+      assert.equal(started.mode, "watch");
+      write(path.join(ws, "a.md"), "1");
+      write(path.join(ws, "sub/b.md"), "2");
+      changed();
+      await new Promise((r) => setTimeout(r, 300));
       assert.equal(fs.readFileSync(path.join(mountState, "workspace/a.md"), "utf8"), "1");
       assert.equal(fs.readFileSync(path.join(mountState, "workspace/sub/b.md"), "utf8"), "2");
+      write(path.join(ws, "c.md"), "3");
+      changed();
+      storage.stopWorkspaceWatcher();
+      assert.equal(fs.readFileSync(path.join(mountState, "workspace/c.md"), "utf8"), "3");
+    } finally {
+      storage.stopWorkspaceWatcher();
+      watch.mock.restore();
     }
-    write(path.join(ws, "c.md"), "3");
-    await new Promise((r) => setTimeout(r, 20)); // event delivered, debounce still pending
-    storage.stopWorkspaceWatcher();
-    assert.equal(fs.readFileSync(path.join(mountState, "workspace/c.md"), "utf8"), "3");
   });
 
   it("flushWorkspaceMirror is a no-op after stop", () => {
@@ -460,15 +473,14 @@ describe("state storage wiring in agentcore-contract.js", () => {
     assert.ok(source.includes("stateStorage.gatewayStateEnv(OPENCLAW_DIR)"));
   });
 
-  it("restores the mirror before config write, legacy import and gateway spawn (in that order)", () => {
-    const setup = idx("const sessionStorageAvailable = setupSessionStorage();");
-    const config = idx("    writeOpenClawConfig();\n\n    // 1g. OpenClaw 2.0 moved session state");
-    const migrate = idx("if (await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 }))");
-    // The restart path also spawns the gateway; take the spawn that follows the import.
-    const spawnGw = source.indexOf('["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"]', migrate);
+  it("restores the mirror before config write, legacy import and gateway activation (in that order)", () => {
+    const setup = idx("const sessionStorageAvailable = liveAdopted ? liveRestore.storage.available : setupSessionStorage();");
+    const config = idx("writeOpenClawConfig({ preserveSeedFiles: liveAdopted });");
+    const migrate = idx("await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 })");
+    const spawnGw = source.indexOf("await preparedGateway.activate(", migrate);
     assert.ok(setup < config, "setup before config write");
     assert.ok(config < migrate, "config write before legacy import");
-    assert.ok(spawnGw > migrate, "gateway spawn after legacy import");
+    assert.ok(spawnGw > migrate, "gateway activation after legacy import");
   });
 
   it("on SIGTERM stops the gateway, then snapshots state to the mount, then saves to S3", () => {
@@ -480,14 +492,14 @@ describe("state storage wiring in agentcore-contract.js", () => {
   });
 
   it("starts the periodic mirror once the gateway is ready", () => {
-    const ready = idx("openclawReady = true;\n    workspaceSync.startPeriodicSave(namespace);");
+    const ready = idx('activationScope.mark("gateway");');
     assert.ok(source.indexOf("stateStorage.startPeriodicMirror(", ready) > ready);
   });
 
-  it("starts the workspace watcher after the legacy import and before the gateway spawns", () => {
-    const migrate = idx("if (await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 }))");
+  it("starts the workspace watcher after the legacy import and before the gateway activates", () => {
+    const migrate = idx("await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 })");
     const watcher = source.indexOf("stateStorage.startWorkspaceWatcher(", migrate);
-    const spawnGw = source.indexOf('["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"]', migrate);
+    const spawnGw = source.indexOf("await preparedGateway.activate(", migrate);
     assert.ok(watcher > migrate && watcher < spawnGw);
   });
 
@@ -500,5 +512,126 @@ describe("state storage wiring in agentcore-contract.js", () => {
 
   it("never symlinks the workspace onto the mount", () => {
     assert.equal(source.includes("symlinkSync"), false);
+  });
+});
+
+describe("strict session state preservation", () => {
+  let root, home, mount, opts, storage, DatabaseSync, savedModule;
+  const modulePath = require.resolve("./state-storage");
+  const write = (file, content) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, content); };
+  beforeEach(() => {
+    savedModule = require.cache[modulePath];
+    delete require.cache[modulePath];
+    storage = require("./state-storage");
+    if (hasNodeSqlite) ({ DatabaseSync } = require("node:sqlite"));
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "state-v2-"));
+    home = path.join(root, "home");
+    mount = path.join(root, "mount");
+    fs.mkdirSync(home);
+    fs.mkdirSync(mount);
+    opts = { ...storage.resolvePaths({ homeDir: home, mountDir: mount }), log: { log() {}, warn() {} } };
+  });
+  afterEach(() => {
+    try {
+      storage.stopWorkspaceWatcher();
+      storage.stopPeriodicMirror();
+    } finally {
+      mock.restoreAll();
+      if (savedModule) require.cache[modulePath] = savedModule; else delete require.cache[modulePath];
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not inspect the mount when the module is imported", () => {
+    const exists = mock.method(fs, "existsSync");
+    const reads = mock.method(fs, "readdirSync");
+    delete require.cache[require.resolve("./state-storage")];
+    require("./state-storage");
+    assert.equal(exists.mock.callCount(), 0);
+    assert.equal(reads.mock.callCount(), 0);
+  });
+
+  it("does not let an empty local SQLite file shadow the persisted database", sqliteOnly, () => {
+    const saved = path.join(opts.mountStateDir, "state/openclaw.sqlite");
+    fs.mkdirSync(path.dirname(saved), { recursive: true });
+    const db = new DatabaseSync(saved);
+    db.exec("CREATE TABLE history (text TEXT); INSERT INTO history VALUES ('kept')");
+    db.close();
+    write(path.join(opts.stateDir, "state/openclaw.sqlite"), "");
+    storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: opts.log });
+    const local = new DatabaseSync(path.join(opts.stateDir, "state/openclaw.sqlite"), { readOnly: true });
+    assert.equal(local.prepare("SELECT text FROM history").get().text, "kept");
+    local.close();
+  });
+
+  it("propagates mount read failures instead of reporting empty success", () => {
+    const original = fs.readdirSync;
+    mock.method(fs, "readdirSync", (dir, ...args) => {
+      if (dir === opts.mountStateDir) throw Object.assign(new Error("mount EIO"), { code: "EIO" });
+      return original(dir, ...args);
+    });
+    assert.throws(() => storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: opts.log }), /mount EIO/);
+  });
+
+  it("validates SQLite on local staging and rejects a corrupt workspace snapshot", sqliteOnly, () => {
+    const file = path.join(opts.mountWorkspaceDir, "history.sqlite");
+    write(file, "corrupt database");
+    const sqlite = storage.getNodeSqlite();
+    mock.method(sqlite, "DatabaseSync", function (dbPath, options) {
+      assert.equal(dbPath.startsWith(mount + path.sep), false, "never open SQLite on the mount");
+      return new DatabaseSync(dbPath, options);
+    });
+    assert.throws(() => storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: opts.log }), /database/i);
+    assert.equal(fs.readFileSync(file, "utf8"), "corrupt database");
+    assert.deepEqual(fs.readdirSync(opts.workspaceDir), []);
+  });
+
+  it("keeps the existing mount workspace when the local workspace is empty", () => {
+    fs.mkdirSync(opts.workspaceDir, { recursive: true });
+    write(path.join(opts.mountWorkspaceDir, "notes.md"), "saved");
+    const result = storage.mirrorWorkspaceDir(opts);
+    assert.equal(result.pruned, 0);
+    assert.equal(fs.readFileSync(path.join(opts.mountWorkspaceDir, "notes.md"), "utf8"), "saved");
+  });
+
+  it("defers workspace SQLite to the full snapshot mirror", sqliteOnly, async () => {
+    const file = path.join(opts.workspaceDir, "history.sqlite");
+    fs.mkdirSync(opts.workspaceDir, { recursive: true });
+    const db = new DatabaseSync(file);
+    try {
+      db.exec("PRAGMA journal_mode=WAL; CREATE TABLE history (text TEXT); INSERT INTO history VALUES ('in WAL')");
+      const fast = storage.mirrorWorkspaceDir(opts);
+      assert.equal(fast.skipped, 1);
+      assert.equal(fs.existsSync(path.join(opts.mountWorkspaceDir, "history.sqlite")), false);
+      const full = await storage.mirrorStateDir(opts);
+      assert.equal(full.sqlite, 1);
+      const saved = new DatabaseSync(path.join(opts.mountWorkspaceDir, "history.sqlite"), { readOnly: true });
+      assert.equal(saved.prepare("SELECT text FROM history").get().text, "in WAL");
+      saved.close();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("checks the restore barrier before mirror writes or watcher setup", async () => {
+    opts.assertReady = () => { throw new Error("restore pending"); };
+    write(path.join(opts.stateDir, "workspace/notes.md"), "unrestored");
+    await assert.rejects(storage.mirrorStateDir(opts), /restore pending/);
+    assert.throws(() => storage.mirrorWorkspaceDir(opts), /restore pending/);
+    assert.throws(() => storage.startWorkspaceWatcher(opts), /restore pending/);
+    assert.equal(fs.existsSync(opts.mountStateDir), false);
+  });
+
+  it("does not prune a persisted subtree after a local read error", async () => {
+    write(path.join(opts.workspaceDir, "unreadable/current.md"), "current");
+    write(path.join(opts.workspaceDir, "ok.md"), "ok");
+    write(path.join(opts.mountWorkspaceDir, "unreadable/saved.md"), "saved");
+    const original = fs.readdirSync;
+    mock.method(fs, "readdirSync", (dir, ...args) => {
+      if (dir === path.join(opts.workspaceDir, "unreadable")) throw new Error("unreadable subtree");
+      return original(dir, ...args);
+    });
+    await assert.rejects(storage.mirrorStateDir(opts), /unreadable subtree/);
+    assert.equal(fs.readFileSync(path.join(opts.mountWorkspaceDir, "unreadable/saved.md"), "utf8"), "saved");
   });
 });

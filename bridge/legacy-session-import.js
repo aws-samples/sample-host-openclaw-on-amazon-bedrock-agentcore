@@ -214,7 +214,7 @@ function writeReceipts(openclawDir, fingerprints, log = console) {
 // fill-missing restore of a same-session restart) brings the retired files
 // back next to the migrated 2.0 store, and doctor is only re-run when a
 // sessions.json without a receipt is present — so after the first successful
-// upgrade the gateway crash-loops on exit 78 and the shim answers forever.
+// upgrade the gateway exits with code 78 and cannot become ready.
 //
 // So, on a successful import, the contract also records WHICH files doctor
 // retired (state-dir-relative path + sha256 of the bytes it had) in a manifest

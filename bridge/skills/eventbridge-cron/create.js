@@ -15,8 +15,7 @@ const {
   validateTimezone,
   generateScheduleId,
   buildScheduleName,
-  extractChannelInfo,
-  buildActorId,
+  resolveScheduleDelivery,
   saveCronRecord,
 } = require("./common");
 
@@ -48,11 +47,10 @@ async function main() {
   validateExpression(expression);
   validateTimezone(timezone);
 
-  // Determine channel info
-  const extracted = extractChannelInfo(userId);
-  const channel = channelArg || extracted.channel;
-  const channelTarget = channelTargetArg || extracted.channelTarget;
-  const actorId = buildActorId(channel, channelTarget);
+  // Keep the AgentCore Runtime owner separate from the current conversation's destination.
+  const { actorId, channelActorId, channel, channelTarget } = resolveScheduleDelivery(userId, {
+    channel: channelArg, channelTarget: channelTargetArg,
+  });
 
   // Generate schedule ID and name
   const scheduleId = generateScheduleId();
@@ -68,6 +66,7 @@ async function main() {
   const lambdaInput = JSON.stringify({
     userId: realUserId || userId,
     actorId,
+    channelActorId,
     channel,
     channelTarget,
     message,
@@ -109,6 +108,7 @@ async function main() {
       channel,
       channelTarget,
       actorId,
+      channelActorId,
       enabled: true,
       createdAt: now,
       updatedAt: now,

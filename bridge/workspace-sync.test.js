@@ -17,7 +17,7 @@
  * Note: S3Client creation is tested implicitly (SDK only in Docker image).
  * Run: cd bridge && node --test workspace-sync.test.js
  */
-const { describe, it, beforeEach, afterEach } = require("node:test");
+const { describe, it, beforeEach, afterEach, mock } = require("node:test");
 const assert = require("node:assert/strict");
 
 describe("workspace-sync credentials", () => {
@@ -559,9 +559,8 @@ describe("awaitRestore", () => {
     assert.deepEqual(warnings, [], "no timeout warning once the restore has settled");
   });
 
-  it("failed restore: logs the failure, resolves, and never warns about a timeout", async () => {
-    const result = await workspaceSync.awaitRestore(Promise.reject(new Error("boom")), 45000, { log });
-    assert.equal(result, "restored");
+  it("failed restore rejects and never warns about a timeout", async () => {
+    await assert.rejects(workspaceSync.awaitRestore(Promise.reject(new Error("boom")), 45000, { log }), /boom/);
     assert.deepEqual(warnings, ["[contract] Workspace restore failed: boom"]);
 
     mock.timers.tick(45000);
@@ -569,7 +568,7 @@ describe("awaitRestore", () => {
     assert.equal(warnings.length, 1, "no timeout warning after a settled (failed) restore");
   });
 
-  it("slow restore: warns after the wait and resolves so the gateway can start", async () => {
+  it("slow restore rejects at the deadline and keeps admission closed", async () => {
     let finishRestore;
     const slow = new Promise((resolve) => { finishRestore = resolve; });
     const pending = workspaceSync.awaitRestore(slow, 45000, { log });
@@ -579,16 +578,15 @@ describe("awaitRestore", () => {
     assert.deepEqual(warnings, [], "no warning before the wait elapses");
 
     mock.timers.tick(1);
-    const result = await pending;
-    assert.equal(result, "timeout");
-    assert.deepEqual(warnings, [
-      "[contract] Workspace restore still running after 45000ms — starting gateway anyway",
-    ]);
+    await assert.rejects(pending, /Workspace restore timed out after 45000ms/);
+    assert.equal(workspaceSync.getRestoreState(), "failed");
+    assert.deepEqual(warnings, []);
 
     // A late-finishing restore must not produce any further output.
     finishRestore();
     await Promise.resolve();
-    assert.equal(warnings.length, 1);
+    assert.equal(warnings.length, 0);
+    assert.equal(workspaceSync.getRestoreState(), "failed");
   });
 
   it("does not keep the process alive while waiting (timer is unref'd)", async () => {
@@ -632,13 +630,8 @@ describe("restore wait wiring in agentcore-contract.js", () => {
 
 // --- AGENTS.md template validation ---
 
-describe("AGENTS.md template in agentcore-contract.js", () => {
-  const fs = require("fs");
-  const path = require("path");
-  const source = fs.readFileSync(
-    path.join(__dirname, "agentcore-contract.js"),
-    "utf-8",
-  );
+describe("AGENTS.md template", () => {
+  const source = require("./gateway-config").renderAgents({ browserEnabled: true });
 
   it("does not tell the LLM to 'Read' skill files (read tool is denied)", () => {
     // The read tool is denied in OpenClaw's tool profile, so AGENTS.md must not
@@ -879,8 +872,7 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
   it("does not seed the cache for a file whose download failed", async () => {
     objects["telegram_1/.openclaw/workspace/BROKEN.md"] = "x";
     failGets.add("telegram_1/.openclaw/workspace/BROKEN.md");
-    const r = await workspaceSync.restoreWorkspace("telegram_1");
-    assert.equal(r.failed, 1);
+    await assert.rejects(workspaceSync.restoreWorkspace("telegram_1"), /incomplete/);
     assert.equal(fs.existsSync(path.join(tmpDir, ".openclaw", "workspace", "BROKEN.md")), false);
     assert.equal(fs.existsSync(path.join(tmpDir, ".openclaw", "workspace", "SOUL.md")), true);
 
@@ -897,16 +889,22 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
 
   // --- fill-missing restore (session-storage mount already had SOME state) ---
 
-  it("overwrite:false restores only files missing locally and keeps existing ones untouched", async () => {
+  it("overwrite:false restores only files missing locally and keeps existing ones untouched",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" }, async () => {
     const soul = path.join(tmpDir, ".openclaw", "workspace", "SOUL.md");
     fs.mkdirSync(path.dirname(soul), { recursive: true });
     fs.writeFileSync(soul, "soul LOCAL (fresher, from the mount mirror)\n");
-    objects["telegram_1/.openclaw/state/openclaw.sqlite"] = "SQLite format 3\0fake-db-bytes";
+    const sourcePath = path.join(tmpDir, "source.sqlite");
+    const db = new (require("node:sqlite").DatabaseSync)(sourcePath);
+    db.exec("CREATE TABLE records(value TEXT)");
+    db.close();
+    const databaseBytes = await workspaceSync.snapshotSqlite(sourcePath);
+    objects["telegram_1/.openclaw/state/openclaw.sqlite"] = databaseBytes;
 
     const r = await workspaceSync.restoreWorkspace("telegram_1", { overwrite: false });
     assert.deepEqual(r, { restored: 2, kept: 1, keptUnchanged: 0, failed: 0, hadState: true });
     assert.equal(fs.readFileSync(soul, "utf8"), "soul LOCAL (fresher, from the mount mirror)\n", "existing file kept");
-    assert.equal(fs.readFileSync(path.join(tmpDir, ".openclaw", "state", "openclaw.sqlite"), "latin1"), "SQLite format 3\0fake-db-bytes");
+    assert.deepEqual(fs.readFileSync(path.join(tmpDir, ".openclaw", "state", "openclaw.sqlite")), databaseBytes);
     assert.equal(fs.readFileSync(path.join(tmpDir, ".openclaw", "runtime-skills.json"), "utf8"), '{"version":1,"skills":{}}\n');
     assert.equal(puts.length, 0, "restore never PUTs");
     assert.equal(workspaceSync.getRestoreState(), "ready");
@@ -1138,8 +1136,7 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
 
     it("stays closed when one object could not be restored (a partially restored state dir must not reach S3)", async () => {
       failGets.add("telegram_1/.openclaw/runtime-skills.json");
-      const r = await workspaceSync.restoreWorkspace("telegram_1", { overwrite: false });
-      assert.equal(r.failed, 1);
+      await assert.rejects(workspaceSync.restoreWorkspace("telegram_1", { overwrite: false }), /incomplete/);
       assert.equal(workspaceSync.getRestoreState(), "failed");
       // The gateway would now create these fresh; none of it may be uploaded.
       fs.mkdirSync(path.join(tmpDir, ".openclaw", "state"), { recursive: true });
@@ -1581,14 +1578,26 @@ describe("change-driven backup", () => {
     assert.equal(await workspaceSync.flushPendingSaves("test"), null);
   });
 
-  it("watches the real state dir with fs.watch and uploads a changed file", async () => {
-    const started = workspaceSync.startChangeBackup("telegram_1", { debounceMs: 100, maxWaitMs: 2000 });
-    assert.ok(["watch", "poll"].includes(started.mode));
-    write("workspace/live.md", "live");
-    write("tmp/openclaw-0/gateway.state.lock.sqlite", "");
-    await sleep(600);
-    if (started.mode === "watch") {
+  it("uploads a changed file from the watcher callback and ignores lock events", async () => {
+    let changed;
+    const watcher = new (require("node:events").EventEmitter)();
+    watcher.close = () => {};
+    const watch = mock.method(fs, "watch", (_dir, _opts, callback) => {
+      changed = callback;
+      return watcher;
+    });
+    try {
+      const started = workspaceSync.startChangeBackup("telegram_1", { debounceMs: 100, maxWaitMs: 2000 });
+      assert.equal(started.mode, "watch");
+      write("workspace/live.md", "live");
+      write("tmp/openclaw-0/gateway.state.lock.sqlite", "");
+      changed("change", "workspace/live.md");
+      changed("change", "tmp/openclaw-0/gateway.state.lock.sqlite");
+      await sleep(250);
       assert.deepEqual(keys(), ["telegram_1/.openclaw/workspace/live.md"]);
+    } finally {
+      await workspaceSync.stopChangeBackup("test");
+      watch.mock.restore();
     }
   });
 
@@ -1619,7 +1628,7 @@ describe("change backup wiring in agentcore-contract.js", () => {
 
   it("starts the change backup once the gateway is ready, next to the periodic save", () => {
     const periodic = idx("workspaceSync.startPeriodicSave(namespace);");
-    const change = idx("workspaceSync.startChangeBackup(namespace);");
+    const change = idx("workspaceSync.startChangeBackup(namespace, liveAdopted ? { initialSweep: true } : undefined)");
     assert.ok(change > periodic && change - periodic < 200);
   });
 
@@ -1940,8 +1949,7 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
       s3.metadata[KEY] = { sha256: "0".repeat(64), encoding: "gzip" };
       s3.encodings[KEY] = "gzip";
       const fresh = freshModule();
-      const r = await fresh.restoreWorkspace(NS);
-      assert.equal(r.failed, 1);
+      await assert.rejects(fresh.restoreWorkspace(NS), /incomplete/);
       assert.equal(fresh.getRestoreState(), "failed");
       assert.equal(fs.existsSync(path.join(tmpDir, ".openclaw", REL)), false, "nothing handed to the gateway");
       assert.ok(warnings.some((w) => /sha256 mismatch/.test(w)), warnings.join("\n"));
@@ -1999,8 +2007,7 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
       s3.objects[KEY] = Buffer.alloc(101 * 1024);
       const fresh = freshModule();
       fresh._setLimitsForTests({ maxSqliteFileSize: 100 * 1024 });
-      const r = await fresh.restoreWorkspace(NS);
-      assert.equal(r.restored, 0);
+      await assert.rejects(fresh.restoreWorkspace(NS), /incomplete/);
       assert.ok(warnings.some((x) => /Skipping oversized file/.test(x)));
     },
   );
@@ -2066,5 +2073,369 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
     assert.equal(workspaceSync.DEFAULT_LARGE_SQLITE_MIN_INTERVAL_MS, 10 * 60 * 1000);
     workspaceSync.startChangeBackup(NS, { debounceMs: 10, maxWaitMs: 100, sqliteMinIntervalMs: 90_000, largeSqliteMinIntervalMs: 1_000 });
     assert.ok(logs.some((l) => /databases over 65536 bytes at most every 90s, gzip'd/.test(l)), logs.join("\n"));
+  });
+});
+
+describe("strict workspace restore", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const Module = require("node:module");
+  const modulePath = require.resolve("./workspace-sync");
+  let sync, root, state, savedHome, savedBucket, savedRegion, savedModule;
+  let realLoad, objects, send, calls, clientOptions, DatabaseSync;
+  const quiet = { warn() {} };
+  const local = (rel) => path.join(state, rel);
+  const write = (rel, body) => {
+    fs.mkdirSync(path.dirname(local(rel)), { recursive: true });
+    fs.writeFileSync(local(rel), body);
+  };
+
+  beforeEach(() => {
+    sync = null;
+    clientOptions = undefined;
+    savedModule = require.cache[modulePath];
+    if (hasNodeSqlite) ({ DatabaseSync } = require("node:sqlite"));
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-v2-"));
+    state = path.join(root, ".openclaw");
+    savedHome = process.env.HOME;
+    savedBucket = process.env.S3_USER_FILES_BUCKET;
+    savedRegion = process.env.AWS_REGION;
+    process.env.AWS_REGION = "us-west-2";
+    process.env.HOME = root;
+    process.env.S3_USER_FILES_BUCKET = "test-bucket";
+    objects = {};
+    calls = [];
+    send = async (cmd) => {
+      if (cmd.kind === "list") return { Contents: Object.entries(objects).map(([Key, body]) => ({ Key, Size: body.length })) };
+      if (cmd.kind === "get") return { Body: (async function* () { yield objects[cmd.input.Key]; })() };
+      return {};
+    };
+    realLoad = Module._load;
+    Module._load = function (name, ...rest) {
+      if (name !== "@aws-sdk/client-s3") return realLoad.call(this, name, ...rest);
+      const sdk = {
+        S3Client: function (options) {
+          clientOptions = options;
+          return { send: (cmd) => { calls.push(cmd); return send(cmd); } };
+        },
+      };
+      for (const [name, kind] of Object.entries({
+        ListObjectsV2Command: "list", GetObjectCommand: "get", HeadObjectCommand: "head", PutObjectCommand: "put",
+      })) sdk[name] = function (input) { this.kind = kind; this.input = input; };
+      return sdk;
+    };
+    delete require.cache[require.resolve("./workspace-sync")];
+    sync = require("./workspace-sync");
+  });
+
+  afterEach(async () => {
+    try {
+      mock.timers.reset();
+      await sync?.cleanup();
+    } finally {
+      mock.restoreAll();
+      Module._load = realLoad;
+      if (savedModule) require.cache[modulePath] = savedModule; else delete require.cache[modulePath];
+      if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+      if (savedBucket === undefined) delete process.env.S3_USER_FILES_BUCKET; else process.env.S3_USER_FILES_BUCKET = savedBucket;
+      if (savedRegion === undefined) delete process.env.AWS_REGION; else process.env.AWS_REGION = savedRegion;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects failed and partially failed barriers", async () => {
+    await assert.rejects(sync.awaitRestore(Promise.reject(new Error("denied")), 50, { log: quiet }), /denied/);
+    await assert.rejects(sync.awaitRestore(Promise.resolve({ failed: 1 }), 50, { log: quiet }), /incomplete|failed/i);
+  });
+
+  it("does not open the strict barrier when the bucket is missing", async () => {
+    delete process.env.S3_USER_FILES_BUCKET;
+    delete require.cache[require.resolve("./workspace-sync")];
+    sync = require("./workspace-sync");
+    await assert.rejects(sync.restoreWorkspace("telegram_1"), /S3_USER_FILES_BUCKET/);
+    assert.throws(() => sync.assertRestoreReady(), /restore/i);
+  });
+
+  it("timeout blocks late restore writes, uploads and further restore attempts", async () => {
+    let finishList;
+    send = () => new Promise((resolve) => { finishList = resolve; });
+    mock.timers.enable({ apis: ["setTimeout"] });
+    const restore = sync.restoreWorkspace("telegram_1");
+    const wait = sync.awaitRestore(restore, 100, { log: quiet });
+    const rejected = assert.rejects(wait, /timed out|timeout/i);
+    mock.timers.tick(100);
+    await rejected;
+    finishList({ Contents: [{ Key: "telegram_1/.openclaw/history.json", Size: 2 }] });
+    await assert.rejects(restore);
+    assert.equal(fs.existsSync(local("history.json")), false);
+    write("empty.json", "{}");
+    assert.equal(await sync.saveFile("telegram_1", "empty.json"), false);
+    assert.equal(sync.getRestoreState(), "failed");
+    assert.throws(() => sync.assertRestoreReady(), /restore/i);
+    await assert.rejects(sync.restoreWorkspace("telegram_1"));
+    assert.equal(calls.filter((c) => c.kind === "put" || c.kind === "get").length, 0);
+  });
+
+  it("aborts an in-flight download on timeout without publishing its partial file", async () => {
+    const { Readable } = require("node:stream");
+    const body = new Readable({ read() {} });
+    objects["telegram_1/.openclaw/history.json"] = Buffer.from("complete");
+    write("history.json", "saved");
+    const normalSend = send;
+    send = async (cmd) => cmd.kind === "get" ? { Body: body } : normalSend(cmd);
+    mock.timers.enable({ apis: ["setTimeout"] });
+    const restore = sync.restoreWorkspace("telegram_1");
+    const wait = sync.awaitRestore(restore, 100, { log: quiet });
+    const rejected = assert.rejects(wait, /timed out/i);
+    body.push(Buffer.from("partial"));
+    await new Promise(setImmediate);
+    mock.timers.tick(100);
+    await rejected;
+    await assert.rejects(restore);
+    assert.equal(fs.readFileSync(local("history.json"), "utf8"), "saved");
+    assert.deepEqual(fs.readdirSync(state), ["history.json"]);
+    assert.equal(sync.getRestoreState(), "failed");
+  });
+
+  it("opens the barrier only after a confirmed empty listing for a new user", async () => {
+    assert.throws(() => sync.assertRestoreReady(), /restore/i);
+    write("workspace/notes.md", "notes");
+    assert.equal(await sync.uploadStateFile("telegram_1", "workspace/notes.md"), "skipped");
+    const restore = sync.restoreWorkspace("telegram_1");
+    assert.equal(await sync.awaitRestore(restore, 100), "restored");
+    sync.assertRestoreReady();
+    assert.equal(await sync.saveFile("telegram_1", "workspace/notes.md"), true);
+    assert.equal(calls.filter((c) => c.kind === "put").length, 1);
+  });
+
+  it("keeps newer mount files and fills a zero-byte local database from S3",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" }, async () => {
+    const dbFile = path.join(root, "saved.sqlite");
+    const db = new DatabaseSync(dbFile);
+    db.exec("CREATE TABLE history (text TEXT); INSERT INTO history VALUES ('saved turn')");
+    db.close();
+    objects["telegram_1/.openclaw/state/openclaw.sqlite"] = fs.readFileSync(dbFile);
+    objects["telegram_1/.openclaw/workspace/notes.md"] = Buffer.from("older");
+    write("state/openclaw.sqlite", "");
+    write("workspace/notes.md", "newer");
+    const result = await sync.restoreWorkspace("telegram_1", { overwrite: false });
+    assert.equal(result.restored, 1);
+    assert.equal(fs.readFileSync(local("workspace/notes.md"), "utf8"), "newer");
+    const restored = new DatabaseSync(local("state/openclaw.sqlite"), { readOnly: true });
+    assert.equal(restored.prepare("SELECT text FROM history").get().text, "saved turn");
+    restored.close();
+  });
+
+  it("rejects failed downloads without overwriting the good local copy", async () => {
+    objects["telegram_1/.openclaw/history.json"] = Buffer.from("remote");
+    write("history.json", "good local");
+    const normalSend = send;
+    send = async (cmd) => {
+      if (cmd.kind === "get") return { Body: (async function* () { yield "partial"; throw new Error("interrupted"); })() };
+      return normalSend(cmd);
+    };
+    await assert.rejects(sync.restoreWorkspace("telegram_1"), /incomplete|failed/i);
+    assert.equal(fs.readFileSync(local("history.json"), "utf8"), "good local");
+    assert.equal(sync.getRestoreState(), "failed");
+    assert.deepEqual(fs.readdirSync(state), ["history.json"]);
+  });
+
+  it("does not accept an empty or invalid SQLite backup as restored state", async () => {
+    objects["telegram_1/.openclaw/state/openclaw.sqlite"] = Buffer.from("");
+    await assert.rejects(sync.restoreWorkspace("telegram_1"), /incomplete|failed/i);
+    assert.equal(fs.existsSync(local("state/openclaw.sqlite")), false);
+  });
+
+  it("rejects a corrupt nonempty SQLite download without replacing saved state", async () => {
+    objects["telegram_1/.openclaw/state/openclaw.sqlite"] = Buffer.from("corrupt database");
+    write("state/openclaw.sqlite", "original");
+    await assert.rejects(sync.restoreWorkspace("telegram_1"), /incomplete|failed/i);
+    assert.equal(fs.readFileSync(local("state/openclaw.sqlite"), "utf8"), "original");
+  });
+
+  it("rejects a truncated listing without a continuation token", async () => {
+    send = async () => ({ Contents: [], IsTruncated: true });
+    await assert.rejects(sync.restoreWorkspace("telegram_1"), /listing/i);
+    assert.equal(sync.getRestoreState(), "failed");
+  });
+
+  it("does not treat oversized required state as an empty successful restore", async () => {
+    sync._setLimitsForTests({ maxFileSize: 2 });
+    objects["telegram_1/.openclaw/history.json"] = Buffer.from("important");
+    await assert.rejects(sync.restoreWorkspace("telegram_1"), /incomplete|failed/i);
+    assert.equal(sync.getRestoreState(), "failed");
+  });
+
+  it("validates namespace and rejects a different owner before any upload", async () => {
+    await assert.rejects(sync.restoreWorkspace("../other"), /namespace/i);
+    assert.equal(calls.length, 0);
+    await sync.restoreWorkspace("telegram_1");
+    write("history.json", "owned");
+    await assert.rejects(sync.saveFile("telegram_2", "history.json"), /namespace/i);
+    await assert.rejects(sync.restoreWorkspace("telegram_2"), /namespace/i);
+    assert.equal(calls.filter((c) => c.kind === "put").length, 0);
+  });
+
+  it("blocks a local directory symlink from redirecting a restore outside state", async () => {
+    write("placeholder", "x");
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, local("workspace"));
+    objects["telegram_1/.openclaw/workspace/notes.md"] = Buffer.from("private");
+    await assert.rejects(sync.restoreWorkspace("telegram_1"), /incomplete|failed|symlink/i);
+    assert.equal(fs.existsSync(path.join(outside, "notes.md")), false);
+  });
+
+  it("does not enqueue, traverse or retry generated plugin skill links", async (t) => {
+    await sync.restoreWorkspace("telegram_1");
+    const installed = path.join(root, "installed-plugin-skill");
+    fs.mkdirSync(installed);
+    fs.writeFileSync(path.join(installed, "SKILL.md"), "bundled skill");
+    fs.mkdirSync(local("plugin-skills"), { recursive: true });
+    for (const name of ["browser-automation", "canvas"]) {
+      fs.symlinkSync(installed, local(`plugin-skills/${name}`));
+    }
+    // Drive watch events directly so the retry assertions do not depend on OS timing.
+    t.mock.method(fs, "watch", () => ({ on() {}, close() {} }));
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const scheduled = t.mock.method(globalThis, "setTimeout");
+    const warnings = t.mock.method(console, "warn", () => {});
+    const reads = t.mock.method(fs, "readdirSync");
+    sync.startChangeBackup("telegram_1", { debounceMs: 10, maxWaitMs: 20 });
+    const generated = [
+      "plugin-skills",
+      "plugin-skills/",
+      "plugin-skills/browser-automation",
+      "plugin-skills/canvas",
+      "plugin-skills/canvas/SKILL.md",
+      "plugin-skills/canvas/state.sqlite-wal",
+    ];
+    for (const rel of generated) {
+      assert.equal(sync.changeTarget(rel), null, rel);
+      sync.markChanged(rel);
+    }
+    assert.equal(scheduled.mock.callCount(), 0, "generated changes must not schedule a flush");
+    for (let i = 0; i < 3; i++) {
+      const result = await sync.flushPendingSaves("generated-links");
+      assert.equal(result.failed, 0);
+      assert.equal(result.deferred, 0);
+      t.mock.timers.tick(100);
+    }
+    assert.equal(scheduled.mock.callCount(), 0, "no retry timers remain");
+    assert.deepEqual(sync.walkDir(state), []);
+    assert.deepEqual(reads.mock.calls.map((call) => call.arguments[0]), [state]);
+    for (const rel of generated.slice(0, -1)) {
+      assert.equal(await sync.saveFile("telegram_1", rel), false, rel);
+    }
+    assert.equal(await sync.uploadStateFile("telegram_1", "plugin-skills/canvas/SKILL.md", { force: true }), "skipped");
+    sync.markChanged(null);
+    const sweep = await sync.flushPendingSaves("generated-sweep");
+    assert.equal(sweep.failed, 0);
+    assert.equal(sweep.deferred, 0);
+    await sync.saveWorkspace("telegram_1");
+    await sync.stopChangeBackup("generated-stop");
+    assert.equal(calls.filter((c) => c.kind === "put").length, 0);
+    assert.equal(warnings.mock.callCount(), 0);
+  });
+
+  it("still backs up user skill content outside the generated root", async (t) => {
+    await sync.restoreWorkspace("telegram_1");
+    const userFiles = [
+      "skills/custom/SKILL.md",
+      "workspace/skills/custom/SKILL.md",
+      "workspace/plugin-skills/custom/SKILL.md",
+      "plugin-skills-custom/SKILL.md",
+      "runtime-skills.json",
+    ];
+    for (const rel of userFiles) write(rel, "user content");
+    // A generated link must not consume the walker's cycle guard for user content.
+    fs.mkdirSync(local("plugin-skills"));
+    fs.symlinkSync(local("workspace/plugin-skills/custom"), local("plugin-skills/custom"));
+    assert.deepEqual(sync.walkDir(state).sort(), [...userFiles].sort());
+    t.mock.method(fs, "watch", () => ({ on() {}, close() {} }));
+    sync.startChangeBackup("telegram_1");
+    for (const rel of userFiles) {
+      assert.equal(sync.changeTarget(rel), rel);
+      sync.markChanged(rel);
+    }
+    assert.equal((await sync.flushPendingSaves("user-skills")).uploaded, userFiles.length);
+    write(userFiles[0], "updated user content");
+    assert.equal(await sync.saveFile("telegram_1", userFiles[0]), true);
+    write(userFiles[1], "updated workspace content");
+    await sync.saveWorkspace("telegram_1");
+    assert.deepEqual(
+      [...new Set(calls.filter((c) => c.kind === "put").map((c) => c.input.Key))].sort(),
+      userFiles.map((rel) => `telegram_1/.openclaw/${rel}`).sort(),
+    );
+  });
+
+  it("still rejects ordinary and nested plugin-skills symlink escapes during backup", async (t) => {
+    await sync.restoreWorkspace("telegram_1");
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, "SKILL.md"), "must stay outside");
+    fs.mkdirSync(local("workspace"), { recursive: true });
+    fs.mkdirSync(local("skills"));
+    fs.symlinkSync(path.join(outside, "SKILL.md"), local("workspace/escape.md"));
+    fs.symlinkSync(outside, local("workspace/plugin-skills"));
+    fs.symlinkSync(outside, local("plugin-skills-custom"));
+    fs.symlinkSync(outside, local("skills/linked"));
+    const escapes = [
+      "workspace/escape.md",
+      "workspace/plugin-skills/SKILL.md",
+      "plugin-skills-custom/SKILL.md",
+      "skills/linked/SKILL.md",
+    ];
+    t.mock.method(fs, "watch", () => ({ on() {}, close() {} }));
+    sync.startChangeBackup("telegram_1");
+    for (const rel of escapes) {
+      assert.equal(sync.changeTarget(rel), rel);
+      await assert.rejects(sync.saveFile("telegram_1", rel), /State path contains symlink/);
+      await assert.rejects(sync.uploadStateFile("telegram_1", rel, { force: true }), /State path contains symlink/);
+      sync.markChanged(rel);
+    }
+    assert.equal((await sync.flushPendingSaves("symlink-escapes")).failed, escapes.length);
+    await sync.saveWorkspace("telegram_1");
+    assert.equal(calls.filter((c) => c.kind === "put").length, 0);
+  });
+
+  it("still rejects restore through a generated plugin skill link", async () => {
+    const outside = path.join(root, "installed-skill");
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, "SKILL.md"), "original");
+    fs.mkdirSync(local("plugin-skills"), { recursive: true });
+    fs.symlinkSync(outside, local("plugin-skills/canvas"));
+    objects["telegram_1/.openclaw/plugin-skills/canvas/SKILL.md"] = Buffer.from("replacement");
+    await assert.rejects(sync.restoreWorkspace("telegram_1"), /incomplete|failed|symlink/i);
+    assert.equal(sync.getRestoreState(), "failed");
+    assert.equal(fs.readFileSync(path.join(outside, "SKILL.md"), "utf8"), "original");
+    assert.equal(calls.filter((c) => c.kind === "get").length, 0);
+  });
+
+  it("fails closed when configured STS credentials expire, including a cached SDK provider", async () => {
+    mock.timers.enable({ apis: ["Date"], now: 1000 });
+    sync.configureCredentials({ accessKeyId: "key", secretAccessKey: "secret", sessionToken: "token", expiration: new Date(2000) });
+    sync.getS3Client();
+    assert.equal(typeof clientOptions.credentials, "function");
+    assert.equal((await clientOptions.credentials()).accessKeyId, "key");
+    mock.timers.tick(1001);
+    assert.throws(() => sync.getS3Client(), /expired/i);
+    await assert.rejects(clientOptions.credentials(), /expired/i);
+  });
+
+  it("a bound provider failure keeps strict restore closed without parent credentials", async () => {
+    let refreshes = 0;
+    const provider = async () => { refreshes++; throw new Error("STS unavailable"); };
+    sync.configureCredentialProvider(provider);
+    assert.throws(() => sync.configureCredentialProvider(async () => ({})), /already bound/);
+    await assert.rejects(sync.restoreWorkspace("telegram_1"), /STS unavailable/);
+    assert.equal(typeof clientOptions.credentials, "function");
+    assert.equal(sync.getRestoreState(), "failed");
+    const attempted = refreshes;
+    write("notes.txt", "must stay local");
+    await sync.saveWorkspace("telegram_1");
+    assert.equal(refreshes, attempted);
+    assert.ok(!calls.some((command) => command.kind === "put"));
   });
 });

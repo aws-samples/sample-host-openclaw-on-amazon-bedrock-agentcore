@@ -19,16 +19,16 @@ Running an AI agent with tool access (bash, web fetch, file operations) on a loc
 | Threat | Local PC / VPS | AgentCore on AWS |
 |---|---|---|
 | **Multi-tenant data leakage** | Shared filesystem; one user can read another's data | Per-user Firecracker microVMs + STS session-scoped S3 credentials restrict access to `{namespace}/*` |
-| **Credential theft** | Plaintext `.env` files, shell history | Secrets Manager (KMS-encrypted, audited via CloudTrail); credentials never written to disk or env vars |
+| **Credential theft** | Plaintext `.env` files, shell history | Long-lived secrets in Secrets Manager (KMS-encrypted, audited via CloudTrail); temporary scoped credentials in runtime files read through `credential_process` |
 | **Network exposure** | Open ports, direct internet exposure | VPC private subnets, no public IPs on containers, 7+ VPC endpoints keep traffic on AWS backbone |
 | **Abuse / runaway costs** | No budget controls | Daily token budget (1M tokens), daily cost budget ($5 USD), anomaly detection, CloudWatch alarms |
 | **Audit trail** | None or manual log review | CloudTrail (most accounts already have one; optional dedicated trail available), CloudWatch access logs, Bedrock invocation logging |
-| **Lateral movement** | Full host access, all env vars | STS scoped credentials + tool deny list + credential env var blocklist; zero-access fallback if STS fails |
+| **Lateral movement** | Full host access, all env vars | STS scoped credentials + tool deny list + credential env var blocklist; V2 activation fails closed if credentials are unavailable |
 | **OS / container CVEs** | Manual patching | ECR image scanning on push, managed runtime, multi-stage Docker build (no build tools in runtime) |
 | **DDoS / abuse** | Direct exposure, no rate limits | API Gateway throttling (burst 50, sustained 100 req/s), webhook signature validation |
-| **Secret rotation** | Manual, often forgotten | Secrets Manager with 15-min cache TTL, STS credential refresh every 45 min |
+| **Secret rotation** | Manual, often forgotten | Secrets Manager with 15-min cache TTL; scoped credentials checked before turns and persistence operations, refreshed when remaining validity is insufficient |
 | **User access control** | None or basic auth | DynamoDB allowlist (registration_open=false), Cognito admin-provisioned identities |
-| **DNS rebinding / SSRF** | No protection | IP blocklists (loopback, private, link-local, IMDS), DNS resolution validation, redirect chain validation |
+| **DNS rebinding / SSRF** | No protection | See [Application-Level Security](#37-application-level-security); full OpenClaw tool behavior requires deployed-image verification |
 | **Compliance evidence** | None | cdk-nag AwsSolutions checks enforced at deploy time, CloudTrail file validation |
 
 ---
@@ -90,7 +90,7 @@ Each user session runs in a dedicated Firecracker microVM managed by AgentCore R
 
 #### STS Session-Scoped Credentials
 
-On container init, the contract server calls `STS:AssumeRole` on the execution role with a **session policy** that restricts:
+During user activation, the contract server calls `STS:AssumeRole` on the execution role with a **session policy** that restricts:
 
 | Resource | Scope |
 |---|---|
@@ -128,13 +128,13 @@ The execution role's trust policy requires `sts:RoleSessionName` matching `scope
 
 Credential files are written using write-to-tmp-then-rename (`fs.writeFileSync` to `.tmp`, then `fs.renameSync`) to prevent `credential_process` from reading partially-written files during refresh.
 
-#### Zero-Access Fallback
+#### Credential Failure
 
-If `EXECUTION_ROLE_ARN` is not set or STS `AssumeRole` fails, OpenClaw starts with zero AWS access — all credential env vars are stripped, no `credential_process` is configured. Tools fail gracefully but no cross-user data access is possible.
+Missing execution-role configuration or failed STS acquisition blocks V2 activation; chat and cron are not dispatched.
 
 #### Credential Refresh
 
-A 45-minute interval timer re-assumes the role and updates credential files (STS self-assume max duration is 1 hour for role chaining).
+Scoped credentials are checked before turns and persistence operations, and refreshed when their remaining validity is insufficient.
 
 #### Proxy Trust Boundary
 
@@ -186,23 +186,15 @@ Users frequently need to store third-party API keys for skills and integrations.
 
 **Rotation and caching**:
 - Secrets Manager values cached for 15 minutes in Lambda (rotated secrets reflected within 15 min)
-- STS scoped credentials refresh every 45 minutes
+- Scoped credentials are checked before turns and persistence operations, and refreshed when their remaining validity is insufficient
 - Cognito passwords are deterministic (HMAC-derived) — never stored or user-facing
-- Gateway token and webhook secret fetched eagerly at container boot
+- User credentials and gateway secrets are acquired after immutable user binding, not during V2 snapshot preparation
 
 ### 3.7 Application-Level Security
 
 #### SSRF Prevention
 
-The lightweight agent's `web_fetch` tool implements multi-layer SSRF protection:
-
-| Check | Details |
-|---|---|
-| IP blocklist (pre-connect) | Blocks loopback (`127.*`), private (`10.*`, `172.16-31.*`, `192.168.*`), link-local (`169.254.*` — covers IMDS), RFC 6598, IPv6 unique local/link-local, IPv4-mapped IPv6 addresses |
-| Hostname blocklist | `localhost`, `metadata.google.internal`, `metadata.internal`, `instance-data` |
-| DNS rebinding mitigation | `validateResolvedIps()` resolves hostname and checks resolved IPs against blocklist before connecting |
-| Redirect validation | Each redirect target re-validated (URL safety + DNS resolution) with depth limit of 3 |
-| Protocol restriction | Only `http:` and `https:` allowed |
+The former startup shim and its custom web-fetch SSRF implementation are removed. Do not treat that retired implementation as protection for full OpenClaw tools. Current tool behavior and network controls must be assessed on the deployed V2 image.
 
 #### Path Traversal Prevention
 
@@ -216,9 +208,7 @@ The lightweight agent's `web_fetch` tool implements multi-layer SSRF protection:
 |---|---|
 | S3 filenames | Regex validation, namespace prefix enforcement |
 | User namespaces | `VALID_NAMESPACE = /^[a-zA-Z][a-zA-Z0-9_-]{1,64}$/` |
-| Web fetch HTML output | Script/style/noscript block removal, HTML entity decoding, tag stripping |
 | Workspace content | `sanitizeWorkspaceContent()` escapes code fence characters (backticks, tildes) to prevent fence-break injection in system prompts |
-| Search queries | Truncated to 500 characters |
 | Image format validation | Checked against `VALID_BEDROCK_FORMATS` set (jpeg, png, gif, webp) |
 
 #### Tool Security
@@ -313,9 +303,9 @@ Bedrock Guardrails add a content-level defense layer that evaluates both user in
 
 **How it works**: The proxy injects `guardrailConfig` into every Bedrock Converse/ConverseStream API call. Bedrock evaluates the guardrail server-side — blocked inputs get a rejection message, blocked outputs are replaced or anonymized. The IAM role has `bedrock:ApplyGuardrail` permission.
 
-**Opt-out**: Set `"enable_guardrails": false` in `cdk.json`. This skips the entire `GuardrailsStack` — no guardrail resources, no guardrail charges, no content filtering.
+**Opt-out**: For a fresh deployment, set `"enable_guardrails": false` in `cdk.json`. This skips the entire `GuardrailsStack` — no guardrail resources, no guardrail charges, no content filtering. For existing deployments, first follow the [dependency check](guardrails.md#disable).
 
-> **Cost note**: Guardrails add ~$0.75 per 1,000 text units on top of model inference costs. See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling guardrails removes content-level protections but other security layers (STS scoping, tool deny list, SSRF protection) remain active.
+> **Cost note**: Guardrails add ~$0.75 per 1,000 text units on top of model inference costs. See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling guardrails removes content-level protections but other security layers (STS scoping, tool deny list) remain active.
 
 ---
 

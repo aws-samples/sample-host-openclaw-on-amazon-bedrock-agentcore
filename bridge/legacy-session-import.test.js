@@ -169,9 +169,9 @@ describe("legacy import wiring in agentcore-contract.js", () => {
     const spawnDoctor = idx('["doctor", "--fix", "--non-interactive"]');
     const success = idx("if (result.code === 0 && remaining.length === 0) {");
     const write = idx("legacySessionImport.writeReceipts(OPENCLAW_DIR, fingerprints)");
-    const quarantine = idx("Import did not complete. Quarantine what is left");
+    const failure = idx('throw new Error("Legacy session import did not complete")');
     assert.ok(fp < spawnDoctor, "hash before doctor runs");
-    assert.ok(success < write && write < quarantine, "receipts written inside the success branch only");
+    assert.ok(success < write && write < failure, "receipts written inside the success branch only");
   });
 
   it("ships the module in the image", () => {
@@ -188,7 +188,7 @@ describe("retired-files manifest: files doctor removed must not come back from S
   // 990 .jsonl transcripts. A same-session restart's fill-missing restore
   // brought all 1010 back from S3; the receipt skipped the sessions.json
   // import, doctor did not run, and the gateway exited 78 three times
-  // ("Legacy workspace setup state requires migration") -> shim forever.
+  // ("Legacy workspace setup state requires migration") blocks readiness.
   let dir, warnings;
   const log = { warn: (m) => warnings.push(m), log: () => {} };
   const write = (rel, body) => {
@@ -349,15 +349,15 @@ describe("retired-files wiring in agentcore-contract.js (F5)", () => {
     const success = idx("if (result.code === 0 && remaining.length === 0) {");
     const diff = idx("legacySessionImport.diffRetiredFiles(stateBeforeDoctor, OPENCLAW_DIR)");
     const manifest = idx("legacySessionImport.writeRetiredManifest(OPENCLAW_DIR, retired)");
-    const quarantine = idx("Import did not complete. Quarantine what is left");
+    const failure = idx('throw new Error("Legacy session import did not complete")');
     assert.ok(fp < spawnDoctor, "fingerprint before doctor runs");
-    assert.ok(success < diff && diff < manifest && manifest < quarantine, "manifest written inside the success branch only");
+    assert.ok(success < diff && diff < manifest && manifest < failure, "manifest written inside the success branch only");
   });
 
   it("prunes resurrected files after EVERY restore, before the config write and before deciding on doctor", () => {
     const restored = idx("await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);");
-    const prune = idx("const resurrected = pruneResurrectedLegacyFiles();");
-    const config = source.indexOf("writeOpenClawConfig();", restored);
+    const prune = idx("const resurrected = liveAdopted ? { changed: [] } : pruneResurrectedLegacyFiles();");
+    const config = source.indexOf("writeOpenClawConfig({ preserveSeedFiles: liveAdopted });", restored);
     const doctor = idx("migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 })");
     assert.ok(restored < prune && prune < config && config < doctor);
     assert.ok(source.includes("legacySessionImport.pruneRetiredFiles(OPENCLAW_DIR)"));
@@ -388,8 +388,8 @@ describe("import records reach S3 immediately (F6)", () => {
     const receipts = idx("const receipts = legacySessionImport.writeReceipts(OPENCLAW_DIR, fingerprints);");
     const manifest = idx("const manifest = legacySessionImport.writeRetiredManifest(OPENCLAW_DIR, retired);");
     const backup = idx("await backupImportRecords([...receipts, ...(manifest ? [manifest.path] : [])]);");
-    const quarantine = idx("Import did not complete. Quarantine what is left");
-    assert.ok(success < receipts && receipts < manifest && manifest < backup && backup < quarantine);
+    const failure = idx('throw new Error("Legacy session import did not complete")');
+    assert.ok(success < receipts && receipts < manifest && manifest < backup && backup < failure);
     const helper = idx("async function backupImportRecords(absolutePaths)");
     assert.ok(source.slice(helper, helper + 1200).includes("workspaceSync.saveFile(namespace, rel)"));
   });

@@ -1,126 +1,33 @@
 ---
 name: agentcore-operations
-description: "OpenClaw on AgentCore Runtime operations — deployment (CDK + Starter Toolkit hybrid), Docker build/push, runtime management, session lifecycle, debugging, adding new channels, and common gotchas. Use this skill for deployment, troubleshooting, operations questions, adding new messaging channels, or when something isn't working."
+description: "OpenClaw on AgentCore Runtime operations — deployment (CDK + pinned V2 SDK), Docker build/push, AgentCore Runtime management, session lifecycle, debugging, adding new channels, and common gotchas. Use this skill for deployment, troubleshooting, operations questions, adding new messaging channels, or when something isn't working."
 user-invocable: true
 ---
 
 # OpenClaw on AgentCore — Operations Guide
 
-## Hybrid Deployment Architecture
+## V2 Deployment Architecture
 
-CDK manages infrastructure. AgentCore Starter Toolkit manages the container runtime.
-
-| Component | Managed By |
-|-----------|-----------|
-| VPC, NAT, VPC Endpoints | CDK (`OpenClawVpc`) |
-| KMS, Secrets, Cognito | CDK (`OpenClawSecurity`) |
-| ECR repo, S3, SG, IAM Role | CDK (`OpenClawAgentCore`) |
-| Router Lambda, API Gateway, DynamoDB | CDK (`OpenClawRouter`) |
-| Cron Lambda, EventBridge Scheduler | CDK (`OpenClawCron`) |
-| Dashboards, Alarms | CDK (`OpenClawObservability`, `OpenClawTokenMonitoring`) |
-| **Runtime, Endpoint, Docker image** | **Starter Toolkit / direct API** |
-
-### Why hybrid?
-- AgentCore Runtime is ARM64 — local x86 machines can't easily cross-compile
-- Starter Toolkit supports CodeBuild (cloud ARM64 build) and local-build modes
-- CDK's CfnRuntime has L1 property gaps; direct API gives full control
-- AgentCore console only shows metrics for Starter Toolkit-created runtimes
-
----
+CDK manages foundation and dependent stacks. Phase 2 uses the pinned SDK controller because CloudFormation/CDK currently cannot set `platformVersion`. The controller explicitly selects V2, preserves existing configuration, verifies READY/readback, and performs a billed full-OpenClaw chat warmup. Follow [the runbook](../../docs/runtime-v2.md) for setup and validation.
 
 ## Deployment Playbook
 
-### 1. CDK Infrastructure Deploy
-
 ```bash
-source .venv/bin/activate
-export CDK_DEFAULT_ACCOUNT=<ACCOUNT_ID> CDK_DEFAULT_REGION=us-west-2
-cdk deploy --all --require-approval never
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+uv venv .venv-deploy
+uv pip sync --python .venv-deploy/bin/python requirements-deploy.txt
+./scripts/deploy.sh                    # Fresh V2 release_1
 ```
 
-### 2. Build & Push Docker Image
+The default manifest is `.runtime/runtime-v2.json`; CDK context is `runtime_manifest`. Foundation-only `--phase1` needs no manifest. Dependent `--phase3` requires successful real-chat warmup and V2 readback. For changed images/configuration, preserve the previous manifest and use a new immutable endpoint:
 
 ```bash
-# Build locally (ARM64)
-cd bridge && sudo docker build --platform linux/arm64 -t openclaw-bridge:v${TAG} .
-
-# Login to ECR
-aws ecr get-login-password --region us-west-2 | \
-  sudo docker login --username AWS --password-stdin \
-  <ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com
-
-# Tag & push
-ECR=<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/bedrock-agentcore-openclaw_agent
-sudo docker tag openclaw-bridge:v${TAG} ${ECR}:v${TAG}
-sudo docker push ${ECR}:v${TAG}
+./scripts/deploy.sh --runtime-only --endpoint-name release_2
+./scripts/deploy.sh --phase3
 ```
 
-### 3. Update Runtime
-
-**CRITICAL: `update-agent-runtime` is a FULL REPLACE. Omitting `--environment-variables` wipes ALL env vars.**
-
-```bash
-aws bedrock-agentcore-control update-agent-runtime \
-  --agent-runtime-id <RUNTIME_ID> \
-  --role-arn "arn:aws:iam::<ACCOUNT_ID>:role/openclaw-agentcore-execution-role-us-west-2" \
-  --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"${ECR}:v${TAG}\"}}" \
-  --network-configuration '{"networkMode":"VPC","networkModeConfig":{"securityGroups":["<SECURITY_GROUP_ID>"],"subnets":["<PRIVATE_SUBNET_1>","<PRIVATE_SUBNET_2>"]}}' \
-  --environment-variables '{
-    "AWS_REGION":"us-west-2",
-    "BEDROCK_AGENTCORE_MEMORY_ID":"<MEMORY_ID>",
-    "BEDROCK_AGENTCORE_MEMORY_NAME":"openclaw_agent_mem",
-    "BEDROCK_MODEL_ID":"global.anthropic.claude-opus-4-6-v1",
-    "COGNITO_CLIENT_ID":"<COGNITO_CLIENT_ID>",
-    "COGNITO_PASSWORD_SECRET_ID":"openclaw/cognito-password-secret",
-    "COGNITO_USER_POOL_ID":"<COGNITO_USER_POOL_ID>",
-    "CRON_LAMBDA_ARN":"arn:aws:lambda:us-west-2:<ACCOUNT_ID>:function:openclaw-cron-executor",
-    "CRON_LEAD_TIME_MINUTES":"5",
-    "EVENTBRIDGE_ROLE_ARN":"arn:aws:iam::<ACCOUNT_ID>:role/openclaw-cron-scheduler-role-us-west-2",
-    "EVENTBRIDGE_SCHEDULE_GROUP":"openclaw-cron",
-    "EXECUTION_ROLE_ARN":"arn:aws:iam::<ACCOUNT_ID>:role/openclaw-agentcore-execution-role-us-west-2",
-    "GATEWAY_TOKEN_SECRET_ID":"openclaw/gateway-token",
-    "IDENTITY_TABLE_NAME":"openclaw-identity",
-    "S3_USER_FILES_BUCKET":"openclaw-user-files-<ACCOUNT_ID>-us-west-2",
-    "SUBAGENT_BEDROCK_MODEL_ID":"global.anthropic.claude-opus-4-6-v1",
-    "BROWSER_IDENTIFIER":"<BROWSER_ID>"
-  }' \
-  --region us-west-2
-```
-
-### 4. Stop Old Sessions (REQUIRED after runtime update)
-
-Runtime updates do NOT replace running containers. You must stop old sessions manually.
-
-```bash
-# Find session ID
-SID=$(aws dynamodb get-item --table-name openclaw-identity --region us-west-2 \
-  --key '{"PK":{"S":"USER#<userId>"},"SK":{"S":"SESSION"}}' \
-  --query 'Item.sessionId.S' --output text)
-
-# Stop it
-agentcore stop-session -a openclaw_agent -s "$SID"
-
-# Delete DynamoDB record to force new session creation
-aws dynamodb delete-item --table-name openclaw-identity --region us-west-2 \
-  --key '{"PK":{"S":"USER#<userId>"},"SK":{"S":"SESSION"}}'
-```
-
-### 5. Verify
-
-```bash
-# Check runtime status
-aws bedrock-agentcore-control get-agent-runtime \
-  --agent-runtime-id <RUNTIME_ID> --region us-west-2 \
-  --query '{status:status,version:agentRuntimeVersion,image:agentRuntimeArtifact.containerConfiguration.containerUri}'
-
-# Test invoke
-agentcore invoke '{"action":"status"}' -a openclaw_agent
-
-# Test chat (new session)
-agentcore invoke '{"action":"chat","userId":"test","actorId":"test:t1","channel":"test","message":"hi"}' -a openclaw_agent
-```
-
----
+Use `--image-uri "$IMAGE_URI"` for a reviewed prebuilt ARM64 image. Existing routes keep their AgentCore Runtime/endpoint/version. Never delete SESSION records, stop all users, or repoint an existing endpoint to force upgrades. A session-specific stop uses the saved ARN, endpoint name and session ID and leaves that route intact. No V1 maintenance, fallback, platform selection or enrollment opt-in flags exist.
 
 ## Debugging Playbook
 
@@ -137,22 +44,23 @@ agentcore invoke '{"action":"chat","userId":"test","actorId":"test:t1","channel"
 
 | Error Message | Root Cause | Fix |
 |--------------|-----------|-----|
-| `Runtime initialization time exceeded 120s` | ECR pull permissions missing — execution role can't pull from `bedrock-agentcore-*` ECR repo | Add `arn:aws:ecr:{region}:{account}:repository/bedrock-agentcore-openclaw_agent` to IAM policy |
-| `The provided model identifier is invalid` | Wrong Bedrock model ID OR stale container using old env vars | 1. Verify model ID works: `aws bedrock-runtime converse --model-id <id> ...` 2. Stop old session |
-| `Gateway token not available` | Container env var `GATEWAY_TOKEN_SECRET_ID` missing or secret empty | Check runtime env vars (full replace issue?) and Secrets Manager value |
+| `Runtime initialization time exceeded 120s` | ECR pull permissions missing — execution role can't pull from `bedrock-agentcore-*` ECR repo | Add `arn:aws:ecr:{region}:{account}:repository/openclaw-bridge` to IAM policy |
+| `The provided model identifier is invalid` | Wrong Bedrock model ID OR stale container using old env vars | 1. Verify model ID works: `aws bedrock-runtime converse --model-id <id> ...` 2. Inspect the saved route and configuration; deploy a reviewed release |
+| `Gateway token not available` | Container env var `GATEWAY_TOKEN_SECRET_ID` missing or secret empty | Check AgentCore Runtime env vars (full replace issue?) and Secrets Manager value |
 | `I'm having trouble connecting right now` | Proxy started but Bedrock call failed — usually network or model access | Check VPC endpoints, NAT Gateway, Bedrock model access |
 | `I'm having trouble starting up` | Init failed — proxy didn't start within 30s | Check container logs for crash reason |
 | `Feishu: ignoring event type:` (empty) | Feishu event encrypted but not decrypted | Ensure `_decrypt_feishu_event()` is called before parsing |
 | `Packed policy consumes N% of allotted space` | STS session policy exceeds 2048 packed bytes | Remove Condition blocks, use shorter ARNs, reduce actions |
 | `NameError` / `chat_id` not defined in cron Lambda | Feishu send function has wrong variable names | Fix `send_feishu_message` in `lambda/cron/index.py` |
 | `HTTP Error 400` sending Feishu cron message | Using `chat_id` (oc_) but target is `open_id` (ou_) | Use `receive_id_type=open_id` for P2P cron delivery |
-| Container starts but `proxyReady: false` | Missing env vars (stale session from before runtime update) | Stop session, delete DynamoDB SESSION record |
+| Container starts but `proxyReady: false` | Missing env vars (stale session from before AgentCore Runtime update) | Inspect strict restore and readiness for the saved V2 binding; retain the route |
 
 ### Diagnostic Commands
 
 ```bash
-# Check container init state
-agentcore invoke '{"action":"status"}' -a openclaw_agent
+# Verify the deployment target; user diagnostics must use the saved SESSION route
+uv run --no-project --python .venv-deploy/bin/python python scripts/runtime_deploy.py verify \
+  --region "$CDK_DEFAULT_REGION" --manifest .runtime/runtime-v2.json --require-enrollment-ready
 
 # Search for errors in router
 aws logs filter-log-events --log-group-name /openclaw/lambda/router \
@@ -166,7 +74,7 @@ aws dynamodb scan --table-name openclaw-identity --region us-west-2 \
   --query 'Items[*].{user:PK.S,session:sessionId.S}'
 
 # Check ECR images
-aws ecr describe-images --repository-name bedrock-agentcore-openclaw_agent \
+aws ecr describe-images --repository-name openclaw-bridge \
   --region us-west-2 --query 'imageDetails[*].{tag:imageTags[0],size:imageSizeInBytes,pushed:imagePushedAt}' \
   --output table
 
@@ -178,15 +86,6 @@ aws bedrock-agentcore-control get-agent-runtime \
 aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=<VPC_ID>" \
   --region us-west-2 --query 'VpcEndpoints[*].{Service:ServiceName,State:State}'
 
-# Nuke all sessions (for clean testing)
-for item in $(aws dynamodb scan --table-name openclaw-identity --region us-west-2 \
-  --filter-expression "SK = :sk" --expression-attribute-values '{":sk":{"S":"SESSION"}}' \
-  --query 'Items[*].[PK.S,sessionId.S]' --output text); do
-  PK=$(echo "$item" | cut -f1); SID=$(echo "$item" | cut -f2)
-  agentcore stop-session -a openclaw_agent -s "$SID" 2>/dev/null
-  aws dynamodb delete-item --table-name openclaw-identity --region us-west-2 \
-    --key "{\"PK\":{\"S\":\"$PK\"},\"SK\":{\"S\":\"SESSION\"}}"
-done
 ```
 
 ---
@@ -332,9 +231,9 @@ Update:
 
 | Resource | Value |
 |----------|-------|
-| Runtime ID | `<RUNTIME_ID>` |
-| Runtime ARN | `arn:aws:bedrock-agentcore:us-west-2:<ACCOUNT_ID>:runtime/<RUNTIME_ID>` |
-| ECR Repo | `<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/bedrock-agentcore-openclaw_agent` |
+| AgentCore Runtime ID | `<RUNTIME_ID>` |
+| AgentCore Runtime ARN | `arn:aws:bedrock-agentcore:us-west-2:<ACCOUNT_ID>:runtime/<RUNTIME_ID>` |
+| ECR Repo | `<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/openclaw-bridge` |
 | Execution Role | `openclaw-agentcore-execution-role-us-west-2` |
 | VPC | `<VPC_ID>` |
 | Private Subnets | `<PRIVATE_SUBNET_1>`, `<PRIVATE_SUBNET_2>` |
@@ -346,13 +245,13 @@ Update:
 
 ## Lessons Learned
 
-1. **`update-agent-runtime` wipes env vars if omitted** — always include full `--environment-variables`
-2. **Stale sessions mask fixes** — always stop old sessions after runtime update
-3. **ECR repo naming mismatch** — Starter Toolkit creates `bedrock-agentcore-*` repos; CDK IAM policies must include this pattern
+1. **Configuration preservation** — use the pinned SDK controller and inspect its readback.
+2. **Saved routes stay pinned** — stopping a session does not change its release endpoint.
+3. **ECR repo naming mismatch** — execution-role pull permissions must cover the repository selected by the build helper.
 4. **120s init timeout = check ECR permissions first** — misleading error message
 5. **Feishu AES decryption** — use ctypes/OpenSSL, not pycryptodome (Lambda architecture mismatch)
 6. **STS session policy 2048 byte packed limit** — remove Condition blocks, keep policies minimal
 7. **VPC endpoint not the cause of model ID errors** — cross-region inference profiles work through VPC endpoints
 8. **Container CloudWatch logs not automatic** — need cloudwatch-logger.js (custom module that hooks console.log)
-9. **Warm pool unnecessary** — lightweight agent responds in ~5s; OpenClaw ready in ~5s more. Cold start is fast enough
+9. **Startup evidence** — historical status measurements do not prove current-image chat or USER_READY latency.
 10. **Docker Hub rate limits in CodeBuild** — use ECR Public Gallery base images (`public.ecr.aws/docker/library/node:22-slim`)

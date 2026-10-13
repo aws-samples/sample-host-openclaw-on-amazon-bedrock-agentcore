@@ -4,7 +4,11 @@ AgentCore Runtime supports [Managed Session Storage](https://docs.aws.amazon.com
 
 ## Integration
 
-`scripts/deploy.sh` configures session storage automatically via `filesystemConfigurations` (adding `sessionStorage.mountPath: /mnt/workspace` to the runtime with `update_agent_runtime`). At runtime:
+OpenClaw 1.x/pre-2.0 import below refers to application data formats, not an AgentCore Runtime V1 execution path. Those import receipts and compatibility files remain part of V2 restore.
+
+The pinned SDK controller used by `scripts/deploy.sh` includes and verifies `filesystemConfigurations` with `sessionStorage.mountPath: /mnt/workspace` during AgentCore Runtime create/update. It retains the local SQLite and mount-mirror layout. V2 additionally blocks activation and uploads on restore failure, partial failure or timeout; see the [AgentCore Runtime V2 runbook](runtime-v2.md). The timing observations and best-effort V1 restore behavior below are historical V1 findings, not V2 performance results.
+
+At runtime:
 
 1. **`agentcore-contract.js`** (via `bridge/state-storage.js`) keeps the whole `~/.openclaw`,
    agent workspace included, as a real directory on the container's local disk and restores the
@@ -48,7 +52,7 @@ AgentCore Runtime supports [Managed Session Storage](https://docs.aws.amazon.com
    the `workspace/` subtree is additionally mirrored within a few seconds of any change by a
    debounced `fs.watch` (2 s debounce, 15 s ceiling per burst)
 
-If session storage is unavailable, the system falls back to S3 as primary (5 min sync) with no changes needed.
+An absent optional session-storage mount uses S3 as primary (5 min sync). V2 treats an available but unreadable or partially restored mount as an activation failure, not as permission to start empty.
 
 ## Why the state dir (and the workspace) are not on the mount
 

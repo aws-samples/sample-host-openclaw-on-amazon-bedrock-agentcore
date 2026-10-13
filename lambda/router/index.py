@@ -18,7 +18,6 @@ import os
 import re
 import threading
 import time
-import hashlib
 import uuid
 from urllib import request as urllib_request
 from urllib.parse import quote
@@ -26,13 +25,14 @@ from urllib.parse import quote
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from runtime_routing import RouteUnavailable, admit_route, is_unknown_outcome, resolve_route
+from runtime_enrollment import authorize_channel_actor, enroll_new_user, link_actor, read_actor_owner, reconcile_actor_owner
+from runtime_invocation import InvocationTransportError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # --- Configuration ---
-AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
-AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
@@ -43,10 +43,13 @@ LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
+RUNTIME_TARGET = json.loads(os.environ.get("RUNTIME_TARGET", "null"))
 
 # --- Clients (lazy init on cold start) ---
-dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION,
+                         config=Config(connect_timeout=2, read_timeout=3, retries={"max_attempts": 0}))
 identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
+identity_client = boto3.client("dynamodb", region_name=AWS_REGION, config=Config(retries={"max_attempts": 0}))
 agentcore_client = boto3.client(
     "bedrock-agentcore",
     region_name=AWS_REGION,
@@ -413,123 +416,32 @@ def resolve_user(channel, channel_user_id, display_name=""):
 
     # 1. Try to find existing mapping
     try:
-        resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"})
+        resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"}, ConsistentRead=True)
         if "Item" in resp:
+            owner = read_actor_owner(identity_table, channel_key)
+            if owner and owner["userId"] != resp["Item"]["userId"]:
+                raise RouteUnavailable("Channel mapping conflicts with durable actor ownership")
             return resp["Item"]["userId"], False
     except ClientError as e:
         logger.error("DynamoDB get_item failed: %s", e)
+        raise
 
     # 2. Check allowlist before creating a new user
     if not is_user_allowed(channel, channel_user_id):
         logger.warning("User %s not on allowlist — rejecting registration", channel_key)
         return None, False
 
-    # 3. Create new user (conditional write to handle race conditions)
-    # STABILITY NOTE: userId is deterministic (SHA-256 of channel_key) so that
-    # EventBridge schedules and DynamoDB CRON# records survive redeployments.
-    # Existing users registered before this fix keep their random userIds —
-    # the CHANNEL# PROFILE record is authoritative and never re-created.
-    # Do NOT delete or re-create CHANNEL# records; that would orphan all
-    # dependent records (USER# PROFILE, SESSION, CRON#).
-    user_id = f"user_{hashlib.sha256(channel_key.encode()).hexdigest()[:16]}"
-    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    try:
-        # User profile
-        identity_table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": "PROFILE",
-                "userId": user_id,
-                "createdAt": now_iso,
-                "displayName": display_name or channel_user_id,
-            },
-            ConditionExpression="attribute_not_exists(PK)",
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            logger.error("Failed to create user profile: %s", e)
-
-    try:
-        # Channel -> user mapping (conditional to prevent race)
-        identity_table.put_item(
-            Item={
-                "PK": pk,
-                "SK": "PROFILE",
-                "userId": user_id,
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "displayName": display_name or channel_user_id,
-                "boundAt": now_iso,
-            },
-            ConditionExpression="attribute_not_exists(PK)",
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            # Another invocation created it first — read and return theirs
-            resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"})
-            if "Item" in resp:
-                return resp["Item"]["userId"], False
-        logger.error("Failed to create channel mapping: %s", e)
-
-    # User -> channel back-reference
-    try:
-        identity_table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": f"CHANNEL#{channel_key}",
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "boundAt": now_iso,
-            }
-        )
-    except ClientError:
-        pass  # Non-critical
-
-    logger.info("New user created: %s for %s", user_id, channel_key)
-    return user_id, True
-
+    if RUNTIME_TARGET is None:
+        return None, False
+    return enroll_new_user(
+        identity_table, identity_client, IDENTITY_TABLE_NAME,
+        channel, channel_user_id, display_name, RUNTIME_TARGET,
+    )
 
 
 def get_or_create_session(user_id):
-    """Get or create a session ID for the user. Session IDs must be >= 33 chars."""
-    pk = f"USER#{user_id}"
-
-    try:
-        resp = identity_table.get_item(Key={"PK": pk, "SK": "SESSION"})
-        if "Item" in resp:
-            # Update last activity
-            identity_table.update_item(
-                Key={"PK": pk, "SK": "SESSION"},
-                UpdateExpression="SET lastActivity = :now",
-                ExpressionAttributeValues={":now": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-            )
-            return resp["Item"]["sessionId"]
-    except ClientError as e:
-        logger.error("DynamoDB session lookup failed: %s", e)
-
-    # Create new session (>= 33 chars required by AgentCore)
-    session_id = f"ses_{user_id}_{uuid.uuid4().hex[:12]}"
-    if len(session_id) < 33:
-        session_id += "_" + uuid.uuid4().hex[: 33 - len(session_id)]
-    logger.info("New session created: %s for user %s", session_id, user_id)
-    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    try:
-        identity_table.put_item(
-            Item={
-                "PK": pk,
-                "SK": "SESSION",
-                "sessionId": session_id,
-                "createdAt": now_iso,
-                "lastActivity": now_iso,
-            }
-        )
-    except ClientError as e:
-        logger.error("Failed to create session: %s", e)
-
-    logger.info("New session created: %s for %s", session_id, user_id)
-    return session_id
+    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation."""
+    return resolve_route(identity_table, user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +450,10 @@ def get_or_create_session(user_id):
 
 def create_bind_code(user_id):
     """Generate an 8-char bind code and store it in DynamoDB with TTL."""
+    try:
+        route = _binding_route(user_id)
+    except RouteUnavailable:
+        return None
     code = uuid.uuid4().hex[:8].upper()  # 16^8 = 4.3B keyspace
     ttl = int(time.time()) + BIND_CODE_TTL_SECONDS
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -547,11 +463,27 @@ def create_bind_code(user_id):
             "PK": f"BIND#{code}",
             "SK": "BIND",
             "userId": user_id,
+            "runtimeActorId": route.actor_id,
+            "generation": route.generation,
+            "sessionId": route.session_id,
             "createdAt": now_iso,
             "ttl": ttl,
-        }
+        },
+        ConditionExpression="attribute_not_exists(PK)",
     )
     return code
+
+
+def _binding_route(user_id):
+    profile = identity_table.get_item(
+        Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+    ).get("Item", {})
+    route = get_or_create_session(user_id)
+    owner = read_actor_owner(identity_table, route.actor_id)
+    if (profile.get("runtimeEnrollment") != "V2" or profile.get("enrollmentActorId") != route.actor_id
+            or not owner or owner["userId"] != user_id):
+        raise RouteUnavailable("Canonical V2 binding ownership requires reconciliation")
+    return route
 
 
 def redeem_bind_code(code, channel, channel_user_id, display_name=""):
@@ -561,7 +493,7 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
     """
     code = code.strip().upper()
     try:
-        resp = identity_table.get_item(Key={"PK": f"BIND#{code}", "SK": "BIND"})
+        resp = identity_table.get_item(Key={"PK": f"BIND#{code}", "SK": "BIND"}, ConsistentRead=True)
         item = resp.get("Item")
         if not item:
             return None, False
@@ -571,36 +503,22 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 
         user_id = item["userId"]
         channel_key = f"{channel}:{channel_user_id}"
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-        # Create channel -> user mapping
-        identity_table.put_item(
-            Item={
-                "PK": f"CHANNEL#{channel_key}",
-                "SK": "PROFILE",
-                "userId": user_id,
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "displayName": display_name or channel_user_id,
-                "boundAt": now_iso,
-            }
-        )
-        # Back-reference
-        identity_table.put_item(
-            Item={
-                "PK": f"USER#{user_id}",
-                "SK": f"CHANNEL#{channel_key}",
-                "channel": channel,
-                "channelUserId": channel_user_id,
-                "boundAt": now_iso,
-            }
-        )
-        # Delete the bind code
-        identity_table.delete_item(Key={"PK": f"BIND#{code}", "SK": "BIND"})
+        current = identity_table.get_item(
+            Key={"PK": f"CHANNEL#{channel_key}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item")
+        owner = reconcile_actor_owner(identity_table, channel_key)
+        if (bool(owner) != bool(current) or (owner and owner["userId"] != user_id)
+                or (current and current.get("userId") != user_id)):
+            return None, False
+        route = _binding_route(user_id)
+        if (item.get("runtimeActorId") != route.actor_id or item.get("generation") != route.generation
+                or item.get("sessionId") != route.session_id):
+            return None, False
+        link_actor(IDENTITY_TABLE_NAME, identity_client, channel_key, user_id, current, owner, code, display_name, route)
 
         logger.info("Bind code %s redeemed: %s -> %s", code, channel_key, user_id)
         return user_id, True
-    except ClientError as e:
+    except (ClientError, RouteUnavailable) as e:
         logger.error("Bind code redemption failed: %s", e)
         return None, False
 
@@ -609,7 +527,7 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 # AgentCore invocation
 # ---------------------------------------------------------------------------
 
-def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
+def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_target=None):
     """Invoke the AgentCore Runtime with a per-user session.
 
     Message can be a plain string or a structured dict with text + images.
@@ -617,41 +535,51 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
     payload = json.dumps({
         "action": "chat",
         "userId": user_id,
-        "actorId": actor_id,
+        "actorId": route.actor_id,
+        "channelActorId": actor_id,
         "channel": channel,
+        "channelTarget": str(channel_target) if channel_target is not None else actor_id.split(":", 1)[-1],
         "message": message,
+        **route.payload_context(),
     }).encode()
 
     try:
-        logger.info("Invoking AgentCore: arn=%s qualifier=%s session=%s", AGENTCORE_RUNTIME_ARN, AGENTCORE_QUALIFIER, session_id)
-        resp = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
-            qualifier=AGENTCORE_QUALIFIER,
-            runtimeSessionId=session_id,
-            payload=payload,
-            contentType="application/json",
-            accept="application/json",
-        )
-        status_code = resp.get("statusCode")
-        logger.info("AgentCore response status: %s", status_code)
-        MAX_RESPONSE_BYTES = 500_000  # 500 KB — prevents OOM from large subagent responses
-        body = resp.get("response")
-        if body:
-            if hasattr(body, "read"):
-                body_bytes = body.read(MAX_RESPONSE_BYTES + 1)
-                body_text = body_bytes.decode("utf-8", errors="replace")
-                if len(body_bytes) > MAX_RESPONSE_BYTES:
-                    logger.warning("AgentCore response truncated at %d bytes", MAX_RESPONSE_BYTES)
-                    body_text = body_text[:MAX_RESPONSE_BYTES]
-            else:
-                body_text = str(body)[:MAX_RESPONSE_BYTES]
-            logger.info("AgentCore response (len=%d, first 200 chars): %s", len(body_text), body_text[:200])
+        authorize_channel_actor(identity_table, route, user_id, actor_id, channel)
+        with admit_route(identity_table, route, user_id, route.actor_id) as admission:
+            logger.info("Invoking AgentCore: arn=%s qualifier=%s session=%s generation=%s",
+                        route.runtime_arn, route.endpoint_name, route.session_id, route.generation)
+            body = None
             try:
-                return json.loads(body_text)
-            except json.JSONDecodeError:
-                return {"response": body_text}
-        logger.warning("AgentCore returned no response body")
-        return {"response": "No response from agent."}
+                MAX_RESPONSE_BYTES = 500_000  # 500 KB — prevents OOM from large subagent responses
+                try:
+                    resp = agentcore_client.invoke_agent_runtime(
+                        **route.invocation(), payload=payload,
+                        contentType="application/json", accept="application/json",
+                    )
+                    body = resp.get("response")
+                    body_bytes = body.read(MAX_RESPONSE_BYTES + 1) if body and hasattr(body, "read") else None
+                except Exception as error:
+                    raise InvocationTransportError(str(error)) from error
+                logger.info("AgentCore response status: %s", resp.get("statusCode"))
+                if body_bytes is None:
+                    body_bytes = body if isinstance(body, bytes) else str(body or "").encode()
+                if not body_bytes or len(body_bytes) > MAX_RESPONSE_BYTES:
+                    raise InvocationTransportError("AgentCore Runtime response is missing or exceeds size limit")
+                try:
+                    result = json.loads(body_bytes.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise InvocationTransportError("AgentCore Runtime response is not valid JSON") from error
+                if not isinstance(result, dict):
+                    raise InvocationTransportError("AgentCore Runtime response is not an object")
+                if is_unknown_outcome(result):
+                    admission.retain()
+                return result
+            finally:
+                if body is not None and hasattr(body, "close"):
+                    try:
+                        body.close()
+                    except Exception:
+                        logger.warning("AgentCore response cleanup failed", exc_info=True)
     except Exception as e:
         logger.error("AgentCore invocation failed: %s", e, exc_info=True)
         return {"response": f"Sorry, I'm having trouble right now. Please try again later."}
@@ -1541,9 +1469,15 @@ def handle_telegram(body):
         )
         return
 
+    session_id = get_or_create_session(resolved_user_id)
+    authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "telegram")
+
     # Handle link-accounts command (generate bind code for existing users)
     if _is_link_command(text):
         code = create_bind_code(resolved_user_id)
+        if not code:
+            send_telegram_message(chat_id, "Account linking requires identity reconciliation.", token)
+            return
         send_telegram_message(
             chat_id,
             f"Your link code is: `{code}`\n\nEnter this code on another channel within 10 minutes "
@@ -1558,7 +1492,7 @@ def handle_telegram(body):
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
     if has_image:
-        namespace = actor_id.replace(":", "_")
+        namespace = session_id.actor_id.replace(":", "_")
         image_bytes, content_type, _ = _download_telegram_image(message, token)
         if image_bytes:
             s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
@@ -1570,9 +1504,6 @@ def handle_telegram(body):
         else:
             send_telegram_message(chat_id, "Sorry, I couldn't download that image. Please try again.", token)
             return
-
-    # Get or create session
-    session_id = get_or_create_session(resolved_user_id)
 
     image_count = 0 if isinstance(agent_message, str) else len(agent_message.get("images", []))
     logger.info(
@@ -1589,7 +1520,8 @@ def handle_telegram(body):
     )
     typing_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message)
+        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message,
+                                      channel_target=chat_id)
     finally:
         stop_typing.set()
         typing_thread.join(timeout=2)
@@ -1686,9 +1618,15 @@ def handle_slack(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    session_id = get_or_create_session(resolved_user_id)
+    authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "slack")
+
     # Handle link-accounts command (generate bind code for existing users)
     if _is_link_command(text):
         code = create_bind_code(resolved_user_id)
+        if not code:
+            send_slack_message(channel_id, "Account linking requires identity reconciliation.", bot_token)
+            return {"statusCode": 200, "body": "ok"}
         send_slack_message(
             channel_id,
             f"Your link code is: `{code}`\n\nEnter this code on another channel within 10 minutes "
@@ -1700,7 +1638,7 @@ def handle_slack(body, headers=None):
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
     if has_image:
-        namespace = actor_id.replace(":", "_")
+        namespace = session_id.actor_id.replace(":", "_")
         # Use first image file
         file_info = image_files[0]
         image_bytes, content_type, _ = _download_slack_file(file_info, bot_token)
@@ -1714,9 +1652,6 @@ def handle_slack(body, headers=None):
         else:
             send_slack_message(channel_id, "Sorry, I couldn't download that image. Please try again.", bot_token)
             return {"statusCode": 200, "body": "ok"}
-
-    # Get or create session
-    session_id = get_or_create_session(resolved_user_id)
 
     logger.info(
         "Slack: user=%s actor=%s session=%s msg_len=%d has_image=%s",
@@ -1732,7 +1667,8 @@ def handle_slack(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message)
+        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message,
+                                      channel_target=channel_id)
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -1843,9 +1779,15 @@ def handle_feishu(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    session_id = get_or_create_session(resolved_user_id)
+    authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "feishu")
+
     # Handle link-accounts command
     if _is_link_command(text):
         bind_code = create_bind_code(resolved_user_id)
+        if not bind_code:
+            send_feishu_message(chat_id, "Account linking requires identity reconciliation.")
+            return {"statusCode": 200, "body": "ok"}
         send_feishu_message(
             chat_id,
             f"Your link code is: {bind_code}\n\nEnter this code on another channel within 10 minutes "
@@ -1856,7 +1798,7 @@ def handle_feishu(body, headers=None):
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text or "hi"
     if has_image:
-        namespace = actor_id.replace(":", "_")
+        namespace = session_id.actor_id.replace(":", "_")
         image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
         if image_bytes:
             s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
@@ -1868,9 +1810,6 @@ def handle_feishu(body, headers=None):
         else:
             send_feishu_message(chat_id, "Sorry, I couldn't download that image. Please try again.")
             return {"statusCode": 200, "body": "ok"}
-
-    # Get or create session
-    session_id = get_or_create_session(resolved_user_id)
 
     logger.info(
         "Feishu: user=%s actor=%s session=%s msg_len=%d has_image=%s chat_type=%s",
@@ -1886,7 +1825,8 @@ def handle_feishu(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message)
+        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message,
+                                      channel_target=chat_id)
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)

@@ -28,8 +28,6 @@ def _base_context(**extra):
         "account": _ACCOUNT,
         "region": _REGION,
         "availability_zones": [f"{_REGION}a", f"{_REGION}b"],
-        "runtime_id": "openclaw_agent-TEST",
-        "runtime_endpoint_id": "DEFAULT",
     }
     ctx.update(extra)
     return ctx

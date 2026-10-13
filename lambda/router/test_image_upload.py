@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # Set required env vars before importing the module
@@ -21,6 +22,7 @@ sys.modules["botocore.exceptions"] = MagicMock()
 
 import importlib
 index = importlib.import_module("index")
+TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_test123", actor_id="telegram:456")
 
 
 class TestUploadImageToS3(unittest.TestCase):
@@ -230,7 +232,7 @@ class TestHandleTelegramWithImages(unittest.TestCase):
     """Integration tests for handle_telegram with image support."""
 
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "I see a cat!"})
-    @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012345678")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "resolve_user", return_value=("user_test123", False))
     @patch.object(index, "send_telegram_typing")
     @patch.object(index, "send_telegram_message")
@@ -261,7 +263,7 @@ class TestHandleTelegramWithImages(unittest.TestCase):
         self.assertEqual(len(msg["images"]), 1)
 
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Hello!"})
-    @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012345678")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "resolve_user", return_value=("user_test123", False))
     @patch.object(index, "send_telegram_typing")
     @patch.object(index, "send_telegram_message")

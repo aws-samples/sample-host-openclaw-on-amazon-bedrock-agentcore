@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # Set required env vars before importing the module
@@ -22,6 +23,7 @@ sys.modules["botocore.exceptions"] = MagicMock()
 
 import importlib
 index = importlib.import_module("index")
+TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id="slack:U12345USER")
 
 
 # --- Test helpers ---
@@ -89,7 +91,7 @@ class TestSlackEventTypeFiltering(unittest.TestCase):
 
     @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
-    @patch.object(index, "get_or_create_session", return_value="ses_test")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Hi"})
     @patch.object(index, "send_slack_message")
     def test_message_event_is_processed(self, mock_send, mock_invoke, mock_session, mock_resolve, mock_tokens):
@@ -100,7 +102,7 @@ class TestSlackEventTypeFiltering(unittest.TestCase):
 
     @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
-    @patch.object(index, "get_or_create_session", return_value="ses_test")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Sunny"})
     @patch.object(index, "send_slack_message")
     def test_app_mention_event_is_processed(self, mock_send, mock_invoke, mock_session, mock_resolve, mock_tokens):
@@ -132,7 +134,7 @@ class TestSlackEventTypeFiltering(unittest.TestCase):
 
     @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
-    @patch.object(index, "get_or_create_session", return_value="ses_test")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "_download_slack_file", return_value=(b"img", "image/jpeg", None))
     @patch.object(index, "_upload_image_to_s3", return_value="user/img.jpg")
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Nice image"})
@@ -153,7 +155,7 @@ class TestSlackMentionStripping(unittest.TestCase):
 
     @patch.object(index, "send_slack_message")
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "The weather is sunny"})
-    @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
     @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
     def test_app_mention_strips_bot_tag(self, mock_tokens, mock_resolve, mock_session, mock_invoke, mock_send):
@@ -169,7 +171,7 @@ class TestSlackMentionStripping(unittest.TestCase):
 
     @patch.object(index, "send_slack_message")
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Hi"})
-    @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
     @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
     def test_dm_message_strips_mention_too(self, mock_tokens, mock_resolve, mock_session, mock_invoke, mock_send):
@@ -184,7 +186,7 @@ class TestSlackMentionStripping(unittest.TestCase):
 
     @patch.object(index, "send_slack_message")
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Hi"})
-    @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
     @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
     def test_multiple_mentions_stripped(self, mock_tokens, mock_resolve, mock_session, mock_invoke, mock_send):
@@ -207,7 +209,7 @@ class TestSlackMentionStripping(unittest.TestCase):
 
     @patch.object(index, "send_slack_message")
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Yes"})
-    @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
     @patch.object(index, "_get_slack_tokens", return_value=(SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET))
     def test_message_without_mention_unchanged(self, mock_tokens, mock_resolve, mock_session, mock_invoke, mock_send):

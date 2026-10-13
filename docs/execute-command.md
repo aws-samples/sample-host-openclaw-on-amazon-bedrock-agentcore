@@ -1,6 +1,6 @@
 # Execute Command (Operator CLI)
 
-AgentCore Runtime exposes [`InvokeAgentRuntimeCommand`](https://docs.aws.amazon.com/bedrock-agentcore/latest/APIReference/API_InvokeAgentRuntimeCommand.html) — a data-plane API that runs **one shell command inside the microVM of a runtime session** and streams stdout/stderr back. No LLM turn, no tool loop, no tokens: it is the closest thing to "SSH into the box" that AgentCore offers. See the [launch blog](https://aws.amazon.com/blogs/machine-learning/persist-session-state-with-filesystem-configuration-and-execute-shell-commands/) and the [developer guide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-execute-command.html).
+AgentCore Runtime exposes [`InvokeAgentRuntimeCommand`](https://docs.aws.amazon.com/bedrock-agentcore/latest/APIReference/API_InvokeAgentRuntimeCommand.html) — a data-plane API that runs **one shell command inside the microVM of an AgentCore Runtime session** and streams stdout/stderr back. No LLM turn, no tool loop, no tokens: it is the closest thing to "SSH into the box" that AgentCore offers. See the [launch blog](https://aws.amazon.com/blogs/machine-learning/persist-session-state-with-filesystem-configuration-and-execute-shell-commands/) and the [developer guide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-execute-command.html).
 
 This repo wraps it in `scripts/agentcore-exec.py`, an **operator-only** CLI for post-deploy health checks, workspace inspection, and deterministic CI/E2E assertions.
 
@@ -10,63 +10,70 @@ This repo wraps it in `scripts/agentcore-exec.py`, an **operator-only** CLI for 
 
 | Aspect | Behaviour |
 |---|---|
-| Where it runs | The **same microVM, filesystem and session** as the OpenClaw session identified by `runtimeSessionId`. `/mnt/workspace` (the live `~/.openclaw/workspace` link and the state-dir mirror from [session storage](session-storage.md)) is visible exactly as the agent left it — no sync step. |
+| Where it runs | The **same microVM, filesystem and session** selected by AgentCore Runtime ARN, endpoint name and `runtimeSessionId`. `~/.openclaw/workspace` is a real local directory; `/mnt/workspace/.openclaw` is the [session-storage mirror](session-storage.md), which may lag current local writes. |
 | Input | `command` (1 byte – 64 KB, run by bash), optional `timeout` (1–3600 s, default 300). |
 | Output | An event stream: `contentStart` → `contentDelta { stdout \| stderr }` (many) → `contentStop { exitCode, status }`. `status` is `COMPLETED` or `TIMED_OUT`; `exitCode -1` means a platform error. |
 | Statefulness | **One-shot.** Every call is a fresh bash: no shell history, no env carry-over between calls. Chain steps with `&&`. |
 | Concurrency | Non-blocking — runs alongside `InvokeAgentRuntime` traffic on the same session. |
 | Limits | 25 TPS per account/region. `RetryableConflictException` (HTTP 409) while a session is spinning up or down; `ThrottlingException` when over the rate. Both are retried by the CLI with bounded exponential backoff and jitter. |
-| Session id | 33–256 chars, same rules as `InvokeAgentRuntime`. Passing an id that has no live session provisions a **new** session (empty `/mnt/workspace`). |
+| Session id | 33–256 chars. If omitted, the CLI generates a fresh `exec_<uuid>` id rather than selecting a user's live session. This does not bind an application user or verify restoration/activation. Live behavior of a new session was not tested in this task. |
 | Logging | CloudTrail records the caller, time and source IP. The service logs the **request id and the input command** to CloudWatch. **stdout/stderr are not logged** by the service. |
-| Prerequisites | Runtimes **created before 2026-03-17 must be redeployed** (re-run `scripts/deploy.sh`) before they accept commands — there is no configuration flag to flip. The microVM ships **no dev tools beyond what `bridge/Dockerfile` installs**. The runtime stage is `node:22-slim` plus `curl`, `jq` and `python3` — so bash, node and npm are present but **`git` is deliberately not** (it exists only in the build stage). Commands that need other tools require a Dockerfile change and redeploy. |
+| Prerequisites | Runtimes **created before 2026-03-17 must be redeployed** before they accept commands — there is no configuration flag to flip. Use the [AgentCore Runtime V2 release workflow](runtime-v2.md). The microVM ships **no dev tools beyond what `bridge/Dockerfile` installs**; the current image uses `node:24-slim`. Commands that need other tools require a Dockerfile change and redeploy. |
 
 ## Operator workflow
 
 ### Prerequisites
 
-* Python 3 with a boto3/botocore that knows the operation (verified with botocore **1.43.22**; older releases that predate the April 2026 launch make the script exit with an explicit "upgrade boto3" message). `pip install -U boto3`.
+* Prepare `.venv-deploy` with uv as shown in the [offline setup](runtime-v2.md#offline-checks). It uses `requirements-deploy.txt`, with `boto3==1.43.95` and `botocore==1.43.95`, to run the operator script. The script rejects SDKs without the command operation.
 * The AWS CLI does **not** expose `invoke-agent-runtime-command` yet (checked on 2.33.15) — that is why this is a boto3 script.
 * Credentials for a principal holding the [IAM statement below](#iam-statement).
-* `cdk.json` with `runtime_id` / `runtime_endpoint_id` populated (`deploy.sh` does this), or pass `--runtime-arn` explicitly.
+* Use the selected user's authoritative route for the AgentCore Runtime ARN, endpoint name and session ID. The deployment manifest may target a different endpoint from an existing enrolled user. The CLI resolves a V2 `--manifest` or an explicit `--runtime-arn` / `--runtime-id` with `--qualifier`; it has no legacy CDK AgentCore Runtime fallback.
 
 ### Examples
 
-Health check in a **new throwaway session** (default when `--session-id` is omitted — it never touches a user's session):
+Set `ACTIVE_RUNTIME_ARN`, `ACTIVE_ENDPOINT_NAME` and `ACTIVE_SESSION_ID` from the selected user's
+`USER#<userId>` / `SESSION` record (`runtimeArn`, `endpointName`, `sessionId`). Reject old or incomplete routes rather than filling defaults. Use a known
+live, activated V2 session and its Region in `CDK_DEFAULT_REGION`; do not invent an ID or substitute
+the latest deployment endpoint. Record the reason for inspecting user data in your incident/change log.
+
+Check the selected live container:
 
 ```bash
-python3 scripts/agentcore-exec.py --command 'node --version && df -h /mnt/workspace'
+uv run --no-project --python .venv-deploy/bin/python python scripts/agentcore-exec.py --region "$CDK_DEFAULT_REGION" \
+  --runtime-arn "$ACTIVE_RUNTIME_ARN" --qualifier "$ACTIVE_ENDPOINT_NAME" \
+  --session-id "$ACTIVE_SESSION_ID" --command 'node --version && df -h /mnt/workspace'
 ```
 
-Verify the session-storage layout (local state dir, live workspace link, mirror on the mount):
+Verify the local state/workspace directories and the mount mirror. This checks layout, not
+checkpoint completeness or equality with the latest local writes:
 
 ```bash
-python3 scripts/agentcore-exec.py \
-  --command 'test -d ~/.openclaw && test -L ~/.openclaw/workspace && readlink ~/.openclaw/workspace && ls -la /mnt/workspace/.openclaw'
+uv run --no-project --python .venv-deploy/bin/python python scripts/agentcore-exec.py --region "$CDK_DEFAULT_REGION" \
+  --runtime-arn "$ACTIVE_RUNTIME_ARN" --qualifier "$ACTIVE_ENDPOINT_NAME" \
+  --session-id "$ACTIVE_SESSION_ID" \
+  --command 'test -d ~/.openclaw && test ! -L ~/.openclaw && test -d ~/.openclaw/workspace && test ! -L ~/.openclaw/workspace && test -d /mnt/workspace/.openclaw && ls -ld ~/.openclaw/workspace /mnt/workspace/.openclaw'
 ```
 
-Inspect a **specific user's live session** (pass the same `ses_<user>_<hex>` id the router generates — this reads user data, so record why in your change/incident log):
+Inspect local state and the mirror in that same session:
 
 ```bash
-python3 scripts/agentcore-exec.py \
-  --session-id ses_user_0123456789abcdef_0a1b2c3d4e5f \
-  --command 'du -sh /mnt/workspace/.openclaw && ls /mnt/workspace/.openclaw/agents'
+uv run --no-project --python .venv-deploy/bin/python python scripts/agentcore-exec.py --region "$CDK_DEFAULT_REGION" \
+  --runtime-arn "$ACTIVE_RUNTIME_ARN" --qualifier "$ACTIVE_ENDPOINT_NAME" \
+  --session-id "$ACTIVE_SESSION_ID" \
+  --command 'du -sh ~/.openclaw /mnt/workspace/.openclaw && ls ~/.openclaw/agents'
 ```
 
 Machine-readable output for CI (`--json` prints one object: `sessionId`, `runtimeArn`, `status`, `exitCode`, `stdout`, `stderr`, `attempts`):
 
 ```bash
-python3 scripts/agentcore-exec.py --json --timeout 60 \
-  --command 'test -f /mnt/workspace/.openclaw/openclaw.json && echo present' \
+uv run --no-project --python .venv-deploy/bin/python python scripts/agentcore-exec.py --region "$CDK_DEFAULT_REGION" \
+  --runtime-arn "$ACTIVE_RUNTIME_ARN" --qualifier "$ACTIVE_ENDPOINT_NAME" \
+  --session-id "$ACTIVE_SESSION_ID" --json --timeout 60 \
+  --command 'test -f ~/.openclaw/openclaw.json && echo present' \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["exitCode"]==0, d'
 ```
 
-Target an explicit runtime/endpoint/region instead of `cdk.json`:
-
-```bash
-python3 scripts/agentcore-exec.py --region us-west-2 \
-  --runtime-arn arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/openclaw_agent-XXXX \
-  --qualifier DEFAULT --command 'cat /etc/os-release'
-```
+Omitting `--session-id` selects a new container session, not the active user's workspace.
 
 ### Exit status
 
@@ -76,7 +83,7 @@ python3 scripts/agentcore-exec.py --region us-west-2 \
 | `124` | Remote command `TIMED_OUT` (hit `--timeout`; the service killed it). Same convention as coreutils `timeout`. |
 | `125` | Service reported a platform error (`exitCode -1`). |
 | `1` | AWS/API error — the command did not run, or its outcome is unknown. |
-| `2` | Invalid arguments (empty or >64 KB command, bad timeout/session id, no runtime target). |
+| `2` | Invalid arguments (empty or >64 KB command, bad timeout/session id, no AgentCore Runtime target). |
 
 ### Retry semantics
 
@@ -84,7 +91,7 @@ python3 scripts/agentcore-exec.py --region us-west-2 \
 
 ## IAM statement
 
-There is **no operator or E2E role in the CDK stacks** — `scripts/deploy.sh` and `tests/e2e/` run with whatever credentials the operator already has (the same principal that runs `cdk deploy`). Attach the statement below to **that** principal (your IAM role/user, or the CI role that runs the E2E suite). Substitute region, account and the `runtime_id` from `cdk.json`:
+There is **no operator or E2E role in the CDK stacks** — `scripts/deploy.sh` and `tests/e2e/` run with whatever credentials the operator already has (the same principal that runs `cdk deploy`). Attach the statement below to **that** principal (your IAM role/user, or the CI role that runs the E2E suite). Substitute the Region, account and AgentCore Runtime ID from the selected route's ARN:
 
 ```json
 {
@@ -150,4 +157,4 @@ Because the command runs in the same microVM as the session, it is the most dire
 python3 -m unittest tests.test_agentcore_exec -v
 ```
 
-A live smoke test is cheap and deterministic (billed as runtime compute, not tokens): `python3 scripts/agentcore-exec.py --command 'node --version'`.
+A live smoke test is cheap and deterministic (billed as AgentCore Runtime compute, not tokens): `uv run --no-project --python .venv-deploy/bin/python python scripts/agentcore-exec.py --command 'node --version'`.

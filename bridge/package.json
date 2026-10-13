@@ -3,22 +3,26 @@
   "version": "1.0.0",
   "private": true,
   "description": "OpenClaw AgentCore bridge container",
+  "scripts": {
+    "test": "node --test *.test.js",
+    "test:v2": "node --test runtime-lifecycle.test.js gateway-lifecycle.test.js runtime-contract.test.js openclaw-worker-owner.test.js openclaw-preinit.test.js patch-openclaw-preinit.test.js"
+  },
   "dependencies": {
-    "@aws-sdk/client-bedrock-runtime": "^3.0.0",
-    "@aws-sdk/client-cognito-identity-provider": "^3.0.0",
-    "@aws-sdk/client-s3": "^3.0.0",
-    "@aws-sdk/client-secrets-manager": "^3.0.0",
-    "@aws-sdk/client-scheduler": "^3.0.0",
-    "@aws-sdk/client-dynamodb": "^3.0.0",
-    "@aws-sdk/client-bedrock-agentcore": "^3.0.0",
-    "@aws-sdk/client-sts": "^3.0.0",
-    "@aws-sdk/lib-dynamodb": "^3.0.0",
-    "@aws-sdk/s3-request-presigner": "^3.0.0",
-    "@aws-sdk/client-cloudwatch-logs": "^3.0.0",
-    "@aws-sdk/credential-provider-node": "^3.0.0",
-    "@smithy/signature-v4": "^5.0.0",
+    "@aws-sdk/client-bedrock-runtime": "3.1147.0",
+    "@aws-sdk/client-cognito-identity-provider": "3.1147.0",
+    "@aws-sdk/client-s3": "3.1147.0",
+    "@aws-sdk/client-secrets-manager": "3.1147.0",
+    "@aws-sdk/client-scheduler": "3.1147.0",
+    "@aws-sdk/client-dynamodb": "3.1147.0",
+    "@aws-sdk/client-bedrock-agentcore": "3.1147.0",
+    "@aws-sdk/client-sts": "3.1147.0",
+    "@aws-sdk/lib-dynamodb": "3.1147.0",
+    "@aws-sdk/s3-request-presigner": "3.1147.0",
+    "@aws-sdk/client-cloudwatch-logs": "3.1147.0",
+    "@aws-sdk/credential-provider-node": "3.972.84",
+    "@smithy/signature-v4": "5.7.4",
     "@aws-crypto/sha256-js": "5.2.0",
-    "playwright-core": "^1.50.0",
-    "ws": "^8.0.0"
+    "playwright-core": "1.63.0",
+    "ws": "8.22.0"
   }
 }

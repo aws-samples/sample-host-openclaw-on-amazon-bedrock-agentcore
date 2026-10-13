@@ -841,7 +841,7 @@ Feishu users follow the same pattern as Telegram/Slack:
 | `USER#user_abc123` | `CHANNEL#feishu:ou_xxxx` | User's bound Feishu channel |
 | `ALLOW#feishu:ou_xxxx` | `ALLOW` | Feishu user allowlist entry |
 
-Cross-channel binding works identically — a Feishu user can generate a bind code and link to their Telegram/Slack identity.
+For AgentCore Runtime V2, an unregistered Feishu channel identity can redeem a bind code as an alias of the canonical Telegram/Slack user. SESSION.actorId and its AgentCore Runtime route remain fixed. An actor owned by another canonical user cannot transfer; existing accounts are not merged.
 
 ---
 

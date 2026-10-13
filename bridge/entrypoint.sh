@@ -1,6 +1,30 @@
 #!/bin/bash
-# Start the contract server immediately — AgentCore requires a fast /ping response.
-# Secrets are fetched by the contract server itself via the AWS SDK.
+# Container entrypoint for OpenClaw on AgentCore Runtime V2.
+#
+# Records launch lineage for snapshot diagnostics and prepares Node.js caching
+# and IPv4 networking before handing off to the contract server. Requires Bash
+# and the bridge files installed under /app by the container image.
+
+if [[ "${AGENTCORE_RUNTIME_PLATFORM+x}" && "$AGENTCORE_RUNTIME_PLATFORM" != "V2" ]]; then
+    echo "[openclaw-agentcore] AGENTCORE_RUNTIME_PLATFORM must be V2 when set" >&2
+    exit 1
+fi
+
+# Capture shell execution before pre-flight work; snapshots inherit this lineage.
+entrypoint_epoch_realtime=${EPOCHREALTIME:-}
+unset OPENCLAW_ENTRYPOINT_WALL_MS OPENCLAW_ENTRYPOINT_EXECUTION_ID
+if [[ "$entrypoint_epoch_realtime" =~ ^[0-9]{10}\.[0-9]{6}$ ]]; then
+    entrypoint_seconds=${entrypoint_epoch_realtime%.*}
+    entrypoint_fraction=${entrypoint_epoch_realtime#*.}
+    export OPENCLAW_ENTRYPOINT_WALL_MS=$((10#$entrypoint_seconds * 1000 + 10#${entrypoint_fraction:0:3}))
+    export OPENCLAW_ENTRYPOINT_EXECUTION_ID="entrypoint-${OPENCLAW_ENTRYPOINT_WALL_MS}-${RANDOM}-${RANDOM}"
+    printf '{"schema_version":1,"event":"ENTRYPOINT_EXEC","wall_unix_ms":%s,"entrypoint_execution_id":"%s","delivery":"producer"}\n' \
+        "$OPENCLAW_ENTRYPOINT_WALL_MS" "$OPENCLAW_ENTRYPOINT_EXECUTION_ID"
+fi
+unset entrypoint_epoch_realtime entrypoint_seconds entrypoint_fraction
+
+# Start the contract server; V2 health waits for state-free common bootstrap.
+# The common gateway token is fetched at bootstrap; user resources wait for activation.
 # Do NOT use set -e — the contract server must start regardless of any pre-flight issues.
 
 echo "[openclaw-agentcore] Starting OpenClaw on AgentCore Runtime (per-user session mode)..."
@@ -27,8 +51,6 @@ else
 fi
 
 # --- Start the AgentCore contract server (port 8080) ---
-# Must be the first thing to start — AgentCore health-checks /ping very quickly.
-# Secrets are pre-fetched at boot. Lightweight agent handles messages while OpenClaw starts.
 echo "[openclaw-agentcore] Starting AgentCore contract server on port 8080..."
-echo "[openclaw-agentcore] Hybrid mode: lightweight agent (~10s) -> OpenClaw handoff (~1-2min)"
+echo "[openclaw-agentcore] Common bootstrap -> user activation -> OpenClaw"
 exec node /app/agentcore-contract.js

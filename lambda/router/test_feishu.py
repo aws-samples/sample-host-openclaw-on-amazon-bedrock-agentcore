@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
 # Set required env vars before importing the module
@@ -24,6 +25,7 @@ sys.modules["botocore.exceptions"] = MagicMock()
 
 import importlib
 index = importlib.import_module("index")
+TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id="feishu:ou_test123")
 
 
 # --- Test helpers ---
@@ -155,7 +157,7 @@ class TestHandleFeishuTextMessage(unittest.TestCase):
 
     @patch.object(index, "send_feishu_message")
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Hi there!"})
-    @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
     def test_p2p_text_message(self, mock_resolve, mock_session, mock_invoke, mock_send):
         """P2P text message is processed correctly."""
@@ -172,7 +174,7 @@ class TestHandleFeishuTextMessage(unittest.TestCase):
 
     @patch.object(index, "send_feishu_message")
     @patch.object(index, "invoke_agent_runtime", return_value={"response": "Group reply"})
-    @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012")
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
     def test_group_message_strips_mention(self, mock_resolve, mock_session, mock_invoke, mock_send):
         """Group message with @mention strips the mention tag."""
@@ -255,7 +257,8 @@ class TestHandleFeishuBindCommands(unittest.TestCase):
     @patch.object(index, "_is_link_command", return_value=True)
     @patch.object(index, "create_bind_code", return_value="XYZ789")
     @patch.object(index, "resolve_user", return_value=("user_abc123", False))
-    def test_link_accounts_command(self, mock_resolve, mock_create, _mock_is_link, _mock_is_bind, mock_send):
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
+    def test_link_accounts_command(self, mock_session, mock_resolve, mock_create, _mock_is_link, _mock_is_bind, mock_send):
         """'link accounts' generates a bind code."""
         event = _make_feishu_text_event("link accounts")
         index.handle_feishu(json.dumps(event))

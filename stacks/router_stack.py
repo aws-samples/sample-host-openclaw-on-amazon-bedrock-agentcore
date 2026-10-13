@@ -21,6 +21,7 @@ from aws_cdk import (
     aws_logs as logs,
 )
 import cdk_nag
+import json
 from constructs import Construct
 
 from stacks import retention_days
@@ -33,7 +34,7 @@ class RouterStack(Stack):
         construct_id: str,
         *,
         runtime_arn: str,
-        runtime_endpoint_id: str,
+        runtime_endpoint_name: str,
         gateway_token_secret_name: str,
         telegram_token_secret_name: str,
         slack_token_secret_name: str,
@@ -42,6 +43,7 @@ class RouterStack(Stack):
         cmk_arn: str,
         user_files_bucket_name: str,
         user_files_bucket_arn: str,
+        runtime_target: dict | None = None,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -92,11 +94,17 @@ class RouterStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="index.handler",
             code=_lambda.Code.from_asset("lambda/router"),
+            layers=[_lambda.LayerVersion(
+                self, "RuntimeRoutingLayer",
+                code=_lambda.Code.from_asset("lambda/shared", exclude=["**/__pycache__/**", "**/*.pyc"]),
+                compatible_runtimes=[_lambda.Runtime.PYTHON_3_13],
+                description="Shared per-user AgentCore Runtime route resolution and admission",
+            )],
             timeout=Duration.seconds(lambda_timeout),
             memory_size=lambda_memory,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
-                "AGENTCORE_QUALIFIER": runtime_endpoint_id,
+                "AGENTCORE_QUALIFIER": runtime_endpoint_name,
                 "IDENTITY_TABLE_NAME": self.identity_table.table_name,
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
@@ -105,6 +113,7 @@ class RouterStack(Stack):
                 "REGISTRATION_OPEN": registration_open,
                 "USER_FILES_BUCKET": user_files_bucket_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
+                "RUNTIME_TARGET": json.dumps(runtime_target, separators=(",", ":")),
             },
             log_group=router_log_group,
         )
@@ -173,17 +182,13 @@ class RouterStack(Stack):
 
         # AgentCore Runtime invocation — scoped to specific runtime and its endpoints
         # IAM evaluates against runtime/{id}/runtime-endpoint/{endpoint-id}
-        self.router_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "bedrock-agentcore:InvokeAgentRuntime",
-                ],
-                resources=[
-                    runtime_arn,
-                    f"{runtime_arn}/*",
-                ],
+        if runtime_arn:
+            self.router_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=["bedrock-agentcore:InvokeAgentRuntime"],
+                    resources=[runtime_arn, f"{runtime_arn}/*"],
+                )
             )
-        )
 
         # DynamoDB read/write
         self.identity_table.grant_read_write_data(self.router_fn)
@@ -269,7 +274,7 @@ class RouterStack(Stack):
                     "for CMK-encrypted table. S3 PutObject scoped to */_uploads/* "
                     "prefix for image uploads.",
                     applies_to=[
-                        f"Resource::{runtime_arn}/*",
+                        *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",

@@ -7,8 +7,8 @@ idle-terminate naturally.
 
 Hybrid deployment model:
   Phase 1 (CDK): VPC, Security, AgentCore-base (Role/SG/S3), Observability
-  Phase 2 (Starter Toolkit): Runtime, Endpoint, ECR, Docker build
-  Phase 3 (CDK): Router, Cron, TokenMonitoring (needs runtime_id/endpoint_id)
+  Phase 2 (SDK controller): AgentCore Runtime, Endpoint, ECR, Docker build
+  Phase 3 (CDK): Router, Cron, TokenMonitoring and AgentCore Runtime Invoke IAM
 """
 
 import os
@@ -25,6 +25,7 @@ from stacks.gateway_stack import GatewayStack
 from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
+from stacks.runtime_config import load_runtime_manifest, runtime_target_from_manifest
 
 app = cdk.App()
 
@@ -61,8 +62,7 @@ if app.node.try_get_context("enable_gateway") is True:
     )
 
 # --- AgentCore base resources (Role, SG, S3) ---
-# Runtime/Endpoint created by Starter Toolkit; runtime_id/endpoint_id
-# injected via cdk.json context after `agentcore deploy`.
+# AgentCore Runtime and its endpoints are owned by the SDK controller.
 agentcore_stack = AgentCoreStack(
     app,
     "OpenClawAgentCore",
@@ -83,12 +83,20 @@ agentcore_stack = AgentCoreStack(
     env=env,
 )
 
+runtime_manifest = load_runtime_manifest(
+    app.node.try_get_context("runtime_manifest"), env.region, env.account,
+)
+runtime_target = runtime_target_from_manifest(runtime_manifest)
+runtime_arn = runtime_manifest["agentRuntimeArn"] if runtime_manifest else ""
+runtime_endpoint_name = runtime_manifest["endpointName"] if runtime_manifest else ""
+
 # --- Router (Lambda + API Gateway HTTP API for Telegram/Slack webhooks) ---
 router_stack = RouterStack(
     app,
     "OpenClawRouter",
-    runtime_arn=agentcore_stack.runtime_arn,
-    runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
+    runtime_arn=runtime_arn,
+    runtime_endpoint_name=runtime_endpoint_name,
+    runtime_target=runtime_target,
     gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
     slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
@@ -111,8 +119,8 @@ _identity_table_arn = f"arn:aws:dynamodb:{_region}:{_account}:table/{_identity_t
 cron_stack = CronStack(
     app,
     "OpenClawCron",
-    runtime_arn=agentcore_stack.runtime_arn,
-    runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
+    runtime_arn=runtime_arn,
+    runtime_endpoint_name=runtime_endpoint_name,
     identity_table_name=_identity_table_name,
     identity_table_arn=_identity_table_arn,
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,

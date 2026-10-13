@@ -2,6 +2,8 @@
 
 This document provides a detailed technical view of the OpenClaw on AgentCore architecture. For a high-level overview, see the [README](../README.md#architecture).
 
+AgentCore Runtime V2 is the only platform. See the [AgentCore Runtime V2 runbook](runtime-v2.md) for snapshot eligibility, user readiness, deployment and migration limits.
+
 ## Component Diagram
 
 ```mermaid
@@ -57,10 +59,10 @@ flowchart TB
 
 | Component | Port | Purpose |
 |---|---|---|
-| **Contract Server** | 8080 | AgentCore HTTP contract (`/ping`, `/invocations`), lazy initialization, routing (shim vs WebSocket bridge) |
-| **Lightweight Agent** | — | Warm-up shim during cold start; agentic loop with 13 tools via proxy → Bedrock (see below) |
+| **Contract Server** | 8080 | AgentCore HTTP contract (`/ping`, `/invocations`); V2 bootstrap/activation and full-gateway admission |
 | **Bedrock Proxy** | 18790 | OpenAI-compatible API → Bedrock ConverseStream, Cognito identity, multimodal image handling |
-| **OpenClaw Gateway** | 18789 | Headless AI agent with full tools and ClawHub skills (available after ~1-2 min startup) |
+| **OpenClaw Gateway** | 18789 | Headless OpenClaw `2026.9.5` with full tools and ClawHub skills; V2 verifies `/startupz`, protocol-4 token handshake and cached `last-heartbeat` RPC |
+| **Shared routing layer** | — | Conditional Router/Cron admission on one AgentCore Runtime ARN, endpoint name, session ID and generation |
 
 ## Data Flow
 
@@ -89,25 +91,20 @@ sequenceDiagram
         RL->>S3: Upload to _uploads/
     end
 
-    RL->>AC: InvokeAgentRuntime
+    RL->>DB: Resolve route and conditionally admit invocation
+    RL->>AC: InvokeAgentRuntime (ARN, endpoint name, session, generation)
     Note over RL,C: Typing indicator every 4s (Telegram)<br/>Progress message after 30s (both channels)
 
     opt First message (cold start)
         AC->>AC: STS AssumeRole (scoped S3 creds)
-        AC->>AC: Start proxy (~5s)
-        AC->>S3: Restore .openclaw/ (background)
-        AC->>AC: Start OpenClaw with scoped creds (background, ~1-2 min)
+        AC->>S3: Restore .openclaw/ after session-storage restore
+        Note over AC,S3: V2 restore failure/timeout blocks activation
+        AC->>AC: Start proxy and OpenClaw with scoped creds
     end
 
-    alt Warm-up phase (OpenClaw not ready)
-        Note over AC,B: Lightweight agent shim handles message
-        AC->>B: ConverseStream (via proxy)
-        B-->>AC: Response + warm-up footer
-    else Full mode (OpenClaw ready)
-        Note over AC,B: WebSocket bridge to OpenClaw
-        AC->>B: ConverseStream (via OpenClaw → proxy)
-        B-->>AC: Response (no footer)
-    end
+    Note over AC,B: V2 waits for USER_READY<br/>Full OpenClaw through the authenticated gateway
+    AC->>B: ConverseStream (via OpenClaw → proxy)
+    B-->>AC: Completed response
 
     AC-->>RL: Final response
     Note over RL: Unwrap nested content blocks<br/>Convert markdown → Telegram HTML
@@ -127,7 +124,7 @@ sequenceDiagram
 
     EB->>CL: Scheduled trigger
     CL->>AC: Warmup request
-    AC-->>CL: Ready
+    AC-->>CL: Ready (V2 requires USER_READY)
     CL->>AC: Send cron message
     AC->>B: ConverseStream
     B-->>AC: Response
@@ -136,6 +133,8 @@ sequenceDiagram
 ```
 
 ### Cross-Channel Account Linking
+
+An unregistered channel can become an alias of the canonical V2 user. Its caller/delivery identity stays separate from SESSION.actorId. An actor already owned by another canonical user cannot transfer; this is not an account merge.
 
 ```mermaid
 sequenceDiagram
@@ -162,127 +161,36 @@ sequenceDiagram
 
 ## Container Internals
 
+V2 completes strict activation before full OpenClaw handles chat or cron.
+
 ```mermaid
 flowchart TB
-    subgraph MicroVM["AgentCore MicroVM (ARM64, per-user)"]
-        CONTRACT["<b>Contract Server :8080</b><br/>GET /ping → Healthy<br/>POST /invocations<br/>Lazy init · SIGTERM save"]
-
-        CONTRACT -->|"warm-up<br/>(OpenClaw not ready)"| SHIM
-        CONTRACT -->|"full mode<br/>(OpenClaw ready)"| OPENCLAW
-
-        subgraph ShimBox["Warm-up Phase (~5s – ~1-2min)"]
-            SHIM["<b>Lightweight Agent</b><br/>Agentic loop (20 iters)<br/>17 tools · SSRF protection<br/>Appends warm-up footer"]
-        end
-
-        subgraph FullBox["Full Mode (~1-2min onward)"]
-            OPENCLAW["<b>OpenClaw Gateway :18789</b><br/>Headless mode · Full tool profile<br/>5 ClawHub skills · Sub-agents"]
-        end
-
-        PROXY["<b>Bedrock Proxy :18790</b><br/>OpenAI compat → ConverseStream<br/>Cognito identity · Multimodal images"]
-
-        SHIM -->|"POST /v1/chat/completions<br/>(non-streaming)"| PROXY
-        OPENCLAW <-->|WebSocket| PROXY
+    subgraph MicroVM["AgentCore V2 microVM: canonical user"]
+        CONTRACT["Contract :8080<br/>Full readiness + immutable binding"]
+        CONTRACT -->|"USER_READY"| OPENCLAW["OpenClaw :18789<br/>Full tools, skills, subagents"]
+        OPENCLAW -->|"/v1/chat/completions"| PROXY["Bedrock proxy :18790<br/>Credentials and Guardrails"]
     end
-
-    PROXY -->|ConverseStream| BEDROCK["Amazon Bedrock<br/>Claude"]
-
-    S3[("S3<br/>workspace · files · images")]
-    CONTRACT <-->|"restore / save<br/>.openclaw/"| S3
-    SHIM -.->|"execFile<br/>skill scripts"| S3
+    PROXY --> BEDROCK["Amazon Bedrock"]
+    CONTRACT <-->|"Strict restore / persistence"| S3[("S3 + session storage mirror")]
 ```
 
-### Lightweight Agent Tools
-
-```mermaid
-flowchart LR
-    subgraph WebTools["In-Process (HTTP)"]
-        WF["web_fetch<br/><i>Read web pages</i>"]
-        WS["web_search<br/><i>DuckDuckGo HTML</i>"]
-    end
-
-    subgraph FileTools["Child Process (execFile)"]
-        RF["read_user_file"]
-        WUF["write_user_file"]
-        LF["list_user_files"]
-        DF["delete_user_file"]
-    end
-
-    subgraph CronTools["Child Process (execFile)"]
-        CS["create_schedule"]
-        LS["list_schedules"]
-        US["update_schedule"]
-        DS["delete_schedule"]
-    end
-
-    subgraph SkillTools["Child Process (execFile)"]
-        IS["install_skill"]
-        UNS["uninstall_skill"]
-        LSK["list_skills"]
-    end
-
-    subgraph ApiKeyTools["Child Process (execFile)"]
-        MAK["manage_api_key<br/><i>Native file CRUD</i>"]
-        MS["manage_secret<br/><i>Secrets Manager CRUD</i>"]
-        RAK["retrieve_api_key<br/><i>SM first, native fallback</i>"]
-        MIG["migrate_api_key<br/><i>Between backends</i>"]
-    end
-
-    subgraph SSRF["SSRF Prevention"]
-        BL["Hostname blocklist<br/><i>localhost, metadata, IMDS</i>"]
-        DNS["Post-DNS IP check<br/><i>loopback, RFC-1918,<br/>RFC-6598, link-local,<br/>IPv6 ULA, IPv4-mapped</i>"]
-        LIM["Limits: 512KB raw,<br/>50KB text, 15s timeout,<br/>3 redirects, 8 results"]
-    end
-
-    WF & WS --> BL --> DNS --> LIM
-    FileTools -->|"/skills/s3-user-files/*.js"| S3[("S3")]
-    CronTools -->|"/skills/eventbridge-cron/*.js"| EB["EventBridge<br/>Scheduler"]
-    SkillTools -->|"/skills/clawhub-manage/*.js"| DISK["Filesystem<br/>(clawhub CLI)"]
-    ApiKeyTools -->|"/skills/api-keys/*.js"| SM["Secrets Manager<br/>+ S3 (native)"]
-```
+The OpenAI-compatible `/v1/chat/completions` protocol is independent of AgentCore Runtime platform V2. File, scheduling, ClawHub and API key skills remain in full OpenClaw; Browser and Gateway integrations retain their readiness checks.
 
 ### Two-Phase Startup
 
 ```mermaid
-gantt
-    title Cold Start Timeline
-    dateFormat s
-    axisFormat %S s
-
-    section Container
-    MicroVM created                     :done, t0, 0, 1s
-
-    section Warm-up Phase
-    Proxy starts (~5s)                  :active, t1, 1s, 5s
-    Lightweight agent handles messages  :active, t2, 5s, 90s
-
-    section Background
-    OpenClaw starting (~1-2 min)        :crit, t3, 5s, 90s
-    Workspace restore from S3           :done, t4, 1s, 10s
-
-    section Full Mode
-    OpenClaw ready — handoff            :milestone, m1, 90s, 0
-    Full runtime handles messages       :t5, 90s, 140s
+flowchart LR
+    B["Common bootstrap<br/>User-neutral live gateway"] --> S["BOOTSTRAP_READY<br/>Snapshot boundary"]
+    S --> R["First user request<br/>Immutable binding"]
+    R --> A["Strict restore<br/>Scoped credentials"]
+    A --> G["Bind eligible prepared gateway<br/>or start gateway for restored/custom state"]
+    G --> P["Browser, skills<br/>Persistence"]
+    P --> U["USER_READY<br/>Full chat / cron"]
 ```
 
-**Warm-up phase** (t=~5s to ~1-2min): Lightweight agent responds with 13 tools (web_fetch, web_search, 4 file, 4 cron, 3 skill management). All responses include `"_Warm-up mode — after full startup..._"` footer.
+See the [AgentCore Runtime V2 lifecycle contract](runtime-v2.md#lifecycle-and-compatibility) for snapshot eligibility, readiness checks and restore failure handling.
 
-**Full mode** (t=~1-2min onward): OpenClaw gateway handles messages via WebSocket bridge. No warm-up footer. ClawHub skills available (transcript, deep-research-pro, jina-reader, telegram-compose, task-decomposer).
-
-### Lightweight Agent Architecture
-
-The lightweight agent (`bridge/lightweight-agent.js`) provides immediate responsiveness during the ~1-2 minute OpenClaw cold start. It is NOT a replacement for OpenClaw — it's a shim that handles messages until the full runtime is ready.
-
-| Property | Detail |
-|---|---|
-| **Routing** | Calls proxy at `127.0.0.1:18790/v1/chat/completions` (OpenAI format, non-streaming) |
-| **Agentic loop** | Up to 20 iterations of tool-call → tool-result → assistant-response |
-| **Tools (17)** | `read_user_file`, `write_user_file`, `list_user_files`, `delete_user_file`, `create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`, `install_skill`, `uninstall_skill`, `list_skills`, `manage_api_key` (native file), `manage_secret` (Secrets Manager), `retrieve_api_key` (unified lookup), `migrate_api_key` (between backends), `web_fetch`, `web_search` |
-| **File/cron tools** | Execute skill scripts via `execFile` with isolated env vars |
-| **Web tools** | In-process HTTP(S) with SSRF prevention (blocked IPs, DNS rebinding mitigation, redirect validation) |
-| **SSRF protection** | Pre-connection hostname blocklist + post-DNS-resolution IP validation covering loopback, RFC-1918, RFC-6598, link-local (AWS IMDS), IPv6 ULA, IPv4-mapped IPv6 |
-| **Web limits** | 512KB raw HTML, 50KB text output, 15s timeout, 3 redirect max, 8 search results |
-| **Detection** | Appends deterministic `"_Warm-up mode — ..."` footer to every response; absence of footer = OpenClaw is handling messages |
-| **Handoff** | Contract server checks `openclawReady` flag; once true, all messages route via WebSocket bridge to OpenClaw |
+Deployment warmup is a billed real chat with an isolated synthetic actor/session after AgentCore Runtime and endpoint readback. It requires full OpenClaw completion, USER_READY and matching immutable binding; see the [warmup contract](runtime-v2.md#post-deployment-warmup). It neither warms real-user state nor establishes first-reply latency.
 
 ## S3 Bucket Structure
 
@@ -290,7 +198,6 @@ The lightweight agent (`bridge/lightweight-agent.js`) provides immediate respons
 s3://openclaw-user-files-{account}-{region}/
 ├── telegram_123456789/           # User namespace (channel_id)
 │   ├── .openclaw/                 # Workspace (synced on init/shutdown)
-│   │   ├── openclaw.json
 │   │   ├── MEMORY.md
 │   │   ├── USER.md
 │   │   └── ...
@@ -311,12 +218,17 @@ s3://openclaw-user-files-{account}-{region}/
 | PK | SK | Purpose | TTL |
 |---|---|---|---|
 | `CHANNEL#telegram:123` | `PROFILE` | Channel → userId mapping | - |
+| `ACTOR#telegram:123` | `OWNER` | Durable userId, actorId, platformVersion and ownerGeneration | - |
 | `USER#user_abc` | `PROFILE` | User profile | - |
 | `USER#user_abc` | `CHANNEL#telegram:123` | User's bound channels | - |
-| `USER#user_abc` | `SESSION` | Current AgentCore session ID | - |
+| `USER#user_abc` | `SESSION` | Route tuple, platform, admission status/count/tokens; V2 actor binding | - |
 | `USER#user_abc` | `CRON#reminder-1` | Cron schedule metadata | - |
 | `BIND#ABC123` | `BIND` | Cross-channel bind code | 10 min |
 | `ALLOW#telegram:123` | `ALLOW` | User allowlist entry | - |
+
+Route fields are `runtimeArn`, `endpointName`, `sessionId`, `generation`, `platformVersion`, `routeStatus`, `inFlight` and `activeAdmissions`; V2 also pins `actorId`, AgentCore Runtime version, image digest and configuration hash. V2 first registrations transact five absent identity/session/OWNER records. V2 starts at generation 1. Missing OWNER requires a strongly consistent paginated legacy Scan; retained provenance or uncertainty blocks fresh enrollment. OWNER has no TTL. A missing V2-enrolled SESSION/profile fails closed. V1 and incomplete routes fail closed; there is no default AgentCore Runtime fallback.
+
+Admission adds a unique token and increments the count; release removes only that token once. Unknown transport/deadline outcomes retain admission, and freeze requires zero count plus no tokens. Cron's bounded calls reserve 6 seconds for release, plus 15 seconds for delivery on business calls. Conditional admission does not fence S3 writes, stop processes or prove drain. Unregistered channel aliases may link to the canonical V2 route; transfer from another canonical owner and existing-user migration are not implemented. See the [runbook](runtime-v2.md) for reconciliation limits.
 
 ## Security Architecture
 

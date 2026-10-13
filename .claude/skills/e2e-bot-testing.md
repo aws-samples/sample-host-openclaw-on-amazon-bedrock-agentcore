@@ -1,6 +1,6 @@
 ---
 name: e2e-bot-testing
-description: "Run automated E2E tests against the deployed OpenClaw bot — webhook simulation, session reset, CloudWatch log verification, full OpenClaw startup timing, ClawHub skill validation, and sub-agent skill verification. Use this skill whenever testing a deployment, verifying cold start behavior, checking if OpenClaw is fully up, measuring startup phase timing, testing sub-agent skills (deep-research-pro, task-decomposer), or diagnosing why messages fail."
+description: "Run automated E2E tests against the deployed OpenClaw bot — webhook simulation, saved V2 routes, CloudWatch log verification, full OpenClaw completion, ClawHub skill validation, and sub-agent skill verification. Use this skill whenever testing a deployment, verifying cold start behavior, checking if OpenClaw is fully up, measuring startup phase timing, testing sub-agent skills (deep-research-pro, task-decomposer), or diagnosing why messages fail."
 user-invocable: true
 ---
 
@@ -10,117 +10,80 @@ Automated end-to-end testing for the deployed OpenClaw bot. Simulates Telegram w
 
 ## Prerequisites
 
+Install the [pinned SDK and pytest](../../docs/runtime-v2.md#offline-checks), then run the commands below from the repository root.
+
 ```bash
 # Required env vars — your real Telegram chat/user IDs
 export E2E_TELEGRAM_CHAT_ID=123456789
 export E2E_TELEGRAM_USER_ID=123456789
 
 # Region (auto-detected from CDK_DEFAULT_REGION or cdk.json if not set)
-export CDK_DEFAULT_REGION=ap-southeast-2
+export CDK_DEFAULT_REGION=us-west-2
 ```
 
 ## Quick Reference
 
 | Command | Purpose |
 |---------|---------|
-| `pytest tests/e2e/bot_test.py -v -k smoke` | Connectivity + webhook validation |
-| `pytest tests/e2e/bot_test.py -v -k lifecycle` | Full message lifecycle |
-| `pytest tests/e2e/bot_test.py -v -k cold_start` | Cold start (new session creation) |
-| `pytest tests/e2e/bot_test.py -v -k warmup` | Verify warm-up shim footer present |
-| `pytest tests/e2e/bot_test.py -v -k full_startup` | Wait for full OpenClaw + timing |
-| `pytest tests/e2e/bot_test.py -v -k subagent` | Sub-agent skill verification |
-| `pytest tests/e2e/bot_test.py -v -k ScopedCredentials` | Scoped S3 credentials (file ops) |
-| `pytest tests/e2e/bot_test.py -v -k TestApiKeyManagement` | API key storage (native + Secrets Manager) |
-| `pytest tests/e2e/bot_test.py -v -k TestSkillManagement` | ClawHub skill install/uninstall lifecycle |
-| `pytest tests/e2e/bot_test.py -v -k TestCronSchedule` | Cron schedule lifecycle + DynamoDB CRON# record verification |
-| `pytest tests/e2e/bot_test.py -v -k conversation` | Multi-turn conversation tests |
-| `pytest tests/e2e/bot_test.py -v` | All E2E tests |
-| `pytest -m "not e2e"` | Skip E2E tests in fast CI |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k smoke` | Connectivity + webhook validation |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k lifecycle` | Full message lifecycle |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k cold_start` | First registration on a new identity |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k full_startup` | V2 readiness and full OpenClaw completion |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k subagent` | Sub-agent skill verification |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k ScopedCredentials` | Scoped S3 credentials (file ops) |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestApiKeyManagement` | API key storage (native + Secrets Manager) |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestSkillManagement` | ClawHub skill install/uninstall lifecycle |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestCronSchedule` | Cron schedule lifecycle + DynamoDB CRON# record verification |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k conversation` | Multi-turn conversation tests |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v` | All E2E tests |
+| `uv run --no-project --python .venv/bin/python python -m pytest tests/ --ignore=tests/e2e -m "not e2e"` | Skip E2E tests in fast CI |
 
 ### CLI (ad-hoc testing)
 
 | Command | Purpose |
 |---------|---------|
-| `python -m tests.e2e.bot_test --health` | Check API Gateway is reachable |
-| `python -m tests.e2e.bot_test --send "Hello" --tail-logs` | Send message + verify lifecycle |
-| `python -m tests.e2e.bot_test --reset --send "Hello" --tail-logs` | Cold start test |
-| `python -m tests.e2e.bot_test --reset-user` | Full user reset |
-| `python -m tests.e2e.bot_test --conversation multi_turn --tail-logs` | Multi-turn test |
-| `python -m tests.e2e.bot_test --subagent --tail-logs` | Sub-agent skill test |
-| `python -m tests.e2e.bot_test --scoped-creds --tail-logs` | Scoped credentials test |
-| `python -m tests.e2e.bot_test --api-keys --tail-logs` | API key management test (native + SM) |
-| `python -m tests.e2e.bot_test --skill-manage --tail-logs` | Skill management test (list, install, uninstall) |
-| `python -m tests.e2e.bot_test --cron --tail-logs` | Cron schedule lifecycle test (create, verify DynamoDB, list, delete) |
+| `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --stop-session` | Stop the saved test session; preserve its route |
+| `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --health` | Check API Gateway is reachable |
+| `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --send "Hello" --tail-logs` | Send message + verify lifecycle |
+| `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --conversation multi_turn --tail-logs` | Multi-turn test |
+| `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --subagent --tail-logs` | Sub-agent skill test |
+| `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --scoped-creds --tail-logs` | Scoped credentials test |
+| `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --api-keys --tail-logs` | API key management test (native + SM) |
+| `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --skill-manage --tail-logs` | Skill management test (list, install, uninstall) |
+| `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --cron --tail-logs` | Cron schedule lifecycle test (create, verify DynamoDB, list, delete) |
 
-## Startup Phases and Timing
+## V2 startup evidence
 
-The bot has a two-phase startup. Understanding these phases is critical for interpreting test results:
+Snapshot eligibility and full readiness follow the [V2 lifecycle contract](../../docs/runtime-v2.md#lifecycle-and-compatibility). All chat and cron wait for `USER_READY`.
 
-```
-Cold Start Timeline
-───────────────────────────────────────────────────────────────────
-t=0s       Container created (new microVM)
-t=~5s      Proxy ready → lightweight agent shim handles messages
-           Responses include: "_Warm-up mode — after full startup..._"
-t=~1-2min  OpenClaw gateway ready → full runtime handles messages
-           Responses have NO warm-up footer
-           ClawHub skills available (transcript, deep-research, etc.)
-```
+`get_agent_status(cfg)` invokes the saved SESSION ARN/endpoint/session and checks V2 binding metadata. Readiness requires `lifecycle.state == "USER_READY"`, `openclawReady` and `proxyReady`. `TestFullStartup` additionally runs a single diagnostic chat with shared admission and requires `execution.engine == "openclaw"`, `execution.phase == "completed"`, V2 readiness and exact binding fields. The Router's log preview is truncated and is not sufficient completion metadata.
 
-| Phase | What Responds | Indicator | Typical Time |
-|-------|---------------|-----------|-------------|
-| **Warm-up** | Lightweight agent shim (proxy → Bedrock) | `"warm-up mode"` in response | 5-15s from cold start |
-| **Full** | OpenClaw gateway (WebSocket bridge) | No warm-up footer | 1-2 min from cold start |
-
-### How to detect which phase is active
-
-The `TailResult.is_warmup` property checks for `"warm-up mode"` (case-insensitive) in the response text. This footer is deterministically appended by `bridge/lightweight-agent.js` and is never present when the full OpenClaw runtime handles the message.
-
-```python
-tail = tail_logs(cfg, since_ms=since_ms)
-if tail.is_warmup:
-    print("Still in warm-up shim mode")
-else:
-    print("Full OpenClaw is running!")
-```
-
-### ClawHub skills (post-warmup only)
-
-These skills are only available after OpenClaw fully starts. Requesting one during warm-up will get a response from the shim (without the skill output):
-
-| Skill | Test Prompt |
-|-------|------------|
-| `transcript` | `"Get the transcript of https://www.youtube.com/watch?v=dQw4w9WgXcQ"` |
-| `deep-research-pro` | `"Research the latest advances in quantum computing"` |
-| `jina-reader` | `"Read and summarize https://example.com"` |
-| `task-decomposer` | `"Break down the task of building a REST API"` |
-
-The `TestFullStartup` test waits for full startup and verifies responses no longer contain the warm-up footer, confirming ClawHub skills are available.
+The diagnostic chat makes a billed model call without channel delivery. It never retries uncertain outcomes; retained admission needs reconciliation. No latency lower bound or claimed cold-start timing is used. `TestColdStart` requires a genuinely new dedicated identity and skips an existing registration without deleting it. ClawHub, API key, Browser, scoped-credential, conversation, Guardrail and Cron functional tests remain available.
 
 ### Sub-agent skill verification (TestSubagent)
 
-Two ClawHub skills spawn sub-agents for parallel work: `deep-research-pro` and `task-decomposer`. The `TestSubagent` class verifies these skills produce substantial responses after full OpenClaw startup.
+Two ClawHub skills spawn sub-agents for parallel work: `deep-research-pro` and `task-decomposer`. `TestSubagent` checks response length, V2 readiness and the proxy's sub-agent request counter when available.
 
 ```bash
 # Run sub-agent tests only
-pytest tests/e2e/bot_test.py -v -k subagent
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k subagent
 
 # Ad-hoc CLI testing
-python -m tests.e2e.bot_test --subagent --tail-logs
+uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --subagent --tail-logs
 ```
 
 **What the tests verify:**
-1. OpenClaw is fully started (not in warm-up mode)
-2. `task-decomposer` produces structured output (>100 chars) for a decomposition request
-3. `deep-research-pro` produces detailed output (>200 chars) for a research request
-4. Responses come from full OpenClaw, not the lightweight warm-up shim
+1. Bound V2 lifecycle reports USER_READY
+2. `task-decomposer` produces a response of at least 100 characters
+3. `deep-research-pro` produces a response of at least 200 characters
+4. When both status reads expose `subagentRequestCount`, its value increases after the skill invocation
 
-**What the tests cannot verify** (observability gap):
-- Whether sub-agents were actually spawned (container stdout not in CloudWatch)
-- Whether the proxy received multiple requests (one per sub-agent)
-- Which model the sub-agents used
+**Evidence limits:**
+- A counter increase shows that the proxy received requests using the sub-agent model route. It does not establish response quality or successful completion of every sub-agent.
+- If either counter read is unavailable, the test reports that gap and omits the counter assertion; sub-agent execution remains unverified.
+- Response-length assertions alone do not prove sub-agent health or which Bedrock model was used.
 
-The tests are behavioral smoke tests — they confirm the skills produce substantial output after full startup. If sub-agent execution is fundamentally broken (sandbox misconfigured, model routing fails, skill loading fails), the response would be an error or a short deflection, failing the length assertion.
+Container stdout/stderr is available in `/openclaw/container`. `container_logs.py` reads streams for the saved canonical actor; use those logs to investigate execution details.
 
 **Sub-agent configuration path** (for debugging failures):
 ```
@@ -130,18 +93,18 @@ cdk.json: subagent_model_id → agentcore_stack.py: SUBAGENT_BEDROCK_MODEL_ID en
       → proxy resolveModelId() → Bedrock ConverseStream (SUBAGENT_BEDROCK_MODEL_ID or MODEL_ID)
 ```
 
-**Subagent verification**: The proxy detects subagent requests by the distinct model name (`bedrock-agentcore-subagent`), increments `subagentRequestCount`, and exposes it via `/health` and the contract `status` endpoint. E2E tests assert this count increases after skill invocations.
+**Subagent verification**: The proxy detects subagent requests by the distinct model name (`bedrock-agentcore-subagent`), increments `subagentRequestCount`, and exposes it via `/health` and the contract `status` endpoint. E2E tests assert the increase only when both counter reads are available.
 
 ### API key management verification (TestApiKeyManagement)
 
-Tests the dual-mode API key storage system during warm-up mode (lightweight agent). These tools are available immediately on cold start — no need to wait for full OpenClaw startup.
+Tests native-file and Secrets Manager API key storage through full OpenClaw after V2 USER_READY.
 
 ```bash
 # Run API key tests only
-pytest tests/e2e/bot_test.py -v -k TestApiKeyManagement
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestApiKeyManagement
 
 # Ad-hoc CLI testing
-python -m tests.e2e.bot_test --api-keys --tail-logs
+uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --api-keys --tail-logs
 ```
 
 **Tools tested:**
@@ -159,18 +122,18 @@ python -m tests.e2e.bot_test --api-keys --tail-logs
 4. List operations for both backends
 5. Cleanup: delete from both backends
 
-**Test resets session** to force warm-up mode, since API key tools are lightweight agent tools (not OpenClaw skills).
+The setup waits for V2 readiness and cleans up test keys while retaining the SESSION route.
 
 ### Skill management verification (TestSkillManagement)
 
-Tests the clawhub-manage skill lifecycle: list installed skills, install a new skill, verify it appears, uninstall it, and verify it's gone. Runs during warm-up mode (lightweight agent) since the clawhub-manage tool is available immediately.
+Tests the clawhub-manage skill lifecycle: list installed skills, install a new skill, verify it appears, uninstall it, and verify it's gone. Runs through full OpenClaw after V2 readiness.
 
 ```bash
 # Run skill management tests only
-pytest tests/e2e/bot_test.py -v -k TestSkillManagement
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestSkillManagement
 
 # Ad-hoc CLI testing
-python -m tests.e2e.bot_test --skill-manage --tail-logs
+uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --skill-manage --tail-logs
 ```
 
 **What the tests verify:**
@@ -180,7 +143,7 @@ python -m tests.e2e.bot_test --skill-manage --tail-logs
 4. Uninstall the test skill
 5. Verify the skill is removed from the list
 
-**Test resets session** to force warm-up mode. After install/uninstall, the skill changes take effect on the next session start (after idle timeout).
+The setup retains the saved route and waits for V2 readiness before skill operations.
 
 ### Cron schedule verification (TestCronSchedule)
 
@@ -188,10 +151,10 @@ Tests the eventbridge-cron skill lifecycle and **critically verifies DynamoDB CR
 
 ```bash
 # Run cron tests only
-pytest tests/e2e/bot_test.py -v -k TestCronSchedule
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestCronSchedule
 
 # Ad-hoc CLI testing
-python -m tests.e2e.bot_test --cron --tail-logs
+uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --cron --tail-logs
 ```
 
 **What the tests verify:**
@@ -206,12 +169,12 @@ python -m tests.e2e.bot_test --cron --tail-logs
 **Why this test matters:**
 The cron executor Lambda verifies schedule ownership by looking up `CRON#{scheduleId}` under `USER#{internalUserId}` (e.g., `USER#user_abc123`). If the scoped credentials only allow `USER#{actorId}` (e.g., `USER#telegram:12345`), the cron skill can create EventBridge schedules but silently fails to write the DynamoDB ownership record. Schedules appear to work but the Lambda rejects every execution with "Schedule not owned by user — skipping execution."
 
-**Test resets session** to start clean. Cleanup fixture removes stale test schedules from prior runs (both EventBridge and DynamoDB).
+The fixture retains the V2 session route and removes stale test schedules from prior runs (both EventBridge and DynamoDB).
 
 | Troubleshooting | Cause | Fix |
 |----------------|-------|-----|
 | `test_cron_record_exists` fails | Scoped credentials DynamoDB LeadingKeys missing `USER#{internalUserId}` | Add `internalUserId` to `buildSessionPolicy()` in `scoped-credentials.js` |
-| `test_create_schedule` timeout | eventbridge-cron skill not in lightweight agent TOOLS array | Check `lightweight-agent.js` has `create_schedule` tool |
+| `test_create_schedule` timeout | V2 activation or skill execution incomplete | Inspect lifecycle and eventbridge-cron tool logs |
 | `test_list_schedules` shows empty | Scoped creds can't read `USER#{internalUserId}` CRON# records | Same fix as `test_cron_record_exists` |
 | `test_eventbridge_schedule_exists` fails | Scheduler IAM permissions missing | Check `scoped-credentials.js` includes `scheduler:CreateSchedule` |
 
@@ -250,23 +213,26 @@ log_tailer.py --filter_log_events--> Pattern matching --> TailResult
 | `New session created: X for X` | Cold start detected |
 | `New user created: X for X` | New user created |
 
-The `AgentCore response body` line contains JSON: `{"response": "full text..."}`. The log tailer parses this JSON to extract the complete response text (up to 2000 chars), which is more reliable than the truncated `Response to send` line.
+`AgentCore response` logs only the first 200 characters of the JSON body. `Response to send` logs up to 2,000 characters of extracted text; neither is guaranteed to contain the full response. The tailer also recognizes contract-owned Telegram streaming. FullStartup reads complete execution metadata through the saved V2 route.
 
 ### Test Classes
 
-| Class | Purpose | Resets Session | Stops Container |
-|-------|---------|:-:|:-:|
-| `TestSmoke` | Connectivity, webhook auth | | |
-| `TestMessageLifecycle` | Full lifecycle via log tailing | | |
-| `TestColdStart` | New session creation after reset | ✓ | |
-| `TestWarmupShim` | Warm-up footer present on cold start | ✓ | ✓ |
-| `TestFullStartup` | Full OpenClaw ready + phase timing | ✓ | ✓ |
-| `TestSubagent` | Sub-agent skill verification | | |
-| `TestScopedCredentials` | S3 file ops via scoped STS creds | | |
-| `TestApiKeyManagement` | API key storage (native + SM) | ✓ | |
-| `TestSkillManagement` | ClawHub skill install/uninstall | ✓ | |
-| `TestCronSchedule` | Cron lifecycle + DynamoDB CRON# record | ✓ | |
-| `TestConversation` | Multi-turn scenarios | | |
+| Class | Purpose |
+|---|---|
+| `TestSmoke` | Connectivity and webhook auth |
+| `TestMessageLifecycle` | Full channel lifecycle |
+| `TestColdStart` | First registration; skips an existing identity |
+| `TestFullStartup` | V2 readiness, OpenClaw completion and binding metadata |
+| `TestSubagent` | Subagent skill verification |
+| `TestScopedCredentials` | Scoped S3 file operations |
+| `TestApiKeyManagement` | Native and Secrets Manager API keys |
+| `TestSkillManagement` | ClawHub install/uninstall |
+| `TestCronSchedule` / `TestCronExecution` | Schedule lifecycle and delivery |
+| `TestBrowserFeature` | Browser tools |
+| `TestGuardrailSecurity` | Application security |
+| `TestConversation` | Multi-turn scenarios |
+
+These tests retain SESSION records. Only an explicit `--stop-session` diagnostic stops a saved session; it is not part of the runner.
 
 ### Conversation Scenarios
 
@@ -283,30 +249,17 @@ Pre-defined scenarios in `tests/e2e/conftest.py`:
 tests/e2e/
   config.py       - AWS config auto-discovery (CF outputs, Secrets Manager, cdk.json)
   webhook.py      - Build + POST Telegram webhook payloads
-  session.py      - DynamoDB session/user reset + AgentCore session stop
+  session.py      - Saved V2 route/status, full completion evidence, route-preserving stop
   log_tailer.py   - CloudWatch log tailing with pattern matching
   bot_test.py     - CLI entrypoint (argparse) + pytest test classes
   conftest.py     - pytest fixtures, auto-mark e2e, conversation scenarios
 ```
 
-## Session Reset for True Cold Start
+## Saved V2 sessions
 
-A "true cold start" requires **two** cleanup steps:
+Never delete SESSION or identity records to force a cold start. `_stop_agentcore_session(cfg)` resolves the saved route before stopping its exact ARN/endpoint/session, and retains the records. Stopping a session is not a new registration, migration, state-checkpoint proof or guarantee of the next invocation's startup path. The only stop CLI is `--stop-session`; old reset flags are unsupported.
 
-1. **Delete DDB session record** (`reset_session`) — forces the Router Lambda to create a new session ID on next message
-2. **Stop AgentCore session** (`_stop_agentcore_session`) — terminates the running container so a new one is pulled
-
-If you only delete the DDB record, the old container may still be running (warm, with OpenClaw already started). The next message gets a new session ID but reuses the warm container — not a true cold start.
-
-```python
-from tests.e2e.session import reset_session, _stop_agentcore_session, get_user_id
-
-# True cold start reset
-user_id = get_user_id(cfg)
-if user_id:
-    reset_session(cfg)            # Delete SESSION record from DDB
-    _stop_agentcore_session(cfg)  # Terminate the running container
-```
+Cold-start registration testing requires a previously unused dedicated identity. Existing or incomplete routes must be reconciled, not relabeled V2 or filled from a default AgentCore Runtime. Avoid parallel test suites against the same identity.
 
 ## Config Auto-Discovery
 
@@ -316,7 +269,7 @@ All configuration is resolved automatically from AWS — no hardcoded values:
 |--------|--------|
 | API URL | CloudFormation `OpenClawRouter` stack output `ApiUrl` |
 | Webhook secret | Secrets Manager `openclaw/webhook-secret` |
-| Runtime ARN | CloudFormation `OpenClawAgentCore` stack output `RuntimeArn` |
+| AgentCore Runtime ARN | Saved `USER#<userId>` / `SESSION.runtimeArn`; endpoint/session come from the same record |
 | Region | `CDK_DEFAULT_REGION` env → `cdk.json` context → boto3 session |
 | Log group | `/openclaw/lambda/router` (hardcoded, matches `stacks/router_stack.py`) |
 | Identity table | `openclaw-identity` (hardcoded, matches `stacks/router_stack.py`) |
@@ -324,44 +277,45 @@ All configuration is resolved automatically from AWS — no hardcoded values:
 
 ## Deployment Verification Workflow
 
-After deploying a new container version, run tests in this order:
+The V2 runner defaults to `TestSmoke` and `TestMessageLifecycle`. Repeat `--test-node tests/e2e/path.py::ClassName` to replace those defaults. Even `--skip-deploy` verifies `.runtime/runtime-v2.json` (or `--manifest`) for enrollment readiness. The runner does not delete sessions, stop runtimes or change image versions. Selected feature tests still perform live model/tool operations.
+
+With `E2E_TELEGRAM_CHAT_ID` set, it attempts Telegram start and post-pytest completion notices. Notifications are best effort; an earlier deployment/verification failure exits before the completion notice. Pytest output is saved to `/tmp/e2e-results.txt`, overridable with `E2E_RESULTS_FILE`, and a text-derived summary is printed and included in the completion notice. The exit status comes from pytest; retain the full output when reporting results.
+
+Use the following feature suites for regression checks. Live E2E uses real AWS resources, model/tool calls and channel messages; use a dedicated V2 test identity and its saved route:
 
 ```bash
 # 1. Smoke — API Gateway is up, webhook auth works
-pytest tests/e2e/bot_test.py -v -k smoke
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k smoke
 
 # 2. Lifecycle — message flows end-to-end (uses existing warm session)
-pytest tests/e2e/bot_test.py -v -k lifecycle
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k lifecycle
 
-# 3. Cold start — new session creation works
-pytest tests/e2e/bot_test.py -v -k cold_start
+# 3. First registration — requires a genuinely new test identity
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k cold_start
 
-# 4. Warm-up shim — lightweight agent responds during cold start
-pytest tests/e2e/bot_test.py -v -k warmup
 
-# 5. Full startup — OpenClaw fully starts, phase timing measured
-#    (This takes 3-5+ min — it polls until warm-up footer disappears)
-pytest tests/e2e/bot_test.py -v -k full_startup
+# 5. Full startup — V2 readiness, execution completion and immutable binding
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k full_startup
 
 # 6. Sub-agent skills — verify deep-research-pro and task-decomposer
 #    (Requires full OpenClaw; waits for startup if needed)
-pytest tests/e2e/bot_test.py -v -k subagent
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k subagent
 
 # 7. Cron schedule — create, verify CRON# DynamoDB record, list, delete
 #    (Critical for scoped credentials validation)
-pytest tests/e2e/bot_test.py -v -k TestCronSchedule
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestCronSchedule
 
 # 8. Skill management — install/uninstall ClawHub skills
-pytest tests/e2e/bot_test.py -v -k TestSkillManagement
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestSkillManagement
 
 # 9. Conversations — multi-turn and rapid-fire
-pytest tests/e2e/bot_test.py -v -k conversation
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k conversation
 
 # Or run everything:
-pytest tests/e2e/bot_test.py -v
+uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v
 ```
 
-Use subagents for parallel monitoring: launch a background agent to tail CloudWatch logs and check for OpenClaw full startup timing while running the pytest suite in the foreground.
+Record the saved route, image/version and exact run results. Skipped required suites do not establish release readiness.
 
 ## Adding New Test Scenarios
 
@@ -378,7 +332,7 @@ SCENARIOS = {
 ```
 
 2. The scenario is automatically available as:
-   - CLI: `python -m tests.e2e.bot_test --conversation new_scenario --tail-logs`
+   - CLI: `uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --conversation new_scenario --tail-logs`
    - pytest: via the `conversation_scenario` parametrized fixture
 
 ## Adding New Log Patterns
@@ -394,47 +348,40 @@ If new log lines are added to `lambda/router/index.py`:
 
 | Operation | Default | Notes |
 |-----------|---------|-------|
-| Log tail | 300s | Accommodates cold start (~1-2 min) |
+| Log tail | 300s | Observation budget; not a startup-latency guarantee |
 | Full startup poll | 600s | Waits for full OpenClaw (10 min max) |
 | Sub-agent skill timeout | 600s | Sub-agent skills may take several minutes |
-| Startup poll interval | 30s | Between status-check messages |
+| Startup poll interval | 30s | Between read-only bound status checks |
 | Webhook POST | 30s | API Gateway timeout |
 | Health check | 10s | Simple GET |
 | Poll interval | 5s | CloudWatch log polling frequency |
 | Rapid-fire delay | 1s | Between rapid messages |
 | Normal delay | 5s | Between conversation turns |
 
-## Observability Gaps
+## Observability
 
-Container stdout/stderr (Node.js `console.log` from `agentcore-contract.js`) is **not captured in CloudWatch**. The available log groups show only:
+The application logger sends container output to `/openclaw/container`, with stream prefixes derived from the saved canonical actor. `container_logs.py` and Guardrail wiring tests use that prefix. Router lifecycle logs remain in `/openclaw/lambda/router`.
 
-| Log Group | Contents |
-|-----------|----------|
-| `/openclaw/lambda/router` | Lambda execution logs (message lifecycle) |
-| `/aws/vendedlogs/bedrock-agentcore/runtime/APPLICATION_LOGS/...` | OTEL traces (InvokeAgentRuntime spans) |
-| `/aws/bedrock-agentcore/runtimes/...-DEFAULT` | Empty `otel-rt-logs` stream |
-| `/aws/bedrock-agentcore/runtimes/...-openclaw_agent_live` | Empty `otel-rt-logs` stream |
-
-This means diagnostic messages like `[contract] OpenClaw ready`, `[contract] OpenClaw failed to start`, and `[openclaw:out/err]` are invisible. To diagnose container-level issues, test locally with `docker run`.
+Native AgentCore Runtime log delivery is separate and is not inferred from application logs. Historical empty native streams do not establish that current application diagnostics are absent. Router text previews are truncated; use bound status and full completion metadata for V2 assertions.
 
 ## Troubleshooting
 
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
-| Config error: Output not found | Stack not deployed | `cdk deploy OpenClawRouter` |
+| Config error: Output not found | Stack not deployed | `./scripts/deploy.sh --phase3 --manifest .runtime/runtime-v2.json`; if the manifest is missing, follow the [initial deployment steps](../../docs/runtime-v2.md#deploy-and-verify-v2) |
 | 401 Unauthorized | Webhook secret mismatch | Check Secrets Manager `openclaw/webhook-secret` |
 | Tail timeout, no logs | Wrong region or log group | Verify `CDK_DEFAULT_REGION` |
 | Tail timeout, partial (received + invoked, no sent) | AgentCore cold start exceeds timeout | Increase `--timeout` to 600 |
-| Session not found | First-time user | Use `--send` first to create user, then `--reset` |
+| Session not found | Missing registration or incomplete ownership | Register only a genuinely new dedicated identity; reconcile existing ownership without deleting records |
 | "I received an unexpected response" | Proxy returned error instead of choices | Check proxy error detail in Lambda logs: `AgentCore response body` JSON |
 | "Proxy error: X is not defined" | Code error in `agentcore-proxy.js` | Fix the ReferenceError in proxy code, rebuild container |
-| Warm-up footer never disappears | OpenClaw binary broken in container | Run `docker run --rm --platform linux/arm64 --entrypoint bash IMAGE -c "openclaw --version"` to check |
+| USER_READY not reached | Activation failed or is pending | Inspect lifecycle, strict restore, credentials, gateway and Browser logs |
 | `openclaw: missing dist/entry.(m)js` | Docker COPY resolved symlinks | Use `ln -s` instead of `COPY --from=builder` for `/usr/local/bin/openclaw` |
-| New container code not taking effect | AgentCore caches image digests at deploy time | Bump `image_version` in cdk.json AND run `cdk deploy` |
-| Cold start test gets warm response | Old container still running | Stop AgentCore session AND delete DDB session record |
-| Multiple sessions created during tests | Each test run may create a new session | Expected — each session independently cold-starts |
+| New container code not taking effect | AgentCore caches image digests at deploy time | Deploy through the SDK controller with a new immutable endpoint |
+| Cold-start registration test skips | Test identity already registered | Use a genuinely new dedicated identity; retain the existing route |
+| Route changed during tests | Concurrent registration or operator change | Stop testing and reconcile the saved route |
 | Sub-agent test: short response | Skill didn't invoke sub-agents, or model answered directly | Check `openclaw.json` has correct `subagents` config; verify skill is loaded (`ls /skills/`) |
-| Sub-agent test: warm-up response | OpenClaw not fully started | Test waits 10 min max; check container logs for startup errors |
+| Sub-agent test: readiness failure | V2 activation incomplete | Inspect lifecycle and container logs before another turn |
 | Sub-agent test: timeout | Sub-agent processing exceeded Lambda timeout | Check `router_lambda_timeout_seconds` (default 300s); sub-agent tasks may need longer |
 | API key test: manage_secret fails | Scoped STS credentials missing SM permissions | Check `agentcore_stack.py` has `secretsmanager:*` on `openclaw/user/*`; verify `EXECUTION_ROLE_ARN` env var is set |
 | API key test: key value not in response | Model didn't use the tool or redacted the value | Check prompt is explicit about tool name and action; verify tool is in TOOLS array |
@@ -462,16 +409,9 @@ If `openclaw --version` throws `missing dist/entry.(m)js`, the multi-stage Docke
 
 ### Image Version Deployment
 
-AgentCore resolves image tags to digests at CDK deploy time. Pushing new layers to an existing tag without bumping the version **will not take effect**:
+Use the pinned SDK controller, preserve the previous manifest and choose an unused release endpoint. A CDK-only deployment or image push does not update an existing saved route.
 
 ```bash
-# Correct workflow:
-# 1. Edit cdk.json: "image_version": N+1
-# 2. Update BUILD_VERSION in bridge/agentcore-contract.js
-# 3. Build + push with new tag
-docker build --no-cache --platform linux/arm64 -t openclaw-bridge:vN+1 bridge/
-docker tag openclaw-bridge:vN+1 ACCOUNT.dkr.ecr.REGION.amazonaws.com/openclaw-bridge:vN+1
-docker push ACCOUNT.dkr.ecr.REGION.amazonaws.com/openclaw-bridge:vN+1
-# 4. CDK deploy (resolves new digest)
-cdk deploy OpenClawAgentCore --require-approval never
+./scripts/deploy.sh --runtime-only --endpoint-name release_2
+./scripts/deploy.sh --phase3 --manifest .runtime/runtime-v2.json
 ```

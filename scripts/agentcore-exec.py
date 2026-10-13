@@ -3,10 +3,10 @@
 
 Wraps the AgentCore Runtime data-plane API ``InvokeAgentRuntimeCommand`` via
 boto3 (the AWS CLI does not expose this verb yet). The command runs in the same
-microVM and filesystem as the OpenClaw session identified by the session id, so
-``/mnt/workspace`` and the ``~/.openclaw`` symlink are visible exactly as the
-agent left them. stdout/stderr are streamed back as they arrive and this script
-exits with the command's own exit code. No LLM turn is involved.
+microVM and filesystem selected by the runtime endpoint and session id. The
+local ``~/.openclaw`` directory and its ``/mnt/workspace`` mirror are visible
+as the agent left them. stdout/stderr are streamed back as they arrive and this
+script exits with the command's own exit code. No LLM turn is involved.
 
 SECURITY -- READ BEFORE USE
 ---------------------------
@@ -27,19 +27,8 @@ Therefore:
 * Every invocation is recorded in CloudTrail (caller, time, source IP) and the
   input command is logged to CloudWatch by the service. stdout/stderr are not.
 
-See ``docs/execute-command.md`` for the operator workflow and the IAM statement.
-
-Examples
---------
-    # Health check in a NEW throwaway session
-    python3 scripts/agentcore-exec.py --command 'node --version && df -h /mnt/workspace'
-
-    # Inspect a specific user's persistent workspace (touches user data -- audit it)
-    python3 scripts/agentcore-exec.py --session-id ses_user_0123456789abcdef_0a1b2c3d4e5f \\
-        --command 'ls -la /mnt/workspace/.openclaw'
-
-    # Machine-readable output for CI assertions
-    python3 scripts/agentcore-exec.py --json --command 'test -L ~/.openclaw && echo ok'
+See ``docs/execute-command.md`` for route resolution, operator examples and
+the IAM statement.
 """
 
 from __future__ import annotations
@@ -48,6 +37,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 import uuid
@@ -139,12 +129,17 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument(
         "--runtime-id",
         help="Agent runtime id (the part after 'runtime/'). The ARN is composed from --region "
-        "and the STS caller account. Default: 'runtime_id' from cdk.json.",
+        "and the STS caller account. Requires an explicit --qualifier.",
+    )
+    parser.add_argument(
+        "--manifest",
+        help="AgentCore Runtime V2 manifest. Default: cdk.json 'runtime_manifest', then "
+        ".runtime/runtime-v2.json. Relative paths resolve from the project root.",
     )
     parser.add_argument(
         "--qualifier",
-        help="Runtime endpoint name (qualifier). Default: 'runtime_endpoint_id' from cdk.json, "
-        "else the service default endpoint.",
+        help="AgentCore Runtime endpoint name (qualifier). Default: endpointName from the V2 manifest. "
+        "Required with an explicit runtime ARN/id when no --manifest is supplied.",
     )
     parser.add_argument(
         "--region",
@@ -223,6 +218,32 @@ def load_cdk_context(path: Path = CDK_JSON) -> Dict[str, Any]:
         return {}
 
 
+def load_runtime_manifest(path: Optional[str], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the V2 operator target, including failed/skipped warmup artifacts for diagnosis."""
+    selected = Path(path or ctx.get("runtime_manifest") or ".runtime/runtime-v2.json")
+    if not selected.is_absolute():
+        selected = REPO_ROOT / selected
+    try:
+        manifest = json.loads(selected.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ExecError(f"Cannot read AgentCore Runtime manifest {selected}: {type(error).__name__}", EXIT_USAGE) from error
+    if (not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int
+            or manifest["schemaVersion"] != 1 or manifest.get("platformVersion") != "V2"):
+        raise ExecError("AgentCore Runtime manifest requires schemaVersion 1 and platformVersion V2", EXIT_USAGE)
+    arn = manifest.get("agentRuntimeArn")
+    match = re.fullmatch(
+        r"arn:aws[a-z-]*:bedrock-agentcore:([a-z0-9-]+):[0-9]{12}:runtime/([A-Za-z0-9_-]+)", arn or ""
+    ) if isinstance(arn, str) else None
+    if (not match or match[1] != manifest.get("region")
+            or match[2] != manifest.get("agentRuntimeId")):
+        raise ExecError("AgentCore Runtime manifest ARN, runtime ID and region must match", EXIT_USAGE)
+    endpoint = manifest.get("endpointName")
+    if (manifest.get("endpointPolicy") != "IMMUTABLE" or not isinstance(endpoint, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", endpoint) or endpoint == "DEFAULT"):
+        raise ExecError("AgentCore Runtime manifest requires an immutable custom endpoint", EXIT_USAGE)
+    return manifest
+
+
 def resolve_region(cli_region: Optional[str], ctx: Dict[str, Any], session_region: Optional[str]) -> str:
     region = (
         cli_region
@@ -245,16 +266,18 @@ def resolve_runtime_arn(
     ctx: Dict[str, Any],
     get_account: Callable[[], str],
 ) -> str:
-    """Return the runtime ARN. ``get_account`` is only called when composing from an id."""
+    """Return an explicit or manifest ARN; legacy CDK runtime_id is never a default."""
     if runtime_arn:
         if not runtime_arn.startswith("arn:") or ":runtime/" not in runtime_arn:
             raise ExecError(f"--runtime-arn does not look like a runtime ARN: {runtime_arn}", EXIT_USAGE)
         return runtime_arn
-    rid = runtime_id or ctx.get("runtime_id")
+    if not runtime_id and ctx.get("agentRuntimeArn"):
+        return ctx["agentRuntimeArn"]
+    rid = runtime_id
     if not rid or rid == "PLACEHOLDER":
         raise ExecError(
-            "No runtime target: pass --runtime-arn or --runtime-id, or set 'runtime_id' in cdk.json "
-            "(deploy.sh writes it after the first deployment).",
+            "No runtime target: use a V2 --manifest or explicit --runtime-arn/--runtime-id "
+            "with --qualifier.",
             EXIT_USAGE,
         )
     account = get_account()
@@ -455,15 +478,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         import boto3  # deferred: --help and validation never need AWS
 
         ctx = load_cdk_context()
+        manifest = {}
+        if args.manifest or not (args.runtime_arn or args.runtime_id):
+            manifest = load_runtime_manifest(args.manifest, ctx)
+        qualifier = args.qualifier or manifest.get("endpointName")
+        if not qualifier:
+            raise ExecError("Explicit --runtime-arn/--runtime-id requires --qualifier or --manifest", EXIT_USAGE)
+        if manifest and qualifier != manifest["endpointName"]:
+            raise ExecError("--qualifier conflicts with the AgentCore Runtime manifest endpoint", EXIT_USAGE)
         boto_session = boto3.session.Session()
-        region = resolve_region(args.region, ctx, boto_session.region_name)
+        region = resolve_region(args.region, manifest or ctx, boto_session.region_name)
+        if manifest and region != manifest["region"]:
+            raise ExecError("AWS region conflicts with the AgentCore Runtime manifest", EXIT_USAGE)
 
         def _account() -> str:
             # Only reached when composing an ARN from a runtime id.
             return boto_session.client("sts", region_name=region).get_caller_identity()["Account"]
 
-        runtime_arn = resolve_runtime_arn(args.runtime_arn, args.runtime_id, region, ctx, _account)
-        qualifier = args.qualifier or ctx.get("runtime_endpoint_id") or None
+        runtime_arn = resolve_runtime_arn(args.runtime_arn, args.runtime_id, region, manifest, _account)
+        if manifest and runtime_arn != manifest["agentRuntimeArn"]:
+            raise ExecError("Explicit runtime target conflicts with the AgentCore Runtime manifest", EXIT_USAGE)
 
         throwaway = session_id is None
         if throwaway:

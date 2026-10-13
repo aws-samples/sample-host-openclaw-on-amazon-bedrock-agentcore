@@ -6,7 +6,7 @@ image gains two unused files, and `openclaw.json` is unchanged.
 
 Today the in-house skills (`bridge/skills/s3-user-files`, `bridge/skills/eventbridge-cron`,
 `bridge/skills/api-keys`) run as **exec skills**: OpenClaw shells out to a Node script inside the
-container, which calls AWS with the runtime's scoped credentials. This prototype exposes the same
+container, which calls AWS with the AgentCore Runtime's scoped credentials. This prototype exposes the same
 capabilities as **MCP tools served by an Amazon Bedrock AgentCore Gateway**, so that
 
 * the model calls a typed tool (`list_files`, `create_schedule`, ...) instead of composing a shell
@@ -27,8 +27,8 @@ the other.
 | Gateway | `AWS::BedrockAgentCore::Gateway` `openclaw-tools`, protocol MCP, `CUSTOM_JWT` inbound authorizer: discovery URL of the existing `OpenClawSecurity` user pool, `allowedClients = [CognitoProxyClientId]` (the `openclaw-proxy` app client the Bedrock proxy already authenticates each user against) | `stacks/gateway_stack.py` |
 | Interceptor | REQUEST interceptor Lambda `openclaw-gateway-interceptor` with `passRequestHeaders: true`; copies the bearer JWT into the reserved tool argument `__caller_token`, overwriting anything the model sent | `lambda/gateway_tools/interceptor/` |
 | Targets | Two Lambda MCP targets: **`user-files`** (`list_files`, `read_file`, `write_file`, `delete_file`) and **`schedules`** (`create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`). Tool schemas live in one JSON file consumed by both CDK and the tests | `lambda/gateway_tools/tool-schemas.json`, `s3_user_files/`, `eventbridge_cron/` |
-| Bridge | When `AGENTCORE_GATEWAY_URL` is set, the contract server mints the per-user Cognito **access** token and writes `mcp.servers.agentcore` into `openclaw.json`; a timer refreshes the bearer 5 min before expiry | `bridge/gateway-mcp.js`, `bridge/cognito-token.js`, `bridge/agentcore-contract.js` |
-| Deploy | Phase 1 also deploys `OpenClawGateway`; `read_cdk_outputs` reads `GatewayUrl` by exact output name with `require_cdk_output`, and Phase 2 passes `AGENTCORE_GATEWAY_URL` to the runtime only when the flag is on | `scripts/deploy.sh` |
+| Bridge | When `AGENTCORE_GATEWAY_URL` is set, the contract server mints the per-user Cognito **access** token and writes `mcp.servers.agentcore` into `openclaw.json`. V2 refreshes before a turn with controlled gateway restart/readiness | `bridge/gateway-mcp.js`, `bridge/cognito-token.js`, `bridge/agentcore-contract.js` |
+| Deploy | Phase 1 also deploys `OpenClawGateway`; `read_cdk_outputs` reads `GatewayUrl` by exact output name with `require_cdk_output`, and Phase 2 passes `AGENTCORE_GATEWAY_URL` to the AgentCore Runtime only when the flag is on | `scripts/deploy.sh` |
 
 `api-keys` is **not** ported: it manages Secrets Manager secrets and the "native file" mode writes
 into the OpenClaw state directory, which only the exec skill can reach. Follow-up.
@@ -81,7 +81,7 @@ check therefore applies to Gateway-created schedules unchanged.
 | Gateway service role | `lambda:InvokeFunction` | exactly the three functions above; trust policy conditioned on `aws:SourceAccount` and `aws:SourceArn = gateway/*` |
 
 Per-user isolation inside the bucket/table is enforced by the verified namespace in code (the same
-model as the runtime execution role today). `dynamodb:Scan`, `s3:*` and `Resource: "*"` are asserted
+model as the AgentCore Runtime execution role today). `dynamodb:Scan`, `s3:*` and `Resource: "*"` are asserted
 absent by `test_lambda_iam_is_scoped`. cdk-nag `AwsSolutions` runs on the stack in tests with the
 suppressions documented inline in `stacks/gateway_stack.py`.
 
@@ -109,44 +109,62 @@ This is the `mcp.servers` shape from OpenClaw 2026.9.5 (`docs/gateway/config-ext
 hot-reloadable key: "MCP config changes retire only changed or removed server connections ...
 active runs can continue calling their tools" (`docs/gateway/configuration/hot-reload.md`).
 
-Token lifecycle:
-
-1. `init()` in the contract server mints the access token for the session's `actorId` with the same
-   provider the proxy uses (`bridge/cognito-token.js`: `AdminGetUser`/`AdminCreateUser` +
-   HMAC-derived password + `ADMIN_USER_PASSWORD_AUTH`), so both processes derive the same password.
-2. `writeOpenClawConfig()` adds the block above. If Cognito is not configured or the mint fails the
-   block is omitted, a warning is logged, and the exec skills keep working; the failure is non-fatal.
-3. `scheduleBearerRefresh` re-mints 5 minutes before `expiresAt` (Cognito tokens last 3600 s) and
-   rewrites only the `Authorization` header, atomically (tmp file + rename) so the OpenClaw config
-   watcher sees a complete file. Failed refreshes retry every 60 s. The timer is stopped on `SIGTERM`.
+V2 requires a bearer when Gateway is enabled: missing Cognito configuration or failed minting
+fails activation. Before each turn, `verifyV2Resources()` checks bearer validity for the turn
+budget plus 60 seconds. A needed refresh stops the bound gateway, publishes the new config,
+restarts the gateway and verifies readiness before dispatch. Failure keeps admission closed.
+Config hot reload alone does not prove bearer adoption.
 
 Inside a running container: `openclaw mcp doctor agentcore --probe` (via
 `scripts/agentcore-exec.py`) lists the tools the Gateway serves and proves the bearer is accepted.
 
 ## Deploy / verify / disable
 
+Set `context.enable_gateway` in `cdk.json` to JSON boolean `true`. For an existing V2 deployment, preserve its manifest and choose an unused endpoint for the changed configuration:
+
 ```bash
-# enable
-#   cdk.json: "enable_gateway": true
-BUILD_MODE=codebuild ./scripts/deploy.sh          # Phase 1 now includes OpenClawGateway; Phase 2 passes AGENTCORE_GATEWAY_URL
+./scripts/deploy.sh --endpoint-name release_2
 
-# verify
+# Verify the stack output.
 aws cloudformation describe-stacks --stack-name OpenClawGateway \
+  --region "$CDK_DEFAULT_REGION" \
   --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue" --output text
-python3 scripts/agentcore-exec.py --session-id <ses_...> --command 'openclaw mcp doctor agentcore --probe'
-# container log lines to look for:
-#   [contract] Gateway MCP bearer acquired for telegram:<id> (expires ...)
-#   [contract] OpenClaw headless config written (mcp.servers.agentcore enabled)
-#   [contract] [gateway-mcp] bearer refreshed; next refresh before ...
-
-# disable (runtime side first, then the stack)
-#   cdk.json: "enable_gateway": false
-./scripts/deploy.sh                               # Phase 2 re-deploys the runtime without AGENTCORE_GATEWAY_URL
-cdk destroy OpenClawGateway                       # removes Gateway, targets, interceptor, tool Lambdas, log groups
 ```
 
-`cdk destroy OpenClawGateway` holds no user data: files stay in the S3 bucket and schedules stay in
-the `openclaw-cron` group, both still reachable through the exec skills.
+A fresh installation uses `./scripts/deploy.sh` and initial endpoint `release_1`. Shared-stack updates require the verified `.runtime/runtime-v2.json` manifest through `runtime_manifest`. Configuration changes use a new immutable release endpoint; existing saved routes remain unchanged. See [AgentCore Runtime V2 deployment](runtime-v2.md#deploy-and-verify-v2).
+
+To verify a user's live session, set the active ARN, endpoint and session variables from its
+authoritative route as described in [Execute Command](execute-command.md#examples):
+
+```bash
+uv run --no-project --python .venv-deploy/bin/python python scripts/agentcore-exec.py --region "$CDK_DEFAULT_REGION" \
+  --runtime-arn "$ACTIVE_RUNTIME_ARN" --qualifier "$ACTIVE_ENDPOINT_NAME" \
+  --session-id "$ACTIVE_SESSION_ID" --command 'openclaw mcp doctor agentcore --probe'
+```
+
+To disable Gateway, first set only `context.enable_gateway` to JSON boolean `false` in
+`cdk.json`, then use `./scripts/deploy.sh --runtime-only --endpoint-name release_3` with an unused endpoint name. This does not change existing enrolled users.
+
+To direct new registrations to this release, run `./scripts/deploy.sh --phase3 --manifest .runtime/runtime-v2.json` after successful warmup.
+
+Do not destroy the stack while any routed AgentCore Runtime version or live/in-flight session still
+needs Gateway. Older pinned V2 versions can retain that dependency even after a new release
+disables it. Existing-user migration is unavailable; keep the stack if any dependency remains
+or its absence cannot be verified.
+
+Only after all consumers have stopped using Gateway, temporarily set **only**
+`context.enable_gateway` back to JSON boolean `true` in `cdk.json` so CDK can select the stack:
+
+```bash
+source .venv/bin/activate
+cdk destroy OpenClawGateway
+```
+
+Restore that key to JSON boolean `false` after the command, including on failure or cancellation.
+Do not deploy while the temporary `true` is set. `app.py` tests `is True`, so the CLI string
+`-c enable_gateway=true` does not substitute for this JSON boolean. Destruction removes Gateway,
+targets, interceptor, tool Lambdas and their log groups; user files remain in S3 and schedules
+remain in `openclaw-cron`.
 
 ## Tests
 
@@ -155,20 +173,23 @@ the `openclaw-cron` group, both still reachable through the exec skills.
 | `tests/test_gateway_stack_synth.py` (10) | flag off -> 8 stacks, no Gateway resources or outputs; flag missing behaves as off; flag on -> 9 stacks with `GatewayUrl`/`GatewayId`; CUSTOM_JWT against the pool + interceptor with `PassRequestHeaders`; two targets whose tools match the JSON and the handlers, carry `__caller_token` and no identity argument; scoped IAM; Gateway role can only invoke the three functions and use the CMK (`kms:DescribeKey`/`Decrypt`/`GenerateDataKey`/`CreateGrant`, pinned to the AgentCore service and a gateway ARN in this account); cdk-nag has no errors |
 | `lambda/gateway_tools/identity.test.js` (15, RS256, real keys) | good ID and access tokens resolve; wrong issuer / audience / signature / expired / malformed are refused; namespace derivation |
 | `lambda/gateway_tools/tools.test.js` (16) | each tool addresses `<namespace>/...` from the token only; spoofed `user_id`/`namespace` ignored; interceptor overwrites `__caller_token` and refuses calls with no bearer |
-| `bridge/gateway-mcp.test.js` (12) | no env var -> config untouched; env var -> exact `mcp.servers.agentcore` block; `rewriteBearer` atomic + idempotent; refresh scheduled at `expiresAt - 5 min`, forces a fresh token, retries on failure, stops cleanly |
+| `bridge/gateway-mcp.test.js` (8) | Gateway URL enablement; exact `mcp.servers.agentcore` block while preserving other config; required bearer; HMAC password derivation; shared ID/access-token cache and forced refresh; missing-access-token rejection; user provisioning |
 
 Byte-identity of the eight existing templates with the flag off is checked by two hermetic synths
 (`main` vs branch, dummy account) diffed file by file; see the PR description.
 
-Run: `pytest tests/test_gateway_stack_synth.py -v`; `cd bridge && node --test gateway-mcp.test.js`;
+From the repository root after the [SDK and pytest setup](runtime-v2.md#offline-checks), run each command independently:
+`uv run --no-project --python .venv/bin/python python -m pytest tests/test_gateway_stack_synth.py -v`; `cd bridge && node --test gateway-mcp.test.js`;
 `node --test lambda/gateway_tools/*.test.js` (Node 24).
 
 ## Performance (us-west-2 staging, 2026-09-24)
 
+Historical V1 measurements. The reset procedure below records the old experiment; do not use it with V2. These results do not validate the current V2 image.
+
 Same harness and prompts for both phases, 10 cold-start iterations each (session record deleted and
-runtime session stopped before every iteration). Wall latency = webhook POST to the router's
+AgentCore Runtime session stopped before every iteration). Wall latency = webhook POST to the router's
 `Response to send` log line; tool round trip = container `embedded run tool start` to `tool end`.
-Baseline: runtime with `enable_gateway=false` (exec skills). Gateway: the rebuilt image with
+Baseline: AgentCore Runtime with `enable_gateway=false` (exec skills). Gateway: the rebuilt image with
 `AGENTCORE_GATEWAY_URL` set, measured after the `clientContext.custom` fix below.
 
 | Measure | exec skills p50 / p95 | Gateway tools p50 / p95 | Delta p50 |

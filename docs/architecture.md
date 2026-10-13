@@ -1,5 +1,7 @@
 # OpenClaw on AgentCore — Solution Architecture
 
+AgentCore Runtime V2 separates user-free snapshot preparation from strict activation. Chat and cron wait for full OpenClaw readiness. See the [AgentCore Runtime V2 runbook](runtime-v2.md) for manifest-based deployment, immutable endpoints and migration limits.
+
 ## High-Level Architecture
 
 ```
@@ -73,7 +75,7 @@
 |  |  |  |  | contract.js  |  | Gateway         |   |  |                                    |
 |  |  |  |  | (port 8080)  |  | (port 18789)    |   |  |                                    |
 |  |  |  |  | - /ping      |  | - headless mode |   |  |                                    |
-|  |  |  |  | - /invoke    |  | - no channels   |   |  |                                    |
+|  |  |  |  | /invocations|  | - no channels   |   |  |                                    |
 |  |  |  |  | - WS bridge  |  | - tools & skills|   |  |                                    |
 |  |  |  |  +--------------+  +--------+--------+   |  |                                    |
 |  |  |  |                             |            |  |                                    |
@@ -103,7 +105,7 @@
 |  |  | Amazon Bedrock   |               | S3 User Files      |                              |
 |  |  | ConverseStream   |               | Bucket             |                              |
 |  |  | API              |               | - {ns}/.openclaw/  |                              |
-|  |  | MiniMax M2.1     |               | - {ns}/files/      |                              |
+|  |  | Bedrock model   |               | - {ns}/files/      |                              |
 |  |  +------------------+               +--------------------+                              |
 |  |                                                                                         |
 +--+-----------------------------------------------------------------------------------------+
@@ -111,79 +113,50 @@
 
 ## Per-User Session Lifecycle
 
-```
-  User sends first message on Telegram
-         |
-         v
-  API Gateway HTTP API (POST /webhook/telegram)
-         |
-         v
-  Router Lambda validates X-Telegram-Bot-Api-Secret-Token
-         |
-         v
-  Self-invoke async (returns 200 to Telegram immediately)
-         |
-         v
-  Resolve user in DynamoDB (create if new)
-  Get/create session (ses_{user_id}_{uuid})
-         |
-         v
-  InvokeAgentRuntime(runtimeSessionId = per-user session ID)
-         |
-         v
-  AgentCore creates new microVM for this session
-         |
-         v
-  Container starts -> contract server (port 8080) -> /ping = Healthy
-         |
-         v
-  First /invocations {action: "chat"}:
-    1. Restore .openclaw/ from S3  (workspace-sync.js)
-    2. Start agentcore-proxy.js (port 18790) with USER_ID env
-    3. Write headless OpenClaw config (no channels)
-    4. Start OpenClaw gateway (port 18789, ~4 min startup)
-    5. Start periodic workspace saves (every 5 min)
-         |
-         v
-  WebSocket bridge: auth -> chat.send -> streaming deltas -> final
-         |
-         v
-  Router Lambda sends response to Telegram via sendMessage API
-         |
-         v
-  (Subsequent messages reuse the warm microVM — fast response)
-         |
-  ... idle for 30 min (configurable) ...
-         |
-         v
-  AgentCore sends SIGTERM:
-    1. Save .openclaw/ to S3  (final workspace save)
-    2. Kill child processes
-    3. Exit
-         |
-         v
-  (Next message: new microVM created, workspace restored from S3)
+Router and Cron resolve the same `(runtime ARN, endpoint name, session ID, generation)` from the user's `SESSION` record. V1 and incomplete records fail closed without a default AgentCore Runtime. First registration transacts identity/session records and a durable actor OWNER with no TTL. Missing ownership requires paginated legacy reconciliation; an existing user's missing session is never enrollment evidence. Missing V2-enrolled sessions fail closed. Conditional admission uses a unique token per invocation and retains uncertain outcomes for reconciliation. V2 pins the actor namespace and release.
+
+V2 lifecycle:
+
+```mermaid
+flowchart TD
+    B["BOOTSTRAPPING: prepare user-neutral live gateway"] --> S["BOOTSTRAP_READY: snapshot boundary"]
+    S --> R["First invocation: bind user, actor, session, generation"]
+    R --> A["BINDING: scoped credentials, strict restore"]
+    A --> G["Bind eligible prepared gateway<br/>or start gateway for restored/custom state"]
+    G --> V["startupz, protocol-4 token handshake, last-heartbeat"]
+    V --> P["Browser, skills, persistence ready"]
+    P --> U["USER_READY: serialized OpenClaw turns"]
+    U --> C["RECOVERING: refresh and verify resources"]
+    C --> U
+    A -->|failure or timeout| F["FAILED: reject admission, clean up"]
+    C -->|failure| F
 ```
 
+Snapshot eligibility and full readiness follow the [AgentCore Runtime V2 lifecycle contract](runtime-v2.md#lifecycle-and-compatibility). V2 never invokes the lightweight agent or replays an uncertain turn through another engine. `last-heartbeat` reads cached memory; gateway verification alone is not user readiness. Configured Browser sessions require actual `READY` status before readiness and every turn. Cleanup does not establish a verified checkpoint or stopped-session migration gate.
+
+Authorized links retain the canonical storage actor and saved V2 route while separately authorizing the caller and delivery target. Existing-user migration and automatic rollback are not implemented. See the [runbook](runtime-v2.md).
+
 ## Container Internal Architecture
+
+V2 uses the ports, proxy and OpenClaw `2026.9.5` shown below, with the readiness and strict-restore barriers above. SQLite stays on local disk and is mirrored to `/mnt/workspace/.openclaw/`, with S3 backups.
 
 ```
 +-----------------------------------------------------------------------+
 |  AgentCore Runtime Container (node:24-slim, ARM64, per-user)          |
 |                                                                       |
-|  entrypoint.sh starts contract server immediately:                    |
+|  entrypoint.sh starts contract server and prepares gateway modules:                    |
 |                                                                       |
 |  agentcore-contract.js (port 8080)         <-- MUST START FIRST      |
-|    |-- GET /ping -> {"status":"Healthy"}   (allows idle termination)  |
-|    |-- POST /invocations {action:"chat"}   (triggers lazy init)      |
+|    |-- GET /ping -> {"status":"Healthy"}   (only after preparation acknowledgement)  |
+|    |-- POST /invocations {action:"chat"}   (waits for USER_READY)      |
 |    |-- POST /invocations {action:"status"} (health info)             |
 |    |                                                                  |
-|    |-- On first chat (lazy init):                                    |
+|    |-- On first bound request (strict activation):                                    |
 |    |   1. Fetch secrets from Secrets Manager                         |
 |    |   2. Restore .openclaw/ from S3 (workspace-sync.js)             |
 |    |   3. Start agentcore-proxy.js (port 18790)                      |
 |    |   4. Write headless OpenClaw config (no channels)               |
-|    |   5. Start OpenClaw gateway (port 18789) — ~4 min startup       |
+|    |   5. Activate prepared gateway; verify Browser and readiness                       |
 |    |   6. Start periodic workspace saves                              |
 |    |                                                                  |
 |    |-- On subsequent chats:                                          |
@@ -191,7 +164,7 @@
 |    |   connect -> auth(token) -> chat.send -> deltas -> final        |
 |    |                                                                  |
 |    |-- On SIGTERM:                                                   |
-|        Save .openclaw/ to S3 -> kill children -> exit                |
+|        Drain credentials -> flush state and stop children -> cleanup                |
 |                                                                       |
 |  agentcore-proxy.js (port 18790)                                      |
 |    |-- POST /v1/chat/completions -> Bedrock ConverseStream            |
@@ -265,14 +238,24 @@
   Extract channel user ID (e.g. "telegram:123456789")
          |
          v
-  DynamoDB lookup: CHANNEL#telegram:123456789
+  Strong DynamoDB lookup: CHANNEL#telegram:123456789 / PROFILE
          |
-         +-- Not found: create new user (user_<uuid>)
-         |   -> CHANNEL# item, USER# profile, SESSION item
+         +-- Missing: read durable ACTOR#telegram:123456789 / OWNER
+         |   -> OWNER absent: paginated legacy ownership reconciliation
+         |   -> Owner/provenance, ambiguity, error or scan limit: fail closed
+         |   -> Proven new: user_<first 16 hex of SHA256(actorId)>
+         |      Conditional transaction: all five records must be absent
+         |      CHANNEL mapping + USER profile + SESSION
+         |      + USER channel back-reference + durable OWNER (no TTL)
+         |   -> Transaction race: read authoritative winning CHANNEL mapping
          +-- Found: get existing userId
          |
          v
-  InvokeAgentRuntime(sessionId from DynamoDB SESSION item)
+  Resolve SESSION runtime ARN, endpoint, session and generation
+  Missing V2-enrolled profile/session: fail closed
+         |
+         v
+  Conditional admission token -> InvokeAgentRuntime(resolved route)
          |
          v
   Container starts -> agentcore-proxy.js
@@ -300,6 +283,8 @@
 
 ## Cross-Channel Account Linking
 
+Authorized links retain the canonical V2 actor and route. A second channel must not belong to another owner. Bind codes carry route generation/session evidence; stale codes are rejected.
+
 ```
   User on Telegram: "link"
          |
@@ -326,6 +311,8 @@
 ```
 
 ## CDK Stack Dependencies
+
+CDK creates the foundation and Lambda stacks. `scripts/runtime_deploy.py` deploys with explicit `platformVersion`, verifies version/endpoint and records image/configuration hashes. V2 custom endpoints are immutable through the controller. Phase 1 can run without a manifest. Phase 3 requires `runtime_manifest` with verified V2 readback and full-gateway warmup before configuring invocation permissions and new registrations. The default SDK manifest is `.runtime/runtime-v2.json`; endpoints start at `release_1`. Deployment does not migrate existing routes.
 
 ```
   OpenClawVpc ─────────────┐

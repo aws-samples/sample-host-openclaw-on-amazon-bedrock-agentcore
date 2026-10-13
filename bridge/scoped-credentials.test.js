@@ -256,7 +256,7 @@ describe("createScopedCredentials", () => {
     AccessKeyId: "AKIAIOSFODNN7EXAMPLE",
     SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
     SessionToken: "FwoGZXIvYXdzEBYaDH...",
-    Expiration: new Date("2026-03-02T02:00:00Z"),
+    Expiration: new Date(Date.now() + 3600000),
   };
 
   beforeEach(() => {
@@ -388,7 +388,7 @@ describe("writeCredentialFiles", () => {
     accessKeyId: "AKIAIOSFODNN7EXAMPLE",
     secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
     sessionToken: "FwoGZXIvYXdzEBYaDH...",
-    expiration: new Date("2026-03-02T02:00:00Z"),
+    expiration: new Date(Date.now() + 3600000),
   };
 
   beforeEach(() => {
@@ -439,7 +439,7 @@ describe("writeCredentialFiles", () => {
     const updatedCreds = {
       ...CREDS,
       accessKeyId: "AKIAI_REFRESHED",
-      expiration: new Date("2026-03-02T03:00:00Z"),
+      expiration: new Date(Date.now() + 7200000),
     };
     writeCredentialFiles(updatedCreds, tmpDir);
 
@@ -517,18 +517,21 @@ describe("buildOpenClawEnv", () => {
     assert.equal(env.AWS_CONTAINER_CREDENTIALS_FULL_URI, undefined);
   });
 
-  it("includes standard env vars (PATH, HOME, NODE_OPTIONS, AWS_REGION)", () => {
+  it("includes standard env vars and the image compile cache", () => {
     const env = buildOpenClawEnv({
       credDir: "/tmp/scoped",
       baseEnv: {
         PATH: "/usr/bin",
         HOME: "/root",
         NODE_OPTIONS: "--dns-result-order=ipv4first",
+        NODE_COMPILE_CACHE: "/app/.compile-cache",
         AWS_REGION: "us-west-2",
       },
     });
     assert.equal(env.PATH, "/usr/bin");
     assert.equal(env.HOME, "/root");
+    assert.equal(env.NODE_COMPILE_CACHE, "/app/.compile-cache");
+    assert.equal(env.AWS_EC2_METADATA_DISABLED, "true");
     assert.equal(env.AWS_REGION, "us-west-2");
   });
 
@@ -639,5 +642,287 @@ describe("buildSessionPolicy Secrets Manager", () => {
     const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt, "Secrets Manager actions should exist");
     assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
+  });
+});
+
+describe("expiry-aware scoped credentials", () => {
+  let dir, now, calls, refresh, published, manager, scoped, savedModule;
+  const modulePath = require.resolve("./scoped-credentials");
+  const creds = (key = "new", lifetime = 3600000) => ({
+    accessKeyId: key, secretAccessKey: "secret", sessionToken: "token", expiration: new Date(now + lifetime),
+  });
+  beforeEach(() => {
+    savedModule = require.cache[modulePath];
+    delete require.cache[modulePath];
+    scoped = require("./scoped-credentials");
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "creds-v2-"));
+    now = Date.now();
+    calls = 0;
+    published = [];
+    refresh = async () => creds(`key-${++calls}`);
+  });
+  afterEach(() => {
+    try {
+      manager?.stop();
+    } finally {
+      manager = null;
+      mock.restoreAll();
+      if (savedModule) require.cache[modulePath] = savedModule; else delete require.cache[modulePath];
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  const create = (options = {}) => {
+    manager = scoped.createCredentialManager("telegram_1", {
+      credDir: dir, now: () => now, refresh: () => refresh(), onRefresh: (c) => published.push(c.accessKeyId),
+      ...options,
+    });
+    return manager;
+  };
+
+  it("exposes the runtime expiry helpers with an explicit safety margin", () => {
+    assert.equal(scoped.credentialsExpireAt(creds()), now + 3600000);
+    assert.equal(scoped.credentialsExpireAt({ expiration: "invalid" }), 0);
+    assert.equal(scoped.credentialsNeedRefresh(creds("key", 1000), { now, minValidityMs: 2000 }), true);
+    assert.equal(scoped.credentialsNeedRefresh(creds(), { now, minValidityMs: 2000 }), false);
+  });
+
+  it("does no credential IO before activation and refreshes after a wall-clock jump", async () => {
+    create();
+    assert.equal(calls, 0);
+    assert.deepEqual(fs.readdirSync(dir), []);
+    await manager.ensureFresh();
+    now += 3600001;
+    assert.throws(() => manager.getCredentials(), /expired/i);
+    await manager.ensureFresh();
+    assert.equal(manager.getCredentials().accessKeyId, "key-2");
+    assert.deepEqual(published, ["key-1", "key-2"]);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "scoped-creds.json"))).AccessKeyId, "key-2");
+  });
+
+  it("coalesces concurrent activation and refresh calls", async () => {
+    create();
+    let resolve;
+    refresh = () => { calls++; return new Promise((r) => { resolve = r; }); };
+    const first = manager.ensureFresh();
+    const second = manager.ensureFresh();
+    await Promise.resolve();
+    assert.equal(calls, 1);
+    resolve(creds());
+    await Promise.all([first, second]);
+    assert.equal(published.length, 1);
+  });
+
+  it("rejects failed refresh with expired credentials and can retry", async () => {
+    create();
+    await manager.ensureFresh();
+    now += 3600001;
+    refresh = async () => { throw new Error("STS unavailable"); };
+    await assert.rejects(manager.ensureFresh(), /STS unavailable/);
+    assert.throws(() => manager.getCredentials(), /expired/i);
+    refresh = async () => creds("recovered");
+    await manager.ensureFresh();
+    assert.equal(manager.getCredentials().accessKeyId, "recovered");
+  });
+
+  it("stopping retires pending refresh before files or callbacks can publish", async () => {
+    create();
+    let resolve;
+    refresh = () => new Promise((r) => { resolve = r; });
+    const pending = manager.ensureFresh();
+    await Promise.resolve();
+    manager.stop();
+    resolve(creds());
+    await assert.rejects(pending, /stopped/i);
+    assert.deepEqual(fs.readdirSync(dir), []);
+    assert.deepEqual(published, []);
+    await assert.rejects(manager.ensureFresh(), /stopped/i);
+  });
+
+  it("does not start a queued refresh after stop", async () => {
+    create();
+    const pending = manager.ensureFresh();
+    manager.stop();
+    await assert.rejects(pending, /stopped/i);
+    assert.equal(calls, 0);
+    assert.deepEqual(published, []);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  it("does not publish after stop while asynchronous preparation is pending", async () => {
+    let started, finish;
+    const preparationStarted = new Promise((resolve) => { started = resolve; });
+    const prepared = new Promise((resolve) => { finish = resolve; });
+    create({
+      prepareRefresh: async () => { started(); return prepared; },
+      onRefresh: (next, value) => published.push([next.accessKeyId, value]),
+    });
+    const pending = manager.ensureFresh();
+    await Promise.race([preparationStarted, pending]);
+    assert.deepEqual(published, []);
+    assert.deepEqual(fs.readdirSync(dir), []);
+    manager.stop();
+    finish("prepared");
+    await assert.rejects(pending, /stopped/i);
+    assert.deepEqual(published, []);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  it("drain fences child publication while request and persistence share pending preparation", async () => {
+    let started, finish;
+    const preparationStarted = new Promise((resolve) => { started = resolve; });
+    const prepared = new Promise((resolve) => { finish = resolve; });
+    create({ prepareRefresh: async () => { started(); await prepared; } });
+    const request = manager.ensureFresh();
+    const rejected = assert.rejects(request, /draining/i);
+    await preparationStarted;
+    const save = manager.ensureFresh({ forPersistence: true, minValidityMs: 60000 });
+    manager.beginDrain();
+    finish();
+    await rejected;
+    assert.equal((await save).accessKeyId, "key-1");
+    assert.equal(calls, 1);
+    assert.deepEqual(published, []);
+    assert.deepEqual(fs.readdirSync(dir), []);
+    assert.throws(() => manager.getCredentials(), /draining/i);
+  });
+
+  for (const acquisitionFails of [false, true]) {
+    it(`persistence joins pending acquisition across drain${acquisitionFails ? " and retries a failed acquisition" : ""}`, async () => {
+      let finish, reject;
+      create();
+      refresh = () => {
+        calls++;
+        return new Promise((resolve, fail) => { finish = resolve; reject = fail; });
+      };
+      const request = manager.ensureFresh();
+      const rejected = assert.rejects(request, acquisitionFails ? /STS unavailable/ : /draining/);
+      await Promise.resolve();
+      manager.beginDrain();
+      const save = manager.ensureFresh({ forPersistence: true, minValidityMs: 60000 });
+      if (acquisitionFails) {
+        const failedSave = assert.rejects(save, /STS unavailable/);
+        reject(new Error("STS unavailable"));
+        await Promise.all([rejected, failedSave]);
+        refresh = async () => { calls++; return creds("recovered"); };
+        assert.equal((await manager.ensureFresh({ forPersistence: true })).accessKeyId, "recovered");
+        assert.equal(calls, 2);
+      } else {
+        finish(creds("draining"));
+        assert.equal((await save).accessKeyId, "draining");
+        await rejected;
+        assert.equal(calls, 1);
+      }
+      assert.deepEqual(published, []);
+      assert.deepEqual(fs.readdirSync(dir), []);
+    });
+  }
+
+  it("stop fences a draining refresh while asynchronous preparation is pending", async () => {
+    let started, finish;
+    const preparationStarted = new Promise((resolve) => { started = resolve; });
+    const prepared = new Promise((resolve) => { finish = resolve; });
+    create({ prepareRefresh: async () => { started(); await prepared; } });
+    manager.beginDrain();
+    const save = manager.ensureFresh({ forPersistence: true, minValidityMs: 60000 });
+    await preparationStarted;
+    manager.stop();
+    finish();
+    await assert.rejects(save, /stopped/i);
+    assert.deepEqual(published, []);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  it("checks each concurrent caller's validity margin after a shared refresh", async () => {
+    let finish;
+    create();
+    refresh = () => {
+      calls++;
+      return new Promise((resolve) => { finish = resolve; });
+    };
+    const save = manager.ensureFresh({ forPersistence: true, minValidityMs: 60000 });
+    const request = manager.ensureFresh({ minValidityMs: 680000 });
+    const rejected = assert.rejects(request, /expired/i);
+    await Promise.resolve();
+    finish(creds("short", 120000));
+    assert.equal((await save).accessKeyId, "short");
+    await rejected;
+    assert.equal(calls, 1);
+  });
+
+  it("publishes prepared credentials synchronously after preparation succeeds", async () => {
+    const prepared = { ready: true };
+    create({
+      prepareRefresh: async (next) => {
+        assert.deepEqual(fs.readdirSync(dir), []);
+        assert.equal(next.accessKeyId, "key-1");
+        return prepared;
+      },
+      onRefresh: (next, value) => {
+        assert.equal(value, prepared);
+        published.push(next.accessKeyId);
+      },
+    });
+    await manager.ensureFresh();
+    assert.deepEqual(published, ["key-1"]);
+    assert.equal(manager.getCredentials().accessKeyId, "key-1");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "scoped-creds.json"))).AccessKeyId, "key-1");
+  });
+
+  it("rejects asynchronous publication callbacks before they can start", async () => {
+    let finish;
+    const deferred = new Promise((resolve) => { finish = resolve; });
+    const onRefresh = async (next) => {
+      await deferred;
+      published.push(next.accessKeyId);
+    };
+    assert.throws(() => create({ onRefresh }), /onRefresh.*synchronous.*prepareRefresh/i);
+    finish();
+    await Promise.resolve();
+    assert.equal(calls, 0);
+    assert.deepEqual(published, []);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  it("rejects preparation failures and credentials that expire during preparation", async () => {
+    let fail = true;
+    create({
+      prepareRefresh: async () => {
+        if (fail) throw new Error("preparation failed");
+        now += 3600001;
+      },
+    });
+    await assert.rejects(manager.ensureFresh(), /preparation failed/);
+    fail = false;
+    await assert.rejects(manager.ensureFresh(), /expired/i);
+    assert.deepEqual(published, []);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  it("rejects invalid or expired credentials before replacing existing files", () => {
+    scoped.writeCredentialFiles(creds("good"), dir, { now: () => now });
+    const original = fs.readFileSync(path.join(dir, "scoped-creds.json"), "utf8");
+    assert.throws(() => scoped.writeCredentialFiles(creds("bad", -1), dir, { now: () => now }), /expired/i);
+    assert.throws(() => scoped.writeCredentialFiles(creds("bad", -1), dir), /expired/i);
+    assert.throws(() => scoped.writeCredentialFiles({ ...creds(), sessionToken: null }, dir, { now: () => now }), /sessionToken/i);
+    assert.equal(fs.readFileSync(path.join(dir, "scoped-creds.json"), "utf8"), original);
+  });
+
+  it("uses private atomic files and removes its staging file after a failed rename", () => {
+    scoped.writeCredentialFiles(creds("good"), dir);
+    const file = path.join(dir, "scoped-creds.json");
+    const original = fs.readFileSync(file, "utf8");
+    const rename = fs.renameSync;
+    mock.method(fs, "renameSync", (src, dst) => {
+      if (dst === file) {
+        assert.equal(fs.readFileSync(file, "utf8"), original);
+        assert.equal(JSON.parse(fs.readFileSync(src)).AccessKeyId, "next");
+        throw new Error("rename failed");
+      }
+      return rename(src, dst);
+    });
+    assert.throws(() => scoped.writeCredentialFiles(creds("next"), dir), /rename failed/);
+    assert.equal(fs.readFileSync(file, "utf8"), original);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(fs.readdirSync(dir).sort(), ["scoped-aws-config", "scoped-creds.json"]);
   });
 });

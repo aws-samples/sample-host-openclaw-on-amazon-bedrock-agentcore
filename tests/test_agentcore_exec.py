@@ -28,6 +28,15 @@ RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/openclaw
 SESSION_ID = "exec_" + "0" * 32
 
 
+def _manifest():
+    return {
+        "schemaVersion": 1, "platformVersion": "V2", "region": "us-west-2",
+        "agentRuntimeId": "openclaw_agent-TEST", "agentRuntimeArn": RUNTIME_ARN,
+        "endpointName": "release_2", "endpointPolicy": "IMMUTABLE",
+        "warmup": {"status": "failed"},
+    }
+
+
 # --- helpers -----------------------------------------------------------------
 
 
@@ -302,9 +311,15 @@ class TestValidation(unittest.TestCase):
         arn = ax.resolve_runtime_arn(None, "rt-1", "ap-southeast-2", {}, lambda: "111122223333")
         self.assertEqual(arn, "arn:aws:bedrock-agentcore:ap-southeast-2:111122223333:runtime/rt-1")
 
-    def test_resolve_runtime_arn_falls_back_to_cdk_json(self):
-        arn = ax.resolve_runtime_arn(None, None, "us-west-2", {"runtime_id": "from-cdk"}, lambda: "1" * 12)
-        self.assertTrue(arn.endswith(":runtime/from-cdk"))
+    def test_resolve_runtime_arn_uses_manifest_without_sts(self):
+        sts = MagicMock(side_effect=AssertionError("STS must not be called"))
+        arn = ax.resolve_runtime_arn(None, None, "us-west-2", _manifest(), sts)
+        self.assertEqual(arn, RUNTIME_ARN)
+
+    def test_legacy_cdk_runtime_id_is_not_a_default(self):
+        sts = MagicMock(side_effect=AssertionError("STS must not be called"))
+        with self.assertRaises(ax.ExecError):
+            ax.resolve_runtime_arn(None, None, "us-west-2", {"runtime_id": "from-cdk"}, sts)
 
     def test_resolve_runtime_arn_rejects_placeholder_and_missing(self):
         for ctx in ({}, {"runtime_id": "PLACEHOLDER"}):
@@ -336,6 +351,53 @@ class TestValidation(unittest.TestCase):
             os.unlink(fh.name)
 
 
+class TestManifest(unittest.TestCase):
+    def test_default_and_context_paths_resolve_from_project_root(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(ax, "REPO_ROOT", Path(directory)):
+            default = Path(directory) / ".runtime/runtime-v2.json"
+            default.parent.mkdir()
+            default.write_text(json.dumps(_manifest()))
+            self.assertEqual(ax.load_runtime_manifest(None, {}), _manifest())
+            configured = Path(directory) / "configured.json"
+            configured.write_text(json.dumps(_manifest()))
+            self.assertEqual(ax.load_runtime_manifest(None, {"runtime_manifest": "configured.json"}), _manifest())
+            self.assertEqual(ax.load_runtime_manifest(str(default), {"runtime_manifest": "missing.json"}), _manifest())
+
+    def test_manifest_accepts_failed_warmup_for_operator_diagnosis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(json.dumps(_manifest()))
+            self.assertEqual(ax.load_runtime_manifest(str(path), {})["warmup"]["status"], "failed")
+
+    def test_manifest_rejects_v1_or_conflicting_target_metadata(self):
+        invalid = [
+            ("platformVersion", "V1"), ("platformVersion", None), ("schemaVersion", True),
+            ("agentRuntimeArn", "not-an-arn"), ("agentRuntimeArn", []),
+            ("agentRuntimeId", "different-TEST"), ("region", "us-east-1"),
+            ("endpointPolicy", "MUTABLE"), ("endpointName", "DEFAULT"), ("endpointName", []),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            for key, value in invalid:
+                with self.subTest(key=key, value=value):
+                    manifest = _manifest()
+                    manifest[key] = value
+                    path.write_text(json.dumps(manifest))
+                    with self.assertRaises(ax.ExecError) as error:
+                        ax.load_runtime_manifest(str(path), {})
+                    self.assertEqual(error.exception.exit_code, ax.EXIT_USAGE)
+
+    def test_missing_or_invalid_manifest_is_a_usage_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            for content in (None, "{", "[]"):
+                if content is not None:
+                    path.write_text(content)
+                with self.assertRaises(ax.ExecError) as error:
+                    ax.load_runtime_manifest(str(path), {})
+                self.assertEqual(error.exception.exit_code, ax.EXIT_USAGE)
+
+
 # --- main() end to end with a patched boto3 -------------------------------------------
 
 
@@ -354,9 +416,68 @@ class TestMain(unittest.TestCase):
             rc = ax.main(argv)
         return rc, out.getvalue(), err.getvalue(), session
 
+    def test_default_target_uses_v2_manifest_and_ignores_legacy_context(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(ax, "REPO_ROOT", Path(directory)):
+            path = Path(directory) / ".runtime/runtime-v2.json"
+            path.parent.mkdir()
+            path.write_text(json.dumps(_manifest()))
+            with patch.object(ax, "load_cdk_context", return_value={
+                "runtime_id": "old-v1", "runtime_endpoint_id": "DEFAULT", "region": "us-east-1",
+            }):
+                rc, out, _, session = self._run_main(
+                    ["--command", "true", "--json"], [{"stream": _ok_stream()}],
+                )
+            self.assertEqual(rc, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["runtimeArn"], RUNTIME_ARN)
+            self.assertEqual(payload["qualifier"], "release_2")
+            session.client.assert_called_once_with("bedrock-agentcore", region_name="us-west-2")
+
+    def test_explicit_arn_and_qualifier_do_not_load_manifest(self):
+        with patch.object(ax, "load_runtime_manifest", side_effect=AssertionError("must not read manifest")):
+            rc, out, _, _ = self._run_main(
+                ["--command", "true", "--json", "--runtime-arn", RUNTIME_ARN, "--qualifier", "release_7"],
+                [{"stream": _ok_stream()}],
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["qualifier"], "release_7")
+
+    def test_explicit_target_without_qualifier_is_a_usage_error(self):
+        rc, _, err, session = self._run_main(
+            ["--command", "true", "--runtime-arn", RUNTIME_ARN], [],
+        )
+        self.assertEqual(rc, ax.EXIT_USAGE)
+        self.assertIn("--qualifier", err)
+        session.client.assert_not_called()
+
+    def test_manifest_conflicts_stop_before_command_invocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(json.dumps(_manifest()))
+            for extra in (["--region", "us-east-1"], ["--qualifier", "release_3"],
+                          ["--runtime-arn", RUNTIME_ARN + "other"]):
+                with self.subTest(extra=extra):
+                    rc, _, err, session = self._run_main(
+                        ["--command", "true", "--manifest", str(path), *extra], [],
+                    )
+                    self.assertEqual(rc, ax.EXIT_USAGE)
+                    self.assertIn("conflicts", err)
+                    session.client.assert_not_called()
+
+    def test_v1_manifest_stops_before_aws(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            manifest = _manifest()
+            manifest["platformVersion"] = "V1"
+            path.write_text(json.dumps(manifest))
+            rc, _, err, session = self._run_main(["--command", "true", "--manifest", str(path)], [])
+        self.assertEqual(rc, ax.EXIT_USAGE)
+        self.assertIn("platformVersion V2", err)
+        session.client.assert_not_called()
+
     def test_main_streams_and_returns_command_exit_code(self):
         rc, out, err, session = self._run_main(
-            ["--command", "false", "--runtime-arn", RUNTIME_ARN],
+            ["--command", "false", "--runtime-arn", RUNTIME_ARN, "--qualifier", "release_2"],
             [{"stream": _ok_stream(("out\n",), ("err\n",), exit_code=1)}],
         )
         self.assertEqual(rc, 1)
@@ -369,7 +490,8 @@ class TestMain(unittest.TestCase):
 
     def test_main_json_output(self):
         rc, out, _, _ = self._run_main(
-            ["--json", "--command", "true", "--runtime-arn", RUNTIME_ARN, "--session-id", SESSION_ID],
+            ["--json", "--command", "true", "--runtime-arn", RUNTIME_ARN,
+             "--qualifier", "release_2", "--session-id", SESSION_ID],
             [{"stream": _ok_stream(("ok\n",))}],
         )
         self.assertEqual(rc, 0)
@@ -383,7 +505,8 @@ class TestMain(unittest.TestCase):
 
     def test_main_timed_out_exit_124(self):
         rc, _, err, _ = self._run_main(
-            ["--command", "sleep 999", "--runtime-arn", RUNTIME_ARN, "--timeout", "5"],
+            ["--command", "sleep 999", "--runtime-arn", RUNTIME_ARN,
+             "--qualifier", "release_2", "--timeout", "5"],
             [{"stream": _ok_stream((), exit_code=137, status="TIMED_OUT")}],
         )
         self.assertEqual(rc, ax.EXIT_TIMED_OUT)
@@ -400,7 +523,8 @@ class TestMain(unittest.TestCase):
         fake_boto3.session.Session.return_value = session
         with patch.dict(sys.modules, {"boto3": fake_boto3}), \
                 patch.object(sys, "stdout", io.StringIO()), patch.object(sys, "stderr", io.StringIO()):
-            rc = ax.main(["--command", "true", "--runtime-id", "openclaw_agent-TEST", "--region", "us-west-2"])
+            rc = ax.main(["--command", "true", "--runtime-id", "openclaw_agent-TEST",
+                          "--qualifier", "release_2", "--region", "us-west-2"])
         self.assertEqual(rc, 0)
         self.assertEqual(client.invoke_agent_runtime_command.call_args.kwargs["agentRuntimeArn"], RUNTIME_ARN)
 
@@ -414,7 +538,7 @@ class TestMain(unittest.TestCase):
 
     def test_main_reports_aws_error_exit_1(self):
         rc, _, err, _ = self._run_main(
-            ["--command", "true", "--runtime-arn", RUNTIME_ARN],
+            ["--command", "true", "--runtime-arn", RUNTIME_ARN, "--qualifier", "release_2"],
             [_client_error("ResourceNotFoundException", "no such runtime", 404)],
         )
         self.assertEqual(rc, ax.EXIT_AWS_ERROR)

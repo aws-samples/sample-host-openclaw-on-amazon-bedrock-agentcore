@@ -1,5 +1,7 @@
 # Release Notes: OpenClaw us-west-2 Multi-Region Deployment + Feishu Channel
 
+> Historical AgentCore Runtime V1 release record; commands and timings are not current V2 instructions or performance evidence. Use the [AgentCore Runtime V2 runbook](runtime-v2.md).
+
 **Branch:** `deploy/starter-toolkit-hybrid`
 **Date:** 2026-03-12
 **Region:** us-west-2 (Oregon)
@@ -11,25 +13,25 @@
 ### Situation
 OpenClaw was previously deployed only in us-east-1 as a single-region service, using a pure CDK deployment approach. This approach had several pain points:
 - **Docker build difficulties**: AgentCore Runtime runs on ARM64, but developer machines are x86. Cross-compiling ARM64 container images locally was slow and error-prone.
-- **AgentCore console not displaying metrics**: Suspected to be related to the pure-CDK CfnRuntime deployment method. The GenAI Observability Dashboard showed no Runtime metrics or traces.
-- **Slow Runtime cold start**: Under the pure CDK deployment, Runtime cold start took approximately 60 seconds, resulting in poor user experience.
+- **AgentCore console not displaying metrics**: Suspected to be related to the pure-CDK CfnRuntime deployment method. The GenAI Observability Dashboard showed no AgentCore Runtime metrics or traces.
+- **Slow AgentCore Runtime cold start**: Under the pure CDK deployment, AgentCore Runtime cold start took approximately 60 seconds, resulting in poor user experience.
 - **Multi-region expansion blocked**: Issues such as IAM role global naming conflicts and ECR permission mismatches prevented cross-region deployment.
 
 ### Task
 Design and implement a new deployment strategy that resolves the Docker build, console metrics, cold start performance, and cross-region deployment issues, while extending the service to us-west-2.
 
 ### Action
-- **Adopted a CDK + AgentCore Starter Toolkit hybrid deployment architecture**: CDK manages infrastructure (VPC, IAM, S3, Lambda, API Gateway, DynamoDB, and other resources across 7 stacks), while Starter Toolkit manages Runtime, Endpoint, ECR, and Docker image builds.
+- **Adopted a CDK + AgentCore Starter Toolkit hybrid deployment architecture**: CDK manages infrastructure (VPC, IAM, S3, Lambda, API Gateway, DynamoDB, and other resources across 7 stacks), while Starter Toolkit manages AgentCore Runtime, Endpoint, ECR, and Docker image builds.
 - **Improved Docker build workflow**: Starter Toolkit supports two modes -- `--local-build` (build locally with Docker and push) and the default CodeBuild mode (cloud-based ARM64 build with no local Docker requirement). It also supports rapid local development testing via `agentcore dev`.
 - **Appended region suffix to IAM role names** (e.g., `openclaw-agentcore-execution-role-us-west-2`) to avoid global naming conflicts.
 - **Updated CDK IAM policies to match Starter Toolkit's ECR naming convention** (`bedrock-agentcore-` prefix), resolving a permissions issue that had produced a misleading "initialization exceeded 120s" error.
-- **Implemented a 3-phase deployment workflow**: Phase 1 -- CDK foundation stacks; Phase 2 -- Starter Toolkit Runtime; Phase 3 -- CDK dependent stacks.
+- **Implemented a 3-phase deployment workflow**: Phase 1 -- CDK foundation stacks; Phase 2 -- Starter Toolkit AgentCore Runtime; Phase 3 -- CDK dependent stacks.
 - **Produced comprehensive operational documentation**: deployment guide, operations runbook, common commands reference, and lessons-learned log.
 
 ### Result
 - All 7 CDK stacks plus the AgentCore Runtime were successfully deployed in us-west-2 and passed end-to-end validation.
-- **AgentCore console metrics restored**: After switching to the Starter Toolkit deployment method, the GenAI Observability Dashboard correctly displayed all Runtime metrics and traces.
-- **Runtime cold start reduced from approximately 60 seconds to approximately 1 second**: The change in deployment method drastically shortened startup time.
+- **AgentCore console metrics restored**: After switching to the Starter Toolkit deployment method, the GenAI Observability Dashboard correctly displayed all AgentCore Runtime metrics and traces.
+- **AgentCore Runtime cold start reduced from approximately 60 seconds to approximately 1 second**: The change in deployment method drastically shortened startup time.
 - First message response on cold start takes approximately 5 seconds (handled directly by the Lightweight Agent); OpenClaw reaches full readiness in approximately 10 seconds.
 - The deployment strategy is replicable to other regions, with a standardized 3-phase workflow and supporting documentation now in place.
 
@@ -118,7 +120,7 @@ Implement and validate the Warm Pool strategy, then evaluate whether it remained
 
 ### Result
 - The Warm Pool technical approach was validated and confirmed to be fully functional.
-- **However, it was no longer needed**: After switching to the Starter Toolkit deployment method, Runtime cold start dropped from approximately 60 seconds to approximately 1 second. The Lightweight Agent responds to the first message within approximately 5 seconds (including Bedrock model invocation time), providing a sufficiently good user experience.
+- **However, it was no longer needed**: After switching to the Starter Toolkit deployment method, AgentCore Runtime cold start dropped from approximately 60 seconds to approximately 1 second. The Lightweight Agent responds to the first message within approximately 5 seconds (including Bedrock model invocation time), providing a sufficiently good user experience.
 - **Decision: Remove Warm Pool** to eliminate unnecessary complexity (additional Lambda + EventBridge rule + DynamoDB records + KMS permission management).
 - **Technical design documentation was preserved** so the solution can be quickly restored if needed in the future.
 
@@ -130,7 +132,7 @@ Implement and validate the Warm Pool strategy, then evaluate whether it remained
 
 | Metric | Before (Pure CDK) | After (Hybrid Deployment) |
 |--------|---------------------|----------------------------|
-| Runtime cold start | ~60s | **~1s** |
+| AgentCore Runtime cold start | ~60s | **~1s** |
 | First message response | ~60s+ | **~5s** (Lightweight Agent) |
 | OpenClaw full readiness | ~2-3 min | **~10s** |
 | Console metrics display | Unavailable | Functioning normally |

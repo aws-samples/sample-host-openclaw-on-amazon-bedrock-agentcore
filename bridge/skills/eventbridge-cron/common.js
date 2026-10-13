@@ -3,6 +3,7 @@
  */
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const { DynamoDBDocumentClient, PutCommand, GetCommand, DeleteCommand, QueryCommand, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
+const fs = require("fs");
 
 const REGION = process.env.AWS_REGION;
 if (!REGION) {
@@ -184,11 +185,32 @@ function extractChannelInfo(userId) {
 }
 
 /**
- * Build the actorId from channel info.
- * channel=telegram, channelTarget=12345 -> actorId=telegram:12345
+ * Read the current turn's delivery destination without changing its storage owner.
  */
-function buildActorId(channel, channelTarget) {
-  return `${channel}:${channelTarget}`;
+function resolveScheduleDelivery(userId, { channel, channelTarget } = {}) {
+  const identity = JSON.parse(fs.readFileSync("/tmp/current-identity.json", "utf8"));
+  if (typeof identity.actorId !== "string" || identity.actorId.replace(/:/g, "_") !== userId) {
+    throw new Error("Schedule namespace does not match the AgentCore Runtime owner");
+  }
+  if (typeof identity.channel !== "string" || !identity.channel ||
+      typeof identity.channelActorId !== "string" ||
+      !identity.channelActorId.startsWith(`${identity.channel}:`) ||
+      !identity.channelActorId.slice(identity.channel.length + 1)) {
+    throw new Error("Current channel delivery identity is unavailable");
+  }
+  if (channel && channel !== identity.channel) {
+    throw new Error("Schedule channel must match the current conversation");
+  }
+  const target = channelTarget === "" ? identity.channelTarget : (channelTarget ?? identity.channelTarget);
+  if (typeof target !== "string" || !target) {
+    throw new Error("Schedule delivery target is unavailable");
+  }
+  return {
+    actorId: identity.actorId,
+    channelActorId: identity.channelActorId,
+    channel: identity.channel,
+    channelTarget: target,
+  };
 }
 
 /**
@@ -303,7 +325,7 @@ module.exports = {
   generateScheduleId,
   buildScheduleName,
   extractChannelInfo,
-  buildActorId,
+  resolveScheduleDelivery,
   getDynamoClient,
   saveCronRecord,
   getCronRecord,

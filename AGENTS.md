@@ -1,5 +1,7 @@
 # AGENTS.md — openclaw-on-agentcore
 
+AgentCore Runtime V2 only: use `runtime_manifest` for CDK, `.runtime/runtime-v2.json` for the SDK controller, and immutable endpoints starting with `release_1`. Phase 1 can omit the manifest; Phase 3 requires verified readback and full-chat warmup. Never delete SESSION records to reset tests. See [the runbook](docs/runtime-v2.md).
+
 ## Build & Validation Commands (Backpressure)
 
 ### CDK (Python)
@@ -10,7 +12,7 @@ source .venv/bin/activate
 cdk synth 2>&1
 
 # Run Python unit tests
-pytest tests/ -v 2>&1
+uv run --no-project --python .venv/bin/python python -m pytest tests/ --ignore=tests/e2e -v
 
 # Type check (if mypy configured)
 mypy stacks/ --ignore-missing-imports 2>&1
@@ -21,10 +23,10 @@ mypy stacks/ --ignore-missing-imports 2>&1
 # Syntax check — must pass before committing any .js change
 node --check bridge/agentcore-proxy.js
 node --check bridge/agentcore-contract.js
-node --check bridge/lightweight-agent.js
+node --check bridge/runtime-lifecycle.js
 
 # Run bridge tests (if any)
-cd bridge && npm test 2>&1 || echo "No tests yet"
+npm test --prefix bridge
 ```
 
 ### Red Team folder
@@ -62,13 +64,14 @@ pytest tests/e2e/ -v 2>&1
 
 | File | Purpose |
 |------|---------|
-| `stacks/agentcore_stack.py` | AgentCore Runtime container + IAM |
+| `stacks/agentcore_stack.py` | CDK foundation, Browser, storage and IAM |
+| `scripts/runtime_deploy.py` | Pinned SDK V2 AgentCore Runtime controller; `.runtime/runtime-v2.json` |
 | `stacks/security_stack.py` | KMS, Secrets Manager, Cognito |
 | `stacks/guardrails_stack.py` | NEW — Bedrock Guardrails (create this) |
 | `app.py` | CDK stack wiring |
 | `bridge/agentcore-proxy.js` | Bedrock ConverseStream proxy — inject guardrailConfig here |
 | `bridge/agentcore-contract.js` | Container entrypoint |
-| `bridge/lightweight-agent.js` | Warm-up shim |
+| `bridge/runtime-lifecycle.js` | V2 bootstrap, immutable binding and readiness |
 | `tests/e2e/bot_test.py` | E2E bot tests |
 | `docs/redteam-design.md` | Full design context |
 | `cdk.json` | CDK context flags (add enable_guardrails here) |

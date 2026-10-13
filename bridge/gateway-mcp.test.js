@@ -1,13 +1,10 @@
 /**
- * Tests for gateway-mcp.js (mcp.servers.agentcore config + bearer refresh) and
+ * Tests for gateway-mcp.js (mcp.servers.agentcore config) and
  * cognito-token.js (shared per-user token provider).
  * Run: node --test gateway-mcp.test.js
  */
-const { describe, it, beforeEach, afterEach } = require("node:test");
+const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
 const crypto = require("crypto");
 
 const gw = require("./gateway-mcp");
@@ -56,120 +53,6 @@ describe("gateway-mcp.applyGatewayMcp", () => {
     assert.equal(gw.isEnabled({}), false);
     assert.equal(gw.isEnabled({ AGENTCORE_GATEWAY_URL: "  " }), false);
     assert.equal(gw.isEnabled({ AGENTCORE_GATEWAY_URL: "https://x/mcp" }), true);
-  });
-});
-
-describe("gateway-mcp.rewriteBearer", () => {
-  let dir;
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "gwmcp-"));
-  });
-  afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("rewrites only the Authorization header, atomically, and reports change", () => {
-    const p = path.join(dir, "openclaw.json");
-    const cfg = gw.applyGatewayMcp(BASE_CONFIG, { gatewayUrl: "https://x/mcp", token: "old" });
-    fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
-
-    assert.equal(gw.rewriteBearer(p, "new"), true);
-    const after = JSON.parse(fs.readFileSync(p, "utf8"));
-    assert.equal(after.mcp.servers.agentcore.headers.Authorization, "Bearer new");
-    assert.equal(after.mcp.servers.agentcore.url, "https://x/mcp");
-    assert.deepEqual(after.models, BASE_CONFIG.models);
-    assert.deepEqual(fs.readdirSync(dir), ["openclaw.json"], "no tmp file left behind");
-
-    assert.equal(gw.rewriteBearer(p, "new"), false, "idempotent");
-  });
-
-  it("is a no-op on a config without the agentcore server", () => {
-    const p = path.join(dir, "openclaw.json");
-    fs.writeFileSync(p, JSON.stringify(BASE_CONFIG));
-    assert.equal(gw.rewriteBearer(p, "x"), false);
-    assert.deepEqual(JSON.parse(fs.readFileSync(p, "utf8")), BASE_CONFIG);
-  });
-});
-
-describe("gateway-mcp.scheduleBearerRefresh", () => {
-  let dir, p;
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "gwmcp-"));
-    p = path.join(dir, "openclaw.json");
-    fs.writeFileSync(p, JSON.stringify(gw.applyGatewayMcp(BASE_CONFIG, { gatewayUrl: "https://x/mcp", token: "t0" })));
-  });
-  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
-
-  function fakeTimers() {
-    const timers = [];
-    return {
-      timers,
-      setTimer: (fn, ms) => {
-        const h = { fn, ms, cleared: false, unref() {} };
-        timers.push(h);
-        return h;
-      },
-      clearTimer: (h) => {
-        h.cleared = true;
-      },
-    };
-  }
-
-  it("schedules the first refresh leadMs before expiry and forces a fresh token", async () => {
-    const t = fakeTimers();
-    let now = 1_000_000;
-    const calls = [];
-    const expires1 = now + 3_540_000; // 59 min out, like Cognito's 3600 - 60
-    const handle = gw.scheduleBearerRefresh({
-      configPath: p,
-      getToken: async (opts) => {
-        calls.push(opts);
-        return { token: `t${calls.length}`, expiresAt: now + 3_540_000 };
-      },
-      leadMs: 5 * 60 * 1000,
-      now: () => now,
-      setTimer: t.setTimer,
-      clearTimer: t.clearTimer,
-      log: () => {},
-    });
-    handle.start(expires1);
-    assert.equal(t.timers.length, 1);
-    assert.equal(t.timers[0].ms, expires1 - 5 * 60 * 1000 - now);
-
-    now = expires1 - 5 * 60 * 1000;
-    await t.timers[0].fn();
-    assert.deepEqual(calls, [{ force: true }]);
-    assert.equal(JSON.parse(fs.readFileSync(p, "utf8")).mcp.servers.agentcore.headers.Authorization, "Bearer t1");
-    assert.equal(t.timers.length, 2, "next refresh scheduled");
-    assert.equal(t.timers[1].ms, 3_540_000 - 5 * 60 * 1000);
-
-    handle.stop();
-    assert.equal(t.timers[1].cleared, true);
-  });
-
-  it("retries in 60 s when minting fails and never goes below a 30 s delay", async () => {
-    const t = fakeTimers();
-    const now = 5_000_000;
-    let fail = true;
-    const handle = gw.scheduleBearerRefresh({
-      configPath: p,
-      getToken: async () => {
-        if (fail) throw new Error("cognito down");
-        return { token: "ok", expiresAt: now + 1000 };
-      },
-      now: () => now,
-      setTimer: t.setTimer,
-      clearTimer: t.clearTimer,
-      log: () => {},
-    });
-    handle.start(now + 10); // already inside the lead window
-    assert.equal(t.timers[0].ms, 30 * 1000);
-    await t.timers[0].fn();
-    assert.equal(t.timers[1].ms, 60 * 1000, "retry delay");
-    assert.equal(JSON.parse(fs.readFileSync(p, "utf8")).mcp.servers.agentcore.headers.Authorization, "Bearer t0");
-    fail = false;
-    await t.timers[1].fn();
-    assert.equal(JSON.parse(fs.readFileSync(p, "utf8")).mcp.servers.agentcore.headers.Authorization, "Bearer ok");
   });
 });
 

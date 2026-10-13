@@ -13,19 +13,18 @@ Requires:
     - Deployed stack with BEDROCK_GUARDRAIL_ID configured on the runtime
       (scripts/deploy.sh Phase 2 does this from the OpenClawGuardrails outputs)
     - E2E_TELEGRAM_CHAT_ID and E2E_TELEGRAM_USER_ID env vars set
-    - logs:FilterLogEvents on the AgentCore runtime log group
-      (/aws/bedrock-agentcore/runtimes/<runtime_id>-<endpoint>), which is where
-      bridge/agentcore-proxy.js writes its "[guardrail] intervention ..." line
+    - logs:FilterLogEvents on /openclaw/container, scoped to the canonical
+      actor from the saved V2 route for proxy intervention evidence
 """
 
-import json
 import os
 import time
-from pathlib import Path
 
 import pytest
 
 from .log_tailer import tail_logs
+from .session import get_agent_status
+from .container_logs import CONTAINER_LOG_GROUP, namespace
 from .webhook import post_webhook
 
 # The actual guardrail ID deployed — used to verify it is NOT leaked
@@ -52,25 +51,8 @@ _GUARDRAIL_INTERVENTION_MARKERS = (
 _GUARDRAIL_INTERVENTION_FILTER = '"[guardrail] intervention"'
 
 
-def _runtime_log_group() -> str:
-    """AgentCore runtime log group, derived from cdk.json (runtime_id/endpoint).
-
-    The proxy's console output lands in
-    /aws/bedrock-agentcore/runtimes/<runtime_id>-<runtime_endpoint_id>, not in
-    the Router Lambda group that log_tailer reads.
-    """
-    cdk_json = Path(__file__).resolve().parents[2] / "cdk.json"
-    with open(cdk_json) as f:
-        ctx = json.load(f).get("context", {})
-    runtime_id = ctx.get("runtime_id", "")
-    endpoint_id = ctx.get("runtime_endpoint_id", "") or "DEFAULT"
-    if not runtime_id:
-        raise RuntimeError("runtime_id not set in cdk.json — run scripts/deploy.sh Phase 2 first")
-    return f"/aws/bedrock-agentcore/runtimes/{runtime_id}-{endpoint_id}"
-
-
 def _find_guardrail_intervention(
-    region: str, *, since_ms: int, timeout_s: int = 120, poll_interval_s: int = 5
+    cfg, *, since_ms: int, timeout_s: int = 120, poll_interval_s: int = 5
 ) -> list:
     """Poll the runtime log group for the proxy's guardrail-intervention line.
 
@@ -78,12 +60,14 @@ def _find_guardrail_intervention(
     """
     import boto3
 
-    logs = boto3.client("logs", region_name=region)
-    log_group = _runtime_log_group()
+    logs = boto3.client("logs", region_name=cfg.region)
+    log_group = CONTAINER_LOG_GROUP
+    stream_prefix = namespace(cfg) + "-"
     start = time.monotonic()
     while (time.monotonic() - start) < timeout_s:
         resp = logs.filter_log_events(
             logGroupName=log_group,
+            logStreamNamePrefix=stream_prefix,
             startTime=since_ms,
             filterPattern=_GUARDRAIL_INTERVENTION_FILTER,
             limit=50,
@@ -98,28 +82,6 @@ def _find_guardrail_intervention(
             return matches
         time.sleep(poll_interval_s)
     return []
-
-
-def _has_guardrail_configured() -> bool:
-    """Check if the deployment has a guardrail ID configured (via CDK outputs)."""
-    try:
-        import boto3
-        from botocore.exceptions import ClientError
-
-        from .config import _resolve_region
-
-        region = _resolve_region()
-        cf = boto3.client("cloudformation", region_name=region)
-        stacks = cf.describe_stacks(StackName="OpenClawAgentCore")
-        outputs = {
-            o["OutputKey"]: o["OutputValue"]
-            for o in stacks["Stacks"][0].get("Outputs", [])
-        }
-        # Check if the runtime has guardrail env vars configured
-        # (presence of the stack is sufficient — the env var is baked in at deploy)
-        return True
-    except Exception:
-        return False
 
 
 @pytest.mark.guardrail
@@ -190,16 +152,14 @@ class TestGuardrailWiring:
             f"Incomplete lifecycle (timed_out={tail.timed_out}, "
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
-        assert not tail.is_warmup, (
-            "Response came from the warm-up shim, not the real proxy — "
-            "guardrails only apply on the OpenClaw/proxy path."
-        )
+        status = get_agent_status(e2e_config)
+        assert status.get("lifecycle", {}).get("state") == "USER_READY", status
 
         # The only acceptable evidence: the proxy logged a guardrail intervention.
-        interventions = _find_guardrail_intervention(e2e_config.region, since_ms=since_ms)
+        interventions = _find_guardrail_intervention(e2e_config, since_ms=since_ms)
         assert interventions, (
             "No guardrail intervention logged by the proxy in "
-            f"{_runtime_log_group()} after the harmful prompt. Either the "
+            f"{CONTAINER_LOG_GROUP} after the harmful prompt. Either the "
             "guardrail is not wired (BEDROCK_GUARDRAIL_ID missing on the runtime "
             "or bedrock:ApplyGuardrail missing on the role) or the model answered "
             "before the guardrail evaluated it.\n"

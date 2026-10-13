@@ -15,8 +15,38 @@
 
 const fs = require("fs");
 const path = require("path");
+const { isAsyncFunction } = require("util").types;
 
 const VALID_NAMESPACE = /^[a-zA-Z][a-zA-Z0-9_-]{1,64}$/;
+
+function validateNamespace(namespace) {
+  if (typeof namespace !== "string" || !VALID_NAMESPACE.test(namespace)) {
+    throw new Error(`Invalid namespace "${namespace}" — must match ${VALID_NAMESPACE}`);
+  }
+  return namespace;
+}
+
+function credentialsExpireAt(creds) {
+  const expiresAt = new Date(creds?.expiration).getTime();
+  return Number.isFinite(expiresAt) ? expiresAt : 0;
+}
+
+function credentialsNeedRefresh(creds, { now = Date.now(), minValidityMs = 5 * 60 * 1000 } = {}) {
+  const timestamp = typeof now === "function" ? now() : now;
+  return !creds || credentialsExpireAt(creds) <= timestamp + minValidityMs;
+}
+
+function assertCredentialsFresh(creds, { now = Date.now, minValidityMs = 0 } = {}) {
+  for (const key of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+    if (!creds || typeof creds[key] !== "string" || !creds[key]) {
+      throw new Error(`Scoped credentials: ${key} is required`);
+    }
+  }
+  if (credentialsNeedRefresh(creds, { now, minValidityMs })) {
+    throw new Error("Scoped credentials expired or expiration is invalid");
+  }
+  return creds;
+}
 
 // ENV vars that MUST be excluded from OpenClaw to prevent credential leakage
 const CREDENTIAL_ENV_BLOCKLIST = [
@@ -35,6 +65,7 @@ const FORWARDED_ENV_KEYS = [
   "HOME",
   "NODE_PATH",
   "NODE_OPTIONS",
+  "NODE_COMPILE_CACHE",
   "AWS_REGION",
   "S3_USER_FILES_BUCKET",
   "USER_ID",
@@ -63,11 +94,7 @@ const FORWARDED_ENV_KEYS = [
  * @returns {string} JSON policy document
  */
 function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn, eventbridgeRoleArn, identityTableArn, scheduleGroupArn, region, account }) {
-  if (!namespace || !VALID_NAMESPACE.test(namespace)) {
-    throw new Error(
-      `Invalid namespace "${namespace}" — must match ${VALID_NAMESPACE}`,
-    );
-  }
+  validateNamespace(namespace);
 
   // EventBridge Scheduler resources:
   // - CRUD actions (Create/Update/Delete/Get) operate on individual schedules
@@ -134,6 +161,7 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
  * @returns {Promise<{accessKeyId: string, secretAccessKey: string, sessionToken: string, expiration: Date}>}
  */
 async function createScopedCredentials(namespace, opts = {}) {
+  validateNamespace(namespace);
   const bucket = process.env.S3_USER_FILES_BUCKET;
   const roleArn = process.env.EXECUTION_ROLE_ARN;
   const cmkArn = process.env.CMK_ARN;
@@ -194,12 +222,24 @@ async function createScopedCredentials(namespace, opts = {}) {
 
   const resp = await stsClient.send(command);
 
-  return {
+  const creds = {
     accessKeyId: resp.Credentials.AccessKeyId,
     secretAccessKey: resp.Credentials.SecretAccessKey,
     sessionToken: resp.Credentials.SessionToken,
     expiration: resp.Credentials.Expiration,
   };
+  assertCredentialsFresh(creds, { now: opts.now });
+  return creds;
+}
+
+function writePrivateFileAtomic(file, content) {
+  const tmp = `${file}.tmp-${process.pid}-${require("crypto").randomUUID()}`;
+  try {
+    fs.writeFileSync(tmp, content, { mode: 0o600, flag: "wx" });
+    fs.renameSync(tmp, file);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (err) { if (err.code !== "ENOENT") throw err; }
+  }
 }
 
 /**
@@ -212,7 +252,8 @@ async function createScopedCredentials(namespace, opts = {}) {
  * @param {object} creds - Credentials from createScopedCredentials()
  * @param {string} dir - Directory to write files in
  */
-function writeCredentialFiles(creds, dir) {
+function writeCredentialFiles(creds, dir, { now = Date.now } = {}) {
+  assertCredentialsFresh(creds, { now });
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   const credsJson = {
@@ -228,11 +269,7 @@ function writeCredentialFiles(creds, dir) {
   // Atomic write: write to .tmp then rename — prevents credential_process
   // from reading a partially-written file during refresh.
   const credsPath = path.join(dir, "scoped-creds.json");
-  const credsTmp = credsPath + ".tmp";
-  fs.writeFileSync(credsTmp, JSON.stringify(credsJson, null, 2), {
-    mode: 0o600,
-  });
-  fs.renameSync(credsTmp, credsPath);
+  writePrivateFileAtomic(credsPath, JSON.stringify(credsJson, null, 2));
 
   const configContent = [
     "[default]",
@@ -242,11 +279,76 @@ function writeCredentialFiles(creds, dir) {
   ].join("\n");
 
   const configPath = path.join(dir, "scoped-aws-config");
-  const configTmp = configPath + ".tmp";
-  fs.writeFileSync(configTmp, configContent, {
-    mode: 0o600,
-  });
-  fs.renameSync(configTmp, configPath);
+  writePrivateFileAtomic(configPath, configContent);
+}
+
+// Requests and persistence share refreshes; drain keeps only persistence active.
+function createCredentialManager(namespace, {
+  credDir, internalUserId, stsClient, onRefresh = () => {}, now = Date.now,
+  prepareRefresh = () => {},
+  refreshBeforeMs = 5 * 60 * 1000,
+  refresh = () => createScopedCredentials(namespace, { internalUserId, stsClient, now }),
+} = {}) {
+  validateNamespace(namespace);
+  if (!Number.isFinite(refreshBeforeMs) || refreshBeforeMs < 0) throw new Error("Invalid refreshBeforeMs");
+  const callbackError = "onRefresh must be synchronous; use prepareRefresh for asynchronous preparation";
+  if (typeof onRefresh !== "function" || isAsyncFunction(onRefresh)) throw new TypeError(callbackError);
+  if (typeof prepareRefresh !== "function") throw new TypeError("prepareRefresh must be a function");
+  let credentials = null;
+  let inFlight = null;
+  let stopped = false;
+  let draining = false;
+  function assertActive() {
+    if (stopped) throw new Error("Scoped credential manager stopped");
+  }
+  function assertAccess(forPersistence = false) {
+    assertActive();
+    if (draining && !forPersistence) throw new Error("Scoped credential manager draining");
+  }
+  function getCredentials() {
+    assertAccess();
+    return assertCredentialsFresh(credentials, { now });
+  }
+  async function ensureFresh({ forPersistence = false, minValidityMs = refreshBeforeMs } = {}) {
+    assertAccess(forPersistence === true);
+    if (!Number.isFinite(minValidityMs) || minValidityMs < 0) throw new Error("Invalid minValidityMs");
+    if (!inFlight && credentials && new Date(credentials.expiration).getTime() > now() + minValidityMs) {
+      return assertCredentialsFresh(credentials, { now, minValidityMs });
+    }
+    inFlight ||= Promise.resolve().then(async () => {
+      assertActive();
+      const next = await refresh();
+      assertActive();
+      assertCredentialsFresh(next, { now, minValidityMs });
+      const prepared = await prepareRefresh(next);
+      assertActive();
+      assertCredentialsFresh(next, { now, minValidityMs });
+      // Draining saves use memory only; stopped or aborted children get no new files.
+      if (!draining) {
+        // No await between the stop check and synchronous publication.
+        if (credDir) writeCredentialFiles(next, credDir, { now });
+        const result = onRefresh(next, prepared);
+        if (result && typeof result.then === "function") {
+          Promise.resolve(result).catch(() => {});
+          throw new TypeError(callbackError);
+        }
+      }
+      assertActive();
+      credentials = Object.freeze({ ...next });
+      return credentials;
+    }).finally(() => { inFlight = null; });
+    const refreshed = await inFlight;
+    assertAccess(forPersistence === true);
+    return assertCredentialsFresh(refreshed, { now, minValidityMs });
+  }
+  function beginDrain() {
+    draining = true;
+  }
+  function stop() {
+    stopped = true;
+    credentials = null;
+  }
+  return { ensureFresh, getCredentials, beginDrain, stop };
 }
 
 /**
@@ -262,7 +364,7 @@ function writeCredentialFiles(creds, dir) {
  * @returns {object} Environment variables for spawn()
  */
 function buildOpenClawEnv({ credDir, baseEnv = {} }) {
-  const env = {};
+  const env = { AWS_EC2_METADATA_DISABLED: "true" };
 
   // Forward allowed env vars from base environment
   for (const key of FORWARDED_ENV_KEYS) {
@@ -291,6 +393,11 @@ function buildOpenClawEnv({ credDir, baseEnv = {} }) {
 }
 
 module.exports = {
+  credentialsExpireAt,
+  credentialsNeedRefresh,
+  validateNamespace,
+  assertCredentialsFresh,
+  createCredentialManager,
   buildSessionPolicy,
   createScopedCredentials,
   writeCredentialFiles,

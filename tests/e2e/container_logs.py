@@ -9,8 +9,8 @@ These helpers let a test prove *how* a reply was produced, not just that a
 reply arrived:
 
 * :func:`openclaw_ready` — the real OpenClaw 2.0 gateway reached ready in this
-  container (``[contract] OpenClaw is ready on port``), i.e. the reply did not
-  come from the warm-up shim.
+  container (``[contract] OpenClaw is ready on port``). This alone does not
+  prove a particular turn completed.
 * :func:`tool_calls` — the ``tool=`` names OpenClaw's embedded agent started in
   a time window (``exec`` for the exec skills; the MCP tool name for Gateway
   tools).
@@ -27,6 +27,7 @@ from typing import Dict, List, Optional
 import boto3
 
 from .config import E2EConfig
+from .session import get_session_route
 
 CONTAINER_LOG_GROUP = "/openclaw/container"
 GATEWAY_LAMBDA_LOG_GROUPS = {
@@ -40,7 +41,7 @@ _TOOL_END = re.compile(r"embedded run tool end: runId=\S+ tool=(\S+)")
 
 
 def namespace(cfg: E2EConfig) -> str:
-    return f"telegram_{cfg.telegram_user_id}"
+    return get_session_route(cfg).actor_id.replace(":", "_")
 
 
 def _logs(cfg: E2EConfig):
@@ -50,7 +51,8 @@ def _logs(cfg: E2EConfig):
 def latest_stream(cfg: E2EConfig) -> Optional[str]:
     """Newest container log stream for the E2E user."""
     resp = _logs(cfg).describe_log_streams(
-        logGroupName=CONTAINER_LOG_GROUP, orderBy="LastEventTime", descending=True, limit=10
+        logGroupName=CONTAINER_LOG_GROUP, logStreamNamePrefix=namespace(cfg) + "-",
+        orderBy="LogStreamName", descending=True, limit=10
     )
     ns = namespace(cfg)
     for s in resp.get("logStreams", []):

@@ -88,6 +88,7 @@ function isTransientFile(relativePath) {
     /\.sqlite-(wal|shm|journal|snapshot)$/.test(name) ||
     /\.tmp-\d+$/.test(name) ||
     name.endsWith(".lock") ||
+    name.endsWith(".lock.sqlite") ||
     name.endsWith(".log")
   );
 }
@@ -122,18 +123,19 @@ function resolvePaths({ homeDir = process.env.HOME || "/root", mountDir = DEFAUL
  * List regular files under `root` as relative paths. Does NOT follow symlinks
  * and skips caches and OpenClaw's transient staging directories.
  */
-function walkFiles(root, dir = root) {
+function walkFiles(root, dir = root, { strict = false } = {}) {
   const out = [];
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    if (strict && !(err.code === "ENOENT" && dir === root)) throw err;
     return out;
   }
   for (const entry of entries) {
     if (entry.isDirectory()) {
       if (isTransientDir(entry.name)) continue;
-      out.push(...walkFiles(root, path.join(dir, entry.name)));
+      out.push(...walkFiles(root, path.join(dir, entry.name), { strict }));
     } else if (entry.isFile()) {
       out.push(path.relative(root, path.join(dir, entry.name)));
     }
@@ -141,14 +143,10 @@ function walkFiles(root, dir = root) {
   return out;
 }
 
-function hasLocalSqlite(stateDir) {
-  return walkFiles(stateDir).some((rel) => rel.endsWith(SQLITE_EXT));
-}
-
 /**
  * True when the mounted state dir holds any persisted content (a mirrored
  * state file or a workspace file) — i.e. this is a returning user and the S3
- * restore should be skipped. Empty directories (which setupSessionStorage
+ * restore should fill only missing files. Empty directories (which setupSessionStorage
  * itself creates) do not count.
  */
 function sessionStorageHasContent(mountStateDir) {
@@ -158,6 +156,35 @@ function sessionStorageHasContent(mountStateDir) {
 function insideBase(resolvedBase, candidate) {
   const resolved = path.resolve(candidate);
   return resolved === resolvedBase || resolved.startsWith(resolvedBase + path.sep);
+}
+
+function assertSafePath(root, candidate) {
+  const base = path.resolve(root);
+  const resolved = path.resolve(candidate);
+  if (!insideBase(base, resolved)) throw new Error("Path outside state directory");
+  let current = base;
+  const parts = path.relative(base, resolved).split(path.sep).filter(Boolean);
+  for (let i = 0; i <= parts.length; i++) {
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) throw new Error(`State path contains symlink: ${current}`);
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+    }
+    if (i < parts.length) current = path.join(current, parts[i]);
+  }
+}
+
+function assertSqliteFile(file) {
+  if (fs.statSync(file).size === 0) throw new Error("Empty SQLite state");
+  const sqlite = getNodeSqlite();
+  if (!sqlite) throw new Error("node:sqlite unavailable for restore validation");
+  const db = new sqlite.DatabaseSync(file, { readOnly: true });
+  try {
+    const rows = db.prepare("PRAGMA quick_check").all();
+    if (rows.length !== 1 || rows[0].quick_check !== "ok") throw new Error("Invalid SQLite state");
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -175,7 +202,7 @@ function insideBase(resolvedBase, candidate) {
  * storage mount cannot provide — then copied to `destPath` via a temp file and
  * rename so a reader never sees a partial file.
  */
-async function snapshotSqliteToFile(dbPath, destPath, { sqlite = getNodeSqlite(), stagingDir = os.tmpdir() } = {}) {
+async function snapshotSqliteToFile(dbPath, destPath, { sqlite = getNodeSqlite(), stagingDir = os.tmpdir(), assertReady } = {}) {
   if (!sqlite || typeof sqlite.backup !== "function") {
     throw new Error("node:sqlite backup API unavailable on this Node runtime");
   }
@@ -183,27 +210,29 @@ async function snapshotSqliteToFile(dbPath, destPath, { sqlite = getNodeSqlite()
     stagingDir,
     `.${path.basename(dbPath)}.${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sqlite-snapshot`,
   );
-  const source = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+  const tmpDest = `${destPath}.tmp-${process.pid}`;
   try {
-    source.exec("PRAGMA busy_timeout = 5000"); // bounded wait if the writer is mid-commit
-    source.exec("BEGIN");
+    const source = new sqlite.DatabaseSync(dbPath, { readOnly: true });
     try {
-      await sqlite.backup(source, stagePath);
+      source.exec("PRAGMA busy_timeout = 5000"); // bounded wait if the writer is mid-commit
+      source.exec("BEGIN");
+      try {
+        await sqlite.backup(source, stagePath);
+      } finally {
+        try { source.exec("ROLLBACK"); } catch { /* read-only txn */ }
+      }
     } finally {
-      try { source.exec("ROLLBACK"); } catch { /* read-only txn */ }
+      try { source.close(); } catch { /* already closed */ }
     }
-  } finally {
-    try { source.close(); } catch { /* already closed */ }
-  }
-  try {
+    if (assertReady) assertReady();
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
-    const tmpDest = `${destPath}.tmp-${process.pid}`;
     fs.copyFileSync(stagePath, tmpDest);
     fs.renameSync(tmpDest, destPath);
     return fs.statSync(destPath).size;
   } finally {
     try { fs.unlinkSync(stagePath); } catch { /* best effort */ }
     try { fs.unlinkSync(`${stagePath}-journal`); } catch { /* none */ }
+    try { fs.unlinkSync(tmpDest); } catch { /* not created */ }
   }
 }
 
@@ -211,15 +240,24 @@ async function snapshotSqliteToFile(dbPath, destPath, { sqlite = getNodeSqlite()
  * Copy a plain file atomically (temp file in the destination dir + rename),
  * preserving the source mtime so unchanged files can be detected later.
  */
-function copyFileAtomic(src, dest) {
+function copyFileAtomic(src, dest, { validate } = {}) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const tmp = `${dest}.tmp-${process.pid}`;
-  fs.copyFileSync(src, tmp);
   try {
-    const st = fs.statSync(src);
-    fs.utimesSync(tmp, st.atime, st.mtime);
-  } catch { /* best effort */ }
-  fs.renameSync(tmp, dest);
+    fs.copyFileSync(src, tmp);
+    if (validate) validate(tmp);
+    try {
+      const st = fs.statSync(src);
+      fs.utimesSync(tmp, st.atime, st.mtime);
+    } catch { /* best effort */ }
+    fs.renameSync(tmp, dest);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* not created */ }
+    // Read-only SQLite validation may create sidecars on this staged copy.
+    try { fs.unlinkSync(`${tmp}-wal`); } catch { /* none */ }
+    try { fs.unlinkSync(`${tmp}-shm`); } catch { /* none */ }
+    try { fs.unlinkSync(`${tmp}-journal`); } catch { /* none */ }
+  }
 }
 
 /**
@@ -239,25 +277,20 @@ function sameSizeAndMtime(src, dest) {
 /**
  * Restore the mirrored state dir from the mount to local disk.
  *
- * Runs only while the local state dir holds no SQLite database yet (a cold
- * start in a fresh container); once the gateway has run locally the local
- * copy is the truth and must not be clobbered. Workspace files are restored
- * without overwriting anything already present locally (never destroys
+ * Fills missing files and validates SQLite without clobbering local state.
+ * Workspace files are restored without overwriting anything already present locally (never destroys
  * local work); transient files and 0-byte *.sqlite files (a database that was
  * created but never written — e.g. left behind by a gateway that crashed on
  * the mount — which would otherwise shadow a real snapshot) are skipped.
  *
- * @returns {{ files: number, workspaceFiles: number, skipped: number, reason?: string }}
+ * @returns {{ files: number, workspaceFiles: number, skipped: number }}
  */
 function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
-  if (hasLocalSqlite(stateDir)) {
-    return { files: 0, workspaceFiles: 0, skipped: 0, reason: "local state dir already holds SQLite state" };
-  }
   const resolvedBase = path.resolve(stateDir);
   let files = 0;
   let workspaceFiles = 0;
   let skipped = 0;
-  for (const rel of walkFiles(mountStateDir)) {
+  for (const rel of walkFiles(mountStateDir, mountStateDir, { strict: true })) {
     if (isTransientFile(rel)) continue;
     const src = path.join(mountStateDir, rel);
     const dest = path.join(stateDir, rel);
@@ -266,27 +299,27 @@ function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
       skipped++;
       continue;
     }
-    try {
-      if (isWorkspacePath(rel)) {
-        if (fs.existsSync(dest)) {
-          skipped++;
-          continue;
-        }
-        copyFileAtomic(src, dest);
-        workspaceFiles++;
-        continue;
-      }
-      if (rel.endsWith(SQLITE_EXT) && fs.statSync(src).size === 0) {
-        log.warn(`[state-storage] Skipping 0-byte SQLite file on restore: ${rel}`);
-        skipped++;
-        continue;
-      }
-      copyFileAtomic(src, dest);
-      files++;
-    } catch (err) {
-      log.warn(`[state-storage] Failed to restore ${rel}: ${err.message}`);
+    assertSafePath(stateDir, dest);
+    assertSafePath(mountStateDir, src);
+    if (fs.existsSync(dest) && !(rel.endsWith(SQLITE_EXT) && fs.statSync(dest).size === 0)) {
+      if (rel.endsWith(SQLITE_EXT)) assertSqliteFile(dest);
       skipped++;
+      continue;
     }
+    if (rel.endsWith(SQLITE_EXT) && fs.statSync(src).size === 0) {
+      log.warn(`[state-storage] Skipping 0-byte SQLite file on restore: ${rel}`);
+      skipped++;
+      continue;
+    }
+    // Validation opens only the staged local copy; SQLite never opens the mount.
+    const validate = rel.endsWith(SQLITE_EXT) ? assertSqliteFile : undefined;
+    if (isWorkspacePath(rel)) {
+      copyFileAtomic(src, dest, { validate });
+      workspaceFiles++;
+      continue;
+    }
+    copyFileAtomic(src, dest, { validate });
+    files++;
   }
   return { files, workspaceFiles, skipped };
 }
@@ -305,18 +338,20 @@ function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
  *
  * @returns {Promise<{ files: number, unchanged: number, sqlite: number, skipped: number, pruned: number }>}
  */
-async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite = getNodeSqlite(), stagingDir } = {}) {
+async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite = getNodeSqlite(), stagingDir, assertReady } = {}) {
+  if (assertReady) assertReady();
   const result = { files: 0, unchanged: 0, sqlite: 0, skipped: 0, pruned: 0 };
-  const localFiles = walkFiles(stateDir).filter((rel) => !isTransientFile(rel));
+  const localFiles = walkFiles(stateDir, stateDir, { strict: true }).filter((rel) => !isTransientFile(rel));
   const localSet = new Set(localFiles);
   const staging = stagingDir || fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-state-mirror-"));
   try {
     for (const rel of localFiles) {
+      if (assertReady) assertReady();
       const src = path.join(stateDir, rel);
       const dest = path.join(mountStateDir, rel);
       try {
         if (rel.endsWith(SQLITE_EXT)) {
-          await snapshotSqliteToFile(src, dest, { sqlite, stagingDir: staging });
+          await snapshotSqliteToFile(src, dest, { sqlite, stagingDir: staging, assertReady });
           result.sqlite++;
         } else if (sameSizeAndMtime(src, dest)) {
           result.unchanged++;
@@ -331,8 +366,9 @@ async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite =
     }
     // Prune mirror files that were deleted locally. Only when the local walk
     // produced something — an empty local set means we could not read it.
-    if (localFiles.length > 0) {
-      for (const rel of walkFiles(mountStateDir)) {
+    if (assertReady) assertReady();
+    if (localFiles.length > 0 && result.skipped === 0) {
+      for (const rel of walkFiles(mountStateDir, mountStateDir, { strict: true })) {
         if (localSet.has(rel)) continue;
         try {
           fs.unlinkSync(path.join(mountStateDir, rel));
@@ -355,16 +391,21 @@ async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite =
  *
  * @returns {{ files: number, unchanged: number, skipped: number, pruned: number }}
  */
-function mirrorWorkspaceDir({ stateDir, mountStateDir, log = console } = {}) {
+function mirrorWorkspaceDir({ stateDir, mountStateDir, log = console, assertReady } = {}) {
+  if (assertReady) assertReady();
   const result = { files: 0, unchanged: 0, skipped: 0, pruned: 0 };
   const workspaceDir = path.join(stateDir, WORKSPACE_SUBDIR);
   const mountWorkspaceDir = path.join(mountStateDir, WORKSPACE_SUBDIR);
   if (!fs.existsSync(workspaceDir)) return result;
-  const localFiles = walkFiles(workspaceDir).filter((rel) => !isTransientFile(rel));
+  const localFiles = walkFiles(workspaceDir, workspaceDir, { strict: true }).filter((rel) => !isTransientFile(rel));
   const localSet = new Set(localFiles);
   for (const rel of localFiles) {
     const src = path.join(workspaceDir, rel);
     const dest = path.join(mountWorkspaceDir, rel);
+    if (rel.endsWith(SQLITE_EXT)) {
+      result.skipped++;
+      continue; // The full state mirror snapshots databases, including workspace ones.
+    }
     try {
       if (sameSizeAndMtime(src, dest)) {
         result.unchanged++;
@@ -377,7 +418,8 @@ function mirrorWorkspaceDir({ stateDir, mountStateDir, log = console } = {}) {
       result.skipped++;
     }
   }
-  for (const rel of walkFiles(mountWorkspaceDir)) {
+  if (localFiles.length === 0 || result.skipped > 0) return result;
+  for (const rel of walkFiles(mountWorkspaceDir, mountWorkspaceDir, { strict: true })) {
     if (localSet.has(rel)) continue;
     try {
       fs.unlinkSync(path.join(mountWorkspaceDir, rel));
@@ -402,8 +444,11 @@ function mirrorWorkspaceDir({ stateDir, mountStateDir, log = console } = {}) {
  */
 function setupSessionStorage({ homeDir, mountDir, log = console } = {}) {
   const p = resolvePaths({ homeDir, mountDir });
-  if (!fs.existsSync(p.mountDir)) {
-    return { available: false, ...p };
+  try {
+    if (!fs.statSync(p.mountDir).isDirectory()) throw new Error("Session storage mount is not a directory");
+  } catch (err) {
+    if (err.code === "ENOENT") return { available: false, ...p };
+    throw err;
   }
   fs.mkdirSync(p.mountWorkspaceDir, { recursive: true });
 
@@ -417,10 +462,9 @@ function setupSessionStorage({ homeDir, mountDir, log = console } = {}) {
     } else if (st.isDirectory()) {
       stateDirWas = "directory";
     } else {
-      stateDirWas = "file";
-      fs.unlinkSync(p.stateDir);
+      throw new Error("Local state path is not a directory");
     }
-  } catch { /* missing */ }
+  } catch (err) { if (err.code !== "ENOENT") throw err; }
   fs.mkdirSync(p.stateDir, { recursive: true });
 
   // 2. Real local workspace dir.
@@ -433,10 +477,9 @@ function setupSessionStorage({ homeDir, mountDir, log = console } = {}) {
     } else if (st.isDirectory()) {
       workspaceWas = "directory";
     } else {
-      workspaceWas = "file";
-      fs.unlinkSync(p.workspaceDir);
+      throw new Error("Local workspace path is not a directory");
     }
-  } catch { /* missing */ }
+  } catch (err) { if (err.code !== "ENOENT") throw err; }
   fs.mkdirSync(p.workspaceDir, { recursive: true });
 
   // 3. Restore the mirror (state files + workspace) to local disk.
@@ -446,8 +489,7 @@ function setupSessionStorage({ homeDir, mountDir, log = console } = {}) {
     `[state-storage] Local state dir ${p.stateDir} (was: ${stateDirWas}); ` +
       `local workspace ${p.workspaceDir} (was: ${workspaceWas}); ` +
       `restored ${restored.files} state file(s) + ${restored.workspaceFiles} workspace file(s) from ${p.mountStateDir}` +
-      (restored.skipped ? `, skipped ${restored.skipped}` : "") +
-      (restored.reason ? ` (${restored.reason})` : ""),
+      (restored.skipped ? `, skipped ${restored.skipped}` : ""),
   );
   return { available: true, ...p, stateDirWas, workspaceWas, restored };
 }
@@ -485,6 +527,7 @@ function mirrorNow(opts) {
  * container is stopped without a graceful SIGTERM.
  */
 function startPeriodicMirror(opts, intervalMs) {
+  if (opts.assertReady) opts.assertReady();
   const interval = intervalMs || parseInt(process.env.STATE_MIRROR_INTERVAL_MS || "300000", 10);
   if (_mirrorTimer) clearInterval(_mirrorTimer);
   _mirrorTimer = setInterval(() => {
@@ -556,6 +599,7 @@ function scheduleWorkspaceMirror(debounceMs, maxWaitMs) {
  * @returns {{ mode: "watch" | "poll" | "none" }}
  */
 function startWorkspaceWatcher(opts, { debounceMs = 2000, maxWaitMs = 15000, fallbackIntervalMs = 30000 } = {}) {
+  if (opts.assertReady) opts.assertReady();
   stopWorkspaceWatcher();
   _watchOpts = opts;
   const log = opts.log || console;
@@ -605,7 +649,186 @@ function stopWorkspaceWatcher() {
   _watchOpts = null;
 }
 
+// Tickets are local capabilities, never caller-provided absence booleans.
+const emptyMountTickets = new WeakMap();
+function attachmentNumber(value) {
+  return typeof value === "string" && /^[0-9]{1,10}$/.test(value) &&
+    Number(value) <= 0xffffffff ? Number(value) : null;
+}
+function attachmentDeviceMatches(dev, mountDevice) {
+  try {
+    if (process.platform !== "linux" || typeof dev !== "string" || !/^[0-9]{1,20}$/.test(dev)) return null;
+    const parts = /^([0-9]{1,10}):([0-9]{1,10})$/.exec(mountDevice || "");
+    if (!parts || parts[0] !== mountDevice) return null;
+    const value = BigInt(dev), major = BigInt(parts[1]), minor = BigInt(parts[2]);
+    if (value > 0xffffffffffffffffn || major > 0xffffffffn || minor > 0xffffffffn) return null;
+    return ((value >> 8n & 0xfffn) | (value >> 32n & 0xfffff000n)) === major &&
+      ((value & 0xffn) | (value >> 12n & 0xffffff00n)) === minor;
+  } catch { return null; }
+}
+function selectVisibleAttachment(p, attached, expectedIdentity) {
+  if (process.platform !== "linux" ||
+      !["openSync", "closeSync", "fstatSync"].every((key) => typeof fs[key] === "function") ||
+      !["O_RDONLY", "O_DIRECTORY", "O_NOFOLLOW"].every((key) => Number.isInteger(fs.constants?.[key]))) {
+    return null;
+  }
+  const rows = attached.map((row) => {
+    const fields = row.line.split(" - ")[0].split(" ");
+    const id = attachmentNumber(fields[0]), parent = attachmentNumber(fields[1]);
+    const device = /^([0-9]{1,10}):([0-9]{1,10})$/.exec(fields[2] || "");
+    return id !== null && id > 0 && parent !== null && fields.length >= 6 &&
+      device && attachmentNumber(device[1]) !== null && attachmentNumber(device[2]) !== null &&
+      /^[a-zA-Z0-9._+-]{1,64}$/.test(row.type)
+      ? { row, id, device: fields[2] } : null;
+  });
+  if (rows.some((row) => row === null)) return null;
+  const identity = (stat) => {
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
+    const values = [stat.dev, stat.ino, stat.mode, stat.mtimeNs, stat.ctimeNs];
+    return values.every((value) => typeof value === "bigint" && value >= 0n) ? values.map(String) : null;
+  };
+  const sameIdentity = (stat) => JSON.stringify(identity(stat)) === JSON.stringify(expectedIdentity);
+  let fd, selected = null;
+  try {
+    fd = fs.openSync(p.mountDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!sameIdentity(opened)) return null;
+    const lines = fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8").split("\n")
+      .filter((line) => /^mnt_id(?:[ \t:]|$)/.test(line));
+    const match = lines.length === 1 ? /^mnt_id:[ \t]+([0-9]{1,10})[ \t]*$/.exec(lines[0]) : null;
+    const id = match ? attachmentNumber(match[1]) : null;
+    if (id === null || id === 0) return null;
+    const matching = rows.filter((row) => row.id === id);
+    if (matching.length !== 1) return null;
+    const active = matching[0];
+    if (!["nfs", "nfs4"].includes(active.row.type) ||
+        attachmentDeviceMatches(String(opened.dev), active.device) !== true) return null;
+    if (fs.realpathSync(p.mountDir) !== path.resolve(p.mountDir) ||
+        !sameIdentity(fs.fstatSync(fd, { bigint: true })) ||
+        !sameIdentity(fs.lstatSync(p.mountDir, { bigint: true }))) return null;
+    selected = active;
+  } catch {
+    selected = null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); }
+      catch { selected = null; }
+    }
+  }
+  if (!selected) return null;
+  return { ...selected.row, visibility: { mountId: selected.id, identity: expectedIdentity } };
+}
+function liveSeedIneligible(reason) {
+  return Object.assign(new Error("Live seed storage is ineligible"), {
+    code: "LIVE_SEED_INELIGIBLE", reason,
+  });
+}
+
+function inspectEmptySessionStorage({ homeDir, mountDir } = {}) {
+  const p = resolvePaths({ homeDir, mountDir });
+  let mountIdentity;
+  const rejected = (reason) => { throw liveSeedIneligible(reason); };
+  const directory = (file) => {
+    const stat = fs.lstatSync(file, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()) rejected("layout_not_directory");
+    const description = [stat.dev, stat.ino, stat.mode, stat.mtimeNs, stat.ctimeNs].map(String);
+    return description;
+  };
+  try {
+    for (const file of [path.dirname(p.stateDir), p.stateDir, p.workspaceDir, p.mountDir]) {
+      if (fs.realpathSync(file) !== path.resolve(file)) rejected("layout_symlink");
+      const description = directory(file);
+      if (file === p.mountDir) mountIdentity = description;
+    }
+  } catch (error) {
+    if (error.code === "ENOENT") rejected("mount_or_layout_missing");
+    throw error;
+  }
+  if (insideBase(path.resolve(p.mountDir), p.stateDir) ||
+      insideBase(path.resolve(p.stateDir), p.mountDir)) rejected("layout_overlap");
+
+  let mountInfo;
+  try { mountInfo = fs.readFileSync("/proc/self/mountinfo", "utf8"); }
+  catch (error) {
+    if (error.code === "ENOENT") {
+      rejected("attachment_unconfirmed");
+    }
+    throw error;
+  }
+  const decode = (value) => value.replace(/\\([0-7]{3})/g,
+    (_, octal) => String.fromCharCode(parseInt(octal, 8)));
+  const attached = mountInfo.trim().split("\n").filter(Boolean).flatMap((line) => {
+    const parts = line.split(" - ");
+    if (parts.length !== 2) rejected("attachment_unconfirmed");
+    const fields = parts[0].split(" ");
+    const type = parts[1].split(" ")[0];
+    const point = decode(fields[4] || "");
+    return point === path.resolve(p.mountDir) ? [{ line, type }] : [];
+  });
+  const selected = attached.length > 1
+    ? selectVisibleAttachment(p, attached, mountIdentity)
+    : attached.length === 1 && ["nfs", "nfs4"].includes(attached[0].type) ? attached[0] : null;
+  if (!selected) {
+    rejected("attachment_unconfirmed");
+  }
+  const allowed = new Set(["", STATE_DIRNAME, `${STATE_DIRNAME}/${WORKSPACE_SUBDIR}`]);
+  const inventory = [];
+  function walk(dir, relative = "") {
+    if (!allowed.has(relative)) rejected("mount_content");
+    const before = directory(dir);
+    const names = fs.readdirSync(dir).sort();
+    for (const name of names) {
+      if (typeof name !== "string" || !name || name === "." || name === ".." ||
+          name.includes("/") || name.includes("\0")) rejected("mount_inventory_invalid");
+      const rel = relative ? `${relative}/${name}` : name;
+      if (!allowed.has(rel)) rejected("mount_content");
+      walk(path.join(dir, name), rel);
+    }
+    const after = directory(dir);
+    if (JSON.stringify(before) !== JSON.stringify(after) ||
+        JSON.stringify(names) !== JSON.stringify(fs.readdirSync(dir).sort())) {
+      rejected("mount_inventory_changed");
+    }
+    inventory.push([relative, before]);
+  }
+  walk(p.mountDir);
+  const ticket = Object.freeze({});
+  emptyMountTickets.set(ticket, {
+    paths: p, mount: selected.line, inventory,
+    ...(selected.visibility ? { visibility: selected.visibility } : {}),
+    local: [p.stateDir, p.workspaceDir].map((file) => directory(file).slice(0, 3)),
+  });
+  return ticket;
+}
+
+function assertEmptySessionStorage(ticket) {
+  const previous = emptyMountTickets.get(ticket);
+  if (!previous) throw liveSeedIneligible("mount_ticket_invalid");
+  const currentTicket = inspectEmptySessionStorage({
+    homeDir: path.dirname(previous.paths.stateDir), mountDir: previous.paths.mountDir,
+  });
+  const current = emptyMountTickets.get(currentTicket);
+  emptyMountTickets.delete(currentTicket);
+  if (JSON.stringify(previous) !== JSON.stringify(current)) {
+    throw liveSeedIneligible("mount_inventory_changed");
+  }
+}
+
+function attachEmptySessionStorage(ticket) {
+  assertEmptySessionStorage(ticket);
+  const { paths: p } = emptyMountTickets.get(ticket);
+  emptyMountTickets.delete(ticket);
+  // Only the empty mirror is created. The live local DB and workspace stay put.
+  fs.mkdirSync(p.mountWorkspaceDir, { recursive: true });
+  return { available: true, ...p };
+}
+
 module.exports = {
+  inspectEmptySessionStorage,
+  assertEmptySessionStorage,
+  attachEmptySessionStorage,
+  assertSafePath,
+  assertSqliteFile,
   DEFAULT_MOUNT,
   STATE_DIRNAME,
   WORKSPACE_SUBDIR,

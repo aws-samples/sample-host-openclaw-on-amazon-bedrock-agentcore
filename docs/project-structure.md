@@ -11,7 +11,7 @@ openclaw-on-agentcore/
     __init__.py                   # Shared helper (RetentionDays converter)
     vpc_stack.py                  # VPC, subnets, NAT, 7 interface + 1 S3 gateway VPC endpoints, flow logs
     security_stack.py             # KMS CMK, Secrets Manager, Cognito, optional CloudTrail
-    agentcore_stack.py            # Execution role, SG, S3 user-files bucket, optional AgentCore Browser (Runtime/ECR are toolkit-managed)
+    agentcore_stack.py            # Role, SG, S3 bucket, optional Browser; AgentCore Runtime via SDK, ECR via runtime_image.py
     router_stack.py               # Router Lambda + API Gateway HTTP API (telegram/slack/feishu routes) + DynamoDB identity
     observability_stack.py        # Operations dashboard, alarms, SNS topic, Bedrock invocation logging
     token_monitoring_stack.py     # Lambda processor, DynamoDB (3 GSIs), token analytics dashboard
@@ -21,7 +21,7 @@ openclaw-on-agentcore/
   bridge/
     Dockerfile                    # Container image (node:24-slim, ARM64, pinned openclaw@2026.9.5 + clawhub@0.23.3, 5 owner-pinned ClawHub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
-    agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
+    agentcore-contract.js         # HTTP contract; V2 full-gateway readiness
     openclaw-tool-deny.test.js    # openclaw.json tools.deny covers the channel-delivery tools (node:test, 7 tests)
     read-body.js                  # Reads a request body as Buffers and decodes UTF-8 once (contract server keeps its 1 MB / 413 cap)
     read-body.test.js             # Request body decoding + size cap tests (node:test, 8 tests)
@@ -33,8 +33,6 @@ openclaw-on-agentcore/
     gateway-mcp.js                # mcp.servers.agentcore config + bearer refresh (only when AGENTCORE_GATEWAY_URL is set)
     gateway-mcp.test.js           # Gateway MCP config/refresh + Cognito token provider tests (node:test, 12 tests)
     cognito-token.js              # Per-user Cognito ID/access token provider shared by proxy and contract server
-    lightweight-agent.js          # Warm-up agent shim (17 tools: web, s3-user-files, eventbridge-cron, clawhub-manage, api-keys)
-    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 125 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     proxy-identity.test.js        # Proxy identity resolution tests (node:test)
@@ -84,8 +82,11 @@ openclaw-on-agentcore/
     setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
     setup-slack.sh                # Slack Event Subscriptions + admin allowlist
     setup-feishu.sh               # Feishu app credentials + event subscription + admin allowlist
-    deploy.sh                     # Three-phase deploy (CDK -> Starter Toolkit -> CDK)
-    e2e-deploy-and-test.sh        # Deploy then run the E2E suite
+    deploy.sh                     # Three-phase deploy (CDK -> pinned SDK controller -> CDK)
+    runtime_deploy.py              # AgentCore Runtime SDK controller, manifest readback and chat warmup
+    runtime_image.py               # Resolve or create the ECR repository
+    runtime_manifest.py            # Pure deployment/CDK enrollment evidence validation
+    e2e-deploy-and-test.sh          # V2 manifest verification + smoke/lifecycle; no route resets
     manage-allowlist.sh           # Add/remove/list users in the allowlist
     agentcore-exec.py             # Operator CLI: run a shell command in a live session (InvokeAgentRuntimeCommand)
     guardrail-eval.py             # Operator CLI: run fixture prompts through ApplyGuardrail, exit 1 on unexpected verdicts
@@ -97,9 +98,9 @@ openclaw-on-agentcore/
     e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
       config.py                   # AWS config auto-discovery (CF outputs, Secrets Manager)
       webhook.py                  # Build + POST Telegram webhook payloads
-      session.py                  # DynamoDB session/user reset + AgentCore session stop
+      session.py                  # Saved V2 route/status and route-preserving session stop
       log_tailer.py               # CloudWatch log tailing with pattern matching
-      bot_test.py                 # CLI entrypoint + pytest test classes (50 tests, 15 classes)
+      bot_test.py                 # CLI entrypoint + V2 functional test classes
       conftest.py                 # pytest fixtures, conversation scenarios
       container_logs.py           # Container/Lambda log helpers for the Gateway E2E tests
       test_gateway_tools.py       # Gateway MCP tools E2E (4 tests, `-m gateway`; skipped when the stack is not deployed)

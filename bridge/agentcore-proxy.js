@@ -8,16 +8,26 @@
 
 const http = require("http");
 const crypto = require("crypto");
+const { osRandomUUID } = require("./runtime-lifecycle");
 const fs = require("fs");
+const { extractSystemText } = require("./system-messages");
+const modelPolicy = require("./model-policy");
+const { preparedSdk } = require("./proxy-sdk-snapshot");
+const { createProxyAuthChild } = require("./proxy-auth-prepare");
+const { createSystemPrefixCache, addToolPrefixCachePoint } = require("./system-prefix-cache");
+const systemPrefixCache = createSystemPrefixCache();
 
 const PORT = 18790;
+// The SDK snapshot owner loads this body only after installing the bound environment.
+const BOUND_ACTOR_ID = process.env.USER_ID || "";
 const AWS_REGION = process.env.AWS_REGION;
 if (!AWS_REGION) {
   console.error("[proxy] FATAL: AWS_REGION environment variable is not set.");
   process.exit(1);
 }
 const MODEL_ID =
-  process.env.BEDROCK_MODEL_ID || "minimax.minimax-m2.1";
+  process.env.BEDROCK_MODEL_ID || modelPolicy.PRIMARY_MODEL_ID;
+const FALLBACK_MODEL_ID = process.env.BEDROCK_FALLBACK_MODEL_ID || modelPolicy.FALLBACK_MODEL_ID;
 
 // Log credential env vars at startup for debugging
 console.log(`[proxy] AWS_REGION=${AWS_REGION} MODEL_ID=${MODEL_ID}`);
@@ -57,6 +67,7 @@ const COGNITO_PASSWORD_SECRET = process.env.COGNITO_PASSWORD_SECRET || "";
 let lastIdentityDiag = null;
 let chatRequestCount = 0;
 let subagentRequestCount = 0;
+let modelOutcomeUnknown = false;
 
 const SYSTEM_PROMPT =
   "You are a helpful personal assistant powered by OpenClaw. You are friendly, " +
@@ -119,20 +130,26 @@ function extractSessionMetadata(parsed, headers) {
   let sessionId = "";
   let idSource = "none";
 
-  // 0. Check shared identity file (updated by contract server on each message,
-  //    supports cross-channel identity changes for bound users). Falls back to
-  //    env vars if the file doesn't exist or can't be read.
+  if (BOUND_ACTOR_ID && process.env.USER_ID !== BOUND_ACTOR_ID) {
+    throw new Error("Proxy canonical actor changed");
+  }
+
+  // Delivery metadata may change across linked channels; the bound actor may not.
+  let identity;
   try {
-    const identity = JSON.parse(
+    identity = JSON.parse(
       fs.readFileSync("/tmp/current-identity.json", "utf-8"),
     );
-    if (identity.actorId) {
-      actorId = identity.actorId;
-      channel = identity.channel || "unknown";
-      idSource = "identity-file";
-    }
   } catch (_) {
     // File not yet written or unreadable — fall back to env vars
+  }
+  if (identity?.actorId) {
+    if (BOUND_ACTOR_ID && identity.actorId !== BOUND_ACTOR_ID) {
+      throw new Error("Proxy canonical actor changed");
+    }
+    actorId = identity.actorId;
+    channel = identity.channel || "unknown";
+    idSource = "identity-file";
   }
   if (!actorId && process.env.USER_ID) {
     actorId = process.env.USER_ID;
@@ -144,7 +161,7 @@ function extractSessionMetadata(parsed, headers) {
     const key = `${actorId}:${channel}`;
     if (!sessionMap.has(key)) {
       const ts = Date.now().toString(36);
-      const rand = crypto.randomBytes(12).toString("hex");
+      const rand = osRandomUUID();
       sessionMap.set(
         key,
         `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
@@ -348,7 +365,7 @@ function extractSessionMetadata(parsed, headers) {
     const key = `${actorId}:${channel}`;
     if (!sessionMap.has(key)) {
       const ts = Date.now().toString(36);
-      const rand = crypto.randomBytes(12).toString("hex");
+      const rand = osRandomUUID();
       sessionMap.set(
         key,
         `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
@@ -372,6 +389,9 @@ const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
   region: AWS_REGION,
   log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[proxy] Cognito")),
 });
+const proxyAuthPrepare = BOUND_ACTOR_ID ? createProxyAuthChild({
+  channel: process, tokenProvider: cognitoTokens, boundActor: BOUND_ACTOR_ID,
+}) : cognitoTokens;
 
 // Lazily initialized S3 client
 let _s3Client = null;
@@ -822,7 +842,7 @@ async function buildUserIdentityContext(actorId, channel) {
  * Returns null if Cognito is not configured.
  */
 async function getCognitoToken(actorId) {
-  const entry = await cognitoTokens.getIdToken(actorId);
+  const entry = await proxyAuthPrepare.getIdToken(actorId);
   return entry ? entry.token : null;
 }
 
@@ -954,11 +974,7 @@ function convertMessages(messages) {
     }
   }
 
-  const systemMessages = messages.filter((m) => m.role === "system");
-  const systemText =
-    systemMessages.length > 0
-      ? systemMessages.map((m) => m.content).join("\n")
-      : SYSTEM_PROMPT;
+  const systemText = extractSystemText(messages, SYSTEM_PROMPT);
 
   return { bedrockMessages, systemText };
 }
@@ -996,7 +1012,7 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
   const {
     BedrockRuntimeClient,
     ConverseCommand,
-  } = require("@aws-sdk/client-bedrock-runtime");
+  } = preparedSdk() || require("@aws-sdk/client-bedrock-runtime");
   const modelId = resolveModelId(requestedModel);
   const client = new BedrockRuntimeClient({
     region: AWS_REGION,
@@ -1012,6 +1028,7 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     system: [{ text: finalSystemText }],
     // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
     inferenceConfig: buildInferenceConfig(modelId, temperatureOverride),
+    ...(!isSubagentRequest({ model: requestedModel }) && modelPolicy.requestFields(modelId)),
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
@@ -1093,29 +1110,64 @@ async function invokeBedrockStreaming(
   model,
   systemTextOverride,
   toolConfig,
+  systemPrefix,
 ) {
+  if (modelOutcomeUnknown) {
+    if (!res.destroyed && !res.writableEnded) {
+      const body = JSON.stringify({ error: modelPolicy.UNKNOWN_OUTCOME_ERROR });
+      if (res.headersSent) res.end(`data: ${body}\n\n`);
+      else {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(body);
+      }
+    }
+    return "";
+  }
+  const subagent = isSubagentRequest({ model });
+  const route = modelPolicy.createStreamingRoute({
+    primaryModelId: subagent ? resolveModelId(model) : MODEL_ID,
+    fallbackModelId: subagent ? null : FALLBACK_MODEL_ID, response: res,
+  });
+  try {
+    return await invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix);
+  } finally { route?.finish(); }
+}
+
+async function invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix) {
   const {
     BedrockRuntimeClient,
     ConverseStreamCommand,
-  } = require("@aws-sdk/client-bedrock-runtime");
-  const modelId = resolveModelId(model);
+  } = preparedSdk() || require("@aws-sdk/client-bedrock-runtime");
+  let modelId = route ? route.modelId(0) : resolveModelId(model);
   const client = new BedrockRuntimeClient({
     region: AWS_REGION,
     requestHandler: bedrockClientOptions(modelId),
+    ...(route && { maxAttempts: 1 }),
   });
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
 
-  const params = {
-    modelId,
+  const payload = {
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
     // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
-    inferenceConfig: buildInferenceConfig(modelId, temperatureOverride),
     ...(guardrailConfig && { guardrailConfig }),
   };
-  if (toolConfig) params.toolConfig = toolConfig;
+  if (toolConfig) payload.toolConfig = toolConfig;
+  const requestParams = (selectedModelId) => {
+    const params = {
+      ...(route ? structuredClone(payload) : payload),
+      modelId: selectedModelId,
+      inferenceConfig: buildInferenceConfig(selectedModelId, temperatureOverride),
+      ...(route && modelPolicy.requestFields(selectedModelId)),
+    };
+    if (params.toolConfig) params.toolConfig = addToolPrefixCachePoint(params.toolConfig, selectedModelId);
+    params.system = systemPrefixCache.apply(systemPrefix, params.system, finalSystemText,
+      selectedModelId, params.toolConfig, params.messages);
+    return params;
+  };
+  let params = requestParams(modelId);
 
   const chatId = `chatcmpl-${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1130,14 +1182,21 @@ async function invokeBedrockStreaming(
   let currentToolBlockIndex = -1;
 
   let lastError;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  const attemptLimit = route ? route.maxAttempts : MAX_RETRIES;
+  for (let attempt = 0; attempt < attemptLimit; attempt++) {
+    let messageStopObserved = false;
     try {
       if (attempt > 0) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
         console.log(
-          `[proxy] Stream retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms`,
+          `[proxy] Stream ${route ? "fallback" : "retry"} ${attempt + 1}/${attemptLimit} after ${delay}ms`,
         );
         await sleep(delay);
+        route?.active();
+        if (route) {
+          modelId = route.modelId(attempt);
+          params = requestParams(modelId);
+        }
         fullResponseText = "";
         toolCalls.length = 0;
         currentToolUse = null;
@@ -1145,16 +1204,22 @@ async function invokeBedrockStreaming(
         currentToolBlockIndex = -1;
       }
 
-      const response = await client.send(new ConverseStreamCommand(params));
+      route?.active();
+      const command = new ConverseStreamCommand(params);
+      route?.sent(attempt, command.input);
+      const response = await (route ? client.send(command, { abortSignal: route.signal }) : client.send(command));
+      route?.resolved(attempt, response);
 
       // Write SSE headers
-      res.writeHead(200, {
+      if (!res.headersSent) res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
       });
 
       for await (const event of response.stream) {
+        route?.event(event);
+        if (event.messageStop) messageStopObserved = true;
         // Text content
         if (event.contentBlockDelta?.delta?.text) {
           const textDelta = event.contentBlockDelta.delta.text;
@@ -1163,7 +1228,7 @@ async function invokeBedrockStreaming(
             id: chatId,
             object: "chat.completion.chunk",
             created,
-            model: model || MODEL_ID,
+            model: route ? modelId : model || MODEL_ID,
             choices: [
               {
                 index: 0,
@@ -1210,7 +1275,7 @@ async function invokeBedrockStreaming(
             id: chatId,
             object: "chat.completion.chunk",
             created,
-            model: model || MODEL_ID,
+            model: route ? modelId : model || MODEL_ID,
             choices: [
               {
                 index: 0,
@@ -1251,13 +1316,16 @@ async function invokeBedrockStreaming(
         }
       }
 
+      if (!messageStopObserved) throw new Error("Bedrock stream ended before messageStop");
+
       // Send final chunk with appropriate finish_reason
+      route?.active();
       const finishReason = toolCalls.length > 0 ? "tool_calls" : "stop";
       const finalChunk = {
         id: chatId,
         object: "chat.completion.chunk",
         created,
-        model: model || MODEL_ID,
+        model: route ? modelId : model || MODEL_ID,
         choices: [
           {
             index: 0,
@@ -1269,6 +1337,7 @@ async function invokeBedrockStreaming(
       res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       res.write("data: [DONE]\n\n");
       res.end();
+      route?.completed(attempt);
 
       console.log(
         `[proxy] Stream complete: ${inputTokens}in/${outputTokens}out tokens` +
@@ -1281,22 +1350,31 @@ async function invokeBedrockStreaming(
         `[proxy] Stream attempt ${attempt + 1} failed:`,
         err.message,
       );
-      if (err.$metadata && err.$metadata.httpStatusCode < 500) break;
+      if (route) {
+        if (!route.failed(attempt, err)) break;
+      } else if (err.$metadata && err.$metadata.httpStatusCode < 500) break;
     }
   }
 
+  const failure = route?.failure;
+  if (failure && failure.code !== "BEDROCK_REQUEST_REJECTED") {
+    modelOutcomeUnknown = true;
+  }
   // If all retries failed and headers not yet sent
-  if (!res.headersSent) {
-    res.writeHead(502, { "Content-Type": "application/json" });
+  if (route && (res.destroyed || res.writableEnded)) {
+    return "";
+  } else if (!res.headersSent) {
+    res.writeHead(failure ? 400 : 502, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
-        error: {
+        error: failure || {
           message: "Bedrock streaming failed: " + lastError.message,
           type: "proxy_error",
         },
       }),
     );
   } else {
+    if (failure) res.write(`data: ${JSON.stringify({ error: failure })}\n\n`);
     res.end();
   }
   return "";
@@ -1367,6 +1445,7 @@ const server = http.createServer(async (req, res) => {
         cognito: COGNITO_USER_POOL_ID ? "configured" : "disabled",
         total_requests: chatRequestCount,
         subagent_requests: subagentRequestCount,
+        model_outcome_unknown: modelOutcomeUnknown,
         installed_skills: installedSkills,
         s3_skill_exists: s3SkillExists,
       }),
@@ -1376,6 +1455,11 @@ const server = http.createServer(async (req, res) => {
 
   // Chat completions endpoint
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
+    if (modelOutcomeUnknown) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: modelPolicy.UNKNOWN_OUTCOME_ERROR }));
+      return;
+    }
     // Decode once from Buffers so a UTF-8 character split across chunks survives.
     readBody(req).then(async (body) => {
       try {
@@ -1510,12 +1594,10 @@ const server = http.createServer(async (req, res) => {
           actorId,
           channel,
         );
-        const systemMessages = messages.filter((m) => m.role === "system");
-        const baseSystemText =
-          systemMessages.length > 0
-            ? systemMessages.map((m) => m.content).join("\n")
-            : SYSTEM_PROMPT;
+        const baseSystemText = extractSystemText(messages, SYSTEM_PROMPT);
         const systemTextOverride = baseSystemText + identityContext + memoryContext;
+        const systemPrefix = stream
+          ? systemPrefixCache.capture(messages, baseSystemText, systemTextOverride) : undefined;
 
         // --- Direct Bedrock path ---
         if (stream) {
@@ -1525,6 +1607,7 @@ const server = http.createServer(async (req, res) => {
             parsed.model,
             systemTextOverride,
             toolConfig,
+            systemPrefix,
           );
         } else {
           const result = await invokeBedrock(

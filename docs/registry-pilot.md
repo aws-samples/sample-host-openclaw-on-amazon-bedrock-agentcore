@@ -3,6 +3,8 @@
 Status: **plan only, nothing implemented.** Rating from the research this plan follows: *pilot,
 narrowly*. No code, stack or flag described here exists yet; every "would" below is a proposal.
 
+This unimplemented AgentCore Runtime V1 proposal needs redesign for V2. Section 6's SESSION resets and timing thresholds and Section 7's rollback/teardown do not apply; use the [AgentCore Runtime V2 runbook](runtime-v2.md).
+
 The question that prompted it: can several OpenClaw deployments share one approved set of tools
 without an image rebuild, with someone other than the deployer approving each addition? For tools
 served by the [AgentCore Gateway](gateway-mcp-tools.md) the answer is yes, and AWS Agent Registry
@@ -115,8 +117,7 @@ ready, and a failure to reach it leaves behaviour identical to today.
 | Fallback | everywhere | Registry unreachable, 4xx, malformed response, or no approved record: log `[registry] catalog unavailable (<reason>); keeping static mcp.servers.agentcore` and do nothing. Fail open to the static entry, never to an empty tool set |
 | Env | `AGENTCORE_REGISTRY_MCP_URL` (from the `RegistryMcpUrl` output) | Set only when `enable_registry` is on; absent means every code path above is skipped, the same rule `AGENTCORE_GATEWAY_URL` follows (`bridge/gateway-mcp.js` `isEnabled()`) |
 
-Not changed: `bridge/lightweight-agent.js` (warm-up shim; its tool list is static because it exists
-to answer before any network round trip), the Dockerfile, anything under `bridge/skills/`.
+This remains a proposed Registry integration. The AgentCore Runtime V2 path has no lightweight startup shim; the Dockerfile and existing `bridge/skills/` are outside this proposal.
 
 Expected cost (estimates, not measured): one `list` + one `batch_get` over TLS from the microVM,
 0.2 to 0.6 s, *after* ready, so **0 s added to boot-to-ready**. The Cognito call from the same VPC
@@ -144,7 +145,7 @@ The pilot measures how often.
    (`mcp.servers.registry` is never written); the contract server, not the model, consumes the
    catalogue.
 3. **Per-user reads.** The registry uses JWT inbound auth with the user's own access token; the
-   runtime execution role gets **no** `agent-registry:*Discoverable*` permissions. This keeps
+   AgentCore Runtime execution role gets **no** `agent-registry:*Discoverable*` permissions. This keeps
    "who read what" attributable per user instead of one shared role, and keeps the Registry
    outside the per-user credential boundary described in
    [gateway-mcp-tools.md](gateway-mcp-tools.md#identity-where-the-namespace-comes-from).
@@ -155,7 +156,7 @@ The pilot measures how often.
    | Deploy role (CloudFormation / CDK) | `agent-registry:CreateRegistry`, `UpdateRegistry`, `GetRegistry`, `DeleteRegistry`, `CreateRegistryRecord`, `UpdateRegistryRecord`, `GetRegistryRecord`, `DeleteRegistryRecord`, `SubmitRegistryRecord`, `TagResource` | the one registry ARN and `registry/<id>/record/*` |
    | Curator role (humans, MFA, assumable from the operator account) | `agent-registry:UpdateRegistryRecordStatus`, `GetRegistryRecord`, `ListRegistryRecords` | same registry |
    | Users (Cognito access token) | JWT inbound auth only: `ListDiscoverable*`, `GetDiscoverable*`, `BatchGetDiscoverable*`, `InvokeRegistryMcp` | same registry |
-   | Runtime execution role, Gateway role, Lambda target roles | **nothing** on `agent-registry:` | |
+   | AgentCore Runtime execution role, Gateway role, Lambda target roles | **nothing** on `agent-registry:` | |
 
    Action names follow the IAM reference
    ([registry-iam-permissions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/registry-iam-permissions.html));
@@ -200,15 +201,17 @@ The pilot measures how often.
   The `deploy.sh` SDK-step fallback from the research is therefore not needed.
 * **Deploy:** `scripts/deploy.sh` reads `RegistryMcpUrl` with `require_cdk_output` when the flag
   is on (the `GatewayUrl` block at lines 225 to 241 is the template) and passes
-  `AGENTCORE_REGISTRY_MCP_URL` and `AGENTCORE_REGISTRY_ALLOWED_ACCOUNTS` to the runtime. First
+  `AGENTCORE_REGISTRY_MCP_URL` and `AGENTCORE_REGISTRY_ALLOWED_ACCOUNTS` to the AgentCore Runtime. First
   deploy leaves the record in DRAFT/PENDING_APPROVAL; the runbook step "curator approves
   `openclaw-gateway` v`<image_version>`" is a documented manual action, not something the deploy
   script does.
 
 ## 6. Pilot test plan (us-west-2 staging, `enable_gateway: true`, `enable_registry: true`)
 
+Historical V1 test proposal: do not use the SESSION reset or timing thresholds below with V2. See the [AgentCore Runtime V2 live acceptance gates](runtime-v2.md#live-acceptance-gates).
+
 Same harness as the Gateway E2E (`tests/e2e/`, 10 cold-start iterations, session record deleted
-and runtime session stopped before each). Baseline to beat: Gateway-on **boot -> OpenClaw ready
+and AgentCore Runtime session stopped before each). Baseline to beat: Gateway-on **boot -> OpenClaw ready
 p50 10.59 s / p95 10.80 s** ([gateway-mcp-tools.md](gateway-mcp-tools.md#performance-us-west-2-staging-2026-09-24)).
 
 | # | Test | Pass condition |
@@ -227,10 +230,12 @@ p50 10.59 s / p95 10.80 s** ([gateway-mcp-tools.md](gateway-mcp-tools.md#perform
 Unit tests (no AWS): `bridge/registry-catalog.test.js` (record -> server entry; allow-list rejects
 foreign and look-alike hosts; `toolFilter` derived; malformed record skipped; `rewriteBearer`
 loops over N servers) and `tests/test_registry_stack_synth.py` (flag off = unchanged; flag on =
-registry + record + curator role + no `agent-registry:` grant on the runtime, Gateway or Lambda
+registry + record + curator role + no `agent-registry:` grant on the AgentCore Runtime, Gateway or Lambda
 roles; cdk-nag clean).
 
 ## 7. Success criteria, cost, rollback, teardown
+
+The AgentCore Runtime rollback and teardown steps below are historical and do not apply to V2. Follow the [existing-user migration limits](runtime-v2.md#existing-user-migration-and-cutover) and retain existing routes and shared dependencies.
 
 **Success** (all must hold): T1 through T10 pass; a tool added by approving a record reached
 OpenClaw with zero image builds; the curator and deploy principals are different IAM roles and
@@ -243,10 +248,10 @@ month, and no searches ([pricing](https://aws.amazon.com/bedrock/agentcore/prici
 even 1,000 cold starts a day is about 60,000 calls a month, 3 % of the free tier. The EventBridge
 rule and SNS topic are within their free tiers at this volume. No new compute.
 
-**Rollback during the pilot** (runtime side first, then the stack, the same order as the Gateway):
+**Rollback during the pilot** (AgentCore Runtime side first, then the stack, the same order as the Gateway):
 
 1. `cdk.json`: `enable_registry: false`; `./scripts/deploy.sh --runtime-only` redeploys the
-   runtime without `AGENTCORE_REGISTRY_MCP_URL`; the bridge writes the static entry only. This
+   AgentCore Runtime without `AGENTCORE_REGISTRY_MCP_URL`; the bridge writes the static entry only. This
    alone restores today's behaviour for every new cold start.
 2. `cdk destroy OpenClawRegistry` removes the registry, its records, the curator role and the
    notification rule. It holds no user data: records are metadata, and files and schedules

@@ -26,6 +26,7 @@ const OPUS_NO_TEMPERATURE_MIN_MAJOR = 5;
  */
 function modelRejectsTemperature(modelId) {
   if (typeof modelId !== "string" || !modelId) return false;
+  if (modelId === "global.anthropic.claude-haiku-5-5") return true;
   const m = modelId.match(/(?:^|[./])anthropic\.claude-opus-(\d+)(?=[-.:]|$)/);
   if (!m) return false;
   return Number(m[1]) >= OPUS_NO_TEMPERATURE_MIN_MAJOR;

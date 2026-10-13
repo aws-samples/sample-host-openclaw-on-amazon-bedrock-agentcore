@@ -14,10 +14,9 @@
  *
  * Namespace format: {actorId.replace(/:/g, "_")} (e.g., "telegram_123456789")
  * S3 prefix: {namespace}/.openclaw/
- * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/). On AgentCore this
- * is a local directory whose `workspace/` entry is a symlink onto the session
- * storage mount (state-storage.js); the walk follows it so workspace files are
- * still backed up.
+ * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/). On AgentCore Runtime,
+ * this and `workspace/` are local directories. state-storage.js mirrors them
+ * to the session storage mount when available; S3 backups include both.
  */
 
 const fs = require("fs");
@@ -26,6 +25,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { pipeline } = require("stream/promises");
 const stateStorage = require("./state-storage");
+const { validateNamespace, assertCredentialsFresh } = require("./scoped-credentials");
 
 // Lazy-require AWS SDK (only available inside Docker image, not in local dev/test)
 let _s3Sdk = null;
@@ -150,21 +150,46 @@ const CREDENTIAL_SCAN_EXEMPT = "user-api-keys.json";
 // S3 client singleton (same pattern as agentcore-proxy.js)
 let _s3Client = null;
 let _scopedCredentials = null;
+let _credentialProvider = null;
 
 function getS3Client() {
+  if (!_credentialProvider && _scopedCredentials?.expiration !== undefined) assertCredentialsFresh(_scopedCredentials);
   if (!_s3Client) {
     const { S3Client } = getS3Sdk();
     const opts = { region: process.env.AWS_REGION };
-    if (_scopedCredentials) {
-      opts.credentials = {
-        accessKeyId: _scopedCredentials.accessKeyId,
-        secretAccessKey: _scopedCredentials.secretAccessKey,
-        sessionToken: _scopedCredentials.sessionToken,
+    if (_credentialProvider) {
+      const provider = _credentialProvider;
+      opts.credentials = async () => {
+        const credentials = await provider();
+        if (provider !== _credentialProvider) throw new Error("Workspace credential owner changed");
+        return { ...assertCredentialsFresh(credentials) };
+      };
+    } else if (_scopedCredentials) {
+      opts.credentials = async () => {
+        if (_scopedCredentials.expiration !== undefined) assertCredentialsFresh(_scopedCredentials);
+        return { ..._scopedCredentials };
       };
     }
     _s3Client = new S3Client(opts);
+    if (_credentialProvider) {
+      const send = _s3Client.send.bind(_s3Client);
+      _s3Client.send = async (...args) => {
+        // Check every operation, including cached clients and multipart parts.
+        await opts.credentials();
+        return send(...args);
+      };
+    }
   }
   return _s3Client;
+}
+
+function configureCredentialProvider(provider) {
+  if (typeof provider !== "function") throw new TypeError("Workspace credential provider is required");
+  if (_credentialProvider && _credentialProvider !== provider) {
+    throw new Error("Workspace credential owner is already bound");
+  }
+  _credentialProvider = provider;
+  _s3Client = null;
 }
 
 /**
@@ -183,10 +208,12 @@ function configureCredentials(credentials) {
   if (!credentials.secretAccessKey) {
     throw new Error("configureCredentials: secretAccessKey is required");
   }
+  if (credentials.expiration !== undefined) assertCredentialsFresh(credentials);
   _scopedCredentials = {
     accessKeyId: credentials.accessKeyId,
     secretAccessKey: credentials.secretAccessKey,
     sessionToken: credentials.sessionToken,
+    ...(credentials.expiration !== undefined ? { expiration: new Date(credentials.expiration) } : {}),
   };
   // Reset client so next getS3Client() picks up new credentials
   _s3Client = null;
@@ -233,6 +260,15 @@ function shouldSkip(relativePath) {
     }
   }
   return false;
+}
+
+/**
+ * OpenClaw regenerates these state-root links from installed plugins.
+ * Exclude them from backup while retaining validation for nested user
+ * directories and restore paths.
+ */
+function isGeneratedPluginSkillPath(relativePath) {
+  return relativePath === "plugin-skills" || relativePath.startsWith("plugin-skills/");
 }
 
 /**
@@ -298,8 +334,10 @@ async function snapshotSqliteToFile(dbPath) {
 
 function removeSnapshotFile(stagePath) {
   try { fs.unlinkSync(stagePath); } catch { /* best effort */ }
-  // backup() may leave a -journal next to the staged copy on some builds
+  // Backup and read-only validation can create sidecars on the staged copy.
   try { fs.unlinkSync(`${stagePath}-journal`); } catch { /* none */ }
+  try { fs.unlinkSync(`${stagePath}-wal`); } catch { /* none */ }
+  try { fs.unlinkSync(`${stagePath}-shm`); } catch { /* none */ }
 }
 
 /** sha256 (hex) of a file's bytes, streamed. */
@@ -326,16 +364,36 @@ function readFileHead(filePath, bytes) {
 // State of the S3 restore for this process. Every upload path (change backup,
 // periodic save, single-file save, final save) is a no-op unless it is "ready":
 //   "unknown" — restoreWorkspace() has not been called yet
-//   "pending" — restore in flight (the gateway may already be running if the
-//               bounded pre-spawn wait timed out)
+//   "pending" — restore in flight; gateway activation waits for completion
 //   "ready"   — every S3 object was restored, or S3 holds nothing for this
-//               namespace (new user), or there is no bucket/namespace at all
+//               namespace (new user)
 //   "failed"  — the listing failed or at least one object could not be
 //               restored: local state may be partial, so this container never
 //               uploads (seen on staging: a same-session restart with no state
 //               DBs uploaded a fresh empty database over the good S3 copy
 //               within 20 s).
 let _restoreState = "unknown";
+let _restoreNamespace = null;
+let _restoreAttempt = null;
+let _fatalRestoreError = null;
+
+function assertRestoreReady() {
+  if (_restoreState !== "ready" || _fatalRestoreError) {
+    throw _fatalRestoreError || new Error(`Workspace restore is ${_restoreState}`);
+  }
+}
+
+function assertNamespaceBound(namespace) {
+  validateNamespace(namespace);
+  if (_restoreNamespace && namespace !== _restoreNamespace) {
+    throw new Error("Workspace namespace does not match the restored owner");
+  }
+}
+
+function assertRestoreActive(attempt) {
+  if (attempt.error) throw attempt.error;
+  if (_fatalRestoreError) throw _fatalRestoreError;
+}
 
 function uploadsAllowed() {
   return _restoreState === "ready";
@@ -352,6 +410,7 @@ function warnGated(what) {
 }
 
 function setRestoreState(state) {
+  if (state === "ready" && _fatalRestoreError) return;
   _restoreState = state;
   if (state === "ready") {
     _gateWarned = false;
@@ -390,20 +449,153 @@ function setRestoreState(state) {
  * @returns {Promise<{ restored: number, kept: number, keptUnchanged: number, failed: number, hadState: boolean }>}
  *   `keptUnchanged` counts the kept files verified identical to S3 (seeded).
  */
-async function restoreWorkspace(namespace, { overwrite = true } = {}) {
-  if (!BUCKET || !namespace) {
-    console.log("[workspace-sync] No bucket or namespace — skipping restore");
-    setRestoreState("ready"); // nothing to protect: uploads are no-ops without a bucket
-    return { restored: 0, kept: 0, keptUnchanged: 0, failed: 0, hadState: false };
+async function restoreAbsentSeed(namespace, { lifecycle, scope, bindSeed } = {}) {
+  assertNamespaceBound(namespace);
+  if (_fatalRestoreError) throw _fatalRestoreError;
+  if (_restoreState !== "unknown") throw new Error("Live seed restore was already attempted");
+  if (!BUCKET || !_credentialProvider || typeof bindSeed !== "function") {
+    throw new Error("Live seed restore requires a bound persistence owner");
   }
+  const binding = lifecycle.snapshot().binding;
+  const provider = _credentialProvider;
+  const attempt = { controller: new AbortController(), error: null };
+  _restoreNamespace = namespace;
+  _restoreAttempt = attempt;
+  setRestoreState("pending");
+  let bound = false;
+  const abort = () => {
+    const error = scope.signal.reason || new Error("Live seed restore aborted");
+    attempt.error = error;
+    _fatalRestoreError ||= error;
+    attempt.controller.abort(error);
+    setRestoreState("failed");
+  };
+  const check = () => {
+    assertRestoreActive(attempt);
+    scope.checkpoint();
+    lifecycle.checkpoint();
+    const current = lifecycle.snapshot();
+    if (_restoreAttempt !== attempt || _restoreState !== "pending" ||
+        current.state !== "BINDING" || current.binding !== binding ||
+        current.generation !== scope.generation || !current.resources.includes("credentials") ||
+        provider !== _credentialProvider || !binding ||
+        binding.actorId.replace(/:/g, "_") !== namespace ||
+        process.env.USER_ID !== binding.actorId || process.env.INTERNAL_USER_ID !== binding.userId) {
+      throw new Error("Live seed restore owner changed");
+    }
+    lifecycle.assertBinding(binding);
+  };
+  const ineligible = (reason) => Object.assign(new Error("Live seed restore is ineligible"), {
+    code: "LIVE_SEED_INELIGIBLE", reason,
+  });
+  async function inspectNamespace() {
+    const prefix = `${namespace}/`;
+    const s3 = getS3Client();
+    const tokens = new Set();
+    let continuationToken;
+    do {
+      check();
+      const params = { Bucket: BUCKET, Prefix: prefix, MaxKeys: 1000 };
+      if (continuationToken !== undefined) params.ContinuationToken = continuationToken;
+      const page = await s3.send(new (getS3Sdk().ListObjectsV2Command)(params),
+        { abortSignal: attempt.controller.signal });
+      check();
+      if (!page || typeof page !== "object" ||
+          typeof page.IsTruncated !== "boolean" ||
+          (page.Contents !== undefined && !Array.isArray(page.Contents)) ||
+          (page.CommonPrefixes !== undefined &&
+            (!Array.isArray(page.CommonPrefixes) || page.CommonPrefixes.length)) ||
+          (page.Prefix !== undefined && page.Prefix !== prefix)) {
+        throw ineligible("listing_invalid");
+      }
+      const contents = page.Contents || [];
+      if (page.KeyCount !== undefined &&
+          (!Number.isSafeInteger(page.KeyCount) || page.KeyCount !== contents.length)) {
+        throw ineligible("listing_invalid");
+      }
+      for (const item of contents) {
+        if (!item || typeof item.Key !== "string" || !item.Key.startsWith(prefix)) {
+          throw ineligible("listing_invalid");
+        }
+      }
+      if (contents.length) throw ineligible("namespace_content");
+      if (page.IsTruncated) {
+        const next = page.NextContinuationToken;
+        if (typeof next !== "string" || !next || tokens.has(next)) {
+          throw ineligible("listing_incomplete");
+        }
+        tokens.add(next);
+        continuationToken = next;
+      } else {
+        if (page.NextContinuationToken !== undefined) throw ineligible("listing_invalid");
+        continuationToken = undefined;
+      }
+    } while (continuationToken !== undefined);
+  }
+  scope.signal.addEventListener("abort", abort, { once: true });
+  try {
+    if (scope.signal.aborted) abort();
+    check();
+    if ((process.env.AGENTCORE_GATEWAY_URL || "").trim()) throw ineligible("mcp_enabled");
+    const ticket = stateStorage.inspectEmptySessionStorage();
+    await inspectNamespace();
+    check();
+    stateStorage.assertEmptySessionStorage(ticket);
+    // Recheck remote absence immediately before admission; this is not a distributed lock.
+    await inspectNamespace();
+    check();
+    stateStorage.assertEmptySessionStorage(ticket);
+    const proof = Object.freeze({
+      generation: scope.generation, actorId: binding.actorId, userId: binding.userId,
+      verified: true, restoreGateVerified: true, mcpDisabled: true,
+    });
+    const result = await bindSeed(proof);
+    bound = result?.status === "bound" && result.bound === true;
+    check();
+    if (!bound) throw ineligible("owner_declined");
+    if (result.generation !== scope.generation || result.userReady !== false ||
+        !Number.isSafeInteger(result.pid) || result.pid <= 0) {
+      throw new Error("Live seed owner acknowledgement mismatch");
+    }
+    // A changed mirror after bind is fatal, never a deletion of bound user state.
+    stateStorage.assertEmptySessionStorage(ticket);
+    const storage = stateStorage.attachEmptySessionStorage(ticket);
+    check();
+    setRestoreState("ready");
+    return { status: "adopted", owner: result, storage, restored: 0, failed: 0, hadState: false };
+  } catch (error) {
+    if (error.code === "LIVE_SEED_INELIGIBLE" && !bound && !attempt.error && !_fatalRestoreError) {
+      setRestoreState("ineligible");
+      return { status: "ineligible", reason: error.reason };
+    }
+    attempt.error ||= error;
+    _fatalRestoreError ||= error;
+    attempt.controller.abort(error);
+    setRestoreState("failed");
+    throw error;
+  } finally {
+    scope.signal.removeEventListener("abort", abort);
+  }
+}
+
+async function restoreWorkspace(namespace, { overwrite = true } = {}) {
+  assertNamespaceBound(namespace);
+  if (_fatalRestoreError) throw _fatalRestoreError;
+  if (_restoreState === "pending") throw new Error("Workspace restore already pending");
+  if (!BUCKET) throw new Error("Workspace restore requires S3_USER_FILES_BUCKET");
+  _restoreNamespace = namespace;
+  const attempt = { controller: new AbortController(), error: null };
+  _restoreAttempt = attempt;
   setRestoreState("pending");
   try {
-    const result = await runRestore(namespace, overwrite);
+    const result = await runRestore(namespace, overwrite, attempt);
+    assertRestoreActive(attempt);
     if (result.failed > 0) {
       setRestoreState("failed");
       console.warn(
         `[workspace-sync] Restore incomplete (${result.failed} file(s) failed) — S3 uploads disabled for this container`,
       );
+      throw new Error(`Workspace restore incomplete: ${result.failed} file(s) failed`);
     } else {
       setRestoreState("ready");
     }
@@ -415,7 +607,7 @@ async function restoreWorkspace(namespace, { overwrite = true } = {}) {
   }
 }
 
-async function runRestore(namespace, overwrite) {
+async function runRestore(namespace, overwrite, attempt) {
   const prefix = `${namespace}/${WORKSPACE_PREFIX}/`;
   const s3 = getS3Client();
 
@@ -438,12 +630,21 @@ async function runRestore(namespace, overwrite) {
     };
     if (continuationToken) params.ContinuationToken = continuationToken;
 
-    const response = await s3.send(new (getS3Sdk().ListObjectsV2Command)(params));
+    const response = await s3.send(new (getS3Sdk().ListObjectsV2Command)(params), { abortSignal: attempt.controller.signal });
+    assertRestoreActive(attempt);
     const objects = response.Contents || [];
 
     for (const obj of objects) {
+      assertRestoreActive(attempt);
+      if (typeof obj.Key !== "string" || !obj.Key.startsWith(prefix)) {
+        throw new Error("S3 restore returned an object outside the namespace");
+        continue;
+      }
       const relativePath = obj.Key.slice(prefix.length);
       if (!relativePath || shouldSkip(relativePath)) continue;
+      if (normalizeRelativePath(relativePath) !== relativePath) {
+        throw new Error("Invalid S3 restore path");
+      }
       hadState = true;
 
       // Validate object size before downloading (uses ListObjectsV2 Size field).
@@ -454,6 +655,7 @@ async function runRestore(namespace, overwrite) {
         console.warn(
           `[workspace-sync] Skipping oversized file: ${obj.Key} (${obj.Size} bytes > ${sizeCap})`,
         );
+        failed++;
         continue;
       }
 
@@ -470,13 +672,31 @@ async function runRestore(namespace, overwrite) {
         console.warn(
           `[workspace-sync] Path traversal blocked: ${relativePath}`,
         );
+        failed++;
         continue;
       }
 
-      if (!overwrite && fs.existsSync(localFile)) {
+      try {
+        stateStorage.assertSafePath(LOCAL_PATH, localFile);
+      } catch (err) {
+        failed++;
+        console.warn(`[workspace-sync] Failed to restore ${relativePath}: ${err.message}`);
+        continue;
+      }
+
+      const emptySqlite = relativePath.endsWith(SQLITE_EXT) &&
+        fs.existsSync(localFile) && fs.statSync(localFile).size === 0;
+      if (!overwrite && fs.existsSync(localFile) && !emptySqlite) {
         // Local copy (restored from the session-storage mirror) wins. Whether
         // it matches S3 is checked below (seedKeptFiles); until proven
         // identical its hash is NOT seeded and the first save uploads it.
+        if (relativePath.endsWith(SQLITE_EXT)) {
+          try { stateStorage.assertSqliteFile(localFile); } catch (err) {
+            failed++;
+            console.warn(`[workspace-sync] Failed to validate ${relativePath}: ${err.message}`);
+            continue;
+          }
+        }
         keptFiles.push({ key: obj.Key, relativePath });
         continue;
       }
@@ -485,8 +705,10 @@ async function runRestore(namespace, overwrite) {
         fs.mkdirSync(localDir, { recursive: true });
         const getResp = await s3.send(
           new (getS3Sdk().GetObjectCommand)({ Bucket: BUCKET, Key: obj.Key }),
+          { abortSignal: attempt.controller.signal },
         );
-        const hash = await writeRestoredObject(getResp, localFile);
+        assertRestoreActive(attempt);
+        const hash = await writeRestoredObject(getResp, localFile, attempt);
         // What is on disk now IS what S3 holds, so the first save after a
         // restore must not re-upload it. Without this seed every restored file
         // was PUT again by the first full save (SIGTERM / periodic) of the
@@ -501,6 +723,9 @@ async function runRestore(namespace, overwrite) {
       }
     }
 
+    if (response.IsTruncated && (!response.NextContinuationToken || response.NextContinuationToken === continuationToken)) {
+      throw new Error("Incomplete S3 restore listing");
+    }
     continuationToken = response.IsTruncated
       ? response.NextContinuationToken
       : undefined;
@@ -508,6 +733,7 @@ async function runRestore(namespace, overwrite) {
 
   const kept = keptFiles.length;
   const keptUnchanged = kept ? await seedKeptFiles(s3, keptFiles) : 0;
+  assertRestoreActive(attempt);
 
   console.log(
     `[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}` +
@@ -530,33 +756,40 @@ async function runRestore(namespace, overwrite) {
  * restore of this file fails — a torn or mis-decoded download must never be
  * handed to the gateway as its state.
  */
-async function writeRestoredObject(getResp, localFile) {
+async function writeRestoredObject(getResp, localFile, attempt) {
   const meta = getResp.Metadata || {};
   const gzipped =
     getResp.ContentEncoding === GZIP_ENCODING || meta[UPLOAD_ENCODING_METADATA_KEY] === GZIP_ENCODING;
   const expected = meta[UPLOAD_HASH_METADATA_KEY];
   const tmpFile = `${localFile}.tmp-${Date.now()}`;
   const hash = crypto.createHash("sha256");
+  let size = 0;
   const stages = [getResp.Body];
   if (gzipped) stages.push(zlib.createGunzip());
   stages.push(async function* (source) {
     for await (const chunk of source) {
+      assertRestoreActive(attempt);
+      size += Buffer.byteLength(chunk);
+      const cap = localFile.endsWith(SQLITE_EXT) ? _limits.maxSqliteFileSize : _limits.maxFileSize;
+      if (size > cap) throw new Error("Restored object exceeds size limit");
       hash.update(chunk);
       yield chunk;
     }
   });
-  stages.push(fs.createWriteStream(tmpFile));
+  stages.push(fs.createWriteStream(tmpFile, { fd: fs.openSync(tmpFile, "wx", 0o600) }));
   try {
-    await pipeline(...stages);
+    await pipeline(...stages, { signal: attempt.controller.signal });
+    assertRestoreActive(attempt);
     const digest = hash.digest("hex");
     if (expected && expected !== digest) {
       throw new Error(`sha256 mismatch after download (S3 says ${expected.slice(0, 12)}…, got ${digest.slice(0, 12)}…)`);
     }
+    if (localFile.endsWith(SQLITE_EXT)) stateStorage.assertSqliteFile(tmpFile);
+    stateStorage.assertSafePath(LOCAL_PATH, localFile);
     fs.renameSync(tmpFile, localFile);
     return digest;
-  } catch (err) {
-    try { fs.unlinkSync(tmpFile); } catch { /* not created */ }
-    throw err;
+  } finally {
+    removeSnapshotFile(tmpFile);
   }
 }
 
@@ -635,27 +868,37 @@ async function localUploadHash(relativePath) {
 /**
  * Await a workspace restore for at most `waitMs`.
  *
- * Resolves as soon as the restore settles (a failure is logged, not thrown).
- * If the restore is still running after `waitMs`, logs a warning and resolves
- * anyway so the caller can start the gateway. The wait timer is cleared once
- * the restore settles, so the warning only fires on a genuine timeout (it
- * used to fire on every boot, ~45s after a ~1s restore).
+ * Rejects failure and timeout, aborts outstanding restore IO and keeps
+ * uploads disabled after timeout.
  *
  * Injectable `timers` lets tests use fake timers instead of sleeping.
  */
 async function awaitRestore(restorePromise, waitMs, { log = console, timers = globalThis } = {}) {
+  if (!Number.isFinite(waitMs) || waitMs < 0) throw new Error("Invalid restore timeout");
   let timer = null;
+  const attempt = _restoreAttempt;
+  const fail = (err, fatal = false) => {
+    if (fatal) _fatalRestoreError = err;
+    if (attempt) {
+      attempt.error = err;
+      attempt.controller.abort(err);
+    }
+    setRestoreState("failed");
+    return err;
+  };
   const settled = Promise.resolve(restorePromise)
+    .then((result) => {
+      if (result?.failed > 0) throw new Error(`Workspace restore incomplete: ${result.failed} file(s) failed`);
+      if (attempt) assertRestoreActive(attempt);
+    })
     .catch((err) => {
       log.warn(`[contract] Workspace restore failed: ${err.message}`);
+      throw fail(err);
     })
     .then(() => "restored");
-  const timedOut = new Promise((resolve) => {
+  const timedOut = new Promise((_, reject) => {
     timer = timers.setTimeout(() => {
-      log.warn(
-        `[contract] Workspace restore still running after ${waitMs}ms — starting gateway anyway`,
-      );
-      resolve("timeout");
+      reject(fail(new Error(`Workspace restore timed out after ${waitMs}ms`), true));
     }, waitMs);
     if (typeof timer.unref === "function") timer.unref();
   });
@@ -667,7 +910,7 @@ async function awaitRestore(restorePromise, waitMs, { log = console, timers = gl
 }
 
 /**
- * Recursively walk a directory and return all file paths (relative to root).
+ * Recursively walk backup files (relative to root), excluding generated plugin skills.
  *
  * Follows directory symlinks (with a realpath cycle guard): on AgentCore the
  * state dir is local disk but `~/.openclaw/workspace` is a symlink onto the
@@ -688,6 +931,8 @@ function walkDir(dir, root = dir, seen = new Set()) {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
+      const relativePath = path.relative(root, fullPath);
+      if (isGeneratedPluginSkillPath(relativePath)) continue;
       let isDir = entry.isDirectory();
       let isFile = entry.isFile();
       if (entry.isSymbolicLink()) {
@@ -702,7 +947,7 @@ function walkDir(dir, root = dir, seen = new Set()) {
       if (isDir) {
         results.push(...walkDir(fullPath, root, seen));
       } else if (isFile) {
-        results.push(path.relative(root, fullPath));
+        results.push(relativePath);
       }
     }
   } catch (err) {
@@ -740,14 +985,20 @@ function contentHash(content) {
  * Shared by saveWorkspace(), saveFile() and the change-driven backup.
  *
  * `relativePath` must already be normalised and inside the state dir; skip
- * rules are the caller's job. Never throws on a per-file problem it can report
+ * rules other than the generated plugin skills root are the caller's job.
+ * Never throws on a per-file problem it can report
  * (missing, oversized, snapshot failure) — those come back as an outcome — but
  * lets S3 errors propagate so the caller can count and log them.
  *
  * @returns {Promise<"uploaded"|"unchanged"|"skipped"|"missing">}
  */
 async function uploadStateFile(namespace, relativePath, { force = false } = {}) {
+  assertNamespaceBound(namespace);
+  if (!uploadsAllowed()) { warnGated("File upload"); return "skipped"; }
+  if (normalizeRelativePath(relativePath) !== relativePath) throw new Error("Invalid state file path");
+  if (isGeneratedPluginSkillPath(relativePath)) return "skipped";
   const localFile = path.join(LOCAL_PATH, relativePath);
+  stateStorage.assertSafePath(LOCAL_PATH, localFile);
   let stat;
   try {
     stat = fs.statSync(localFile);
@@ -793,6 +1044,7 @@ function scanForCredentials(relativePath, content) {
 
 /** Single PUT of an in-memory body, with its sha256 as object metadata. */
 async function putObject(key, content, hash) {
+  assertRestoreReady();
   await getS3Client().send(
     new (getS3Sdk().PutObjectCommand)({
       Bucket: BUCKET,
@@ -877,6 +1129,7 @@ async function uploadSqliteFile(key, localFile, relativePath, stat, force) {
  * @returns {Promise<{ bytes: number, parts: number }>} compressed bytes sent
  */
 async function uploadCompressedFile(key, filePath, { hash, size }) {
+  assertRestoreReady();
   const s3 = getS3Client();
   const sdk = getS3Sdk();
   const base = {
@@ -900,6 +1153,8 @@ async function uploadCompressedFile(key, filePath, { hash, size }) {
   let pendingBytes = 0;
   let total = 0;
   const sendPart = async (body) => {
+    assertRestoreReady();
+    getS3Client();
     if (!uploadId) {
       const created = await s3.send(new sdk.CreateMultipartUploadCommand(base));
       uploadId = created.UploadId;
@@ -928,11 +1183,15 @@ async function uploadCompressedFile(key, filePath, { hash, size }) {
       }
     }
     const tail = Buffer.concat(pending);
+    assertRestoreReady();
+    getS3Client();
     if (!uploadId) {
       await s3.send(new sdk.PutObjectCommand({ ...base, Body: tail }));
       return { bytes: total, parts: 1 };
     }
     if (tail.length > 0) await sendPart(tail);
+    assertRestoreReady();
+    getS3Client();
     await s3.send(new sdk.CompleteMultipartUploadCommand({
       Bucket: BUCKET,
       Key: key,
@@ -961,6 +1220,7 @@ async function uploadCompressedFile(key, filePath, { hash, size }) {
  * _uploadedHashes).
  */
 async function saveWorkspace(namespace) {
+  if (namespace) assertNamespaceBound(namespace);
   if (!BUCKET || !namespace) return;
   if (!uploadsAllowed()) {
     warnGated("Full save");
@@ -1003,6 +1263,7 @@ async function saveWorkspace(namespace) {
  * escapes the state dir.
  */
 function normalizeRelativePath(relativePath) {
+  if (typeof relativePath !== "string" || relativePath.includes("\0")) return null;
   const normalized = path.posix.normalize(String(relativePath).split(path.sep).join("/"));
   if (
     !normalized ||
@@ -1024,6 +1285,7 @@ function normalizeRelativePath(relativePath) {
  * (missing, skipped, or content unchanged since the last upload).
  */
 async function saveFile(namespace, relativePath) {
+  if (namespace) assertNamespaceBound(namespace);
   if (!BUCKET || !namespace || !relativePath) return false;
   const normalized = normalizeRelativePath(relativePath);
   if (!normalized) {
@@ -1062,6 +1324,7 @@ function setBackupMode(enabled) {
  * Start periodic workspace saves.
  */
 function startPeriodicSave(namespace, intervalMs) {
+  assertNamespaceBound(namespace);
   const defaultInterval = parseInt(process.env.WORKSPACE_SYNC_INTERVAL_MS || "300000", 10);
   const interval = intervalMs || (_backupMode ? BACKUP_INTERVAL_MS : defaultInterval);
   if (_saveInterval) clearInterval(_saveInterval);
@@ -1159,7 +1422,7 @@ function isLargeSqlite(rel) {
  */
 function changeTarget(relativePath) {
   let rel = normalizeRelativePath(relativePath);
-  if (!rel) return null;
+  if (!rel || isGeneratedPluginSkillPath(rel)) return null;
   const sidecar = rel.match(SQLITE_SIDECAR_RE);
   if (sidecar) rel = sidecar[1];
   const parts = rel.split("/");
@@ -1357,6 +1620,7 @@ function startChangePollFallback(intervalMs) {
  * @returns {{ mode: "watch" | "poll" | "none" }}
  */
 function startChangeBackup(namespace, opts = {}) {
+  if (namespace) assertNamespaceBound(namespace);
   closeChangeWatcher();
   if (!BUCKET || !namespace) {
     console.log("[workspace-sync] No bucket or namespace — change backup disabled");
@@ -1382,6 +1646,7 @@ function startChangeBackup(namespace, opts = {}) {
     largeSqliteMinIntervalMs: Math.max(0, sqliteMinIntervalMs, largeSqliteMinIntervalMs),
   };
   const fallbackIntervalMs = opts.fallbackIntervalMs || DEFAULT_CHANGE_POLL_INTERVAL_MS;
+  if (opts.initialSweep === true) markChanged(null);
   try {
     fs.mkdirSync(LOCAL_PATH, { recursive: true });
     _changeWatcher = fs.watch(LOCAL_PATH, { recursive: true, persistent: false }, (_event, filename) => {
@@ -1459,6 +1724,8 @@ async function cleanup(namespace) {
 }
 
 module.exports = {
+  restoreAbsentSeed,
+  assertRestoreReady,
   restoreWorkspace,
   awaitRestore,
   saveWorkspace,
@@ -1469,6 +1736,7 @@ module.exports = {
   flushPendingSaves,
   cleanup,
   configureCredentials,
+  configureCredentialProvider,
   setBackupMode,
   getS3Client,
   // Exported for testing

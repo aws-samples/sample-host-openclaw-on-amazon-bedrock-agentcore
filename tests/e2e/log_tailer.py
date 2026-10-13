@@ -30,7 +30,7 @@ PATTERNS = {
         r"Response to send \(len=(\d+)\): (.+)", re.DOTALL
     ),
     "telegram_sent": re.compile(
-        r"Telegram response sent to chat_id=(\S+)"
+        r"Telegram response (?:sent to|already streamed by contract .+ skipping send to) chat_id=(\S+)"
     ),
     "new_session": re.compile(
         r"New session created: (\S+) for (\S+)"
@@ -72,15 +72,6 @@ class TailResult:
             and self.telegram_sent
         )
 
-    @property
-    def is_warmup(self) -> bool:
-        """True if response came from the lightweight agent warm-up shim.
-
-        The shim appends a deterministic footer containing 'warm-up mode'.
-        When OpenClaw is fully running, responses route through the WebSocket
-        bridge and never contain this footer.
-        """
-        return "warm-up mode" in self.response_text.lower()
 
 
 def _parse_line(line: str, result: TailResult) -> None:

@@ -87,3 +87,5 @@ SYNC.md
 post-deploy.sh
 .bedrock_agentcore.yaml
 .bedrock_agentcore/
+.venv-deploy/
+.runtime/

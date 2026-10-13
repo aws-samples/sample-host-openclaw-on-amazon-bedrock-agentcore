@@ -1,7 +1,9 @@
 # OpenClaw 2.0 upgrade (2026.3.8 → 2026.9.5)
 
+This records the earlier OpenClaw data-format upgrade. OpenClaw pre-2.0 import and its receipts remain relevant on AgentCore Runtime V2; AgentCore Runtime V1 maintenance and startup-shim behavior are historical. Current V2 requires strict restore and USER_READY, with no shim fallback. Historical test results below do not validate the current V2 image.
+
 This deployment now pins **`openclaw@2026.9.5`** (npm `latest`) on **`node:24-slim`**, with
-**`clawhub@0.23.3`**, in both `bridge/Dockerfile` and `.bedrock_agentcore/openclaw_agent/Dockerfile`.
+**`clawhub@0.23.3`**, in `bridge/Dockerfile`.
 
 "OpenClaw 2.0" is upstream's name for release **v2026.8.1** and everything after it. There is no
 `2.x` semver; versions stay date-based. The `extended-stable` channel (`2026.7.35`) is the *pre-2.0*
@@ -46,12 +48,11 @@ the knob if you want the new behaviour.
 Also worth knowing (no knob needed): during gateway startup 2.0 may answer `connect` with
 `UNAVAILABLE "gateway starting; retry shortly"`. The bridge surfaces any non-ok `connect` as
 `Auth failed: …`, so a user who hits that window sees that text instead of the previous WebSocket
-timeout fallback. The lightweight agent still handles messages until the gateway is ready.
+timeout fallback. That fallback described the historical deployment; V2 waits for full readiness.
 
 ## Upgrade path for existing deployments
 
-1. Build and push the new bridge image, bump `image_version` in `cdk.json`, redeploy
-   `OpenClawAgentCore` (see [Deploy new bridge version](operations.md#deploy-new-bridge-version)).
+1. Deploy AgentCore Runtime V2 through the [release runbook](runtime-v2.md). Existing saved routes remain pinned; this OpenClaw data-import mechanism is not an existing-user AgentCore Runtime migration command. A CDK-only deployment does not update the AgentCore Runtime image.
 2. **First boot per user — legacy session import.** Users who chatted on 2026.3.8 have
    `~/.openclaw/agents/main/sessions/sessions.json` (+ `.jsonl` transcripts) on their session-storage
    mount or in their S3 backup. 2.0 keeps session rows in
@@ -95,7 +96,10 @@ timeout fallback. The lightweight agent still handles messages until the gateway
    periodic save is 30 minutes away in backup mode, and an idle stop sends no SIGTERM. On the
    us-west-2 F1 test two full upgrade boots wrote both files and neither reached S3, so every later
    cold start re-ran doctor and the prune had nothing to work from.
-3. **If the import fails** (exit ≠ 0, timeout, or `sessions.json` still present), the leftover index
+3. **Historical AgentCore Runtime V1 behavior (steps 3–4).** V2 blocks activation when the import fails;
+   the following is not a current V2 recovery procedure.
+
+   **If the import fails** (exit ≠ 0, timeout, or `sessions.json` still present), the leftover index
    is moved aside to `sessions.json.pre-2.0-unreadable-<timestamp>` and the gateway starts with
    empty history for that agent. Transcripts (`.jsonl`) are left in place, so an operator can retry
    later with `openclaw doctor --session-sqlite import --session-sqlite-all-agents` after restoring
@@ -112,7 +116,7 @@ timeout fallback. The lightweight agent still handles messages until the gateway
 
 ## Validating a build
 
-- `docker buildx build --platform linux/arm64 -f bridge/Dockerfile .` — settles the native
+- `docker buildx build --platform linux/arm64 -f bridge/Dockerfile bridge` — uses the bridge build context and checks the native
   prebuilds (`koffi`, `@lydell/node-pty`, `tree-sitter-bash` on arm64) and `node:sqlite` on Node 24.
 - `cd bridge && node --test` (Node 24) — includes the SQLite snapshot tests in
   `workspace-sync.test.js` and the state-dir relocate/mirror/restore tests in

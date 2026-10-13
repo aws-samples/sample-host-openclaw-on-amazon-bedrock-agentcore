@@ -1,182 +1,125 @@
 #!/usr/bin/env bash
-# e2e-deploy-and-test.sh
-# Full E2E pipeline: deploy → reset sessions → stop runtime → run all E2E tests
-# Usage: ./scripts/e2e-deploy-and-test.sh [--skip-deploy] [--test-filter PATTERN]
+# Deploy and verify V2, then run the V2 smoke/lifecycle tests without resetting state.
+# Selected tests remain responsible for their own V2 contract and side effects.
 set -euo pipefail
 
-REGION="ap-southeast-2"
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEPLOY_PYTHON="${DEPLOY_PYTHON:-$PROJECT_DIR/.venv-deploy/bin/python}"
+E2E_PYTHON="${E2E_PYTHON:-$PROJECT_DIR/.venv/bin/python}"
 SKIP_DEPLOY=false
-TEST_FILTER="${2:-}"
-
-for arg in "$@"; do
-  case $arg in
-    --skip-deploy) SKIP_DEPLOY=true ;;
-    --test-filter) TEST_FILTER="${2:-}" ;;
+MANIFEST=".runtime/runtime-v2.json"
+TEST_NODES=()
+DEPLOY_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --skip-deploy) SKIP_DEPLOY=true; shift ;;
+    --manifest) MANIFEST="${2:?--manifest requires a path}"; shift 2 ;;
+    --image-uri|--endpoint-name) DEPLOY_ARGS+=("$1" "${2:?option requires a value}"); shift 2 ;;
+    --test-node)
+      node="${2:?--test-node requires a tests/e2e/path.py::test_name}"
+      case "$node" in
+        *..*|tests/e2e/bot_test.py::TestWarmupShim*)
+          echo "ERROR: select V2 tests under tests/e2e/; the V1 warmup shim is unsupported." >&2
+          exit 1 ;;
+        tests/e2e/*.py::*) TEST_NODES+=("$node") ;;
+        *)
+          echo "ERROR: --test-node must name an individual test under tests/e2e/." >&2
+          exit 1 ;;
+      esac
+      shift 2 ;;
+    --help|-h)
+      echo "Usage: $0 [--test-node tests/e2e/path.py::test_name ...] [--skip-deploy] [--manifest PATH] [--image-uri URI] [--endpoint-name NAME]"
+      echo "Default: V2 bot_test.py::TestSmoke and ::TestMessageLifecycle; --test-node replaces both."
+      echo "V2 only. No session deletion, runtime stopping, or image-version rewrite."
+      exit 0 ;;
+    *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
   esac
 done
+if [ "${RUNTIME_PLATFORM+x}" = x ]; then
+  echo "ERROR: RUNTIME_PLATFORM is no longer supported; unset it for V2 deployment." >&2
+  exit 1
+fi
+if [ "${#TEST_NODES[@]}" -eq 0 ]; then
+  TEST_NODES=(tests/e2e/bot_test.py::TestSmoke tests/e2e/bot_test.py::TestMessageLifecycle)
+fi
+if ! command -v uv >/dev/null || [ ! -x "$DEPLOY_PYTHON" ] || [ ! -x "$E2E_PYTHON" ]; then
+  echo "ERROR: install uv and prepare .venv-deploy and .venv (or set DEPLOY_PYTHON and E2E_PYTHON)." >&2
+  exit 1
+fi
+cd "$PROJECT_DIR"
+PYTHON=(uv run --no-project --python "$DEPLOY_PYTHON" python)
+REGION="${CDK_DEFAULT_REGION:-${AWS_REGION:-}}"
+if [ -z "$REGION" ]; then
+  REGION=$("${PYTHON[@]}" -c 'import json; print(json.load(open("cdk.json"))["context"].get("region", ""))')
+fi
+if [ -z "$REGION" ]; then
+  echo "ERROR: set CDK_DEFAULT_REGION or AWS_REGION." >&2
+  exit 1
+fi
+export CDK_DEFAULT_REGION="$REGION"
 
-# ── Telegram notification helper ────────────────────────────────────────────
-TG_CHAT_ID="${E2E_TELEGRAM_CHAT_ID:?Set E2E_TELEGRAM_CHAT_ID}"
+TG_CHAT_ID="${E2E_TELEGRAM_CHAT_ID:-}"
+RESULTS_FILE="${E2E_RESULTS_FILE:-/tmp/e2e-results.txt}"
 send_telegram() {
-  local msg="$1"
-  local token
+  # Notifications are best effort and must not change the deployment/test result.
+  [ -n "$TG_CHAT_ID" ] || return 0
+  local msg="$1" token payload
   token=$(aws secretsmanager get-secret-value \
     --secret-id openclaw/channels/telegram \
     --region "$REGION" --query SecretString --output text 2>/dev/null) || return 0
-  curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-    -H "Content-Type: application/json" \
-    -d "{\"chat_id\": \"${TG_CHAT_ID}\", \"text\": $(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$msg"), \"parse_mode\": \"Markdown\"}" \
-    > /dev/null
+  payload=$("${PYTHON[@]}" -c \
+    'import json,sys; print(json.dumps({"chat_id": sys.argv[1], "text": sys.argv[2], "parse_mode": "Markdown"}))' \
+    "$TG_CHAT_ID" "$msg") || return 0
+  curl -sS --fail --connect-timeout 5 --max-time 10 -X POST \
+    "https://api.telegram.org/bot${token}/sendMessage" \
+    -H "Content-Type: application/json" -d "$payload" >/dev/null 2>&1 || true
 }
 
-cd "$PROJECT_DIR"
-echo "================================================"
-echo " OpenClaw E2E Deploy + Test Pipeline"
-echo " Region: $REGION | Account: $ACCOUNT"
-echo "================================================"
+send_telegram "🚀 *E2E Pipeline started*
+Preparing AgentCore Runtime V2 and selected E2E tests..."
 
-# ── Step 1: Deploy ───────────────────────────────────────────────────────────
 if [ "$SKIP_DEPLOY" = false ]; then
-  send_telegram "🚀 *E2E Pipeline started*
-Step 1/4: Deploying to AWS..."
-
-  echo ""
-  echo "── Step 1: CDK Deploy ──────────────────────────"
-  source .venv/bin/activate
-
-  # Bump image_version
-  CURRENT_VERSION=$(python3 -c "import json; print(json.load(open('cdk.json'))['context']['image_version'])")
-  NEW_VERSION=$((CURRENT_VERSION + 1))
-  python3 -c "
-import json
-with open('cdk.json') as f: cfg = json.load(f)
-cfg['context']['image_version'] = $NEW_VERSION
-with open('cdk.json', 'w') as f: json.dump(cfg, f, indent=2)
-print(f'Bumped image_version: $CURRENT_VERSION → $NEW_VERSION')
-"
-  # CDK synth first (validates cdk-nag)
-  echo "Running cdk synth..."
-  cdk synth --quiet 2>&1 | tail -5
-
-  echo "Deploying all stacks..."
-  cdk deploy --all --require-approval never 2>&1 | tail -30
-
-  echo ""
-  echo "── Step 2: Build + Push Docker Image ──────────"
-  ECR_URI=$(aws ecr describe-repositories \
-    --repository-names openclaw-bridge \
-    --region "$REGION" \
-    --query "repositories[0].repositoryUri" --output text 2>/dev/null)
-
-  aws ecr get-login-password --region "$REGION" | \
-    docker login --username AWS --password-stdin "$ECR_URI" 2>/dev/null
-
-  echo "Building ARM64 image v${NEW_VERSION}..."
-  docker build --platform linux/arm64 -t "openclaw-bridge:v${NEW_VERSION}" bridge/ 2>&1 | tail -10
-
-  docker tag "openclaw-bridge:v${NEW_VERSION}" "${ECR_URI}:v${NEW_VERSION}"
-  echo "Pushing ${ECR_URI}:v${NEW_VERSION}..."
-  docker push "${ECR_URI}:v${NEW_VERSION}" 2>&1 | tail -5
-
-  send_telegram "✅ *Deploy complete*
-Image v${NEW_VERSION} pushed to ECR.
-Step 2/4: Resetting sessions..."
-else
-  echo "── Skipping deploy (--skip-deploy) ────────────"
+  bash "$PROJECT_DIR/scripts/deploy.sh" --manifest "$MANIFEST" ${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}
 fi
+"${PYTHON[@]}" "$PROJECT_DIR/scripts/runtime_deploy.py" verify --region "$REGION" \
+  --manifest "$MANIFEST" --require-enrollment-ready
 
-# ── Step 3: Reset sessions + stop old runtime ────────────────────────────────
-echo ""
-echo "── Step 3: Reset sessions + stop old runtime ──"
-
-# Require E2E env vars
-if [ -z "${E2E_TELEGRAM_USER_ID:-}" ] || [ -z "${E2E_TELEGRAM_CHAT_ID:-}" ]; then
-  echo "ERROR: E2E_TELEGRAM_USER_ID and E2E_TELEGRAM_CHAT_ID must be set"
-  echo "  export E2E_TELEGRAM_USER_ID=<YOUR_TELEGRAM_USER_ID>"
-  echo "  export E2E_TELEGRAM_CHAT_ID=<YOUR_TELEGRAM_CHAT_ID>"
-  exit 1
-fi
-
-cd "$PROJECT_DIR"
-python3 - <<'EOF'
-import sys
-sys.path.insert(0, ".")
-from tests.e2e.config import load_config
-from tests.e2e.session import reset_session, _stop_agentcore_session
-
-cfg = load_config()
-print(f"Stopping AgentCore session for E2E user...")
-stopped = _stop_agentcore_session(cfg)
-print(f"  Session stopped: {stopped}")
-
-print(f"Resetting session record in DynamoDB (preserving user identity)...")
-reset = reset_session(cfg)
-print(f"  Session reset: {reset}")
-
-print("Session reset complete — next message will trigger cold start with new image.")
-EOF
-
-send_telegram "✅ *Sessions reset*
-Old container terminated. Cold start will pick up new image.
-Step 3/4: Running E2E tests..."
-
-# ── Step 4: E2E Tests ────────────────────────────────────────────────────────
-echo ""
-echo "── Step 4: E2E Tests ───────────────────────────"
-echo "Waiting 10s for DynamoDB to settle..."
-sleep 10
-
-cd "$PROJECT_DIR"
-source .venv/bin/activate
-
-# Build pytest command — run all test classes documented in the E2E skill
-PYTEST_CMD="python -m pytest tests/e2e/bot_test.py -v --tb=short"
-if [ -n "$TEST_FILTER" ]; then
-  PYTEST_CMD="$PYTEST_CMD -k $TEST_FILTER"
-fi
-
-echo "Running: $PYTEST_CMD"
-echo ""
-
+echo "Running: ${TEST_NODES[*]}"
 set +e
-$PYTEST_CMD 2>&1 | tee /tmp/e2e-results.txt
-E2E_EXIT=$?
+uv run --no-project --python "$E2E_PYTHON" python -m pytest "${TEST_NODES[@]}" -v --tb=short \
+  2>&1 | tee "$RESULTS_FILE"
+E2E_EXIT=${PIPESTATUS[0]}
 set -e
 
-# Parse results
-PASSED=$(grep -c "PASSED" /tmp/e2e-results.txt || true)
-FAILED=$(grep -c "FAILED" /tmp/e2e-results.txt || true)
-SKIPPED=$(grep -c "SKIPPED" /tmp/e2e-results.txt || true)
-ERRORS=$(grep -c "ERROR" /tmp/e2e-results.txt || true)
+PASSED=$(grep -c "PASSED" "$RESULTS_FILE" 2>/dev/null || true)
+FAILED=$(grep -c "FAILED" "$RESULTS_FILE" 2>/dev/null || true)
+SKIPPED=$(grep -c "SKIPPED" "$RESULTS_FILE" 2>/dev/null || true)
+ERRORS=$(grep -c "ERROR" "$RESULTS_FILE" 2>/dev/null || true)
+PASSED=${PASSED:-0}
+FAILED=${FAILED:-0}
+SKIPPED=${SKIPPED:-0}
+ERRORS=${ERRORS:-0}
+echo "E2E Results: PASSED=$PASSED FAILED=$FAILED SKIPPED=$SKIPPED ERRORS=$ERRORS"
 
-echo ""
-echo "================================================"
-echo " E2E Results: PASSED=$PASSED FAILED=$FAILED SKIPPED=$SKIPPED ERRORS=$ERRORS"
-echo "================================================"
-
-# ── Notify ───────────────────────────────────────────────────────────────────
+FAILURES=""
 if [ "$E2E_EXIT" -eq 0 ]; then
   STATUS="✅ All E2E tests passed"
   EMOJI="🎉"
 else
   STATUS="❌ E2E tests failed"
   EMOJI="🚨"
-  # Collect failed test names
-  FAILURES=$(grep "FAILED" /tmp/e2e-results.txt | head -5 | sed 's/FAILED //' | tr '\n' '\n' || true)
+  FAILURES=$(grep "FAILED" "$RESULTS_FILE" 2>/dev/null | head -5 | sed 's/FAILED //' || true)
 fi
-
 MSG="${EMOJI} *E2E Pipeline complete*
 ${STATUS}
 
-Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}
-$([ -n "${FAILURES:-}" ] && echo "
+Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED} | Errors: ${ERRORS}"
+if [ -n "$FAILURES" ]; then
+  MSG="${MSG}
+
 *Failed tests:*
-${FAILURES}")"
-
+${FAILURES}"
+fi
 send_telegram "$MSG"
-
-echo ""
-echo "Full results: /tmp/e2e-results.txt"
+echo "Full results: $RESULTS_FILE"
 exit "$E2E_EXIT"

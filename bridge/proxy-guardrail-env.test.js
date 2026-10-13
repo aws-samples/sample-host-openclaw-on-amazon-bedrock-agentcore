@@ -57,6 +57,8 @@ describe("workspace AGENTS.md injection keeps the contract's Browser section", (
     assert.ok(Number(m[1]) >= 8192, `per-file cap ${m[1]} is too small for the contract AGENTS.md`);
   });
   it("contract still writes the Browser section the cap must cover", () => {
-    assert.match(contractSrc, /"## Browser \(AgentCore Browser\)"/);
+    const { renderAgents } = require("./gateway-config");
+    assert.match(renderAgents({ browserEnabled: true }), /## Browser \(AgentCore Browser\)/);
+    assert.match(contractSrc, /renderAgents\(\{ browserEnabled: !!process\.env\.BROWSER_IDENTIFIER \}\)/);
   });
 });

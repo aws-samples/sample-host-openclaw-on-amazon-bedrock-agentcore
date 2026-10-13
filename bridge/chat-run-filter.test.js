@@ -1,5 +1,5 @@
 /**
- * Tests for chat-run-filter.js and its wiring in agentcore-contract.js.
+ * Tests for chat-run-filter.js and its wiring in gateway-lifecycle.js.
  * Run: node --test chat-run-filter.test.js
  *
  * Regression: a cron brief's main run (agent:main:main) spawned a sub-agent.
@@ -168,32 +168,38 @@ describe("chat run tracker", () => {
 });
 
 describe("contract wiring", () => {
-  const src = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
+  const src = fs.readFileSync(path.join(__dirname, "gateway-lifecycle.js"), "utf-8");
+  const contract = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
   const dockerfile = fs.readFileSync(path.join(__dirname, "Dockerfile"), "utf-8");
 
-  it("contract requires the filter and creates a tracker per chat.send", () => {
+  it("contract uses the gateway transport with a tracker per chat.send", () => {
+    assert.match(contract, /require\("\.\/gateway-lifecycle"\)/);
+    assert.match(contract, /await gatewayTurn\(/);
     assert.match(src, /require\("\.\/chat-run-filter"\)/);
-    assert.match(src, /createChatRunTracker\(chatReqId\)/);
+    assert.match(src, /createChatRunTracker\(runId\)/);
   });
 
   it("chat events are classified before delta/final/error/aborted handling", () => {
-    const start = src.indexOf('msg.event === "chat"');
+    const start = src.indexOf('frame.event === "chat"');
     assert.notEqual(start, -1);
-    const block = src.slice(start, src.indexOf("// Step 4", start));
-    const classifyAt = block.indexOf("chatRun.classify(");
+    const block = src.slice(start);
+    const classifyAt = block.indexOf("tracker.classify(");
     assert.notEqual(classifyAt, -1, "chat handler must classify events");
-    for (const st of ['"delta"', '"final"', '"error"', '"aborted"']) {
+    for (const st of ['"delta"', '"final"']) {
       const at = block.indexOf(`payload.state === ${st}`);
       assert.ok(at > classifyAt, `${st} handling must come after classify`);
     }
+    assert.ok(block.indexOf('["error", "aborted"].includes(payload.state)') > classifyAt);
   });
 
-  it("ignored-event log uses a constant format string", () => {
-    assert.match(src, /console\.log\(\s*"\[contract\] Ignoring chat %s for runId=%s sessionKey=%s \(%s\)"/);
+  it("ignored and yielded events cannot update the response", () => {
+    const ignore = src.indexOf('verdict.action === "ignore" || verdict.action === "yield"');
+    const response = src.indexOf("if (text) response = text;");
+    assert.ok(ignore > 0 && response > ignore);
   });
 
   it("chat.send ack runId is adopted", () => {
-    assert.match(src, /chatRun\.adoptAck\(msg\.payload\)/);
+    assert.match(src, /tracker\.adoptAck\(frame\.payload\)/);
   });
 
   it("Dockerfile copies chat-run-filter.js into /app", () => {

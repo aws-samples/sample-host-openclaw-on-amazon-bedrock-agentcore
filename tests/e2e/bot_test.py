@@ -3,8 +3,7 @@
 CLI usage:
     python -m tests.e2e.bot_test --health
     python -m tests.e2e.bot_test --send "Hello" --tail-logs
-    python -m tests.e2e.bot_test --reset --send "Hello" --tail-logs
-    python -m tests.e2e.bot_test --reset-user
+    python -m tests.e2e.bot_test --stop-session
     python -m tests.e2e.bot_test --conversation multi_turn --tail-logs
     python -m tests.e2e.bot_test --subagent --tail-logs
     python -m tests.e2e.bot_test --skill-manage --tail-logs
@@ -34,7 +33,8 @@ import pytest
 from .config import load_config
 from .conftest import SCENARIOS
 from .log_tailer import tail_logs
-from .session import get_agent_status, get_session_id, get_user_id, reset_session, reset_user
+from .session import (get_agent_status, get_chat_completion, get_session_id,
+                      get_session_route, get_user_id, _stop_agentcore_session)
 from .webhook import health_check, post_webhook
 
 
@@ -172,160 +172,46 @@ class TestTelegramFormatting:
 
 
 class TestColdStart:
-    """Cold start tests — reset session, send message, verify new session creation."""
+    """First registration on a dedicated, previously unused test identity."""
 
     def test_cold_start(self, e2e_config):
-        """Reset session and verify a new session is created on next message."""
-        # Ensure user exists first
-        user_id = get_user_id(e2e_config)
-        if user_id:
-            reset_session(e2e_config)
-
+        """Observe initial V2 registration without deleting an existing route."""
+        if get_user_id(e2e_config):
+            pytest.skip("Cold-start registration requires a genuinely new test identity; no reset is performed")
         since_ms = int(time.time() * 1000)
-        result = post_webhook(e2e_config, "E2E cold start test")
+        result = post_webhook(e2e_config, "E2E first registration test")
         assert result.status_code == 200
-
-        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
-        assert tail.full_lifecycle, (
-            f"Incomplete lifecycle after cold start "
-            f"(timed_out={tail.timed_out}, elapsed={tail.elapsed_s:.1f}s)\n"
-            f"Raw lines: {tail.raw_lines[-5:]}"
-        )
-        # New session should have been created (unless user was brand new)
-        if user_id:
-            assert tail.new_session, "Expected new session creation after reset"
-
-
-class TestWarmupShim:
-    """Verify the lightweight agent warm-up shim is responding during cold start."""
-
-    # Deterministic footer appended by the shim to every response
-    SHIM_FOOTER = "warm-up mode"
-
-    def test_cold_start_shim_response(self, e2e_config):
-        """After session reset + stop, the first response should come from
-        the warm-up shim and include the deterministic footer about
-        additional community skills coming online after full startup."""
-        from .session import _stop_agentcore_session
-
-        user_id = get_user_id(e2e_config)
-        if user_id:
-            reset_session(e2e_config)
-            _stop_agentcore_session(e2e_config)
-
-        since_ms = int(time.time() * 1000)
-        result = post_webhook(e2e_config, "What can you do?")
-        assert result.status_code == 200
-
-        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
-        assert tail.full_lifecycle, (
-            f"Incomplete lifecycle (timed_out={tail.timed_out})"
-        )
-
-        # The shim appends a deterministic footer about warm-up mode
-        resp_lower = tail.response_text.lower()
-        assert self.SHIM_FOOTER in resp_lower, (
-            f"Expected shim warm-up footer in response.\n"
-            f"Looked for: {self.SHIM_FOOTER!r}\n"
-            f"Response ({tail.response_len} chars): {tail.response_text[:300]}"
-        )
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=600)
+        assert tail.full_lifecycle, f"Incomplete first registration: {tail.raw_lines[-5:]}"
+        route = get_session_route(e2e_config)
+        assert route.platform_version == "V2"
+        assert tail.session_id == route.session_id
+        _assert_v2_ready(e2e_config)
 
 
 class TestFullStartup:
-    """Verify OpenClaw fully starts up and ClawHub skills become available.
-
-    Unlike TestWarmupShim (which only checks the cold-start shim responds),
-    this test waits for the full OpenClaw runtime to come online. It measures
-    the timing of each phase:
-      1. Webhook → warm-up response (lightweight agent shim, ~5-15s)
-      2. Warm-up → full OpenClaw ready (no more warm-up footer, ~1-2min)
-
-    The test confirms full startup by sending a message that exercises a
-    ClawHub skill (only available after OpenClaw gateway is ready). A response
-    without the warm-up footer proves the full runtime is handling messages.
-    """
-
-    # Maximum time to wait for OpenClaw to finish starting (seconds).
-    # Typical cold start is ~1-2 min; 10 min covers slow regions/cold pulls.
-    MAX_STARTUP_WAIT_S = 600
-    POLL_INTERVAL_S = 30  # Time between status-check messages
+    """Verify V2 USER_READY and an explicit full OpenClaw completion."""
 
     def test_full_startup_and_skill(self, e2e_config):
-        """Reset session, wait for full OpenClaw startup, verify a
-        post-warmup response (no warm-up footer)."""
-        from .session import _stop_agentcore_session
-
-        # --- Phase 0: Force a true cold start ---
-        user_id = get_user_id(e2e_config)
-        if user_id:
-            reset_session(e2e_config)
-            _stop_agentcore_session(e2e_config)
-
-        cold_start_time = time.time()
-        cold_start_mono = time.monotonic()
-
-        # --- Phase 1: First message (warm-up shim should respond) ---
-        since_ms = int(cold_start_time * 1000)
-        result = post_webhook(e2e_config, "What tools and skills do you have?")
-        assert result.status_code == 200
-
-        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
-        assert tail.full_lifecycle, (
-            f"Phase 1 incomplete (timed_out={tail.timed_out})"
-        )
-        warmup_response_s = time.monotonic() - cold_start_mono
-
-        # First response during cold start should be from the shim
-        assert tail.is_warmup, (
-            f"Expected warm-up shim response on cold start, but got full "
-            f"OpenClaw response in {warmup_response_s:.1f}s. "
-            f"Response: {tail.response_text[:200]}"
-        )
-
-        # --- Phase 2: Poll until OpenClaw is fully started ---
-        fully_up = False
-        full_startup_s = 0.0
-        last_response = ""
-
-        deadline = cold_start_mono + self.MAX_STARTUP_WAIT_S
-        while time.monotonic() < deadline:
-            time.sleep(self.POLL_INTERVAL_S)
-
-            since_ms = int(time.time() * 1000)
-            post_webhook(
-                e2e_config,
-                "Status check — list your available tools briefly.",
-            )
-            tail = tail_logs(
-                e2e_config, since_ms=since_ms, timeout_s=120,
-            )
-
-            if not tail.full_lifecycle:
-                continue
-
-            last_response = tail.response_text
-            if not tail.is_warmup:
-                fully_up = True
-                full_startup_s = time.monotonic() - cold_start_mono
-                break
-
-        assert fully_up, (
-            f"OpenClaw did not fully start within {self.MAX_STARTUP_WAIT_S}s. "
-            f"Still seeing warm-up footer.\n"
-            f"Last response: {last_response[:300]}"
-        )
-
-        # --- Report timing ---
-        print(f"\n  Phase 1 — warm-up response: {warmup_response_s:.1f}s")
-        print(f"  Phase 2 — full OpenClaw ready: {full_startup_s:.1f}s")
-        print(f"  Response (no warm-up footer): {last_response[:200]}")
-
-        # Sanity: full startup should take at least 30s (if faster, the shim
-        # check in phase 1 probably didn't work correctly)
-        assert full_startup_s > 30, (
-            f"Suspiciously fast full startup ({full_startup_s:.1f}s). "
-            f"The warm-up shim may not be working correctly."
-        )
+        """Keep the saved binding and check gateway completion, independent of timing."""
+        ready, elapsed = _wait_for_full_openclaw(e2e_config)
+        assert ready, f"OpenClaw not ready after {elapsed:.1f}s"
+        route = get_session_route(e2e_config)
+        started = time.monotonic()
+        result = get_chat_completion(e2e_config, "List your available tools and skills briefly.")
+        assert result.get("runtimePlatform") == "V2"
+        assert result.get("phase") == "USER_READY"
+        assert result.get("execution") == {"engine": "openclaw", "phase": "completed"}
+        assert result.get("status") not in ("error", "unknown_outcome")
+        assert result.get("response"), "Completed chat returned no text"
+        assert not result.get("streamed"), "Diagnostic chat must not deliver a channel message"
+        assert result.get("userId") == route.user_id
+        assert result.get("actorId") == route.actor_id
+        assert result.get("sessionId") == route.session_id
+        assert result.get("runtimeSessionId") == route.session_id
+        assert result.get("routingGeneration") == route.generation
+        assert get_session_route(e2e_config) == route
+        print(f"\n  Diagnostic chat round trip: {time.monotonic() - started:.1f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -336,30 +222,41 @@ _OPENCLAW_STARTUP_TIMEOUT_S = 600  # Max wait for full cold start (slow regions)
 _SUBAGENT_TIMEOUT_S = 600  # Sub-agent skills may take several minutes
 
 
+def _assert_v2_ready(e2e_config):
+    status = get_agent_status(e2e_config)
+    assert status and status.get("runtimePlatform") == "V2", "Missing V2 status"
+    assert status.get("lifecycle", {}).get("state") == "USER_READY", status
+    assert status.get("openclawReady") and status.get("proxyReady"), status
+    return status
+
+
 def _wait_for_full_openclaw(e2e_config, max_wait_s=_OPENCLAW_STARTUP_TIMEOUT_S,
                             poll_interval_s=30):
-    """Wait for OpenClaw to be fully started (not in warm-up mode).
+    """Start one channel turn if needed, then poll bound lifecycle status only.
 
-    Sends periodic status-check messages until the response no longer
-    contains the warm-up footer. Sleeps before the first probe to avoid
-    wasting a poll cycle when called immediately after a cold start.
-
-    Returns (is_ready, elapsed_s).
+    A missing/incomplete route fails closed. Polling never retries a chat with
+    an uncertain outcome or uses response wording as readiness evidence.
     """
     start = time.monotonic()
-
-    while (time.monotonic() - start) < max_wait_s:
-        # Sleep before probing — avoids wasting a 120s tail_logs cycle
-        # when the session is known to be cold (just started/reset).
-        time.sleep(poll_interval_s)
-
+    status = get_agent_status(e2e_config)
+    if status.get("lifecycle", {}).get("state") in ("FAILED", "DRAINING"):
+        return False, time.monotonic() - start
+    if status.get("lifecycle", {}).get("state") != "USER_READY":
         since_ms = int(time.time() * 1000)
-        post_webhook(e2e_config, "Quick status check")
-        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=120)
-
-        if tail.full_lifecycle and not tail.is_warmup:
+        result = post_webhook(e2e_config, "E2E readiness check: say hello briefly.")
+        if result.status_code != 200:
+            return False, time.monotonic() - start
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=max_wait_s)
+        if not tail.full_lifecycle:
+            return False, time.monotonic() - start
+    while time.monotonic() - start < max_wait_s:
+        status = get_agent_status(e2e_config)
+        phase = status.get("lifecycle", {}).get("state")
+        if phase == "USER_READY" and status.get("openclawReady") and status.get("proxyReady"):
             return True, time.monotonic() - start
-
+        if phase in ("FAILED", "DRAINING"):
+            break
+        time.sleep(poll_interval_s)
     return False, time.monotonic() - start
 
 
@@ -368,7 +265,7 @@ class TestSubagent:
 
     Tests deep-research-pro and task-decomposer skills, which spawn
     sub-agents for parallel work. Requires OpenClaw to be fully started
-    (not in warm-up mode).
+    through the V2 USER_READY barrier.
 
     After each skill invocation, queries the contract status endpoint to
     verify that subagentRequestCount increased — definitive proof that
@@ -409,7 +306,7 @@ class TestSubagent:
 
         The task-decomposer skill spawns sub-agents to break complex
         requests into manageable subtasks. Verifies the response is
-        substantial, came from full OpenClaw (not warm-up shim), and
+        substantial, came from full OpenClaw with V2 readiness, and
         that subagentRequestCount increased.
         """
         baseline_count = self._get_subagent_count(e2e_config)
@@ -428,10 +325,7 @@ class TestSubagent:
             f"Incomplete lifecycle (timed_out={tail.timed_out}, "
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
-        assert not tail.is_warmup, (
-            "Response came from warm-up shim, not full OpenClaw. "
-            "Task-decomposer skill not available during warm-up."
-        )
+        _assert_v2_ready(e2e_config)
         assert tail.response_len >= self.MIN_TASK_DECOMPOSE_LEN, (
             f"Response too short ({tail.response_len} chars) for task "
             f"decomposition. Expected structured subtask output.\n"
@@ -466,7 +360,7 @@ class TestSubagent:
 
         The deep-research-pro skill spawns sub-agents for multi-step
         research on complex topics. Verifies the response is detailed,
-        came from full OpenClaw (not warm-up shim), and that
+        came from full OpenClaw with V2 readiness, and that
         subagentRequestCount increased.
         """
         baseline_count = self._get_subagent_count(e2e_config)
@@ -485,10 +379,7 @@ class TestSubagent:
             f"Incomplete lifecycle (timed_out={tail.timed_out}, "
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
-        assert not tail.is_warmup, (
-            "Response came from warm-up shim, not full OpenClaw. "
-            "Deep-research-pro skill not available during warm-up."
-        )
+        _assert_v2_ready(e2e_config)
         assert tail.response_len >= self.MIN_DEEP_RESEARCH_LEN, (
             f"Response too short ({tail.response_len} chars) for deep "
             f"research. Expected multi-section research output.\n"
@@ -560,7 +451,7 @@ class TestScopedCredentials:
             f"Write file incomplete (timed_out={tail.timed_out}, "
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
-        assert not tail.is_warmup, "Response from warm-up shim, not full OpenClaw"
+        _assert_v2_ready(e2e_config)
         print(f"  Write response ({tail.response_len} chars): {tail.response_text[:200]}")
 
     def test_read_file(self, e2e_config):
@@ -577,7 +468,7 @@ class TestScopedCredentials:
             f"Read file incomplete (timed_out={tail.timed_out}, "
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
-        assert not tail.is_warmup, "Response from warm-up shim, not full OpenClaw"
+        _assert_v2_ready(e2e_config)
 
         # The response should contain the test content we wrote
         assert self.TEST_CONTENT in tail.response_text, (
@@ -607,9 +498,8 @@ class TestApiKeyManagement:
     """Verify dual-mode API key storage: native file-based and Secrets Manager.
 
     Tests the manage_api_key (native), manage_secret (Secrets Manager),
-    retrieve_api_key (unified lookup), and migrate_api_key tools during
-    warm-up mode (lightweight agent). These tools are available immediately
-    without waiting for full OpenClaw startup.
+    retrieve_api_key (unified lookup), and migrate_api_key tools after V2
+    USER_READY, preserving the saved session route.
 
     Flow (enforced by numeric prefixes for alphabetical ordering):
       1. Set a native API key via manage_api_key
@@ -619,8 +509,7 @@ class TestApiKeyManagement:
       5. List native keys and secrets
       6. Clean up: delete both keys
 
-    Uses the api-keys skill scripts in /skills/api-keys/ which work in both
-    warm-up mode (lightweight agent) and full OpenClaw mode.
+    Uses the api-keys skill scripts in /skills/api-keys/ through full OpenClaw.
 
     Run with: pytest tests/e2e/bot_test.py -v -k TestApiKeyManagement
     """
@@ -636,10 +525,10 @@ class TestApiKeyManagement:
 
     @pytest.fixture(autouse=True, scope="class")
     def fresh_session(self, e2e_config):
-        """Reset session and clean up stale entries before tests."""
+        """Wait for V2 readiness and clean up stale test entries."""
         # Force-delete any lingering test secret (e.g. stuck in 7-day recovery window)
         sm = boto3.client("secretsmanager", region_name=e2e_config.region)
-        namespace = f"telegram_{e2e_config.telegram_user_id}"
+        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
         secret_name = f"openclaw/user/{namespace}/{self.SM_KEY_NAME}"
         try:
             sm.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
@@ -649,7 +538,8 @@ class TestApiKeyManagement:
             if e.response["Error"]["Code"] != "ResourceNotFoundException":
                 print(f"\n  [cleanup] Warning deleting test secret: {e.response['Error']['Code']}")
 
-        reset_session(e2e_config)
+        ready, elapsed = _wait_for_full_openclaw(e2e_config)
+        assert ready, f"OpenClaw not ready after {elapsed:.1f}s"
         time.sleep(2)
 
         # Clean up any stale native key from a prior E2E run by asking the bot
@@ -842,19 +732,18 @@ class TestSkillManagement:
       4. Uninstall the skill
       5. Verify it's removed from the list
 
-    These tests reset the session to force a cold start so they run in
-    warm-up mode (lightweight agent) where install/uninstall/list tools
-    are explicitly available. Newly installed skills are available on the
-    next session start.
+    These tests use full OpenClaw and retain the saved V2 route. Installed
+    skill availability is checked by the existing functional assertions.
 
     Run with: pytest tests/e2e/bot_test.py -v -k TestSkillManagement
     """
 
     @pytest.fixture(autouse=True, scope="class")
     def fresh_session(self, e2e_config):
-        """Reset session before skill management tests to ensure warm-up mode."""
-        reset_session(e2e_config)
-        time.sleep(2)  # Brief pause after session reset
+        """Wait for V2 readiness before skill management tests."""
+        ready, elapsed = _wait_for_full_openclaw(e2e_config)
+        assert ready, f"OpenClaw not ready after {elapsed:.1f}s"
+        time.sleep(2)  # Allow prior tool effects to settle
 
     # hackernews is lightweight (no API key), good for testing install/uninstall
     TEST_SKILL = "hackernews"
@@ -1015,8 +904,7 @@ class TestCronSchedule:
       5. Verify the CRON# record is gone from DynamoDB
       6. Verify the EventBridge schedule is gone
 
-    Uses the eventbridge-cron skill which works in both warm-up mode
-    (lightweight agent) and full OpenClaw mode.
+    Uses the eventbridge-cron skill through full OpenClaw on V2.
 
     Run with: pytest tests/e2e/bot_test.py -v -k TestCronSchedule
     """
@@ -1033,16 +921,17 @@ class TestCronSchedule:
 
     @pytest.fixture(autouse=True, scope="class")
     def fresh_session(self, e2e_config):
-        """Reset session to start clean, then clean up stale test schedules."""
+        """Retain the V2 route and clean up stale test schedules."""
         # Clean up any leftover test schedules from prior runs
         self._cleanup_stale_schedules(e2e_config)
-        reset_session(e2e_config)
+        ready, elapsed = _wait_for_full_openclaw(e2e_config)
+        assert ready, f"OpenClaw not ready after {elapsed:.1f}s"
         time.sleep(2)
 
     @classmethod
     def _cleanup_stale_schedules(cls, cfg):
         """Delete any leftover E2E test schedules from prior runs."""
-        namespace = f"telegram_{cfg.telegram_user_id}"
+        namespace = get_session_route(cfg).actor_id.replace(":", "_")
         scheduler = boto3.client("scheduler", region_name=cfg.region)
         try:
             resp = scheduler.list_schedules(GroupName=cls.SCHEDULE_GROUP)
@@ -1154,7 +1043,7 @@ class TestCronSchedule:
     def test_eventbridge_schedule_exists(self, e2e_config):
         """Verify the EventBridge schedule was created."""
         assert TestCronSchedule._schedule_id, "No schedule ID from previous test"
-        namespace = f"telegram_{e2e_config.telegram_user_id}"
+        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
         eb_name = f"openclaw-{namespace}-{TestCronSchedule._schedule_id}"
 
         scheduler = boto3.client("scheduler", region_name=e2e_config.region)
@@ -1175,7 +1064,7 @@ class TestCronSchedule:
     def test_list_schedules(self, e2e_config):
         """Verify the test schedule exists in EventBridge via boto3."""
         assert TestCronSchedule._schedule_id, "No schedule ID from previous test"
-        namespace = f"telegram_{e2e_config.telegram_user_id}"
+        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
         eb_name = f"openclaw-{namespace}-{TestCronSchedule._schedule_id}"
 
         scheduler = boto3.client("scheduler", region_name=e2e_config.region)
@@ -1191,7 +1080,7 @@ class TestCronSchedule:
     def test_delete_schedule(self, e2e_config):
         """Delete the test schedule via boto3 directly (prevents wrong-schedule deletion)."""
         assert TestCronSchedule._schedule_id, "No schedule ID from previous test"
-        namespace = f"telegram_{e2e_config.telegram_user_id}"
+        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
         eb_name = f"openclaw-{namespace}-{TestCronSchedule._schedule_id}"
 
         # Delete EventBridge schedule
@@ -1239,7 +1128,7 @@ class TestCronSchedule:
     def test_eventbridge_schedule_deleted(self, e2e_config):
         """Verify the EventBridge schedule was removed."""
         assert TestCronSchedule._schedule_id, "No schedule ID from previous test"
-        namespace = f"telegram_{e2e_config.telegram_user_id}"
+        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
         eb_name = f"openclaw-{namespace}-{TestCronSchedule._schedule_id}"
 
         scheduler = boto3.client("scheduler", region_name=e2e_config.region)
@@ -1287,15 +1176,16 @@ class TestCronExecution:
 
     @pytest.fixture(autouse=True, scope="class")
     def fresh_session(self, e2e_config):
-        """Reset session to start clean, then clean up stale test schedules."""
+        """Retain the V2 route and clean up stale test schedules."""
         self._cleanup_stale_schedules(e2e_config)
-        reset_session(e2e_config)
+        ready, elapsed = _wait_for_full_openclaw(e2e_config)
+        assert ready, f"OpenClaw not ready after {elapsed:.1f}s"
         time.sleep(2)
 
     @classmethod
     def _cleanup_stale_schedules(cls, cfg):
         """Delete any leftover E2E execution test schedules from prior runs."""
-        namespace = f"telegram_{cfg.telegram_user_id}"
+        namespace = get_session_route(cfg).actor_id.replace(":", "_")
         scheduler = boto3.client("scheduler", region_name=cfg.region)
         try:
             resp = scheduler.list_schedules(GroupName=cls.SCHEDULE_GROUP)
@@ -1440,7 +1330,8 @@ class TestCronExecution:
 
         payload = {
             "userId": user_id,
-            "actorId": actor_id,
+            "actorId": get_session_route(e2e_config).actor_id,
+            "channelActorId": actor_id,
             "channel": "telegram",
             "channelTarget": e2e_config.telegram_user_id,
             "message": self.SCHEDULE_MSG,
@@ -1480,7 +1371,7 @@ class TestCronExecution:
         if not schedule_id:
             pytest.skip("No schedule to clean up")
 
-        namespace = f"telegram_{e2e_config.telegram_user_id}"
+        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
         eb_name = f"openclaw-{namespace}-{schedule_id}"
 
         # Delete EventBridge schedule
@@ -1511,7 +1402,7 @@ class TestBrowserFeature:
 
     Sends a single navigate request to verify the browser skill is available
     and functional. Requires full OpenClaw startup (browser skill is not
-    available during the lightweight-agent warm-up phase).
+    available only after V2 activation).
 
     Run with: pytest tests/e2e/bot_test.py -v -k TestBrowserFeature
     """
@@ -1609,12 +1500,6 @@ class TestGuardrailSecurity:
         ready, elapsed = _wait_for_full_openclaw(e2e_config)
         assert ready, f"OpenClaw not fully started after {elapsed:.0f}s"
         print(f"\n  OpenClaw ready in {elapsed:.1f}s")
-
-    @pytest.fixture(autouse=True)
-    def reset_between_tests(self, e2e_config):
-        """Reset session before each guardrail test to avoid conversation context carry-over."""
-        reset_session(e2e_config)
-        yield
 
     @staticmethod
     def _is_refusal(text):
@@ -2242,8 +2127,7 @@ def main():
     parser.add_argument("--cron", action="store_true", help="Test cron schedule lifecycle (create, verify CRON# record, list, delete)")
     parser.add_argument("--browser", action="store_true", help="Test browser skill (navigate, screenshot, interact)")
     parser.add_argument("--guardrail", action="store_true", help="Test guardrail security (requires BEDROCK_GUARDRAIL_ID)")
-    parser.add_argument("--reset", action="store_true", help="Reset session before sending")
-    parser.add_argument("--reset-user", action="store_true", help="Full user reset (delete all records)")
+    parser.add_argument("--stop-session", action="store_true", help="Stop only the saved V2 test session; retain its route")
     parser.add_argument("--tail-logs", action="store_true", help="Tail CloudWatch logs to verify lifecycle")
     parser.add_argument("--timeout", type=int, default=300, help="Log tail timeout in seconds")
     args = parser.parse_args()
@@ -2263,14 +2147,10 @@ def main():
         ok = _cli_health(cfg)
         sys.exit(0 if ok else 1)
 
-    if args.reset_user:
-        count = reset_user(cfg)
-        print(f"Reset user: deleted {count} DynamoDB records")
+    if args.stop_session:
+        stopped = _stop_agentcore_session(cfg)
+        print(f"Saved V2 session stopped: {stopped}; route retained")
         sys.exit(0)
-
-    if args.reset:
-        ok = reset_session(cfg)
-        print(f"Reset session: {'deleted' if ok else 'no session found'}")
 
     if args.subagent:
         ok = _cli_subagent(cfg, args.tail_logs)
@@ -2310,8 +2190,7 @@ def main():
 
     if not any([args.health, args.send, args.conversation, args.subagent,
                 args.scoped_creds, args.skill_manage, args.api_keys,
-                args.cron, args.browser, args.guardrail, args.reset,
-                args.reset_user]):
+                args.cron, args.browser, args.guardrail, args.stop_session]):
         parser.print_help()
         sys.exit(1)
 

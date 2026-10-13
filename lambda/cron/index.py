@@ -5,25 +5,23 @@ if cold, sends the cron message, and delivers the response to the user's
 channel (Telegram, Slack or Feishu).
 """
 
-import hashlib
 import json
 import logging
 import os
 import re
 import time
-import uuid
 from urllib import request as urllib_request
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from runtime_routing import admit_route, is_unknown_outcome, resolve_route
+from runtime_enrollment import authorize_channel_actor, read_actor_owner
+from runtime_invocation import InvocationTransportError, invoke_bounded
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # --- Configuration ---
-AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
-AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
@@ -33,18 +31,17 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
 # --- Clients ---
-dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION,
+                         config=Config(connect_timeout=2, read_timeout=3, retries={"max_attempts": 0}))
 identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
-agentcore_client = boto3.client(
-    "bedrock-agentcore",
-    region_name=AWS_REGION,
-    config=Config(
-        read_timeout=max(LAMBDA_TIMEOUT_SECONDS - 30, 60),
-        connect_timeout=10,
-        retries={"max_attempts": 0},
-    ),
-)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
+
+
+def runtime_client_factory(*, connect_timeout, read_timeout):
+    return boto3.client(
+        "bedrock-agentcore", region_name=AWS_REGION,
+        config=Config(connect_timeout=connect_timeout, read_timeout=read_timeout, retries={"max_attempts": 0}),
+    )
 
 # --- Token cache (survives across warm invocations, 15-min TTL) ---
 _SECRET_CACHE_TTL_SECONDS = 900  # 15 minutes
@@ -143,44 +140,8 @@ def _get_feishu_tenant_token():
 # ---------------------------------------------------------------------------
 
 def get_or_create_session(user_id):
-    """Get or create a session ID for the user. Session IDs must be >= 33 chars."""
-    pk = f"USER#{user_id}"
-
-    try:
-        resp = identity_table.get_item(Key={"PK": pk, "SK": "SESSION"})
-        if "Item" in resp:
-            identity_table.update_item(
-                Key={"PK": pk, "SK": "SESSION"},
-                UpdateExpression="SET lastActivity = :now",
-                ExpressionAttributeValues={
-                    ":now": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                },
-            )
-            return resp["Item"]["sessionId"]
-    except ClientError as e:
-        logger.error("DynamoDB session lookup failed: %s", e)
-
-    # Create new session (>= 33 chars required by AgentCore)
-    session_id = f"ses_{user_id}_{uuid.uuid4().hex[:12]}"
-    if len(session_id) < 33:
-        session_id += "_" + uuid.uuid4().hex[: 33 - len(session_id)]
-    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    try:
-        identity_table.put_item(
-            Item={
-                "PK": pk,
-                "SK": "SESSION",
-                "sessionId": session_id,
-                "createdAt": now_iso,
-                "lastActivity": now_iso,
-            }
-        )
-    except ClientError as e:
-        logger.error("Failed to create session: %s", e)
-
-    logger.info("New session created: %s for %s", session_id, user_id)
-    return session_id
+    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation."""
+    return resolve_route(identity_table, user_id)
 
 
 def resolve_current_user_id(actor_id):
@@ -190,16 +151,19 @@ def resolve_current_user_id(actor_id):
     (session rotation). This ensures cron always uses the same session as the
     user's active chat container rather than an old/stale session.
 
-    Falls back to None if lookup fails (caller should use payload userId as fallback).
+    Returns None if the canonical channel identity cannot be verified.
     """
     if not actor_id:
         return None
     try:
         resp = identity_table.get_item(
-            Key={"PK": f"CHANNEL#{actor_id}", "SK": "PROFILE"}
+            Key={"PK": f"CHANNEL#{actor_id}", "SK": "PROFILE"}, ConsistentRead=True,
         )
         if "Item" in resp and "userId" in resp["Item"]:
             resolved = resp["Item"]["userId"]
+            owner = read_actor_owner(identity_table, actor_id)
+            if owner and owner["userId"] != resolved:
+                return None
             logger.info("Resolved current userId=%s from actorId=%s", resolved, actor_id)
             return resolved
     except Exception as e:
@@ -211,75 +175,81 @@ def resolve_current_user_id(actor_id):
 # AgentCore invocation helpers
 # ---------------------------------------------------------------------------
 
-def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=None):
+def invoke_agentcore(route, action, user_id, actor_id, channel, message=None, deadline=None, channel_target=None):
     """Invoke AgentCore Runtime with the given action."""
     payload_dict = {
         "action": action,
         "userId": user_id,
-        "actorId": actor_id,
+        "actorId": route.actor_id,
+        "channelActorId": actor_id,
         "channel": channel,
+        "channelTarget": str(channel_target) if channel_target is not None else actor_id.split(":", 1)[-1],
+        **route.payload_context(),
     }
     if message:
         payload_dict["message"] = message
 
     payload = json.dumps(payload_dict).encode()
+    if deadline is None:
+        deadline = time.monotonic() + max(0, LAMBDA_TIMEOUT_SECONDS - 30)
 
     try:
-        logger.info(
-            "Invoking AgentCore: action=%s session=%s user=%s",
-            action, session_id, user_id,
-        )
-        resp = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
-            qualifier=AGENTCORE_QUALIFIER,
-            runtimeSessionId=session_id,
-            payload=payload,
-            contentType="application/json",
-            accept="application/json",
-        )
-        MAX_RESPONSE_BYTES = 500_000  # 500 KB — prevents OOM from large subagent responses
-        body = resp.get("response")
-        if body:
-            if hasattr(body, "read"):
-                body_bytes = body.read(MAX_RESPONSE_BYTES + 1)
-                body_text = body_bytes.decode("utf-8", errors="replace")
-                if len(body_bytes) > MAX_RESPONSE_BYTES:
-                    logger.warning("AgentCore response truncated at %d bytes", MAX_RESPONSE_BYTES)
-                    body_text = body_text[:MAX_RESPONSE_BYTES]
-            else:
-                body_text = str(body)[:MAX_RESPONSE_BYTES]
-            logger.info("AgentCore response (first 500): %s", body_text[:500])
+        authorize_channel_actor(identity_table, route, user_id, actor_id, channel)
+        with admit_route(identity_table, route, user_id, route.actor_id) as admission:
+            logger.info(
+                "Invoking AgentCore: action=%s session=%s user=%s generation=%s",
+                action, route.session_id, user_id, route.generation,
+            )
+            status_code, body_bytes = invoke_bounded(
+                runtime_client_factory,
+                {**route.invocation(), "payload": payload, "contentType": "application/json", "accept": "application/json"},
+                deadline,
+            )
+            if not body_bytes:
+                raise InvocationTransportError("AgentCore Runtime response is missing")
             try:
-                return json.loads(body_text)
-            except json.JSONDecodeError:
-                return {"response": body_text}
-        return {"response": "No response from agent."}
+                result = json.loads(body_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise InvocationTransportError("AgentCore Runtime response is not valid JSON") from error
+            if not isinstance(result, dict):
+                raise InvocationTransportError("AgentCore Runtime response is not an object")
+            if is_unknown_outcome(result):
+                admission.retain()
+            if status_code != 200:
+                return {"response": "Agent invocation failed.", "status": "failed"}
+            return result
     except Exception as e:
         logger.error("AgentCore invocation failed: %s", e, exc_info=True)
-        return {"response": f"Agent invocation failed: {e}"}
+        return {"response": f"Agent invocation failed: {e}", "status": "failed"}
 
 
-def warmup_and_wait(session_id, user_id, actor_id, channel):
+def warmup_and_wait(session_id, user_id, actor_id, channel, deadline=None, channel_target=None):
     """Send warmup action and poll until the container is ready.
 
     Returns True if the container is ready, False if warmup timed out.
     """
-    start = time.time()
-    while time.time() - start < WARMUP_MAX_WAIT_SECONDS:
-        result = invoke_agentcore(session_id, "warmup", user_id, actor_id, channel)
+    start = time.monotonic()
+    deadline = min(deadline or float("inf"), start + WARMUP_MAX_WAIT_SECONDS)
+    while time.monotonic() < deadline:
+        result = invoke_agentcore(session_id, "warmup", user_id, actor_id, channel, deadline=deadline,
+                                  channel_target=channel_target)
+        if (not isinstance(result, dict) or result.get("error") or is_unknown_outcome(result)
+                or time.monotonic() >= deadline):
+            return False
         status = result.get("status", "")
-        logger.info("Warmup status: %s (elapsed: %.0fs)", status, time.time() - start)
+        phase = result.get("phase")
+        logger.info("Warmup status: %s (elapsed: %.0fs)", status, time.monotonic() - start)
 
         if status == "ready":
-            return True
+            return phase in (None, "USER_READY")
+        if phase not in (None, "BOOTSTRAPPING", "BOOTSTRAP_READY", "BINDING", "RECOVERING"):
+            return False
 
         if status != "initializing":
-            # Unexpected status — might already be running or encountered an error
-            # Try sending the cron action anyway
-            logger.warning("Unexpected warmup status: %s — proceeding", status)
-            return True
+            logger.warning("Unexpected warmup status: %s", status)
+            return False
 
-        time.sleep(WARMUP_POLL_INTERVAL_SECONDS)
+        time.sleep(min(WARMUP_POLL_INTERVAL_SECONDS, max(0, deadline - time.monotonic())))
 
     logger.error("Warmup timed out after %ds", WARMUP_MAX_WAIT_SECONDS)
     return False
@@ -721,7 +691,7 @@ def handler(event, context):
     logger.info("Cron event received: %s", json.dumps(event)[:1000])
 
     user_id = event.get("userId")
-    actor_id = event.get("actorId")
+    actor_id = event.get("channelActorId") or event.get("actorId")
     channel = event.get("channel")
     channel_target = event.get("channelTarget")
     message = event.get("message")
@@ -744,7 +714,9 @@ def handler(event, context):
     # The payload userId may be stale (from before userId was made deterministic).
     # Look up the current active userId via CHANNEL# PROFILE so the ownership check
     # uses the correct userId, and cron shares the same session as chat.
-    current_user_id = resolve_current_user_id(actor_id) or user_id
+    current_user_id = resolve_current_user_id(actor_id)
+    if not current_user_id or not actor_id.startswith(f"{channel}:"):
+        return {"statusCode": 403, "body": "Channel identity verification failed"}
     if current_user_id != user_id:
         logger.info(
             "actorId=%s resolved to current userId=%s (payload had %s)",
@@ -755,7 +727,7 @@ def handler(event, context):
     # Use current_user_id (resolved from channel identity) for the lookup.
     try:
         cron_record = identity_table.get_item(
-            Key={"PK": f"USER#{current_user_id}", "SK": f"CRON#{schedule_id}"}
+            Key={"PK": f"USER#{current_user_id}", "SK": f"CRON#{schedule_id}"}, ConsistentRead=True,
         ).get("Item")
         if not cron_record:
             logger.error(
@@ -774,10 +746,20 @@ def handler(event, context):
         }
 
     # Phase 1: Get or create session
-    session_id = get_or_create_session(current_user_id)
+    try:
+        session_id = get_or_create_session(current_user_id)
+        authorize_channel_actor(identity_table, session_id, current_user_id, actor_id, channel)
+    except Exception as error:
+        logger.error("AgentCore Runtime route unavailable: %s", error)
+        return {"statusCode": 503, "body": "Runtime route unavailable"}
 
     # Phase 2: Warm up the container if cold
-    warmup_ok = warmup_and_wait(session_id, current_user_id, actor_id, channel)
+    remaining = context.get_remaining_time_in_millis() / 1000 if context else LAMBDA_TIMEOUT_SECONDS
+    lambda_deadline = time.monotonic() + remaining
+    warmup_ok = warmup_and_wait(
+        session_id, current_user_id, actor_id, channel,
+        deadline=lambda_deadline - 60, channel_target=channel_target,
+    )
     if not warmup_ok:
         error_msg = (
             f"[Scheduled: {schedule_name or schedule_id}] "
@@ -789,7 +771,15 @@ def handler(event, context):
 
     # Phase 3: Execute the cron message
     cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"
-    result = invoke_agentcore(session_id, "cron", current_user_id, actor_id, channel, cron_message)
+    if context:
+        lambda_deadline = min(lambda_deadline, time.monotonic() + context.get_remaining_time_in_millis() / 1000)
+    result = invoke_agentcore(
+        session_id, "cron", current_user_id, actor_id, channel, cron_message,
+        deadline=lambda_deadline - 15, channel_target=channel_target,
+    )
+    if (not isinstance(result, dict) or result.get("status") in ("failed", "error")
+            or is_unknown_outcome(result) or result.get("error")):
+        return {"statusCode": 503, "body": "Scheduled task invocation failed or outcome unknown"}
     response_text = result.get("response", "No response from scheduled task.")
 
     # Phase 4: Deliver response to channel

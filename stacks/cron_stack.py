@@ -1,10 +1,10 @@
 """Cron Stack — EventBridge Scheduler + Cron Executor Lambda.
 
 Deploys the EventBridge Scheduler group and cron executor Lambda that fires
-on user-defined schedules, invokes per-user AgentCore sessions, and delivers
-responses back to the originating channel (Telegram/Slack).
+on user-defined schedules, invokes per-user AgentCore Runtime sessions, and delivers
+responses back to the originating channel (Telegram/Slack/Feishu).
 
-Also grants the AgentCore execution role permissions to create/manage
+Also grants the AgentCore Runtime execution role permissions to create/manage
 EventBridge schedules and write cron records to the identity DynamoDB table.
 """
 
@@ -31,7 +31,7 @@ class CronStack(Stack):
         construct_id: str,
         *,
         runtime_arn: str,
-        runtime_endpoint_id: str,
+        runtime_endpoint_name: str,
         identity_table_name: str,
         identity_table_arn: str,
         telegram_token_secret_name: str,
@@ -82,11 +82,17 @@ class CronStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="index.handler",
             code=_lambda.Code.from_asset("lambda/cron"),
+            layers=[_lambda.LayerVersion(
+                self, "RuntimeRoutingLayer",
+                code=_lambda.Code.from_asset("lambda/shared", exclude=["**/__pycache__/**", "**/*.pyc"]),
+                compatible_runtimes=[_lambda.Runtime.PYTHON_3_13],
+                description="Shared per-user AgentCore Runtime route resolution and admission",
+            )],
             timeout=Duration.seconds(lambda_timeout),
             memory_size=lambda_memory,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
-                "AGENTCORE_QUALIFIER": runtime_endpoint_id,
+                "AGENTCORE_QUALIFIER": runtime_endpoint_name,
                 "IDENTITY_TABLE_NAME": identity_table_name,
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
@@ -116,17 +122,13 @@ class CronStack(Stack):
         # --- Cron Lambda IAM Permissions ---
 
         # AgentCore Runtime invocation
-        self.cron_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "bedrock-agentcore:InvokeAgentRuntime",
-                ],
-                resources=[
-                    runtime_arn,
-                    f"{runtime_arn}/*",
-                ],
+        if runtime_arn:
+            self.cron_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=["bedrock-agentcore:InvokeAgentRuntime"],
+                    resources=[runtime_arn, f"{runtime_arn}/*"],
+                )
             )
-        )
 
         # DynamoDB read (identity table — for session lookup)
         self.cron_fn.add_to_role_policy(
@@ -245,7 +247,7 @@ class CronStack(Stack):
                     "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
                     "index wildcard needed for query operations.",
                     applies_to=[
-                        f"Resource::{runtime_arn}/*",
+                        *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                     ],

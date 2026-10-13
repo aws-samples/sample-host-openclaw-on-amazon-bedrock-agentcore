@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/test")
@@ -28,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
 
 index = importlib.import_module("index")
+TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_test", actor_id="telegram:123456")
 
 TELEGRAM_LIMIT = 4096
 
@@ -94,7 +96,7 @@ def handle_reply(fake, reply_text):
     """Run handle_telegram end to end with the agent returning reply_text."""
     with patch.object(index, "_get_telegram_token", return_value="tok"), \
             patch.object(index, "resolve_user", return_value=("user_test", False)), \
-            patch.object(index, "get_or_create_session", return_value="ses_test"), \
+            patch.object(index, "get_or_create_session", return_value=TEST_ROUTE), \
             patch.object(index, "send_telegram_typing"), \
             patch.object(index, "_periodic_typing"), \
             patch.object(index, "invoke_agent_runtime", return_value={"response": reply_text}), \
@@ -151,7 +153,7 @@ class TestHandleTelegramLongReply(unittest.TestCase):
         fake = FakeTelegram()
         with patch.object(index, "_get_telegram_token", return_value="tok"), \
                 patch.object(index, "resolve_user", return_value=("user_test", False)), \
-                patch.object(index, "get_or_create_session", return_value="ses_test"), \
+                patch.object(index, "get_or_create_session", return_value=TEST_ROUTE), \
                 patch.object(index, "send_telegram_typing"), \
                 patch.object(index, "_periodic_typing"), \
                 patch.object(index, "invoke_agent_runtime",

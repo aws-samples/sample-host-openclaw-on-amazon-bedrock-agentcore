@@ -1,5 +1,7 @@
 # Red Team Test Audit Report
 
+> Historical audit of the 2026-03-13 deployment. Retired startup-shim controls and file references below are not current V2 security guarantees.
+
 **Date:** 2026-03-13
 **Scope:** `redteam/` test suite vs. deployed Bedrock Guardrails + application security controls
 **Files audited:** 6 test YAML files, 8 CDK stacks, 3 bridge runtime files, 5 skill directories

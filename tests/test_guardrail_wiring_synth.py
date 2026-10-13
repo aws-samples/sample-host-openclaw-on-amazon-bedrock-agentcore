@@ -14,6 +14,10 @@ availability zones are fixed via context so no CLI lookup is ever attempted.
     pytest tests/test_guardrail_wiring_synth.py -v
 """
 
+from fnmatch import fnmatchcase
+import json
+from pathlib import Path
+
 import aws_cdk as cdk
 from aws_cdk.assertions import Match, Template
 
@@ -40,8 +44,6 @@ def _synth_agentcore(enable_guardrails: bool):
             # Fixed AZs so VpcStack never triggers an availability-zone lookup.
             "availability_zones": [f"{_REGION}a", f"{_REGION}b"],
             "enable_guardrails": enable_guardrails,
-            "runtime_id": "openclaw_agent-TEST",
-            "runtime_endpoint_id": "DEFAULT",
         }
     )
     env = cdk.Environment(account=_ACCOUNT, region=_REGION)
@@ -117,3 +119,113 @@ def test_runtime_role_has_no_apply_guardrail_when_disabled():
     assert _apply_guardrail_statements(agentcore_tpl) == []
     guardrails_tpl.resource_count_is("AWS::Bedrock::Guardrail", 0)
     assert "GuardrailId" not in guardrails_tpl.to_json().get("Outputs", {})
+
+
+def test_default_primary_and_fallback_keep_global_streaming_invocation_grants():
+    """Global profile invocation needs both profile and destination model ARNs."""
+    context = json.loads((Path(__file__).resolve().parents[1] / "cdk.json").read_text())["context"]
+    template, _ = _synth_agentcore(enable_guardrails=True)
+    statements = [
+        statement
+        for logical_id, resource in template.find_resources("AWS::IAM::Policy").items()
+        if logical_id.startswith("OpenClawExecutionRole")
+        for statement in resource["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    for model_id in [context["default_model_id"], context["fallback_model_id"]]:
+        assert model_id.startswith("global.")
+        resources = [f"arn:aws:bedrock:{_REGION}:{_ACCOUNT}:inference-profile/{model_id}"]
+        resources.extend(
+            f"arn:aws:bedrock:{region}::foundation-model/{model_id.removeprefix('global.')}"
+            for region in ["us-west-2", "us-east-1", "eu-west-1"]
+        )
+        for action in ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]:
+            for resource in resources:
+                assert any(
+                    statement["Effect"] == "Allow"
+                    and action in (
+                        [statement["Action"]] if isinstance(statement["Action"], str)
+                        else statement["Action"]
+                    )
+                    and any(fnmatchcase(resource, pattern) for pattern in (
+                        [statement["Resource"]] if isinstance(statement["Resource"], str)
+                        else statement["Resource"]
+                    ))
+                    for statement in statements
+                ), (action, resource)
+
+
+def _execution_role_log_statements(template: Template) -> list:
+    policies = [
+        resource for logical_id, resource in template.find_resources("AWS::IAM::Policy").items()
+        if logical_id.startswith("OpenClawExecutionRole")
+    ]
+    assert len(policies) == 1
+    statements = []
+    for statement in policies[0]["Properties"]["PolicyDocument"]["Statement"]:
+        actions = statement["Action"]
+        actions = [actions] if isinstance(actions, str) else actions
+        if any(action.startswith("logs:") for action in actions):
+            statements.append(statement)
+    return statements
+
+
+def test_runtime_native_log_permissions_do_not_depend_on_runtime_name_or_id():
+    prefix = f"arn:aws:logs:{_REGION}:{_ACCOUNT}:log-group:"
+    expected = {
+        frozenset(["logs:CreateLogGroup", "logs:DescribeLogStreams"]):
+            prefix + "/aws/bedrock-agentcore/runtimes/*",
+        frozenset(["logs:CreateLogStream", "logs:PutLogEvents"]):
+            prefix + "/aws/bedrock-agentcore/runtimes/*:log-stream:*",
+        frozenset(["logs:DescribeLogGroups"]): prefix + "*",
+    }
+    template, _ = _synth_agentcore(enable_guardrails=False)
+    statements = _execution_role_log_statements(template)
+    assert len(statements) == 4
+    actual = {}
+    for statement in statements:
+        if statement["Resource"] == [prefix + "/openclaw/*", prefix + "/openclaw/*:*"]:
+            continue
+        assert statement["Effect"] == "Allow"
+        assert "Condition" not in statement
+        actions = statement["Action"]
+        actions = [actions] if isinstance(actions, str) else actions
+        actual[frozenset(actions)] = statement["Resource"]
+    assert actual == expected
+
+
+def test_runtime_custom_log_permissions_are_preserved():
+    template, _ = _synth_agentcore(enable_guardrails=False)
+    prefix = f"arn:aws:logs:{_REGION}:{_ACCOUNT}:log-group:"
+    statements = _execution_role_log_statements(template)
+    custom = [
+        statement for statement in statements
+        if statement["Resource"] == [prefix + "/openclaw/*", prefix + "/openclaw/*:*"]
+    ]
+    assert custom == [{
+        "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+        "Effect": "Allow",
+        "Resource": [prefix + "/openclaw/*", prefix + "/openclaw/*:*"],
+    }]
+
+
+def test_runtime_native_log_nag_suppressions_are_resource_scoped():
+    template, _ = _synth_agentcore(enable_guardrails=False)
+    role = next(
+        resource for logical_id, resource in template.find_resources("AWS::IAM::Role").items()
+        if logical_id.startswith("OpenClawExecutionRole")
+    )
+    suppressions = [
+        suppression for suppression in role["Metadata"]["cdk_nag"]["rules_to_suppress"]
+        if suppression["id"] == "AwsSolutions-IAM5"
+    ]
+    assert len(suppressions) == 1
+    entries = suppressions[0]["applies_to"]
+    prefix = f"Resource::arn:aws:logs:{_REGION}:{_ACCOUNT}:log-group:"
+    assert {entry for entry in entries if entry.startswith("Resource::arn:aws:logs:")} == {
+        prefix + "/openclaw/*",
+        prefix + "/openclaw/*:*",
+        prefix + "/aws/bedrock-agentcore/runtimes/*",
+        prefix + "/aws/bedrock-agentcore/runtimes/*:log-stream:*",
+        prefix + "*",
+    }
+    assert not any(entry.startswith("Action::logs:") for entry in entries)

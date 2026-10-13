@@ -5,8 +5,7 @@ AgentCore container -> OpenClaw 2.0 -> Gateway -> tool Lambda, and then proves
 from logs *how* the reply was produced:
 
 * the container that answered ran the real OpenClaw 2.0 gateway to ready
-  (``[contract] OpenClaw is ready on port``), not the warm-up shim, and the
-  reply carries no ``warm-up mode`` footer;
+  (``[contract] OpenClaw is ready on port``) and bound status reports V2 USER_READY;
 * the bridge wrote ``mcp.servers.agentcore`` into openclaw.json;
 * OpenClaw's embedded agent started an MCP tool (``tool=<...list_files>``
   etc.), not ``exec``;
@@ -33,6 +32,7 @@ import pytest
 
 from . import container_logs as cl
 from .log_tailer import tail_logs
+from .session import get_agent_status
 from .webhook import post_webhook
 
 pytestmark = [pytest.mark.gateway, pytest.mark.e2e]
@@ -80,7 +80,8 @@ class Turn:
 
     # ---- evidence assertions --------------------------------------------
     def assert_real_openclaw(self):
-        assert not self.tail.is_warmup, f"reply came from the warm-up shim: {self.reply[:200]}"
+        status = get_agent_status(self._cfg)
+        assert status.get("lifecycle", {}).get("state") == "USER_READY", status
         assert cl.openclaw_ready(self._cfg, self.stream), (
             f"container {self.stream} never logged 'OpenClaw is ready on port'"
         )

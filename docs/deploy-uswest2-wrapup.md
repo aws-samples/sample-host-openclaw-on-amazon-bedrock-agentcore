@@ -1,5 +1,7 @@
 # us-west-2 Deployment Wrap-up (2026-03-11)
 
+> Historical AgentCore Runtime V1 release record; commands and timings are not current V2 instructions or performance evidence. Use the [AgentCore Runtime V2 runbook](runtime-v2.md).
+
 ## Branch
 
 `deploy/starter-toolkit-hybrid` (worktree at `~/g-repo/openclaw-deploy`)
@@ -24,7 +26,7 @@ All 7 CDK stacks deployed to us-west-2:
 
 ### AgentCore Runtime (Starter Toolkit)
 
-- Runtime created: `<RUNTIME_ID>`
+- AgentCore Runtime created: `<RUNTIME_ID>`
 - Endpoint: `DEFAULT`
 - Docker image built locally and pushed: `bedrock-agentcore-openclaw_agent:local-build`
 - Memory: `<MEMORY_ID>` (STM only)
@@ -53,15 +55,15 @@ All 7 CDK stacks deployed to us-west-2:
 - `secretsReady: true` — Secrets Manager fetch works
 - `init()` is triggered on chat action, proxy process is spawned
 - Proxy never becomes ready on port 18790
-- No runtime log group exists (`/aws/bedrock-agentcore/runtimes/<RUNTIME_ID>-DEFAULT`) — container stdout not captured
+- No AgentCore Runtime log group exists (`/aws/bedrock-agentcore/runtimes/<RUNTIME_ID>-DEFAULT`) — container stdout not captured
 
 **Likely cause:** Proxy needs outbound network to reach Bedrock/Cognito. Private subnets have NAT + VPC endpoints (`bedrock-runtime`, `ecr.api`, `ecr.dkr`, `secretsmanager`, `logs`, `monitoring`, `ssm`, `s3`). Security group egress only allows TCP 443 — should be sufficient but needs verification from container logs.
 
 **Next step:** Get container stdout logs. Either:
-- Fix observability config so runtime logs appear in CloudWatch
+- Fix observability config so AgentCore Runtime logs appear in CloudWatch
 - Or add diagnostic logging to `/invocations` status response (e.g., proxy exit code, stderr capture)
 
-### 2. No runtime CloudWatch logs
+### 2. No AgentCore Runtime CloudWatch logs
 
 The log group `/aws/bedrock-agentcore/runtimes/<RUNTIME_ID>-DEFAULT` was never created. Other agents in the same account have this log group. May be a Starter Toolkit observability setup gap vs CDK's `CfnRuntime` approach.
 
@@ -211,7 +213,7 @@ aws iam get-role-policy --role-name openclaw-agentcore-execution-role-us-west-2 
   --policy-name OpenClawExecutionRoleDefaultPolicy466AD231
 ```
 
-## Required environment variables for runtime
+## Required environment variables for AgentCore Runtime
 
 These must be passed via `--env` flags or `update-agent-runtime --environment-variables`:
 
@@ -250,6 +252,6 @@ BEDROCK_AGENTCORE_MEMORY_NAME=openclaw_agent_mem
 | Deployment | Pure CDK (`CfnRuntime`) | CDK + Starter Toolkit |
 | ECR repo name | `openclaw-bridge` | `bedrock-agentcore-openclaw_agent` |
 | VPC subnets | Default VPC (public) | Custom VPC (private + NAT) |
-| Runtime logs | Present | Missing (no log group) |
+| AgentCore Runtime logs | Present | Missing (no log group) |
 | Image | 514 MB (local cross-compile) | 514 MB (local cross-compile) |
 | Proxy status | Working | Not starting (needs debugging) |

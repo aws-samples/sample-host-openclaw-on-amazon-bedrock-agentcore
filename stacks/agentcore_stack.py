@@ -5,11 +5,10 @@ Creates the supporting resources that the AgentCore Runtime needs:
   - Security Group (VPC networking for the container)
   - S3 Bucket (per-user file storage and workspace sync)
 
-The Runtime itself (container, endpoint) is deployed separately via the
-AgentCore Starter Toolkit (`agentcore deploy`), which handles ECR, Docker
-build (CodeBuild), and Runtime/Endpoint lifecycle. The deploy script
-passes the execution role ARN, subnet IDs, and security group ID from
-this stack to the toolkit.
+AgentCore Runtime (container, immutable endpoint) is deployed separately
+by the pinned V2 SDK controller. The deploy script builds the ARM64 image
+or accepts a prebuilt image, then passes the execution role ARN, subnet IDs,
+and security group ID from this stack to the controller.
 """
 
 from aws_cdk import (
@@ -89,7 +88,7 @@ class AgentCoreStack(Stack):
             ),
         )
 
-        # Bedrock model invocation
+        # Bedrock model invocation, including Global profiles and fallback models.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
@@ -234,6 +233,30 @@ class AgentCoreStack(Stack):
             )
         )
 
+        # AgentCore Runtime names and IDs are assigned by the SDK controller.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:CreateLogGroup", "logs:DescribeLogStreams"],
+                resources=[
+                    f"arn:aws:logs:{region}:{account}:log-group:/aws/bedrock-agentcore/runtimes/*",
+                ],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                resources=[
+                    f"arn:aws:logs:{region}:{account}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*",
+                ],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["logs:DescribeLogGroups"],
+                resources=[f"arn:aws:logs:{region}:{account}:log-group:*"],
+            )
+        )
+
         # CloudWatch Metrics — namespace condition prevents alarm falsification
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
@@ -261,7 +284,7 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # ECR pull (toolkit creates the repo, but the execution role needs pull access)
+        # ECR pull; the deployment controller accepts these repository prefixes.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
@@ -336,15 +359,6 @@ class AgentCoreStack(Stack):
         # S3 per-user file storage permissions
         self.user_files_bucket.grant_read_write(self.execution_role)
 
-        # --- Runtime info (from Starter Toolkit, read via context) ------------
-        # Runtime/Endpoint/ECR managed by Starter Toolkit (`agentcore deploy`),
-        # not CDK. These are populated by the deploy script after `agentcore deploy`
-        # and passed to dependent stacks (Router, Cron).
-        runtime_id = self.node.try_get_context("runtime_id") or "PLACEHOLDER"
-        runtime_endpoint_id = self.node.try_get_context("runtime_endpoint_id") or "PLACEHOLDER"
-        self.runtime_arn = f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{runtime_id}"
-        self.runtime_endpoint_id = runtime_endpoint_id
-
         # --- AgentCore Browser (optional) -------------------------------------
         enable_browser = str(self.node.try_get_context("enable_browser") or "false").lower() == "true"
         self.browser = None
@@ -387,9 +401,7 @@ class AgentCoreStack(Stack):
                     )
                 )
 
-                # In hybrid deploy mode, Runtime is managed by Starter Toolkit.
-                # Browser identifier is passed via --env BROWSER_IDENTIFIER=<id>
-                # during `agentcore deploy`. Export it for the deploy script.
+                # The deploy script passes this ID to AgentCore Runtime.
                 self.browser_id = self.browser.attr_browser_id
 
         # --- Outputs ----------------------------------------------------------
@@ -419,9 +431,10 @@ class AgentCoreStack(Stack):
                     "Bedrock guardrail ARNs require wildcard for guardrail version. "
                     "aws-marketplace:ViewSubscriptions/Subscribe (Bedrock model access "
                     "checks) do not support resource-level permissions and require '*'. "
-                    "Logs, Metrics, X-Ray, and Secrets Manager APIs are scoped to "
-                    "project prefix (openclaw/*) or do not support resource-level "
-                    "permissions. Cognito scoped to specific user pool.",
+                    "Custom logs and Secrets Manager use the project prefix (openclaw/*). "
+                    "AgentCore Runtime logs use the documented service prefix, with log group "
+                    "discovery scoped to the current account and region. Metrics and X-Ray "
+                    "do not support resource-level permissions. Cognito scoped to specific user pool.",
                     applies_to=[
                         "Resource::arn:aws:bedrock:*::foundation-model/*",
                         f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",
@@ -432,6 +445,9 @@ class AgentCoreStack(Stack):
                         "Resource::*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*:*",
+                        f"Resource::arn:aws:logs:{region}:{account}:log-group:/aws/bedrock-agentcore/runtimes/*",
+                        f"Resource::arn:aws:logs:{region}:{account}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*",
+                        f"Resource::arn:aws:logs:{region}:{account}:log-group:*",
                         # S3 per-user file storage bucket (grant_read_write wildcards)
                         "Action::s3:Abort*",
                         "Action::s3:DeleteObject*",

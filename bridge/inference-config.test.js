@@ -129,7 +129,7 @@ describe("proxy and contract wiring", () => {
   });
 
   it("both Converse and ConverseStream calls build inferenceConfig per model", () => {
-    const uses = proxySrc.match(/inferenceConfig:\s*buildInferenceConfig\(modelId, temperatureOverride\)/g) || [];
+    const uses = proxySrc.match(/inferenceConfig:\s*buildInferenceConfig\((?:modelId|selectedModelId), temperatureOverride\)/g) || [];
     assert.equal(uses.length, 2);
     assert.match(proxySrc, /parseTemperatureOverride\(process\.env\.BEDROCK_TEMPERATURE\)/);
   });
