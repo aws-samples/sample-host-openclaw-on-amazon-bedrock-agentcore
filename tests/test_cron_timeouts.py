@@ -6,6 +6,7 @@ needs it to stop before the Lambda does and to measure the turn from dispatch.
 """
 
 import json
+import time
 from unittest.mock import patch
 
 from tests.test_runtime_routing import (
@@ -69,3 +70,34 @@ def test_cron_lambda_never_async_retries_a_brief(tmp_path):
     assert configs[0]["FunctionName"] == {"Ref": function_id}
     function = resources[function_id]["Properties"]
     assert function["Timeout"] == int(function["Environment"]["Variables"]["LAMBDA_TIMEOUT_SECONDS"])
+
+
+def test_queue_expiry_reply_releases_the_cron_admission():
+    # The contract's reply when a brief's budget runs out queued behind another turn.
+    module = load_lambda("cron")
+    table = module.identity_table = FakeTable(candidate())
+    module.agentcore_client = FakeRuntime([{
+        "response": "Agent initialization or readiness failed. No turn was dispatched.",
+        "userId": USER, "sessionId": None, "status": "error",
+    }])
+    route = module.get_or_create_session(USER)
+    result = module.invoke_agentcore(route, "cron", USER, ACTOR, "telegram", "CN brief", deadline=time.monotonic() + 300)
+    assert result["status"] == "error"
+    session = table.items[(f"USER#{USER}", "SESSION")]
+    assert session["inFlight"] == 0 and "activeAdmissions" not in session
+
+
+def test_handler_sends_the_fixed_notice_when_a_queued_brief_expires():
+    module = load_lambda("cron")
+    table = module.identity_table = cron_table()
+    module.agentcore_client = FakeRuntime([
+        {"status": "ready", "phase": "USER_READY"},
+        {"response": "Agent initialization or readiness failed. No turn was dispatched.", "status": "error"},
+    ])
+    with patch.object(module, "deliver_response") as deliver:
+        assert module.handler(cron_event(), None)["statusCode"] == 503
+    (call,) = deliver.call_args_list
+    assert call.args[2].endswith(module.CRON_FAILED_MESSAGE)
+    assert "No turn was dispatched" not in call.args[2]
+    session = table.items[(f"USER#{USER}", "SESSION")]
+    assert session["inFlight"] == 0 and "activeAdmissions" not in session
