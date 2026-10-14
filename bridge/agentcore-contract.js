@@ -136,6 +136,12 @@ const BROWSER_SESSION_TIMEOUT_SECONDS = 3600;
 const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
 const ACTIVATION_TIMEOUT_MS = Number(process.env.USER_ACTIVATION_TIMEOUT_MS || 300000);
 const TURN_TIMEOUT_MS = 620000;
+// A cron caller (the cron Lambda) sends callerBudgetMs: how long it will keep
+// reading this response. Briefs on one session queue behind each other, so a
+// queued turn gets its own TURN_TIMEOUT_MS from dispatch, but never more than
+// the caller's budget less a margin for unknown-outcome cleanup and the reply.
+const MAX_CALLER_BUDGET_MS = 900000; // Lambda's maximum timeout
+const CALLER_REPLY_MARGIN_MS = 20000;
 let proxyModelOutcomeUnknown = false;
 const UNKNOWN_OUTCOME_RESPONSE = "The request outcome is unknown. It has not been automatically retried. Check any resulting changes before retrying.";
 const v2Lifecycle = createRuntimeLifecycle({
@@ -2089,6 +2095,13 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
   if (payload.stream !== undefined && typeof payload.stream !== "boolean") {
     return reply({ error: "stream must be a boolean" }, 400);
   }
+  const callerBudgetMs = payload.callerBudgetMs;
+  if (callerBudgetMs !== undefined && (!Number.isSafeInteger(callerBudgetMs) ||
+      callerBudgetMs <= 0 || callerBudgetMs > MAX_CALLER_BUDGET_MS)) {
+    return reply({ error: "callerBudgetMs must be a positive integer of at most 900000" }, 400);
+  }
+  const callerDeadline = callerBudgetMs === undefined ? null
+    : Date.now() + callerBudgetMs - CALLER_REPLY_MARGIN_MS;
   if ((runtimeSessionHeader && payload.runtimeSessionId && runtimeSessionHeader !== payload.runtimeSessionId) ||
       (payload.routingGeneration !== undefined &&
         (!Number.isSafeInteger(payload.routingGeneration) || payload.routingGeneration < 0))) {
@@ -2109,7 +2122,8 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
     userId, actorId, channel, channelActorId, channelTarget,
     runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
     routingGeneration: payload.routingGeneration ?? null,
-    deadline: Date.now() + TURN_TIMEOUT_MS,
+    // Bounds the queue wait; the turn itself is re-bounded at dispatch below.
+    deadline: callerDeadline ?? Date.now() + TURN_TIMEOUT_MS,
   });
   try {
     v2Lifecycle.assertBinding(context);
@@ -2132,10 +2146,20 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
     }).finally(() => { activeTaskCount = Math.max(0, activeTaskCount - 1); });
     return reply({ status: "initializing" });
   }
+  if (action === "warmup" && activeTaskCount > 1) {
+    // Another turn is running on this ready binding. Queueing the warmup behind
+    // it would block a second brief's warmup for the whole first brief; the
+    // queued turn re-verifies resources and proxy health before it dispatches.
+    activeTaskCount = Math.max(0, activeTaskCount - 1);
+    return reply({ status: "ready" });
+  }
   const stream = action === "chat" && payload.stream === true
     ? require("./invocation-stream").createInvocationStream(req, res, arrival, TURN_TIMEOUT_MS) : null;
   try {
-    const result = await v2Lifecycle.run(context, async (turn) => {
+    const result = await v2Lifecycle.run(context, async (queued) => {
+      // With a caller budget, time spent queued behind another turn is not charged to this one.
+      const turn = callerDeadline === null ? queued
+        : Object.freeze({ ...queued, deadline: Math.min(Date.now() + TURN_TIMEOUT_MS, callerDeadline) });
       await v2Lifecycle.recover(() => verifyV2Resources(turn), turn.deadline - Date.now());
       const before = await checkProxyHealth().catch(() => null);
       const dispatchAllowed = before?.model_outcome_unknown === false;

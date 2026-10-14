@@ -16,7 +16,7 @@ import boto3
 from botocore.config import Config
 from runtime_routing import admit_route, is_unknown_outcome, resolve_route
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
-from runtime_invocation import InvocationTransportError, invoke_bounded
+from runtime_invocation import RELEASE_RESERVE_SECONDS, InvocationTransportError, invoke_bounded
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -50,6 +50,13 @@ _token_cache = {}  # {secret_id: (value, fetched_at)}
 # --- Constants ---
 WARMUP_POLL_INTERVAL_SECONDS = 15
 WARMUP_MAX_WAIT_SECONDS = 300
+# Exception text can name the endpoint URL, runtime ARN and account ID, so
+# users only ever see these fixed messages; details stay in logs as a type.
+INVOCATION_FAILED_RESPONSE = "Agent invocation failed."
+CRON_FAILED_MESSAGE = (
+    "Your scheduled task did not return a result this time. "
+    "It will run again at the next scheduled time."
+)
 
 
 def _get_secret(secret_id):
@@ -188,10 +195,16 @@ def invoke_agentcore(route, action, user_id, actor_id, channel, message=None, de
     }
     if message:
         payload_dict["message"] = message
-
-    payload = json.dumps(payload_dict).encode()
     if deadline is None:
         deadline = time.monotonic() + max(0, LAMBDA_TIMEOUT_SECONDS - 30)
+    if action == "cron":
+        # Tell the contract how long this Lambda will read the response, so a
+        # turn queued behind another brief stops (or never starts) before we
+        # give up, instead of running on with no listener.
+        budget_ms = int((deadline - RELEASE_RESERVE_SECONDS - time.monotonic()) * 1000)
+        payload_dict["callerBudgetMs"] = max(1, min(900_000, budget_ms))
+
+    payload = json.dumps(payload_dict).encode()
 
     try:
         authorize_channel_actor(identity_table, route, user_id, actor_id, channel)
@@ -216,11 +229,12 @@ def invoke_agentcore(route, action, user_id, actor_id, channel, message=None, de
             if is_unknown_outcome(result):
                 admission.retain()
             if status_code != 200:
-                return {"response": "Agent invocation failed.", "status": "failed"}
+                return {"response": INVOCATION_FAILED_RESPONSE, "status": "failed"}
             return result
     except Exception as e:
-        logger.error("AgentCore invocation failed: %s", e, exc_info=True)
-        return {"response": f"Agent invocation failed: {e}", "status": "failed"}
+        # Log the type only: botocore messages embed the runtime ARN and account ID.
+        logger.error("AgentCore invocation failed: %s", type(e).__name__)
+        return {"response": INVOCATION_FAILED_RESPONSE, "status": "failed"}
 
 
 def warmup_and_wait(session_id, user_id, actor_id, channel, deadline=None, channel_target=None):
@@ -779,6 +793,10 @@ def handler(event, context):
     )
     if (not isinstance(result, dict) or result.get("status") in ("failed", "error")
             or is_unknown_outcome(result) or result.get("error")):
+        status = result.get("status") if isinstance(result, dict) else None
+        logger.warning("Scheduled task %s did not complete: status=%s", schedule_id, status)
+        # Never forward the runtime's response text on failure; send a fixed notice.
+        deliver_response(channel, channel_target, f"[Scheduled: {schedule_name or schedule_id}] {CRON_FAILED_MESSAGE}")
         return {"statusCode": 503, "body": "Scheduled task invocation failed or outcome unknown"}
     response_text = result.get("response", "No response from scheduled task.")
 
