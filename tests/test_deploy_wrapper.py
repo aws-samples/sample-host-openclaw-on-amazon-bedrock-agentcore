@@ -17,6 +17,7 @@ def project(tmp_path):
     scripts.mkdir()
     shutil.copy(ROOT / "scripts/deploy.sh", scripts)
     shutil.copy(ROOT / "scripts/build_and_push.sh", scripts)
+    shutil.copy(ROOT / "scripts/model_selection.py", scripts)
     context = {
         "region": "us-west-2", "runtime_id": "active-1234567890",
         "runtime_endpoint_id": "DEFAULT", "enable_guardrails": True,
@@ -235,6 +236,42 @@ def test_wrapper_passes_explicit_model_configuration(project):
     assert runtime_env["BEDROCK_MODEL_ID"] == "custom-primary"
     assert runtime_env["BEDROCK_FALLBACK_MODEL_ID"] == "custom-fallback"
     assert runtime_env["SUBAGENT_BEDROCK_MODEL_ID"] == "custom-subagent"
+
+
+def test_wrapper_passes_or_removes_user_selectable_models(project):
+    root, env = project
+    command = ["bash", str(root / "scripts/deploy.sh"), "--runtime-only",
+               "--image-uri", "123456789012.dkr.ecr.us-west-2.amazonaws.com/openclaw:v1"]
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    disabled = next(item["configuration"] for item in calls(project) if "configuration" in item)
+    assert "BEDROCK_USER_SELECTABLE_MODEL_IDS" not in disabled["environmentVariables"]
+    assert "BEDROCK_USER_SELECTABLE_MODEL_IDS" in disabled["unsetEnvironmentVariables"]
+
+    (root / "calls.jsonl").unlink()
+    config = json.loads((root / "cdk.json").read_text())
+    config["context"]["user_selectable_models"] = {
+        "sonnet": "global.anthropic.claude-sonnet-5-5", "opus": "global.anthropic.claude-opus-5-5"}
+    (root / "cdk.json").write_text(json.dumps(config))
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    enabled = next(item["configuration"] for item in calls(project) if "configuration" in item)
+    assert enabled["environmentVariables"]["BEDROCK_USER_SELECTABLE_MODEL_IDS"] == (
+        "global.anthropic.claude-sonnet-5-5,global.anthropic.claude-opus-5-5")
+
+
+def test_wrapper_rejects_invalid_user_selectable_models_before_runtime_update(project):
+    root, env = project
+    config = json.loads((root / "cdk.json").read_text())
+    config["context"]["user_selectable_models"] = {"default": "global.anthropic.claude-opus-5-5"}
+    (root / "cdk.json").write_text(json.dumps(config))
+    result = subprocess.run([
+        "bash", str(root / "scripts/deploy.sh"), "--runtime-only",
+        "--image-uri", "123456789012.dkr.ecr.us-west-2.amazonaws.com/openclaw:v1",
+    ], env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "user_selectable_models" in result.stderr
+    assert not any("configuration" in item for item in calls(project))
 
 
 def test_phase1_uses_cdk_python_without_deployment_venv(project):

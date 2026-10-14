@@ -52,6 +52,12 @@ MODEL_PRICING = {
     # in-Region (AWS Price List, AmazonBedrockFoundationModels, 2026-09-28).
     "global.anthropic.claude-opus-5-5": {"input": 4.00, "output": 20.00},
     "anthropic.claude-opus-5-5": {"input": 4.40, "output": 22.00},
+    # Claude Sonnet 5.5 and Haiku 5.5 (standard context), same global/geo split
+    # (AWS Price List, AmazonBedrockFoundationModels us-east-1, 2026-10-14).
+    "global.anthropic.claude-sonnet-5-5": {"input": 2.00, "output": 10.00},
+    "anthropic.claude-sonnet-5-5": {"input": 2.20, "output": 11.00},
+    "global.anthropic.claude-haiku-5-5": {"input": 0.10, "output": 0.50},
+    "anthropic.claude-haiku-5-5": {"input": 0.11, "output": 0.55},
     "minimax.minimax-m2": {"input": 1.00, "output": 5.00},
 }
 

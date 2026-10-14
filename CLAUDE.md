@@ -294,6 +294,7 @@ PYTHONPATH=lambda/shared/python:lambda/router uv run --no-project --python .venv
 PYTHONPATH=lambda/shared/python:lambda/router uv run --no-project --python .venv/bin/python python -m pytest lambda/router/test_content_extraction.py -v  # content block extraction tests
 PYTHONPATH=lambda/shared/python:lambda/router uv run --no-project --python .venv/bin/python python -m pytest lambda/router/test_markdown_html.py -v       # markdown-to-HTML conversion tests
 PYTHONPATH=lambda/shared/python:lambda/router uv run --no-project --python .venv/bin/python python -m pytest lambda/router/test_screenshot_handling.py -v # screenshot marker detection + delivery tests
+PYTHONPATH=lambda/shared/python:lambda/router uv run --no-project --python .venv/bin/python python -m pytest lambda/router/test_model_switching.py -v   # /model per-user model switching tests
 ```
 
 ### E2E Tests

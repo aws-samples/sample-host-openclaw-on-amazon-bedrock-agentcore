@@ -85,5 +85,27 @@ class TestExistingPricingUnchanged(unittest.TestCase):
         )
 
 
+class TestUserSelectableModelPricing(unittest.TestCase):
+    """Every model shipped in cdk.json user_selectable_models has an explicit price."""
+
+    def test_sonnet_and_haiku_5_5_global_and_geo_prices(self):
+        expected = {
+            "global.anthropic.claude-sonnet-5-5": (2.00, 10.00),
+            "au.anthropic.claude-sonnet-5-5": (2.20, 11.00),
+            "anthropic.claude-sonnet-5-5": (2.20, 11.00),
+            "global.anthropic.claude-haiku-5-5": (0.10, 0.50),
+            "us.anthropic.claude-haiku-5-5": (0.11, 0.55),
+        }
+        for model_id, (input_price, output_price) in expected.items():
+            self.assertAlmostEqual(tm.estimate_cost(model_id, MILLION, 0), input_price, places=6, msg=model_id)
+            self.assertAlmostEqual(tm.estimate_cost(model_id, 0, MILLION), output_price, places=6, msg=model_id)
+
+    def test_shipped_allowlist_models_are_not_default_priced(self):
+        import json
+        context = json.loads((_ROOT / "cdk.json").read_text())["context"]
+        for model_id in context["user_selectable_models"].values():
+            self.assertTrue(any(key in model_id for key in tm.MODEL_PRICING), model_id)
+
+
 if __name__ == "__main__":
     unittest.main()
