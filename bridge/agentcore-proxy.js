@@ -381,6 +381,7 @@ function extractSessionMetadata(parsed, headers) {
 // cache). Shared with agentcore-contract.js via bridge/cognito-token.js so
 // both processes derive the same password for the same actorId.
 const { scopeGuardrailToLatestUserTurn } = require("./guardrail-scope");
+const { reconcileToolHistory } = require("./tool-history");
 const { readBody } = require("./read-body");
 const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
   userPoolId: COGNITO_USER_POOL_ID,
@@ -1032,6 +1033,8 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
+  // Without tools on this request, history tool blocks become text (see tool-history.js).
+  params.messages = reconcileToolHistory(params.messages, toolConfig);
 
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -1155,6 +1158,8 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) payload.toolConfig = toolConfig;
+  // Without tools on this request, history tool blocks become text (see tool-history.js).
+  payload.messages = reconcileToolHistory(payload.messages, toolConfig);
   const requestParams = (selectedModelId) => {
     const params = {
       ...(route ? structuredClone(payload) : payload),

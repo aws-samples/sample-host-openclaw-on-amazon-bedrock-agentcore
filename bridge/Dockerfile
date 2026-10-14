@@ -176,6 +176,7 @@ COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
 COPY cognito-token.js /app/cognito-token.js
 COPY guardrail-scope.js /app/guardrail-scope.js
+COPY tool-history.js /app/tool-history.js
 COPY system-messages.js /app/system-messages.js
 COPY inference-config.js /app/inference-config.js
 COPY read-body.js /app/read-body.js
