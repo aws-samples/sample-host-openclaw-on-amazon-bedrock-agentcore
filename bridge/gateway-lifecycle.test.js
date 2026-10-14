@@ -13,6 +13,7 @@ async function fakeGateway(t, {
 } = {}) {
   const calls = [];
   const frames = [];
+  const handlerMap = new Map(Object.entries(handlers));
   const server = http.createServer((_req, res) => {
     calls.push("startupz");
     res.writeHead(startup);
@@ -40,8 +41,9 @@ async function fakeGateway(t, {
       } else if (frame.method === "config.get") {
         assert.deepEqual(frame.params, {});
         config?.({ frame, reply, port: server.address().port });
-      } else if (handlers[frame.method]) {
-        handlers[frame.method]({ socket, frame, reply });
+      } else {
+        const handler = handlerMap.get(frame.method);
+        if (typeof handler === "function") handler({ socket, frame, reply });
       }
     });
   });
