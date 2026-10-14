@@ -449,6 +449,221 @@ test("list failure, missing task methods, hangs and dead gateways never reject",
   assert.equal(unauth.phase, "failed");
 });
 
+// ── Final delivery: only the run's answer, not the whole run buffer ─────────
+// openclaw 2026.9.5 server-chat emitChatDelta/emitChatTerminal join every
+// assistant text item of a run into one buffer, so the WS final carries the
+// status lines the model wrote before its tool calls. The bridge reads the
+// run back with chat.history and delivers the last assistant message.
+
+const HISTORY_METHODS = ["chat.send", "last-heartbeat", "chat.history"];
+const commentarySignature = (id) => JSON.stringify({ v: 1, id: `commentary-0-${id}`, phase: "commentary" });
+
+// Transcript shapes as openclaw 2026.9.5 stores them (agent transcript events).
+const userMessage = (key, text = "brief please") => ({
+  role: "user", content: [{ type: "text", text }], idempotencyKey: key, timestamp: 1,
+  __openclaw: { senderIsOwner: true, transport: "gateway" },
+});
+const commentaryMessage = (run, text, id) => ({
+  role: "assistant", stopReason: "toolUse", __openclaw: { runId: run },
+  content: [{ type: "text", text, textSignature: commentarySignature(id) },
+    { type: "toolCall", id: `call-${id}`, name: "exec", arguments: { command: "true" } }],
+});
+const toolOnlyMessage = (run, id) => ({
+  role: "assistant", stopReason: "toolUse", __openclaw: { runId: run },
+  content: [{ type: "toolCall", id: `call-${id}`, name: "exec", arguments: { command: "true" } }],
+});
+const toolResult = (run, id) => ({
+  role: "toolResult", toolCallId: `call-${id}`, toolName: "exec", isError: false,
+  __openclaw: { runId: run }, content: [{ type: "text", text: "ok" }],
+});
+const answerMessage = (run, text) => ({
+  role: "assistant", stopReason: "stop", __openclaw: { runId: run }, content: [{ type: "text", text }],
+});
+
+const BRIEF = `Morning brief\n\n${"- market item with enough detail to be a real answer\n".repeat(5)}`;
+
+function historyGateway(t, { history, chatEvents, methods = HISTORY_METHODS }) {
+  const historyCalls = [];
+  return fakeGateway(t, {
+    methods,
+    chat: ({ frame, reply, socket }) => {
+      reply(true, { status: "accepted", runId: frame.id });
+      for (const payload of chatEvents(frame.id)) {
+        socket.send(JSON.stringify({ type: "event", event: "chat", payload }));
+      }
+    },
+    handlers: {
+      "chat.history": ({ frame, reply, socket }) => {
+        historyCalls.push(frame.params);
+        history({ frame, reply, socket });
+      },
+    },
+  }).then((gateway) => ({ ...gateway, historyCalls }));
+}
+
+// Two text items and a tool call, as the gateway streams them: the buffer
+// grows "Status A" -> "Status A\n\n<brief>".
+const twoItemsAndToolCall = (run) => [
+  { runId: run, sessionKey: "agent:main:main", state: "delta", text: "That old result is stale; checking prices now." },
+  { runId: run, sessionKey: "agent:main:main", state: "delta", text: `That old result is stale; checking prices now.\n\n${BRIEF}` },
+  { runId: run, sessionKey: "agent:main:main", state: "final", text: `That old result is stale; checking prices now.\n\n${BRIEF}` },
+];
+
+test("final delivery is the run's last assistant message, not the status lines before tool calls", async (t) => {
+  const deltas = [];
+  const gateway = await historyGateway(t, {
+    chatEvents: twoItemsAndToolCall,
+    history: ({ frame, reply }) => {
+      const run = gateway.frames.find((f) => f.method === "chat.send").id;
+      reply(true, { sessionKey: frame.params.sessionKey, messages: [
+        userMessage("earlier-run"), answerMessage("earlier-run", "yesterday's answer"),
+        userMessage(run),
+        commentaryMessage(run, "That old result is stale; checking prices now.", "a"), toolResult(run, "a"),
+        toolOnlyMessage(run, "b"), toolResult(run, "b"),
+        answerMessage(run, BRIEF),
+      ] });
+    },
+  });
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please",
+    onDelta: (text) => deltas.push(text), log: recordingLog() });
+  assert.equal(result.phase, "completed");
+  assert.equal(result.response, BRIEF.trim());
+  assert.equal(result.delivery, "history");
+  assert.ok(!result.response.includes("stale"));
+  assert.deepEqual(gateway.historyCalls, [{ sessionKey: "agent:main:main", limit: 100, maxChars: 500000 }]);
+  // Live streaming is unchanged: the deltas still carry the run buffer.
+  assert.equal(deltas.length, 2);
+  assert.ok(deltas[1].startsWith("That old result is stale"));
+});
+
+test("a short final answer is delivered together with the run's earlier non-commentary text", async (t) => {
+  const gateway = await historyGateway(t, {
+    chatEvents: twoItemsAndToolCall,
+    history: ({ reply }) => {
+      const run = gateway.frames.find((f) => f.method === "chat.send").id;
+      reply(true, { messages: [
+        userMessage(run),
+        commentaryMessage(run, "Checking prices now.", "a"), toolResult(run, "a"),
+        // Unphased text next to a tool call is content, not commentary.
+        { ...toolOnlyMessage(run, "b"), content: [{ type: "text", text: BRIEF },
+          { type: "toolCall", id: "call-b", name: "exec", arguments: {} }] }, toolResult(run, "b"),
+        answerMessage(run, "Audio is attached."),
+      ] });
+    },
+  });
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please", log: recordingLog() });
+  assert.equal(result.response, `${BRIEF.trim()}\n\nAudio is attached.`);
+  assert.ok(!result.response.includes("Checking prices"));
+  assert.equal(result.delivery, "history");
+});
+
+test("a short final answer with no other content is delivered alone", async (t) => {
+  const gateway = await historyGateway(t, {
+    chatEvents: (run) => [{ runId: run, sessionKey: "agent:main:main", state: "final", text: "Working.\n\nDone." }],
+    history: ({ reply }) => {
+      const run = gateway.frames.find((f) => f.method === "chat.send").id;
+      reply(true, { messages: [userMessage(run), commentaryMessage(run, "Working.", "a"), toolResult(run, "a"),
+        answerMessage(run, "Done.")] });
+    },
+  });
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "hi", log: recordingLog() });
+  assert.equal(result.response, "Done.");
+});
+
+for (const failure of ["rejected", "empty", "no-final", "truncated", "timeout", "closed", "capability"]) {
+  test(`chat.history ${failure} falls back to the run buffer with a warning`, async (t) => {
+    const buffer = `That old result is stale; checking prices now.\n\n${BRIEF}`;
+    const gateway = await historyGateway(t, {
+      methods: failure === "capability" ? ["chat.send", "last-heartbeat"] : HISTORY_METHODS,
+      chatEvents: twoItemsAndToolCall,
+      history: ({ reply, socket }) => {
+        const run = gateway.frames.find((f) => f.method === "chat.send").id;
+        if (failure === "rejected") return reply(false, undefined);
+        if (failure === "empty") return reply(true, { messages: [] });
+        if (failure === "no-final") return reply(true, { messages: [userMessage(run), commentaryMessage(run, "x", "a")] });
+        if (failure === "truncated") return reply(true, { messages: [userMessage(run),
+          { ...answerMessage(run, BRIEF), __openclaw: { runId: run, truncated: true, reason: "oversized" } }] });
+        if (failure === "closed") return socket.terminate();
+      },
+    });
+    const out = recordingLog();
+    const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please", log: out,
+      deadline: Date.now() + (failure === "timeout" ? 300 : 20000) });
+    assert.equal(result.phase, "completed");
+    assert.equal(result.accepted, true);
+    assert.equal(result.response, buffer);
+    assert.equal(result.delivery, "buffer");
+    assert.ok(out.lines.some(([level]) => level === "warn"), "fallback must warn");
+    assertConstantFormats(out.lines, [buffer.slice(0, 20)]);
+    assert.equal(gateway.calls.filter((method) => method === "chat.send").length, 1);
+  });
+}
+
+test("history from other runs and sub-agents is never delivered", async (t) => {
+  const gateway = await historyGateway(t, {
+    chatEvents: (run) => [
+      { runId: "sub", sessionKey: "agent:main:subagent:1", state: "final", text: "subagent report" },
+      ...twoItemsAndToolCall(run),
+    ],
+    history: ({ reply }) => {
+      const run = gateway.frames.find((f) => f.method === "chat.send").id;
+      reply(true, { messages: [
+        userMessage(run), answerMessage(run, BRIEF),
+        // A later queued input and its run must not replace our answer.
+        userMessage("later-run"), answerMessage("later-run", "later answer"),
+        answerMessage("sub", "subagent report"),
+      ] });
+    },
+  });
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please", log: recordingLog() });
+  assert.equal(result.response, BRIEF.trim());
+});
+
+test("a yielded run delivers its successor's final answer", async (t) => {
+  const gateway = await historyGateway(t, {
+    chatEvents: (run) => [
+      { runId: run, sessionKey: "agent:main:main", state: "final", yielded: true, text: "waiting" },
+      { runId: "successor", sessionKey: "agent:main:main", state: "delta", text: "Status\n\nReal answer" },
+      { runId: "successor", sessionKey: "agent:main:main", state: "final", text: "Status\n\nReal answer" },
+    ],
+    history: ({ reply }) => {
+      const run = gateway.frames.find((f) => f.method === "chat.send").id;
+      reply(true, { messages: [
+        userMessage(run), commentaryMessage(run, "Status", "a"), toolResult(run, "a"),
+        answerMessage("successor", BRIEF),
+      ] });
+    },
+  });
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please", log: recordingLog() });
+  assert.equal(result.response, BRIEF.trim());
+});
+
+test("the raw content-block guard (#137) still applies to the history answer", async (t) => {
+  const src = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf8");
+  const start = src.indexOf("function extractTextFromContent(");
+  const end = src.indexOf("\n}\n", start);
+  assert.ok(start !== -1 && end !== -1);
+  const extractText = new Function(`${src.slice(start, end + 2)}\nreturn extractTextFromContent;`)();
+  const raw = JSON.stringify([{ type: "text", text: BRIEF }]);
+  const gateway = await historyGateway(t, {
+    chatEvents: (run) => [{ runId: run, sessionKey: "agent:main:main", state: "final", message: { content: raw } }],
+    history: ({ reply }) => {
+      const run = gateway.frames.find((f) => f.method === "chat.send").id;
+      reply(true, { messages: [userMessage(run), answerMessage(run, raw)] });
+    },
+  });
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please",
+    extractText, log: recordingLog() });
+  assert.equal(result.response, BRIEF.trim());
+  assert.equal(result.delivery, "history");
+});
+
+test("the contract's turn keeps handing the gateway result to delivery unchanged", () => {
+  const contract = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf8");
+  assert.match(contract, /extractText: extractTextFromContent,/);
+  assert.match(contract, /outcome\.response \|\| "The request completed without a text response\."/);
+});
+
 test("the contract runs the sweep after gateway readiness and before the first turn", () => {
   const contract = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf8");
   assert.match(contract, /dismissStaleSuspendedDeliveries[^;]*\} = require\("\.\/gateway-lifecycle"\)/s);

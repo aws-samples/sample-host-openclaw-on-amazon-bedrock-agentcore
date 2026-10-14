@@ -68,9 +68,79 @@ function appliedConfigReady(snapshot, port) {
     config.agents?.defaults?.model?.primary === "agentcore/bedrock-agentcore";
 }
 
+const TOOL_BLOCK_TYPES = new Set(["toolCall", "tool_call", "toolUse", "tool_use", "functionCall", "function_call"]);
+const SHORT_FINAL_CHARS = 200;
+const HISTORY_TIMEOUT_MS = 5000;
+const HISTORY_LIMIT = 100;
+const HISTORY_MAX_CHARS = 500000; // openclaw 2026.9.5 ChatHistoryParamsSchema maximum; default 8000 truncates.
+
+function textBlockPhase(block) {
+  let signature = block?.textSignature;
+  if (typeof signature === "string") {
+    try { signature = JSON.parse(signature); } catch { signature = undefined; }
+  }
+  return signature && typeof signature === "object" ? signature.phase : undefined;
+}
+
+function historyMeta(message) {
+  const meta = message?.__openclaw;
+  return meta && typeof meta === "object" ? meta : {};
+}
+
+function historyUserKey(message) {
+  return message.idempotencyKey ?? historyMeta(message).idempotencyKey;
+}
+
+/**
+ * Pick the text to deliver for one run from openclaw 2026.9.5 chat.history.
+ *
+ * The WS chat final carries the run's whole text buffer, so status lines the
+ * model wrote before tool calls reach the user. The answer is the last
+ * assistant message of the run that has no tool call, without commentary-phase
+ * text blocks. When that message is short and the run wrote other
+ * non-commentary text, all of it is delivered so content split over several
+ * messages is not lost. Returns null when the run's answer cannot be found
+ * or was truncated by the gateway, so the caller can fall back.
+ */
+function selectFinalAnswer(messages, { userKey, runIds, extractText = (value) => typeof value === "string" ? value : "" }) {
+  if (!Array.isArray(messages)) return null;
+  const list = messages.filter((message) => message && typeof message === "object");
+  let start = -1;
+  for (let i = list.length - 1; i >= 0 && userKey; i--) {
+    if (list[i].role === "user" && historyUserKey(list[i]) === userKey) { start = i; break; }
+  }
+  const items = [];
+  for (const message of start === -1 ? list : list.slice(start + 1)) {
+    const otherInput = message.role === "user" && historyUserKey(message) && historyUserKey(message) !== userKey;
+    if (start !== -1 && otherInput) break;
+    if (message.role !== "assistant") continue;
+    const messageRun = historyMeta(message).runId;
+    if (messageRun ? !runIds.has(messageRun) : start === -1) continue;
+    if (message.phase === "commentary" || message.openclawStreamFallback) continue;
+    const content = Array.isArray(message.content) ? message.content
+      : typeof message.content === "string" ? [{ type: "text", text: message.content }] : [];
+    const blocks = content.filter((block) => block?.type === "text" && typeof block.text === "string" &&
+      textBlockPhase(block) !== "commentary");
+    items.push({
+      text: blocks.length ? String(extractText(blocks.map((block) => block.text).join("")) || "").trim() : "",
+      hasTool: content.some((block) => TOOL_BLOCK_TYPES.has(block?.type)),
+      truncated: historyMeta(message).truncated === true,
+    });
+  }
+  let last = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (!items[i].hasTool && items[i].text) { last = i; break; }
+  }
+  if (last === -1) return null;
+  const earlier = items.slice(0, last).filter((item) => item.text);
+  const chosen = items[last].text.length < SHORT_FINAL_CHARS && earlier.length ? [...earlier, items[last]] : [items[last]];
+  if (chosen.some((item) => item.truncated)) return null;
+  return { text: chosen.map((item) => item.text).join("\n\n"), items: chosen.length };
+}
+
 function gatewayTurn({
   url, token, message, onDelta, extractText = (value) => typeof value === "string" ? value : "",
-  deadline = Date.now() + 620000, signal, probeOnly = false, configProbe = false,
+  deadline = Date.now() + 620000, signal, probeOnly = false, configProbe = false, log = globalThis.console,
 }) {
   return new Promise((resolve) => {
     let socket;
@@ -78,31 +148,44 @@ function gatewayTurn({
     let sent = false;
     let accepted = false;
     let response = "";
+    let delivery = "buffer";
     let connectId;
     let probeId;
     let configId;
+    let historyId;
     let configSnapshot;
     let runId;
     let tracker;
+    const ownRuns = new Set();
     let stage = "challenge";
     let capabilities = [];
     let timer;
     let handshakeTimer;
+    let historyTimer;
     const finish = (phase, error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(handshakeTimer);
+      clearTimeout(historyTimer);
       signal?.removeEventListener("abort", abort);
       socket?.terminate();
       resolve({
         phase, response, runId: runId || null,
         ...(configSnapshot ? { configSnapshot } : {}),
+        ...(phase === "completed" ? { delivery } : {}),
         accepted: accepted ? true : sent && phase !== "rejected" ? null : false,
         ...(error ? { error } : {}),
       });
     };
-    const uncertain = (error) => finish(sent ? "unknown_outcome" : "not_sent", error);
+    // The run has finished: any history problem delivers today's run buffer.
+    const deliverBuffer = (reason) => {
+      if (settled) return;
+      try { log?.warn?.("[gateway] Delivering the run text buffer (%s chars): %s", response.length, reason); } catch {}
+      finish("completed");
+    };
+    const uncertain = (error) => stage === "history" ? deliverBuffer(error)
+      : finish(sent ? "unknown_outcome" : "not_sent", error);
     const abort = () => uncertain("Gateway request aborted");
     if (signal?.aborted || Date.now() >= deadline) return uncertain("Turn deadline exceeded");
     signal?.addEventListener("abort", abort, { once: true });
@@ -175,6 +258,7 @@ function gatewayTurn({
       } else if (stage === "chat" && frame.type === "event" && frame.event === "chat") {
         const payload = frame.payload || {};
         const verdict = tracker.classify(payload);
+        if (verdict.action !== "ignore" && tracker.state.runId) ownRuns.add(tracker.state.runId);
         if (verdict.action === "ignore" || verdict.action === "yield") return;
         const text = extractText(payload.message?.content) || extractText(payload.message) ||
           extractText(payload.text) || extractText(payload.content);
@@ -183,10 +267,34 @@ function gatewayTurn({
         if (payload.state === "delta") {
           try { if (text) onDelta?.(text); } catch {}
         } else if (payload.state === "final") {
-          finish("completed");
+          // The final carries every assistant item of the run joined together;
+          // deliver only the run's answer, read back from the transcript.
+          if (!capabilities.includes("chat.history")) {
+            return deliverBuffer("chat.history capability unavailable");
+          }
+          stage = "history";
+          clearTimeout(timer);
+          historyTimer = setTimeout(() => deliverBuffer("chat.history timed out"),
+            Math.max(1, Math.min(HISTORY_TIMEOUT_MS, deadline - Date.now())));
+          historyId = randomUUID();
+          send(historyId, "chat.history", {
+            sessionKey: tracker.state.sessionKey || payload.sessionKey || "global",
+            limit: HISTORY_LIMIT, maxChars: HISTORY_MAX_CHARS,
+          });
         } else if (["error", "aborted"].includes(payload.state)) {
           finish(payload.state, "Gateway turn ended without completion");
         }
+      } else if (stage === "history" && frame.type === "res" && frame.id === historyId) {
+        if (frame.ok !== true) return deliverBuffer("chat.history rejected");
+        const answer = selectFinalAnswer(frame.payload?.messages, { userKey: runId, runIds: ownRuns, extractText });
+        if (!answer) return deliverBuffer("no final assistant message in chat.history");
+        try {
+          log?.log?.("[gateway] Delivering the run's final answer from chat.history: %s chars from %s item(s), buffer %s chars",
+            answer.text.length, answer.items, response.length);
+        } catch {}
+        response = answer.text;
+        delivery = "history";
+        finish("completed");
       }
     });
     socket.on("error", () => uncertain("Gateway connection failed"));
@@ -374,5 +482,5 @@ async function dismissStaleSuspendedDeliveries({
 
 module.exports = {
   readStartup, waitForGateway, gatewayTurn, appliedConfigReady,
-  dismissStaleSuspendedDeliveries, isStaleSuspendedDelivery, STALE_DELIVERY_MS,
+  dismissStaleSuspendedDeliveries, isStaleSuspendedDelivery, STALE_DELIVERY_MS, selectFinalAnswer,
 };
