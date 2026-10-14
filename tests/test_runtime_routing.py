@@ -836,5 +836,8 @@ def test_cron_sdk_warmup_reaches_execution_and_preserves_admission(sdk_body, res
         deliver.assert_called_once_with("telegram", "123", "done")
         assert record["inFlight"] == 0 and "activeAdmissions" not in record
     else:
-        deliver.assert_not_called()
+        # The user gets one fixed notice, never the runtime's own text.
+        deliver.assert_called_once()
+        assert deliver.call_args.args[:2] == ("telegram", "123")
+        assert deliver.call_args.args[2].endswith(module.CRON_FAILED_MESSAGE)
         assert record["inFlight"] == 1 and len(record["activeAdmissions"]) == 1

@@ -151,6 +151,14 @@ def test_telegram_preserves_unknown_response_delivery_ownership(streamed):
     assert_retained(table, resolve(table))
 
 
+def assert_fixed_cron_notice(module, deliver):
+    """An unconfirmed cron outcome sends only the fixed notice, never the runtime's text."""
+    deliver.assert_called_once()
+    channel, target, text = deliver.call_args.args
+    assert (channel, target) == ("telegram", "123")
+    assert text == f"[Scheduled: schedule123] {module.CRON_FAILED_MESSAGE}"
+
+
 @pytest.mark.parametrize("metadata", UNKNOWN_METADATA[:4])
 def test_cron_does_not_report_or_deliver_unknown_execution_as_success(metadata):
     module = load_lambda("cron")
@@ -160,7 +168,7 @@ def test_cron_does_not_report_or_deliver_unknown_execution_as_success(metadata):
     ])
     with patch.object(module, "deliver_response") as deliver:
         assert module.handler(cron_event(), None)["statusCode"] == 503
-    deliver.assert_not_called()
+    assert_fixed_cron_notice(module, deliver)
     assert [json.loads(call["payload"])["action"] for call in runtime.calls] == ["warmup", "cron"]
     assert_retained(table, resolve(table))
 
@@ -337,7 +345,7 @@ def test_handler_never_delivers_unconfirmed_body_or_replays(caller, content):
             module, "deliver_response",
         ) as send:
             assert module.handler(cron_event(), None)["statusCode"] == 503
-        send.assert_not_called()
+        assert_fixed_cron_notice(module, send)
     assert len(runtime.calls) == 1
     assert_retained(table, route)
     assert resolve(table) == route
