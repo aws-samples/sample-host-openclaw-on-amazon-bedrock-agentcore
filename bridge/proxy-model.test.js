@@ -94,6 +94,7 @@ function streaming(send, { subagent = false, subagentModel = "custom-subagent" }
       systemText: "system",
     }),
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
+    reconcileToolHistory: require("./tool-history").reconcileToolHistory,
     guardrailConfig: { guardrailIdentifier: "test-guard", guardrailVersion: "1" },
     buildInferenceConfig: require("./inference-config").buildInferenceConfig,
     temperatureOverride: undefined,
