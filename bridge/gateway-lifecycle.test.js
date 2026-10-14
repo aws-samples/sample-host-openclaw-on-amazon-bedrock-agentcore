@@ -278,8 +278,10 @@ function recordingLog() {
 
 function assertConstantFormats(lines, ids) {
   for (const [, format] of lines) {
+    // Constant first argument (CodeQL) with values as trailing arguments, no
+    // printf placeholders: cloudwatch-logger.js joins arguments as they are.
     assert.equal(typeof format, "string");
-    assert.match(format, /%s/);
+    assert.doesNotMatch(format, /%[sdifjoOc]/);
     for (const id of ids) assert.ok(!format.includes(id), `format string must not embed ${id}`);
   }
 }
@@ -338,7 +340,7 @@ test("an old suspended sub-agent delivery is dismissed exactly once", async (t) 
   assert.ok(out.lines.some(([level, format, ...args]) => level === "log" && /Dismissed/.test(format) &&
     args.includes("task-old") && args.includes("run-old")));
   assert.ok(out.lines.some(([level, format, ...args]) => level === "log" && /sweep/.test(format) &&
-    args.join(" ") === "1 1 1 0"));
+    [format, ...args].join(" ") === "[gateway] Stale delivery sweep: listed 1 stale 1 dismissed 1 not_dismissed 0"));
   assertConstantFormats(out.lines, ["task-old", "run-old"]);
   assert.ok(!gateway.calls.includes("chat.send"));
 });
@@ -600,6 +602,110 @@ for (const failure of ["rejected", "empty", "no-final", "truncated", "timeout", 
     assert.equal(gateway.calls.filter((method) => method === "chat.send").length, 1);
   });
 }
+
+// After a snapshot restore the first chat.history can be slow: staging saw
+// 5559 ms right after "process was frozen ~913077ms", against a 5000 ms limit,
+// so that turn fell back to the run buffer and could have leaked status lines.
+const runAnswer = (gateway) => {
+  const run = gateway.frames.find((f) => f.method === "chat.send").id;
+  return { messages: [userMessage(run), commentaryMessage(run, "That old result is stale; checking prices now.", "a"),
+    toolResult(run, "a"), answerMessage(run, BRIEF)] };
+};
+
+test("a chat.history reply slower than the old 5 s limit still delivers the final answer", async (t) => {
+  const gateway = await historyGateway(t, {
+    chatEvents: twoItemsAndToolCall,
+    history: ({ reply }) => {
+      const timer = setTimeout(() => reply(true, runAnswer(gateway)), 5600);
+      t.after(() => clearTimeout(timer));
+    },
+  });
+  const out = recordingLog();
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please", log: out });
+  assert.equal(result.phase, "completed");
+  assert.equal(result.delivery, "history");
+  assert.equal(result.response, BRIEF.trim());
+  assert.equal(gateway.historyCalls.length, 1);
+  assert.ok(!out.lines.some(([level]) => level === "warn"));
+});
+
+test("a chat.history request that gets no reply is retried once and the answer delivered", async (t) => {
+  const gateway = await historyGateway(t, {
+    chatEvents: twoItemsAndToolCall,
+    history: ({ reply }) => {
+      if (gateway.historyCalls.length === 2) reply(true, runAnswer(gateway));
+    },
+  });
+  const out = recordingLog();
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please", log: out,
+    historyTimeoutMs: 200, deadline: Date.now() + 20000 });
+  assert.equal(result.delivery, "history");
+  assert.equal(result.response, BRIEF.trim());
+  assert.equal(gateway.historyCalls.length, 2);
+  assert.deepEqual(gateway.historyCalls[1], gateway.historyCalls[0]);
+  assert.ok(out.lines.some(([level, format]) => level === "warn" && /retrying/.test(format)));
+  assertConstantFormats(out.lines, [BRIEF.slice(0, 20)]);
+});
+
+test("a late reply to the first chat.history request is still used after the retry is sent", async (t) => {
+  let first;
+  const gateway = await historyGateway(t, {
+    chatEvents: twoItemsAndToolCall,
+    history: ({ frame, reply }) => {
+      if (gateway.historyCalls.length === 1) { first = frame.id; return; }
+      reply(true, runAnswer(gateway), first);
+    },
+  });
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please",
+    log: recordingLog(), historyTimeoutMs: 200, deadline: Date.now() + 20000 });
+  assert.equal(result.delivery, "history");
+  assert.equal(result.response, BRIEF.trim());
+});
+
+test("a chat.history that never answers falls back after two bounded attempts", async (t) => {
+  const gateway = await historyGateway(t, { chatEvents: twoItemsAndToolCall, history: () => {} });
+  const out = recordingLog();
+  const started = Date.now();
+  const result = await gatewayTurn({ url: gateway.url, token: "secret", message: "brief please", log: out,
+    historyTimeoutMs: 200, deadline: Date.now() + 20000 });
+  const elapsed = Date.now() - started;
+  assert.equal(result.phase, "completed");
+  assert.equal(result.delivery, "buffer");
+  assert.equal(result.response, `That old result is stale; checking prices now.\n\n${BRIEF}`);
+  assert.equal(gateway.historyCalls.length, 2);
+  assert.ok(elapsed >= 400 && elapsed < 2000, `fallback after two 200 ms attempts, took ${elapsed} ms`);
+  assert.ok(out.lines.some(([level, format, ...args]) => level === "warn" && /buffer/.test(format) &&
+    args.includes("chat.history timed out")));
+  assertConstantFormats(out.lines, [BRIEF.slice(0, 20)]);
+});
+
+test("the chat.history wait never runs past a near turn deadline", async (t) => {
+  // Default attempt length: the first attempt is cut to the deadline, no retry.
+  const near = await historyGateway(t, { chatEvents: twoItemsAndToolCall, history: () => {} });
+  let deadline = Date.now() + 1500;
+  let result = await gatewayTurn({ url: near.url, token: "secret", message: "brief please",
+    log: recordingLog(), deadline });
+  assert.equal(result.delivery, "buffer");
+  assert.ok(Date.now() <= deadline + 100, "first attempt must stop at the deadline");
+  assert.equal(near.historyCalls.length, 1);
+  // Room for a retry, but not a full attempt: the retry is cut to the deadline.
+  const tight = await historyGateway(t, { chatEvents: twoItemsAndToolCall, history: () => {} });
+  deadline = Date.now() + 600;
+  result = await gatewayTurn({ url: tight.url, token: "secret", message: "brief please",
+    log: recordingLog(), historyTimeoutMs: 400, deadline });
+  assert.equal(result.delivery, "buffer");
+  assert.equal(tight.historyCalls.length, 2);
+  assert.ok(Date.now() <= deadline + 100, "retry must stop at the deadline");
+});
+
+test("bridge log lines render the same through console and the CloudWatch logger", () => {
+  // cloudwatch-logger.js joins console arguments with spaces and does not
+  // apply printf placeholders, so "%s" would reach CloudWatch literally.
+  const src = fs.readFileSync(path.join(__dirname, "gateway-lifecycle.js"), "utf8");
+  const calls = [...src.matchAll(/log\?\.(?:log|warn)\?\.\(\s*("(?:[^"\\]|\\.)*")/g)];
+  assert.ok(calls.length >= 8);
+  for (const [, literal] of calls) assert.doesNotMatch(literal, /%[sdifjoOc]/, literal);
+});
 
 test("history from other runs and sub-agents is never delivered", async (t) => {
   const gateway = await historyGateway(t, {

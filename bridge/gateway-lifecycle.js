@@ -70,7 +70,12 @@ function appliedConfigReady(snapshot, port) {
 
 const TOOL_BLOCK_TYPES = new Set(["toolCall", "tool_call", "toolUse", "tool_use", "functionCall", "function_call"]);
 const SHORT_FINAL_CHARS = 200;
-const HISTORY_TIMEOUT_MS = 5000;
+// The first chat.history after a snapshot restore can take several seconds
+// (5559 ms on staging after a ~15 min freeze), so each attempt gets 15 s and a
+// timed-out request is sent once more, always inside the turn deadline.
+const HISTORY_TIMEOUT_MS = 15000;
+const HISTORY_ATTEMPTS = 2;
+const HISTORY_RETRY_MIN_MS = 100;
 const HISTORY_LIMIT = 100;
 const HISTORY_MAX_CHARS = 500000; // openclaw 2026.9.5 ChatHistoryParamsSchema maximum; default 8000 truncates.
 
@@ -141,6 +146,7 @@ function selectFinalAnswer(messages, { userKey, runIds, extractText = (value) =>
 function gatewayTurn({
   url, token, message, onDelta, extractText = (value) => typeof value === "string" ? value : "",
   deadline = Date.now() + 620000, signal, probeOnly = false, configProbe = false, log = globalThis.console,
+  historyTimeoutMs = HISTORY_TIMEOUT_MS,
 }) {
   return new Promise((resolve) => {
     let socket;
@@ -152,7 +158,7 @@ function gatewayTurn({
     let connectId;
     let probeId;
     let configId;
-    let historyId;
+    const historyIds = new Set();
     let configSnapshot;
     let runId;
     let tracker;
@@ -181,7 +187,7 @@ function gatewayTurn({
     // The run has finished: any history problem delivers today's run buffer.
     const deliverBuffer = (reason) => {
       if (settled) return;
-      try { log?.warn?.("[gateway] Delivering the run text buffer (%s chars): %s", response.length, reason); } catch {}
+      try { log?.warn?.("[gateway] Delivering the run text buffer; chars, reason:", response.length, reason); } catch {}
       finish("completed");
     };
     const uncertain = (error) => stage === "history" ? deliverBuffer(error)
@@ -274,22 +280,36 @@ function gatewayTurn({
           }
           stage = "history";
           clearTimeout(timer);
-          historyTimer = setTimeout(() => deliverBuffer("chat.history timed out"),
-            Math.max(1, Math.min(HISTORY_TIMEOUT_MS, deadline - Date.now())));
-          historyId = randomUUID();
-          send(historyId, "chat.history", {
+          const historyParams = {
             sessionKey: tracker.state.sessionKey || payload.sessionKey || "global",
             limit: HISTORY_LIMIT, maxChars: HISTORY_MAX_CHARS,
-          });
+          };
+          // Each attempt ends by the turn deadline. A late reply to an earlier
+          // attempt is still accepted after the retry is sent.
+          const requestHistory = (attempt) => {
+            const wait = Math.max(1, Math.min(historyTimeoutMs, deadline - Date.now()));
+            historyTimer = setTimeout(() => {
+              if (settled) return;
+              if (attempt >= HISTORY_ATTEMPTS || deadline - Date.now() < HISTORY_RETRY_MIN_MS) {
+                return deliverBuffer("chat.history timed out");
+              }
+              try { log?.warn?.("[gateway] chat.history got no reply, retrying once; waited ms:", wait); } catch {}
+              requestHistory(attempt + 1);
+            }, wait);
+            const id = randomUUID();
+            historyIds.add(id);
+            send(id, "chat.history", historyParams);
+          };
+          requestHistory(1);
         } else if (["error", "aborted"].includes(payload.state)) {
           finish(payload.state, "Gateway turn ended without completion");
         }
-      } else if (stage === "history" && frame.type === "res" && frame.id === historyId) {
+      } else if (stage === "history" && frame.type === "res" && historyIds.has(frame.id)) {
         if (frame.ok !== true) return deliverBuffer("chat.history rejected");
         const answer = selectFinalAnswer(frame.payload?.messages, { userKey: runId, runIds: ownRuns, extractText });
         if (!answer) return deliverBuffer("no final assistant message in chat.history");
         try {
-          log?.log?.("[gateway] Delivering the run's final answer from chat.history: %s chars from %s item(s), buffer %s chars",
+          log?.log?.("[gateway] Delivering the run's final answer from chat.history; chars, items, buffer chars:",
             answer.text.length, answer.items, response.length);
         } catch {}
         response = answer.text;
@@ -429,7 +449,7 @@ async function dismissStaleSuspendedDeliveries({
     session = await openOperatorSession({ url, token, signal, deadline });
     if (!session.methods.includes("tasks.list") || !session.methods.includes("tasks.dismiss")) {
       result.phase = "skipped";
-      log?.warn?.("[gateway] Stale delivery sweep skipped: %s", "task methods unavailable");
+      log?.warn?.("[gateway] Stale delivery sweep skipped: task methods unavailable");
       return result;
     }
     const stale = [];
@@ -453,27 +473,27 @@ async function dismissStaleSuspendedDeliveries({
         items = Array.isArray(payload?.results) ? payload.results : [];
       } catch (error) {
         for (const taskId of taskIds) result.notDismissed.push({ taskId, reason: error.message });
-        log?.warn?.("[gateway] tasks.dismiss failed for %s: %s", taskIds.join(","), error.message);
+        log?.warn?.("[gateway] tasks.dismiss failed; tasks, error:", taskIds.join(","), error.message);
         continue;
       }
       for (const taskId of taskIds) {
         const item = items.find((entry) => entry?.taskId === taskId);
         if (item?.ok === true) {
           result.dismissed.push(taskId);
-          log?.log?.("[gateway] Dismissed stale sub-agent delivery task=%s run=%s", taskId, runIds.get(taskId));
+          log?.log?.("[gateway] Dismissed stale sub-agent delivery task", taskId, "run", runIds.get(taskId));
         } else {
           const reason = typeof item?.reason === "string" ? item.reason : "no result";
           result.notDismissed.push({ taskId, reason });
-          log?.warn?.("[gateway] Sub-agent delivery not dismissed task=%s reason=%s", taskId, reason);
+          log?.warn?.("[gateway] Sub-agent delivery not dismissed task", taskId, "reason", reason);
         }
       }
     }
-    log?.log?.("[gateway] Stale delivery sweep: listed=%s stale=%s dismissed=%s not_dismissed=%s",
-      result.listed, result.candidates.length, result.dismissed.length, result.notDismissed.length);
+    log?.log?.("[gateway] Stale delivery sweep: listed", result.listed, "stale", result.candidates.length,
+      "dismissed", result.dismissed.length, "not_dismissed", result.notDismissed.length);
   } catch (error) {
     result.phase = "failed";
     result.error = error?.message || "unknown error";
-    log?.warn?.("[gateway] Stale delivery sweep failed: %s", result.error);
+    log?.warn?.("[gateway] Stale delivery sweep failed:", result.error);
   } finally {
     session?.close();
   }
