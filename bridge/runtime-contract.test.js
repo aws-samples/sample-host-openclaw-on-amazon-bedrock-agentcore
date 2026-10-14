@@ -1668,3 +1668,31 @@ for (const callerBudgetMs of [0, -1, 1.5, "600000", 900001, null]) {
     assert.ok(!app.calls.includes("chat.send"));
   });
 }
+
+test("a queued cron turn replies status:error at its caller deadline, while the earlier turn still runs", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const gateway = blockingTurns(t);
+  const app = loadContract(t, { gatewayTurnImpl: gateway.gatewayTurnImpl });
+  const en = app.request({ ...owner, action: "cron", message: "EN brief", callerBudgetMs: 900000 });
+  await until(() => gateway.turns.length === 1, "the EN turn");
+  // 20 s reply margin + 150 ms: the CN caller's queue deadline is 150 ms after arrival.
+  const cnArrival = Date.now();
+  const cn = app.request({ ...owner, action: "cron", message: "CN brief", callerBudgetMs: 20150 });
+  const raced = await Promise.race([cn, sleep(1500).then(() => "still queued")]);
+  assert.notEqual(raced, "still queued", "CN got no reply until the EN turn released the queue");
+  assert.equal(raced.code, 200);
+  assert.equal(raced.body.status, "error");
+  assert.notEqual(raced.body.status, "unknown_outcome", "the caller must be able to release its admission");
+  assert.ok(Date.now() - cnArrival < 1500);
+  const ping = await app.request(null, "GET", "/ping");
+  assert.equal(ping.code, 200);
+  assert.equal(ping.body.active_tasks, 1, "only the EN turn is still active");
+  // EN is unaffected, and CN never reaches the gateway once EN releases the queue.
+  gateway.turns[0].done.resolve({ phase: "completed", response: "EN done" });
+  assert.equal((await en).body.response, "EN done");
+  await sleep(100);
+  assert.equal(gateway.turns.length, 1, "CN was dispatched after its caller had its reply");
+  assert.equal(app.calls.filter((entry) => entry === "chat.send").length, 1);
+  assert.equal((await app.request(null, "GET", "/ping")).body.status, "Healthy");
+});

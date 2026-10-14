@@ -154,7 +154,12 @@ function createRuntimeLifecycle({
 
   function run(context, execute) {
     const turn = Object.freeze({ ...context, engine: "openclaw" });
-    const result = tail.then(async () => {
+    let expired = false;
+    let timer;
+    const work = tail.then(async () => {
+      clearTimeout(timer);
+      // Expired while queued: the caller already has its error, so never dispatch.
+      if (expired) throw new Error("Turn deadline exceeded in queue");
       assertBinding(turn);
       checkpoint();
       if (now() >= turn.deadline) throw new Error("Turn deadline exceeded in queue");
@@ -163,8 +168,18 @@ function createRuntimeLifecycle({
       if (now() >= turn.deadline) throw new Error("Turn deadline exceeded during activation");
       return execute(turn);
     });
-    tail = result.catch(() => {});
-    return result;
+    // Later turns still wait for the earlier turn, not for this one's expiry.
+    tail = work.catch(() => {});
+    if (!Number.isFinite(turn.deadline)) return work;
+    // Reject at the deadline while queued, so the caller gets its reply before it stops
+    // listening. Once the turn starts, the timer is cleared and the turn's own bounds apply.
+    const expiry = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        expired = true;
+        reject(new Error("Turn deadline exceeded in queue"));
+      }, Math.max(0, turn.deadline - now()));
+    });
+    return Promise.race([work, expiry]);
   }
 
   function health(activeTasks = 0) {
