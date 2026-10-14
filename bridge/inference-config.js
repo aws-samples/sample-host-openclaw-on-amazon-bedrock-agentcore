@@ -3,8 +3,9 @@
  *
  * Claude Opus 5 and later reject `temperature` on Converse/ConverseStream
  * ("ValidationException: temperature is deprecated for this model"), so the
- * key must be left out of inferenceConfig for those models. Every other model
- * keeps the historical temperature of 0.7.
+ * key must be left out of inferenceConfig for those models. Claude Haiku 5.5
+ * and Claude Sonnet 5.5 also return a 400 for a non-default temperature.
+ * Every other model keeps the historical temperature of 0.7.
  *
  * BEDROCK_TEMPERATURE overrides the per-model default for every model:
  *   unset / ""  -> per-model default (above)
@@ -18,6 +19,8 @@ const DEFAULT_TEMPERATURE = 0.7;
 
 // Anthropic Opus major version at or above which temperature is rejected.
 const OPUS_NO_TEMPERATURE_MIN_MAJOR = 5;
+// Non-Opus models that reject a non-default temperature.
+const NO_TEMPERATURE_MODEL = /(?:^|[./])anthropic\.claude-(?:haiku|sonnet)-5-5(?=[-.:]|$)/;
 
 /**
  * True when the model rejects `temperature`. Matches the model name after any
@@ -26,7 +29,7 @@ const OPUS_NO_TEMPERATURE_MIN_MAJOR = 5;
  */
 function modelRejectsTemperature(modelId) {
   if (typeof modelId !== "string" || !modelId) return false;
-  if (modelId === "global.anthropic.claude-haiku-5-5") return true;
+  if (NO_TEMPERATURE_MODEL.test(modelId)) return true;
   const m = modelId.match(/(?:^|[./])anthropic\.claude-opus-(\d+)(?=[-.:]|$)/);
   if (!m) return false;
   return Number(m[1]) >= OPUS_NO_TEMPERATURE_MIN_MAJOR;

@@ -33,8 +33,12 @@ const STREAM_ERRORS = Object.freeze({
   validationException: "ValidationException",
 });
 
+// Claude Haiku 5.5 runs with thinking disabled. Other models keep their own
+// default: Opus 5.5 cannot disable thinking, and Sonnet 5.5 rejects "disabled".
+const THINKING_DISABLED_MODEL = /(?:^|[./])anthropic\.claude-haiku-5-5(?=[-.:]|$)/;
+
 function requestFields(modelId) {
-  return modelId === PRIMARY_MODEL_ID
+  return typeof modelId === "string" && THINKING_DISABLED_MODEL.test(modelId)
     ? { additionalModelRequestFields: { thinking: { type: "disabled" } } }
     : {};
 }

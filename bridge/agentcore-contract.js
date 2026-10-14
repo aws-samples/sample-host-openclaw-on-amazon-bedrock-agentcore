@@ -480,12 +480,16 @@ function stopGateway(waitMs) {
   });
 }
 
-function updateIdentityFile(actorId, channel, channelActorId = null, channelTarget = null) {
+function updateIdentityFile(actorId, channel, channelActorId = null, channelTarget = null,
+  modelOverride = null) {
   const tempFile = `${IDENTITY_FILE}.${osRandomUUID()}.tmp`;
   try {
+    // modelOverride is per turn: a turn without one (Cron, or no /model choice)
+    // rewrites the file without it, so the proxy uses the deployment default.
     fs.writeFileSync(
       tempFile,
-      JSON.stringify({ actorId, channel, channelActorId, channelTarget }),
+      JSON.stringify({ actorId, channel, channelActorId, channelTarget,
+        ...(modelOverride ? { modelOverride } : {}) }),
       "utf-8",
     );
     fs.renameSync(tempFile, IDENTITY_FILE);
@@ -1545,6 +1549,8 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
         BEDROCK_GUARDRAIL_VERSION: process.env.BEDROCK_GUARDRAIL_VERSION || "",
         // Optional temperature override read by agentcore-proxy.js ("none" omits it; unset = per-model default).
         BEDROCK_TEMPERATURE: process.env.BEDROCK_TEMPERATURE || "",
+        // Allowlisted per-user /model overrides (comma-separated; empty = feature disabled).
+        BEDROCK_USER_SELECTABLE_MODEL_IDS: process.env.BEDROCK_USER_SELECTABLE_MODEL_IDS || "",
         USER_ID: actorId,
         INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
         CHANNEL: channel,
@@ -1569,7 +1575,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
             (AGENTCORE_GATEWAY_URL && !gatewayBearer?.token) ||
             ["BEDROCK_MODEL_ID", "BEDROCK_FALLBACK_MODEL_ID", "COGNITO_USER_POOL_ID", "COGNITO_CLIENT_ID",
               "S3_USER_FILES_BUCKET", "SUBAGENT_BEDROCK_MODEL_ID", "BEDROCK_GUARDRAIL_ID",
-              "BEDROCK_GUARDRAIL_VERSION", "BEDROCK_TEMPERATURE"].some(
+              "BEDROCK_GUARDRAIL_VERSION", "BEDROCK_TEMPERATURE", "BEDROCK_USER_SELECTABLE_MODEL_IDS"].some(
               (key) => (process.env[key] || "") !== proxyEnv[key]) ||
             JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8")).actorId !== actorId) {
           throw new Error("Prepared Proxy binding is unavailable");
@@ -2105,8 +2111,9 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
   if (channelTarget !== null && (typeof channelTarget !== "string" || !channelTarget)) {
     return reply({ error: "Invalid channel delivery target" }, 400);
   }
+  const modelOverride = payloadModelOverride(payload.modelOverride);
   const context = Object.freeze({
-    userId, actorId, channel, channelActorId, channelTarget,
+    userId, actorId, channel, channelActorId, channelTarget, modelOverride,
     runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
     routingGeneration: payload.routingGeneration ?? null,
     deadline: Date.now() + TURN_TIMEOUT_MS,
@@ -2143,7 +2150,8 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
       if (action === "warmup" && dispatchAllowed) return { status: "ready" };
       stream?.signal.throwIfAborted();
       stream?.ready(v2Lifecycle.snapshot());
-      updateIdentityFile(turn.actorId, turn.channel, turn.channelActorId, turn.channelTarget);
+      updateIdentityFile(turn.actorId, turn.channel, turn.channelActorId, turn.channelTarget,
+        turn.modelOverride);
       let streamer = null;
       if (action === "chat" && TELEGRAM_BOT_TOKEN && turn.channel === "telegram" &&
           turn.channelActorId && turn.channelTarget) {
@@ -2222,6 +2230,17 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
     stream?.close();
     activeTaskCount = Math.max(0, activeTaskCount - 1);
   }
+}
+
+// Shape check for the Router's per-user `/model` override. The proxy accepts it
+// only when it is also in BEDROCK_USER_SELECTABLE_MODEL_IDS.
+function payloadModelOverride(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && /^[a-z0-9][a-z0-9.-]{0,127}(?::[0-9]{1,3})?$/.test(value)) {
+    return value;
+  }
+  console.warn("[contract] Ignoring malformed modelOverride in invocation payload");
+  return null;
 }
 
 /**

@@ -66,7 +66,30 @@ for (const bound of [true, false]) {
   });
 }
 
-function streaming(send, { subagent = false, subagentModel = "custom-subagent" } = {}) {
+test("the proxy reads the per-turn model override only from the bound identity file", () => {
+  const start = source.indexOf("function extractSessionMetadata(");
+  const end = source.indexOf("// Per-user Cognito", start);
+  const load = (fileText, env = { USER_ID: "slack:owner", CHANNEL: "slack" }) => {
+    const box = {
+      require: () => ({ osRandomUUID: () => "00000000-0000-4000-8000-000000000001" }),
+      crypto: require("node:crypto"), Date, BOUND_ACTOR_ID: "slack:owner",
+      fs: { readFileSync: () => { if (fileText === null) throw new Error("ENOENT"); return fileText; } },
+      process: { env }, sessionMap: new Map(), console: { log() {} },
+    };
+    vm.createContext(box);
+    vm.runInContext('const { osRandomUUID } = require("./runtime-lifecycle");' + source.slice(start, end), box);
+    return box.extractSessionMetadata({}, {});
+  };
+  const identity = { actorId: "slack:owner", channel: "slack", modelOverride: "global.anthropic.claude-opus-5-5" };
+  assert.equal(load(JSON.stringify(identity)).modelOverride, "global.anthropic.claude-opus-5-5");
+  assert.equal(load(JSON.stringify({ ...identity, modelOverride: 5 })).modelOverride, null);
+  assert.equal(load(JSON.stringify({ actorId: "slack:owner", channel: "slack" })).modelOverride, null);
+  assert.equal(load(null).modelOverride, null, "no identity file: environment identity, no override");
+  assert.throws(() => load(JSON.stringify({ ...identity, actorId: "slack:intruder" })), /canonical actor changed/);
+});
+
+function streaming(send, { subagent = false, subagentModel = "custom-subagent", allowlist = [],
+  primaryModel = policy.PRIMARY_MODEL_ID, fallbackModel = policy.FALLBACK_MODEL_ID } = {}) {
   const requests = [], clients = [], frames = [], logs = [];
   let handler, bodyReads = 0;
   const response = new EventEmitter();
@@ -86,7 +109,8 @@ function streaming(send, { subagent = false, subagentModel = "custom-subagent" }
         }
       },
     }),
-    MODEL_ID: policy.PRIMARY_MODEL_ID, FALLBACK_MODEL_ID: policy.FALLBACK_MODEL_ID,
+    MODEL_ID: primaryModel, FALLBACK_MODEL_ID: fallbackModel,
+    USER_SELECTABLE_MODEL_IDS: new Set(allowlist),
     AWS_REGION: "us-west-2", MAX_RETRIES: 5, BASE_DELAY_MS: 0,
     sleep: async () => {}, bedrockClientOptions: () => ({}), structuredClone,
     convertMessages: () => ({
@@ -139,8 +163,10 @@ function streaming(send, { subagent = false, subagentModel = "custom-subagent" }
       box.health({ method: "GET", url: "/health" }, { writeHead() {}, end: (value) => { body = value; } });
       return JSON.parse(body);
     },
-    invoke: (nextResponse = response) => box.invokeBedrockStreaming([], nextResponse, subagent ? "bedrock-agentcore-subagent" : "bedrock-agentcore",
-      "system", { tools: [{ toolSpec: { name: "test", inputSchema: { json: { type: "object" } } } }] }),
+    invoke: (nextResponse = response, modelOverride = null) => box.invokeBedrockStreaming([], nextResponse, subagent ? "bedrock-agentcore-subagent" : "bedrock-agentcore",
+      "system", { tools: [{ toolSpec: { name: "test", inputSchema: { json: { type: "object" } } } }] },
+      undefined, modelOverride),
+    resolveModelId: (...args) => box.resolveModelId(...args),
   };
 }
 
@@ -233,6 +259,82 @@ test("a disconnected response cannot authorize another send", async () => {
   await app.invoke();
   assert.equal(app.requests.length, 1);
   assert.equal(app.requests[0].options.abortSignal.aborted, true);
+});
+
+// --- Per-user /model override (issue #18) ---
+const HAIKU_55 = "global.anthropic.claude-haiku-5-5";
+const SONNET_55 = "global.anthropic.claude-sonnet-5-5";
+const OPUS_55 = "global.anthropic.claude-opus-5-5";
+const ALLOWLIST = [HAIKU_55, SONNET_55, OPUS_55];
+const unavailable = () => { throw Object.assign(new Error("service unavailable"), {
+  name: "ServiceUnavailableException", $metadata: { httpStatusCode: 503, attempts: 1 },
+}); };
+
+test("an allowlisted override becomes the main-agent primary with model-specific fields", async () => {
+  for (const [override, thinkingDisabled] of [[OPUS_55, false], [SONNET_55, false], [HAIKU_55, true]]) {
+    const app = streaming(() => reply(), { allowlist: ALLOWLIST });
+    assert.equal(await app.invoke(undefined, override), "answer");
+    const params = app.requests[0].input;
+    assert.equal(params.modelId, override);
+    assert.equal(Object.hasOwn(params, "additionalModelRequestFields"), thinkingDisabled, override);
+    if (thinkingDisabled) assert.equal(params.additionalModelRequestFields.thinking.type, "disabled");
+    assert.equal(Object.hasOwn(params.inferenceConfig, "temperature"), false, override);
+    assert.equal(app.logs[0].attempts[0].model_id, override);
+    assert.match(app.frames[0], new RegExp(`"model":"${override.replace(/\./g, "\\.")}"`));
+  }
+});
+
+test("an override falls back once to the deployment fallback with the fallback's own fields", async () => {
+  const app = streaming((_input, ordinal) => (ordinal === 1 ? unavailable() : reply()),
+    { allowlist: ALLOWLIST });
+  assert.equal(await app.invoke(undefined, OPUS_55), "answer");
+  assert.deepEqual(app.requests.map((entry) => entry.input.modelId), [OPUS_55, policy.FALLBACK_MODEL_ID]);
+  assert.equal(Object.hasOwn(app.requests[1].input, "additionalModelRequestFields"), false);
+  assert.equal(app.requests[1].input.inferenceConfig.temperature, 0.7, "Sonnet 4.6 keeps temperature");
+  assert.equal(app.logs[0].fallback_selected, true);
+});
+
+test("an override equal to the fallback makes no second attempt", async () => {
+  const app = streaming(unavailable, { allowlist: [...ALLOWLIST, policy.FALLBACK_MODEL_ID] });
+  await app.invoke(undefined, policy.FALLBACK_MODEL_ID);
+  assert.equal(app.requests.length, 1);
+  assert.equal(app.requests[0].input.modelId, policy.FALLBACK_MODEL_ID);
+  assert.equal(app.logs[0].fallback_selected, false);
+});
+
+test("a Haiku override on a non-Haiku deployment still disables thinking", async () => {
+  const app = streaming(() => reply(), { allowlist: ALLOWLIST, primaryModel: "global.anthropic.claude-sonnet-4-6" });
+  await app.invoke(undefined, HAIKU_55);
+  assert.equal(app.requests[0].input.modelId, HAIKU_55);
+  assert.equal(app.requests[0].input.additionalModelRequestFields.thinking.type, "disabled");
+  const plain = streaming(() => reply(), { allowlist: ALLOWLIST, primaryModel: "global.anthropic.claude-sonnet-4-6" });
+  await plain.invoke();
+  assert.equal(plain.requests[0].input.modelId, "global.anthropic.claude-sonnet-4-6");
+  assert.equal(Object.hasOwn(plain.requests[0].input, "additionalModelRequestFields"), false);
+  assert.equal(plain.requests[0].input.inferenceConfig.temperature, 0.7);
+});
+
+test("a stale, unknown or malformed override is ignored in favour of MODEL_ID", async () => {
+  for (const override of ["global.anthropic.claude-fable-5-1", "", null, 42, { modelId: OPUS_55 }]) {
+    const app = streaming(() => reply(), { allowlist: ALLOWLIST });
+    await app.invoke(undefined, override);
+    assert.equal(app.requests[0].input.modelId, policy.PRIMARY_MODEL_ID, String(override));
+  }
+  const disabled = streaming(() => reply());
+  await disabled.invoke(undefined, OPUS_55);
+  assert.equal(disabled.requests[0].input.modelId, policy.PRIMARY_MODEL_ID, "empty allowlist disables overrides");
+});
+
+test("sub-agent requests ignore the user's override and keep one attempt", async () => {
+  const app = streaming(() => reply(), { subagent: true, allowlist: ALLOWLIST });
+  await app.invoke(undefined, OPUS_55);
+  assert.equal(app.requests[0].input.modelId, "custom-subagent");
+  assert.equal(app.clients[0].maxAttempts, 1);
+  assert.equal(app.logs[0].fallback_selected, false);
+  assert.equal(app.resolveModelId("bedrock-agentcore-subagent", OPUS_55), "custom-subagent");
+  assert.equal(app.resolveModelId("agentcore/bedrock-agentcore-subagent", OPUS_55), "custom-subagent");
+  assert.equal(app.resolveModelId("agentcore/bedrock-agentcore", OPUS_55), OPUS_55);
+  assert.equal(app.resolveModelId(undefined, OPUS_55), OPUS_55);
 });
 
 test("subagent override keeps its configured model with one SDK attempt and no fallback", async () => {
