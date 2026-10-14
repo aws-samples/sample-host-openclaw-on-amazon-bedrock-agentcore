@@ -38,7 +38,7 @@ const runtimeSkills = require("./runtime-skills");
 const { createCognitoTokenProvider } = require("./cognito-token");
 const { readBody } = require("./read-body");
 const { createRuntimeLifecycle, osRandomUUID } = require("./runtime-lifecycle");
-const { waitForGateway, gatewayTurn } = require("./gateway-lifecycle");
+const { waitForGateway, gatewayTurn, dismissStaleSuspendedDeliveries } = require("./gateway-lifecycle");
 const { createPreparedGateway } = require("./openclaw-worker-owner");
 const { renderConfig, renderAgents } = require("./gateway-config");
 const { createLiveSeedBridge, readGatewayToken } = require("./live-seed-bridge");
@@ -1726,6 +1726,13 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
       await waitForGateway({
         port: OPENCLAW_PORT, token: GATEWAY_TOKEN, signal: activationScope.signal,
         deadline: Date.now() + ACTIVATION_TIMEOUT_MS, configProbe: true,
+      });
+      checkpoint();
+      // A suspended sub-agent delivery stays in every turn's context for 7 days
+      // and gets narrated into replies. Bounded and non-throwing.
+      await dismissStaleSuspendedDeliveries({
+        url: `ws://127.0.0.1:${OPENCLAW_PORT}`, token: GATEWAY_TOKEN, signal: activationScope.signal,
+        deadline: Date.now() + 15000,
       });
       checkpoint();
       openclawReady = true;
