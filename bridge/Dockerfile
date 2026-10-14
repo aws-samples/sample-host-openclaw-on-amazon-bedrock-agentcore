@@ -178,6 +178,7 @@ COPY guardrail-scope.js /app/guardrail-scope.js
 COPY inference-config.js /app/inference-config.js
 COPY read-body.js /app/read-body.js
 COPY chat-run-filter.js /app/chat-run-filter.js
+COPY gateway-ops.js /app/gateway-ops.js
 COPY gateway-mcp.js /app/gateway-mcp.js
 COPY runtime-skills.js /app/runtime-skills.js
 

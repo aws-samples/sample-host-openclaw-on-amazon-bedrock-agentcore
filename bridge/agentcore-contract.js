@@ -36,6 +36,7 @@ const runtimeSkills = require("./runtime-skills");
 const { createCognitoTokenProvider } = require("./cognito-token");
 const { readBody } = require("./read-body");
 const { createChatRunTracker } = require("./chat-run-filter");
+const gatewayOps = require("./gateway-ops");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -153,6 +154,10 @@ let lastActivityTime = Math.floor(Date.now() / 1000);
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
 let processingMessage = false;
+// Startup sweep of stale suspended sub-agent deliveries (gateway-ops.js). The
+// queue waits for it before sending a turn, so the first turn's runtime
+// context no longer lists the stale result. Bounded; never rejects.
+let staleDeliverySweep = null;
 
 /**
  * Write current actorId and channel to a shared file so the proxy process
@@ -1038,12 +1043,33 @@ function writeOpenClawConfig() {
 }
 
 /**
+ * Dismiss sub-agent deliveries openclaw suspended more than 2 h ago. openclaw
+ * 2026.9.5 renders each suspended row into every main-session turn as
+ * "Child results awaiting delivery" for 7 days, and the model narrates it into
+ * replies. Runs in the background (bounded to 15 s), so it never delays
+ * readiness; processMessageQueue() waits for it before the first turn.
+ */
+function startStaleDeliverySweep() {
+  return gatewayOps
+    .dismissStaleSuspendedDeliveries({
+      url: `ws://127.0.0.1:${OPENCLAW_PORT}`,
+      token: GATEWAY_TOKEN,
+      deadline: Date.now() + gatewayOps.STALE_SWEEP_TIMEOUT_MS,
+      log: console,
+    })
+    .catch((err) => {
+      console.warn("[contract] Stale delivery sweep error:", err?.message || "unknown");
+    });
+}
+
+/**
  * Poll for OpenClaw readiness in the background.
  * Sets openclawReady=true and starts workspace saves when ready.
  */
 async function pollOpenClawReadiness(namespace) {
   const ready = await waitForPort(OPENCLAW_PORT, "OpenClaw", 300000, 5000);
   if (ready) {
+    staleDeliverySweep = startStaleDeliverySweep();
     openclawReady = true;
     workspaceSync.startPeriodicSave(namespace);
     workspaceSync.startChangeBackup(namespace);
@@ -1954,6 +1980,8 @@ async function processMessageQueue() {
   processingMessage = true;
 
   while (messageQueue.length > 0) {
+    if (staleDeliverySweep) await staleDeliverySweep;
+    if (messageQueue.length === 0) break;
     const { message, onDelta, resolve, reject } = messageQueue.shift();
     console.log(
       `[contract] Processing queued message (${messageQueue.length} remaining)`,
