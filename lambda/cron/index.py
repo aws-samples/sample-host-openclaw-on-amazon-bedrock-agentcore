@@ -16,7 +16,7 @@ import boto3
 from botocore.config import Config
 from runtime_routing import admit_route, is_unknown_outcome, resolve_route
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
-from runtime_invocation import InvocationTransportError, invoke_bounded
+from runtime_invocation import RELEASE_RESERVE_SECONDS, InvocationTransportError, invoke_bounded
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -195,10 +195,16 @@ def invoke_agentcore(route, action, user_id, actor_id, channel, message=None, de
     }
     if message:
         payload_dict["message"] = message
-
-    payload = json.dumps(payload_dict).encode()
     if deadline is None:
         deadline = time.monotonic() + max(0, LAMBDA_TIMEOUT_SECONDS - 30)
+    if action == "cron":
+        # Tell the contract how long this Lambda will read the response, so a
+        # turn queued behind another brief stops (or never starts) before we
+        # give up, instead of running on with no listener.
+        budget_ms = int((deadline - RELEASE_RESERVE_SECONDS - time.monotonic()) * 1000)
+        payload_dict["callerBudgetMs"] = max(1, min(900_000, budget_ms))
+
+    payload = json.dumps(payload_dict).encode()
 
     try:
         authorize_channel_actor(identity_table, route, user_id, actor_id, channel)

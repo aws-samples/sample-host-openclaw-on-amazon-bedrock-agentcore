@@ -89,6 +89,10 @@ class CronStack(Stack):
                 description="Shared per-user AgentCore Runtime route resolution and admission",
             )],
             timeout=Duration.seconds(lambda_timeout),
+            # EventBridge Scheduler invokes asynchronously. Lambda's default two
+            # async retries re-run a brief that timed out or crashed, so the user
+            # gets a duplicate turn (and its "already ran" reply) instead of the brief.
+            retry_attempts=0,
             memory_size=lambda_memory,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
