@@ -24,7 +24,7 @@ import cdk_nag
 import json
 from constructs import Construct
 
-from stacks import retention_days
+from stacks import apply_table_tags, retention_days
 
 
 class RouterStack(Stack):
@@ -69,6 +69,7 @@ class RouterStack(Stack):
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.RETAIN,
+            deletion_protection=True,
             time_to_live_attribute="ttl",
             point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
                 point_in_time_recovery_enabled=True,
@@ -76,6 +77,7 @@ class RouterStack(Stack):
             encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
             encryption_key=identity_cmk,
         )
+        apply_table_tags(self.identity_table)
 
         # --- Log Group ---
         router_log_group = logs.LogGroup(

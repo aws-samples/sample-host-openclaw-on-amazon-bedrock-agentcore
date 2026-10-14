@@ -285,6 +285,7 @@ All tunable parameters are in `cdk.json`:
 | `enable_gateway` | `false` | Prototype: deploy `OpenClawGateway` (AgentCore Gateway serving the per-user file and schedule tools as MCP tools) and pass `AGENTCORE_GATEWAY_URL` to the AgentCore Runtime. See [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md) |
 | `anomaly_band_width` | `2` | Standard-deviation band for the token-usage anomaly detector alarm |
 | `runtime_manifest` | (empty for foundation) | Verified V2 manifest required for dependent stacks; wrapper default `.runtime/runtime-v2.json` |
+| `table_tags` | `{}` | Extra tags put on every DynamoDB table (identity and token-usage). CloudFormation does not copy its own stack tags onto DynamoDB tables, so if your account runs an automated cleanup job that deletes untagged tables, set the opt-out tag it honours, for example `{"auto-delete": "no"}` (or `-c 'table_tags={"auto-delete":"no"}'`). Deletion protection is on for both tables regardless of this setting |
 
 > **Guardrails cost**: Bedrock Guardrails are enabled by default and add ~$0.75 per 1,000 text units on top of model inference costs. Before disabling, follow the [dependency check](docs/guardrails.md#disable). See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling removes content-level protections but other security layers (STS scoping, tool deny list) remain active.
 
@@ -461,7 +462,7 @@ The guardrail is applied only when the AgentCore Runtime role has `bedrock:Apply
 cdk destroy --all
 ```
 
-Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys and the Cognito User Pool have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`.
+Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys, the Cognito User Pool and the DynamoDB identity and token-usage tables have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed; the DynamoDB tables also have deletion protection, which you must turn off before deleting them. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`.
 
 ## Contributing
 
