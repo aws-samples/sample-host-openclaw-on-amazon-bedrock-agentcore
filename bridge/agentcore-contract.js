@@ -2020,9 +2020,20 @@ function enqueueMessage(message, onDelta) {
  * @param {string} message - The message to send
  * @param {number} timeoutMs - Timeout in milliseconds
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
+ * @param {object} [options]
+ * @param {number} [options.historyTimeoutMs] - per-attempt chat.history wait (tests)
+ *
+ * On our run's final the reply is read back with chat.history and only the
+ * run's last non-commentary assistant message is returned (see
+ * gateway-ops.js selectFinalAnswer): the WS final carries the whole run buffer,
+ * including status lines written before tool calls. Live deltas are unchanged.
+ * Any chat.history problem falls back to the run buffer with a warning.
  */
-async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
+async function bridgeMessage(message, timeoutMs = 620000, onDelta, options = {}) {
   const { randomUUID } = require("crypto");
+  const gatewayOps = require("./gateway-ops");
+  const historyTimeoutMs = options.historyTimeoutMs || gatewayOps.HISTORY_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
     console.log(`[contract] Connecting to WebSocket: ${wsUrl}`);
@@ -2040,11 +2051,20 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
     // Which gateway run this request owns; see chat-run-filter.js.
     let chatRun = null;
     let unhandledMsgs = [];
+    // Methods the gateway advertised in hello-ok; chat.history is optional.
+    let capabilities = [];
+    // Our run and any sessions_yield successor the run filter accepted.
+    const ownRuns = new Set();
+    // After our run's final: waiting for chat.history, chat events are ignored.
+    let historyStage = false;
+    let historyTimer = null;
+    const historyIds = new Set();
 
     const done = (text) => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timer);
+      clearTimeout(historyTimer);
       try {
         ws.close();
       } catch {}
@@ -2062,6 +2082,42 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
       // Return "" on timeout so caller can fall back to lightweight agent
       done(responseText || "");
     }, timeoutMs);
+
+    // The run has finished: resolve with this text, or "" when it is empty.
+    const finishFinal = (text) => {
+      if (text) {
+        done(text);
+      } else {
+        console.warn("[contract] Empty final: no text in the run's final or its buffer");
+        done("");
+      }
+    };
+    // The run has finished but its answer could not be read back: deliver the
+    // run buffer, as before chat.history was used.
+    const deliverBuffer = (reason) => {
+      if (resolved) return;
+      console.warn("[contract] Delivering the run text buffer; chars, reason:", responseText.length, reason);
+      finishFinal(responseText);
+    };
+    const requestHistory = (params, attempt) => {
+      const wait = Math.max(1, Math.min(historyTimeoutMs, deadline - Date.now()));
+      historyTimer = setTimeout(() => {
+        if (resolved) return;
+        if (attempt >= gatewayOps.HISTORY_ATTEMPTS || deadline - Date.now() < gatewayOps.HISTORY_RETRY_MIN_MS) {
+          deliverBuffer("chat.history timed out");
+          return;
+        }
+        console.warn("[contract] chat.history got no reply, retrying once; waited ms:", wait);
+        requestHistory(params, attempt + 1);
+      }, wait);
+      const id = randomUUID();
+      historyIds.add(id);
+      try {
+        ws.send(JSON.stringify({ type: "req", id, method: "chat.history", params }));
+      } catch {
+        deliverBuffer("chat.history send failed");
+      }
+    };
 
     ws.on("open", () => {
       console.log("[contract] WebSocket connected, waiting for challenge...");
@@ -2123,6 +2179,8 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           return;
         }
         authenticated = true;
+        const methods = msg.payload?.features?.methods;
+        capabilities = Array.isArray(methods) ? methods : [];
         console.log(
           "[contract] Authenticated successfully, sending chat.send...",
         );
@@ -2158,7 +2216,33 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
       // Step 3: Chat events — state: "delta" (streaming) or "final" (complete)
       // OpenClaw puts content in payload.message.content (usual) or
       // directly in payload.message (string or content-blocks array).
+      // chat.history reply for our finished run.
+      if (historyStage && msg.type === "res" && historyIds.has(msg.id)) {
+        if (!msg.ok) {
+          deliverBuffer("chat.history rejected");
+          return;
+        }
+        const answer = gatewayOps.selectFinalAnswer(msg.payload?.messages, {
+          userKey: chatReqId,
+          runIds: ownRuns,
+          extractText: extractTextFromContent,
+        });
+        if (!answer) {
+          deliverBuffer("no final assistant message in chat.history");
+          return;
+        }
+        console.log(
+          "[contract] Delivering the run's final answer from chat.history; chars, items, buffer chars:",
+          answer.text.length,
+          answer.items,
+          responseText.length,
+        );
+        done(answer.text);
+        return;
+      }
+
       if (msg.type === "event" && msg.event === "chat") {
+        if (historyStage) return;
         const payload = msg.payload || {};
 
         // The gateway broadcasts chat events for every run, including
@@ -2166,6 +2250,7 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
         // sessions_yield successor) may stream or end this request.
         if (chatRun) {
           const verdict = chatRun.classify(payload);
+          if (verdict.action !== "ignore" && chatRun.state.runId) ownRuns.add(chatRun.state.runId);
           if (verdict.action === "ignore") {
             console.log(
               "[contract] Ignoring chat %s for runId=%s sessionKey=%s (%s)",
@@ -2200,6 +2285,23 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           const text = extractFromPayload(payload);
           if (text) responseText = text;
           console.log(`[contract] Chat final (${responseText.length} chars)`);
+          if (capabilities.includes("chat.history")) {
+            // The final carries every assistant item of the run joined
+            // together; deliver only the run's answer, read back from the
+            // transcript. The turn timer stops; each attempt ends by the
+            // turn deadline.
+            historyStage = true;
+            clearTimeout(timer);
+            requestHistory(
+              {
+                sessionKey: chatRun?.state.sessionKey || payload.sessionKey || "global",
+                limit: gatewayOps.HISTORY_LIMIT,
+                maxChars: gatewayOps.HISTORY_MAX_CHARS,
+              },
+              1,
+            );
+            return;
+          }
           if (responseText) {
             done(responseText);
           } else {
@@ -2267,6 +2369,10 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
 
     ws.on("error", (err) => {
       console.error(`[contract] WebSocket error: ${err.message}`);
+      if (historyStage) {
+        deliverBuffer("socket error during chat.history");
+        return;
+      }
       // Return "" on error so caller can fall back to lightweight agent
       done(responseText || "");
     });
@@ -2280,6 +2386,10 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
       console.warn(
         `[contract] WebSocket closed: code=${code} reason=${reasonStr} auth=${authenticated} chatSent=${chatSent} responseLen=${responseText.length}${debugInfo}`,
       );
+      if (historyStage) {
+        deliverBuffer("socket closed during chat.history");
+        return;
+      }
       // Return "" on unexpected close so caller can fall back to lightweight agent
       done(responseText || "");
     });

@@ -6,6 +6,10 @@
  *   renders every suspended row into each main-session turn as
  *   "Child results awaiting delivery" for 7 days, and the model narrates it
  *   into replies.
+ * - selectFinalAnswer(): picks the run's answer from chat.history. The WS
+ *   chat final carries the whole run's text buffer (every assistant item
+ *   joined with blank lines), so status lines written before tool calls
+ *   reached users.
  *
  * Gateway protocol v4, openclaw 2026.9.5 (bridge/Dockerfile pin). The RPC
  * shapes match main's bridge/gateway-lifecycle.js; this V1 copy keeps the
@@ -194,7 +198,92 @@ async function dismissStaleSuspendedDeliveries({
   return result;
 }
 
+const TOOL_BLOCK_TYPES = new Set(["toolCall", "tool_call", "toolUse", "tool_use", "functionCall", "function_call"]);
+const SHORT_FINAL_CHARS = 200;
+// The first chat.history after a snapshot restore can take several seconds
+// (5559 ms on staging after a ~15 min freeze), so each attempt gets 15 s and a
+// timed-out request is sent once more, always inside the turn deadline.
+const HISTORY_TIMEOUT_MS = 15000;
+const HISTORY_ATTEMPTS = 2;
+const HISTORY_RETRY_MIN_MS = 100;
+const HISTORY_LIMIT = 100;
+const HISTORY_MAX_CHARS = 500000; // openclaw 2026.9.5 ChatHistoryParamsSchema maximum; default 8000 truncates.
+
+function textBlockPhase(block) {
+  let signature = block?.textSignature;
+  if (typeof signature === "string") {
+    try { signature = JSON.parse(signature); } catch { signature = undefined; }
+  }
+  return signature && typeof signature === "object" ? signature.phase : undefined;
+}
+
+function historyMeta(message) {
+  const meta = message?.__openclaw;
+  return meta && typeof meta === "object" ? meta : {};
+}
+
+function historyUserKey(message) {
+  return message.idempotencyKey ?? historyMeta(message).idempotencyKey;
+}
+
+/**
+ * Pick the text to deliver for one run from openclaw 2026.9.5 chat.history.
+ *
+ * The answer is the last assistant message of the run that has no tool call,
+ * without commentary-phase text blocks. When that message is short and the
+ * run wrote other non-commentary text, all of it is delivered so content split
+ * over several messages is not lost. Returns null when the run's answer cannot
+ * be found or was truncated by the gateway, so the caller can fall back.
+ *
+ * @param {object[]} messages chat.history payload.messages
+ * @param {{userKey: string, runIds: Set<string>, extractText?: function}} opts
+ *   userKey: our chat.send idempotencyKey; runIds: our run and any
+ *   sessions_yield successor the run filter accepted.
+ */
+function selectFinalAnswer(messages, { userKey, runIds, extractText = (value) => typeof value === "string" ? value : "" }) {
+  if (!Array.isArray(messages)) return null;
+  const list = messages.filter((message) => message && typeof message === "object");
+  let start = -1;
+  for (let i = list.length - 1; i >= 0 && userKey; i--) {
+    if (list[i].role === "user" && historyUserKey(list[i]) === userKey) { start = i; break; }
+  }
+  const items = [];
+  for (const message of start === -1 ? list : list.slice(start + 1)) {
+    const otherInput = message.role === "user" && historyUserKey(message) && historyUserKey(message) !== userKey;
+    if (start !== -1 && otherInput) break;
+    if (message.role !== "assistant") continue;
+    const messageRun = historyMeta(message).runId;
+    if (messageRun ? !runIds.has(messageRun) : start === -1) continue;
+    if (message.phase === "commentary" || message.openclawStreamFallback) continue;
+    const content = Array.isArray(message.content) ? message.content
+      : typeof message.content === "string" ? [{ type: "text", text: message.content }] : [];
+    const blocks = content.filter((block) => block?.type === "text" && typeof block.text === "string" &&
+      textBlockPhase(block) !== "commentary");
+    items.push({
+      text: blocks.length ? String(extractText(blocks.map((block) => block.text).join("")) || "").trim() : "",
+      hasTool: content.some((block) => TOOL_BLOCK_TYPES.has(block?.type)),
+      truncated: historyMeta(message).truncated === true,
+    });
+  }
+  let last = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (!items[i].hasTool && items[i].text) { last = i; break; }
+  }
+  if (last === -1) return null;
+  const earlier = items.slice(0, last).filter((item) => item.text);
+  const chosen = items[last].text.length < SHORT_FINAL_CHARS && earlier.length ? [...earlier, items[last]] : [items[last]];
+  if (chosen.some((item) => item.truncated)) return null;
+  return { text: chosen.map((item) => item.text).join("\n\n"), items: chosen.length };
+}
+
 module.exports = {
+  selectFinalAnswer,
+  HISTORY_TIMEOUT_MS,
+  HISTORY_ATTEMPTS,
+  HISTORY_RETRY_MIN_MS,
+  HISTORY_LIMIT,
+  HISTORY_MAX_CHARS,
+  SHORT_FINAL_CHARS,
   openOperatorSession,
   isStaleSuspendedDelivery,
   dismissStaleSuspendedDeliveries,
