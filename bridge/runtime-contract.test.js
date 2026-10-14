@@ -338,6 +338,10 @@ function loadContract(t, {
         assert.equal(options.configProbe, true);
         calls.push("gateway:verified");
       },
+      dismissStaleSuspendedDeliveries: async () => {
+        calls.push("gateway:sweep");
+        return { phase: "done", listed: 0, candidates: [], dismissed: [], notDismissed: [] };
+      },
       gatewayTurn: async (args) => {
         ready();
         calls.push("chat.send");
@@ -744,6 +748,10 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   assert.equal(status.lifecycle.binding.userId, owner.userId);
   assert.equal(status.lifecycle.binding.actorId, owner.actorId);
   assert.ok(app.calls.some((call) => call.includes("[OPENCLAW_IMAGES:")));
+  // The stale suspended-delivery sweep runs once, after readiness, before the first turn.
+  assert.equal(app.calls.filter((call) => call === "gateway:sweep").length, 1);
+  assert.ok(app.calls.indexOf("gateway:verified") < app.calls.indexOf("gateway:sweep"));
+  assert.ok(app.calls.indexOf("gateway:sweep") < app.calls.indexOf("chat.send"));
   assert.equal((await app.request({ ...owner, action: "warmup" })).body.status, "ready");
   assert.equal(app.children.find((child) => child.kind === "node").env.NODE_COMPILE_CACHE, "/app/.compile-cache");
   const phases = app.logs.map((line) => line.match(
