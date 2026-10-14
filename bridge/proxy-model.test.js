@@ -280,7 +280,7 @@ test("an allowlisted override becomes the main-agent primary with model-specific
     if (thinkingDisabled) assert.equal(params.additionalModelRequestFields.thinking.type, "disabled");
     assert.equal(Object.hasOwn(params.inferenceConfig, "temperature"), false, override);
     assert.equal(app.logs[0].attempts[0].model_id, override);
-    assert.match(app.frames[0], new RegExp(`"model":"${override.replace(/\./g, "\\.")}"`));
+    assert.equal(JSON.parse(app.frames[0].slice("data: ".length)).model, override);
   }
 });
 
