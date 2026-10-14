@@ -28,6 +28,7 @@
     "runtime_id": "openclaw_agent-21FHcrBssV",
     "runtime_endpoint_id": "DEFAULT",
     "cron_lead_time_minutes": 5,
+    "table_tags": {},
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:stackRelativeExports": true,
     "@aws-cdk/aws-ec2:uniqueImdsv2TemplateName": true,
