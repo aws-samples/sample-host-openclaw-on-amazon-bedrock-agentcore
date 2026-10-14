@@ -53,6 +53,13 @@ _token_cache = {}  # {secret_id: (value, fetched_at)}
 # --- Constants ---
 WARMUP_POLL_INTERVAL_SECONDS = 15
 WARMUP_MAX_WAIT_SECONDS = 300
+# Exception text can name the endpoint URL, runtime ARN and account ID, so
+# users only ever see these fixed messages; details stay in logs as a type.
+INVOCATION_FAILED_RESPONSE = "Agent invocation failed."
+CRON_FAILED_MESSAGE = (
+    "Your scheduled task did not return a result this time. "
+    "It will run again at the next scheduled time."
+)
 
 
 def _get_secret(secret_id):
@@ -248,15 +255,20 @@ def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=Non
                     body_text = body_text[:MAX_RESPONSE_BYTES]
             else:
                 body_text = str(body)[:MAX_RESPONSE_BYTES]
-            logger.info("AgentCore response (first 500): %s", body_text[:500])
             try:
-                return json.loads(body_text)
+                parsed = json.loads(body_text)
             except json.JSONDecodeError:
+                logger.info("AgentCore response: non-JSON body, len=%d", len(body_text))
                 return {"response": body_text}
+            # Never log the body: a contract error reply can carry exception text.
+            status = parsed.get("status") if isinstance(parsed, dict) else None
+            logger.info("AgentCore response: len=%d status=%s", len(body_text), status)
+            return parsed
         return {"response": "No response from agent."}
     except Exception as e:
-        logger.error("AgentCore invocation failed: %s", e, exc_info=True)
-        return {"response": f"Agent invocation failed: {e}"}
+        # Log the type only: botocore messages embed the runtime ARN and account ID.
+        logger.error("AgentCore invocation failed: %s", type(e).__name__)
+        return {"response": INVOCATION_FAILED_RESPONSE, "status": "failed"}
 
 
 def warmup_and_wait(session_id, user_id, actor_id, channel):
@@ -700,6 +712,26 @@ def deliver_response(channel, channel_target, response_text):
         logger.warning("Unknown channel type: %s", channel)
 
 
+def _cron_run_failed(result):
+    """True when a cron turn failed or produced nothing worth delivering.
+
+    Covers an invocation exception (status "failed"), a contract error reply
+    (status "error", e.g. init failed), a contract 400 body ({"error": ...}),
+    and an empty, whitespace-only or missing response.
+    """
+    if not isinstance(result, dict):
+        return True
+    if result.get("status") in ("failed", "error") or result.get("error"):
+        return True
+    response = result.get("response")
+    if not isinstance(response, str):
+        return True
+    if not _extract_text_from_content_blocks(response).strip():
+        return True
+    # invoke_agentcore's placeholder for an empty response body.
+    return response == "No response from agent."
+
+
 # ---------------------------------------------------------------------------
 # Lambda handler
 # ---------------------------------------------------------------------------
@@ -790,7 +822,14 @@ def handler(event, context):
     # Phase 3: Execute the cron message
     cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"
     result = invoke_agentcore(session_id, "cron", current_user_id, actor_id, channel, cron_message)
-    response_text = result.get("response", "No response from scheduled task.")
+    if _cron_run_failed(result):
+        status = result.get("status") if isinstance(result, dict) else None
+        logger.warning("Scheduled task %s did not complete: status=%s", schedule_id, status)
+        # Never forward the runtime's response text on failure; send a fixed notice.
+        deliver_response(channel, channel_target,
+                         f"[Scheduled: {schedule_name or schedule_id}] {CRON_FAILED_MESSAGE}")
+        return {"statusCode": 503, "body": "Scheduled task invocation failed or returned nothing"}
+    response_text = result["response"]
 
     # Phase 4: Deliver response to channel
     logger.info("Delivering response (len=%d) to %s:%s", len(response_text), channel, channel_target)
