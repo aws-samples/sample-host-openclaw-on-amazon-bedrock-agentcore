@@ -174,7 +174,7 @@ class CronStack(Stack):
             )
         )
 
-        # S3 read of brief audio (AUDIO_S3_KEY marker -> Telegram sendAudio).
+        # S3 read of brief audio (BRIEF_AUDIO marker -> Telegram sendAudio).
         # Read-only and mp3-only. IAM can't scope this per user, so the Lambda
         # checks that the key sits under the run's own namespace before reading.
         self.cron_fn.add_to_role_policy(

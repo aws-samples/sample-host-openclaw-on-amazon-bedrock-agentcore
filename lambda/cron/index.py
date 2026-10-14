@@ -669,16 +669,27 @@ def send_feishu_message(receiver_id, text):
 
 
 # ---------------------------------------------------------------------------
-# Brief audio (AUDIO_S3_KEY marker -> Telegram sendAudio)
+# Brief audio (BRIEF_AUDIO marker -> Telegram sendAudio)
 # ---------------------------------------------------------------------------
 #
 # The agent can't attach audio to a cron reply: tts and read are denied, local
 # media outside OpenClaw's roots is dropped, and the contract keeps only text.
 # So a brief uploads its mp3 to the user's S3 namespace and ends the reply with
-# one line "AUDIO_S3_KEY: <namespace>/<file>.mp3". The Lambda strips that line
+# one line "BRIEF_AUDIO: <namespace>/<file>.mp3". The Lambda strips that line
 # and sends the object itself. The IAM grant allows any */*.mp3 object in the
 # bucket, so the namespace check below is what keeps one user's brief from
 # sending another user's file.
+#
+# The label must not look like a secret name. OpenClaw's gateway redacts the
+# value after any upper-case label ending in KEY, TOKEN, SECRET, PASSWORD or
+# PASSWD followed by ':' or '=' (2026.9.5 dist/redact-*.mjs,
+# ENV_ASSIGNMENT_REDACT_PATTERN), and only scans text containing KEY, TOKEN,
+# SECRET, PASSWORD, PASSWD, AUTH, COOKIE, SIGNATURE, CREDENTIAL, CARD, CVC, CVV
+# or PAYMENT (DEFAULT_REDACT_PREFILTER_SOURCES, case-insensitive). The earlier
+# label AUDIO_S3_KEY reached the Lambda as "AUDIO_S3_KEY: ***". BRIEF_AUDIO
+# contains none of those words; bridge/brief-audio-marker.test.js checks it
+# against OpenClaw's own redaction when the dist is installed.
+AUDIO_MARKER_LABEL = "BRIEF_AUDIO"
 
 # Telegram Bot API upload limit for sendAudio.
 AUDIO_MAX_BYTES = 50 * 1024 * 1024
@@ -687,18 +698,20 @@ AUDIO_MIN_SECONDS = 10
 AUDIO_UPLOAD_TIMEOUT_SECONDS = 60
 
 # Any line that starts with the marker (Markdown bold/code around it allowed).
-_AUDIO_MARKER_LINE_RE = re.compile(r"^[\s`*]*AUDIO_S3_KEY[\s`*]*:", re.MULTILINE)
-_AUDIO_MARKER_RE = re.compile(r"^[\s`*]*AUDIO_S3_KEY[\s`*]*:[\s`*]*(?P<key>[^\s`*]*)[\s`*]*$")
+_AUDIO_MARKER_LINE_RE = re.compile(rf"^[\s`*]*{AUDIO_MARKER_LABEL}[\s`*]*:", re.MULTILINE)
+_AUDIO_MARKER_RE = re.compile(rf"^[\s`*]*{AUDIO_MARKER_LABEL}[\s`*]*:[\s`*]*(?P<key>[^\s`*]*)[\s`*]*$")
 # Same character set the s3-user-files skill's sanitize() produces, plus '/'.
 _AUDIO_KEY_RE = re.compile(r"^[A-Za-z0-9_\-./]+$")
 
 
 def split_audio_marker(text):
-    """Remove every AUDIO_S3_KEY line from text.
+    """Remove every BRIEF_AUDIO line from text.
 
     Returns (text_without_marker_lines, key). key is the value of the last
     marker line, or None. The text is returned unchanged when there is no
-    marker, so replies without one are delivered exactly as before.
+    marker, so replies without one are delivered exactly as before. A marker
+    line whose value can't be read (empty, redacted to ***, extra words) is
+    still stripped and logged with a fixed warning; its text is never logged.
     """
     if not isinstance(text, str) or not _AUDIO_MARKER_LINE_RE.search(text):
         return text, None
@@ -710,6 +723,8 @@ def split_audio_marker(text):
             key = (match.group("key") if match else "") or None
             continue
         kept.append(line)
+    if key is None:
+        logger.warning("Brief audio skipped: marker line present but its key could not be read")
     return "\n".join(kept).rstrip(), key
 
 
