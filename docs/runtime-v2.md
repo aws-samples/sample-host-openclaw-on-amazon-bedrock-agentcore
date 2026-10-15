@@ -23,12 +23,14 @@ OpenClaw `2026.9.5` keeps its generated Runtime metadata in system messages whil
 
 The bridge translates OpenClaw's OpenAI-compatible streaming chat to Bedrock `ConverseStream`. AgentCore Runtime callers receive JSON unless they send `action:"chat", stream:true`. `cdk.json` and the deployment wrapper select:
 
-- Primary: `global.anthropic.claude-haiku-5-5` (`BEDROCK_MODEL_ID`), with `additionalModelRequestFields.thinking.type="disabled"` and no temperature.
-- Fallback: `global.anthropic.claude-sonnet-4-6` (`BEDROCK_FALLBACK_MODEL_ID`), retaining its model-specific settings.
+- Primary: `global.anthropic.claude-opus-5-5` (`BEDROCK_MODEL_ID`), no temperature and no `thinking` field (Opus 5.5 rejects `thinking.type="disabled"`; it uses adaptive thinking).
+- Sub-agents: `global.anthropic.claude-sonnet-5-5` (`SUBAGENT_BEDROCK_MODEL_ID`; unset or empty uses the same default), no temperature, one attempt and no fallback.
+- Fallback: `global.anthropic.claude-sonnet-5-5` (`BEDROCK_FALLBACK_MODEL_ID`), no temperature.
+- Opus 5+ and Sonnet 5+ reject `temperature`; `bridge/inference-config.js` omits it. `global.anthropic.claude-haiku-5-5` remains supported as an override and still sends `thinking.type="disabled"`. System and tool prompt-cache points are added for these three models (`bridge/system-prefix-cache.js`).
 
 Fallback is limited to eligible transient primary API failures before content starts. Partial output, tool execution, cancellation, Guardrail intervention and ambiguous transport outcomes must not trigger replay through another model.
 
-The execution role grants invocation and streaming for the source-account `inference-profile/*` and cross-region `foundation-model/*` resources, covering both models. Guardrail and Marketplace grants remain in place. Verify model access and organization/Region restrictions in the deployment account.
+The execution role grants invocation and streaming for the source-account `inference-profile/*` and cross-region `foundation-model/*` resources, covering these models. Guardrail and Marketplace grants remain in place. Verify model access and organization/Region restrictions in the deployment account.
 
 ## Offline checks
 

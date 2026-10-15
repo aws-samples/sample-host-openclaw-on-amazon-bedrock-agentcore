@@ -10,7 +10,7 @@
 | Regions | `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `ap-northeast-1` ([AWS list](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions); `V2_REGIONS` in `scripts/runtime_deploy.py` rejects any other Region) | Any Region with AgentCore Runtime |
 | Runtime deployment | Pinned SDK controller (`scripts/runtime_deploy.py`, `.venv-deploy`), immutable `release_N` endpoints, runtime manifest `.runtime/runtime-v2.json` | AgentCore Starter Toolkit (`agentcore` CLI), runtime `openclaw_agent`, generated `.bedrock_agentcore.yaml` |
 | First reply in a new session | Waits for state restore and full OpenClaw startup; no warm-up agent | A lightweight warm-up agent (`bridge/lightweight-agent.js`) answers while OpenClaw starts |
-| Default primary model | `global.anthropic.claude-haiku-5-5`, fallback `global.anthropic.claude-sonnet-4-6` | `global.anthropic.claude-sonnet-4-6` |
+| Default models | Main `global.anthropic.claude-opus-5-5`; sub-agents and fallback `global.anthropic.claude-sonnet-5-5` | Main `global.anthropic.claude-opus-5-5`; sub-agents `global.anthropic.claude-sonnet-5-5`; no fallback model |
 | New features | Yes | Fixes only (backports) |
 
 Pick `main` if your Region supports V2 and you are starting a new deployment. Pick `release/v1` if your Region does not support V2, or if you already run a V1 deployment and want its fixes.

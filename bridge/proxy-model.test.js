@@ -66,7 +66,7 @@ for (const bound of [true, false]) {
   });
 }
 
-function streaming(send, { subagent = false, subagentModel = "custom-subagent" } = {}) {
+function streaming(send, { subagent = false, subagentModel = "custom-subagent", mainModel = policy.PRIMARY_MODEL_ID } = {}) {
   const requests = [], clients = [], frames = [], logs = [];
   let handler, bodyReads = 0;
   const response = new EventEmitter();
@@ -86,7 +86,7 @@ function streaming(send, { subagent = false, subagentModel = "custom-subagent" }
         }
       },
     }),
-    MODEL_ID: policy.PRIMARY_MODEL_ID, FALLBACK_MODEL_ID: policy.FALLBACK_MODEL_ID,
+    MODEL_ID: mainModel, FALLBACK_MODEL_ID: policy.FALLBACK_MODEL_ID,
     AWS_REGION: "us-west-2", MAX_RETRIES: 5, BASE_DELAY_MS: 0,
     sleep: async () => {}, bedrockClientOptions: () => ({}), structuredClone,
     convertMessages: () => ({
@@ -153,13 +153,69 @@ function reply(events = [
     stream: (async function* () { yield* events; })() };
 }
 
-test("the actual proxy sends Haiku with disabled thinking, guardrails and one SDK attempt", async () => {
+// Model defaults as the real proxy computes them from its environment.
+function proxyModelDefaults(env) {
+  const start = source.indexOf("const MODEL_ID =");
+  const end = source.indexOf("// Bedrock Guardrails", start);
+  assert.ok(start > 0 && end > start);
+  const box = { process: { env }, modelPolicy: policy, AWS_REGION: "us-west-2", console: { log() {} } };
+  vm.createContext(box);
+  vm.runInContext(source.slice(start, end) +
+    "\n;globalThis.out = { MODEL_ID, FALLBACK_MODEL_ID, SUBAGENT_BEDROCK_MODEL_ID };", box);
+  return box.out;
+}
+
+test("policy defaults: Opus 5.5 main, Sonnet 5.5 sub-agent and fallback", () => {
+  assert.equal(policy.PRIMARY_MODEL_ID, "global.anthropic.claude-opus-5-5");
+  assert.equal(policy.SUBAGENT_MODEL_ID, "global.anthropic.claude-sonnet-5-5");
+  assert.equal(policy.FALLBACK_MODEL_ID, "global.anthropic.claude-sonnet-5-5");
+  for (const env of [{}, { SUBAGENT_BEDROCK_MODEL_ID: "", BEDROCK_MODEL_ID: "", BEDROCK_FALLBACK_MODEL_ID: "" }]) {
+    assert.deepEqual({ ...proxyModelDefaults(env) }, {
+      MODEL_ID: "global.anthropic.claude-opus-5-5",
+      FALLBACK_MODEL_ID: "global.anthropic.claude-sonnet-5-5",
+      SUBAGENT_BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-5-5",
+    });
+  }
+  // A main-model override does not drag sub-agents along with it.
+  assert.equal(proxyModelDefaults({ BEDROCK_MODEL_ID: "custom-main" }).SUBAGENT_BEDROCK_MODEL_ID,
+    "global.anthropic.claude-sonnet-5-5");
+});
+
+for (const [label, subagent, expected] of [
+  ["main turn routes to Opus 5.5", false, "global.anthropic.claude-opus-5-5"],
+  ["sub-agent turn routes to Sonnet 5.5", true, "global.anthropic.claude-sonnet-5-5"],
+]) {
+  test(`default env: ${label} with no temperature, no thinking field and cache points`, async () => {
+    const defaults = proxyModelDefaults({});
+    const app = streaming(() => reply(), { subagent, mainModel: defaults.MODEL_ID,
+      subagentModel: defaults.SUBAGENT_BEDROCK_MODEL_ID });
+    assert.equal(await app.invoke(), "answer");
+    assert.equal(app.requests.length, 1);
+    const params = app.requests[0].input;
+    assert.equal(params.modelId, expected);
+    assert.equal(Object.hasOwn(params.inferenceConfig, "temperature"), false);
+    assert.equal(Object.hasOwn(params, "additionalModelRequestFields"), false);
+    assert.equal(params.toolConfig.tools.at(-1).cachePoint.type, "default");
+    assert.equal(app.logs[0].attempts[0].model_id, expected);
+  });
+}
+
+test("a Haiku 5.5 main-model override still sends disabled thinking", async () => {
+  const app = streaming(() => reply(), { mainModel: "global.anthropic.claude-haiku-5-5" });
+  assert.equal(await app.invoke(), "answer");
+  const params = app.requests[0].input;
+  assert.equal(params.modelId, "global.anthropic.claude-haiku-5-5");
+  assert.equal(params.additionalModelRequestFields.thinking.type, "disabled");
+  assert.equal(Object.hasOwn(params.inferenceConfig, "temperature"), false);
+});
+
+test("the actual proxy sends Opus 5.5 without a thinking field, with guardrails and one SDK attempt", async () => {
   const app = streaming(() => reply());
   assert.equal(await app.invoke(), "answer");
   assert.equal(app.requests.length, 1);
   const params = app.requests[0].input;
   assert.equal(params.modelId, policy.PRIMARY_MODEL_ID);
-  assert.equal(params.additionalModelRequestFields.thinking.type, "disabled");
+  assert.equal(Object.hasOwn(params, "additionalModelRequestFields"), false);
   assert.equal(Object.hasOwn(params.inferenceConfig, "temperature"), false);
   assert.equal(params.guardrailConfig.guardrailIdentifier, "test-guard");
   assert.ok(params.messages[0].content.some((block) => block.guardContent));
@@ -181,6 +237,7 @@ test("a temporary pre-output failure selects Sonnet once without changing guardr
   assert.equal(await app.invoke(), "answer");
   assert.deepEqual(app.requests.map((entry) => entry.input.modelId),
     [policy.PRIMARY_MODEL_ID, policy.FALLBACK_MODEL_ID]);
+  assert.equal(Object.hasOwn(app.requests[1].input.inferenceConfig, "temperature"), false);
   const [first, second] = app.requests.map((entry) => entry.input);
   for (const key of ["messages", "system", "toolConfig", "guardrailConfig"]) {
     assert.deepEqual(second[key], first[key]);

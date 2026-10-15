@@ -51,7 +51,7 @@ MODEL_PRICING = {
     "anthropic.claude-3-5-haiku-20241022-v1:0": {"input": 0.80, "output": 4.00},
     "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3.00, "output": 15.00},
     "anthropic.claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
-    # Claude Opus 4.6 / 5.5: AWS Price List bulk offer AmazonBedrockFoundationModels,
+    # Claude Opus 4.6 / 5.5, Sonnet 5.5: AWS Price List bulk offer AmazonBedrockFoundationModels,
     # publication 2026-10-12T08:40:08Z, identical in us-east-1 and ap-southeast-2.
     # The global cross-Region profile is cheaper than geo / in-Region.
     # Opus 4.6 usagetypes <R>-MP:<R>_{InputTokenCount,OutputTokenCount,
@@ -74,6 +74,16 @@ MODEL_PRICING = {
     },
     "anthropic.claude-opus-5-5": {
         "input": 4.40, "output": 22.00, "cache_read": 0.22, "cache_write": 5.50,
+    },
+    # Sonnet 5.5: same offer and publication, identical in us-east-1, us-west-2 and
+    # ap-southeast-2. Usagetypes as Opus 5.5 (us-east-1 global SKUs
+    # PXMCKMF8EGSRB3GB, HP32J6RXJZ3XYFUM, 487WBAJQRFHYFE5M, CES7A5M9YH89UF9G;
+    # standard 6TG78WT6WYJUVS72, ZNY2E4B6MTPHYXVH, H6MJYZQS5DCKBCCM, 99NPNFEPJP2AB79S).
+    "global.anthropic.claude-sonnet-5-5": {
+        "input": 2.00, "output": 10.00, "cache_read": 0.10, "cache_write": 2.50,
+    },
+    "anthropic.claude-sonnet-5-5": {
+        "input": 2.20, "output": 11.00, "cache_read": 0.11, "cache_write": 2.75,
     },
     "minimax.minimax-m2": {"input": 1.00, "output": 5.00},
 }

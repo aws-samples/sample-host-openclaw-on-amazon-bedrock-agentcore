@@ -35,7 +35,8 @@ console.log(`[proxy] Credential env: RELATIVE_URI=${!!process.env.AWS_CONTAINER_
 
 // Subagent model routing — distinct model name lets proxy detect subagent requests
 const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcore-subagent";
-const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || MODEL_ID;
+// Unset/empty SUBAGENT_BEDROCK_MODEL_ID uses the policy sub-agent model (Sonnet 5.5).
+const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || modelPolicy.SUBAGENT_MODEL_ID;
 
 // Bedrock Guardrails — content filtering (undefined = disabled)
 const GUARDRAIL_ID = process.env.BEDROCK_GUARDRAIL_ID || "";
@@ -1027,7 +1028,7 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
-    // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
+    // Opus/Sonnet 5+ reject temperature; the key is omitted, not nulled (see inference-config.js).
     inferenceConfig: buildInferenceConfig(modelId, temperatureOverride),
     ...(!isSubagentRequest({ model: requestedModel }) && modelPolicy.requestFields(modelId)),
     ...(guardrailConfig && { guardrailConfig }),
@@ -1154,7 +1155,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
-    // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
+    // Opus/Sonnet 5+ reject temperature; the key is omitted, not nulled (see inference-config.js).
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) payload.toolConfig = toolConfig;
