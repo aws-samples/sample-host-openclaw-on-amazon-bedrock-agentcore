@@ -196,9 +196,9 @@ read_cdk_outputs() {
   fi
 
   # Read config values from cdk.json
-  DEFAULT_MODEL_ID=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('default_model_id','global.anthropic.claude-haiku-5-5'))")
-  FALLBACK_MODEL_ID=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('fallback_model_id','global.anthropic.claude-sonnet-4-6'))")
-  SUBAGENT_MODEL_ID=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('subagent_model_id',''))")
+  DEFAULT_MODEL_ID=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('default_model_id','global.anthropic.claude-opus-5-5'))")
+  FALLBACK_MODEL_ID=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('fallback_model_id','global.anthropic.claude-sonnet-5-5'))")
+  SUBAGENT_MODEL_ID=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('subagent_model_id','global.anthropic.claude-sonnet-5-5'))")
   IMAGE_VERSION=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('image_version','1'))")
   WORKSPACE_SYNC_MS=$("${PYTHON[@]}" -c "import json; print(int(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('workspace_sync_interval_seconds',300))*1000)")
   # How long the bridge waits for the S3 workspace restore before spawning the

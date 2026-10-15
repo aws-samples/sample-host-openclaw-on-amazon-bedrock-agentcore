@@ -269,9 +269,9 @@ All tunable parameters are in `cdk.json`:
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
 | `region` | (empty) | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
 | `availability_zones` | `[]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
-| `default_model_id` | `global.anthropic.claude-haiku-5-5` | Primary Bedrock model. Haiku 5.5 uses thinking disabled and omits temperature; see the [AgentCore Runtime V2 model contract](docs/runtime-v2.md#model-and-api-contract) |
-| `fallback_model_id` | `global.anthropic.claude-sonnet-4-6` | Fallback for eligible primary API failures before content starts; never replays partial output or a Guardrail intervention |
-| `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Use an explicit model such as `global.anthropic.claude-sonnet-4-6` to override |
+| `default_model_id` | `global.anthropic.claude-opus-5-5` | Primary Bedrock model for the main agent. Opus 5.5 uses its default adaptive thinking and omits temperature; see the [AgentCore Runtime V2 model contract](docs/runtime-v2.md#model-and-api-contract) |
+| `fallback_model_id` | `global.anthropic.claude-sonnet-5-5` | Fallback for eligible primary API failures before content starts; never replays partial output or a Guardrail intervention |
+| `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model ID for sub-agents. Empty = the bridge default, also Sonnet 5.5. Sub-agents never use the fallback model |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Threshold of the `openclaw-daily-token-budget` alarm. Despite the name, the alarm compares the token sum over a **1-hour** period |
 | `daily_cost_budget_usd` | `5` | Threshold (USD) of the `openclaw-daily-cost-budget` alarm, compared with the estimated cost summed over a **1-hour** period. `5` is low for an Opus-class model; see [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking) |
@@ -394,7 +394,7 @@ The first message waits for state restoration and full OpenClaw initialization. 
 ### 502 / Bedrock authorization errors
 
 - **Model access not enabled**: Enable model access in the Bedrock console for your region.
-- **Cross-region inference**: The default primary model `global.anthropic.claude-haiku-5-5` and the fallback `global.anthropic.claude-sonnet-4-6` use global cross-region inference profiles that route to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions. See the [model contract](docs/runtime-v2.md#model-and-api-contract).
+- **Cross-region inference**: The default primary model `global.anthropic.claude-opus-5-5` and the sub-agent/fallback model `global.anthropic.claude-sonnet-5-5` use global cross-region inference profiles that route to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions. See the [model contract](docs/runtime-v2.md#model-and-api-contract).
 - **Region not supported**: `scripts/runtime_deploy.py` stops with `V2 region is outside the reviewed supported region set` outside the V2 Regions. Use the [`release/v1` branch](docs/release-v1.md) there.
 
 ### Scheduled task says it "did not return a result this time"

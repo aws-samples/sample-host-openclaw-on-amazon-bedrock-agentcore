@@ -12,8 +12,14 @@
  */
 const { osRandomUUID } = require("./runtime-lifecycle");
 
-const PRIMARY_MODEL_ID = "global.anthropic.claude-haiku-5-5";
-const FALLBACK_MODEL_ID = "global.anthropic.claude-sonnet-4-6";
+const PRIMARY_MODEL_ID = "global.anthropic.claude-opus-5-5";
+const FALLBACK_MODEL_ID = "global.anthropic.claude-sonnet-5-5";
+const SUBAGENT_MODEL_ID = "global.anthropic.claude-sonnet-5-5";
+// Per-model additionalModelRequestFields. Opus 5.5 and Sonnet 5.5 reject
+// thinking.type "disabled" (Opus only allows adaptive), so they send nothing.
+const MODEL_REQUEST_FIELDS = Object.freeze({
+  "global.anthropic.claude-haiku-5-5": Object.freeze({ thinking: Object.freeze({ type: "disabled" }) }),
+});
 const UNKNOWN_OUTCOME_ERROR = Object.freeze({
   code: "PROVIDER_POST_DISPATCH_AMBIGUITY",
   type: "invalid_request_error",
@@ -34,9 +40,8 @@ const STREAM_ERRORS = Object.freeze({
 });
 
 function requestFields(modelId) {
-  return modelId === PRIMARY_MODEL_ID
-    ? { additionalModelRequestFields: { thinking: { type: "disabled" } } }
-    : {};
+  const fields = Object.hasOwn(MODEL_REQUEST_FIELDS, modelId) ? MODEL_REQUEST_FIELDS[modelId] : undefined;
+  return fields ? { additionalModelRequestFields: JSON.parse(JSON.stringify(fields)) } : {};
 }
 
 function sdkMetadata(value) {
@@ -146,4 +151,4 @@ function createStreamingRoute({ primaryModelId, fallbackModelId, response,
   };
 }
 
-module.exports = { PRIMARY_MODEL_ID, FALLBACK_MODEL_ID, UNKNOWN_OUTCOME_ERROR, requestFields, createStreamingRoute };
+module.exports = { PRIMARY_MODEL_ID, FALLBACK_MODEL_ID, SUBAGENT_MODEL_ID, UNKNOWN_OUTCOME_ERROR, requestFields, createStreamingRoute };
