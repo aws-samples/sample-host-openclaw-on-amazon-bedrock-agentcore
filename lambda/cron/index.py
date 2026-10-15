@@ -31,6 +31,12 @@ FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
+AGENTCORE_READ_TIMEOUT_SECONDS = max(LAMBDA_TIMEOUT_SECONDS - 30, 60)
+# Time kept back from the cron turn's budget so the Lambda can still send the
+# fixed failure notice after the contract gives up.
+CALLER_BUDGET_MARGIN_SECONDS = 20
+CALLER_BUDGET_MAX_MS = 900_000
+USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
 
 # --- Clients ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
@@ -39,12 +45,14 @@ agentcore_client = boto3.client(
     "bedrock-agentcore",
     region_name=AWS_REGION,
     config=Config(
-        read_timeout=max(LAMBDA_TIMEOUT_SECONDS - 30, 60),
+        read_timeout=AGENTCORE_READ_TIMEOUT_SECONDS,
         connect_timeout=10,
         retries={"max_attempts": 0},
     ),
 )
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
+s3_client = boto3.client("s3", region_name=AWS_REGION,
+                         config=Config(connect_timeout=2, read_timeout=10, retries={"max_attempts": 2}))
 
 # --- Token cache (survives across warm invocations, 15-min TTL) ---
 _SECRET_CACHE_TTL_SECONDS = 900  # 15 minutes
@@ -53,6 +61,13 @@ _token_cache = {}  # {secret_id: (value, fetched_at)}
 # --- Constants ---
 WARMUP_POLL_INTERVAL_SECONDS = 15
 WARMUP_MAX_WAIT_SECONDS = 300
+# Exception text can name the endpoint URL, runtime ARN and account ID, so
+# users only ever see these fixed messages; details stay in logs as a type.
+INVOCATION_FAILED_RESPONSE = "Agent invocation failed."
+CRON_FAILED_MESSAGE = (
+    "Your scheduled task did not return a result this time. "
+    "It will run again at the next scheduled time."
+)
 
 
 def _get_secret(secret_id):
@@ -211,7 +226,20 @@ def resolve_current_user_id(actor_id):
 # AgentCore invocation helpers
 # ---------------------------------------------------------------------------
 
-def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=None):
+def _caller_budget_ms(deadline):
+    """Milliseconds the contract may spend on a cron turn, measured from now.
+
+    Bounded by the Lambda deadline and by the client read timeout (which
+    starts at the invoke), less a margin for the failure notice, and clamped
+    to the 1..900000 range the contract accepts.
+    """
+    now = time.monotonic()
+    wait_s = min(deadline - now, AGENTCORE_READ_TIMEOUT_SECONDS)
+    budget_ms = int((wait_s - CALLER_BUDGET_MARGIN_SECONDS) * 1000)
+    return max(1, min(CALLER_BUDGET_MAX_MS, budget_ms))
+
+
+def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=None, deadline=None):
     """Invoke AgentCore Runtime with the given action."""
     payload_dict = {
         "action": action,
@@ -221,6 +249,12 @@ def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=Non
     }
     if message:
         payload_dict["message"] = message
+    if action == "cron":
+        # Tell the contract how long this Lambda will wait for the reply, so a
+        # turn queued behind another brief gives up before the Lambda does.
+        if deadline is None:
+            deadline = time.monotonic() + LAMBDA_TIMEOUT_SECONDS
+        payload_dict["callerBudgetMs"] = _caller_budget_ms(deadline)
 
     payload = json.dumps(payload_dict).encode()
 
@@ -248,15 +282,20 @@ def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=Non
                     body_text = body_text[:MAX_RESPONSE_BYTES]
             else:
                 body_text = str(body)[:MAX_RESPONSE_BYTES]
-            logger.info("AgentCore response (first 500): %s", body_text[:500])
             try:
-                return json.loads(body_text)
+                parsed = json.loads(body_text)
             except json.JSONDecodeError:
+                logger.info("AgentCore response: non-JSON body, len=%d", len(body_text))
                 return {"response": body_text}
+            # Never log the body: a contract error reply can carry exception text.
+            status = parsed.get("status") if isinstance(parsed, dict) else None
+            logger.info("AgentCore response: len=%d status=%s", len(body_text), status)
+            return parsed
         return {"response": "No response from agent."}
     except Exception as e:
-        logger.error("AgentCore invocation failed: %s", e, exc_info=True)
-        return {"response": f"Agent invocation failed: {e}"}
+        # Log the type only: botocore messages embed the runtime ARN and account ID.
+        logger.error("AgentCore invocation failed: %s", type(e).__name__)
+        return {"response": INVOCATION_FAILED_RESPONSE, "status": "failed"}
 
 
 def warmup_and_wait(session_id, user_id, actor_id, channel):
@@ -680,9 +719,159 @@ def send_feishu_message(receiver_id, text):
 
 
 
+# ---------------------------------------------------------------------------
+# Brief audio (BRIEF_AUDIO marker -> Telegram sendAudio)
+# ---------------------------------------------------------------------------
+#
+# The agent can't attach audio to a cron reply: tts and read are denied, local
+# media outside OpenClaw's roots is dropped, and the contract keeps only text.
+# So a brief uploads its mp3 to the user's S3 namespace and ends the reply with
+# one line "BRIEF_AUDIO: <namespace>/<file>.mp3". The Lambda strips that line
+# and sends the object itself. The IAM grant allows any */*.mp3 object in the
+# bucket, so the namespace check below is what keeps one user's brief from
+# sending another user's file.
+#
+# The label must not look like a secret name. OpenClaw's gateway redacts the
+# value after any upper-case label ending in KEY, TOKEN, SECRET, PASSWORD or
+# PASSWD followed by ':' or '=' (2026.9.5 dist/redact-*.mjs,
+# ENV_ASSIGNMENT_REDACT_PATTERN), and only scans text containing KEY, TOKEN,
+# SECRET, PASSWORD, PASSWD, AUTH, COOKIE, SIGNATURE, CREDENTIAL, CARD, CVC, CVV
+# or PAYMENT (DEFAULT_REDACT_PREFILTER_SOURCES, case-insensitive). The earlier
+# label AUDIO_S3_KEY reached the Lambda as "AUDIO_S3_KEY: ***". BRIEF_AUDIO
+# contains none of those words.
+AUDIO_MARKER_LABEL = "BRIEF_AUDIO"
+
+# Telegram Bot API upload limit for sendAudio.
+AUDIO_MAX_BYTES = 50 * 1024 * 1024
+# Don't start the download/upload with less than this left before the deadline.
+AUDIO_MIN_SECONDS = 10
+AUDIO_UPLOAD_TIMEOUT_SECONDS = 60
+
+# Any line that starts with the marker (Markdown bold/code around it allowed).
+_AUDIO_MARKER_LINE_RE = re.compile(rf"^[\s`*]*{AUDIO_MARKER_LABEL}[\s`*]*:", re.MULTILINE)
+_AUDIO_MARKER_RE = re.compile(rf"^[\s`*]*{AUDIO_MARKER_LABEL}[\s`*]*:[\s`*]*(?P<key>[^\s`*]*)[\s`*]*$")
+# Same character set the s3-user-files skill's sanitize() produces, plus '/'.
+_AUDIO_KEY_RE = re.compile(r"^[A-Za-z0-9_\-./]+$")
+
+
+def split_audio_marker(text):
+    """Remove every BRIEF_AUDIO line from text.
+
+    Returns (text_without_marker_lines, key). key is the value of the last
+    marker line, or None. The text is returned unchanged when there is no
+    marker, so replies without one are delivered exactly as before. A marker
+    line whose value can't be read (empty, redacted to ***, extra words) is
+    still stripped and logged with a fixed warning; its text is never logged.
+    """
+    if not isinstance(text, str) or not _AUDIO_MARKER_LINE_RE.search(text):
+        return text, None
+    key = None
+    kept = []
+    for line in text.split("\n"):
+        if _AUDIO_MARKER_LINE_RE.match(line):
+            match = _AUDIO_MARKER_RE.match(line)
+            key = (match.group("key") if match else "") or None
+            continue
+        kept.append(line)
+    if key is None:
+        logger.warning("Brief audio skipped: marker line present but its key could not be read")
+    return "\n".join(kept).rstrip(), key
+
+
+def _audio_namespace(actor_id):
+    """User-files namespace for an actor, as the router and contract derive it."""
+    return (actor_id or "").replace(":", "_")
+
+
+def _valid_audio_key(key, namespace):
+    if not isinstance(key, str) or not namespace or len(key) > 1024:
+        return False
+    if ".." in key or not _AUDIO_KEY_RE.match(key):
+        return False
+    prefix = f"{namespace}/"
+    if not key.startswith(prefix) or not key.endswith(".mp3"):
+        return False
+    name = key.rsplit("/", 1)[-1]
+    return len(name) > len(".mp3")
+
+
+def _multipart_body(fields, file_field, filename, content_type, data):
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n".encode()
+    )
+    parts.append(data)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def send_telegram_audio(chat_id, filename, data, token, timeout):
+    """Upload an mp3 with Telegram sendAudio. Raises on failure."""
+    body, content_type = _multipart_body(
+        {"chat_id": chat_id}, "audio", filename, "audio/mpeg", data,
+    )
+    req = urllib_request.Request(
+        f"https://api.telegram.org/bot{token}/sendAudio",
+        data=body, headers={"Content-Type": content_type}, method="POST",
+    )
+    urllib_request.urlopen(req, timeout=timeout)
+
+
+def deliver_brief_audio(channel, channel_target, key, actor_id, deadline):
+    """Send the brief's mp3 from S3 after its text. Never raises.
+
+    Only Telegram is supported. Logs carry a fixed message and the error type
+    only: the key and target are not logged.
+    """
+    if not key:
+        return False
+    if channel != "telegram":
+        logger.info("Brief audio skipped: channel %s has no audio delivery", channel)
+        return False
+    if not USER_FILES_BUCKET:
+        logger.warning("Brief audio skipped: user files bucket not configured")
+        return False
+    if not _valid_audio_key(key, _audio_namespace(actor_id)):
+        logger.warning("Brief audio skipped: key rejected (outside namespace, not .mp3, or unsafe)")
+        return False
+    remaining = deadline - time.monotonic()
+    if remaining < AUDIO_MIN_SECONDS:
+        logger.warning("Brief audio skipped: %d s left before the deadline", int(remaining))
+        return False
+    try:
+        head = s3_client.head_object(Bucket=USER_FILES_BUCKET, Key=key)
+        size = int(head.get("ContentLength", 0))
+        if size <= 0 or size > AUDIO_MAX_BYTES:
+            logger.warning("Brief audio skipped: object size %d outside 1..%d bytes", size, AUDIO_MAX_BYTES)
+            return False
+        data = s3_client.get_object(Bucket=USER_FILES_BUCKET, Key=key)["Body"].read(AUDIO_MAX_BYTES + 1)
+        if len(data) > AUDIO_MAX_BYTES:
+            logger.warning("Brief audio skipped: object grew past %d bytes", AUDIO_MAX_BYTES)
+            return False
+        token = _get_telegram_token()
+        if not token:
+            logger.warning("Brief audio skipped: no Telegram token available")
+            return False
+        timeout = max(1, min(AUDIO_UPLOAD_TIMEOUT_SECONDS, deadline - time.monotonic() - 2))
+        send_telegram_audio(channel_target, key.rsplit("/", 1)[-1], data, token, timeout)
+    except Exception as e:
+        logger.warning("Brief audio not sent: %s", type(e).__name__)
+        return False
+    logger.info("Brief audio sent (%d bytes)", len(data))
+    return True
+
+
 def deliver_response(channel, channel_target, response_text):
     """Deliver a response to the user's channel."""
     response_text = _extract_text_from_content_blocks(response_text)
+    # The audio marker is for the Lambda only; it never reaches the user.
+    response_text, _ = split_audio_marker(response_text)
 
     if channel == "telegram":
         token = _get_telegram_token()
@@ -698,6 +887,26 @@ def deliver_response(channel, channel_target, response_text):
         send_feishu_message(channel_target, response_text)
     else:
         logger.warning("Unknown channel type: %s", channel)
+
+
+def _cron_run_failed(result):
+    """True when a cron turn failed or produced nothing worth delivering.
+
+    Covers an invocation exception (status "failed"), a contract error reply
+    (status "error", e.g. init failed), a contract 400 body ({"error": ...}),
+    and an empty, whitespace-only or missing response.
+    """
+    if not isinstance(result, dict):
+        return True
+    if result.get("status") in ("failed", "error") or result.get("error"):
+        return True
+    response = result.get("response")
+    if not isinstance(response, str):
+        return True
+    if not _extract_text_from_content_blocks(response).strip():
+        return True
+    # invoke_agentcore's placeholder for an empty response body.
+    return response == "No response from agent."
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +928,12 @@ def handler(event, context):
     }
     """
     logger.info("Cron event received: %s", json.dumps(event)[:1000])
+    # Monotonic deadline for this invocation; the brief audio upload must finish before it.
+    remaining_ms = None
+    if context is not None and hasattr(context, "get_remaining_time_in_millis"):
+        remaining_ms = context.get_remaining_time_in_millis()
+    lambda_deadline = time.monotonic() + (
+        remaining_ms / 1000 if remaining_ms is not None else LAMBDA_TIMEOUT_SECONDS)
 
     user_id = event.get("userId")
     actor_id = event.get("actorId")
@@ -789,12 +1004,22 @@ def handler(event, context):
 
     # Phase 3: Execute the cron message
     cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"
-    result = invoke_agentcore(session_id, "cron", current_user_id, actor_id, channel, cron_message)
-    response_text = result.get("response", "No response from scheduled task.")
+    result = invoke_agentcore(session_id, "cron", current_user_id, actor_id, channel, cron_message,
+                              deadline=lambda_deadline)
+    if _cron_run_failed(result):
+        status = result.get("status") if isinstance(result, dict) else None
+        logger.warning("Scheduled task %s did not complete: status=%s", schedule_id, status)
+        # Never forward the runtime's response text on failure; send a fixed notice.
+        deliver_response(channel, channel_target,
+                         f"[Scheduled: {schedule_name or schedule_id}] {CRON_FAILED_MESSAGE}")
+        return {"statusCode": 503, "body": "Scheduled task invocation failed or returned nothing"}
+    response_text, audio_key = split_audio_marker(_extract_text_from_content_blocks(result["response"]))
 
-    # Phase 4: Deliver response to channel
+    # Phase 4: Deliver response to channel, then the brief's audio (if any)
     logger.info("Delivering response (len=%d) to %s:%s", len(response_text), channel, channel_target)
     deliver_response(channel, channel_target, response_text)
+    if audio_key:
+        deliver_brief_audio(channel, channel_target, audio_key, actor_id, lambda_deadline)
 
     logger.info("Cron execution complete: schedule=%s", schedule_id)
     return {"statusCode": 200, "body": "OK"}
