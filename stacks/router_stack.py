@@ -42,6 +42,7 @@ class RouterStack(Stack):
         feishu_token_secret_name: str,
         webhook_secret_name: str,
         whatsapp_token_secret_name: str = "",
+        discord_token_secret_name: str = "",
         cmk_arn: str,
         user_files_bucket_name: str,
         user_files_bucket_arn: str,
@@ -114,6 +115,7 @@ class RouterStack(Stack):
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
                 "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
                 "WHATSAPP_TOKEN_SECRET_ID": whatsapp_token_secret_name,
+                "DISCORD_TOKEN_SECRET_ID": discord_token_secret_name,
                 "WEBHOOK_SECRET_ID": webhook_secret_name,
                 "REGISTRATION_OPEN": registration_open,
                 "USER_FILES_BUCKET": user_files_bucket_name,
@@ -159,6 +161,11 @@ class RouterStack(Stack):
         self.http_api.add_routes(
             path="/webhook/whatsapp",
             methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+            integration=lambda_integration,
+        )
+        self.http_api.add_routes(
+            path="/webhook/discord",
+            methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
         self.http_api.add_routes(

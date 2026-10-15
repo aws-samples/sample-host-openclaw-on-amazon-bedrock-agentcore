@@ -42,6 +42,7 @@ from documents import (
     zip_listing,
 )
 import whatsapp
+import discord_channel
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -52,6 +53,7 @@ TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
+DISCORD_TOKEN_SECRET_ID = os.environ.get("DISCORD_TOKEN_SECRET_ID", "")
 WHATSAPP_TOKEN_SECRET_ID = os.environ.get("WHATSAPP_TOKEN_SECRET_ID", "")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
@@ -148,6 +150,13 @@ def _get_whatsapp_config():
     if not WHATSAPP_TOKEN_SECRET_ID:
         return None
     return whatsapp.parse_config(_get_secret(WHATSAPP_TOKEN_SECRET_ID))
+
+
+def _get_discord_config():
+    """Return the Discord channel config, or None when the channel is not configured."""
+    if not DISCORD_TOKEN_SECRET_ID:
+        return None
+    return discord_channel.parse_config(_get_secret(DISCORD_TOKEN_SECRET_ID))
 
 
 # Feishu tenant_access_token cache (2h TTL, refresh 5 min early)
@@ -2111,6 +2120,140 @@ def _handle_whatsapp_message(config, msg):
     whatsapp.send_text(config, wa_id, response_text)
 
 
+def _discord_json(payload):
+    return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}
+
+
+def _discord_entry(headers, body, http_info):
+    """Verify a Discord interaction, answer PING, and defer slash commands (3 s limit)."""
+    # Disabled (404) until the secret holds a complete JSON config.
+    config = _get_discord_config()
+    if config is None:
+        return {"statusCode": 404, "body": "Not found"}
+    # Verify the Ed25519 signature over the raw body before parsing anything.
+    body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+    if not discord_channel.verify_signature(headers, body_bytes, config["publicKey"]):
+        logger.warning("Discord interaction validation failed from %s", http_info.get("sourceIp", "unknown"))
+        return {"statusCode": 401, "body": "invalid request signature"}
+    try:
+        interaction = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return {"statusCode": 400, "body": "Bad request"}
+    if not isinstance(interaction, dict):
+        return {"statusCode": 400, "body": "Bad request"}
+    if interaction.get("type") == discord_channel.INTERACTION_PING:
+        return _discord_json({"type": discord_channel.RESPONSE_PONG})
+    command = discord_channel.parse_command(interaction, config["applicationId"])
+    if command is None:
+        return _discord_json({"type": discord_channel.RESPONSE_CHANNEL_MESSAGE,
+                              "data": {"content": "Unsupported command.", "flags": discord_channel.EPHEMERAL}})
+    if not _claim_discord_interaction(command["id"]):
+        return _discord_json({"type": discord_channel.RESPONSE_CHANNEL_MESSAGE,
+                              "data": {"content": "Duplicate request ignored.", "flags": discord_channel.EPHEMERAL}})
+    _self_invoke_async("discord", body, {})
+    # In servers the reply is visible only to the caller; in DMs it is a normal message.
+    flags = discord_channel.EPHEMERAL if command["in_guild"] else 0
+    return _discord_json({"type": discord_channel.RESPONSE_DEFERRED_CHANNEL_MESSAGE, "data": {"flags": flags}})
+
+
+DISCORD_DEDUP_TTL_SECONDS = 3600
+
+
+def _claim_discord_interaction(interaction_id):
+    """Record an interaction ID so a replayed signed request runs once. False = duplicate."""
+    try:
+        identity_table.put_item(
+            Item={"PK": f"DEDUP#discord:{interaction_id}", "SK": "DEDUP",
+                  "ttl": int(time.time()) + DISCORD_DEDUP_TTL_SECONDS},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("Discord dedupe write failed: %s", type(e).__name__)
+        return True
+
+
+def handle_discord(body):
+    """Process a verified, deferred Discord slash command (async dispatch)."""
+    config = _get_discord_config()
+    if config is None:
+        logger.error("Discord: channel not configured; interaction dropped")
+        return
+    try:
+        interaction = json.loads(body) if isinstance(body, str) else body
+    except (json.JSONDecodeError, TypeError):
+        return
+    command = discord_channel.parse_command(interaction, config["applicationId"])
+    if command is None:
+        return
+    app_id = config["applicationId"]
+
+    def reply(text):
+        discord_channel.send_reply(app_id, command["token"], text, ephemeral=command["in_guild"])
+
+    try:
+        _handle_discord_command(command, reply)
+    except RouteUnavailable as e:
+        logger.error("Discord: route unavailable: %s", type(e).__name__)
+        reply("Sorry, your account needs attention. Please contact the bot admin.")
+
+
+def _handle_discord_command(command, reply):
+    discord_user_id = command["user_id"]
+    text = command["text"]
+    attachment = command["attachment"]
+    if not text and not attachment:
+        reply("Please include a prompt, e.g. `/ask prompt: hello`.")
+        return
+
+    actor_id = f"discord:{discord_user_id}"
+    is_bind, code = _is_bind_command(text)
+    if is_bind:
+        _, success = redeem_bind_code(code, "discord", discord_user_id, command["name"])
+        reply("Accounts linked successfully! Your sessions are now unified."
+              if success else "Invalid or expired link code. Please try again.")
+        return
+
+    resolved_user_id, _ = resolve_user("discord", discord_user_id, command["name"])
+    if resolved_user_id is None:
+        reply(f"Sorry, this bot is private and requires an invitation.\n\n"
+              f"Your ID: `discord:{discord_user_id}`\n\n"
+              f"Send this ID to the bot admin to request access.")
+        return
+
+    route = get_or_create_session(resolved_user_id)
+    authorize_channel_actor(identity_table, route, resolved_user_id, actor_id, "discord")
+
+    if _is_link_command(text):
+        bind_code = create_bind_code(resolved_user_id)
+        if not bind_code:
+            reply("Account linking requires identity reconciliation.")
+            return
+        reply(f"Your link code is: `{bind_code}`\n\nEnter this code on another channel within 10 minutes "
+              f"by typing: `link {bind_code}`")
+        return
+
+    agent_message = text
+    if attachment:
+        namespace = route.actor_id.replace(":", "_")
+        image_bytes, content_type = discord_channel.download_attachment(
+            attachment, ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES)
+        s3_key = _upload_image_to_s3(image_bytes, namespace, content_type) if image_bytes else None
+        if not s3_key:
+            reply("Sorry, I couldn't process that image. Please try again.")
+            return
+        agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
+
+    logger.info("Discord: user=%s actor=%s msg_len=%d has_image=%s",
+                resolved_user_id, actor_id, len(text), bool(attachment))
+    result = invoke_agent_runtime(route, resolved_user_id, actor_id, "discord", agent_message,
+                                  channel_target=discord_user_id)
+    response_text = result.get("response", "Sorry, I couldn't process your message.")
+    reply(_extract_text_from_content_blocks(response_text))
+
+
 # ---------------------------------------------------------------------------
 # Lambda handler
 # ---------------------------------------------------------------------------
@@ -2131,6 +2274,8 @@ def handler(event, context):
             handle_feishu(body, headers)
         elif channel == "whatsapp":
             handle_whatsapp(body)
+        elif channel == "discord":
+            handle_discord(body)
         return {"statusCode": 200, "body": "ok"}
 
     # --- Function URL entry point ---
@@ -2241,6 +2386,9 @@ def handler(event, context):
             return {"statusCode": 401, "body": "Unauthorized"}
         _self_invoke_async("whatsapp", body, {})
         return {"statusCode": 200, "body": "ok"}
+
+    elif path.endswith("/webhook/discord"):
+        return _discord_entry(headers, body, http_info)
 
     return {"statusCode": 404, "body": "Not found"}
 
