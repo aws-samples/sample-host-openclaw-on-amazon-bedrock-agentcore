@@ -16,8 +16,10 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -82,6 +84,12 @@ DEFAULT_PRICING = {"input": 1.00, "output": 5.00}
 # Unknown model IDs already warned about, so each is logged once per container.
 _warned_unknown_models = set()
 
+# Stored cost precision: the 8 decimal places estimate_cost() rounds to.
+COST_QUANTUM = Decimal("0.00000001")
+# GSI3SK is "COST#" + a fixed-width 015.8f total so string order = numeric
+# order. Totals above this cap share the top sort key instead of breaking order.
+MAX_SORTABLE_COST = Decimal("999999.99999999")
+
 
 def _lookup_pricing(model_id: str) -> dict:
     for key, price in MODEL_PRICING.items():
@@ -108,6 +116,14 @@ def estimate_cost(
     cache_read_cost = (cache_read_tokens / 1_000_000) * pricing.get("cache_read", pricing["input"])
     cache_write_cost = (cache_write_tokens / 1_000_000) * pricing.get("cache_write", pricing["input"])
     return round(input_cost + output_cost + cache_read_cost + cache_write_cost, 8)
+
+
+def cost_sort_key(total: Decimal) -> str:
+    """GSI3SK for a cumulative cost: fixed width, so string sort = numeric sort."""
+    if total > MAX_SORTABLE_COST:
+        logger.warning("Cost total %s exceeds the GSI3SK width; capping the sort key", total)
+        total = MAX_SORTABLE_COST
+    return f"COST#{total.quantize(COST_QUANTUM):015.8f}"
 
 
 def _int_field(source, *names) -> int:
@@ -175,70 +191,58 @@ def extract_openclaw_metadata(log_entry: dict) -> dict:
 
 
 def write_to_dynamodb(record: dict):
-    """Write a token usage record to DynamoDB with composite keys."""
+    """Accumulate a token usage record into its DynamoDB row.
+
+    One row per user/day/channel/session holds running totals. The first
+    update ADDs tokens and cost atomically and returns the new cost total;
+    the second sets GSI3SK from that total, conditional on the total being
+    unchanged, so a concurrent writer that added more cost (and will set
+    GSI3SK from its own, higher total) is never overwritten with a lower one.
+    """
     actor_id = record["actor_id"]
     session_id = record["session_id"]
     channel = record["channel"]
     model_id = record["model_id"]
     date_str = record["date"]
-    cost = record["estimated_cost_usd"]
+    cost = Decimal(str(record["estimated_cost_usd"])).quantize(COST_QUANTUM)
 
     # TTL: current time + TTL_DAYS
     ttl = int(time.time()) + (TTL_DAYS * 86400)
 
-    # Zero-pad cost for lexicographic sort in GSI3
-    cost_sort = f"{cost:015.8f}"
-
-    item = {
+    key = {
         "PK": f"USER#{actor_id}",
         "SK": f"DATE#{date_str}#CHANNEL#{channel}#SESSION#{session_id}",
-        # GSI1: Channel aggregation
-        "GSI1PK": f"CHANNEL#{channel}",
-        "GSI1SK": f"DATE#{date_str}",
-        # GSI2: Model aggregation
-        "GSI2PK": f"MODEL#{model_id}",
-        "GSI2SK": f"DATE#{date_str}",
-        # GSI3: Daily cost ranking
-        "GSI3PK": f"DATE#{date_str}",
-        "GSI3SK": f"COST#{cost_sort}",
-        # Attributes
-        "inputTokens": record["input_tokens"],
-        "outputTokens": record["output_tokens"],
-        "totalTokens": record["total_tokens"],
-        "estimatedCostUSD": str(cost),
-        "invocationCount": 1,
-        "channel": channel,
-        "modelId": model_id,
-        "actorId": actor_id,
-        "sessionId": session_id,
-        "timestamp": record["timestamp"],
-        "ttl": ttl,
     }
 
-    # Use update expression to accumulate if record already exists
-    table.update_item(
-        Key={"PK": item["PK"], "SK": item["SK"]},
+    response = table.update_item(
+        Key=key,
         UpdateExpression=(
             "SET GSI1PK = :g1pk, GSI1SK = :g1sk, "
             "GSI2PK = :g2pk, GSI2SK = :g2sk, "
-            "GSI3PK = :g3pk, GSI3SK = :g3sk, "
+            # A new row is indexed at once (its total is this call's cost);
+            # an existing row's GSI3SK is set from the total below.
+            "GSI3PK = :g3pk, GSI3SK = if_not_exists(GSI3SK, :g3sk), "
             "channel = :channel, modelId = :model, "
             "actorId = :actor, sessionId = :session, "
             "#ts = :ts, #ttl_attr = :ttl "
             "ADD inputTokens :inp, outputTokens :out, "
-            "totalTokens :total, invocationCount :one"
+            "totalTokens :total, invocationCount :one, "
+            "estimatedCostUSD :cost"
         ),
         ExpressionAttributeNames={
             "#ts": "timestamp",
             "#ttl_attr": "ttl",
         },
         ExpressionAttributeValues={
-            ":g1pk": item["GSI1PK"],
-            ":g1sk": item["GSI1SK"],
-            ":g2pk": item["GSI2PK"],
-            ":g2sk": item["GSI2SK"],
-            ":g3pk": item["GSI3PK"],
-            ":g3sk": item["GSI3SK"],
+            # GSI1: Channel aggregation
+            ":g1pk": f"CHANNEL#{channel}",
+            ":g1sk": f"DATE#{date_str}",
+            # GSI2: Model aggregation
+            ":g2pk": f"MODEL#{model_id}",
+            ":g2sk": f"DATE#{date_str}",
+            # GSI3: Daily cost ranking
+            ":g3pk": f"DATE#{date_str}",
+            ":g3sk": cost_sort_key(cost),
             ":channel": channel,
             ":model": model_id,
             ":actor": actor_id,
@@ -249,8 +253,24 @@ def write_to_dynamodb(record: dict):
             ":out": record["output_tokens"],
             ":total": record["total_tokens"],
             ":one": 1,
+            ":cost": cost,
         },
+        ReturnValues="UPDATED_NEW",
     )
+    total = response["Attributes"]["estimatedCostUSD"]
+
+    try:
+        table.update_item(
+            Key=key,
+            UpdateExpression="SET GSI3SK = :g3sk",
+            ConditionExpression="estimatedCostUSD = :total",
+            ExpressionAttributeValues={":g3sk": cost_sort_key(total), ":total": total},
+        )
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        # A concurrent write added cost after ours and sets GSI3SK from its total.
+        logger.warning("GSI3SK update skipped: cost total moved past %s concurrently", total)
 
 
 def publish_metrics(record: dict):
