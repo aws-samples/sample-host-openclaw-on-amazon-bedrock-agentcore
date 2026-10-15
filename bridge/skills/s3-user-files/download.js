@@ -43,7 +43,7 @@ async function main() {
     response = await client.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
   } catch (err) {
     if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
-      console.log(`File not found: ${key}`);
+      console.log("File not found: %s", key);
       return;
     }
     throw err;
@@ -64,10 +64,10 @@ async function main() {
 
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   fs.writeFileSync(target, Buffer.concat(chunks), { mode: 0o600 });
-  console.log(`Downloaded ${total} bytes to ${target}`);
+  console.log("Downloaded %d bytes to %s", total, target);
 }
 
 main().catch((err) => {
-  console.error(`Error: ${err.message}`);
+  console.error("Error: %s", err.message);
   process.exit(1);
 });
