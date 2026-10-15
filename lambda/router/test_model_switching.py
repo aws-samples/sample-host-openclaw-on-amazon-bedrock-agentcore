@@ -245,9 +245,30 @@ class TestChannelHandlers(ModelSwitchingCase):
                             "content": json.dumps({"text": text})}}})
         return sent
 
+    def whatsapp(self, text):
+        sent = []
+        with patch.object(index, "get_or_create_session", return_value=_route("whatsapp:15550001111")), \
+                patch.object(index, "_whatsapp_progress_notify"), \
+                patch.object(index.whatsapp, "send_text", side_effect=lambda c, to, t: sent.append(t)):
+            index._handle_whatsapp_message({}, {"from": "15550001111", "text": text, "image_id": None,
+                                                "name": "Ann", "id": "wamid.1"})
+        return sent
+
+    def discord(self, text):
+        sent = []
+        with patch.object(index, "get_or_create_session", return_value=_route("discord:100000000000000001")):
+            index._handle_discord_command({"user_id": "100000000000000001", "text": text, "attachment": None,
+                                           "name": "Ann"}, sent.append)
+        return sent
+
+    def channels(self):
+        return ((self.telegram, "telegram"), (self.slack, "slack"), (self.feishu, "feishu"),
+                (self.whatsapp, "whatsapp"), (self.discord, "discord"))
+
     def test_set_command_in_every_channel_is_not_forwarded(self):
         for send, text in ((self.telegram, "/model opus"), (self.slack, "<@UBOT> /model opus"),
-                           (self.feishu, "/model opus")):
+                           (self.feishu, "/model opus"), (self.whatsapp, "/model opus"),
+                           (self.discord, "/model opus")):
             self.table.update_item.reset_mock()
             replies = send(text)
             self.assertEqual(len(replies), 1, text)
@@ -257,20 +278,23 @@ class TestChannelHandlers(ModelSwitchingCase):
         self.invoke.assert_not_called()
 
     def test_status_and_clear_commands_are_not_forwarded(self):
-        for send in (self.telegram, self.slack, self.feishu):
+        for send, _ in self.channels():
             self.assertIn("Current model:", send("/model")[0])
             self.assertIn("reset to default", send("/model default")[0])
         self.invoke.assert_not_called()
 
     def test_normal_message_forwards_stored_override(self):
         self.stored(MODELS["sonnet"])
-        for send, channel in ((self.telegram, "telegram"), (self.slack, "slack"), (self.feishu, "feishu")):
+        for send, channel in self.channels():
             self.invoke.reset_mock()
             self.assertEqual(send("hello there")[-1], "agent reply")
             args, kwargs = self.invoke.call_args
             self.assertEqual(args[3], channel)
             self.assertEqual(kwargs["model_override"], MODELS["sonnet"])
         self.table.update_item.assert_not_called()
+
+    def test_whatsapp_reply_has_no_backticks(self):
+        self.assertNotIn("`", self.whatsapp("/model")[0])
 
     def test_normal_message_with_stale_override_uses_default(self):
         self.stored("global.anthropic.claude-opus-4-6")

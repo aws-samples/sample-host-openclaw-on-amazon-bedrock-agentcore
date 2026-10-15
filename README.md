@@ -315,7 +315,7 @@ Users can change the model that answers their own messages from any channel:
 | `/model <alias>` | Use that model for this user's messages, e.g. `/model opus` |
 | `/model default` | Go back to the deployment's `default_model_id` |
 
-The Router Lambda handles the command before anything reaches the agent and replies directly; the command is not part of the conversation. Only a message that starts with `/model` is a command (`/model@YourBot opus` also works in Telegram groups). In Slack, type a space before the slash (` /model opus`), otherwise the Slack client treats it as an unknown slash command and does not send it.
+The Router Lambda handles the command before anything reaches the agent and replies directly; the command is not part of the conversation. Only a message that starts with `/model` is a command (`/model@YourBot opus` also works in Telegram groups). In Slack, type a space before the slash (` /model opus`), otherwise the Slack client treats it as an unknown slash command and does not send it. In Discord, put the command in the `/ask` prompt (`/ask prompt: /model opus`).
 
 The choice is stored as `modelOverride` (the model ID, not the alias) on the user's `USER#<userId>` / `PROFILE` item in the identity table, so it applies on every linked channel and survives session idle timeouts and container recycling. The Router sends it with every chat invocation.
 

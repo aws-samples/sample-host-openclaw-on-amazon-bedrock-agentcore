@@ -2235,6 +2235,12 @@ def _handle_whatsapp_message(config, msg):
         )
         return
 
+    # Handle /model (per-user model switching); the reply is not forwarded to the agent.
+    model_argument = None if has_image else _parse_model_command(text)
+    if model_argument is not None:
+        whatsapp.send_text(config, wa_id, handle_model_command(resolved_user_id, model_argument, code=False))
+        return
+
     agent_message = text
     if has_image:
         namespace = route.actor_id.replace(":", "_")
@@ -2256,7 +2262,8 @@ def _handle_whatsapp_message(config, msg):
     notify_thread.start()
     try:
         result = invoke_agent_runtime(route, resolved_user_id, actor_id, "whatsapp", agent_message,
-                                      channel_target=wa_id)
+                                      channel_target=wa_id,
+                                      model_override=get_model_override(resolved_user_id))
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -2380,6 +2387,12 @@ def _handle_discord_command(command, reply):
               f"by typing: `link {bind_code}`")
         return
 
+    # Handle /model (per-user model switching); the reply is not forwarded to the agent.
+    model_argument = None if attachment else _parse_model_command(text)
+    if model_argument is not None:
+        reply(handle_model_command(resolved_user_id, model_argument))
+        return
+
     agent_message = text
     if attachment:
         namespace = route.actor_id.replace(":", "_")
@@ -2394,7 +2407,8 @@ def _handle_discord_command(command, reply):
     logger.info("Discord: user=%s actor=%s msg_len=%d has_image=%s",
                 resolved_user_id, actor_id, len(text), bool(attachment))
     result = invoke_agent_runtime(route, resolved_user_id, actor_id, "discord", agent_message,
-                                  channel_target=discord_user_id)
+                                  channel_target=discord_user_id,
+                                  model_override=get_model_override(resolved_user_id))
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     reply(_extract_text_from_content_blocks(response_text))
 
