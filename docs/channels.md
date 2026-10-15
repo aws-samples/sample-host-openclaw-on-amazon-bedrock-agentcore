@@ -1,4 +1,4 @@
-# Channel Setup: Slack and Feishu
+# Channel Setup: Slack, Feishu and WhatsApp
 
 Detailed setup for the Slack and Feishu channels. Telegram, the quick-start channel, is covered in the [README](../README.md#telegram).
 
@@ -89,3 +89,37 @@ Feishu (飞书 / Lark) uses the Events API with the Router Lambda as the webhook
    ```
 
 Scheduled-task replies (see [Scheduled Tasks](how-it-works.md#scheduled-tasks-cron-jobs)) are delivered to Feishu users too: `lambda/cron/index.py` routes `feishu` targets to the Feishu sender, using the same `openclaw/channels/feishu` app credentials and a cached tenant access token. Design notes: [docs/design-feishu-channel.md](design-feishu-channel.md).
+
+## WhatsApp
+
+WhatsApp uses the **WhatsApp Business Platform Cloud API** (Meta), with the Router Lambda as the webhook (`GET` and `POST /webhook/whatsapp`). It is **off by default**: both routes return 404 until `openclaw/channels/whatsapp` holds a complete JSON config, so deploying this code changes nothing for existing channels.
+
+Security model:
+- `POST` events are accepted only when `X-Hub-Signature-256` equals `sha256=` + HMAC-SHA256(App Secret, raw body), compared in constant time, before the body is parsed. Missing or wrong signatures get 401.
+- The `GET` subscription check answers `hub.challenge` only when `hub.verify_token` matches your verify token (constant-time); otherwise 403.
+- Meta signs no timestamp, so each message's own `timestamp` must be within 5 minutes, and message IDs are recorded in the identity table for 24 hours so Meta's retries are processed once.
+- Events for a phone number ID other than the configured one are ignored. Media is downloaded only from Meta-hosted HTTPS URLs, without following redirects.
+- The same allowlist and `link` account-binding flow as other channels applies. User IDs are `whatsapp:<phone number in international format, digits only>`. The WhatsApp code does not log tokens or message text; as for other channels, the shared allowlist check logs the ID of a rejected user so the admin can find it.
+
+1. In [Meta for Developers](https://developers.facebook.com/apps), create an app of type **Business** and add the **WhatsApp** product. Use the test phone number Meta provides or register your own business number.
+2. Create a permanent token: in Business Settings, add a **System User**, assign the app, and generate a token with `whatsapp_business_messaging` (and `whatsapp_business_management`). Temporary 24-hour tokens from the API Setup page also work for a quick test.
+3. Note the **Phone number ID** (API Setup page, not the phone number itself) and the **App Secret** (App settings > Basic).
+4. Choose a random verify token, e.g. `openssl rand -hex 24`.
+5. Store the config (all four keys are required; `graphApiVersion` is optional, default `v23.0`):
+   ```bash
+   aws secretsmanager update-secret \
+     --secret-id openclaw/channels/whatsapp \
+     --secret-string '{"accessToken":"EAAxxxx","appSecret":"YOUR_APP_SECRET","verifyToken":"YOUR_VERIFY_TOKEN","phoneNumberId":"123456789012345"}' \
+     --region $CDK_DEFAULT_REGION
+   ```
+   The Router Lambda caches secrets for up to 15 minutes, so a change can take that long to apply.
+6. In the app's **WhatsApp > Configuration**, set **Callback URL** to your API URL followed by `webhook/whatsapp` (see the Slack section for how to get the API URL) and **Verify token** to the value from step 4, then click **Verify and save**.
+7. Under **Webhook fields**, subscribe to `messages`.
+8. Send a message to the bot number. The bot replies with your ID; allow it:
+   ```bash
+   ./scripts/manage-allowlist.sh add whatsapp:15551234567
+   ```
+
+Limits: text and images (WhatsApp sends JPEG and PNG) are supported; other message types are ignored. Replies longer than 4,000 characters are split. WhatsApp only allows free-form messages within 24 hours of the user's last message, so scheduled-task results (cron) reach WhatsApp users only inside that window; outside it Meta rejects the send and the cron Lambda logs a delivery failure. Sending business-initiated template messages is not implemented.
+
+To turn the channel off again, put any non-JSON value back in the secret (for example `aws secretsmanager put-secret-value --secret-id openclaw/channels/whatsapp --secret-string disabled`); both routes return 404 once the cache expires.
