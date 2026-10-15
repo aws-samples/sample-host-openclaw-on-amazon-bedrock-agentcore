@@ -7,6 +7,8 @@ AgentCore Runtime V2 prepares your agent environment once, takes a snapshot, and
 
 This image prepares a user-neutral OpenClaw gateway; user state is restored during activation.
 
+V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1` and `ap-northeast-1` ([AWS: supported Regions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions)); `V2_REGIONS` in `scripts/runtime_deploy.py` rejects other Regions. For other Regions and for existing V1 deployments, see [the `release/v1` branch](release-v1.md).
+
 The pinned SDK controller explicitly sets `platformVersion="V2"`; CDK manages foundation and dependent stacks. [AWS documents](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions): "AWS CloudFormation and the AWS CDK do not currently support setting platformVersion."
 
 ## Lifecycle and compatibility
