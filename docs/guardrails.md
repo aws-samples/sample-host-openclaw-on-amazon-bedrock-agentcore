@@ -146,6 +146,10 @@ python3 scripts/guardrail-eval.py --guardrail-id "$GUARDRAIL_ID" --version "$GUA
 
 At `PROMPT_ATTACK` input strength `HIGH`, ordinary scheduled-brief prompts can be blocked as prompt attacks: an instruction to deliver the brief to the user on a named channel, or persona-style rules at the start of the prompt. A digest about cryptocurrency prices can also match the `CryptoScams` denied topic. The cron task then returns the blocked message instead of the brief. Run this eval against your own cron prompts before enabling guardrails for existing users, then reword the prompts or tune `stacks/guardrails_stack.py` (and publish a new version, see above).
 
+### Known limitation: sub-agent requests
+
+Sub-agent requests go through the same Bedrock proxy, and the guardrail assesses their latest user turn: the task text the main agent wrote for the sub-agent. That text often reads like an instruction to an assistant ("you are a research assistant, find ..."), so it can be blocked as a prompt attack in the same way as a scheduled-task prompt. The sub-agent then returns the guardrail's blocked message to the main agent instead of a result. If sub-agent tasks are blocked, check the [guardrail trace logs](#guardrail-trace-logs) for the policy that fired and tune `stacks/guardrails_stack.py`.
+
 ---
 
 ## Wiring and End-to-End Tests
