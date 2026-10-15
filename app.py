@@ -90,6 +90,8 @@ runtime_target = runtime_target_from_manifest(runtime_manifest)
 runtime_arn = runtime_manifest["agentRuntimeArn"] if runtime_manifest else ""
 runtime_endpoint_name = runtime_manifest["endpointName"] if runtime_manifest else ""
 
+WHATSAPP_SECRET_NAME = "openclaw/channels/whatsapp"
+
 # --- Router (Lambda + API Gateway HTTP API for Telegram/Slack webhooks) ---
 router_stack = RouterStack(
     app,
@@ -102,7 +104,9 @@ router_stack = RouterStack(
     slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
     feishu_token_secret_name=security_stack.channel_secrets["feishu"].secret_name,
     webhook_secret_name=security_stack.webhook_secret.secret_name,
-    whatsapp_token_secret_name=security_stack.channel_secrets["whatsapp"].secret_name,
+    # Fixed secret name (created by OpenClawSecurity) rather than a cross-stack
+    # reference, so adding the channel needs no new export and no redeploy order.
+    whatsapp_token_secret_name=WHATSAPP_SECRET_NAME,
     cmk_arn=security_stack.cmk.key_arn,
     user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
     user_files_bucket_arn=agentcore_stack.user_files_bucket.bucket_arn,
@@ -127,7 +131,7 @@ cron_stack = CronStack(
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
     slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
     feishu_token_secret_name=security_stack.channel_secrets["feishu"].secret_name,
-    whatsapp_token_secret_name=security_stack.channel_secrets["whatsapp"].secret_name,
+    whatsapp_token_secret_name=WHATSAPP_SECRET_NAME,
     cmk_arn=security_stack.cmk.key_arn,
     agentcore_execution_role=agentcore_stack.execution_role,
     user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
