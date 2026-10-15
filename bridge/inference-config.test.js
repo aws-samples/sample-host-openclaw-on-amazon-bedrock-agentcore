@@ -75,6 +75,40 @@ describe("modelRejectsTemperature", () => {
   });
 });
 
+describe("user-selectable 5.5 models (issue #18)", () => {
+  const { requestFields } = require("./model-policy");
+  const variants = (name) => [
+    `global.anthropic.claude-${name}`, `anthropic.claude-${name}`, `us.anthropic.claude-${name}`,
+    `au.anthropic.claude-${name}`,
+    `arn:aws:bedrock:us-west-2:123456789012:inference-profile/global.anthropic.claude-${name}`,
+  ];
+
+  it("omits temperature for Haiku 5.5, Sonnet 5.5 and Opus 5.5 under any profile prefix", () => {
+    for (const id of [...variants("haiku-5-5"), ...variants("sonnet-5-5"), ...variants("opus-5-5")]) {
+      assert.equal(modelRejectsTemperature(id), true, id);
+      assert.deepEqual(buildInferenceConfig(id, parseTemperatureOverride(undefined)), { maxTokens: 16384 }, id);
+    }
+  });
+
+  it("keeps temperature for other Haiku versions and pre-5 Sonnet", () => {
+    for (const id of ["global.anthropic.claude-haiku-4-5-20251001-v1:0", "global.anthropic.claude-haiku-5-55",
+      "global.anthropic.claude-sonnet-4-5-20250929-v1:0", "global.anthropic.claude-sonnet-4-6"]) {
+      assert.equal(modelRejectsTemperature(id), false, id);
+    }
+  });
+
+  it("disables thinking only for Haiku 5.5, by the model actually sent", () => {
+    for (const id of variants("haiku-5-5")) {
+      assert.deepEqual(requestFields(id), { additionalModelRequestFields: { thinking: { type: "disabled" } } }, id);
+    }
+    // Opus 5.5 cannot disable thinking; Sonnet 5.5 rejects "disabled" with a 400.
+    for (const id of [...variants("sonnet-5-5"), ...variants("opus-5-5"), "global.anthropic.claude-sonnet-4-6",
+      "global.anthropic.claude-haiku-5-55", "", undefined, null]) {
+      assert.deepEqual(requestFields(id), {}, String(id));
+    }
+  });
+});
+
 describe("buildInferenceConfig without override", () => {
   it("omits the temperature key for Opus 5 (key absent, not undefined/null)", () => {
     const cfg = buildInferenceConfig(OPUS_5, parseTemperatureOverride(undefined));

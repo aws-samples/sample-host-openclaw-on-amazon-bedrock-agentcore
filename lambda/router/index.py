@@ -61,6 +61,30 @@ AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 RUNTIME_TARGET = json.loads(os.environ.get("RUNTIME_TARGET", "null"))
+DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "")
+
+
+def _load_user_selectable_models(raw):
+    """Parse the operator's /model allowlist ({alias: model_id}).
+
+    CDK validates the map at synth time; anything malformed here disables the
+    feature rather than letting users pick an unvetted model.
+    """
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        logger.error("USER_SELECTABLE_MODELS is not valid JSON; /model is disabled")
+        return {}
+    if not isinstance(value, dict) or not all(
+            isinstance(alias, str) and alias and isinstance(model_id, str) and model_id
+            for alias, model_id in value.items()):
+        logger.error("USER_SELECTABLE_MODELS must map aliases to model IDs; /model is disabled")
+        return {}
+    return {alias.lower(): model_id for alias, model_id in value.items()}
+
+
+# Empty map = per-user model switching disabled.
+USER_SELECTABLE_MODELS = _load_user_selectable_models(os.environ.get("USER_SELECTABLE_MODELS", ""))
 
 # --- Clients (lazy init on cold start) ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION,
@@ -558,10 +582,13 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 # AgentCore invocation
 # ---------------------------------------------------------------------------
 
-def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_target=None):
+def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_target=None,
+                         model_override=None):
     """Invoke the AgentCore Runtime with a per-user session.
 
     Message can be a plain string or a structured dict with text + images.
+    model_override is the user's allowlisted /model choice (a model ID), sent
+    on every turn so it survives container recycling; omitted when unset.
     """
     payload = json.dumps({
         "action": "chat",
@@ -571,6 +598,7 @@ def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_tar
         "channel": channel,
         "channelTarget": str(channel_target) if channel_target is not None else actor_id.split(":", 1)[-1],
         "message": message,
+        **({"modelOverride": model_override} if model_override else {}),
         **route.payload_context(),
     }).encode()
 
@@ -1523,6 +1551,101 @@ def _is_link_command(text):
     return text.strip().lower() in ("link accounts", "link account", "link")
 
 
+# ---------------------------------------------------------------------------
+# Per-user model switching (/model)
+# ---------------------------------------------------------------------------
+
+# "/model", "/model sonnet", "/model@MyBot opus" (Telegram group form). Only an
+# explicit leading "/model" counts, so ordinary messages never switch models.
+_MODEL_COMMAND_RE = re.compile(r"^/model(?:@[A-Za-z0-9_]{1,64})?(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_model_command(text):
+    """Return the /model argument ('' when bare), or None if text is not a /model command."""
+    if not text or not isinstance(text, str):
+        return None
+    match = _MODEL_COMMAND_RE.match(text.strip())
+    if not match:
+        return None
+    return (match.group(1) or "").strip()
+
+
+def get_model_override(user_id):
+    """Return the user's stored model ID if it is still allowlisted, else None (= default)."""
+    if not USER_SELECTABLE_MODELS:
+        return None
+    try:
+        item = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+            ProjectionExpression="modelOverride",
+        ).get("Item") or {}
+    except Exception as e:  # noqa: BLE001 -- a lookup failure falls back to the default model
+        logger.warning("Model override lookup failed for user %s: %s", user_id, type(e).__name__)
+        return None
+    model_id = item.get("modelOverride")
+    if isinstance(model_id, str) and model_id in USER_SELECTABLE_MODELS.values():
+        return model_id
+    if model_id:
+        logger.info("Ignoring model override for user %s: no longer allowlisted", user_id)
+    return None
+
+
+def set_model_override(user_id, model_id):
+    """Store (model_id) or clear (None) the override on USER#<id>/PROFILE. Returns success."""
+    key = {"PK": f"USER#{user_id}", "SK": "PROFILE"}
+    try:
+        if model_id:
+            identity_table.update_item(
+                Key=key,
+                UpdateExpression="SET modelOverride = :model, modelOverrideUpdatedAt = :now",
+                ConditionExpression="attribute_exists(PK)",
+                ExpressionAttributeValues={
+                    ":model": model_id, ":now": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+            )
+        else:
+            identity_table.update_item(
+                Key=key,
+                UpdateExpression="REMOVE modelOverride, modelOverrideUpdatedAt",
+                ConditionExpression="attribute_exists(PK)",
+            )
+        return True
+    except Exception as e:  # noqa: BLE001 -- reported to the user as a failed switch
+        logger.error("Model override update failed for user %s: %s", user_id, type(e).__name__)
+        return False
+
+
+def handle_model_command(user_id, argument, code=True):
+    """Apply a /model command and return the reply text (never forwarded to the agent).
+
+    code=False drops the backticks for channels that show them literally (Feishu).
+    """
+    def fmt(value):
+        return f"`{value}`" if code else value
+
+    models = USER_SELECTABLE_MODELS
+    if not models:
+        return "Model switching is not enabled on this bot."
+    default_label = f"default ({fmt(DEFAULT_MODEL_ID)})" if DEFAULT_MODEL_ID else "default"
+    available = ", ".join([*(fmt(alias) for alias in models), fmt("default")])
+    usage = f"Available: {available}\nSwitch with /model NAME, reset with /model default."
+    if argument == "":
+        current = get_model_override(user_id)
+        alias = next((name for name, model_id in models.items() if model_id == current), None)
+        label = f"{fmt(alias)} ({fmt(current)})" if current else default_label
+        return f"Current model: {label}\n{usage}"
+    choice = argument.lower()
+    if choice == "default":
+        if not set_model_override(user_id, None):
+            return "Sorry, I couldn't reset your model. Please try again."
+        return f"Model reset to {default_label}."
+    if choice not in models:
+        return f"Unknown model.\n{usage}"
+    if not set_model_override(user_id, models[choice]):
+        return "Sorry, I couldn't switch your model. Please try again."
+    return f"Model switched to {fmt(choice)} ({fmt(models[choice])}) for your next messages."
+
+
 def handle_telegram(body):
     """Process a Telegram webhook update."""
     update = json.loads(body) if isinstance(body, str) else body
@@ -1592,6 +1715,12 @@ def handle_telegram(body):
             f"by typing: `link {code}`",
             token,
         )
+        return
+
+    # Handle /model (per-user model switching); the reply is not forwarded to the agent.
+    model_argument = None if (has_image or has_document) else _parse_model_command(text)
+    if model_argument is not None:
+        send_telegram_message(chat_id, handle_model_command(resolved_user_id, model_argument), token)
         return
 
     doc_kind = None
@@ -1670,7 +1799,8 @@ def handle_telegram(body):
     typing_thread.start()
     try:
         result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message,
-                                      channel_target=chat_id)
+                                      channel_target=chat_id,
+                                      model_override=get_model_override(resolved_user_id))
     finally:
         stop_typing.set()
         typing_thread.join(timeout=2)
@@ -1784,6 +1914,13 @@ def handle_slack(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    # Handle /model (Slack users type " /model" with a leading space so the
+    # Slack client sends it as a message instead of a slash command).
+    model_argument = None if has_image else _parse_model_command(text)
+    if model_argument is not None:
+        send_slack_message(channel_id, handle_model_command(resolved_user_id, model_argument), bot_token)
+        return {"statusCode": 200, "body": "ok"}
+
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
     if has_image:
@@ -1817,7 +1954,8 @@ def handle_slack(body, headers=None):
     notify_thread.start()
     try:
         result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message,
-                                      channel_target=channel_id)
+                                      channel_target=channel_id,
+                                      model_override=get_model_override(resolved_user_id))
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -1944,6 +2082,12 @@ def handle_feishu(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
+    # Handle /model (per-user model switching); the reply is not forwarded to the agent.
+    model_argument = None if has_image else _parse_model_command(text)
+    if model_argument is not None:
+        send_feishu_message(chat_id, handle_model_command(resolved_user_id, model_argument, code=False))
+        return {"statusCode": 200, "body": "ok"}
+
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text or "hi"
     if has_image:
@@ -1975,7 +2119,8 @@ def handle_feishu(body, headers=None):
     notify_thread.start()
     try:
         result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message,
-                                      channel_target=chat_id)
+                                      channel_target=chat_id,
+                                      model_override=get_model_override(resolved_user_id))
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -2090,6 +2235,12 @@ def _handle_whatsapp_message(config, msg):
         )
         return
 
+    # Handle /model (per-user model switching); the reply is not forwarded to the agent.
+    model_argument = None if has_image else _parse_model_command(text)
+    if model_argument is not None:
+        whatsapp.send_text(config, wa_id, handle_model_command(resolved_user_id, model_argument, code=False))
+        return
+
     agent_message = text
     if has_image:
         namespace = route.actor_id.replace(":", "_")
@@ -2111,7 +2262,8 @@ def _handle_whatsapp_message(config, msg):
     notify_thread.start()
     try:
         result = invoke_agent_runtime(route, resolved_user_id, actor_id, "whatsapp", agent_message,
-                                      channel_target=wa_id)
+                                      channel_target=wa_id,
+                                      model_override=get_model_override(resolved_user_id))
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -2235,6 +2387,12 @@ def _handle_discord_command(command, reply):
               f"by typing: `link {bind_code}`")
         return
 
+    # Handle /model (per-user model switching); the reply is not forwarded to the agent.
+    model_argument = None if attachment else _parse_model_command(text)
+    if model_argument is not None:
+        reply(handle_model_command(resolved_user_id, model_argument))
+        return
+
     agent_message = text
     if attachment:
         namespace = route.actor_id.replace(":", "_")
@@ -2249,7 +2407,8 @@ def _handle_discord_command(command, reply):
     logger.info("Discord: user=%s actor=%s msg_len=%d has_image=%s",
                 resolved_user_id, actor_id, len(text), bool(attachment))
     result = invoke_agent_runtime(route, resolved_user_id, actor_id, "discord", agent_message,
-                                  channel_target=discord_user_id)
+                                  channel_target=discord_user_id,
+                                  model_override=get_model_override(resolved_user_id))
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     reply(_extract_text_from_content_blocks(response_text))
 

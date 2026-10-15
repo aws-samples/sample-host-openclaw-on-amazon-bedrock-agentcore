@@ -38,6 +38,13 @@ const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcor
 // Unset/empty SUBAGENT_BEDROCK_MODEL_ID uses the policy sub-agent model (Sonnet 5.5).
 const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || modelPolicy.SUBAGENT_MODEL_ID;
 
+// Per-user `/model` overrides arrive per turn in the identity file. Only IDs the
+// operator allowlisted (cdk.json user_selectable_models) are honoured; anything
+// else falls back to MODEL_ID. Empty list = feature disabled.
+const USER_SELECTABLE_MODEL_IDS = new Set(
+  (process.env.BEDROCK_USER_SELECTABLE_MODEL_IDS || "").split(",")
+    .map((id) => id.trim()).filter(Boolean));
+
 // Bedrock Guardrails — content filtering (undefined = disabled)
 const GUARDRAIL_ID = process.env.BEDROCK_GUARDRAIL_ID || "";
 const GUARDRAIL_VERSION = process.env.BEDROCK_GUARDRAIL_VERSION || "DRAFT";
@@ -152,6 +159,8 @@ function extractSessionMetadata(parsed, headers) {
     channel = identity.channel || "unknown";
     idSource = "identity-file";
   }
+  const modelOverride = idSource === "identity-file" &&
+    typeof identity.modelOverride === "string" ? identity.modelOverride : null;
   if (!actorId && process.env.USER_ID) {
     actorId = process.env.USER_ID;
     channel = process.env.CHANNEL || "unknown";
@@ -169,7 +178,7 @@ function extractSessionMetadata(parsed, headers) {
       );
     }
     sessionId = sessionMap.get(key);
-    return { sessionId, actorId, channel, idSource };
+    return { sessionId, actorId, channel, idSource, modelOverride };
   }
 
   // 1. Check custom headers (future: OpenClaw might set these)
@@ -994,28 +1003,37 @@ function isSubagentRequest(parsed) {
 }
 
 /**
- * Resolve the Bedrock model ID based on the requested model name.
- * Subagent requests → SUBAGENT_BEDROCK_MODEL_ID, everything else → MODEL_ID.
+ * Main-agent model: the user's allowlisted `/model` override, else MODEL_ID.
  */
-function resolveModelId(requestedModel) {
-  if (!requestedModel) return MODEL_ID;
+function resolveMainModelId(modelOverride) {
+  return typeof modelOverride === "string" && USER_SELECTABLE_MODEL_IDS.has(modelOverride)
+    ? modelOverride : MODEL_ID;
+}
+
+/**
+ * Resolve the Bedrock model ID based on the requested model name.
+ * Subagent requests → SUBAGENT_BEDROCK_MODEL_ID (never the user's override),
+ * everything else → resolveMainModelId(modelOverride).
+ */
+function resolveModelId(requestedModel, modelOverride = null) {
+  if (!requestedModel) return resolveMainModelId(modelOverride);
   if (requestedModel === SUBAGENT_MODEL_NAME ||
       requestedModel.endsWith(`/${SUBAGENT_MODEL_NAME}`)) {
     return SUBAGENT_BEDROCK_MODEL_ID;
   }
-  return MODEL_ID;
+  return resolveMainModelId(modelOverride);
 }
 
 /**
  * Call Bedrock Converse API (non-streaming).
  * Accepts optional systemTextOverride and toolConfig for tool use.
  */
-async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel) {
+async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel, modelOverride = null) {
   const {
     BedrockRuntimeClient,
     ConverseCommand,
   } = preparedSdk() || require("@aws-sdk/client-bedrock-runtime");
-  const modelId = resolveModelId(requestedModel);
+  const modelId = resolveModelId(requestedModel, modelOverride);
   const client = new BedrockRuntimeClient({
     region: AWS_REGION,
     requestHandler: bedrockClientOptions(modelId),
@@ -1115,6 +1133,7 @@ async function invokeBedrockStreaming(
   systemTextOverride,
   toolConfig,
   systemPrefix,
+  modelOverride = null,
 ) {
   if (modelOutcomeUnknown) {
     if (!res.destroyed && !res.writableEnded) {
@@ -1129,7 +1148,7 @@ async function invokeBedrockStreaming(
   }
   const subagent = isSubagentRequest({ model });
   const route = modelPolicy.createStreamingRoute({
-    primaryModelId: subagent ? resolveModelId(model) : MODEL_ID,
+    primaryModelId: subagent ? resolveModelId(model) : resolveMainModelId(modelOverride),
     fallbackModelId: subagent ? null : FALLBACK_MODEL_ID, response: res,
   });
   try {
@@ -1483,7 +1502,7 @@ const server = http.createServer(async (req, res) => {
         );
 
         // Extract identity for all modes (used for logging + Cognito)
-        const { sessionId, actorId, channel, idSource } =
+        const { sessionId, actorId, channel, idSource, modelOverride } =
           extractSessionMetadata(parsed, req.headers);
         chatRequestCount++;
 
@@ -1619,6 +1638,7 @@ const server = http.createServer(async (req, res) => {
             systemTextOverride,
             toolConfig,
             systemPrefix,
+            modelOverride,
           );
         } else {
           const result = await invokeBedrock(
@@ -1626,6 +1646,7 @@ const server = http.createServer(async (req, res) => {
             systemTextOverride,
             toolConfig,
             parsed.model,
+            modelOverride,
           );
           const response = formatChatResponse(result, parsed.model);
           console.log(

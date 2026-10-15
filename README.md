@@ -18,6 +18,7 @@ AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+- [Per-user model switching](#per-user-model-switching)
 - [Channel Setup](#channel-setup)
 - [Operations](#operations)
 - [Upgrading from OpenClaw 2026.3.x](#upgrading-from-openclaw-20263x)
@@ -33,6 +34,7 @@ AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-
 - Per-user Firecracker microVM isolation (AgentCore Runtime)
 - Multi-channel support (Telegram, Slack, Feishu, WhatsApp) with cross-channel account linking
 - Multimodal: text + image messages via Bedrock ConverseStream
+- Per-user model switching with a `/model` chat command, limited to an operator allowlist
 - STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
 - Custom skills: S3 file storage, EventBridge cron scheduling, API key management, ClawHub skill installer
 - Scheduled briefs that deliver only the final answer, send a fixed notice instead of raw errors, and can attach an MP3 on Telegram ([brief audio](docs/how-it-works.md#brief-audio))
@@ -272,6 +274,7 @@ All tunable parameters are in `cdk.json`:
 | `default_model_id` | `global.anthropic.claude-opus-5-5` | Primary Bedrock model for the main agent. Opus 5.5 uses its default adaptive thinking and omits temperature; see the [AgentCore Runtime V2 model contract](docs/runtime-v2.md#model-and-api-contract) |
 | `fallback_model_id` | `global.anthropic.claude-sonnet-5-5` | Fallback for eligible primary API failures before content starts; never replays partial output or a Guardrail intervention |
 | `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model ID for sub-agents. Empty = the bridge default, also Sonnet 5.5. Sub-agents never use the fallback model |
+| `user_selectable_models` | `haiku`, `sonnet`, `opus` (Claude 5.5 global profiles) | Aliases users can pick with `/model <alias>`, mapped to Bedrock model IDs. Set to `{}` to disable switching. See [Per-user model switching](#per-user-model-switching) |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Threshold of the `openclaw-daily-token-budget` alarm. Despite the name, the alarm compares the token sum over a **1-hour** period |
 | `daily_cost_budget_usd` | `5` | Threshold (USD) of the `openclaw-daily-cost-budget` alarm, compared with the estimated cost summed over a **1-hour** period. `5` is low for an Opus-class model; see [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking) |
@@ -301,6 +304,37 @@ All tunable parameters are in `cdk.json`:
 | `table_tags` | `{}` | Extra tags put on every DynamoDB table (identity and token-usage). CloudFormation does not copy its own stack tags onto DynamoDB tables, so if your account runs an automated cleanup job that deletes untagged tables, set the opt-out tag it honours, for example `{"auto-delete": "no"}` (or `-c 'table_tags={"auto-delete":"no"}'`). Deletion protection is on for both tables regardless of this setting |
 
 > **Guardrails cost**: Bedrock Guardrails are enabled by default and add ~$0.75 per 1,000 text units on top of model inference costs. Before disabling, follow the [dependency check](docs/guardrails.md#disable). See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling removes content-level protections but other security layers (STS scoping, tool deny list) remain active.
+
+## Per-user model switching
+
+Users can change the model that answers their own messages from any channel:
+
+| Command | Effect |
+|---|---|
+| `/model` | Show the current model and the available aliases |
+| `/model <alias>` | Use that model for this user's messages, e.g. `/model opus` |
+| `/model default` | Go back to the deployment's `default_model_id` |
+
+The Router Lambda handles the command before anything reaches the agent and replies directly; the command is not part of the conversation. Only a message that starts with `/model` is a command (`/model@YourBot opus` also works in Telegram groups). In Slack, type a space before the slash (` /model opus`), otherwise the Slack client treats it as an unknown slash command and does not send it. In Discord, put the command in the `/ask` prompt (`/ask prompt: /model opus`).
+
+The choice is stored as `modelOverride` (the model ID, not the alias) on the user's `USER#<userId>` / `PROFILE` item in the identity table, so it applies on every linked channel and survives session idle timeouts and container recycling. The Router sends it with every chat invocation.
+
+The operator controls which models are offered with `user_selectable_models` in `cdk.json`:
+
+```json
+"user_selectable_models": {
+  "haiku": "global.anthropic.claude-haiku-5-5",
+  "sonnet": "global.anthropic.claude-sonnet-5-5",
+  "opus": "global.anthropic.claude-opus-5-5"
+}
+```
+
+- Aliases are 1-32 lowercase letters, digits, `-` or `_`; `default` is reserved. Values must be Bedrock model or inference profile IDs. CDK synth and `scripts/deploy.sh` reject an invalid map.
+- To disable the feature, set `"user_selectable_models": {}` and redeploy both the runtime configuration and the Router (see [Deploy and verify V2](docs/runtime-v2.md#deploy-and-verify-v2)). `/model` then replies that switching is not enabled, and stored choices are ignored.
+- Removing a model from the map takes effect at the next deployment: users who picked it go back to `default_model_id` without being told, and `/model` shows them the default.
+- Rules that still apply with an override: sub-agents keep `subagent_model_id`; if the chosen model fails before any output, the bridge falls back once to `fallback_model_id` (no fallback when they are the same model); scheduled (Cron) tasks use `default_model_id`. Request settings follow the model actually sent (Haiku 5.5 runs with thinking disabled; Haiku 5.5, Sonnet 5.5 and Opus 5.5 omit temperature).
+- Cost: larger models cost more per token. Token monitoring prices Haiku, Sonnet and Opus 5.5, and the daily budget alarms cover all users together.
+- The runtime execution role already allows every model through `inference-profile/*` and `foundation-model/*`. If you narrow that policy, keep every allowlisted model's inference profile and its foundation models.
 
 ## Channel Setup
 

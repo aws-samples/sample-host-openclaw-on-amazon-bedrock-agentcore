@@ -199,6 +199,8 @@ read_cdk_outputs() {
   DEFAULT_MODEL_ID=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('default_model_id','global.anthropic.claude-opus-5-5'))")
   FALLBACK_MODEL_ID=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('fallback_model_id','global.anthropic.claude-sonnet-5-5'))")
   SUBAGENT_MODEL_ID=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('subagent_model_id','global.anthropic.claude-sonnet-5-5'))")
+  # Per-user /model allowlist (validated; empty = feature disabled, runtime variable removed).
+  USER_SELECTABLE_MODEL_IDS=$("${PYTHON[@]}" -c "import sys; sys.path.insert(0, '$SCRIPT_DIR'); import model_selection; sys.exit(model_selection.main(['', '$PROJECT_DIR/cdk.json']))")
   IMAGE_VERSION=$("${PYTHON[@]}" -c "import json; print(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('image_version','1'))")
   WORKSPACE_SYNC_MS=$("${PYTHON[@]}" -c "import json; print(int(json.load(open('$PROJECT_DIR/cdk.json'))['context'].get('workspace_sync_interval_seconds',300))*1000)")
   # How long the bridge waits for the S3 workspace restore before spawning the
@@ -268,7 +270,8 @@ phase2_runtime() {
 
   export EXECUTION_ROLE_ARN SECURITY_GROUP_ID PRIVATE_SUBNET_IDS USER_FILES_BUCKET
   export GATEWAY_TOKEN_SECRET_ID COGNITO_USER_POOL_ID COGNITO_CLIENT_ID COGNITO_PASSWORD_SECRET_ID
-  export CMK_ARN DEFAULT_MODEL_ID FALLBACK_MODEL_ID SUBAGENT_MODEL_ID IMAGE_VERSION WORKSPACE_SYNC_MS WORKSPACE_RESTORE_WAIT_MS
+  export CMK_ARN DEFAULT_MODEL_ID FALLBACK_MODEL_ID SUBAGENT_MODEL_ID USER_SELECTABLE_MODEL_IDS
+  export IMAGE_VERSION WORKSPACE_SYNC_MS WORKSPACE_RESTORE_WAIT_MS
   export CRON_LEAD_TIME SESSION_IDLE SESSION_MAX TELEGRAM_CHANNEL_SECRET_ID
   export GUARDRAIL_ID GUARDRAIL_VERSION BROWSER_IDENTIFIER AGENTCORE_GATEWAY_URL REGION ACCOUNT
   config_file=$(mktemp "$PROJECT_DIR/.runtime/config.XXXXXX")

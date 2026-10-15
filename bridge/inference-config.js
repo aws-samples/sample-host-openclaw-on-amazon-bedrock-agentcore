@@ -18,6 +18,8 @@ const DEFAULT_TEMPERATURE = 0.7;
 
 // Anthropic Opus/Sonnet major version at or above which temperature is rejected.
 const NO_TEMPERATURE_MIN_MAJOR = 5;
+// Other models that reject a non-default temperature, under any profile prefix.
+const NO_TEMPERATURE_MODEL = /(?:^|[./])anthropic\.claude-haiku-5-5(?=[-.:]|$)/;
 
 /**
  * True when the model rejects `temperature`. Matches the model name after any
@@ -26,7 +28,7 @@ const NO_TEMPERATURE_MIN_MAJOR = 5;
  */
 function modelRejectsTemperature(modelId) {
   if (typeof modelId !== "string" || !modelId) return false;
-  if (modelId === "global.anthropic.claude-haiku-5-5") return true;
+  if (NO_TEMPERATURE_MODEL.test(modelId)) return true;
   const m = modelId.match(/(?:^|[./])anthropic\.claude-(?:opus|sonnet)-(\d+)(?=[-.:]|$)/);
   if (!m) return false;
   return Number(m[1]) >= NO_TEMPERATURE_MIN_MAJOR;

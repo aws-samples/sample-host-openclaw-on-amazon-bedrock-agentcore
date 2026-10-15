@@ -25,6 +25,7 @@ import cdk_nag
 import json
 from constructs import Construct
 
+from scripts.model_selection import CONTEXT_KEY as MODEL_SELECTION_KEY, parse_user_selectable_models
 from stacks import apply_table_tags, retention_days
 
 
@@ -57,6 +58,10 @@ class RouterStack(Stack):
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
+        # Per-user `/model` switching: validated at synth so a bad map never deploys.
+        user_selectable_models = parse_user_selectable_models(
+            self.node.try_get_context(MODEL_SELECTION_KEY))
+        default_model_id = self.node.try_get_context("default_model_id") or ""
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
@@ -121,6 +126,8 @@ class RouterStack(Stack):
                 "USER_FILES_BUCKET": user_files_bucket_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
                 "RUNTIME_TARGET": json.dumps(runtime_target, separators=(",", ":")),
+                "USER_SELECTABLE_MODELS": json.dumps(user_selectable_models, separators=(",", ":")),
+                "DEFAULT_MODEL_ID": default_model_id,
             },
             log_group=router_log_group,
         )

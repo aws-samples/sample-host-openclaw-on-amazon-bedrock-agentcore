@@ -15,11 +15,6 @@ const { osRandomUUID } = require("./runtime-lifecycle");
 const PRIMARY_MODEL_ID = "global.anthropic.claude-opus-5-5";
 const FALLBACK_MODEL_ID = "global.anthropic.claude-sonnet-5-5";
 const SUBAGENT_MODEL_ID = "global.anthropic.claude-sonnet-5-5";
-// Per-model additionalModelRequestFields. Opus 5.5 and Sonnet 5.5 reject
-// thinking.type "disabled" (Opus only allows adaptive), so they send nothing.
-const MODEL_REQUEST_FIELDS = Object.freeze({
-  "global.anthropic.claude-haiku-5-5": Object.freeze({ thinking: Object.freeze({ type: "disabled" }) }),
-});
 const UNKNOWN_OUTCOME_ERROR = Object.freeze({
   code: "PROVIDER_POST_DISPATCH_AMBIGUITY",
   type: "invalid_request_error",
@@ -39,9 +34,15 @@ const STREAM_ERRORS = Object.freeze({
   validationException: "ValidationException",
 });
 
+// Per-model additionalModelRequestFields. Claude Haiku 5.5 (any profile prefix)
+// runs with thinking disabled. Opus 5.5 and Sonnet 5.5 reject thinking.type
+// "disabled" (Opus only allows adaptive), so they send nothing.
+const THINKING_DISABLED_MODEL = /(?:^|[./])anthropic\.claude-haiku-5-5(?=[-.:]|$)/;
+
 function requestFields(modelId) {
-  const fields = Object.hasOwn(MODEL_REQUEST_FIELDS, modelId) ? MODEL_REQUEST_FIELDS[modelId] : undefined;
-  return fields ? { additionalModelRequestFields: JSON.parse(JSON.stringify(fields)) } : {};
+  return typeof modelId === "string" && THINKING_DISABLED_MODEL.test(modelId)
+    ? { additionalModelRequestFields: { thinking: { type: "disabled" } } }
+    : {};
 }
 
 function sdkMetadata(value) {

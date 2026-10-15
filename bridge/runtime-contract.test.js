@@ -23,7 +23,7 @@ function loadContract(t, {
   managerFactory, persistenceSave, gatewayTurnImpl,
   prepare = Promise.resolve(), gatewayActivation = Promise.resolve(), migration,
   migrationExitCode = 0, remainingLegacy = false,
-  home = "/test-home", beforeFsOperation, proxyHealth,
+  home = "/test-home", beforeFsOperation, proxyHealth, runtimeEnv = {},
 } = {}) {
   let handler;
   let restored = false;
@@ -50,6 +50,7 @@ function loadContract(t, {
     BROWSER_IDENTIFIER: "browser", USER_ACTIVATION_TIMEOUT_MS: String(activationTimeoutMs),
     NODE_COMPILE_CACHE: "/app/.compile-cache",
     AWS_ACCESS_KEY_ID: "test-only-key", AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://credentials.invalid",
+    ...runtimeEnv,
   };
   if (gatewayMcpEnabled) env.AGENTCORE_GATEWAY_URL = "https://gateway.invalid/mcp";
   const stateDir = `${home || "/root"}/.openclaw`;
@@ -1557,6 +1558,49 @@ for (const channelTarget of [{ channelId: "C789" }, true, 123, ""]) {
     assert.ok(!app.calls.includes("chat.send"));
   });
 }
+
+
+// --- Per-user /model override (issue #18) ---
+const OVERRIDE_IDENTITY_FILE = "/tmp/current-identity.json";
+const OPUS_OVERRIDE = "global.anthropic.claude-opus-5-5";
+
+test("a payload model override reaches the proxy identity file for that turn only", async (t) => {
+  const allowlist = "global.anthropic.claude-haiku-5-5,global.anthropic.claude-sonnet-5-5," + OPUS_OVERRIDE;
+  const app = loadContract(t, { runtimeEnv: { BEDROCK_USER_SELECTABLE_MODEL_IDS: allowlist } });
+  const chosen = await app.request({ ...owner, action: "chat", message: "think hard", modelOverride: OPUS_OVERRIDE });
+  assert.equal(chosen.body.execution.phase, "completed", app.errors.join("\n"));
+  assert.equal(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)).modelOverride, OPUS_OVERRIDE);
+  const proxyChild = app.children.find((child) => child.kind === "node");
+  assert.equal(proxyChild.env.BEDROCK_USER_SELECTABLE_MODEL_IDS, allowlist);
+
+  const plain = await app.request({ ...owner, action: "chat", message: "next" });
+  assert.equal(plain.body.execution.phase, "completed");
+  assert.deepEqual(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)),
+    { actorId: owner.actorId, channel: owner.channel, channelActorId: null, channelTarget: null });
+
+  const cron = await app.request({ ...owner, action: "cron", message: "scheduled" });
+  assert.equal(cron.body.execution.phase, "completed");
+  assert.equal(Object.hasOwn(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)), "modelOverride"), false);
+});
+
+test("a recycled container applies the override on its first turn", async (t) => {
+  const app = loadContract(t);
+  assert.equal(app.files.has(OVERRIDE_IDENTITY_FILE), false);
+  const first = await app.request({ ...owner, action: "chat", message: "hello again", modelOverride: OPUS_OVERRIDE });
+  assert.equal(first.body.execution.phase, "completed", app.errors.join("\n"));
+  assert.equal(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)).modelOverride, OPUS_OVERRIDE);
+  assert.equal(app.children.find((child) => child.kind === "node").env.BEDROCK_USER_SELECTABLE_MODEL_IDS, "",
+    "an unset allowlist is forwarded empty");
+});
+
+test("a malformed payload model override is ignored without failing the turn", async (t) => {
+  const app = loadContract(t);
+  for (const modelOverride of [42, "", "../../etc/passwd", "Global.Anthropic", { id: OPUS_OVERRIDE }, "x".repeat(200)]) {
+    const reply = await app.request({ ...owner, action: "chat", message: "hi", modelOverride });
+    assert.equal(reply.body.execution.phase, "completed", JSON.stringify(modelOverride));
+    assert.equal(Object.hasOwn(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)), "modelOverride"), false);
+  }
+});
 
 // --- Cron timing: the EN and CN briefs share one session, so CN queues behind EN. ---
 

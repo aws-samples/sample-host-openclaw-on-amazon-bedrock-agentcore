@@ -85,6 +85,10 @@ MODEL_PRICING = {
     "anthropic.claude-sonnet-5-5": {
         "input": 2.20, "output": 11.00, "cache_read": 0.11, "cache_write": 2.75,
     },
+    # Claude Haiku 5.5 (standard context), same global/geo split
+    # (AWS Price List, AmazonBedrockFoundationModels us-east-1, 2026-10-14).
+    "global.anthropic.claude-haiku-5-5": {"input": 0.10, "output": 0.50},
+    "anthropic.claude-haiku-5-5": {"input": 0.11, "output": 0.55},
     "minimax.minimax-m2": {"input": 1.00, "output": 5.00},
 }
 
