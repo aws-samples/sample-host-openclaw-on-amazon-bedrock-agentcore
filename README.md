@@ -6,12 +6,15 @@
 
 > **Experimental** — This project is provided for experimentation and learning purposes only. It is **not intended for production use**. APIs, architecture, and configuration may change without notice.
 
-Deploy an AI-powered multi-channel messaging bot (Telegram, Slack, Feishu) on AWS Bedrock AgentCore Runtime V2 using CDK and the deployment SDK. OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Router Lambda handles webhook ingestion from Telegram, Slack and Feishu, resolves user identity via DynamoDB, and invokes per-user AgentCore sessions. Each user gets their own microVM with workspace persistence: the OpenClaw state dir (`~/.openclaw/`, SQLite session state plus the agent workspace) lives on the container's local disk, is mirrored to AgentCore session storage while the session runs, and is backed up to S3. The agent has built-in tools (web, filesystem, runtime, sessions, automation), custom skills for file storage and cron scheduling, and **EventBridge-based cron scheduling** for recurring tasks.
+Deploy an AI-powered multi-channel messaging bot (Telegram, Slack, Feishu, WhatsApp) on AWS Bedrock AgentCore Runtime V2 using CDK and the deployment SDK. OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Router Lambda handles webhook ingestion from Telegram, Slack, Feishu and WhatsApp, resolves user identity via DynamoDB, and invokes per-user AgentCore sessions. Each user gets their own microVM with workspace persistence: the OpenClaw state dir (`~/.openclaw/`, SQLite session state plus the agent workspace) lives on the container's local disk, is mirrored to AgentCore session storage while the session runs, and is backed up to S3. The agent has built-in tools (web, filesystem, runtime, sessions, automation), custom skills for file storage and cron scheduling, and **EventBridge-based cron scheduling** for recurring tasks.
+
+AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1` and `ap-northeast-1`. For other Regions, and for existing V1 deployments, use the [`release/v1` branch](docs/release-v1.md); see [Choosing a branch](#choosing-a-branch-v2-or-v1).
 
 ## Table of Contents
 
 - [Features](#features)
 - [Architecture](#architecture)
+- [Choosing a branch (V2 or V1)](#choosing-a-branch-v2-or-v1)
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -29,11 +32,12 @@ Deploy an AI-powered multi-channel messaging bot (Telegram, Slack, Feishu) on AW
 ## Features
 
 - Per-user Firecracker microVM isolation (AgentCore Runtime)
-- Multi-channel support (Telegram, Slack, Feishu) with cross-channel account linking
+- Multi-channel support (Telegram, Slack, Feishu, WhatsApp) with cross-channel account linking
 - Multimodal: text + image messages via Bedrock ConverseStream
 - Per-user model switching with a `/model` chat command, limited to an operator allowlist
 - STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
 - Custom skills: S3 file storage, EventBridge cron scheduling, API key management, ClawHub skill installer
+- Scheduled briefs that deliver only the final answer, send a fixed notice instead of raw errors, and can attach an MP3 on Telegram ([brief audio](docs/how-it-works.md#brief-audio))
 - Headless browser (optional, AgentCore Browser API)
 - AWS Bedrock Guardrails — content filtering, PII redaction, topic denial, word filters, prompt attack detection
 - LLM red team testing — 62 test cases across 12 attack categories via promptfoo
@@ -77,11 +81,20 @@ Component-by-component reference, moved to [docs/how-it-works.md](docs/how-it-wo
 
 See [docs/architecture-detailed.md](docs/architecture-detailed.md) for sequence diagrams, container internals and data flows, and [docs/architecture.md](docs/architecture.md) for the solution overview.
 
+## Choosing a branch (V2 or V1)
+
+| Branch | AgentCore Runtime | Regions | Deployed with |
+|---|---|---|---|
+| `main` (this README) | V2: snapshot restore, immutable `release_N` endpoints, no warm-up agent | `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `ap-northeast-1` | `scripts/deploy.sh` with the pinned SDK controller |
+| [`release/v1`](docs/release-v1.md) | V1, with the lightweight warm-up agent | Any Region with AgentCore Runtime | `scripts/deploy.sh` with the AgentCore Starter Toolkit (see that branch's README) |
+
+`scripts/runtime_deploy.py` refuses Regions outside the V2 list (`V2_REGIONS`). `release/v1` gets bug-fix backports, not new features. There is no in-place migration of a V1 deployment or its users to V2, and both branches use the same stack names, so don't deploy `main` over a V1 deployment. Details, the backported fixes and a V1/V2 comparison: [docs/release-v1.md](docs/release-v1.md).
+
 ## Prerequisites
 
-- **AWS Account** with Bedrock access
+- **AWS Account** with Bedrock access, in one of the V2 Regions above
 - **AWS CLI** v2 configured with credentials (`aws sts get-caller-identity` should succeed)
-- **Node.js** >= 18 (for CDK CLI)
+- **Node.js** 24.x, 24.16 or later (for the CDK CLI and the bridge unit tests; the container image uses Node 24)
 - **Python** >= 3.11 (for CDK app)
 - **uv** ([installation](https://docs.astral.sh/uv/getting-started/installation/))
 - **Docker buildx** with ARM64 support, or a prebuilt ARM64 ECR image supplied with `--image-uri`
@@ -101,7 +114,7 @@ cd sample-host-openclaw-on-amazon-bedrock-agentcore
 
 # Set your AWS account and region
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export CDK_DEFAULT_REGION=us-west-2  # change to your preferred region
+export CDK_DEFAULT_REGION=us-west-2  # must be a V2 Region, see "Choosing a branch"
 ```
 
 Or edit `cdk.json` directly:
@@ -258,13 +271,13 @@ All tunable parameters are in `cdk.json`:
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
 | `region` | (empty) | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
 | `availability_zones` | `[]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
-| `default_model_id` | `global.anthropic.claude-haiku-5-5` | Primary Bedrock model. Haiku 5.5 uses thinking disabled and omits temperature; see the [AgentCore Runtime V2 model contract](docs/runtime-v2.md#model-and-api-contract) |
-| `fallback_model_id` | `global.anthropic.claude-sonnet-4-6` | Fallback for eligible primary API failures before content starts; never replays partial output or a Guardrail intervention |
-| `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Use an explicit model such as `global.anthropic.claude-sonnet-4-6` to override |
+| `default_model_id` | `global.anthropic.claude-opus-5-5` | Primary Bedrock model for the main agent. Opus 5.5 uses its default adaptive thinking and omits temperature; see the [AgentCore Runtime V2 model contract](docs/runtime-v2.md#model-and-api-contract) |
+| `fallback_model_id` | `global.anthropic.claude-sonnet-5-5` | Fallback for eligible primary API failures before content starts; never replays partial output or a Guardrail intervention |
+| `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model ID for sub-agents. Empty = the bridge default, also Sonnet 5.5. Sub-agents never use the fallback model |
 | `user_selectable_models` | `haiku`, `sonnet`, `opus` (Claude 5.5 global profiles) | Aliases users can pick with `/model <alias>`, mapped to Bedrock model IDs. Set to `{}` to disable switching. See [Per-user model switching](#per-user-model-switching) |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
-| `daily_token_budget` | `1000000` | Daily token budget alarm threshold |
-| `daily_cost_budget_usd` | `5` | Daily cost budget alarm threshold (USD) |
+| `daily_token_budget` | `1000000` | Threshold of the `openclaw-daily-token-budget` alarm. Despite the name, the alarm compares the token sum over a **1-hour** period |
+| `daily_cost_budget_usd` | `5` | Threshold (USD) of the `openclaw-daily-cost-budget` alarm, compared with the estimated cost summed over a **1-hour** period. `5` is low for an Opus-class model; see [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking) |
 | `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |
 | `session_max_lifetime` | `28800` | Per-user session max lifetime (seconds) |
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
@@ -288,6 +301,7 @@ All tunable parameters are in `cdk.json`:
 | `enable_gateway` | `false` | Prototype: deploy `OpenClawGateway` (AgentCore Gateway serving the per-user file and schedule tools as MCP tools) and pass `AGENTCORE_GATEWAY_URL` to the AgentCore Runtime. See [docs/gateway-mcp-tools.md](docs/gateway-mcp-tools.md) |
 | `anomaly_band_width` | `2` | Standard-deviation band for the token-usage anomaly detector alarm |
 | `runtime_manifest` | (empty for foundation) | Verified V2 manifest required for dependent stacks; wrapper default `.runtime/runtime-v2.json` |
+| `table_tags` | `{}` | Extra tags put on every DynamoDB table (identity and token-usage). CloudFormation does not copy its own stack tags onto DynamoDB tables, so if your account runs an automated cleanup job that deletes untagged tables, set the opt-out tag it honours, for example `{"auto-delete": "no"}` (or `-c 'table_tags={"auto-delete":"no"}'`). Deletion protection is on for both tables regardless of this setting |
 
 > **Guardrails cost**: Bedrock Guardrails are enabled by default and add ~$0.75 per 1,000 text units on top of model inference costs. Before disabling, follow the [dependency check](docs/guardrails.md#disable). See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling removes content-level protections but other security layers (STS scoping, tool deny list) remain active.
 
@@ -324,7 +338,7 @@ The operator controls which models are offered with `user_selectable_models` in 
 
 ## Channel Setup
 
-Telegram is the quick-start channel. Slack and Feishu setup is in [docs/channels.md](docs/channels.md).
+Telegram is the quick-start channel. Slack, Feishu and WhatsApp setup is in [docs/channels.md](docs/channels.md).
 
 ### Telegram
 
@@ -348,6 +362,10 @@ Create a Slack app that uses the Events API, point its Request URL at `<ApiUrl>w
 
 Create a Feishu app with **Bot** capability and run `./scripts/setup-feishu.sh`. Manual setup and scheduled-task delivery: [docs/channels.md#feishu](docs/channels.md#feishu).
 
+### WhatsApp
+
+Off by default. Create a Meta app with the WhatsApp product (Cloud API), store its token, App Secret, verify token and phone number ID in `openclaw/channels/whatsapp`, and point the webhook at `webhook/whatsapp`: [docs/channels.md#whatsapp](docs/channels.md#whatsapp).
+
 ## Operations
 
 Operator commands are in [docs/operations.md](docs/operations.md):
@@ -358,6 +376,9 @@ Operator commands are in [docs/operations.md](docs/operations.md):
 - [Run tests](docs/operations.md#run-tests)
 - [Security validation](docs/operations.md#security-validation)
 - Run one-off shell commands inside a live session with `scripts/agentcore-exec.py` (operator-only, full execution-role credentials): [docs/execute-command.md](docs/execute-command.md)
+- Scheduled tasks: [delivery, deadlines and failures](docs/how-it-works.md#delivery-deadlines-and-failures) and the [brief audio marker](docs/how-it-works.md#brief-audio) for prompt authors
+- Token usage, cost estimates and budget alarms: [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking)
+- DynamoDB tables have deletion protection and `RETAIN`; for accounts with automated cleanup of untagged resources, set `table_tags` (see [Configuration](#configuration))
 
 ## Upgrading from OpenClaw 2026.3.x
 
@@ -411,7 +432,20 @@ The first message waits for state restoration and full OpenClaw initialization. 
 ### 502 / Bedrock authorization errors
 
 - **Model access not enabled**: Enable model access in the Bedrock console for your region.
-- **Cross-region inference**: The default model ID `global.anthropic.claude-sonnet-4-6` uses a global cross-region inference profile that routes to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions.
+- **Cross-region inference**: The default primary model `global.anthropic.claude-opus-5-5` and the sub-agent/fallback model `global.anthropic.claude-sonnet-5-5` use global cross-region inference profiles that route to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions. See the [model contract](docs/runtime-v2.md#model-and-api-contract).
+- **Region not supported**: `scripts/runtime_deploy.py` stops with `V2 region is outside the reviewed supported region set` outside the V2 Regions. Use the [`release/v1` branch](docs/release-v1.md) there.
+
+### Scheduled task says it "did not return a result this time"
+
+The Cron Lambda sends this fixed notice when the AgentCore invocation failed, returned an error, or its outcome is unknown (for example the turn ran past the caller's deadline while another brief for the same user was running). It never forwards the error text. Check the `openclaw-cron-executor` logs for the exception type, and stagger schedules that fire close together for one user. See [Delivery, deadlines and failures](docs/how-it-works.md#delivery-deadlines-and-failures).
+
+### Brief audio not sent
+
+The text is delivered and the Lambda logs `Brief audio not sent: <exception type>` or `Brief audio skipped: ...`. Check that the reply's marker line is `BRIEF_AUDIO: <namespace>/<file>.mp3`, the key is in the user's own namespace, and the file is an `.mp3` of at most 50 MB. Audio is sent on Telegram only. See [Brief audio](docs/how-it-works.md#brief-audio).
+
+### Cost alarm fires often, or token usage shows `default-user`
+
+The `openclaw-daily-cost-budget` alarm compares cost per **1-hour** period with `daily_cost_budget_usd` (default `5`); raise it for Opus-class models. Usage is attributed to `default-user` / `unknown` because Bedrock requests carry no request metadata; see [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking).
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
 
@@ -438,7 +472,9 @@ Node.js's Happy Eyeballs (`autoSelectFamily`, Node 20+) tries both IPv4 and IPv6
 | **Session timeout** | Sessions terminate after 30 min idle (configurable via `session_idle_timeout`) |
 | **ClawHub skills** | 5 pre-installed; available only after full OpenClaw startup |
 | **Single region** | AgentCore Runtime deployed in one region; no multi-region failover |
-| **No voice/video** | Only text and images supported; no audio or video messages |
+| **V2 Regions only** | `main` deploys only in the AgentCore Runtime V2 Regions; use [`release/v1`](docs/release-v1.md) elsewhere. V1 deployments cannot be migrated in place |
+| **No voice/video input** | Users can send text and images only; no audio or video messages. Scheduled briefs can send an MP3 on Telegram ([brief audio](docs/how-it-works.md#brief-audio)) |
+| **Token usage attribution** | Bedrock requests carry no request metadata, so token usage is recorded under `default-user` / `unknown` rather than per user and channel |
 
 ## Security
 
@@ -487,6 +523,7 @@ The guardrail is applied only when the AgentCore Runtime role has `bedrock:Apply
 ### Guardrails known limitations
 
 - **Scheduled-task prompts can be blocked.** `PROMPT_ATTACK` runs at input strength `HIGH`. At that strength ordinary scheduled-brief prompts, such as an instruction to send the brief to the user on a named channel or persona-style rules ("you are my assistant, always ..."), can be classified as prompt attacks and the task gets the guardrail's blocked message instead of a reply. A digest about cryptocurrency prices can also match the `CryptoScams` denied topic. Before enabling guardrails for existing users, run `scripts/guardrail-eval.py` against a copy of your own cron prompts (with the `[Scheduled task: <name>]` prefix the Cron Lambda adds) and adjust the prompts or `stacks/guardrails_stack.py`.
+- **Sub-agent tasks can be blocked too.** The guardrail assesses the task text the main agent writes for a sub-agent, which can be classified as a prompt attack in the same way; the sub-agent then returns the blocked message. See [docs/guardrails.md](docs/guardrails.md#known-limitation-sub-agent-requests).
 - **The AgentCore Runtime is pinned to a numbered version.** `deploy.sh` passes the `GuardrailVersion` output of `OpenClawGuardrails` (the `CfnGuardrailVersion` resource) to the AgentCore Runtime as `BEDROCK_GUARDRAIL_VERSION`. Editing the policies in `stacks/guardrails_stack.py` and deploying updates only the guardrail's working draft; CloudFormation publishes a new version only when the `CfnGuardrailVersion` resource itself changes (for example its `description`). Update V2 with `./scripts/deploy.sh --runtime-only --endpoint-name release_2`, using a new unused endpoint name for each changed release. See [docs/guardrails.md](docs/guardrails.md#updating-guardrail-policies).
 
 ## Cleanup
@@ -495,7 +532,7 @@ The guardrail is applied only when the AgentCore Runtime role has `bedrock:Apply
 cdk destroy --all
 ```
 
-Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys and the Cognito User Pool have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`.
+Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys, the Cognito User Pool and the DynamoDB identity and token-usage tables have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed; the DynamoDB tables also have deletion protection, which you must turn off before deleting them. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`.
 
 ## Contributing
 

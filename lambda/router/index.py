@@ -1,4 +1,4 @@
-"""Router Lambda — Webhook ingestion for Telegram, Slack, and Feishu.
+"""Router Lambda — Webhook ingestion for Telegram, Slack, Feishu, and WhatsApp.
 
 Receives webhook events via API Gateway HTTP API, resolves user identity via
 DynamoDB, invokes the per-user AgentCore Runtime session, and sends responses
@@ -8,6 +8,8 @@ Path routing:
   POST /webhook/telegram  — Telegram Bot API webhook
   POST /webhook/slack     — Slack Events API webhook
   POST /webhook/feishu    — Feishu Events API webhook
+  GET  /webhook/whatsapp  — WhatsApp Cloud API subscription verification
+  POST /webhook/whatsapp  — WhatsApp Cloud API webhook (disabled until configured)
 """
 
 import hashlib
@@ -28,6 +30,19 @@ from botocore.exceptions import ClientError
 from runtime_routing import RouteUnavailable, admit_route, is_unknown_outcome, resolve_route
 from runtime_enrollment import authorize_channel_actor, enroll_new_user, link_actor, read_actor_owner, reconcile_actor_owner
 from runtime_invocation import InvocationTransportError
+from documents import (
+    ACCEPTED_FILES_TEXT,
+    KIND_INFO,
+    KIND_ZIP,
+    MAX_DOCUMENT_BYTES,
+    MAX_DOCUMENT_LABEL,
+    ZipListingError,
+    build_document_message,
+    classify_document,
+    zip_listing,
+)
+import whatsapp
+import discord_channel
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -38,6 +53,8 @@ TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
+DISCORD_TOKEN_SECRET_ID = os.environ.get("DISCORD_TOKEN_SECRET_ID", "")
+WHATSAPP_TOKEN_SECRET_ID = os.environ.get("WHATSAPP_TOKEN_SECRET_ID", "")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
@@ -111,7 +128,7 @@ def _get_secret(secret_id):
         _token_cache[secret_id] = (value, time.time())
         return value
     except Exception as e:
-        logger.warning("Failed to fetch secret %s: %s", secret_id, e)
+        logger.warning("Failed to fetch secret: %s", type(e).__name__)
         return ""
 
 
@@ -152,6 +169,20 @@ def _get_feishu_credentials():
         return "", "", "", ""
 
 
+def _get_whatsapp_config():
+    """Return the WhatsApp channel config, or None when the channel is not configured."""
+    if not WHATSAPP_TOKEN_SECRET_ID:
+        return None
+    return whatsapp.parse_config(_get_secret(WHATSAPP_TOKEN_SECRET_ID))
+
+
+def _get_discord_config():
+    """Return the Discord channel config, or None when the channel is not configured."""
+    if not DISCORD_TOKEN_SECRET_ID:
+        return None
+    return discord_channel.parse_config(_get_secret(DISCORD_TOKEN_SECRET_ID))
+
+
 # Feishu tenant_access_token cache (2h TTL, refresh 5 min early)
 _feishu_token_cache = {"token": "", "expires_at": 0}
 
@@ -181,7 +212,7 @@ def _get_feishu_tenant_token():
             return token
         logger.error("Feishu token error: code=%s msg=%s", result.get("code"), result.get("msg", ""))
     except Exception as e:
-        logger.error("Failed to get Feishu tenant_access_token: %s", e)
+        logger.error("Failed to get Feishu tenant_access_token: %s", type(e).__name__)
     return ""
 
 
@@ -1255,7 +1286,7 @@ def _get_secret(secret_id):
         _token_cache[secret_id] = (value, time.time())
         return value
     except Exception as e:
-        logger.warning("Failed to fetch secret %s: %s", secret_id, e)
+        logger.warning("Failed to fetch secret: %s", type(e).__name__)
         return ""
 
 
@@ -1424,6 +1455,80 @@ def _build_structured_message(text, s3_key, content_type):
 
 
 # ---------------------------------------------------------------------------
+# Document (Markdown / ZIP) upload helpers. Parsing lives in documents.py.
+# Logs carry kind and size only, never file names or contents.
+# ---------------------------------------------------------------------------
+
+UNSUPPORTED_DOCUMENT_REPLY = (
+    f"Sorry, I can't open that type of file. I accept {ACCEPTED_FILES_TEXT}, "
+    f"up to {MAX_DOCUMENT_LABEL} each."
+)
+DOCUMENT_TOO_LARGE_REPLY = (
+    f"Sorry, that file is too large. The limit is {MAX_DOCUMENT_LABEL} per file."
+)
+BAD_ZIP_REPLY = (
+    "Sorry, I couldn't read that file as a ZIP archive. It may be damaged or not a real .zip file."
+)
+
+
+def _download_telegram_document(file_id, token, max_bytes=MAX_DOCUMENT_BYTES):
+    """Download a Telegram document of at most ``max_bytes``.
+
+    Returns (bytes, None) on success, or (None, reason) where reason is
+    "too_large" or "failed".
+    """
+    if not file_id:
+        return None, "failed"
+    try:
+        safe_file_id = quote(str(file_id), safe="")
+        url = f"https://api.telegram.org/bot{token}/getFile?file_id={safe_file_id}"
+        resp = urllib_request.urlopen(urllib_request.Request(url), timeout=15)
+        result = json.loads(resp.read().decode("utf-8")).get("result") or {}
+        file_size = result.get("file_size") or 0
+        if isinstance(file_size, int) and file_size > max_bytes:
+            return None, "too_large"
+        file_path = result.get("file_path", "")
+        if not file_path:
+            logger.warning("Telegram getFile returned no file_path for a document")
+            return None, "failed"
+        download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+        resp = urllib_request.urlopen(urllib_request.Request(download_url), timeout=30)
+        data = resp.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None, "too_large"
+        return data, None
+    except Exception as e:
+        logger.warning("Telegram document download failed: %s", type(e).__name__)
+        return None, "failed"
+
+
+def _upload_document_to_s3(data, namespace, kind):
+    """Store an accepted document under {namespace}/_uploads/doc_{ts}_{hex}.{ext}.
+
+    The key never contains the user's file name. Returns the key or None.
+    """
+    if not USER_FILES_BUCKET:
+        logger.warning("USER_FILES_BUCKET not configured, cannot store document")
+        return None
+    info = KIND_INFO.get(kind)
+    if not info or len(data) > MAX_DOCUMENT_BYTES:
+        return None
+    s3_key = f"{namespace}/_uploads/doc_{int(time.time())}_{uuid.uuid4().hex[:8]}.{info['ext']}"
+    try:
+        s3_client.put_object(
+            Bucket=USER_FILES_BUCKET,
+            Key=s3_key,
+            Body=data,
+            ContentType=info["content_type"],
+        )
+        logger.info("Stored document kind=%s size=%d", kind, len(data))
+        return s3_key
+    except Exception as e:
+        logger.error("S3 document upload failed: %s", type(e).__name__)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Webhook handlers
 # ---------------------------------------------------------------------------
 
@@ -1552,12 +1657,15 @@ def handle_telegram(body):
     display_name = user.get("first_name", "") or user.get("username", "")
 
     # Detect image: photo array or document with image mime type
-    has_image = bool(
-        message.get("photo")
-        or (message.get("document", {}).get("mime_type", "") in ALLOWED_IMAGE_TYPES)
-    )
+    document = message.get("document") or {}
+    if not isinstance(document, dict):
+        document = {}
+    doc_mime = str(document.get("mime_type", "") or "")
+    has_image = bool(message.get("photo") or doc_mime in ALLOWED_IMAGE_TYPES)
+    # Any other document is handled as a file (accepted or rejected with a reply).
+    has_document = bool(document) and not has_image
 
-    if not chat_id or not user_id_tg or (not text and not has_image):
+    if not chat_id or not user_id_tg or (not text and not has_image and not has_document):
         logger.info("Telegram: ignoring non-text/non-image or missing-user message")
         return
 
@@ -1610,17 +1718,58 @@ def handle_telegram(body):
         return
 
     # Handle /model (per-user model switching); the reply is not forwarded to the agent.
-    model_argument = None if has_image else _parse_model_command(text)
+    model_argument = None if (has_image or has_document) else _parse_model_command(text)
     if model_argument is not None:
         send_telegram_message(chat_id, handle_model_command(resolved_user_id, model_argument), token)
         return
+
+    doc_kind = None
+    if has_document:
+        doc_kind = classify_document(doc_mime, document.get("file_name", ""))
+        doc_size = document.get("file_size") or 0
+        doc_size = doc_size if isinstance(doc_size, int) else 0
+        if doc_kind is None:
+            logger.info("Telegram: rejected document kind=unsupported type=%r size=%d", doc_mime[:64], doc_size)
+            send_telegram_message(chat_id, UNSUPPORTED_DOCUMENT_REPLY, token)
+            return
+        if doc_size > MAX_DOCUMENT_BYTES:
+            logger.info("Telegram: rejected document kind=%s size=%d reason=too_large", doc_kind, doc_size)
+            send_telegram_message(chat_id, DOCUMENT_TOO_LARGE_REPLY, token)
+            return
 
     # Send typing indicator
     send_telegram_typing(chat_id, token)
 
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
-    if has_image:
+    if has_document:
+        namespace = session_id.actor_id.replace(":", "_")
+        doc_bytes, reason = _download_telegram_document(document.get("file_id"), token)
+        if reason == "too_large":
+            logger.info("Telegram: rejected document kind=%s reason=too_large", doc_kind)
+            send_telegram_message(chat_id, DOCUMENT_TOO_LARGE_REPLY, token)
+            return
+        if doc_bytes is None:
+            send_telegram_message(chat_id, "Sorry, I couldn't download that file. Please try again.", token)
+            return
+        listing = None
+        if doc_kind == KIND_ZIP:
+            try:
+                listing = zip_listing(doc_bytes)
+            except ZipListingError:
+                logger.info("Telegram: rejected document kind=zip size=%d reason=malformed", len(doc_bytes))
+                send_telegram_message(chat_id, BAD_ZIP_REPLY, token)
+                return
+        s3_key = _upload_document_to_s3(doc_bytes, namespace, doc_kind)
+        if not s3_key:
+            send_telegram_message(chat_id, "Sorry, I couldn't store that file. Please try again.", token)
+            return
+        stored_name = s3_key[len(namespace) + 1:]
+        agent_message = build_document_message(
+            text, doc_kind, doc_bytes, stored_name, document.get("file_name", ""), listing,
+        )
+        logger.info("Telegram: document accepted kind=%s size=%d", doc_kind, len(doc_bytes))
+    elif has_image:
         namespace = session_id.actor_id.replace(":", "_")
         image_bytes, content_type, _ = _download_telegram_image(message, token)
         if image_bytes:
@@ -1636,8 +1785,8 @@ def handle_telegram(body):
 
     image_count = 0 if isinstance(agent_message, str) else len(agent_message.get("images", []))
     logger.info(
-        "Telegram: user=%s actor=%s session=%s text_len=%d images=%d",
-        resolved_user_id, actor_id, session_id, len(text), image_count,
+        "Telegram: user=%s actor=%s session=%s text_len=%d images=%d document=%s",
+        resolved_user_id, actor_id, session_id, len(text), image_count, doc_kind or "none",
     )
 
     # Invoke AgentCore with periodic typing indicator
@@ -1982,6 +2131,274 @@ def handle_feishu(body, headers=None):
     return {"statusCode": 200, "body": "ok"}
 
 
+WHATSAPP_DEDUP_TTL_SECONDS = 86400
+
+
+def _whatsapp_verify_subscription(event):
+    """Answer Meta's GET verification request (fail-closed)."""
+    config = _get_whatsapp_config()
+    if config is None:
+        return {"statusCode": 404, "body": "Not found"}
+    challenge = whatsapp.verify_subscription(event.get("queryStringParameters") or {}, config["verifyToken"])
+    if challenge is None:
+        logger.warning("WhatsApp subscription verification rejected")
+        return {"statusCode": 403, "body": "Forbidden"}
+    return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": challenge}
+
+
+def _claim_whatsapp_message(message_id):
+    """Record a message ID so Meta's retries are processed once. False = duplicate."""
+    digest = hashlib.sha256(message_id.encode("utf-8")).hexdigest()
+    try:
+        identity_table.put_item(
+            Item={"PK": f"DEDUP#whatsapp:{digest}", "SK": "DEDUP",
+                  "ttl": int(time.time()) + WHATSAPP_DEDUP_TTL_SECONDS},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("WhatsApp dedupe write failed: %s", type(e).__name__)
+        return True
+
+
+def _whatsapp_progress_notify(config, to, stop_event, notify_after_s=30):
+    """Send a one-time progress message if the request takes longer than notify_after_s."""
+    if not stop_event.wait(timeout=notify_after_s):
+        whatsapp.send_text(
+            config, to,
+            "\u23f3 Working on your request \u2014 this may take a few minutes. "
+            "I'll send the full response when it's ready.",
+        )
+
+
+def handle_whatsapp(body):
+    """Process a verified WhatsApp Cloud API webhook (async dispatch)."""
+    config = _get_whatsapp_config()
+    if config is None:
+        logger.error("WhatsApp: channel not configured; event dropped")
+        return
+    try:
+        payload = json.loads(body) if isinstance(body, str) else body
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("WhatsApp: body is not JSON")
+        return
+    for msg in whatsapp.extract_messages(payload, config["phoneNumberId"]):
+        if not _claim_whatsapp_message(msg["id"]):
+            logger.info("WhatsApp: duplicate message ignored")
+            continue
+        try:
+            _handle_whatsapp_message(config, msg)
+        except RouteUnavailable as e:
+            logger.error("WhatsApp: route unavailable: %s", type(e).__name__)
+            whatsapp.send_text(config, msg["from"], "Sorry, your account needs attention. Please contact the bot admin.")
+
+
+def _handle_whatsapp_message(config, msg):
+    wa_id = msg["from"]
+    text = msg["text"].strip()
+    has_image = bool(msg["image_id"])
+    if not text and not has_image:
+        return
+
+    actor_id = f"whatsapp:{wa_id}"
+    is_bind, code = _is_bind_command(text)
+    if is_bind:
+        _, success = redeem_bind_code(code, "whatsapp", wa_id, msg.get("name", ""))
+        whatsapp.send_text(config, wa_id, "Accounts linked successfully! Your sessions are now unified."
+                           if success else "Invalid or expired link code. Please try again.")
+        return
+
+    resolved_user_id, _ = resolve_user("whatsapp", wa_id, msg.get("name", ""))
+    if resolved_user_id is None:
+        whatsapp.send_text(
+            config, wa_id,
+            f"Sorry, this bot is private and requires an invitation.\n\n"
+            f"Your ID: whatsapp:{wa_id}\n\n"
+            f"Send this ID to the bot admin to request access.",
+        )
+        return
+
+    route = get_or_create_session(resolved_user_id)
+    authorize_channel_actor(identity_table, route, resolved_user_id, actor_id, "whatsapp")
+
+    if _is_link_command(text):
+        bind_code = create_bind_code(resolved_user_id)
+        if not bind_code:
+            whatsapp.send_text(config, wa_id, "Account linking requires identity reconciliation.")
+            return
+        whatsapp.send_text(
+            config, wa_id,
+            f"Your link code is: {bind_code}\n\nEnter this code on another channel within 10 minutes "
+            f"by typing: link {bind_code}",
+        )
+        return
+
+    agent_message = text
+    if has_image:
+        namespace = route.actor_id.replace(":", "_")
+        image_bytes, content_type = whatsapp.download_media(
+            config, msg["image_id"], ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES)
+        s3_key = _upload_image_to_s3(image_bytes, namespace, content_type) if image_bytes else None
+        if not s3_key:
+            whatsapp.send_text(config, wa_id, "Sorry, I couldn't process that image. Please try again.")
+            return
+        agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
+
+    # The actor ID is a phone number, so only the internal user ID is logged.
+    logger.info("WhatsApp: user=%s msg_len=%d has_image=%s", resolved_user_id, len(text), has_image)
+
+    stop_notify = threading.Event()
+    notify_thread = threading.Thread(
+        target=_whatsapp_progress_notify, args=(config, wa_id, stop_notify), daemon=True,
+    )
+    notify_thread.start()
+    try:
+        result = invoke_agent_runtime(route, resolved_user_id, actor_id, "whatsapp", agent_message,
+                                      channel_target=wa_id)
+    finally:
+        stop_notify.set()
+        notify_thread.join(timeout=2)
+    response_text = result.get("response", "Sorry, I couldn't process your message.")
+    response_text = _extract_text_from_content_blocks(response_text)
+    whatsapp.send_text(config, wa_id, response_text)
+
+
+def _discord_json(payload):
+    return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}
+
+
+def _discord_entry(headers, body, http_info):
+    """Verify a Discord interaction, answer PING, and defer slash commands (3 s limit)."""
+    # Disabled (404) until the secret holds a complete JSON config.
+    config = _get_discord_config()
+    if config is None:
+        return {"statusCode": 404, "body": "Not found"}
+    # Verify the Ed25519 signature over the raw body before parsing anything.
+    body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+    if not discord_channel.verify_signature(headers, body_bytes, config["publicKey"]):
+        logger.warning("Discord interaction validation failed from %s", http_info.get("sourceIp", "unknown"))
+        return {"statusCode": 401, "body": "invalid request signature"}
+    try:
+        interaction = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return {"statusCode": 400, "body": "Bad request"}
+    if not isinstance(interaction, dict):
+        return {"statusCode": 400, "body": "Bad request"}
+    if interaction.get("type") == discord_channel.INTERACTION_PING:
+        return _discord_json({"type": discord_channel.RESPONSE_PONG})
+    command = discord_channel.parse_command(interaction, config["applicationId"])
+    if command is None:
+        return _discord_json({"type": discord_channel.RESPONSE_CHANNEL_MESSAGE,
+                              "data": {"content": "Unsupported command.", "flags": discord_channel.EPHEMERAL}})
+    if not _claim_discord_interaction(command["id"]):
+        return _discord_json({"type": discord_channel.RESPONSE_CHANNEL_MESSAGE,
+                              "data": {"content": "Duplicate request ignored.", "flags": discord_channel.EPHEMERAL}})
+    _self_invoke_async("discord", body, {})
+    # In servers the reply is visible only to the caller; in DMs it is a normal message.
+    flags = discord_channel.EPHEMERAL if command["in_guild"] else 0
+    return _discord_json({"type": discord_channel.RESPONSE_DEFERRED_CHANNEL_MESSAGE, "data": {"flags": flags}})
+
+
+DISCORD_DEDUP_TTL_SECONDS = 3600
+
+
+def _claim_discord_interaction(interaction_id):
+    """Record an interaction ID so a replayed signed request runs once. False = duplicate."""
+    try:
+        identity_table.put_item(
+            Item={"PK": f"DEDUP#discord:{interaction_id}", "SK": "DEDUP",
+                  "ttl": int(time.time()) + DISCORD_DEDUP_TTL_SECONDS},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("Discord dedupe write failed: %s", type(e).__name__)
+        return True
+
+
+def handle_discord(body):
+    """Process a verified, deferred Discord slash command (async dispatch)."""
+    config = _get_discord_config()
+    if config is None:
+        logger.error("Discord: channel not configured; interaction dropped")
+        return
+    try:
+        interaction = json.loads(body) if isinstance(body, str) else body
+    except (json.JSONDecodeError, TypeError):
+        return
+    command = discord_channel.parse_command(interaction, config["applicationId"])
+    if command is None:
+        return
+    app_id = config["applicationId"]
+
+    def reply(text):
+        discord_channel.send_reply(app_id, command["token"], text, ephemeral=command["in_guild"])
+
+    try:
+        _handle_discord_command(command, reply)
+    except RouteUnavailable as e:
+        logger.error("Discord: route unavailable: %s", type(e).__name__)
+        reply("Sorry, your account needs attention. Please contact the bot admin.")
+
+
+def _handle_discord_command(command, reply):
+    discord_user_id = command["user_id"]
+    text = command["text"]
+    attachment = command["attachment"]
+    if not text and not attachment:
+        reply("Please include a prompt, e.g. `/ask prompt: hello`.")
+        return
+
+    actor_id = f"discord:{discord_user_id}"
+    is_bind, code = _is_bind_command(text)
+    if is_bind:
+        _, success = redeem_bind_code(code, "discord", discord_user_id, command["name"])
+        reply("Accounts linked successfully! Your sessions are now unified."
+              if success else "Invalid or expired link code. Please try again.")
+        return
+
+    resolved_user_id, _ = resolve_user("discord", discord_user_id, command["name"])
+    if resolved_user_id is None:
+        reply(f"Sorry, this bot is private and requires an invitation.\n\n"
+              f"Your ID: `discord:{discord_user_id}`\n\n"
+              f"Send this ID to the bot admin to request access.")
+        return
+
+    route = get_or_create_session(resolved_user_id)
+    authorize_channel_actor(identity_table, route, resolved_user_id, actor_id, "discord")
+
+    if _is_link_command(text):
+        bind_code = create_bind_code(resolved_user_id)
+        if not bind_code:
+            reply("Account linking requires identity reconciliation.")
+            return
+        reply(f"Your link code is: `{bind_code}`\n\nEnter this code on another channel within 10 minutes "
+              f"by typing: `link {bind_code}`")
+        return
+
+    agent_message = text
+    if attachment:
+        namespace = route.actor_id.replace(":", "_")
+        image_bytes, content_type = discord_channel.download_attachment(
+            attachment, ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES)
+        s3_key = _upload_image_to_s3(image_bytes, namespace, content_type) if image_bytes else None
+        if not s3_key:
+            reply("Sorry, I couldn't process that image. Please try again.")
+            return
+        agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
+
+    logger.info("Discord: user=%s actor=%s msg_len=%d has_image=%s",
+                resolved_user_id, actor_id, len(text), bool(attachment))
+    result = invoke_agent_runtime(route, resolved_user_id, actor_id, "discord", agent_message,
+                                  channel_target=discord_user_id)
+    response_text = result.get("response", "Sorry, I couldn't process your message.")
+    reply(_extract_text_from_content_blocks(response_text))
+
+
 # ---------------------------------------------------------------------------
 # Lambda handler
 # ---------------------------------------------------------------------------
@@ -2000,6 +2417,10 @@ def handler(event, context):
             handle_slack(body, headers)
         elif channel == "feishu":
             handle_feishu(body, headers)
+        elif channel == "whatsapp":
+            handle_whatsapp(body)
+        elif channel == "discord":
+            handle_discord(body)
         return {"statusCode": 200, "body": "ok"}
 
     # --- Function URL entry point ---
@@ -2014,6 +2435,9 @@ def handler(event, context):
             "statusCode": 200,
             "body": json.dumps({"status": "ok", "service": "openclaw-router"}),
         }
+
+    if method == "GET" and path.endswith("/webhook/whatsapp"):
+        return _whatsapp_verify_subscription(event)
 
     if method != "POST":
         return {"statusCode": 405, "body": "Method not allowed"}
@@ -2094,6 +2518,22 @@ def handler(event, context):
         # Self-invoke async for actual processing
         _self_invoke_async("feishu", body, headers)
         return {"statusCode": 200, "body": "ok"}
+
+    elif path.endswith("/webhook/whatsapp"):
+        # Disabled (404) until the secret holds a complete JSON config.
+        config = _get_whatsapp_config()
+        if config is None:
+            return {"statusCode": 404, "body": "Not found"}
+        # Verify the signature over the raw body before parsing anything.
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+        if not whatsapp.verify_signature(headers, body_bytes, config["appSecret"]):
+            logger.warning("WhatsApp webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+        _self_invoke_async("whatsapp", body, {})
+        return {"statusCode": 200, "body": "ok"}
+
+    elif path.endswith("/webhook/discord"):
+        return _discord_entry(headers, body, http_info)
 
     return {"statusCode": 404, "body": "Not found"}
 

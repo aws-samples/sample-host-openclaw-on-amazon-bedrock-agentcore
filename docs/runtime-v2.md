@@ -7,6 +7,8 @@ AgentCore Runtime V2 prepares your agent environment once, takes a snapshot, and
 
 This image prepares a user-neutral OpenClaw gateway; user state is restored during activation.
 
+V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1` and `ap-northeast-1` ([AWS: supported Regions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions)); `V2_REGIONS` in `scripts/runtime_deploy.py` rejects other Regions. For other Regions and for existing V1 deployments, see [the `release/v1` branch](release-v1.md).
+
 The pinned SDK controller explicitly sets `platformVersion="V2"`; CDK manages foundation and dependent stacks. [AWS documents](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions): "AWS CloudFormation and the AWS CDK do not currently support setting platformVersion."
 
 ## Lifecycle and compatibility
@@ -21,14 +23,16 @@ OpenClaw `2026.9.5` keeps its generated Runtime metadata in system messages whil
 
 The bridge translates OpenClaw's OpenAI-compatible streaming chat to Bedrock `ConverseStream`. AgentCore Runtime callers receive JSON unless they send `action:"chat", stream:true`. `cdk.json` and the deployment wrapper select:
 
-- Primary: `global.anthropic.claude-haiku-5-5` (`BEDROCK_MODEL_ID`), with `additionalModelRequestFields.thinking.type="disabled"` and no temperature.
-- Fallback: `global.anthropic.claude-sonnet-4-6` (`BEDROCK_FALLBACK_MODEL_ID`), retaining its model-specific settings.
+- Primary: `global.anthropic.claude-opus-5-5` (`BEDROCK_MODEL_ID`), no temperature and no `thinking` field (Opus 5.5 rejects `thinking.type="disabled"`; it uses adaptive thinking).
+- Sub-agents: `global.anthropic.claude-sonnet-5-5` (`SUBAGENT_BEDROCK_MODEL_ID`; unset or empty uses the same default), no temperature, one attempt and no fallback.
+- Fallback: `global.anthropic.claude-sonnet-5-5` (`BEDROCK_FALLBACK_MODEL_ID`), no temperature.
+- Opus 5+ and Sonnet 5+ reject `temperature`; `bridge/inference-config.js` omits it. `global.anthropic.claude-haiku-5-5` remains supported as an override and still sends `thinking.type="disabled"`. System and tool prompt-cache points are added for these three models (`bridge/system-prefix-cache.js`).
 
 Users can replace the primary for their own main-agent turns with `/model <alias>` from the `user_selectable_models` allowlist (see [Per-user model switching](../README.md#per-user-model-switching)). The Router sends the stored model ID as `modelOverride` in each `action:"chat"` payload; the contract writes it into that turn's identity file, and the proxy uses it only when it is in `BEDROCK_USER_SELECTABLE_MODEL_IDS`. Sub-agents keep `SUBAGENT_BEDROCK_MODEL_ID`, the fallback stays `BEDROCK_FALLBACK_MODEL_ID` (skipped when it equals the override), and `thinking`/temperature settings follow the model actually sent.
 
 Fallback is limited to eligible transient primary API failures before content starts. Partial output, tool execution, cancellation, Guardrail intervention and ambiguous transport outcomes must not trigger replay through another model.
 
-The execution role grants invocation and streaming for the source-account `inference-profile/*` and cross-region `foundation-model/*` resources, covering both models. Guardrail and Marketplace grants remain in place. Verify model access and organization/Region restrictions in the deployment account.
+The execution role grants invocation and streaming for the source-account `inference-profile/*` and cross-region `foundation-model/*` resources, covering these models. Guardrail and Marketplace grants remain in place. Verify model access and organization/Region restrictions in the deployment account.
 
 ## Offline checks
 

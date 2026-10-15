@@ -2,7 +2,7 @@
 
 Deploys the EventBridge Scheduler group and cron executor Lambda that fires
 on user-defined schedules, invokes per-user AgentCore Runtime sessions, and delivers
-responses back to the originating channel (Telegram/Slack/Feishu).
+responses back to the originating channel (Telegram/Slack/Feishu/WhatsApp).
 
 Also grants the AgentCore Runtime execution role permissions to create/manage
 EventBridge schedules and write cron records to the identity DynamoDB table.
@@ -39,6 +39,9 @@ class CronStack(Stack):
         feishu_token_secret_name: str,
         cmk_arn: str,
         agentcore_execution_role: iam.IRole,
+        user_files_bucket_name: str,
+        user_files_bucket_arn: str,
+        whatsapp_token_secret_name: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -89,6 +92,10 @@ class CronStack(Stack):
                 description="Shared per-user AgentCore Runtime route resolution and admission",
             )],
             timeout=Duration.seconds(lambda_timeout),
+            # EventBridge Scheduler invokes asynchronously. Lambda's default two
+            # async retries re-run a brief that timed out or crashed, so the user
+            # gets a duplicate turn (and its "already ran" reply) instead of the brief.
+            retry_attempts=0,
             memory_size=lambda_memory,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
@@ -97,7 +104,9 @@ class CronStack(Stack):
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
                 "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
+                "WHATSAPP_TOKEN_SECRET_ID": whatsapp_token_secret_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
+                "USER_FILES_BUCKET": user_files_bucket_name,
             },
             log_group=cron_log_group,
         )
@@ -159,11 +168,21 @@ class CronStack(Stack):
             )
         )
 
-        # KMS decrypt for secrets
+        # KMS decrypt for secrets (and for the user-files bucket, which uses the same CMK)
         self.cron_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["kms:Decrypt"],
                 resources=[cmk_arn],
+            )
+        )
+
+        # S3 read of brief audio (BRIEF_AUDIO marker -> Telegram sendAudio).
+        # Read-only and mp3-only. IAM can't scope this per user, so the Lambda
+        # checks that the key sits under the run's own namespace before reading.
+        self.cron_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[f"{user_files_bucket_arn}/*/*.mp3"],
             )
         )
 
@@ -245,11 +264,14 @@ class CronStack(Stack):
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
                     "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
-                    "index wildcard needed for query operations.",
+                    "index wildcard needed for query operations. S3 GetObject "
+                    "limited to */*.mp3 brief audio; the per-user namespace "
+                    "check is enforced in code.",
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
+                        "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/*.mp3",
                     ],
                 ),
                 cdk_nag.NagPackSuppression(

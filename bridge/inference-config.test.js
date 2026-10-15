@@ -40,7 +40,25 @@ describe("modelRejectsTemperature", () => {
     assert.equal(modelRejectsTemperature("anthropic.claude-opus-10-1"), true);
   });
 
-  it("is false for current models", () => {
+  it("is true for Sonnet 5 and 5.5 with any region/global prefix (Bedrock rejects it)", () => {
+    for (const id of [
+      "global.anthropic.claude-sonnet-5-5",
+      "us.anthropic.claude-sonnet-5-5",
+      "au.anthropic.claude-sonnet-5-5",
+      "anthropic.claude-sonnet-5-5",
+      "global.anthropic.claude-sonnet-5",
+      "arn:aws:bedrock:us-west-2:123456789012:inference-profile/global.anthropic.claude-sonnet-5-5",
+    ]) {
+      assert.equal(modelRejectsTemperature(id), true, id);
+    }
+  });
+
+  it("omits temperature for the Sonnet 5.5 sub-agent/fallback default", () => {
+    assert.deepEqual(buildInferenceConfig("global.anthropic.claude-sonnet-5-5", parseTemperatureOverride(undefined)),
+      { maxTokens: 16384 });
+  });
+
+  it("is false for models that still accept temperature", () => {
     for (const id of [
       SONNET_46,
       "global.anthropic.claude-sonnet-4-6-v1",
@@ -72,9 +90,9 @@ describe("user-selectable 5.5 models (issue #18)", () => {
     }
   });
 
-  it("keeps temperature for other Haiku and Sonnet versions", () => {
-    for (const id of ["global.anthropic.claude-haiku-4-5-20251001-v1:0", "global.anthropic.claude-sonnet-5",
-      "global.anthropic.claude-sonnet-4-5-20250929-v1:0", "global.anthropic.claude-sonnet-5-55"]) {
+  it("keeps temperature for other Haiku versions and pre-5 Sonnet", () => {
+    for (const id of ["global.anthropic.claude-haiku-4-5-20251001-v1:0", "global.anthropic.claude-haiku-5-55",
+      "global.anthropic.claude-sonnet-4-5-20250929-v1:0", "global.anthropic.claude-sonnet-4-6"]) {
       assert.equal(modelRejectsTemperature(id), false, id);
     }
   });

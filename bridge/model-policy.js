@@ -12,8 +12,9 @@
  */
 const { osRandomUUID } = require("./runtime-lifecycle");
 
-const PRIMARY_MODEL_ID = "global.anthropic.claude-haiku-5-5";
-const FALLBACK_MODEL_ID = "global.anthropic.claude-sonnet-4-6";
+const PRIMARY_MODEL_ID = "global.anthropic.claude-opus-5-5";
+const FALLBACK_MODEL_ID = "global.anthropic.claude-sonnet-5-5";
+const SUBAGENT_MODEL_ID = "global.anthropic.claude-sonnet-5-5";
 const UNKNOWN_OUTCOME_ERROR = Object.freeze({
   code: "PROVIDER_POST_DISPATCH_AMBIGUITY",
   type: "invalid_request_error",
@@ -33,8 +34,9 @@ const STREAM_ERRORS = Object.freeze({
   validationException: "ValidationException",
 });
 
-// Claude Haiku 5.5 runs with thinking disabled. Other models keep their own
-// default: Opus 5.5 cannot disable thinking, and Sonnet 5.5 rejects "disabled".
+// Per-model additionalModelRequestFields. Claude Haiku 5.5 (any profile prefix)
+// runs with thinking disabled. Opus 5.5 and Sonnet 5.5 reject thinking.type
+// "disabled" (Opus only allows adaptive), so they send nothing.
 const THINKING_DISABLED_MODEL = /(?:^|[./])anthropic\.claude-haiku-5-5(?=[-.:]|$)/;
 
 function requestFields(modelId) {
@@ -150,4 +152,4 @@ function createStreamingRoute({ primaryModelId, fallbackModelId, response,
   };
 }
 
-module.exports = { PRIMARY_MODEL_ID, FALLBACK_MODEL_ID, UNKNOWN_OUTCOME_ERROR, requestFields, createStreamingRoute };
+module.exports = { PRIMARY_MODEL_ID, FALLBACK_MODEL_ID, SUBAGENT_MODEL_ID, UNKNOWN_OUTCOME_ERROR, requestFields, createStreamingRoute };

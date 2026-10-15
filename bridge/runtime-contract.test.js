@@ -339,6 +339,10 @@ function loadContract(t, {
         assert.equal(options.configProbe, true);
         calls.push("gateway:verified");
       },
+      dismissStaleSuspendedDeliveries: async () => {
+        calls.push("gateway:sweep");
+        return { phase: "done", listed: 0, candidates: [], dismissed: [], notDismissed: [] };
+      },
       gatewayTurn: async (args) => {
         ready();
         calls.push("chat.send");
@@ -745,6 +749,10 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   assert.equal(status.lifecycle.binding.userId, owner.userId);
   assert.equal(status.lifecycle.binding.actorId, owner.actorId);
   assert.ok(app.calls.some((call) => call.includes("[OPENCLAW_IMAGES:")));
+  // The stale suspended-delivery sweep runs once, after readiness, before the first turn.
+  assert.equal(app.calls.filter((call) => call === "gateway:sweep").length, 1);
+  assert.ok(app.calls.indexOf("gateway:verified") < app.calls.indexOf("gateway:sweep"));
+  assert.ok(app.calls.indexOf("gateway:sweep") < app.calls.indexOf("chat.send"));
   assert.equal((await app.request({ ...owner, action: "warmup" })).body.status, "ready");
   assert.equal(app.children.find((child) => child.kind === "node").env.NODE_COMPILE_CACHE, "/app/.compile-cache");
   const phases = app.logs.map((line) => line.match(
@@ -1592,4 +1600,151 @@ test("a malformed payload model override is ignored without failing the turn", a
     assert.equal(reply.body.execution.phase, "completed", JSON.stringify(modelOverride));
     assert.equal(Object.hasOwn(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)), "modelOverride"), false);
   }
+});
+
+// --- Cron timing: the EN and CN briefs share one session, so CN queues behind EN. ---
+
+async function until(predicate, label, limitMs = 2000) {
+  const stop = Date.now() + limitMs;
+  while (!predicate()) {
+    if (Date.now() > stop) throw new Error(`Timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function blockingTurns(t) {
+  const turns = [];
+  // Release anything still blocked so a failing assertion cannot hang the suite.
+  t.after(() => { for (const turn of turns) turn.done.resolve({ phase: "completed", response: "released" }); });
+  return {
+    turns,
+    gatewayTurnImpl: async (args) => {
+      const turn = { args, sentAt: Date.now(), done: deferred() };
+      turns.push(turn);
+      return turn.done.promise;
+    },
+  };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("a warmup while a cron turn runs reports ready without queueing behind the turn", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const gateway = blockingTurns(t);
+  const app = loadContract(t, { gatewayTurnImpl: gateway.gatewayTurnImpl });
+  const en = app.request({ ...owner, action: "cron", message: "EN brief", callerBudgetMs: 800000 });
+  await until(() => gateway.turns.length === 1, "the EN turn");
+  const warmup = app.request({ ...owner, action: "warmup" });
+  const raced = await Promise.race([warmup, sleep(300).then(() => "queued")]);
+  assert.notEqual(raced, "queued", "warmup waited for the running cron turn");
+  assert.equal(raced.body.status, "ready");
+  gateway.turns[0].done.resolve({ phase: "completed", response: "EN done" });
+  assert.equal((await en).body.response, "EN done");
+  assert.equal(app.calls.filter((entry) => entry === "chat.send").length, 1);
+});
+
+test("a queued cron turn's deadline runs from dispatch, capped by the caller's wait budget", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const gateway = blockingTurns(t);
+  const app = loadContract(t, { gatewayTurnImpl: gateway.gatewayTurnImpl });
+  const en = app.request({ ...owner, action: "cron", message: "EN brief", callerBudgetMs: 900000 });
+  await until(() => gateway.turns.length === 1, "the EN turn");
+  const cnArrival = Date.now();
+  const cn = app.request({ ...owner, action: "cron", message: "CN brief", callerBudgetMs: 900000 });
+  await sleep(400); // CN waits in the queue behind EN.
+  gateway.turns[0].done.resolve({ phase: "completed", response: "EN done" });
+  await until(() => gateway.turns.length === 2, "the CN turn");
+  const cnTurn = gateway.turns[1];
+  // A full 620 s turn from when CN is actually sent; the queue wait is not charged to it.
+  assert.ok(cnTurn.args.deadline >= cnTurn.sentAt + 620000 - 50,
+    `CN lost ${cnTurn.sentAt + 620000 - cnTurn.args.deadline} ms of its turn to the queue`);
+  // Still ends before the caller stops listening, with room to reply.
+  assert.ok(cnTurn.args.deadline <= cnArrival + 900000 - 20000 + 50);
+  cnTurn.done.resolve({ phase: "completed", response: "CN done" });
+  assert.equal((await en).body.response, "EN done");
+  assert.equal((await cn).body.response, "CN done");
+});
+
+test("a cron turn never outlives the caller's wait budget", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const gateway = blockingTurns(t);
+  const app = loadContract(t, { gatewayTurnImpl: gateway.gatewayTurnImpl });
+  const arrival = Date.now();
+  const cron = app.request({ ...owner, action: "cron", message: "brief", callerBudgetMs: 300000 });
+  await until(() => gateway.turns.length === 1, "the cron turn");
+  const deadline = gateway.turns[0].args.deadline;
+  assert.ok(deadline <= arrival + 300000 - 20000 + 50, `deadline ${deadline - arrival} ms after arrival`);
+  assert.ok(deadline >= arrival + 300000 - 20000 - 1000);
+  gateway.turns[0].done.resolve({ phase: "completed", response: "done" });
+  assert.equal((await cron).body.response, "done");
+});
+
+test("a cron turn whose caller budget ran out in the queue is not dispatched", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const gateway = blockingTurns(t);
+  const app = loadContract(t, { gatewayTurnImpl: gateway.gatewayTurnImpl });
+  const en = app.request({ ...owner, action: "cron", message: "EN brief", callerBudgetMs: 900000 });
+  await until(() => gateway.turns.length === 1, "the EN turn");
+  // 20 s reply margin + 100 ms: the CN caller's budget is gone 100 ms after arrival.
+  let cnResult;
+  const cn = app.request({ ...owner, action: "cron", message: "CN brief", callerBudgetMs: 20100 })
+    .then((result) => { cnResult = result; });
+  await sleep(300);
+  gateway.turns[0].done.resolve({ phase: "completed", response: "EN done" });
+  await until(() => cnResult || gateway.turns.length === 2, "CN to settle");
+  assert.equal(gateway.turns.length, 1, "CN must not reach the gateway after its caller gave up");
+  await cn;
+  assert.equal(cnResult.body.status, "error");
+  assert.equal((await en).body.response, "EN done");
+  assert.equal((await app.request(null, "GET", "/ping")).code, 200, "a skipped turn does not fail the runtime");
+});
+
+test("chat without a caller budget keeps the 620 s limit from arrival", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const gateway = blockingTurns(t);
+  const app = loadContract(t, { gatewayTurnImpl: gateway.gatewayTurnImpl });
+  const arrival = Date.now();
+  const chat = app.request({ ...owner, action: "chat", message: "hi" });
+  await until(() => gateway.turns.length === 1, "the chat turn");
+  const deadline = gateway.turns[0].args.deadline;
+  assert.ok(deadline >= arrival + 620000 - 1000 && deadline <= Date.now() + 620000);
+  gateway.turns[0].done.resolve({ phase: "completed", response: "hello" });
+  assert.equal((await chat).body.response, "hello");
+});
+
+for (const callerBudgetMs of [0, -1, 1.5, "600000", 900001, null]) {
+  test(`rejects an invalid caller wait budget before dispatch: ${JSON.stringify(callerBudgetMs)}`, async (t) => {
+    const app = loadContract(t);
+    const result = await app.request({ ...owner, action: "cron", message: "brief", callerBudgetMs });
+    assert.equal(result.code, 400);
+    assert.ok(!app.calls.includes("chat.send"));
+  });
+}
+
+test("a queued cron turn replies status:error at its caller deadline, while the earlier turn still runs", async (t) => {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "error", () => {});
+  const gateway = blockingTurns(t);
+  const app = loadContract(t, { gatewayTurnImpl: gateway.gatewayTurnImpl });
+  const en = app.request({ ...owner, action: "cron", message: "EN brief", callerBudgetMs: 900000 });
+  await until(() => gateway.turns.length === 1, "the EN turn");
+  // 20 s reply margin + 150 ms: the CN caller's queue deadline is 150 ms after arrival.
+  const cnArrival = Date.now();
+  const cn = app.request({ ...owner, action: "cron", message: "CN brief", callerBudgetMs: 20150 });
+  const raced = await Promise.race([cn, sleep(1500).then(() => "still queued")]);
+  assert.notEqual(raced, "still queued", "CN got no reply until the EN turn released the queue");
+  assert.equal(raced.code, 200);
+  assert.equal(raced.body.status, "error");
+  assert.notEqual(raced.body.status, "unknown_outcome", "the caller must be able to release its admission");
+  assert.ok(Date.now() - cnArrival < 1500);
+  const ping = await app.request(null, "GET", "/ping");
+  assert.equal(ping.code, 200);
+  assert.equal(ping.body.active_tasks, 1, "only the EN turn is still active");
+  // EN is unaffected, and CN never reaches the gateway once EN releases the queue.
+  gateway.turns[0].done.resolve({ phase: "completed", response: "EN done" });
+  assert.equal((await en).body.response, "EN done");
+  await sleep(100);
+  assert.equal(gateway.turns.length, 1, "CN was dispatched after its caller had its reply");
+  assert.equal(app.calls.filter((entry) => entry === "chat.send").length, 1);
+  assert.equal((await app.request(null, "GET", "/ping")).body.status, "Healthy");
 });

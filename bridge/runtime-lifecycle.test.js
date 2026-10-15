@@ -106,12 +106,13 @@ test("serial turns use frozen binding and do not execute expired queued work", a
     await hold.promise;
   });
   await new Promise(setImmediate);
-  const second = runtime.run({ ...owner, deadline: Date.now() + 10 }, async () => calls.push("expired"));
+  // The expired turn rejects at its deadline, before the first turn releases the queue.
+  const second = assert.rejects(runtime.run({ ...owner, deadline: Date.now() + 10 }, async () => calls.push("expired")), /deadline/);
   context.actorId = "attacker";
   await new Promise((r) => setTimeout(r, 20));
   hold.resolve();
   await first;
-  await assert.rejects(second, /deadline/);
+  await second;
   assert.deepEqual(calls, ["telegram:1"]);
 });
 
@@ -177,3 +178,43 @@ for (const phase of ["activation", "recovery"]) {
     assert.equal(runtime.snapshot().state, "FAILED");
   });
 }
+
+test("a queued turn is rejected at its own deadline while the earlier turn still runs", async () => {
+  const hold = deferred();
+  const calls = [];
+  const runtime = createRuntimeLifecycle({ activate: async (_c, scope) => markReady(scope) });
+  await runtime.start();
+  const first = runtime.run({ ...owner, deadline: Date.now() + 60000 }, async () => {
+    calls.push("first");
+    await hold.promise;
+    return "first done";
+  });
+  await new Promise(setImmediate);
+  const queuedAt = Date.now();
+  let settledAt = null;
+  const second = runtime.run({ ...owner, deadline: queuedAt + 50 }, async () => calls.push("expired"));
+  const outcome = second.then(() => "resolved", (error) => error.message).finally(() => { settledAt = Date.now(); });
+  // A turn queued after the expired one still waits for the earlier turn.
+  const third = runtime.run({ ...owner, deadline: Date.now() + 60000 }, async () => calls.push("third"));
+  await new Promise((r) => setTimeout(r, 300));
+  assert.notEqual(settledAt, null, "the queued turn was not rejected while the earlier turn held the queue");
+  assert.equal(await outcome, "Turn deadline exceeded in queue");
+  assert.ok(settledAt - queuedAt < 250, `rejected ${settledAt - queuedAt} ms after queueing`);
+  assert.deepEqual(calls, ["first"], "nothing ran ahead of the earlier turn");
+  hold.resolve();
+  assert.equal(await first, "first done");
+  await third;
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(calls, ["first", "third"], "the expired turn was dispatched after the earlier turn released");
+  assert.equal(runtime.snapshot().state, "USER_READY");
+});
+
+test("a turn that starts before its deadline is not cut off by the queue timer", async () => {
+  const runtime = createRuntimeLifecycle({ activate: async (_c, scope) => markReady(scope) });
+  await runtime.start();
+  const result = await runtime.run({ ...owner, deadline: Date.now() + 30 }, async () => {
+    await new Promise((r) => setTimeout(r, 80));
+    return "ran past the queue deadline";
+  });
+  assert.equal(result, "ran past the queue deadline");
+});

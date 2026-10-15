@@ -208,8 +208,9 @@ def test_wrapper_uses_one_interpreter_and_keeps_context(project, mode):
     assert not any(item["tool"] == "agentcore" for item in recorded)
     runtime_env = next(item["configuration"]["environmentVariables"] for item in recorded
                        if "configuration" in item)
-    assert runtime_env["BEDROCK_MODEL_ID"] == "global.anthropic.claude-haiku-5-5"
-    assert runtime_env["BEDROCK_FALLBACK_MODEL_ID"] == "global.anthropic.claude-sonnet-4-6"
+    assert runtime_env["BEDROCK_MODEL_ID"] == "global.anthropic.claude-opus-5-5"
+    assert runtime_env["BEDROCK_FALLBACK_MODEL_ID"] == "global.anthropic.claude-sonnet-5-5"
+    assert runtime_env["SUBAGENT_BEDROCK_MODEL_ID"] == "global.anthropic.claude-sonnet-5-5"
     if mode is None:
         dependent = [item["args"] for item in recorded if item["tool"] == "cdk"][-1]
         assert "runtime_manifest=.runtime/runtime-v2.json" in dependent

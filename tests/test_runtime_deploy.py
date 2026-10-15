@@ -1081,8 +1081,8 @@ def test_foundation_environment_keeps_all_optional_features():
         "SESSION_IDLE": "1800", "SESSION_MAX": "28800",
         "GUARDRAIL_ID": "guardrail", "GUARDRAIL_VERSION": "1", "BROWSER_IDENTIFIER": "browser",
         "AGENTCORE_GATEWAY_URL": "https://example.com/mcp", "SUBAGENT_MODEL_ID": "model",
-        "DEFAULT_MODEL_ID": "global.anthropic.claude-haiku-5-5",
-        "FALLBACK_MODEL_ID": "global.anthropic.claude-sonnet-4-6",
+        "DEFAULT_MODEL_ID": "global.anthropic.claude-opus-5-5",
+        "FALLBACK_MODEL_ID": "global.anthropic.claude-sonnet-5-5",
     }
     desired = foundation_configuration(values)
     env = desired["environmentVariables"]
@@ -1090,8 +1090,8 @@ def test_foundation_environment_keeps_all_optional_features():
     assert env["BROWSER_IDENTIFIER"] == "browser"
     assert env["AGENTCORE_GATEWAY_URL"] == "https://example.com/mcp"
     assert env["SUBAGENT_BEDROCK_MODEL_ID"] == "model"
-    assert env["BEDROCK_MODEL_ID"] == "global.anthropic.claude-haiku-5-5"
-    assert env["BEDROCK_FALLBACK_MODEL_ID"] == "global.anthropic.claude-sonnet-4-6"
+    assert env["BEDROCK_MODEL_ID"] == "global.anthropic.claude-opus-5-5"
+    assert env["BEDROCK_FALLBACK_MODEL_ID"] == "global.anthropic.claude-sonnet-5-5"
     assert desired["networkConfiguration"]["networkModeConfig"]["subnets"] == ["subnet-12345678", "subnet-12345679"]
 
 

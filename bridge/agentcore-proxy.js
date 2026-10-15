@@ -35,7 +35,8 @@ console.log(`[proxy] Credential env: RELATIVE_URI=${!!process.env.AWS_CONTAINER_
 
 // Subagent model routing — distinct model name lets proxy detect subagent requests
 const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcore-subagent";
-const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || MODEL_ID;
+// Unset/empty SUBAGENT_BEDROCK_MODEL_ID uses the policy sub-agent model (Sonnet 5.5).
+const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || modelPolicy.SUBAGENT_MODEL_ID;
 
 // Per-user `/model` overrides arrive per turn in the identity file. Only IDs the
 // operator allowlisted (cdk.json user_selectable_models) are honoured; anything
@@ -390,6 +391,7 @@ function extractSessionMetadata(parsed, headers) {
 // cache). Shared with agentcore-contract.js via bridge/cognito-token.js so
 // both processes derive the same password for the same actorId.
 const { scopeGuardrailToLatestUserTurn } = require("./guardrail-scope");
+const { reconcileToolHistory } = require("./tool-history");
 const { readBody } = require("./read-body");
 const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
   userPoolId: COGNITO_USER_POOL_ID,
@@ -1044,12 +1046,14 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
-    // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
+    // Opus/Sonnet 5+ reject temperature; the key is omitted, not nulled (see inference-config.js).
     inferenceConfig: buildInferenceConfig(modelId, temperatureOverride),
     ...(!isSubagentRequest({ model: requestedModel }) && modelPolicy.requestFields(modelId)),
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
+  // Without tools on this request, history tool blocks become text (see tool-history.js).
+  params.messages = reconcileToolHistory(params.messages, toolConfig);
 
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -1170,10 +1174,12 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
-    // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
+    // Opus/Sonnet 5+ reject temperature; the key is omitted, not nulled (see inference-config.js).
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) payload.toolConfig = toolConfig;
+  // Without tools on this request, history tool blocks become text (see tool-history.js).
+  payload.messages = reconcileToolHistory(payload.messages, toolConfig);
   const requestParams = (selectedModelId) => {
     const params = {
       ...(route ? structuredClone(payload) : payload),
@@ -1187,6 +1193,11 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
     return params;
   };
   let params = requestParams(modelId);
+  // OpenClaw treats a response model that differs from the requested name as a
+  // model-route change and passes a notice on to the user. Report the requested
+  // name (e.g. the sub-agent alias) unless this route fell back to another model.
+  const reportedModel = () =>
+    (route && modelId !== route.modelId(0) ? modelId : model || MODEL_ID);
 
   const chatId = `chatcmpl-${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1247,7 +1258,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
             id: chatId,
             object: "chat.completion.chunk",
             created,
-            model: route ? modelId : model || MODEL_ID,
+            model: reportedModel(),
             choices: [
               {
                 index: 0,
@@ -1294,7 +1305,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
             id: chatId,
             object: "chat.completion.chunk",
             created,
-            model: route ? modelId : model || MODEL_ID,
+            model: reportedModel(),
             choices: [
               {
                 index: 0,
@@ -1344,7 +1355,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
         id: chatId,
         object: "chat.completion.chunk",
         created,
-        model: route ? modelId : model || MODEL_ID,
+        model: reportedModel(),
         choices: [
           {
             index: 0,

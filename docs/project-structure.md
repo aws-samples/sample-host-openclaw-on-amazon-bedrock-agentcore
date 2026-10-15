@@ -8,7 +8,7 @@ openclaw-on-agentcore/
   cdk.json                        # Configuration (model, budgets, sessions, cron, guardrails)
   requirements.txt                # Python deps (aws-cdk-lib, cdk-nag)
   stacks/
-    __init__.py                   # Shared helper (RetentionDays converter)
+    __init__.py                   # Shared helpers (RetentionDays converter, table_tags context for DynamoDB tables)
     vpc_stack.py                  # VPC, subnets, NAT, 7 interface + 1 S3 gateway VPC endpoints, flow logs
     security_stack.py             # KMS CMK, Secrets Manager, Cognito, optional CloudTrail
     agentcore_stack.py            # Role, SG, S3 bucket, optional Browser; AgentCore Runtime via SDK, ECR via runtime_image.py
@@ -34,6 +34,11 @@ openclaw-on-agentcore/
     gateway-mcp.test.js           # Gateway MCP config/refresh + Cognito token provider tests (node:test, 12 tests)
     cognito-token.js              # Per-user Cognito ID/access token provider shared by proxy and contract server
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
+    tool-history.js               # History toolUse/toolResult blocks -> text when a request has no tools
+    tool-history.test.js          # Tool-history rewrite + proxy integration tests (node:test)
+    system-prefix-cache.js        # Bedrock cachePoint blocks after OpenClaw's stable system prefix and tool specs
+    gateway-lifecycle.js          # Gateway readiness, chat transport with final-answer selection, stale sub-agent delivery sweep
+    brief-audio-marker.test.js    # BRIEF_AUDIO label survives OpenClaw's secret redaction (skips without the OpenClaw dist)
     image-support.test.js         # Image support unit tests (node:test)
     proxy-identity.test.js        # Proxy identity resolution tests (node:test)
     agentcore-browser.test.js     # Browser skill unit tests (node:test)
@@ -95,6 +100,12 @@ openclaw-on-agentcore/
     test_guardrail_eval.py        # Unit tests for scripts/guardrail-eval.py (stubbed ApplyGuardrail, no AWS)
     test_state_bucket_lifecycle_synth.py # User-files bucket lifecycle rules synth test (no AWS)
     test_gateway_stack_synth.py   # OpenClawGateway synth tests: flag off = unchanged templates, flag on = stack + IAM + cdk-nag (10 tests, no AWS)
+    test_table_protection_synth.py # DynamoDB deletion protection, RETAIN and table_tags synth tests (no AWS)
+    test_cron_audio.py            # Brief audio marker, key checks and sendAudio delivery (no AWS)
+    test_cron_error_text.py       # Cron failures send a fixed notice; no exception text in replies or logs
+    test_cron_timeouts.py         # callerBudgetMs and no async retry for the Cron Lambda
+    test_router_secret_logging.py # Router secret/token fetch failures log only the exception type
+    test_token_metrics_costs.py, test_token_metrics_pricing.py # Invocation-log parsing, cache tokens and model prices
     e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
       config.py                   # AWS config auto-discovery (CF outputs, Secrets Manager)
       webhook.py                  # Build + POST Telegram webhook payloads
@@ -110,6 +121,8 @@ openclaw-on-agentcore/
     architecture.md               # Solution architecture (ASCII diagrams)
     architecture-detailed.md      # Sequence diagrams, container internals, data flows
     openclaw-2.0-upgrade.md       # 2026.3.8 -> 2026.9.5 upgrade notes, risks, validation
+    runtime-v2.md                 # AgentCore Runtime V2 runbook (deploy phases, release endpoints, warmup, recovery)
+    release-v1.md                 # The release/v1 branch for Regions without V2: backports, deployment, V1/V2 comparison
     design-feishu-channel.md      # Feishu channel design
     security.md                   # Complete security architecture
     guardrails.md                 # Bedrock Guardrails operational runbook

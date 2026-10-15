@@ -138,7 +138,7 @@ def test_synth_wires_allowlist_to_router_and_execution_role_covers_every_model(t
     built = templates(tmp_path)
     variables = router_env(built["OpenClawRouter"])
     assert json.loads(variables["USER_SELECTABLE_MODELS"]) == SHIPPED
-    assert variables["DEFAULT_MODEL_ID"] == "global.anthropic.claude-haiku-5-5"
+    assert variables["DEFAULT_MODEL_ID"] == "global.anthropic.claude-opus-5-5"
     # Router stores the override on USER#/PROFILE via UpdateItem.
     router_actions = {action for resource in built["OpenClawRouter"]["Resources"].values()
                       if resource["Type"] == "AWS::IAM::Policy"

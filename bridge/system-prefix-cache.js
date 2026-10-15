@@ -11,7 +11,7 @@
  */
 const { readFileSync } = require("node:fs");
 const { createHash } = require("node:crypto");
-const { PRIMARY_MODEL_ID, FALLBACK_MODEL_ID } = require("./model-policy");
+const { PRIMARY_MODEL_ID, FALLBACK_MODEL_ID, SUBAGENT_MODEL_ID } = require("./model-policy");
 
 const SOURCE_PINS = [
   ["/app/system-messages.js", "aaf0d64a1d0b53585286edbb1fba4bb468afe13c3672054a1a908ce3a89b2060"],
@@ -30,7 +30,11 @@ const exact = (value, keys) => value && typeof value === "object" && !Array.isAr
 const wrapped = (text, section) => typeof text === "string" &&
   text.startsWith(`<!-- openclaw:attempt:${section} -->\n`) &&
   text.endsWith(`\n<!-- /openclaw:attempt:${section} -->`);
-const supported = (modelId) => [PRIMARY_MODEL_ID, FALLBACK_MODEL_ID].includes(modelId);
+// Models verified to accept system and tool cache points: the policy defaults
+// (Opus 5.5 main, Sonnet 5.5 sub-agent/fallback) and the Haiku 5.5 option.
+const CACHE_MODEL_IDS = new Set([PRIMARY_MODEL_ID, FALLBACK_MODEL_ID, SUBAGENT_MODEL_ID,
+  "global.anthropic.claude-haiku-5-5"]);
+const supported = (modelId) => CACHE_MODEL_IDS.has(modelId);
 
 function addToolPrefixCachePoint(toolConfig, modelId) {
   if (!supported(modelId)) return toolConfig;
