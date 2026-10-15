@@ -90,7 +90,7 @@ class VpcStack(Stack):
         )
 
         # Bedrock Runtime endpoint: Private DNS disabled so global/* cross-region
-        # inference profiles (e.g. global.anthropic.claude-sonnet-4-6) can route
+        # inference profiles (e.g. global.anthropic.claude-sonnet-5-5) can route
         # via NAT gateway to AWS's global routing layer. With private DNS enabled,
         # bedrock-runtime.{region}.amazonaws.com resolves to the VPC endpoint IP
         # even when the proxy sets a custom endpoint URL, blocking cross-region calls.

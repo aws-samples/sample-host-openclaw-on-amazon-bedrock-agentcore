@@ -566,9 +566,9 @@ describe("buildOpenClawEnv", () => {
   it("includes SUBAGENT_BEDROCK_MODEL_ID from baseEnv", () => {
     const env = buildOpenClawEnv({
       credDir: "/tmp/scoped",
-      baseEnv: { SUBAGENT_BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-4-6-v1" },
+      baseEnv: { SUBAGENT_BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-5-5" },
     });
-    assert.equal(env.SUBAGENT_BEDROCK_MODEL_ID, "global.anthropic.claude-sonnet-4-6-v1");
+    assert.equal(env.SUBAGENT_BEDROCK_MODEL_ID, "global.anthropic.claude-sonnet-5-5");
   });
 });
 

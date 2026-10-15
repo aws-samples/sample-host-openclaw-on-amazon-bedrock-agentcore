@@ -16,8 +16,11 @@ if (!AWS_REGION) {
   console.error("[proxy] FATAL: AWS_REGION environment variable is not set.");
   process.exit(1);
 }
+// Defaults: Opus 5.5 for the main agent, Sonnet 5.5 for sub-agents.
+const DEFAULT_MODEL_ID = "global.anthropic.claude-opus-5-5";
+const DEFAULT_SUBAGENT_MODEL_ID = "global.anthropic.claude-sonnet-5-5";
 const MODEL_ID =
-  process.env.BEDROCK_MODEL_ID || "minimax.minimax-m2.1";
+  process.env.BEDROCK_MODEL_ID || DEFAULT_MODEL_ID;
 
 // Log credential env vars at startup for debugging
 console.log(`[proxy] AWS_REGION=${AWS_REGION} MODEL_ID=${MODEL_ID}`);
@@ -25,7 +28,8 @@ console.log(`[proxy] Credential env: RELATIVE_URI=${!!process.env.AWS_CONTAINER_
 
 // Subagent model routing — distinct model name lets proxy detect subagent requests
 const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcore-subagent";
-const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || MODEL_ID;
+// Unset/empty SUBAGENT_BEDROCK_MODEL_ID uses Sonnet 5.5, not the main model.
+const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || DEFAULT_SUBAGENT_MODEL_ID;
 
 // Bedrock Guardrails — content filtering (undefined = disabled)
 const GUARDRAIL_ID = process.env.BEDROCK_GUARDRAIL_ID || "";
@@ -1011,7 +1015,7 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
-    // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
+    // Opus/Sonnet 5+ reject temperature; the key is omitted, not nulled (see inference-config.js).
     inferenceConfig: buildInferenceConfig(modelId, temperatureOverride),
     ...(guardrailConfig && { guardrailConfig }),
   };
@@ -1114,7 +1118,7 @@ async function invokeBedrockStreaming(
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
     system: [{ text: finalSystemText }],
-    // Opus 5+ rejects temperature; the key is omitted, not nulled (see inference-config.js).
+    // Opus/Sonnet 5+ reject temperature; the key is omitted, not nulled (see inference-config.js).
     inferenceConfig: buildInferenceConfig(modelId, temperatureOverride),
     ...(guardrailConfig && { guardrailConfig }),
   };

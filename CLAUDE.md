@@ -17,7 +17,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **Workspace Persistence**: AgentCore Session Storage (primary, `/mnt/workspace`) + S3 backup (5 min). `.openclaw/` symlinked to session storage mount; S3 backup restores on new sessions or version updates. **Note**: `update-agent-runtime` clears session storage — S3 backup auto-restores
-- **AI Model**: Claude Opus 4.6 via Bedrock ConverseStream (configurable via `default_model_id` in `cdk.json`, default `global.anthropic.claude-opus-4-6-v1`)
+- **AI Model**: Claude Opus 5.5 via Bedrock ConverseStream (configurable via `default_model_id` in `cdk.json`, default `global.anthropic.claude-opus-5-5`); sub-agents default to Claude Sonnet 5.5 (`subagent_model_id`, `global.anthropic.claude-sonnet-5-5`)
 - **Identity**: DynamoDB identity table (channel→user mapping, cross-channel binding) + Cognito User Pool
 - **Observability**: CloudWatch dashboards + alarms, Bedrock invocation logging
 - **Token Monitoring**: Lambda + DynamoDB (single-table) + CloudWatch custom metrics
@@ -214,7 +214,7 @@ agentcore configure --name openclaw_agent --entrypoint bridge/agentcore-contract
 
 # Deploy (builds Docker image locally or via CodeBuild, creates/updates Runtime)
 agentcore deploy --agent openclaw_agent --local-build --auto-update-on-conflict \
-  --env "BEDROCK_MODEL_ID=global.anthropic.claude-opus-4-6-v1" \
+  --env "BEDROCK_MODEL_ID=global.anthropic.claude-opus-5-5" \
   --env "S3_USER_FILES_BUCKET=openclaw-user-files-..." ...
 
 # Update cdk.json with runtime_id and runtime_endpoint_id from toolkit output
@@ -320,7 +320,7 @@ aws bedrock-agentcore-control update-agent-runtime \
     "AWS_REGION":"us-west-2",
     "BEDROCK_AGENTCORE_MEMORY_ID":"<MEMORY_ID>",
     "BEDROCK_AGENTCORE_MEMORY_NAME":"openclaw_agent_mem",
-    "BEDROCK_MODEL_ID":"global.anthropic.claude-opus-4-6-v1",
+    "BEDROCK_MODEL_ID":"global.anthropic.claude-opus-5-5",
     "COGNITO_CLIENT_ID":"<COGNITO_CLIENT_ID>",
     "COGNITO_PASSWORD_SECRET_ID":"openclaw/cognito-password-secret",
     "COGNITO_USER_POOL_ID":"<COGNITO_USER_POOL_ID>",
@@ -332,7 +332,7 @@ aws bedrock-agentcore-control update-agent-runtime \
     "GATEWAY_TOKEN_SECRET_ID":"openclaw/gateway-token",
     "IDENTITY_TABLE_NAME":"openclaw-identity",
     "S3_USER_FILES_BUCKET":"openclaw-user-files-<ACCOUNT_ID>-us-west-2",
-    "SUBAGENT_BEDROCK_MODEL_ID":"global.anthropic.claude-opus-4-6-v1"
+    "SUBAGENT_BEDROCK_MODEL_ID":"global.anthropic.claude-sonnet-5-5"
   }' \
   --region us-west-2
 
@@ -496,7 +496,7 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agen
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` |
 | `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
-| `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID for Claude Opus 4.6. The `global.` prefix routes to any available region |
+| `default_model_id` | `global.anthropic.claude-opus-5-5` | Bedrock model ID for Claude Opus 5.5. The `global.` prefix routes to any available region |
 | `runtime_id` | (empty) | AgentCore Runtime ID from Starter Toolkit. Populated by deploy script after `agentcore deploy` |
 | `runtime_endpoint_id` | (empty) | AgentCore Runtime Endpoint ID. Typically `DEFAULT` when using Starter Toolkit |
 | `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
@@ -515,7 +515,7 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agen
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail (S3 bucket + trail). Off by default — most accounts already have one |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
-| `subagent_model_id` | (empty) | Bedrock model for sub-agents. Empty = use `default_model_id` |
+| `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model for sub-agents. Empty = proxy default (also Sonnet 5.5) |
 | `enable_browser` | `false` | Enable headless Chromium browser. Sets `BROWSER_IDENTIFIER` env var on container |
 
 ## Container Startup Sequence
@@ -642,7 +642,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Tool profile**: Uses `"full"` profile with a deny list. Do NOT use `"basic"` (undocumented, may disable web tools). Documented profiles: `minimal`, `coding`, `messaging`, `full`
 - **Deny list**: `["write", "edit", "apply_patch", "read", "browser", "canvas", "cron", "gateway"]` — local writes use S3 skill, `read` blocked to prevent credential reads, no browser/UI in container, EventBridge replaces built-in cron. `exec` is NOT denied — skills like `clawhub-manage` need it; scoped STS credentials limit blast radius
 - **Sub-agent sandbox**: Must be `"off"` — no Docker inside AgentCore microVMs. MicroVMs already provide per-user isolation
-- **Sub-agent model**: Configurable via `SUBAGENT_BEDROCK_MODEL_ID` env var (from `subagent_model_id` in cdk.json). Empty = use same as main model. Subagents use a distinct model name (`bedrock-agentcore-subagent`) so the proxy can detect and count them separately
+- **Sub-agent model**: Configurable via `SUBAGENT_BEDROCK_MODEL_ID` env var (from `subagent_model_id` in cdk.json). Default and empty = `global.anthropic.claude-sonnet-5-5`. Subagents use a distinct model name (`bedrock-agentcore-subagent`) so the proxy can detect and count them separately
 - **`skipBootstrap` removed**: No longer a valid config key — OpenClaw rejects unknown keys and exits with code 1
 - **`skills.allowBundled`**: Must be an array (e.g., `[]` for none, `["*"]` for all), not a boolean. Set to `[]` for fast startup
 - **ClawHub skill paths**: `clawhub install` installs to managed skills path — OpenClaw scans this automatically. Custom skills in `/skills/` loaded via `extraDirs`

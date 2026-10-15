@@ -69,7 +69,7 @@ aws bedrock-agentcore-control update-agent-runtime \
     "AWS_REGION":"us-west-2",
     "BEDROCK_AGENTCORE_MEMORY_ID":"<MEMORY_ID>",
     "BEDROCK_AGENTCORE_MEMORY_NAME":"openclaw_agent_mem",
-    "BEDROCK_MODEL_ID":"global.anthropic.claude-opus-4-6-v1",
+    "BEDROCK_MODEL_ID":"global.anthropic.claude-opus-5-5",
     "COGNITO_CLIENT_ID":"<COGNITO_CLIENT_ID>",
     "COGNITO_PASSWORD_SECRET_ID":"openclaw/cognito-password-secret",
     "COGNITO_USER_POOL_ID":"<COGNITO_USER_POOL_ID>",
@@ -81,7 +81,7 @@ aws bedrock-agentcore-control update-agent-runtime \
     "GATEWAY_TOKEN_SECRET_ID":"openclaw/gateway-token",
     "IDENTITY_TABLE_NAME":"openclaw-identity",
     "S3_USER_FILES_BUCKET":"openclaw-user-files-<ACCOUNT_ID>-us-west-2",
-    "SUBAGENT_BEDROCK_MODEL_ID":"global.anthropic.claude-opus-4-6-v1",
+    "SUBAGENT_BEDROCK_MODEL_ID":"global.anthropic.claude-sonnet-5-5",
     "BROWSER_IDENTIFIER":"<BROWSER_ID>"
   }' \
   --region us-west-2

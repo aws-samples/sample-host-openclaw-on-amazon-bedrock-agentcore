@@ -72,6 +72,49 @@ class TestOpus55Pricing(unittest.TestCase):
         self.assertAlmostEqual(cost, 12_000 / MILLION * 4.00 + 3_000 / MILLION * 20.00, places=8)
 
 
+# Claude Sonnet 5.5 (Amazon Bedrock Edition), USD per 1M tokens, from the AWS
+# Price List API (AmazonBedrockFoundationModels, publication 2026-10-12T08:40:08Z,
+# identical in us-east-1, us-west-2 and ap-southeast-2).
+SONNET_55_GLOBAL = {"input": 2.00, "output": 10.00, "cache_read": 0.10, "cache_write": 2.50}
+SONNET_55_STANDARD = {"input": 2.20, "output": 11.00, "cache_read": 0.11, "cache_write": 2.75}
+
+
+class TestSonnet55Pricing(unittest.TestCase):
+    def _assert_priced(self, model_id, expected):
+        for args, key in (
+            ((MILLION, 0), "input"),
+            ((0, MILLION), "output"),
+            ((0, 0, MILLION, 0), "cache_read"),
+            ((0, 0, 0, MILLION), "cache_write"),
+        ):
+            self.assertAlmostEqual(
+                tm.estimate_cost(model_id, *args), expected[key], places=6, msg=f"{model_id} {key}"
+            )
+
+    def test_sonnet_5_5_global_profile_uses_global_price(self):
+        self._assert_priced("global.anthropic.claude-sonnet-5-5", SONNET_55_GLOBAL)
+
+    def test_sonnet_5_5_geo_and_base_ids_use_standard_price(self):
+        for model_id in (
+            "au.anthropic.claude-sonnet-5-5",
+            "us.anthropic.claude-sonnet-5-5",
+            "anthropic.claude-sonnet-5-5",
+        ):
+            with self.subTest(model_id=model_id):
+                self._assert_priced(model_id, SONNET_55_STANDARD)
+
+    def test_sonnet_5_5_is_not_priced_as_default(self):
+        with self.assertNoLogs(tm.logger, level="WARNING"):
+            tm.estimate_cost("global.anthropic.claude-sonnet-5-5", MILLION, MILLION)
+
+    def test_global_key_listed_before_its_base_key(self):
+        keys = list(tm.MODEL_PRICING)
+        self.assertLess(
+            keys.index("global.anthropic.claude-sonnet-5-5"),
+            keys.index("anthropic.claude-sonnet-5-5"),
+        )
+
+
 class TestExistingPricingUnchanged(unittest.TestCase):
     def test_unknown_model_falls_back_to_default(self):
         cost = tm.estimate_cost("vendor.some-new-model-v9", MILLION, MILLION)
