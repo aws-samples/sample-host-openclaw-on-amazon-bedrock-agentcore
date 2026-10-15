@@ -1,4 +1,4 @@
-"""Router Lambda — Webhook ingestion for Telegram, Slack, and Feishu.
+"""Router Lambda — Webhook ingestion for Telegram, Slack, Feishu, and WhatsApp.
 
 Receives webhook events via API Gateway HTTP API, resolves user identity via
 DynamoDB, invokes the per-user AgentCore Runtime session, and sends responses
@@ -8,6 +8,8 @@ Path routing:
   POST /webhook/telegram  — Telegram Bot API webhook
   POST /webhook/slack     — Slack Events API webhook
   POST /webhook/feishu    — Feishu Events API webhook
+  GET  /webhook/whatsapp  — WhatsApp Cloud API subscription verification
+  POST /webhook/whatsapp  — WhatsApp Cloud API webhook (disabled until configured)
 """
 
 import hashlib
@@ -39,6 +41,7 @@ from documents import (
     classify_document,
     zip_listing,
 )
+import whatsapp
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -49,6 +52,7 @@ TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
+WHATSAPP_TOKEN_SECRET_ID = os.environ.get("WHATSAPP_TOKEN_SECRET_ID", "")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
@@ -137,6 +141,13 @@ def _get_feishu_credentials():
         )
     except (json.JSONDecodeError, TypeError):
         return "", "", "", ""
+
+
+def _get_whatsapp_config():
+    """Return the WhatsApp channel config, or None when the channel is not configured."""
+    if not WHATSAPP_TOKEN_SECRET_ID:
+        return None
+    return whatsapp.parse_config(_get_secret(WHATSAPP_TOKEN_SECRET_ID))
 
 
 # Feishu tenant_access_token cache (2h TTL, refresh 5 min early)
@@ -1966,6 +1977,140 @@ def handle_feishu(body, headers=None):
     return {"statusCode": 200, "body": "ok"}
 
 
+WHATSAPP_DEDUP_TTL_SECONDS = 86400
+
+
+def _whatsapp_verify_subscription(event):
+    """Answer Meta's GET verification request (fail-closed)."""
+    config = _get_whatsapp_config()
+    if config is None:
+        return {"statusCode": 404, "body": "Not found"}
+    challenge = whatsapp.verify_subscription(event.get("queryStringParameters") or {}, config["verifyToken"])
+    if challenge is None:
+        logger.warning("WhatsApp subscription verification rejected")
+        return {"statusCode": 403, "body": "Forbidden"}
+    return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": challenge}
+
+
+def _claim_whatsapp_message(message_id):
+    """Record a message ID so Meta's retries are processed once. False = duplicate."""
+    digest = hashlib.sha256(message_id.encode("utf-8")).hexdigest()
+    try:
+        identity_table.put_item(
+            Item={"PK": f"DEDUP#whatsapp:{digest}", "SK": "DEDUP",
+                  "ttl": int(time.time()) + WHATSAPP_DEDUP_TTL_SECONDS},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("WhatsApp dedupe write failed: %s", type(e).__name__)
+        return True
+
+
+def _whatsapp_progress_notify(config, to, stop_event, notify_after_s=30):
+    """Send a one-time progress message if the request takes longer than notify_after_s."""
+    if not stop_event.wait(timeout=notify_after_s):
+        whatsapp.send_text(
+            config, to,
+            "\u23f3 Working on your request \u2014 this may take a few minutes. "
+            "I'll send the full response when it's ready.",
+        )
+
+
+def handle_whatsapp(body):
+    """Process a verified WhatsApp Cloud API webhook (async dispatch)."""
+    config = _get_whatsapp_config()
+    if config is None:
+        logger.error("WhatsApp: channel not configured; event dropped")
+        return
+    try:
+        payload = json.loads(body) if isinstance(body, str) else body
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("WhatsApp: body is not JSON")
+        return
+    for msg in whatsapp.extract_messages(payload, config["phoneNumberId"]):
+        if not _claim_whatsapp_message(msg["id"]):
+            logger.info("WhatsApp: duplicate message ignored")
+            continue
+        try:
+            _handle_whatsapp_message(config, msg)
+        except RouteUnavailable as e:
+            logger.error("WhatsApp: route unavailable: %s", type(e).__name__)
+            whatsapp.send_text(config, msg["from"], "Sorry, your account needs attention. Please contact the bot admin.")
+
+
+def _handle_whatsapp_message(config, msg):
+    wa_id = msg["from"]
+    text = msg["text"].strip()
+    has_image = bool(msg["image_id"])
+    if not text and not has_image:
+        return
+
+    actor_id = f"whatsapp:{wa_id}"
+    is_bind, code = _is_bind_command(text)
+    if is_bind:
+        _, success = redeem_bind_code(code, "whatsapp", wa_id, msg.get("name", ""))
+        whatsapp.send_text(config, wa_id, "Accounts linked successfully! Your sessions are now unified."
+                           if success else "Invalid or expired link code. Please try again.")
+        return
+
+    resolved_user_id, _ = resolve_user("whatsapp", wa_id, msg.get("name", ""))
+    if resolved_user_id is None:
+        whatsapp.send_text(
+            config, wa_id,
+            f"Sorry, this bot is private and requires an invitation.\n\n"
+            f"Your ID: whatsapp:{wa_id}\n\n"
+            f"Send this ID to the bot admin to request access.",
+        )
+        return
+
+    route = get_or_create_session(resolved_user_id)
+    authorize_channel_actor(identity_table, route, resolved_user_id, actor_id, "whatsapp")
+
+    if _is_link_command(text):
+        bind_code = create_bind_code(resolved_user_id)
+        if not bind_code:
+            whatsapp.send_text(config, wa_id, "Account linking requires identity reconciliation.")
+            return
+        whatsapp.send_text(
+            config, wa_id,
+            f"Your link code is: {bind_code}\n\nEnter this code on another channel within 10 minutes "
+            f"by typing: link {bind_code}",
+        )
+        return
+
+    agent_message = text
+    if has_image:
+        namespace = route.actor_id.replace(":", "_")
+        image_bytes, content_type = whatsapp.download_media(
+            config, msg["image_id"], ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES)
+        s3_key = _upload_image_to_s3(image_bytes, namespace, content_type) if image_bytes else None
+        if not s3_key:
+            whatsapp.send_text(config, wa_id, "Sorry, I couldn't process that image. Please try again.")
+            return
+        agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
+
+    # The actor ID is a phone number, so only the internal user ID is logged.
+    logger.info("WhatsApp: user=%s msg_len=%d has_image=%s", resolved_user_id, len(text), has_image)
+
+    stop_notify = threading.Event()
+    notify_thread = threading.Thread(
+        target=_whatsapp_progress_notify, args=(config, wa_id, stop_notify), daemon=True,
+    )
+    notify_thread.start()
+    try:
+        result = invoke_agent_runtime(route, resolved_user_id, actor_id, "whatsapp", agent_message,
+                                      channel_target=wa_id)
+    finally:
+        stop_notify.set()
+        notify_thread.join(timeout=2)
+    response_text = result.get("response", "Sorry, I couldn't process your message.")
+    response_text = _extract_text_from_content_blocks(response_text)
+    whatsapp.send_text(config, wa_id, response_text)
+
+
 # ---------------------------------------------------------------------------
 # Lambda handler
 # ---------------------------------------------------------------------------
@@ -1984,6 +2129,8 @@ def handler(event, context):
             handle_slack(body, headers)
         elif channel == "feishu":
             handle_feishu(body, headers)
+        elif channel == "whatsapp":
+            handle_whatsapp(body)
         return {"statusCode": 200, "body": "ok"}
 
     # --- Function URL entry point ---
@@ -1998,6 +2145,9 @@ def handler(event, context):
             "statusCode": 200,
             "body": json.dumps({"status": "ok", "service": "openclaw-router"}),
         }
+
+    if method == "GET" and path.endswith("/webhook/whatsapp"):
+        return _whatsapp_verify_subscription(event)
 
     if method != "POST":
         return {"statusCode": 405, "body": "Method not allowed"}
@@ -2077,6 +2227,19 @@ def handler(event, context):
 
         # Self-invoke async for actual processing
         _self_invoke_async("feishu", body, headers)
+        return {"statusCode": 200, "body": "ok"}
+
+    elif path.endswith("/webhook/whatsapp"):
+        # Disabled (404) until the secret holds a complete JSON config.
+        config = _get_whatsapp_config()
+        if config is None:
+            return {"statusCode": 404, "body": "Not found"}
+        # Verify the signature over the raw body before parsing anything.
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+        if not whatsapp.verify_signature(headers, body_bytes, config["appSecret"]):
+            logger.warning("WhatsApp webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+        _self_invoke_async("whatsapp", body, {})
         return {"statusCode": 200, "body": "ok"}
 
     return {"statusCode": 404, "body": "Not found"}

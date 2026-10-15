@@ -2,7 +2,7 @@
 
 Deploys the EventBridge Scheduler group and cron executor Lambda that fires
 on user-defined schedules, invokes per-user AgentCore Runtime sessions, and delivers
-responses back to the originating channel (Telegram/Slack/Feishu).
+responses back to the originating channel (Telegram/Slack/Feishu/WhatsApp).
 
 Also grants the AgentCore Runtime execution role permissions to create/manage
 EventBridge schedules and write cron records to the identity DynamoDB table.
@@ -41,6 +41,7 @@ class CronStack(Stack):
         agentcore_execution_role: iam.IRole,
         user_files_bucket_name: str,
         user_files_bucket_arn: str,
+        whatsapp_token_secret_name: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -103,6 +104,7 @@ class CronStack(Stack):
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
                 "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
+                "WHATSAPP_TOKEN_SECRET_ID": whatsapp_token_secret_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
                 "USER_FILES_BUCKET": user_files_bucket_name,
             },

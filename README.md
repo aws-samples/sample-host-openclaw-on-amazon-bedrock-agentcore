@@ -6,7 +6,7 @@
 
 > **Experimental** — This project is provided for experimentation and learning purposes only. It is **not intended for production use**. APIs, architecture, and configuration may change without notice.
 
-Deploy an AI-powered multi-channel messaging bot (Telegram, Slack, Feishu) on AWS Bedrock AgentCore Runtime V2 using CDK and the deployment SDK. OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Router Lambda handles webhook ingestion from Telegram, Slack and Feishu, resolves user identity via DynamoDB, and invokes per-user AgentCore sessions. Each user gets their own microVM with workspace persistence: the OpenClaw state dir (`~/.openclaw/`, SQLite session state plus the agent workspace) lives on the container's local disk, is mirrored to AgentCore session storage while the session runs, and is backed up to S3. The agent has built-in tools (web, filesystem, runtime, sessions, automation), custom skills for file storage and cron scheduling, and **EventBridge-based cron scheduling** for recurring tasks.
+Deploy an AI-powered multi-channel messaging bot (Telegram, Slack, Feishu, WhatsApp) on AWS Bedrock AgentCore Runtime V2 using CDK and the deployment SDK. OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Router Lambda handles webhook ingestion from Telegram, Slack, Feishu and WhatsApp, resolves user identity via DynamoDB, and invokes per-user AgentCore sessions. Each user gets their own microVM with workspace persistence: the OpenClaw state dir (`~/.openclaw/`, SQLite session state plus the agent workspace) lives on the container's local disk, is mirrored to AgentCore session storage while the session runs, and is backed up to S3. The agent has built-in tools (web, filesystem, runtime, sessions, automation), custom skills for file storage and cron scheduling, and **EventBridge-based cron scheduling** for recurring tasks.
 
 AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1` and `ap-northeast-1`. For other Regions, and for existing V1 deployments, use the [`release/v1` branch](docs/release-v1.md); see [Choosing a branch](#choosing-a-branch-v2-or-v1).
 
@@ -31,7 +31,7 @@ AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-
 ## Features
 
 - Per-user Firecracker microVM isolation (AgentCore Runtime)
-- Multi-channel support (Telegram, Slack, Feishu) with cross-channel account linking
+- Multi-channel support (Telegram, Slack, Feishu, WhatsApp) with cross-channel account linking
 - Multimodal: text + image messages via Bedrock ConverseStream
 - STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
 - Custom skills: S3 file storage, EventBridge cron scheduling, API key management, ClawHub skill installer
@@ -304,7 +304,7 @@ All tunable parameters are in `cdk.json`:
 
 ## Channel Setup
 
-Telegram is the quick-start channel. Slack and Feishu setup is in [docs/channels.md](docs/channels.md).
+Telegram is the quick-start channel. Slack, Feishu and WhatsApp setup is in [docs/channels.md](docs/channels.md).
 
 ### Telegram
 
@@ -327,6 +327,10 @@ Create a Slack app that uses the Events API, point its Request URL at `<ApiUrl>w
 ### Feishu
 
 Create a Feishu app with **Bot** capability and run `./scripts/setup-feishu.sh`. Manual setup and scheduled-task delivery: [docs/channels.md#feishu](docs/channels.md#feishu).
+
+### WhatsApp
+
+Off by default. Create a Meta app with the WhatsApp product (Cloud API), store its token, App Secret, verify token and phone number ID in `openclaw/channels/whatsapp`, and point the webhook at `webhook/whatsapp`: [docs/channels.md#whatsapp](docs/channels.md#whatsapp).
 
 ## Operations
 

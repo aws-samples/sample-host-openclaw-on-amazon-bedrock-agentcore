@@ -16,6 +16,7 @@ from urllib import request as urllib_request
 import boto3
 from botocore.config import Config
 from runtime_routing import admit_route, is_unknown_outcome, resolve_route
+import whatsapp
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
 from runtime_invocation import RELEASE_RESERVE_SECONDS, InvocationTransportError, invoke_bounded
 
@@ -27,6 +28,7 @@ IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
+WHATSAPP_TOKEN_SECRET_ID = os.environ.get("WHATSAPP_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
@@ -835,6 +837,15 @@ def deliver_response(channel, channel_target, response_text):
         send_slack_message(channel_target, response_text, bot_token)
     elif channel == "feishu":
         send_feishu_message(channel_target, response_text)
+    elif channel == "whatsapp":
+        # Free-form messages only reach users inside WhatsApp's 24-hour
+        # customer-service window; outside it Meta rejects the send.
+        config = whatsapp.parse_config(_get_secret(WHATSAPP_TOKEN_SECRET_ID)) if WHATSAPP_TOKEN_SECRET_ID else None
+        if not config:
+            logger.error("WhatsApp channel not configured; cron response not delivered")
+            return
+        if not whatsapp.send_text(config, channel_target, response_text):
+            logger.error("Cron response to WhatsApp was not delivered (outside the 24h window?)")
     else:
         logger.warning("Unknown channel type: %s", channel)
 
