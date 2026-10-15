@@ -723,7 +723,7 @@ function writeOpenClawConfig() {
   const fs = require("fs");
 
   // Sub-agent model uses a distinct name so the proxy can identify subagent requests.
-  // The proxy maps this name → SUBAGENT_BEDROCK_MODEL_ID (or MODEL_ID fallback).
+  // The proxy maps this name → SUBAGENT_BEDROCK_MODEL_ID (default Sonnet 5.5).
   const subagentModel = `agentcore/${SUBAGENT_MODEL_NAME}`;
 
   const config = {

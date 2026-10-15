@@ -12,7 +12,7 @@ const assert = require("node:assert/strict");
 // --- Mirror constants from agentcore-proxy.js ---
 const MODEL_ID = "minimax.minimax-m2.1";
 const SUBAGENT_MODEL_NAME = "bedrock-agentcore-subagent";
-const SUBAGENT_BEDROCK_MODEL_ID = "global.anthropic.claude-sonnet-4-6-v1";
+const SUBAGENT_BEDROCK_MODEL_ID = "global.anthropic.claude-sonnet-5-5";
 
 // --- Mirror of isSubagentRequest from agentcore-proxy.js ---
 

@@ -249,8 +249,8 @@ All tunable parameters are in `cdk.json`:
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
 | `region` | (empty) | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
 | `availability_zones` | `[]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
-| `default_model_id` | `global.anthropic.claude-sonnet-4-6` | Bedrock model ID. The `global.` prefix routes to any available region automatically |
-| `subagent_model_id` | (empty) | Bedrock model ID for sub-agents. Empty = use `default_model_id`. Set to e.g. `global.anthropic.claude-sonnet-4-6-v1` for faster/cheaper sub-agents |
+| `default_model_id` | `global.anthropic.claude-opus-5-5` | Bedrock model ID for the main agent. The `global.` prefix routes to any available region automatically. Opus 5+ and Sonnet 5+ reject `temperature`, so the proxy omits it |
+| `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model ID for sub-agents. Empty = the proxy default, also Sonnet 5.5 |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Daily token budget alarm threshold |
 | `daily_cost_budget_usd` | `5` | Daily cost budget alarm threshold (USD) |
@@ -370,7 +370,7 @@ This is expected for full OpenClaw initialization. However, the **lightweight ag
 ### 502 / Bedrock authorization errors
 
 - **Model access not enabled**: Enable model access in the Bedrock console for your region.
-- **Cross-region inference**: The default model ID `global.anthropic.claude-sonnet-4-6` uses a global cross-region inference profile that routes to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions.
+- **Cross-region inference**: The default main model `global.anthropic.claude-opus-5-5` and sub-agent model `global.anthropic.claude-sonnet-5-5` use global cross-region inference profiles that route to any available region. The IAM policy uses `arn:aws:bedrock:*::foundation-model/*` and `arn:aws:bedrock:{region}:{account}:inference-profile/*` to allow all regions.
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
 

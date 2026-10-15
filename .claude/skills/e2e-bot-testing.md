@@ -127,7 +127,7 @@ The tests are behavioral smoke tests — they confirm the skills produce substan
 cdk.json: subagent_model_id → agentcore_stack.py: SUBAGENT_BEDROCK_MODEL_ID env →
   agentcore-contract.js: writeOpenClawConfig() →
     openclaw.json: agents.defaults.subagents.model = "agentcore/bedrock-agentcore-subagent"
-      → proxy resolveModelId() → Bedrock ConverseStream (SUBAGENT_BEDROCK_MODEL_ID or MODEL_ID)
+      → proxy resolveModelId() → Bedrock ConverseStream (SUBAGENT_BEDROCK_MODEL_ID, default global.anthropic.claude-sonnet-5-5)
 ```
 
 **Subagent verification**: The proxy detects subagent requests by the distinct model name (`bedrock-agentcore-subagent`), increments `subagentRequestCount`, and exposes it via `/health` and the contract `status` endpoint. E2E tests assert this count increases after skill invocations.
