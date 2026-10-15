@@ -35,10 +35,12 @@ cloudwatch = boto3.client("cloudwatch")
 # Keys are matched as substrings of the model ID, first match wins, so a
 # prefixed key (e.g. "global.") must come before its unprefixed base key.
 # The base key also covers geo profiles (au., us., eu., apac.).
+# Optional "cache_read" / "cache_write" are the prompt-cache rates (5-minute
+# TTL write). A model without them bills cache tokens at its input rate.
 MODEL_PRICING = {
     # Amazon Nova
-    "amazon.nova-2-lite-v1:0": {"input": 0.30, "output": 2.50},
     "global.amazon.nova-2-lite-v1:0": {"input": 0.30, "output": 2.50},
+    "amazon.nova-2-lite-v1:0": {"input": 0.30, "output": 2.50},
     "amazon.nova-pro-v1:0": {"input": 0.80, "output": 3.20},
     "amazon.nova-micro-v1:0": {"input": 0.035, "output": 0.14},
     # Claude
@@ -47,29 +49,75 @@ MODEL_PRICING = {
     "anthropic.claude-3-5-haiku-20241022-v1:0": {"input": 0.80, "output": 4.00},
     "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3.00, "output": 15.00},
     "anthropic.claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
-    "anthropic.claude-opus-4-6": {"input": 15.00, "output": 75.00},
-    # Claude Opus 5.5: global cross-Region profile is cheaper than geo /
-    # in-Region (AWS Price List, AmazonBedrockFoundationModels, 2026-09-28).
-    "global.anthropic.claude-opus-5-5": {"input": 4.00, "output": 20.00},
-    "anthropic.claude-opus-5-5": {"input": 4.40, "output": 22.00},
+    # Claude Opus 4.6 / 5.5: AWS Price List bulk offer AmazonBedrockFoundationModels,
+    # publication 2026-10-12T08:40:08Z, identical in us-east-1 and ap-southeast-2.
+    # The global cross-Region profile is cheaper than geo / in-Region.
+    # Opus 4.6 usagetypes <R>-MP:<R>_{InputTokenCount,OutputTokenCount,
+    # CacheReadInputTokenCount,CacheWriteInputTokenCount}[_Global]-Units
+    # (us-east-1 global SKUs MTYB4GKWBMZQVSPV, K8TYGUKS5EQFRM3F, KXCKESFRTF63AAC8,
+    # KTKDKQ27XHRK5GXF; regional GZG423Y4VEBAMFMP, HTCQM6TSYSHDEY34, H9AHG8JC5XET4BBQ,
+    # J3BFGREX5X4DS4TK).
+    "global.anthropic.claude-opus-4-6": {
+        "input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25,
+    },
+    "anthropic.claude-opus-4-6": {
+        "input": 5.50, "output": 27.50, "cache_read": 0.55, "cache_write": 6.875,
+    },
+    # Opus 5.5 usagetypes <R>-MP:<R>_{input_tokens,output_tokens,cache_read_tokens,
+    # cache_write_tokens}_[global_]standard-Units (us-east-1 global SKUs
+    # KVG5FBPDJPKF5TJY, MWH4TD2A4D5CEBAP, QT3QZUNUXV325ZDF, RVG5HJ3PZEQYVC74;
+    # standard J9QFZT8WAQABG9ZX, FCRGDQ596BG7EQKH, E5RCDXA3KP96TBAZ, WXH7FJ56PSA2AT5S).
+    "global.anthropic.claude-opus-5-5": {
+        "input": 4.00, "output": 20.00, "cache_read": 0.20, "cache_write": 5.00,
+    },
+    "anthropic.claude-opus-5-5": {
+        "input": 4.40, "output": 22.00, "cache_read": 0.22, "cache_write": 5.50,
+    },
     "minimax.minimax-m2": {"input": 1.00, "output": 5.00},
 }
 
 # Default pricing when model is unknown
 DEFAULT_PRICING = {"input": 1.00, "output": 5.00}
 
+# Unknown model IDs already warned about, so each is logged once per container.
+_warned_unknown_models = set()
 
-def estimate_cost(model_id: str, input_tokens: int, output_tokens: int) -> float:
-    """Estimate cost in USD based on model pricing."""
-    pricing = DEFAULT_PRICING
+
+def _lookup_pricing(model_id: str) -> dict:
     for key, price in MODEL_PRICING.items():
         if key in model_id:
-            pricing = price
-            break
+            return price
+    if model_id not in _warned_unknown_models:
+        _warned_unknown_models.add(model_id)
+        logger.warning("No pricing for model %s; using default pricing", model_id)
+    return DEFAULT_PRICING
+
+
+def estimate_cost(
+    model_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float:
+    """Estimate cost in USD based on model pricing."""
+    pricing = _lookup_pricing(model_id)
 
     input_cost = (input_tokens / 1_000_000) * pricing["input"]
     output_cost = (output_tokens / 1_000_000) * pricing["output"]
-    return round(input_cost + output_cost, 8)
+    cache_read_cost = (cache_read_tokens / 1_000_000) * pricing.get("cache_read", pricing["input"])
+    cache_write_cost = (cache_write_tokens / 1_000_000) * pricing.get("cache_write", pricing["input"])
+    return round(input_cost + output_cost + cache_read_cost + cache_write_cost, 8)
+
+
+def _int_field(source, *names) -> int:
+    if not isinstance(source, dict):
+        return 0
+    for name in names:
+        value = source.get(name)
+        if isinstance(value, int) and value > 0:
+            return value
+    return 0
 
 
 def extract_openclaw_metadata(log_entry: dict) -> dict:
@@ -267,19 +315,33 @@ def publish_metrics(record: dict):
 
 def process_log_entry(log_entry: dict):
     """Process a single Bedrock invocation log entry."""
-    # Extract token counts
-    input_tokens = log_entry.get("inputTokenCount", 0)
-    output_tokens = log_entry.get("outputTokenCount", 0)
+    # Bedrock ModelInvocationLog nests counts under input / output; older or
+    # flattened records carry them at the top level.
+    log_input = log_entry.get("input") if isinstance(log_entry.get("input"), dict) else {}
+    log_output = log_entry.get("output") if isinstance(log_entry.get("output"), dict) else {}
+    input_tokens = _int_field(log_input, "inputTokenCount") or _int_field(log_entry, "inputTokenCount")
+    output_tokens = _int_field(log_output, "outputTokenCount") or _int_field(log_entry, "outputTokenCount")
 
     # Some log formats nest token counts differently
+    usage = log_entry.get("usage") if isinstance(log_entry.get("usage"), dict) else {}
+    body = log_output.get("outputBodyJson")
+    if not usage and isinstance(body, dict) and isinstance(body.get("usage"), dict):
+        usage = body["usage"]  # Converse TokenUsage
     if not input_tokens and not output_tokens:
-        usage = log_entry.get("usage", {})
-        input_tokens = usage.get("inputTokens", usage.get("input_tokens", 0))
-        output_tokens = usage.get("outputTokens", usage.get("output_tokens", 0))
+        input_tokens = _int_field(usage, "inputTokens", "input_tokens")
+        output_tokens = _int_field(usage, "outputTokens", "output_tokens")
+
+    # Prompt-cache tokens are billed separately from input tokens.
+    cache_read_tokens = (_int_field(log_input, "cacheReadInputTokenCount")
+                         or _int_field(log_entry, "cacheReadInputTokenCount")
+                         or _int_field(usage, "cacheReadInputTokens"))
+    cache_write_tokens = (_int_field(log_input, "cacheWriteInputTokenCount")
+                          or _int_field(log_entry, "cacheWriteInputTokenCount")
+                          or _int_field(usage, "cacheWriteInputTokens"))
 
     total_tokens = input_tokens + output_tokens
 
-    if total_tokens == 0:
+    if total_tokens == 0 and not cache_read_tokens and not cache_write_tokens:
         logger.info("Skipping log entry with zero tokens")
         return
 
@@ -296,7 +358,8 @@ def process_log_entry(log_entry: dict):
     date_str = timestamp[:10]  # yyyy-mm-dd
 
     # Compute estimated cost
-    cost = estimate_cost(model_id, input_tokens, output_tokens)
+    cost = estimate_cost(model_id, input_tokens, output_tokens,
+                         cache_read_tokens, cache_write_tokens)
 
     record = {
         "actor_id": metadata["actor_id"],
@@ -305,6 +368,8 @@ def process_log_entry(log_entry: dict):
         "model_id": model_id,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "total_tokens": total_tokens,
         "estimated_cost_usd": cost,
         "timestamp": timestamp,
