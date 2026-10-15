@@ -36,6 +36,7 @@ const runtimeSkills = require("./runtime-skills");
 const { createCognitoTokenProvider } = require("./cognito-token");
 const { readBody } = require("./read-body");
 const { createChatRunTracker } = require("./chat-run-filter");
+const gatewayOps = require("./gateway-ops");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -153,6 +154,10 @@ let lastActivityTime = Math.floor(Date.now() / 1000);
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
 let processingMessage = false;
+// Startup sweep of stale suspended sub-agent deliveries (gateway-ops.js). The
+// queue waits for it before sending a turn, so the first turn's runtime
+// context no longer lists the stale result. Bounded; never rejects.
+let staleDeliverySweep = null;
 
 /**
  * Write current actorId and channel to a shared file so the proxy process
@@ -1038,12 +1043,33 @@ function writeOpenClawConfig() {
 }
 
 /**
+ * Dismiss sub-agent deliveries openclaw suspended more than 2 h ago. openclaw
+ * 2026.9.5 renders each suspended row into every main-session turn as
+ * "Child results awaiting delivery" for 7 days, and the model narrates it into
+ * replies. Runs in the background (bounded to 15 s), so it never delays
+ * readiness; processMessageQueue() waits for it before the first turn.
+ */
+function startStaleDeliverySweep() {
+  return gatewayOps
+    .dismissStaleSuspendedDeliveries({
+      url: `ws://127.0.0.1:${OPENCLAW_PORT}`,
+      token: GATEWAY_TOKEN,
+      deadline: Date.now() + gatewayOps.STALE_SWEEP_TIMEOUT_MS,
+      log: console,
+    })
+    .catch((err) => {
+      console.warn("[contract] Stale delivery sweep error:", err?.message || "unknown");
+    });
+}
+
+/**
  * Poll for OpenClaw readiness in the background.
  * Sets openclawReady=true and starts workspace saves when ready.
  */
 async function pollOpenClawReadiness(namespace) {
   const ready = await waitForPort(OPENCLAW_PORT, "OpenClaw", 300000, 5000);
   if (ready) {
+    staleDeliverySweep = startStaleDeliverySweep();
     openclawReady = true;
     workspaceSync.startPeriodicSave(namespace);
     workspaceSync.startChangeBackup(namespace);
@@ -1954,13 +1980,28 @@ async function processMessageQueue() {
   processingMessage = true;
 
   while (messageQueue.length > 0) {
-    const { message, onDelta, resolve, reject } = messageQueue.shift();
+    if (staleDeliverySweep) await staleDeliverySweep;
+    if (messageQueue.length === 0) break;
+    const entry = messageQueue.shift();
+    const { message, onDelta, resolve, reject } = entry;
+    clearTimeout(entry.expiryTimer);
     console.log(
       `[contract] Processing queued message (${messageQueue.length} remaining)`,
     );
 
+    // A turn with a caller deadline (cron) runs at most until that deadline,
+    // so its caller hears back while it is still waiting.
+    let timeoutMs = 620000;
+    if (entry.deadline !== undefined) {
+      timeoutMs = Math.min(timeoutMs, entry.deadline - Date.now());
+      if (timeoutMs <= 0) {
+        reject(new Error("Turn deadline exceeded in queue"));
+        continue;
+      }
+    }
+
     try {
-      const response = await bridgeMessage(message, 620000, onDelta);
+      const response = await bridgeMessage(message, timeoutMs, onDelta, { outcome: entry.outcome });
       resolve(response);
     } catch (err) {
       reject(err);
@@ -1974,10 +2015,25 @@ async function processMessageQueue() {
  * Enqueue a message and wait for its response (serialized processing).
  * @param {string} message - The message to send
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
+ * @param {object} [opts]
+ * @param {number} [opts.deadline] - epoch ms; a turn still queued then is
+ *   dropped (rejects "Turn deadline exceeded in queue") and never sent, and a
+ *   dispatched turn's WebSocket wait ends by it. Chat turns pass none.
+ * @param {object} [opts.outcome] - passed to bridgeMessage (receives `kind`)
  */
-function enqueueMessage(message, onDelta) {
+function enqueueMessage(message, onDelta, { deadline, outcome } = {}) {
   return new Promise((resolve, reject) => {
-    messageQueue.push({ message, onDelta, resolve, reject });
+    const entry = { message, onDelta, resolve, reject, deadline, outcome };
+    if (deadline !== undefined) {
+      entry.expiryTimer = setTimeout(() => {
+        const index = messageQueue.indexOf(entry);
+        if (index === -1) return; // already dispatched
+        messageQueue.splice(index, 1);
+        console.warn("[contract] Queued turn reached its deadline before dispatch; still queued:", messageQueue.length);
+        reject(new Error("Turn deadline exceeded in queue"));
+      }, Math.max(0, deadline - Date.now()));
+    }
+    messageQueue.push(entry);
     console.log(
       `[contract] Message enqueued (queue length: ${messageQueue.length})`,
     );
@@ -1992,9 +2048,23 @@ function enqueueMessage(message, onDelta) {
  * @param {string} message - The message to send
  * @param {number} timeoutMs - Timeout in milliseconds
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
+ * @param {object} [options]
+ * @param {number} [options.historyTimeoutMs] - per-attempt chat.history wait (tests)
+ * @param {object} [options.outcome] - receives `kind`: how the turn ended
+ *   (final | empty | timeout | closed | error | aborted | auth). The resolved
+ *   text alone cannot tell a finished run from partial deltas on a timeout.
+ *
+ * On our run's final the reply is read back with chat.history and only the
+ * run's last non-commentary assistant message is returned (see
+ * gateway-ops.js selectFinalAnswer): the WS final carries the whole run buffer,
+ * including status lines written before tool calls. Live deltas are unchanged.
+ * Any chat.history problem falls back to the run buffer with a warning.
  */
-async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
+async function bridgeMessage(message, timeoutMs = 620000, onDelta, options = {}) {
   const { randomUUID } = require("crypto");
+  const gatewayOps = require("./gateway-ops");
+  const historyTimeoutMs = options.historyTimeoutMs || gatewayOps.HISTORY_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
     console.log(`[contract] Connecting to WebSocket: ${wsUrl}`);
@@ -2012,11 +2082,21 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
     // Which gateway run this request owns; see chat-run-filter.js.
     let chatRun = null;
     let unhandledMsgs = [];
+    // Methods the gateway advertised in hello-ok; chat.history is optional.
+    let capabilities = [];
+    // Our run and any sessions_yield successor the run filter accepted.
+    const ownRuns = new Set();
+    // After our run's final: waiting for chat.history, chat events are ignored.
+    let historyStage = false;
+    let historyTimer = null;
+    const historyIds = new Set();
 
-    const done = (text) => {
+    const done = (text, kind) => {
       if (resolved) return;
       resolved = true;
+      if (options.outcome) options.outcome.kind = kind;
       clearTimeout(timer);
+      clearTimeout(historyTimer);
       try {
         ws.close();
       } catch {}
@@ -2032,8 +2112,44 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
         `[contract] WebSocket timeout after ${timeoutMs}ms (auth=${authenticated}, chatSent=${chatSent}, responseLen=${responseText.length})${debugInfo}`,
       );
       // Return "" on timeout so caller can fall back to lightweight agent
-      done(responseText || "");
+      done(responseText || "", "timeout");
     }, timeoutMs);
+
+    // The run has finished: resolve with this text, or "" when it is empty.
+    const finishFinal = (text) => {
+      if (text) {
+        done(text, "final");
+      } else {
+        console.warn("[contract] Empty final: no text in the run's final or its buffer");
+        done("", "empty");
+      }
+    };
+    // The run has finished but its answer could not be read back: deliver the
+    // run buffer, as before chat.history was used.
+    const deliverBuffer = (reason) => {
+      if (resolved) return;
+      console.warn("[contract] Delivering the run text buffer; chars, reason:", responseText.length, reason);
+      finishFinal(responseText);
+    };
+    const requestHistory = (params, attempt) => {
+      const wait = Math.max(1, Math.min(historyTimeoutMs, deadline - Date.now()));
+      historyTimer = setTimeout(() => {
+        if (resolved) return;
+        if (attempt >= gatewayOps.HISTORY_ATTEMPTS || deadline - Date.now() < gatewayOps.HISTORY_RETRY_MIN_MS) {
+          deliverBuffer("chat.history timed out");
+          return;
+        }
+        console.warn("[contract] chat.history got no reply, retrying once; waited ms:", wait);
+        requestHistory(params, attempt + 1);
+      }, wait);
+      const id = randomUUID();
+      historyIds.add(id);
+      try {
+        ws.send(JSON.stringify({ type: "req", id, method: "chat.history", params }));
+      } catch {
+        deliverBuffer("chat.history send failed");
+      }
+    };
 
     ws.on("open", () => {
       console.log("[contract] WebSocket connected, waiting for challenge...");
@@ -2091,10 +2207,13 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           );
           done(
             `Auth failed: ${msg.error?.message || JSON.stringify(msg.payload)}`,
+            "auth",
           );
           return;
         }
         authenticated = true;
+        const methods = msg.payload?.features?.methods;
+        capabilities = Array.isArray(methods) ? methods : [];
         console.log(
           "[contract] Authenticated successfully, sending chat.send...",
         );
@@ -2130,7 +2249,33 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
       // Step 3: Chat events — state: "delta" (streaming) or "final" (complete)
       // OpenClaw puts content in payload.message.content (usual) or
       // directly in payload.message (string or content-blocks array).
+      // chat.history reply for our finished run.
+      if (historyStage && msg.type === "res" && historyIds.has(msg.id)) {
+        if (!msg.ok) {
+          deliverBuffer("chat.history rejected");
+          return;
+        }
+        const answer = gatewayOps.selectFinalAnswer(msg.payload?.messages, {
+          userKey: chatReqId,
+          runIds: ownRuns,
+          extractText: extractTextFromContent,
+        });
+        if (!answer) {
+          deliverBuffer("no final assistant message in chat.history");
+          return;
+        }
+        console.log(
+          "[contract] Delivering the run's final answer from chat.history; chars, items, buffer chars:",
+          answer.text.length,
+          answer.items,
+          responseText.length,
+        );
+        done(answer.text, "final");
+        return;
+      }
+
       if (msg.type === "event" && msg.event === "chat") {
+        if (historyStage) return;
         const payload = msg.payload || {};
 
         // The gateway broadcasts chat events for every run, including
@@ -2138,6 +2283,7 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
         // sessions_yield successor) may stream or end this request.
         if (chatRun) {
           const verdict = chatRun.classify(payload);
+          if (verdict.action !== "ignore" && chatRun.state.runId) ownRuns.add(chatRun.state.runId);
           if (verdict.action === "ignore") {
             console.log(
               "[contract] Ignoring chat %s for runId=%s sessionKey=%s (%s)",
@@ -2172,15 +2318,32 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           const text = extractFromPayload(payload);
           if (text) responseText = text;
           console.log(`[contract] Chat final (${responseText.length} chars)`);
+          if (capabilities.includes("chat.history")) {
+            // The final carries every assistant item of the run joined
+            // together; deliver only the run's answer, read back from the
+            // transcript. The turn timer stops; each attempt ends by the
+            // turn deadline.
+            historyStage = true;
+            clearTimeout(timer);
+            requestHistory(
+              {
+                sessionKey: chatRun?.state.sessionKey || payload.sessionKey || "global",
+                limit: gatewayOps.HISTORY_LIMIT,
+                maxChars: gatewayOps.HISTORY_MAX_CHARS,
+              },
+              1,
+            );
+            return;
+          }
           if (responseText) {
-            done(responseText);
+            done(responseText, "final");
           } else {
             // Empty final — log full payload for diagnostics and return ""
             // to signal caller that the bridge got no content.
             console.warn(
               `[contract] Empty final event — payload: ${JSON.stringify(payload).slice(0, 1000)}`,
             );
-            done("");
+            done("", "empty");
           }
           return;
         }
@@ -2191,12 +2354,13 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           );
           done(
             responseText || `Chat error: ${payload.errorMessage || "unknown"}`,
+            "error",
           );
           return;
         }
 
         if (payload.state === "aborted") {
-          done(responseText || "Chat aborted.");
+          done(responseText || "Chat aborted.", "aborted");
           return;
         }
         return;
@@ -2210,6 +2374,7 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
           );
           done(
             responseText || `Chat error: ${msg.error?.message || "unknown"}`,
+            "error",
           );
           return;
         }
@@ -2223,12 +2388,12 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
         if (status === "started" || status === "accepted") return;
         // "final" or "done" = completed — return "" if no content (bridge empty)
         if (responseText) {
-          done(responseText);
+          done(responseText, "final");
         } else {
           console.warn(
             `[contract] Chat response completed with no streaming content — payload: ${JSON.stringify(msg.payload).slice(0, 500)}`,
           );
-          done("");
+          done("", "empty");
         }
         return;
       }
@@ -2239,8 +2404,12 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
 
     ws.on("error", (err) => {
       console.error(`[contract] WebSocket error: ${err.message}`);
+      if (historyStage) {
+        deliverBuffer("socket error during chat.history");
+        return;
+      }
       // Return "" on error so caller can fall back to lightweight agent
-      done(responseText || "");
+      done(responseText || "", "closed");
     });
 
     ws.on("close", (code, reason) => {
@@ -2252,10 +2421,75 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta) {
       console.warn(
         `[contract] WebSocket closed: code=${code} reason=${reasonStr} auth=${authenticated} chatSent=${chatSent} responseLen=${responseText.length}${debugInfo}`,
       );
+      if (historyStage) {
+        deliverBuffer("socket closed during chat.history");
+        return;
+      }
       // Return "" on unexpected close so caller can fall back to lightweight agent
-      done(responseText || "");
+      done(responseText || "", "closed");
     });
   });
+}
+
+// Cron turn budget. The V1 cron Lambda reads for LAMBDA_TIMEOUT_SECONDS - 30 s
+// (870 s with cdk.json's 900 s) and calls "cron" only after its warm-up loop,
+// which took 0-61 s for the second brief of a pair (prod, 10-08..10-14). A
+// cron request without callerBudgetMs therefore gets 780 s from arrival: it
+// replies 90 s inside the 870 s read timeout and, after a warm-up of up to
+// ~100 s, still leaves the Lambda ~20 s to send its notice. A caller that
+// sends callerBudgetMs (how long it will wait, as main's #147 Lambda does)
+// gets that budget less a 20 s reply margin instead.
+const CRON_DEFAULT_WAIT_MS = 780000;
+const CALLER_REPLY_MARGIN_MS = 20000;
+const MAX_CALLER_BUDGET_MS = 900000; // Lambda's maximum timeout
+const CRON_TURN_FAILED_TEXT =
+  "Your scheduled task did not return a result this time. It will run again at the next scheduled time.";
+
+/**
+ * Validate an optional cron callerBudgetMs. Returns { ok, deadline }, where
+ * deadline is the epoch ms by which the contract must reply.
+ */
+function cronCallerDeadline(arrival, callerBudgetMs) {
+  if (callerBudgetMs === undefined) return { ok: true, deadline: arrival + CRON_DEFAULT_WAIT_MS };
+  if (!Number.isSafeInteger(callerBudgetMs) || callerBudgetMs < 1 || callerBudgetMs > MAX_CALLER_BUDGET_MS) {
+    return { ok: false };
+  }
+  return { ok: true, deadline: arrival + callerBudgetMs - CALLER_REPLY_MARGIN_MS };
+}
+
+/** The fixed failure reply, named after the schedule like the cron Lambda's notices. */
+function cronFailureText(message) {
+  const match = /^\[Scheduled task: ([^\]\n]{1,100})\]/.exec(typeof message === "string" ? message : "");
+  return match ? `[Scheduled: ${match[1]}] ${CRON_TURN_FAILED_TEXT}` : CRON_TURN_FAILED_TEXT;
+}
+
+/**
+ * Run one cron turn through the shared queue. Only a finished run with text
+ * is a result. A timeout, an empty final, a dropped socket or an error/abort
+ * returns status "error" with a fixed text: never the partial deltas streamed
+ * so far and never the lightweight agent (the real gateway is up by now).
+ * A turn still queued at the deadline is never sent.
+ */
+async function runCronTurn(message, deadline) {
+  const outcome = {};
+  let text = "";
+  try {
+    text = await enqueueMessage(message, undefined, { deadline, outcome });
+  } catch (err) {
+    console.error("[contract] Cron turn not run:", err?.message || "unknown");
+    return { response: cronFailureText(message), status: "error" };
+  }
+  // Belt-and-suspenders: strip any remaining content-block JSON wrappers
+  if (text) text = extractTextFromContent(text);
+  if (outcome.kind !== "final" || !text || !text.trim()) {
+    console.warn(
+      "[contract] Cron turn returned no result; outcome, partial chars:",
+      outcome.kind || "unknown",
+      text ? text.length : 0,
+    );
+    return { response: cronFailureText(message), status: "error" };
+  }
+  return { response: text };
 }
 
 /**
@@ -2318,6 +2552,8 @@ const server = http.createServer(async (req, res) => {
     // If the router's invoke read timeout expires on a long turn, it drops the
     // connection and will never send the Telegram reply; finalize() needs to know.
     const callerGone = trackCallerDisconnect(res);
+    // A cron turn's wait budget runs from here, when the caller sent it.
+    const requestArrival = Date.now();
     // Decode once from Buffers so a UTF-8 character split across chunks survives.
     readBody(req, MAX_BODY_SIZE).then(async (body) => {
       try {
@@ -2380,6 +2616,13 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
+          const budget = cronCallerDeadline(requestArrival, payload.callerBudgetMs);
+          if (!budget.ok) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid callerBudgetMs" }));
+            return;
+          }
+
           // Update shared identity file so proxy picks up cross-channel changes
           updateIdentityFile(actorId, channel || "unknown");
 
@@ -2418,35 +2661,10 @@ const server = http.createServer(async (req, res) => {
           // Track active task to prevent idle termination during cron processing
           lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
-          let responseText;
+          let reply;
           try {
-            // Enqueue message (serialized with chat messages to prevent WebSocket races)
-            try {
-              responseText = await enqueueMessage(message);
-            } catch (bridgeErr) {
-              responseText = "";
-              console.error(
-                `[contract] Cron bridge error: ${bridgeErr.message}`,
-              );
-            }
-            // Belt-and-suspenders: strip any remaining content-block JSON wrappers
-            if (responseText) responseText = extractTextFromContent(responseText);
-
-            // If bridge returned empty, fall back to lightweight agent
-            if (!responseText || !responseText.trim()) {
-              console.warn(
-                "[contract] Cron bridge returned empty — falling back to lightweight agent",
-              );
-              try {
-                responseText = await agent.chat(message, actorId, Date.now() + 30000);
-              } catch (agentErr) {
-                responseText =
-                  "I couldn't process this scheduled task. Please check the configuration.";
-                console.error(
-                  `[contract] Cron lightweight agent fallback error: ${agentErr.message}`,
-                );
-              }
-            }
+            // Serialized with chat messages to prevent WebSocket races.
+            reply = await runCronTurn(message, budget.deadline);
           } finally {
             activeTaskCount = Math.max(0, activeTaskCount - 1);
           }
@@ -2454,7 +2672,7 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
-              response: responseText,
+              ...reply,
               userId: currentUserId,
               sessionId: payload.sessionId || null,
             }),
