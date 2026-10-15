@@ -200,6 +200,37 @@ for (const [label, subagent, expected] of [
   });
 }
 
+function chunkModels(frames) {
+  return frames.flatMap((frame) => String(frame).split("\n"))
+    .filter((line) => line.startsWith("data: {"))
+    .map((line) => JSON.parse(line.slice(6)).model).filter((value) => value !== undefined);
+}
+
+for (const [label, subagent, requested] of [
+  ["main turn", false, "bedrock-agentcore"], ["sub-agent turn", true, "bedrock-agentcore-subagent"],
+]) {
+  test(`${label} chunks report the requested model name, so OpenClaw sees no route change`, async () => {
+    const defaults = proxyModelDefaults({});
+    const app = streaming(() => reply(), { subagent, mainModel: defaults.MODEL_ID,
+      subagentModel: defaults.SUBAGENT_BEDROCK_MODEL_ID });
+    await app.invoke();
+    const models = chunkModels(app.frames);
+    assert.ok(models.length > 0);
+    assert.deepEqual([...new Set(models)], [requested]);
+  });
+}
+
+test("chunks after a fallback report the fallback Bedrock model", async () => {
+  const app = streaming((_input, ordinal) => {
+    if (ordinal === 1) throw Object.assign(new Error("service unavailable"), {
+      name: "ServiceUnavailableException", $metadata: { httpStatusCode: 503, attempts: 1 },
+    });
+    return reply();
+  });
+  await app.invoke();
+  assert.deepEqual([...new Set(chunkModels(app.frames))], [policy.FALLBACK_MODEL_ID]);
+});
+
 test("a Haiku 5.5 main-model override still sends disabled thinking", async () => {
   const app = streaming(() => reply(), { mainModel: "global.anthropic.claude-haiku-5-5" });
   assert.equal(await app.invoke(), "answer");

@@ -1174,6 +1174,11 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
     return params;
   };
   let params = requestParams(modelId);
+  // OpenClaw treats a response model that differs from the requested name as a
+  // model-route change and passes a notice on to the user. Report the requested
+  // name (e.g. the sub-agent alias) unless this route fell back to another model.
+  const reportedModel = () =>
+    (route && modelId !== route.modelId(0) ? modelId : model || MODEL_ID);
 
   const chatId = `chatcmpl-${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1234,7 +1239,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
             id: chatId,
             object: "chat.completion.chunk",
             created,
-            model: route ? modelId : model || MODEL_ID,
+            model: reportedModel(),
             choices: [
               {
                 index: 0,
@@ -1281,7 +1286,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
             id: chatId,
             object: "chat.completion.chunk",
             created,
-            model: route ? modelId : model || MODEL_ID,
+            model: reportedModel(),
             choices: [
               {
                 index: 0,
@@ -1331,7 +1336,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
         id: chatId,
         object: "chat.completion.chunk",
         created,
-        model: route ? modelId : model || MODEL_ID,
+        model: reportedModel(),
         choices: [
           {
             index: 0,
