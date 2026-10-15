@@ -73,6 +73,26 @@ node {baseDir}/presign.js <user_id> <filename> [expires_in_seconds]
 
 **Important**: Always use this tool to generate presigned URLs. Do NOT use `aws s3 presign` CLI — it may produce SigV2 signatures that fail on KMS-encrypted buckets.
 
+### download_user_file
+
+Copy a file (including binary files such as ZIP archives) from the user's storage into the local sandbox as raw bytes. Prints the local path. Does not extract archives.
+
+```bash
+node {baseDir}/download.js <user_id> <filename> [output_dir]
+```
+
+- `user_id` (required): The user's unique identifier
+- `filename` (required): The file name, e.g. `_uploads/doc_1700000000_ab12cd34.zip`
+- `output_dir` (optional): Absolute directory to write into (default: `/tmp/openclaw-uploads/<user_id>/`)
+- Files larger than 25 MB are refused.
+
+## Files the user sends in chat
+
+When a user sends a Markdown (`.md`) file or a ZIP (`.zip`) archive, the router stores it under `_uploads/` in the user's storage and the message tells you the exact filename (e.g. `_uploads/doc_1700000000_ab12cd34.md`). Use that filename as-is with read_user_file, download_user_file or presign_user_file.
+
+- Markdown: small files are already inlined in the message; use read_user_file for the full text of a truncated one.
+- ZIP: the message includes a listing from the archive's central directory and flags unsafe entries. To work with the contents, download_user_file the archive and extract it in the sandbox (for example with Python's `zipfile`), skipping entries flagged UNSAFE PATH or SYMLINK and checking sizes as you extract.
+
 ## From Agent Chat
 
 - "Save my preferences" -> write_user_file with the user's preferences
