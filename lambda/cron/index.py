@@ -31,6 +31,11 @@ FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
+AGENTCORE_READ_TIMEOUT_SECONDS = max(LAMBDA_TIMEOUT_SECONDS - 30, 60)
+# Time kept back from the cron turn's budget so the Lambda can still send the
+# fixed failure notice after the contract gives up.
+CALLER_BUDGET_MARGIN_SECONDS = 20
+CALLER_BUDGET_MAX_MS = 900_000
 USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
 
 # --- Clients ---
@@ -40,7 +45,7 @@ agentcore_client = boto3.client(
     "bedrock-agentcore",
     region_name=AWS_REGION,
     config=Config(
-        read_timeout=max(LAMBDA_TIMEOUT_SECONDS - 30, 60),
+        read_timeout=AGENTCORE_READ_TIMEOUT_SECONDS,
         connect_timeout=10,
         retries={"max_attempts": 0},
     ),
@@ -221,7 +226,20 @@ def resolve_current_user_id(actor_id):
 # AgentCore invocation helpers
 # ---------------------------------------------------------------------------
 
-def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=None):
+def _caller_budget_ms(deadline):
+    """Milliseconds the contract may spend on a cron turn, measured from now.
+
+    Bounded by the Lambda deadline and by the client read timeout (which
+    starts at the invoke), less a margin for the failure notice, and clamped
+    to the 1..900000 range the contract accepts.
+    """
+    now = time.monotonic()
+    wait_s = min(deadline - now, AGENTCORE_READ_TIMEOUT_SECONDS)
+    budget_ms = int((wait_s - CALLER_BUDGET_MARGIN_SECONDS) * 1000)
+    return max(1, min(CALLER_BUDGET_MAX_MS, budget_ms))
+
+
+def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=None, deadline=None):
     """Invoke AgentCore Runtime with the given action."""
     payload_dict = {
         "action": action,
@@ -231,6 +249,12 @@ def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=Non
     }
     if message:
         payload_dict["message"] = message
+    if action == "cron":
+        # Tell the contract how long this Lambda will wait for the reply, so a
+        # turn queued behind another brief gives up before the Lambda does.
+        if deadline is None:
+            deadline = time.monotonic() + LAMBDA_TIMEOUT_SECONDS
+        payload_dict["callerBudgetMs"] = _caller_budget_ms(deadline)
 
     payload = json.dumps(payload_dict).encode()
 
@@ -980,7 +1004,8 @@ def handler(event, context):
 
     # Phase 3: Execute the cron message
     cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"
-    result = invoke_agentcore(session_id, "cron", current_user_id, actor_id, channel, cron_message)
+    result = invoke_agentcore(session_id, "cron", current_user_id, actor_id, channel, cron_message,
+                              deadline=lambda_deadline)
     if _cron_run_failed(result):
         status = result.get("status") if isinstance(result, dict) else None
         logger.warning("Scheduled task %s did not complete: status=%s", schedule_id, status)

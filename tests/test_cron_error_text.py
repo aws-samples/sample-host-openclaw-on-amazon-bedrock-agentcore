@@ -76,14 +76,14 @@ def test_successful_run_is_delivered_unchanged():
     deliver.assert_called_once_with("telegram", "123", "Here is your brief.")
 
 
-def test_cron_payload_has_no_v2_only_fields():
-    """callerBudgetMs is a V2 contract field; the V1 contract does not read it."""
+def test_cron_payload_carries_only_v1_fields_and_the_caller_budget():
+    """The V1 contract reads callerBudgetMs (see test_cron_caller_budget.py); no other V2 fields."""
     module = load_cron_lambda()
     module.agentcore_client = FakeRuntime([READY, {"response": "ok"}])
     with patch.object(module, "deliver_response"):
         module.handler(cron_event(), None)
     cron_payload = json.loads(module.agentcore_client.calls[1]["payload"])
-    assert set(cron_payload) == {"action", "userId", "actorId", "channel", "message"}
+    assert set(cron_payload) == {"action", "userId", "actorId", "channel", "message", "callerBudgetMs"}
 
 
 def test_cron_lambda_never_async_retries_a_brief(tmp_path):
