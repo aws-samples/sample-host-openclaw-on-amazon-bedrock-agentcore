@@ -52,7 +52,7 @@ To update an existing V1 deployment, pull `release/v1` and run `./scripts/deploy
 
 What the platform and the code change, as documented:
 
-- **Startup.** V2 prepares a user-neutral OpenClaw gateway once and restores that snapshot for each new session, so new users start from a consistent prepared state ([AWS: platform versions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions)). V1 starts the container per session and covers the startup with the lightweight warm-up agent.
+- **Startup.** V2 prepares the contract server and proxy once and restores that snapshot for each new session; the OpenClaw gateway starts after the restore so it gets fresh entropy ([AWS: platform versions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions)). V1 starts the container per session and covers the startup with the lightweight warm-up agent.
 - **No warm-up shim on V2.** On V2 the first message of a session waits for `USER_READY`: state restore, scoped credentials, gateway and Browser readiness. For a user with saved state, the first reply after a cold start therefore comes later than V1's warm-up reply, which answers before OpenClaw is ready but with a reduced tool set.
 - **Warm sessions.** Once OpenClaw is running, both branches run OpenClaw `2026.9.5` behind the same Bedrock proxy, so warm replies are expected to be similar. Reply time then depends mostly on the model, and the default primary models differ (see the table above).
 - **Storage.** Both keep the OpenClaw state dir on local disk, mirrored to per-session storage and backed up to S3 ([state storage](session-storage.md)).

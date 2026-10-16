@@ -246,9 +246,11 @@ async function commonBootstrap() {
   await proxySdkOwner.prepare();
   v2Lifecycle.checkpoint();
   assertUnboundResourcesAbsent();
+  // Default: starts no gateway, so no OpenClaw key or ID is created before the snapshot.
   await preparedGateway.prepare();
   v2Lifecycle.checkpoint();
   assertUnboundResourcesAbsent(preparedGateway.prepared);
+  console.log(`[contract] gateway_seed=${preparedGateway.sharedSeedEnabled === true ? "unsafe_shared" : "off"}`);
   console.log(`[contract] preparation elapsedMs=${Date.now() - preparationStarted}`);
   console.log("[contract] BOOTSTRAP_READY platform=V2 openclaw=2026.9.5");
 }

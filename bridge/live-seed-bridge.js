@@ -10,6 +10,14 @@
  * unused inventory has been removed. A successful bind is recorded before
  * later checks so cleanup cannot discard adopted state if those checks fail.
  * Stop remains terminal even while token lookup or owner creation is pending.
+ *
+ * The seed is OFF by default. A process started before the Runtime V2 snapshot
+ * replays the same RNG state (Node's randomUUID cache, OpenSSL DRBG) in every
+ * restored microVM, so a seed bound to a new user would give every user the
+ * same OpenClaw device Ed25519 key and the same boot, session and event IDs.
+ * By default bootstrap starts no gateway at all, and every user's gateway is
+ * spawned after the restore. OPENCLAW_UNSAFE_SHARED_SEED=1 restores the old
+ * pre-snapshot seed for benchmarking only; see docs/runtime-v2.md.
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -46,6 +54,7 @@ function createLiveSeedBridge({
   const seedEnv = neutralValues(neutralEnv);
   let phase = "new", owner, cold, seed, common, bound, activationEnv, closing;
   let stopped = false, stopReason;
+  const sharedSeedEnabled = env.OPENCLAW_UNSAFE_SHARED_SEED === "1";
   const checkRunning = () => {
     if (stopped) throw Object.assign(new Error("Live seed was stopped"), { code: "LIVE_SEED_STOPPED" });
   };
@@ -129,6 +138,11 @@ function createLiveSeedBridge({
   async function prepare() {
     checkRunning();
     if (phase !== "new") throw new Error("Live seed preparation was already attempted");
+    if (!sharedSeedEnabled) {
+      // Start nothing before the snapshot: the gateway is spawned per user after restore.
+      phase = "deferred";
+      return { status: "deferred" };
+    }
     phase = "preparing";
     if ((env.AGENTCORE_GATEWAY_URL || "").trim()) return prepareCold();
     const token = await readToken();
@@ -168,7 +182,7 @@ function createLiveSeedBridge({
     scope.checkpoint();
     checkRunning();
     if (cold) return { status: "cold" };
-    if (phase !== "prepared") throw new Error("Live seed is not prepared");
+    if (phase !== "prepared" && phase !== "deferred") throw new Error("Live seed is not prepared");
     const current = lifecycle.snapshot();
     const binding = current.binding;
     if (!binding || current.generation !== scope.generation) throw new Error("Live seed binding mismatch");
@@ -187,6 +201,10 @@ function createLiveSeedBridge({
     let expected;
     try {
       check();
+      if (phase === "deferred") {
+        report(onPhase, "seed_ineligible", { reason: "disabled" });
+        return await prepareCold(check, onPhase);
+      }
       expected = render(token);
       let eligible = !(env.AGENTCORE_GATEWAY_URL || "").trim() && token &&
         isDeepStrictEqual(expected, common) && isDeepStrictEqual(neutralValues(boundEnv), seedEnv);
@@ -269,6 +287,7 @@ function createLiveSeedBridge({
       }) : null;
     },
     get prepared() { return phase === "prepared"; },
+    get sharedSeedEnabled() { return sharedSeedEnabled; },
     get adopted() { return phase === "adopted"; },
   };
 }
