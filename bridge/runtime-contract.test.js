@@ -187,7 +187,11 @@ function loadContract(t, {
           get prepared() { return false; },
           prepare: () => cold.prepare(),
           activate: (input) => cold.activate(input),
-          restoreForBinding: async () => ({ adopted: false }),
+          restoreForBinding: async (input) => {
+            input.onPhase?.("cold_prepare_start");
+            input.onPhase?.("seed_ineligible", { reason: "bad value\n[contract] forged" });
+            return { adopted: false };
+          },
           stop: async () => cold.stop(),
         };
       },
@@ -763,6 +767,26 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   ]);
   phases.forEach((phase, index) => {
     assert.equal(phase[3], activation.generation);
+    if (index) assert.ok(Number(phase[2]) >= Number(phases[index - 1][2]));
+  });
+});
+
+test("cold activation logs every phase in order with monotonic elapsed times", async (t) => {
+  const app = loadContract(t);
+  await tick();
+  const result = await app.request({ ...owner, action: "chat", message: "hello" });
+  assert.equal(result.body.phase, "USER_READY", app.errors.join("\n"));
+  const phases = app.logs.map((line) => line.match(
+    /^\[contract\] ([a-z_]+) elapsedMs=(\d+) generation=(\S+)((?: [a-z_]+=[\w.:-]+)*)$/,
+  )).filter(Boolean);
+  assert.deepEqual(phases.map((phase) => phase[1] + phase[4]), [
+    "credentials_ready", "cold_prepare_start", "seed_ineligible reason=bad_value__contract__forged",
+    "gateway_prepared path=cold", "session_storage_ready available=false", "restore_start", "restore_ready",
+    "config_skills_ready", "gateway_activate_start", "gateway_activated", "proxy_ready", "gateway_ready",
+    "browser_ready", "user_ready",
+  ]);
+  assert.ok(!app.logs.some((line) => /\n/.test(line)));
+  phases.forEach((phase, index) => {
     if (index) assert.ok(Number(phase[2]) >= Number(phases[index - 1][2]));
   });
 });

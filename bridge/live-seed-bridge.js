@@ -102,19 +102,25 @@ function createLiveSeedBridge({
     if (cold) return cold.stop();
     return retireOwner(stopReason);
   }
-  async function prepareCold(check = () => {}) {
+  // Phase telemetry must never interrupt activation.
+  const report = (onPhase, name, details) => { try { onPhase?.(name, details); } catch {} };
+  async function prepareCold(check = () => {}, onPhase) {
     checkRunning();
     if (bound) throw new Error("A bound live seed cannot fall back");
     if (owner) {
+      report(onPhase, "seed_stop_start");
       const retired = await retireOwner("discard");
       checkRunning();
       if (retired.seedInventoryRemoved !== true) throw new Error("Unused live seed state remains");
+      report(onPhase, "seed_stopped");
     }
     check();
     checkRunning();
+    report(onPhase, "cold_prepare_start");
     cold = createCold();
     await cold.prepare();
     checkRunning();
+    report(onPhase, "cold_prepare_ack");
     check();
     phase = "cold";
     common = null;
@@ -158,7 +164,7 @@ function createLiveSeedBridge({
       throw error;
     }
   }
-  async function restoreForBinding({ lifecycle, scope, namespace, channel, token, boundEnv, waitMs }) {
+  async function restoreForBinding({ lifecycle, scope, namespace, channel, token, boundEnv, waitMs, onPhase }) {
     scope.checkpoint();
     checkRunning();
     if (cold) return { status: "cold" };
@@ -192,7 +198,11 @@ function createLiveSeedBridge({
         }
       }
       if (eligible && inspectLocalEligibility() !== true) eligible = false;
-      if (!eligible) return await prepareCold(check);
+      if (!eligible) {
+        report(onPhase, "seed_ineligible", { reason: "bridge_check" });
+        return await prepareCold(check, onPhase);
+      }
+      report(onPhase, "seed_restore_start");
       let result;
       const restore = workspaceSync.restoreAbsentSeed(namespace, {
         lifecycle, scope,
@@ -224,7 +234,10 @@ function createLiveSeedBridge({
       await workspaceSync.awaitRestore(restore, waitMs);
       check();
       if (result?.status === "ineligible") {
-        return await prepareCold(check);
+        const reason = typeof result.reason === "string" && /^[a-z_]{1,64}$/.test(result.reason)
+          ? result.reason : "unknown";
+        report(onPhase, "seed_ineligible", { reason });
+        return await prepareCold(check, onPhase);
       }
       if (result?.status !== "adopted" || !bound) throw new Error("Live seed restore did not commit");
       workspaceSync.assertRestoreReady();
