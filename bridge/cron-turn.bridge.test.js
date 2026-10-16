@@ -245,6 +245,6 @@ test("the cron handler validates callerBudgetMs, runs runCronTurn and has no lig
   assert.doesNotMatch(branch, /agent\.chat\(/, "no shim fallback on cron turns");
   assert.match(branch, /cronCallerDeadline\(requestArrival, payload\.callerBudgetMs\)/);
   assert.match(branch, /writeHead\(400[\s\S]*Invalid callerBudgetMs/);
-  assert.match(branch, /runCronTurn\(message, budget\.deadline\)/);
+  assert.match(branch, /runCronTurn\(message, budget\.deadline, \(\) => setTurnTrigger\("cron"\)\)/);
   assert.ok(branch.indexOf("cronCallerDeadline(") < branch.indexOf("await init("), "budget is checked before init");
 });

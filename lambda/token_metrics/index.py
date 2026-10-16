@@ -3,7 +3,8 @@
 Triggered by CloudWatch Logs subscription filter on /aws/bedrock/invocation-logs.
 For each invocation log entry:
   1. Extracts token counts (input/output), model ID
-  2. Extracts OpenClaw metadata (actor_id, session_id, channel) from request metadata
+  2. Extracts OpenClaw metadata (actor_id, session_id, channel, agent_type) from
+     the requestMetadata the bridge proxy sets on every Converse/ConverseStream call
   3. Computes estimated cost using model pricing lookup
   4. Writes record to DynamoDB with composite keys for multi-access patterns
   5. Publishes CloudWatch custom metrics with dimensions
@@ -14,6 +15,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -146,56 +148,80 @@ def _int_field(source, *names) -> int:
     return 0
 
 
-def extract_openclaw_metadata(log_entry: dict) -> dict:
-    """Extract OpenClaw metadata (actor_id, session_id, channel) from the log entry.
+# Attribution values become DynamoDB key parts and CloudWatch dimensions, so
+# only short identifier strings are accepted; anything else keeps the default.
+_SAFE_VALUE = re.compile(r"^[A-Za-z0-9:_@$#=/+,.-]{1,128}$")
+_SAFE_CHANNEL = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+AGENT_TYPES = ("main", "subagent", "cron")
+UNKNOWN_AGENT_TYPE = "unknown"
+UNBOUND_ACTOR = "default-user"
 
-    Bedrock invocation logs may contain request metadata or we can correlate
-    via X-Ray trace IDs. Supports both direct Bedrock and AgentCore log formats.
+
+def _clean(value, pattern=_SAFE_VALUE):
+    return value if isinstance(value, str) and pattern.match(value) else None
+
+
+def _as_dict(value) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def extract_openclaw_metadata(log_entry: dict) -> dict:
+    """Extract OpenClaw attribution (actor, session, channel, agent type) from a log entry.
+
+    The bridge proxy sets Bedrock ``requestMetadata`` on every Converse /
+    ConverseStream call (bridge/request-metadata.js) and Bedrock copies it into
+    the invocation log record. That is the authoritative source. Records
+    written before the proxy set it, or by any other caller, have none and keep
+    the explicit defaults: default-user / default-session / unknown, with
+    agent type "unknown". The older AgentCore-shaped fields are still read, but
+    only to fill values requestMetadata does not provide.
     """
     metadata = {
-        "actor_id": "default-user",
+        "actor_id": UNBOUND_ACTOR,
         "session_id": "default-session",
         "channel": "unknown",
+        "agent_type": UNKNOWN_AGENT_TYPE,
+        "attribution": "none",
     }
 
-    # Try to extract from request metadata or headers
-    request_metadata = log_entry.get("requestMetadata", {})
-    if request_metadata:
-        metadata["actor_id"] = request_metadata.get("openclaw.actor_id", metadata["actor_id"])
-        metadata["session_id"] = request_metadata.get("openclaw.session_id", metadata["session_id"])
-        metadata["channel"] = request_metadata.get("openclaw.channel", metadata["channel"])
+    def fill(actor=None, session=None, channel=None):
+        if _clean(actor):
+            metadata["actor_id"] = actor
+        if _clean(session):
+            metadata["session_id"] = session
+        if _clean(channel, _SAFE_CHANNEL):
+            metadata["channel"] = channel
 
-    # AgentCore logs: extract from sessionState.promptSessionAttributes
-    session_state = log_entry.get("sessionState", {})
-    prompt_attrs = session_state.get("promptSessionAttributes", {})
+    # Legacy shapes first, so requestMetadata below overrides them.
+    prompt_attrs = _as_dict(_as_dict(log_entry.get("sessionState")).get("promptSessionAttributes"))
     if prompt_attrs:
-        metadata["actor_id"] = prompt_attrs.get("actor_id", metadata["actor_id"])
-        metadata["channel"] = prompt_attrs.get("channel", metadata["channel"])
-
-    # AgentCore logs: extract session ID from top-level field
+        fill(prompt_attrs.get("actor_id"), None, prompt_attrs.get("channel"))
+        metadata["attribution"] = "legacy"
     if log_entry.get("sessionId"):
-        metadata["session_id"] = log_entry["sessionId"]
-
-    # AgentCore logs: extract from agentRuntime metadata
-    runtime_metadata = log_entry.get("agentRuntimeMetadata", {})
+        fill(session=log_entry.get("sessionId"))
+        metadata["attribution"] = "legacy"
+    runtime_metadata = _as_dict(log_entry.get("agentRuntimeMetadata"))
     if runtime_metadata:
-        metadata["actor_id"] = runtime_metadata.get("actorId", metadata["actor_id"])
-        metadata["session_id"] = runtime_metadata.get("sessionId", metadata["session_id"])
-
-    # Also check the input body for custom attributes
-    input_body = log_entry.get("input", {})
-    if isinstance(input_body, str):
-        try:
-            input_body = json.loads(input_body)
-        except (json.JSONDecodeError, TypeError):
-            input_body = {}
-
-    # Some models embed metadata in the request
-    custom_attrs = input_body.get("metadata", {})
+        fill(runtime_metadata.get("actorId"), runtime_metadata.get("sessionId"))
+        metadata["attribution"] = "legacy"
+    custom_attrs = _as_dict(_as_dict(log_entry.get("input")).get("metadata"))
     if custom_attrs:
-        metadata["actor_id"] = custom_attrs.get("actor_id", metadata["actor_id"])
-        metadata["session_id"] = custom_attrs.get("session_id", metadata["session_id"])
-        metadata["channel"] = custom_attrs.get("channel", metadata["channel"])
+        fill(custom_attrs.get("actor_id"), custom_attrs.get("session_id"), custom_attrs.get("channel"))
+        metadata["attribution"] = "legacy"
+
+    request_metadata = _as_dict(log_entry.get("requestMetadata"))
+    if request_metadata.get("openclaw.actor_id") is not None:
+        fill(request_metadata.get("openclaw.actor_id"),
+             request_metadata.get("openclaw.session_id"),
+             request_metadata.get("openclaw.channel"))
+        agent_type = request_metadata.get("openclaw.agent_type")
+        metadata["agent_type"] = agent_type if agent_type in AGENT_TYPES else UNKNOWN_AGENT_TYPE
+        metadata["attribution"] = "request-metadata"
 
     return metadata
 
@@ -203,7 +229,10 @@ def extract_openclaw_metadata(log_entry: dict) -> dict:
 def write_to_dynamodb(record: dict):
     """Accumulate a token usage record into its DynamoDB row.
 
-    One row per user/day/channel/session holds running totals. The first
+    One row per user/day/channel/session holds running totals; a record with a
+    known agent type (main / subagent / cron) gets its own row per agent type,
+    so a record without one (written before the proxy set requestMetadata)
+    keeps accumulating into the pre-existing row with the old sort key. The first
     update ADDs tokens and cost atomically and returns the new cost total;
     the second sets GSI3SK from that total, conditional on the total being
     unchanged, so a concurrent writer that added more cost (and will set
@@ -214,15 +243,16 @@ def write_to_dynamodb(record: dict):
     channel = record["channel"]
     model_id = record["model_id"]
     date_str = record["date"]
+    agent_type = record.get("agent_type", UNKNOWN_AGENT_TYPE)
     cost = Decimal(str(record["estimated_cost_usd"])).quantize(COST_QUANTUM)
 
     # TTL: current time + TTL_DAYS
     ttl = int(time.time()) + (TTL_DAYS * 86400)
 
-    key = {
-        "PK": f"USER#{actor_id}",
-        "SK": f"DATE#{date_str}#CHANNEL#{channel}#SESSION#{session_id}",
-    }
+    sort_key = f"DATE#{date_str}#CHANNEL#{channel}#SESSION#{session_id}"
+    if agent_type in AGENT_TYPES:
+        sort_key += f"#AGENT#{agent_type}"
+    key = {"PK": f"USER#{actor_id}", "SK": sort_key}
 
     response = table.update_item(
         Key=key,
@@ -234,6 +264,7 @@ def write_to_dynamodb(record: dict):
             "GSI3PK = :g3pk, GSI3SK = if_not_exists(GSI3SK, :g3sk), "
             "channel = :channel, modelId = :model, "
             "actorId = :actor, sessionId = :session, "
+            "agentType = :agent, attribution = :attribution, "
             "#ts = :ts, #ttl_attr = :ttl "
             "ADD inputTokens :inp, outputTokens :out, "
             "totalTokens :total, invocationCount :one, "
@@ -257,6 +288,8 @@ def write_to_dynamodb(record: dict):
             ":model": model_id,
             ":actor": actor_id,
             ":session": session_id,
+            ":agent": agent_type,
+            ":attribution": record.get("attribution", "none"),
             ":ts": record["timestamp"],
             ":ttl": ttl,
             ":inp": record["input_tokens"],
@@ -395,6 +428,8 @@ def process_log_entry(log_entry: dict):
         "actor_id": metadata["actor_id"],
         "session_id": metadata["session_id"],
         "channel": metadata["channel"],
+        "agent_type": metadata["agent_type"],
+        "attribution": metadata["attribution"],
         "model_id": model_id,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -407,13 +442,16 @@ def process_log_entry(log_entry: dict):
     }
 
     logger.info(
-        "Processing invocation: model=%s input=%d output=%d cost=$%.6f actor=%s channel=%s",
+        "Processing invocation: model=%s input=%d output=%d cost=$%.6f actor=%s channel=%s "
+        "agent=%s attribution=%s",
         model_id,
         input_tokens,
         output_tokens,
         cost,
         metadata["actor_id"],
         metadata["channel"],
+        metadata["agent_type"],
+        metadata["attribution"],
     )
 
     write_to_dynamodb(record)
