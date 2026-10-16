@@ -607,21 +607,167 @@ async function restoreWorkspace(namespace, { overwrite = true } = {}) {
   }
 }
 
+// --- restore downloads: bounded parallelism + retry -------------------------
+//
+// The restore used to GET one object at a time: ~8-10 files/s, so a
+// 1,000-1,350 file state dir (the live user) spent 100-160 s in the restore on
+// every cold start, on V1 and V2 alike (round-9 perf test). The listing is
+// still read in full first (and validated exactly as before); then the
+// downloads run through a pool of at most `concurrency` GetObjects in flight.
+//
+// What does NOT change:
+//   - Each file is still streamed to a unique temp name next to its target,
+//     sha256-verified against the object metadata, SQLite-validated, and only
+//     then renamed into place (writeRestoredObject). Gzip/multipart SQLite
+//     objects and legacy uncompressed objects are decoded exactly as before.
+//   - A file that cannot be restored still counts as failed and fails the
+//     whole restore; the upload gate opens ("ready") only after EVERY worker
+//     has settled with zero failures, and the contract does not start the
+//     gateway before that (awaitRestore + assertRestoreReady). The order in
+//     which files land on disk is therefore invisible to OpenClaw: nothing
+//     reads the state dir until the restore as a whole has succeeded. SQLite
+//     -wal/-shm/-journal sidecars are never restored (SKIP_PATTERNS), so there
+//     is no db/sidecar pairing to order.
+//   - Missing-only mode (`overwrite: false`) decides keep-vs-download in the
+//     listing pass, before any download starts.
+//   - An abort (restore deadline, owner change) stops every worker: no new
+//     GET starts, in-flight streams are torn down by the abort signal, and a
+//     download that finishes anyway is not renamed into place
+//     (assertRestoreActive() runs after the stream completes; from there to
+//     the rename everything is synchronous).
+//
+// Retries: the SDK already retries a failed GetObject *request*; a stream that
+// breaks mid-body (connection reset, premature close) or an SDK give-up on
+// throttling/5xx is retried here, per file, with capped exponential backoff and
+// full jitter. Anything else (403, sha256 mismatch, invalid SQLite, size cap)
+// fails the file at once.
+const DEFAULT_RESTORE_CONCURRENCY = 16;
+const MAX_RESTORE_CONCURRENCY = 64;
+
+function parseRestoreConcurrency(raw) {
+  if (raw === undefined || raw === "") return DEFAULT_RESTORE_CONCURRENCY;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    console.warn(
+      "[workspace-sync] Ignoring invalid WORKSPACE_RESTORE_CONCURRENCY=%s — using %d",
+      String(raw).slice(0, 32), DEFAULT_RESTORE_CONCURRENCY,
+    );
+    return DEFAULT_RESTORE_CONCURRENCY;
+  }
+  return Math.min(n, MAX_RESTORE_CONCURRENCY);
+}
+
+const _restoreTuning = {
+  concurrency: parseRestoreConcurrency(process.env.WORKSPACE_RESTORE_CONCURRENCY),
+  retries: 3, // extra attempts per file after the first
+  baseDelayMs: 250,
+  maxDelayMs: 4000,
+};
+
+const RETRYABLE_ERROR_NAMES = new Set([
+  "SlowDown", "Throttling", "ThrottlingException", "TooManyRequestsException",
+  "RequestLimitExceeded", "RequestTimeout", "RequestTimeoutException", "TimeoutError",
+  "InternalError", "ServiceUnavailable",
+]);
+const RETRYABLE_ERROR_CODES = new Set([
+  "ECONNRESET", "ETIMEDOUT", "EPIPE", "ECONNREFUSED", "EAI_AGAIN",
+  "ERR_STREAM_PREMATURE_CLOSE", "UND_ERR_SOCKET",
+]);
+
+/** Throttling, 5xx and transient network errors; never an abort. */
+function isRetryableRestoreError(err) {
+  if (!err || err.name === "AbortError") return false;
+  if (err.$retryable) return true;
+  const status = err.$metadata?.httpStatusCode;
+  if (status === 429 || (Number.isInteger(status) && status >= 500 && status <= 599)) return true;
+  return RETRYABLE_ERROR_NAMES.has(err.name) || RETRYABLE_ERROR_NAMES.has(err.Code) ||
+    RETRYABLE_ERROR_CODES.has(err.code);
+}
+
+function restoreBackoffMs(retry) {
+  const cap = Math.min(_restoreTuning.maxDelayMs, _restoreTuning.baseDelayMs * 2 ** retry);
+  return Math.floor(Math.random() * cap); // full jitter
+}
+
+function abortableSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(signal.reason); return; }
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function restoreAborted(attempt) {
+  return Boolean(attempt.error || _fatalRestoreError || attempt.controller.signal.aborted);
+}
+
+/** GET one object into place, retrying transient failures. */
+async function downloadRestoreObject(s3, item, attempt, stats) {
+  for (let retry = 0; ; retry++) {
+    assertRestoreActive(attempt);
+    try {
+      fs.mkdirSync(path.dirname(item.localFile), { recursive: true });
+      const getResp = await s3.send(
+        new (getS3Sdk().GetObjectCommand)({ Bucket: BUCKET, Key: item.key }),
+        { abortSignal: attempt.controller.signal },
+      );
+      assertRestoreActive(attempt);
+      return await writeRestoredObject(getResp, item.localFile, attempt);
+    } catch (err) {
+      if (restoreAborted(attempt) || retry >= _restoreTuning.retries || !isRetryableRestoreError(err)) throw err;
+      stats.retries++;
+      const delay = restoreBackoffMs(retry);
+      console.warn(
+        "[workspace-sync] Retrying restore of %s in %d ms (attempt %d of %d): %s",
+        item.relativePath, delay, retry + 2, _restoreTuning.retries + 1, err.name || err.code || "error",
+      );
+      await abortableSleep(delay, attempt.controller.signal);
+    }
+  }
+}
+
+/**
+ * Run `fn` over `items` with at most `limit` in flight. Resolves only once
+ * every started call has settled; rejects with the first error `fn` threw
+ * (fn reports per-item failures itself and throws only to stop the pool).
+ */
+async function runBounded(items, limit, fn) {
+  let next = 0;
+  let stopError = null;
+  const worker = async () => {
+    while (!stopError && next < items.length) {
+      const item = items[next++];
+      try {
+        await fn(item);
+      } catch (err) {
+        stopError ||= err;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  if (stopError) throw stopError;
+}
+
 async function runRestore(namespace, overwrite, attempt) {
   const prefix = `${namespace}/${WORKSPACE_PREFIX}/`;
   const s3 = getS3Client();
+  const startedAt = Date.now();
+  const concurrency = _restoreTuning.concurrency;
 
   console.log(
     `[workspace-sync] Restoring workspace from s3://${BUCKET}/${prefix}` +
       (overwrite ? "" : " (missing files only — existing local files are kept)"),
   );
 
-  let totalFiles = 0;
   let failed = 0;
   let hadState = false;
   let continuationToken;
   const keptFiles = []; // { key, relativePath } — compared against S3 after the listing
+  const downloads = []; // { key, relativePath, localFile } — fetched after the listing
 
+  // Pass 1: the complete listing. Every validation and every keep-vs-download
+  // decision happens here, before any object is fetched.
   do {
     const params = {
       Bucket: BUCKET,
@@ -638,7 +784,6 @@ async function runRestore(namespace, overwrite, attempt) {
       assertRestoreActive(attempt);
       if (typeof obj.Key !== "string" || !obj.Key.startsWith(prefix)) {
         throw new Error("S3 restore returned an object outside the namespace");
-        continue;
       }
       const relativePath = obj.Key.slice(prefix.length);
       if (!relativePath || shouldSkip(relativePath)) continue;
@@ -660,7 +805,6 @@ async function runRestore(namespace, overwrite, attempt) {
       }
 
       const localFile = path.join(LOCAL_PATH, relativePath);
-      const localDir = path.dirname(localFile);
 
       // Path traversal protection: ensure resolved path stays within LOCAL_PATH
       const resolvedFile = path.resolve(localFile);
@@ -701,26 +845,7 @@ async function runRestore(namespace, overwrite, attempt) {
         continue;
       }
 
-      try {
-        fs.mkdirSync(localDir, { recursive: true });
-        const getResp = await s3.send(
-          new (getS3Sdk().GetObjectCommand)({ Bucket: BUCKET, Key: obj.Key }),
-          { abortSignal: attempt.controller.signal },
-        );
-        assertRestoreActive(attempt);
-        const hash = await writeRestoredObject(getResp, localFile, attempt);
-        // What is on disk now IS what S3 holds, so the first save after a
-        // restore must not re-upload it. Without this seed every restored file
-        // was PUT again by the first full save (SIGTERM / periodic) of the
-        // session even when nothing had touched it.
-        _uploadedHashes.set(relativePath, hash);
-        totalFiles++;
-      } catch (err) {
-        failed++;
-        console.warn(
-          `[workspace-sync] Failed to restore ${relativePath}: ${err.message}`,
-        );
-      }
+      downloads.push({ key: obj.Key, relativePath, localFile });
     }
 
     if (response.IsTruncated && (!response.NextContinuationToken || response.NextContinuationToken === continuationToken)) {
@@ -731,22 +856,52 @@ async function runRestore(namespace, overwrite, attempt) {
       : undefined;
   } while (continuationToken);
 
+  // Pass 2: the downloads, at most `concurrency` in flight.
+  let totalFiles = 0;
+  let totalBytes = 0;
+  const stats = { retries: 0 };
+  await runBounded(downloads, concurrency, async (item) => {
+    assertRestoreActive(attempt);
+    try {
+      const { digest, size } = await downloadRestoreObject(s3, item, attempt, stats);
+      // What is on disk now IS what S3 holds, so the first save after a
+      // restore must not re-upload it. Without this seed every restored file
+      // was PUT again by the first full save (SIGTERM / periodic) of the
+      // session even when nothing had touched it.
+      _uploadedHashes.set(item.relativePath, digest);
+      totalFiles++;
+      totalBytes += size;
+    } catch (err) {
+      // An abort stops the pool (and the restore); any other error fails
+      // just this file, which still fails the restore as a whole.
+      if (restoreAborted(attempt)) throw attempt.error || _fatalRestoreError || err;
+      failed++;
+      console.warn("[workspace-sync] Failed to restore %s: %s", item.relativePath, err.message);
+    }
+  });
+  assertRestoreActive(attempt);
+
   const kept = keptFiles.length;
   const keptUnchanged = kept ? await seedKeptFiles(s3, keptFiles) : 0;
   assertRestoreActive(attempt);
 
+  const elapsedS = ((Date.now() - startedAt) / 1000).toFixed(1);
   console.log(
     `[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}` +
       (kept ? `, kept ${kept} existing local file(s) (${keptUnchanged} verified identical to S3)` : "") +
       (failed ? `, ${failed} failed` : "") +
-      (hadState ? "" : " (no saved state in S3 — new user)"),
+      (hadState ? "" : " (no saved state in S3 — new user)") +
+      ` — ${totalBytes} bytes, concurrency ${concurrency}, ${elapsedS} s, ${stats.retries} retries`,
   );
   return { restored: totalFiles, kept, keptUnchanged, failed, hadState };
 }
 
+// Distinguishes the temp files of concurrent downloads (and of retries).
+let _restoreTmpSeq = 0;
+
 /**
- * Stream one GetObject response to `localFile` and return the sha256 of the
- * bytes written. A gzip snapshot (UPLOAD_ENCODING_METADATA_KEY / the
+ * Stream one GetObject response to `localFile` and return the sha256 and size
+ * of the bytes written. A gzip snapshot (UPLOAD_ENCODING_METADATA_KEY / the
  * ContentEncoding header — see uploadCompressedFile) is decompressed on the
  * way; objects written before compression existed have neither marker and are
  * copied as-is, so they keep restoring. Nothing is buffered whole: a 299 MB
@@ -755,13 +910,15 @@ async function runRestore(namespace, overwrite, attempt) {
  * sha256 (every upload since #115) it must match the bytes written or the
  * restore of this file fails — a torn or mis-decoded download must never be
  * handed to the gateway as its state.
+ *
+ * @returns {Promise<{ digest: string, size: number }>}
  */
 async function writeRestoredObject(getResp, localFile, attempt) {
   const meta = getResp.Metadata || {};
   const gzipped =
     getResp.ContentEncoding === GZIP_ENCODING || meta[UPLOAD_ENCODING_METADATA_KEY] === GZIP_ENCODING;
   const expected = meta[UPLOAD_HASH_METADATA_KEY];
-  const tmpFile = `${localFile}.tmp-${Date.now()}`;
+  const tmpFile = `${localFile}.tmp-${process.pid}-${++_restoreTmpSeq}`;
   const hash = crypto.createHash("sha256");
   let size = 0;
   const stages = [getResp.Body];
@@ -787,7 +944,7 @@ async function writeRestoredObject(getResp, localFile, attempt) {
     if (localFile.endsWith(SQLITE_EXT)) stateStorage.assertSqliteFile(tmpFile);
     stateStorage.assertSafePath(LOCAL_PATH, localFile);
     fs.renameSync(tmpFile, localFile);
-    return digest;
+    return { digest, size };
   } finally {
     removeSnapshotFile(tmpFile);
   }
@@ -1760,4 +1917,11 @@ module.exports = {
   // Tests shrink the size thresholds so the large-file paths run on small
   // fixtures; production values come from the constants above / the env.
   _setLimitsForTests: (overrides) => Object.assign(_limits, overrides),
+  // Tests pin the restore concurrency / retry backoff; production values come
+  // from WORKSPACE_RESTORE_CONCURRENCY and the constants above.
+  _setRestoreTuningForTests: (overrides) => Object.assign(_restoreTuning, overrides),
+  getRestoreTuning: () => ({ ..._restoreTuning }),
+  isRetryableRestoreError,
+  DEFAULT_RESTORE_CONCURRENCY,
+  MAX_RESTORE_CONCURRENCY,
 };
