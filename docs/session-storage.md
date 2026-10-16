@@ -25,7 +25,12 @@ AgentCore Runtime supports [Managed Session Storage](https://docs.aws.amazon.com
    for that restore up to `WORKSPACE_RESTORE_WAIT_MS` (`deploy.sh` passes 180 s from the
    `workspace_restore_wait_seconds` cdk.json context; the bridge falls back to 45 s when unset). The
    wait ends as soon as the restore settles, so it only costs time when the state is large: a
-   ~1,200-file / 220 MB namespace restores in ~100-115 s with sequential GETs, and the pre-2.0
+   ~1,200-file / 220 MB namespace took ~100-115 s with sequential GETs (~8-10 files/s). The restore
+   now lists the whole prefix first, then downloads with at most `WORKSPACE_RESTORE_CONCURRENCY`
+   GetObjects in flight (default 16, max 64), retrying throttling / 5xx / broken streams per file
+   with capped exponential backoff. Every file still lands through a temp file + sha256 check +
+   rename, and a file that fails still closes the upload gate for the container. Files no longer
+   land in listing order, so the restore wait matters as before: the pre-2.0
    `sessions.json`, memory and skills sit late in the S3 listing order, so a 45 s wait would start
    the gateway before they are on disk and skip the legacy session import.
 4. S3 sync switches to **backup mode** — session storage is primary. The full save runs every 30 min
