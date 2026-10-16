@@ -153,7 +153,7 @@ test("the cold path reports each phase in order with the restore's reason", asyn
   assert.equal((await f.bridge.restoreForBinding(f.input)).status, "cold");
   assert.deepEqual(phases, [
     "seed_restore_start", 'seed_ineligible:{"reason":"namespace_content"}',
-    "seed_stop_start", "seed_stopped", "cold_prepare_start", "cold_prepare_ack",
+    "seed_stop_start", "seed_stopped", "cold_prepare_start", 'cold_prepare_ack:{"source":"fresh"}',
   ]);
 });
 
@@ -163,7 +163,7 @@ test("phase telemetry failures and unsafe reasons do not change the cold path", 
   f.workspaceSync.restoreAbsentSeed = async () => ({ status: "ineligible", reason: "Bad reason\nforged" });
   const reasons = [];
   f.input.onPhase = (name, details) => {
-    if (details) reasons.push(details.reason);
+    if (details?.reason) reasons.push(details.reason);
     throw new Error("telemetry down");
   };
   assert.equal((await f.bridge.restoreForBinding(f.input)).status, "cold");

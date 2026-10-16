@@ -26,6 +26,8 @@ function loadContract(t, {
   home = "/test-home", beforeFsOperation, proxyHealth, runtimeEnv = {},
 } = {}) {
   let handler;
+  let capturedCreateCold;
+  let capturedColdStandby;
   let restored = false;
   const calls = [];
   const errors = [];
@@ -180,7 +182,9 @@ function loadContract(t, {
       },
     },
     "./live-seed-bridge": {
-      createLiveSeedBridge({ createCold }) {
+      createLiveSeedBridge({ createCold, coldStandby }) {
+        capturedCreateCold = createCold;
+        capturedColdStandby = coldStandby;
         const cold = createCold();
         return {
           get child() { return cold.child; },
@@ -410,6 +414,7 @@ function loadContract(t, {
   }
   return {
     request, calls, files, children, errors, logs, preparations, activations, remoteBrowserStatus,
+    createCold: (options) => capturedCreateCold(options), coldStandby: () => capturedColdStandby,
     gatewayEnv: () => vm.runInContext('openclawEnvFor("u1")', context),
     shutdown: () => processHandlers.SIGTERM(),
     shutdownDeadline: () => timeouts.findLast((entry) => entry.delay === 12000).callback(),
@@ -862,6 +867,52 @@ test("restore failure blocks every engine and another owner's request cannot ove
   assert.equal(app.children[0].exitCode, 0);
   assert.ok(!app.calls.includes("chat.send"));
   assert.equal((await app.request(null, "GET", "/ping")).code, 503);
+});
+
+test("a prepared gateway that exits while the restore is in flight is never activated", async (t) => {
+  const restore = deferred();
+  const app = loadContract(t, { restore: restore.promise });
+  await tick();
+  const chat = app.request({ ...owner, action: "chat", message: "hello" });
+  await tick();
+  assert.ok(app.calls.includes("restore"));
+  const prepared = app.children[0];
+  prepared.exitCode = 1;
+  prepared.emit("exit", 1);
+  restore.resolve();
+  assert.equal((await chat).body.status, "error");
+  assert.equal(app.activations.length, 0);
+  assert.ok(!app.calls.includes("activate:openclaw"));
+  assert.ok(!app.calls.includes("chat.send"));
+  assert.equal((await app.request(null, "GET", "/ping")).code, 503);
+});
+
+test("cold standby is on by default and OPENCLAW_COLD_STANDBY=0 turns it off", async (t) => {
+  const on = loadContract(t);
+  const off = loadContract(t, { runtimeEnv: { OPENCLAW_COLD_STANDBY: "0" } });
+  await tick();
+  assert.equal(on.coldStandby(), true);
+  assert.equal(off.coldStandby(), false);
+});
+
+test("a cold standby is piped but not observed until promoted, and its failure is not the gateway's", async (t) => {
+  const app = loadContract(t);
+  await tick();
+  const standby = app.createCold({ standby: true });
+  const preparing = standby.prepare();
+  const child = app.children.at(-1);
+  assert.notEqual(child, app.children[0]);
+  child.stdout.emit("data", Buffer.from("standby line\n"));
+  assert.ok(app.logs.includes("[openclaw:out] standby line"));
+  app.preparations.at(-1).onFailure(new Error("standby crashed"));
+  child.emit("error", new Error("late spawn error"));
+  child.exitCode = 1;
+  child.emit("exit", 1);
+  await preparing.catch(() => {});
+  const result = await app.request({ ...owner, action: "chat", message: "hello" });
+  assert.equal(result.body.phase, "USER_READY", app.errors.join("\n"));
+  assert.equal(app.activations.length, 1);
+  assert.equal(app.calls.filter((call) => call === "chat.send").length, 1);
 });
 
 for (const action of ["chat", "cron"]) {

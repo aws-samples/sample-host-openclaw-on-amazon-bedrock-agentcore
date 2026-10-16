@@ -15,6 +15,8 @@ The pinned SDK controller explicitly sets `platformVersion="V2"`; CDK manages fo
 
 Before healthy `/ping`, bootstrap prepares the live gateway without user state, scoped credentials, external Browser sessions or user model/tool calls. Activation binds the user, acquires credentials and strictly restores state and skills. Eligible empty-state sessions bind the prepared gateway; restored or custom state uses normal gateway startup. Chat and cron wait for `USER_READY`: credentials, proxy, gateway, configured Browser and persistence must all be ready.
 
+Bootstrap also prepares a cold standby: the gateway process that normal startup activates, with its OpenClaw modules loaded and waiting for activation. It is prepared before the live gateway writes its config, against an empty state dir (bootstrap fails if the standby wrote anything there). For a user with saved state, activation stops the unused live gateway, then takes the standby instead of spawning and loading a new gateway process, which took 5-48 s on staging. The restore, config, skills and `assertRestoreReady()` steps still finish before the standby is activated, as they did for a freshly spawned gateway. An adopted live gateway stops the standby; a standby that failed before use is replaced by a freshly spawned gateway (`cold_prepare_ack source=fresh_after_standby`). Set `OPENCLAW_COLD_STANDBY=0` on the runtime to turn it off.
+
 Restore failure, partial failure or timeout blocks activation and uploads. Credentials and gateway/Browser readiness are checked before dispatch. SQLite stays on local disk, mirrored to session storage and backed up to S3; never open its databases directly on the mount. See [state storage](session-storage.md) and [runtime behavior](how-it-works.md).
 
 OpenClaw `2026.9.5` keeps its generated Runtime metadata in system messages while Guardrails assess user input. Preserve this boundary when changing providers. Source patches verify package versions and exact hashes; upgrades require rechecking patches, initialization boundaries and tests. See [Guardrails](guardrails.md).
@@ -140,7 +142,7 @@ Each activation logs `[contract] <phase> elapsedMs=<ms> generation=<id>` lines, 
 | `seed_restore_start` | The prepared live seed checks S3 for saved state (empty-state fast path) |
 | `seed_ineligible reason=<r>` | The seed cannot be used: saved state (`reason=namespace_content` etc.) or a bridge check |
 | `seed_stop_start`, `seed_stopped` | The unused seed is stopped and its files removed |
-| `cold_prepare_start`, `cold_prepare_ack` | A prepared gateway for normal startup is obtained (spawn and module load, up to the preinit acknowledgement) |
+| `cold_prepare_start`, `cold_prepare_ack source=<s>` | A prepared gateway for normal startup is obtained: `standby` (prepared at bootstrap), `fresh` (spawned and loaded now) or `fresh_after_standby` |
 | `gateway_prepared path=seed\|cold` | The gateway path is decided |
 | `session_storage_ready available=<bool>` | Cold path: local state dir set up from the session-storage mirror |
 | `restore_start`, `restore_ready` | S3 workspace restore started and committed (`restore_ready` also ends the seed path) |

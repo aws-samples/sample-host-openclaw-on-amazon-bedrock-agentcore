@@ -178,6 +178,9 @@ let lastOpenClawEnv = null;
 const RESTORE_WAIT_MS = parseInt(process.env.WORKSPACE_RESTORE_WAIT_MS || "45000", 10);
 // Max time allowed for the one-time legacy sessions.json -> SQLite import.
 const LEGACY_MIGRATION_TIMEOUT_MS = parseInt(process.env.OPENCLAW_MIGRATION_TIMEOUT_MS || "180000", 10);
+// Prepare the cold-path gateway at bootstrap too, so users with saved state skip a fresh
+// OpenClaw module load after binding. "0" turns it off.
+const COLD_STANDBY = (process.env.OPENCLAW_COLD_STANDBY || "1").trim() !== "0";
 
 // Active task tracking — HealthyBusy prevents AgentCore from terminating during long tasks
 let activeTaskCount = 0;
@@ -203,15 +206,26 @@ async function commonBootstrap() {
   Object.assign(env, preparedGatewayStateEnv());
   delete env.USER_ID;
   delete env.INTERNAL_USER_ID;
-  const createCold = () => createPreparedGateway({
-    env, port: OPENCLAW_PORT,
-    onChild: observeGatewayChild,
-    onFailure: (error) => {
-      const child = preparedGateway?.child;
-      if (shuttingDown || (child && (intentionalGatewayStop === child || openclawProcess !== child))) return;
-      v2Lifecycle.fail(error);
-    },
-  });
+  // A standby (prepared at bootstrap for users with saved state) only has its output piped
+  // until the bridge promotes it; before that its failure is not the gateway's failure.
+  const createCold = ({ standby = false } = {}) => {
+    const gateway = createPreparedGateway({
+      env, port: OPENCLAW_PORT,
+      // The owner detaches its own listeners on failure; keep a late "error" event handled.
+      onChild: standby ? (child) => { child.on("error", () => {}); pipeGatewayOutput(child); }
+        : observeGatewayChild,
+      onFailure: (error) => {
+        const child = preparedGateway?.child;
+        if (standby && (!child || child !== gateway.child)) {
+          console.warn("[contract] Cold standby gateway stopped before use");
+          return;
+        }
+        if (shuttingDown || (child && (intentionalGatewayStop === child || openclawProcess !== child))) return;
+        v2Lifecycle.fail(error);
+      },
+    });
+    return gateway;
+  };
   preparedGateway = createLiveSeedBridge({
     createOwner: async (options) => (await import("./live-gateway-seed-owner.mjs"))
       .createLiveGatewaySeedOwner({ ...options, onEvent: (event) => {
@@ -231,6 +245,8 @@ async function commonBootstrap() {
       !fs.existsSync(runtimeSkills.manifestPath(OPENCLAW_DIR)) &&
       !fs.existsSync(`${OPENCLAW_DIR}/.pre-2.0-retired-files.json`),
     port: OPENCLAW_PORT,
+    coldStandby: COLD_STANDBY,
+    log: (line) => console.log(line),
   });
   // Imports only: clients and credential resolution remain behind user binding.
   require("@aws-sdk/client-bedrock-agentcore");
@@ -342,9 +358,13 @@ function startBoundGateway(env) {
   observeGatewayChild(child);
 }
 
-function observeGatewayChild(child) {
-  openclawProcess = child;
-  openclawExitCode = null;
+// Pipe a gateway child's output into the container log once, whether or not it is the
+// observed gateway yet (a cold standby is piped from spawn and observed on promotion).
+const pipedGatewayChildren = new WeakSet();
+const observedGatewayChildren = new WeakSet();
+function pipeGatewayOutput(child) {
+  if (pipedGatewayChildren.has(child)) return;
+  pipedGatewayChildren.add(child);
   for (const [stream, label] of [[child.stdout, "out"], [child.stderr, "err"]]) {
     let buffer = "";
     stream.on("data", (chunk) => {
@@ -358,6 +378,14 @@ function observeGatewayChild(child) {
       }
     });
   }
+}
+
+function observeGatewayChild(child) {
+  openclawProcess = child;
+  openclawExitCode = null;
+  pipeGatewayOutput(child);
+  if (observedGatewayChildren.has(child)) return;
+  observedGatewayChildren.add(child);
   child.on("error", (error) => {
     v2Lifecycle.fail(error);
   });
