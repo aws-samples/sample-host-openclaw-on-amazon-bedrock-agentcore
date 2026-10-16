@@ -1711,6 +1711,40 @@ test("a cron turn never outlives the caller's wait budget", async (t) => {
   assert.equal((await cron).body.response, "done");
 });
 
+test("a cron turn runs past 620 s up to the caller's wait budget", async (t) => {
+  // us-west-2 daily-market-desk: the cron Lambda waited ~815 s, but every run was cut at
+  // 620 s with unknown_outcome while the model was still working.
+  t.mock.method(console, "log", () => {});
+  const gateway = blockingTurns(t);
+  const app = loadContract(t, { gatewayTurnImpl: gateway.gatewayTurnImpl });
+  const arrival = Date.now();
+  const cron = app.request({ ...owner, action: "cron", message: "long brief", callerBudgetMs: 815000 });
+  await until(() => gateway.turns.length === 1, "the cron turn");
+  const deadline = gateway.turns[0].args.deadline;
+  assert.ok(deadline >= arrival + 815000 - 20000 - 1000,
+    `the turn was cut ${arrival + 815000 - 20000 - deadline} ms before the caller stops listening`);
+  assert.ok(deadline <= Date.now() + 815000 - 20000);
+  gateway.turns[0].done.resolve({ phase: "completed", response: "long brief done" });
+  assert.equal((await cron).body.response, "long brief done");
+});
+
+test("resources are refreshed to outlast a cron turn longer than 620 s", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const validity = [];
+  const app = loadContract(t, {
+    managerFactory: () => ({
+      ensureFresh: async (options = {}) => { validity.push(options.minValidityMs); },
+      getCredentials: () => ({}), stop() {}, beginDrain() {},
+    }),
+  });
+  const result = await app.request({ ...owner, action: "cron", message: "long brief", callerBudgetMs: 815000 });
+  assert.equal(result.body.response, "reply");
+  const perTurn = validity.filter((ms) => ms !== undefined);
+  assert.ok(perTurn.length > 0, "the turn did not ask for credentials covering it");
+  assert.ok(Math.max(...perTurn) >= 815000 - 20000 - 1000 + 60000,
+    `credentials only cover ${Math.max(...perTurn)} ms`);
+});
+
 test("a cron turn whose caller budget ran out in the queue is not dispatched", async (t) => {
   t.mock.method(console, "log", () => {});
   const gateway = blockingTurns(t);

@@ -137,11 +137,17 @@ const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
 const ACTIVATION_TIMEOUT_MS = Number(process.env.USER_ACTIVATION_TIMEOUT_MS || 300000);
 const TURN_TIMEOUT_MS = 620000;
 // A cron caller (the cron Lambda) sends callerBudgetMs: how long it will keep
-// reading this response. Briefs on one session queue behind each other, so a
-// queued turn gets its own TURN_TIMEOUT_MS from dispatch, but never more than
-// the caller's budget less a margin for unknown-outcome cleanup and the reply.
+// reading this response. A cron turn runs until that budget less a margin for
+// unknown-outcome cleanup and the reply, not TURN_TIMEOUT_MS: long briefs need
+// more than 620 s, and the cron Lambda waits up to ~815 s for one. A turn
+// queued behind another brief on the same session gets what is left of it.
 const MAX_CALLER_BUDGET_MS = 900000; // Lambda's maximum timeout
 const CALLER_REPLY_MARGIN_MS = 20000;
+// How long the resources a turn uses (scoped credentials, gateway bearer,
+// browser session) must stay valid for a turn that ends at `deadline`.
+function turnValidityMs(deadline) {
+  return Math.max(TURN_TIMEOUT_MS, deadline - Date.now()) + 60000;
+}
 let proxyModelOutcomeUnknown = false;
 const UNKNOWN_OUTCOME_RESPONSE = "The request outcome is unknown. It has not been automatically retried. Check any resulting changes before retrying.";
 const v2Lifecycle = createRuntimeLifecycle({
@@ -385,12 +391,12 @@ function observeProxyChild(child) {
 async function verifyV2Resources(context) {
   activationScope.checkpoint();
   workspaceSync.assertRestoreReady();
-  await credentialManager.ensureFresh();
+  await credentialManager.ensureFresh({ minValidityMs: turnValidityMs(context.deadline) });
   activationScope.checkpoint();
-  if (AGENTCORE_GATEWAY_URL && gatewayBearer.expiresAt <= Date.now() + TURN_TIMEOUT_MS + 60000) {
+  if (AGENTCORE_GATEWAY_URL && gatewayBearer.expiresAt <= Date.now() + turnValidityMs(context.deadline)) {
     gatewayBearer = await gatewayTokenProvider.getAccessToken(context.actorId, { force: true });
     activationScope.checkpoint();
-    if (gatewayBearer.expiresAt <= Date.now() + TURN_TIMEOUT_MS + 60000) {
+    if (gatewayBearer.expiresAt <= Date.now() + turnValidityMs(context.deadline)) {
       throw new Error("Gateway bearer validity is too short for a turn");
     }
     // Config reload alone does not prove that MCP adopted a refreshed bearer.
@@ -1300,7 +1306,7 @@ async function ensureV2BrowserSession(userId, deadline) {
   if (!currentBrowserSessionId) await initBrowserSession(userId);
   let owner = browserOwner();
   const status = await getBrowserSessionStatus(owner, deadline);
-  if (status === "TERMINATED" || browserExpiresAt <= Date.now() + TURN_TIMEOUT_MS + 60000) {
+  if (status === "TERMINATED" || browserExpiresAt <= Date.now() + turnValidityMs(deadline)) {
     if (status === "TERMINATED") {
       retireBrowserOwner(owner);
       browserSessions.delete(owner.sessionId);
@@ -2191,9 +2197,9 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
     ? require("./invocation-stream").createInvocationStream(req, res, arrival, TURN_TIMEOUT_MS) : null;
   try {
     const result = await v2Lifecycle.run(context, async (queued) => {
-      // With a caller budget, time spent queued behind another turn is not charged to this one.
+      // With a caller budget, the turn runs until the caller stops listening.
       const turn = callerDeadline === null ? queued
-        : Object.freeze({ ...queued, deadline: Math.min(Date.now() + TURN_TIMEOUT_MS, callerDeadline) });
+        : Object.freeze({ ...queued, deadline: callerDeadline });
       await v2Lifecycle.recover(() => verifyV2Resources(turn), turn.deadline - Date.now());
       const before = await checkProxyHealth().catch(() => null);
       const dispatchAllowed = before?.model_outcome_unknown === false;
