@@ -21,7 +21,7 @@ Running an AI agent with tool access (bash, web fetch, file operations) on a loc
 | **Multi-tenant data leakage** | Shared filesystem; one user can read another's data | Per-user Firecracker microVMs + STS session-scoped S3 credentials restrict access to `{namespace}/*` |
 | **Credential theft** | Plaintext `.env` files, shell history | Long-lived secrets in Secrets Manager (KMS-encrypted, audited via CloudTrail); temporary scoped credentials in runtime files read through `credential_process` |
 | **Network exposure** | Open ports, direct internet exposure | VPC private subnets, no public IPs on containers, 7+ VPC endpoints keep traffic on AWS backbone |
-| **Abuse / runaway costs** | No budget controls | Daily token budget (1M tokens), daily cost budget ($5 USD), anomaly detection, CloudWatch alarms |
+| **Abuse / runaway costs** | No budget controls | Hourly and daily token and cost alarms (defaults 5M tokens and $30 per hour, 18M tokens and $100 per day), anomaly detection. Alarms notify only subscribers of the `openclaw-alarms` SNS topic |
 | **Audit trail** | None or manual log review | CloudTrail (most accounts already have one; optional dedicated trail available), CloudWatch access logs, Bedrock invocation logging |
 | **Lateral movement** | Full host access, all env vars | STS scoped credentials + tool deny list + credential env var blocklist; V2 activation fails closed if credentials are unavailable |
 | **OS / container CVEs** | Manual patching | ECR image scanning on push, managed runtime, multi-stage Docker build (no build tools in runtime) |
@@ -262,8 +262,12 @@ To enable it, set `"enable_cloudtrail": true` in `cdk.json` and redeploy. This c
 | Bedrock latency (p99) | > 10,000 ms, 3 eval periods | SNS notification |
 | Bedrock throttles | > 1 per 5 min, 3 eval periods | SNS notification |
 | Router Lambda errors | > 5 per 5 min, 3 eval periods | SNS notification |
-| Daily token budget | > 1,000,000 tokens per hour | SNS notification |
-| Daily cost budget | > $5 USD per hour | SNS notification |
+| `openclaw-hourly-token-spike` | > 5,000,000 tokens per 1 hour (`hourly_token_alarm`) | SNS notification |
+| `openclaw-daily-token-budget` | > 18,000,000 tokens per 1 day (`daily_token_budget`) | SNS notification |
+| `openclaw-hourly-cost-spike` | > $30 USD per 1 hour (`hourly_cost_alarm_usd`) | SNS notification |
+| `openclaw-daily-cost-budget` | > $100 USD per 1 day (`daily_cost_budget_usd`) | SNS notification |
+
+SNS notifications reach only subscribers of the `openclaw-alarms` topic, which has none by default. Set the `alarm_email` context key to add an email subscription, or subscribe the topic to your own paging tool.
 
 #### Anomaly Detection
 

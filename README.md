@@ -21,6 +21,7 @@ AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-
 - [Per-user model switching](#per-user-model-switching)
 - [Channel Setup](#channel-setup)
 - [Operations](#operations)
+- [Upgrading: budget alarms are now hourly and daily](#upgrading-budget-alarms-are-now-hourly-and-daily)
 - [Upgrading from OpenClaw 2026.3.x](#upgrading-from-openclaw-20263x)
 - [Troubleshooting](#troubleshooting)
 - [Known Limitations](#known-limitations)
@@ -276,8 +277,11 @@ All tunable parameters are in `cdk.json`:
 | `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model ID for sub-agents. Empty = the bridge default, also Sonnet 5.5. Sub-agents never use the fallback model |
 | `user_selectable_models` | `haiku`, `sonnet`, `opus` (Claude 5.5 global profiles) | Aliases users can pick with `/model <alias>`, mapped to Bedrock model IDs. Set to `{}` to disable switching. See [Per-user model switching](#per-user-model-switching) |
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
-| `daily_token_budget` | `1000000` | Threshold of the `openclaw-daily-token-budget` alarm. Despite the name, the alarm compares the token sum over a **1-hour** period |
-| `daily_cost_budget_usd` | `5` | Threshold (USD) of the `openclaw-daily-cost-budget` alarm, compared with the estimated cost summed over a **1-hour** period. `5` is low for an Opus-class model; see [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking) |
+| `hourly_token_alarm` | `5000000` | Threshold of the `openclaw-hourly-token-spike` alarm: `TotalTokens` summed over **1 hour** |
+| `daily_token_budget` | `18000000` | Threshold of the `openclaw-daily-token-budget` alarm: `TotalTokens` summed over **1 day** (86400 s) |
+| `hourly_cost_alarm_usd` | `30` | Threshold (USD) of the `openclaw-hourly-cost-spike` alarm: estimated cost summed over **1 hour** |
+| `daily_cost_budget_usd` | `100` | Threshold (USD) of the `openclaw-daily-cost-budget` alarm: estimated cost summed over **1 day** (86400 s). Before this release it was compared per hour; see [Upgrading: budget alarms](#upgrading-budget-alarms-are-now-hourly-and-daily) |
+| `alarm_email` | `""` (unset) | Optional email address subscribed to the `openclaw-alarms` SNS topic. SNS sends a confirmation email that must be accepted. **Unset, every alarm notifies nobody** until someone subscribes to the topic |
 | `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |
 | `session_max_lifetime` | `28800` | Per-user session max lifetime (seconds) |
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
@@ -388,6 +392,22 @@ Operator commands are in [docs/operations.md](docs/operations.md):
 - Token usage, cost estimates and budget alarms: [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking)
 - DynamoDB tables have deletion protection and `RETAIN`; for accounts with automated cleanup of untagged resources, set `table_tags` (see [Configuration](#configuration))
 
+## Upgrading: budget alarms are now hourly and daily
+
+Earlier releases had two "daily" budget alarms that actually compared a **1-hour** sum with `daily_token_budget` and `daily_cost_budget_usd`. Each budget now has two alarms:
+
+| Alarm | Period | Context key | Default |
+|---|---|---|---|
+| `openclaw-hourly-token-spike` (new) | 1 hour | `hourly_token_alarm` | 5,000,000 tokens |
+| `openclaw-daily-token-budget` | 1 day | `daily_token_budget` | 18,000,000 tokens |
+| `openclaw-hourly-cost-spike` (new) | 1 hour | `hourly_cost_alarm_usd` | $30 |
+| `openclaw-daily-cost-budget` | 1 day | `daily_cost_budget_usd` | $100 |
+
+- **`daily_cost_budget_usd` and `daily_token_budget` now really mean per day.** If you set either as an hourly value, move that value to `hourly_cost_alarm_usd` / `hourly_token_alarm` and set the daily key to your daily budget. Otherwise your old hourly number becomes a much tighter daily limit.
+- The two daily alarms keep their names and CloudFormation logical IDs, so the upgrade updates them in place (period 3600 → 86400, new threshold and description). The two hourly alarms are created.
+- The defaults are deployment-specific. The token defaults match the cost defaults at the Opus 5.5 global price ($4 input / $20 output per 1M tokens) for a 90% input / 10% output mix: $5.60 per 1M tokens, so $30 ≈ 5M tokens and $100 ≈ 18M tokens. Cache tokens are billed in the cost estimate but not counted in `TotalTokens`.
+- Alarms only notify subscribers of the `openclaw-alarms` SNS topic. Set `alarm_email` or subscribe the topic yourself.
+
 ## Upgrading from OpenClaw 2026.3.x
 
 This branch moves the image from OpenClaw 2026.3.8 / Node 22 to **OpenClaw 2026.9.5 ("2.0") / Node 24 / clawhub 0.23.3**. The compatibility behavior below concerns OpenClaw data; see the [AgentCore Runtime V2 migration limits](docs/runtime-v2.md#existing-user-migration-and-cutover).
@@ -453,7 +473,7 @@ The text is delivered and the Lambda logs `Brief audio not sent: <exception type
 
 ### Cost alarm fires often, or token usage shows `default-user`
 
-The `openclaw-daily-cost-budget` alarm compares cost per **1-hour** period with `daily_cost_budget_usd` (default `5`); raise it for Opus-class models. Usage is attributed to `default-user` / `unknown` because Bedrock requests carry no request metadata; see [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking).
+`openclaw-hourly-cost-spike` compares the cost of one hour with `hourly_cost_alarm_usd` (default `30`) and `openclaw-daily-cost-budget` compares one day with `daily_cost_budget_usd` (default `100`). One Opus brief or task-generation run can cost several dollars, so set both to what you expect to spend. Usage is attributed to `default-user` / `unknown` because Bedrock requests carry no request metadata; see [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking).
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
 
