@@ -2254,6 +2254,13 @@ async function bridgeMessage(message, timeoutMs = 620000, onDelta, options = {})
               sessionKey: "global",
               message: message,
               idempotencyKey: chatReqId,
+              // Turns are sent one at a time (messageQueue), so a run already
+              // active on the main session has no caller waiting on it, e.g.
+              // openclaw's restart recovery of a turn cut off by a container
+              // stop. openclaw 2026.9.5 defaults to "steer", which folds this
+              // message into that run and answers chat.send with an empty
+              // final; "interrupt" stops that run and answers this message.
+              queueMode: "interrupt",
             },
           }),
         );
