@@ -17,6 +17,7 @@ import boto3
 from botocore.config import Config
 from runtime_routing import admit_route, is_unknown_outcome, resolve_route
 import whatsapp
+import line_channel
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
 from runtime_invocation import RELEASE_RESERVE_SECONDS, InvocationTransportError, invoke_bounded
 
@@ -29,6 +30,7 @@ TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 WHATSAPP_TOKEN_SECRET_ID = os.environ.get("WHATSAPP_TOKEN_SECRET_ID", "")
+LINE_TOKEN_SECRET_ID = os.environ.get("LINE_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
@@ -846,6 +848,14 @@ def deliver_response(channel, channel_target, response_text):
             return
         if not whatsapp.send_text(config, channel_target, response_text):
             logger.error("Cron response to WhatsApp was not delivered (outside the 24h window?)")
+    elif channel == "line":
+        # Cron results go out through the push API (counts against the plan's message quota).
+        config = line_channel.parse_config(_get_secret(LINE_TOKEN_SECRET_ID)) if LINE_TOKEN_SECRET_ID else None
+        if not config:
+            logger.error("LINE channel not configured; cron response not delivered")
+            return
+        if not line_channel.send_text(config, channel_target, response_text):
+            logger.error("Cron response to LINE was not delivered")
     else:
         logger.warning("Unknown channel type: %s", channel)
 

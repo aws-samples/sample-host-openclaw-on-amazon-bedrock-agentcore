@@ -34,7 +34,7 @@ const https = require("node:https");
 const RESERVED_ARG = "__caller_token";
 
 // Same namespace pattern the exec skills enforce (bridge/skills/*/common.js).
-const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp|feishu)_[a-zA-Z0-9_-]{1,64}$/;
+const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}$/;
 
 class IdentityError extends Error {
   constructor(message) {

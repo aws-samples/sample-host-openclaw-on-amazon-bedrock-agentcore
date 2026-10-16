@@ -42,6 +42,7 @@ class CronStack(Stack):
         user_files_bucket_name: str,
         user_files_bucket_arn: str,
         whatsapp_token_secret_name: str = "",
+        line_token_secret_name: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -105,6 +106,7 @@ class CronStack(Stack):
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
                 "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
                 "WHATSAPP_TOKEN_SECRET_ID": whatsapp_token_secret_name,
+                "LINE_TOKEN_SECRET_ID": line_token_secret_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
                 "USER_FILES_BUCKET": user_files_bucket_name,
             },

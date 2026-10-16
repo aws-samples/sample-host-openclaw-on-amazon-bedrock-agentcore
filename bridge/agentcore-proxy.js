@@ -343,7 +343,7 @@ function extractSessionMetadata(parsed, headers) {
   // 5b. Validate actorId format to prevent prompt injection.
   // Only allow channel:alphanumeric patterns or known fallback values.
   const VALID_ACTOR_ID =
-    /^(telegram|slack|discord|whatsapp):[A-Za-z0-9_-]{1,64}$/;
+    /^(telegram|slack|discord|whatsapp|line):[A-Za-z0-9_-]{1,64}$/;
   if (actorId !== "default-user" && !VALID_ACTOR_ID.test(actorId)) {
     console.warn(
       `[proxy] WARNING: actorId "${actorId.slice(0, 80)}" failed validation — falling back to default-user.`,
@@ -751,6 +751,7 @@ const VALID_CHANNELS = new Set([
   "slack",
   "discord",
   "whatsapp",
+  "line",
   "unknown",
 ]);
 
