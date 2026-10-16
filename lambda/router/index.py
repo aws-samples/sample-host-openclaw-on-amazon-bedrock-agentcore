@@ -27,6 +27,18 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from documents import (
+    ACCEPTED_FILES_TEXT,
+    KIND_INFO,
+    KIND_ZIP,
+    MAX_DOCUMENT_BYTES,
+    MAX_DOCUMENT_LABEL,
+    ZipListingError,
+    build_document_message,
+    classify_document,
+    zip_listing,
+)
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -1468,6 +1480,80 @@ def _build_structured_message(text, s3_key, content_type):
 
 
 # ---------------------------------------------------------------------------
+# Document (Markdown / ZIP) upload helpers. Parsing lives in documents.py.
+# Logs carry kind and size only, never file names or contents.
+# ---------------------------------------------------------------------------
+
+UNSUPPORTED_DOCUMENT_REPLY = (
+    f"Sorry, I can't open that type of file. I accept {ACCEPTED_FILES_TEXT}, "
+    f"up to {MAX_DOCUMENT_LABEL} each."
+)
+DOCUMENT_TOO_LARGE_REPLY = (
+    f"Sorry, that file is too large. The limit is {MAX_DOCUMENT_LABEL} per file."
+)
+BAD_ZIP_REPLY = (
+    "Sorry, I couldn't read that file as a ZIP archive. It may be damaged or not a real .zip file."
+)
+
+
+def _download_telegram_document(file_id, token, max_bytes=MAX_DOCUMENT_BYTES):
+    """Download a Telegram document of at most ``max_bytes``.
+
+    Returns (bytes, None) on success, or (None, reason) where reason is
+    "too_large" or "failed".
+    """
+    if not file_id:
+        return None, "failed"
+    try:
+        safe_file_id = quote(str(file_id), safe="")
+        url = f"https://api.telegram.org/bot{token}/getFile?file_id={safe_file_id}"
+        resp = urllib_request.urlopen(urllib_request.Request(url), timeout=15)
+        result = json.loads(resp.read().decode("utf-8")).get("result") or {}
+        file_size = result.get("file_size") or 0
+        if isinstance(file_size, int) and file_size > max_bytes:
+            return None, "too_large"
+        file_path = result.get("file_path", "")
+        if not file_path:
+            logger.warning("Telegram getFile returned no file_path for a document")
+            return None, "failed"
+        download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+        resp = urllib_request.urlopen(urllib_request.Request(download_url), timeout=30)
+        data = resp.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None, "too_large"
+        return data, None
+    except Exception as e:
+        logger.warning("Telegram document download failed: %s", type(e).__name__)
+        return None, "failed"
+
+
+def _upload_document_to_s3(data, namespace, kind):
+    """Store an accepted document under {namespace}/_uploads/doc_{ts}_{hex}.{ext}.
+
+    The key never contains the user's file name. Returns the key or None.
+    """
+    if not USER_FILES_BUCKET:
+        logger.warning("USER_FILES_BUCKET not configured, cannot store document")
+        return None
+    info = KIND_INFO.get(kind)
+    if not info or len(data) > MAX_DOCUMENT_BYTES:
+        return None
+    s3_key = f"{namespace}/_uploads/doc_{int(time.time())}_{uuid.uuid4().hex[:8]}.{info['ext']}"
+    try:
+        s3_client.put_object(
+            Bucket=USER_FILES_BUCKET,
+            Key=s3_key,
+            Body=data,
+            ContentType=info["content_type"],
+        )
+        logger.info("Stored document kind=%s size=%d", kind, len(data))
+        return s3_key
+    except Exception as e:
+        logger.error("S3 document upload failed: %s", type(e).__name__)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Webhook handlers
 # ---------------------------------------------------------------------------
 
@@ -1501,12 +1587,15 @@ def handle_telegram(body):
     display_name = user.get("first_name", "") or user.get("username", "")
 
     # Detect image: photo array or document with image mime type
-    has_image = bool(
-        message.get("photo")
-        or (message.get("document", {}).get("mime_type", "") in ALLOWED_IMAGE_TYPES)
-    )
+    document = message.get("document") or {}
+    if not isinstance(document, dict):
+        document = {}
+    doc_mime = str(document.get("mime_type", "") or "")
+    has_image = bool(message.get("photo") or doc_mime in ALLOWED_IMAGE_TYPES)
+    # Any other document is handled as a file (accepted or rejected with a reply).
+    has_document = bool(document) and not has_image
 
-    if not chat_id or not user_id_tg or (not text and not has_image):
+    if not chat_id or not user_id_tg or (not text and not has_image and not has_document):
         logger.info("Telegram: ignoring non-text/non-image or missing-user message")
         return
 
@@ -1552,12 +1641,53 @@ def handle_telegram(body):
         )
         return
 
+    doc_kind = None
+    if has_document:
+        doc_kind = classify_document(doc_mime, document.get("file_name", ""))
+        doc_size = document.get("file_size") or 0
+        doc_size = doc_size if isinstance(doc_size, int) else 0
+        if doc_kind is None:
+            logger.info("Telegram: rejected document kind=unsupported type=%r size=%d", doc_mime[:64], doc_size)
+            send_telegram_message(chat_id, UNSUPPORTED_DOCUMENT_REPLY, token)
+            return
+        if doc_size > MAX_DOCUMENT_BYTES:
+            logger.info("Telegram: rejected document kind=%s size=%d reason=too_large", doc_kind, doc_size)
+            send_telegram_message(chat_id, DOCUMENT_TOO_LARGE_REPLY, token)
+            return
+
     # Send typing indicator
     send_telegram_typing(chat_id, token)
 
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
-    if has_image:
+    if has_document:
+        namespace = actor_id.replace(":", "_")
+        doc_bytes, reason = _download_telegram_document(document.get("file_id"), token)
+        if reason == "too_large":
+            logger.info("Telegram: rejected document kind=%s reason=too_large", doc_kind)
+            send_telegram_message(chat_id, DOCUMENT_TOO_LARGE_REPLY, token)
+            return
+        if doc_bytes is None:
+            send_telegram_message(chat_id, "Sorry, I couldn't download that file. Please try again.", token)
+            return
+        listing = None
+        if doc_kind == KIND_ZIP:
+            try:
+                listing = zip_listing(doc_bytes)
+            except ZipListingError:
+                logger.info("Telegram: rejected document kind=zip size=%d reason=malformed", len(doc_bytes))
+                send_telegram_message(chat_id, BAD_ZIP_REPLY, token)
+                return
+        s3_key = _upload_document_to_s3(doc_bytes, namespace, doc_kind)
+        if not s3_key:
+            send_telegram_message(chat_id, "Sorry, I couldn't store that file. Please try again.", token)
+            return
+        stored_name = s3_key[len(namespace) + 1:]
+        agent_message = build_document_message(
+            text, doc_kind, doc_bytes, stored_name, document.get("file_name", ""), listing,
+        )
+        logger.info("Telegram: document accepted kind=%s size=%d", doc_kind, len(doc_bytes))
+    elif has_image:
         namespace = actor_id.replace(":", "_")
         image_bytes, content_type, _ = _download_telegram_image(message, token)
         if image_bytes:
@@ -1576,8 +1706,8 @@ def handle_telegram(body):
 
     image_count = 0 if isinstance(agent_message, str) else len(agent_message.get("images", []))
     logger.info(
-        "Telegram: user=%s actor=%s session=%s text_len=%d images=%d",
-        resolved_user_id, actor_id, session_id, len(text), image_count,
+        "Telegram: user=%s actor=%s session=%s text_len=%d images=%d document=%s",
+        resolved_user_id, actor_id, session_id, len(text), image_count, doc_kind or "none",
     )
 
     # Invoke AgentCore with periodic typing indicator
