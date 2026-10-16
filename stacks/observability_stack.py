@@ -1,5 +1,7 @@
 """Observability Stack — Bedrock invocation logging, dashboards, alarms, SNS."""
 
+import re
+
 from aws_cdk import (
     Stack,
     Duration,
@@ -10,6 +12,7 @@ from aws_cdk import (
     aws_logs as logs,
     aws_iam as iam,
     aws_sns as sns,
+    aws_sns_subscriptions as sns_subs,
     custom_resources as cr,
     CfnOutput,
 )
@@ -43,6 +46,19 @@ class ObservabilityStack(Stack):
             display_name="OpenClaw Alarms",
             master_key=alarm_cmk,
         )
+
+        # Alarms notify nobody unless something subscribes to this topic.
+        # Optional context alarm_email adds one email subscription; SNS sends
+        # a confirmation email that the recipient must accept.
+        alarm_email = (self.node.try_get_context("alarm_email") or "").strip()
+        if alarm_email:
+            if not re.fullmatch(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+", alarm_email):
+                raise ValueError(
+                    "context alarm_email must be a single email address"
+                )
+            self.alarm_topic.add_subscription(
+                sns_subs.EmailSubscription(alarm_email)
+            )
 
         # --- Bedrock Invocation Log Group ---------------------------------
         self.invocation_log_group = logs.LogGroup(
