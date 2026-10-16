@@ -501,8 +501,11 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agen
 | `runtime_endpoint_id` | (empty) | AgentCore Runtime Endpoint ID. Typically `DEFAULT` when using Starter Toolkit |
 | `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
 | `cloudwatch_log_retention_days` | `30` | Log retention |
-| `daily_token_budget` | `1000000` | Token budget alarm threshold |
-| `daily_cost_budget_usd` | `5` | Cost budget alarm threshold |
+| `hourly_token_alarm` | `5000000` | `openclaw-hourly-token-spike` threshold (TotalTokens Sum over 1 h) |
+| `daily_token_budget` | `18000000` | `openclaw-daily-token-budget` threshold (TotalTokens Sum over 1 day). Was compared per hour before the alarm split |
+| `hourly_cost_alarm_usd` | `30` | `openclaw-hourly-cost-spike` threshold (EstimatedCostUSD Sum over 1 h) |
+| `daily_cost_budget_usd` | `100` | `openclaw-daily-cost-budget` threshold (EstimatedCostUSD Sum over 1 day). Was compared per hour before the alarm split; move an hourly value to `hourly_cost_alarm_usd` |
+| `alarm_email` | `""` | Optional email subscription on `openclaw-alarms`; unset, alarms notify nobody |
 | `token_ttl_days` | `90` | DynamoDB TTL |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
 | `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |

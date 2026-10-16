@@ -22,6 +22,29 @@ from constructs import Construct
 from stacks import apply_table_tags
 
 
+# Budget alarm defaults. Thresholds are deployment-specific; override them in
+# cdk.json. Token defaults are consistent with the cost defaults at the Opus 5.5
+# global price ($4 input / $20 output per 1M tokens) for a 90% input / 10%
+# output mix: 0.9 * 4 + 0.1 * 20 = $5.60 per 1M TotalTokens, so
+# $30 / 5.60 = 5.4M tokens per hour (rounded to 5M) and
+# $100 / 5.60 = 17.9M tokens per day (rounded to 18M).
+DEFAULT_HOURLY_COST_ALARM_USD = 30
+DEFAULT_DAILY_COST_BUDGET_USD = 100
+DEFAULT_HOURLY_TOKEN_ALARM = 5_000_000
+DEFAULT_DAILY_TOKEN_BUDGET = 18_000_000
+
+
+def _context_threshold(stack: Stack, key: str, default: float) -> float:
+    """Read a positive numeric alarm threshold from context, else the default."""
+    value = stack.node.try_get_context(key)
+    if value is None or value == "":
+        return default
+    number = float(value)
+    if number <= 0:
+        raise ValueError(f"context {key} must be a positive number, got {value!r}")
+    return int(number) if number.is_integer() else number
+
+
 class TokenMonitoringStack(Stack):
     def __init__(
         self,
@@ -35,8 +58,18 @@ class TokenMonitoringStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        daily_token_budget = self.node.try_get_context("daily_token_budget") or 1_000_000
-        daily_cost_budget = self.node.try_get_context("daily_cost_budget_usd") or 5
+        hourly_token_alarm = _context_threshold(
+            self, "hourly_token_alarm", DEFAULT_HOURLY_TOKEN_ALARM
+        )
+        daily_token_budget = _context_threshold(
+            self, "daily_token_budget", DEFAULT_DAILY_TOKEN_BUDGET
+        )
+        hourly_cost_alarm = _context_threshold(
+            self, "hourly_cost_alarm_usd", DEFAULT_HOURLY_COST_ALARM_USD
+        )
+        daily_cost_budget = _context_threshold(
+            self, "daily_cost_budget_usd", DEFAULT_DAILY_COST_BUDGET_USD
+        )
         anomaly_band = self.node.try_get_context("anomaly_band_width") or 2
         ttl_days = self.node.try_get_context("token_ttl_days") or 90
 
@@ -226,27 +259,68 @@ class TokenMonitoringStack(Stack):
         )
 
         # --- Budget Alarms ------------------------------------------------
-        # Daily token budget
+        # Each budget has an hourly spike alarm (Sum over 1 hour) and a daily
+        # budget alarm (Sum over 1 day, 86400 s, which CloudWatch allows for a
+        # single evaluation period). The daily alarms keep their original
+        # construct IDs so an upgrade updates them in place instead of
+        # replacing them.
+        alarm_action = cw_actions.SnsAction(alarm_topic)
+
         total_tokens.create_alarm(
+            self,
+            "HourlyTokenSpikeAlarm",
+            alarm_name="openclaw-hourly-token-spike",
+            alarm_description=(
+                f"OpenClaw TotalTokens summed over 1 hour (3600 s) is greater than "
+                f"{hourly_token_alarm:,} tokens (context hourly_token_alarm)."
+            ),
+            threshold=hourly_token_alarm,
+            evaluation_periods=1,
+            comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+        ).add_alarm_action(alarm_action)
+
+        total_tokens.with_(period=Duration.days(1)).create_alarm(
             self,
             "DailyTokenBudgetAlarm",
             alarm_name="openclaw-daily-token-budget",
+            alarm_description=(
+                f"OpenClaw TotalTokens summed over 1 day (86400 s) is greater than "
+                f"{daily_token_budget:,} tokens (context daily_token_budget)."
+            ),
             threshold=daily_token_budget,
             evaluation_periods=1,
             comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
             treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
-        ).add_alarm_action(cw_actions.SnsAction(alarm_topic))
+        ).add_alarm_action(alarm_action)
 
-        # Daily cost budget
         estimated_cost.create_alarm(
+            self,
+            "HourlyCostSpikeAlarm",
+            alarm_name="openclaw-hourly-cost-spike",
+            alarm_description=(
+                f"OpenClaw EstimatedCostUSD summed over 1 hour (3600 s) is greater than "
+                f"${hourly_cost_alarm:,} USD (context hourly_cost_alarm_usd)."
+            ),
+            threshold=hourly_cost_alarm,
+            evaluation_periods=1,
+            comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+        ).add_alarm_action(alarm_action)
+
+        estimated_cost.with_(period=Duration.days(1)).create_alarm(
             self,
             "DailyCostBudgetAlarm",
             alarm_name="openclaw-daily-cost-budget",
+            alarm_description=(
+                f"OpenClaw EstimatedCostUSD summed over 1 day (86400 s) is greater than "
+                f"${daily_cost_budget:,} USD (context daily_cost_budget_usd)."
+            ),
             threshold=daily_cost_budget,
             evaluation_periods=1,
             comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
             treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
-        ).add_alarm_action(cw_actions.SnsAction(alarm_topic))
+        ).add_alarm_action(alarm_action)
 
         # Anomaly detection alarm
         anomaly_alarm = cw.CfnAnomalyDetector(
