@@ -144,6 +144,33 @@ for (const mismatch of ["token", "agents", "local", "namespace"]) {
   });
 }
 
+test("the cold path reports each phase in order with the restore's reason", async (t) => {
+  const f = fixture(t);
+  await f.bridge.prepare();
+  f.workspaceSync.restoreAbsentSeed = async () => ({ status: "ineligible", reason: "namespace_content" });
+  const phases = [];
+  f.input.onPhase = (name, details) => phases.push(details ? `${name}:${JSON.stringify(details)}` : name);
+  assert.equal((await f.bridge.restoreForBinding(f.input)).status, "cold");
+  assert.deepEqual(phases, [
+    "seed_restore_start", 'seed_ineligible:{"reason":"namespace_content"}',
+    "seed_stop_start", "seed_stopped", "cold_prepare_start", "cold_prepare_ack",
+  ]);
+});
+
+test("phase telemetry failures and unsafe reasons do not change the cold path", async (t) => {
+  const f = fixture(t);
+  await f.bridge.prepare();
+  f.workspaceSync.restoreAbsentSeed = async () => ({ status: "ineligible", reason: "Bad reason\nforged" });
+  const reasons = [];
+  f.input.onPhase = (name, details) => {
+    if (details) reasons.push(details.reason);
+    throw new Error("telemetry down");
+  };
+  assert.equal((await f.bridge.restoreForBinding(f.input)).status, "cold");
+  assert.deepEqual(reasons, ["unknown"]);
+  assert.ok(f.calls.indexOf("stop") < f.calls.indexOf("cold"));
+});
+
 test("an uncertain bind cannot restore over a possibly adopted seed", async (t) => {
   const f = fixture(t);
   await f.bridge.prepare();

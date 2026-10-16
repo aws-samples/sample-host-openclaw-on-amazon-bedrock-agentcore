@@ -1452,9 +1452,15 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
 
   initPromise = (async () => {
     const activationStarted = Date.now();
-    const logActivationPhase = (phase) => {
+    // Phase names and details are fixed values chosen here and in live-seed-bridge.js; details
+    // are still reduced to short word characters so a log line cannot be forged.
+    const logActivationPhase = (phase, details) => {
+      const extra = Object.entries(details || {})
+        .filter(([key, value]) => /^[a-z_]{1,32}$/.test(key) &&
+          ["string", "number", "boolean"].includes(typeof value))
+        .map(([key, value]) => ` ${key}=${String(value).replace(/[^\w.:-]/g, "_").slice(0, 64)}`).join("");
       console.log(
-        `[contract] ${phase} elapsedMs=${Date.now() - activationStarted} generation=${activationScope.generation}`,
+        `[contract] ${phase} elapsedMs=${Date.now() - activationStarted} generation=${activationScope.generation}${extra}`,
       );
     };
     const checkpoint = () => { activationScope.checkpoint(); };
@@ -1528,11 +1534,14 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
     const liveRestore = await preparedGateway.restoreForBinding({
       lifecycle: v2Lifecycle, scope: activationScope, namespace, channel,
       token: GATEWAY_TOKEN, boundEnv: openclawEnvFor(userId), waitMs: RESTORE_WAIT_MS,
+      onPhase: logActivationPhase,
     });
     checkpoint();
     const liveAdopted = liveRestore?.status === "adopted";
+    logActivationPhase("gateway_prepared", { path: liveAdopted ? "seed" : "cold" });
     const sessionStorageAvailable = liveAdopted ? liveRestore.storage.available : setupSessionStorage();
     sessionStorageActive = sessionStorageAvailable;
+    if (!liveAdopted) logActivationPhase("session_storage_ready", { available: sessionStorageAvailable });
 
     // 2. Start the Bedrock proxy with user identity env vars
     // Only pass required env vars — avoid leaking secrets via process.env spread
@@ -1642,6 +1651,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
         // No session storage — use S3 sync as primary (existing behavior)
         restorePromise = workspaceSync.restoreWorkspace(namespace);
       }
+      logActivationPhase("restore_start");
       // Reject incomplete restoration before any user state is written.
       await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);
       checkpoint();
@@ -1713,12 +1723,14 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
     // uses credential_process for scoped S3 access only (see openclawEnvFor).
     checkpoint();
     lastOpenClawEnv = openclawEnv;
+    logActivationPhase("gateway_activate_start");
     await preparedGateway.activate({
       env: openclawEnv, binding: v2Lifecycle.snapshot().binding,
       generation: activationScope.generation, signal: activationScope.signal,
       deadline: Date.now() + ACTIVATION_TIMEOUT_MS,
     });
     checkpoint();
+    logActivationPhase("gateway_activated");
 
     if (browserStartOwner) {
       assertBrowserStartOwner(browserStartOwner);
@@ -1734,6 +1746,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
       await assertProxyOutcomeKnown();
       checkpoint();
       activationScope.mark("proxy");
+      logActivationPhase("proxy_ready");
       await waitForGateway({
         port: OPENCLAW_PORT, token: GATEWAY_TOKEN, signal: activationScope.signal,
         deadline: Date.now() + ACTIVATION_TIMEOUT_MS, configProbe: true,

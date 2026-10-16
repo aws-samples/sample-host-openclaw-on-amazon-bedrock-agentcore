@@ -130,6 +130,25 @@ Use JSON `wall_unix_ms` as producer time, not CloudWatch enqueue/ingestion time.
 
 Measure intervals inside the handler. Client/server clocks can differ; monotonic values from different processes or hosts cannot be subtracted. Client round trips include networking. An unbound status response does not measure `USER_READY`, chat or channel E2E latency.
 
+### Activation phases
+
+Each activation logs `[contract] <phase> elapsedMs=<ms> generation=<id>` lines, measured from the start of that activation, so they can be subtracted from each other. In order:
+
+| Phase | Meaning |
+|---|---|
+| `credentials_ready` | Scoped credentials acquired |
+| `seed_restore_start` | The prepared live seed checks S3 for saved state (empty-state fast path) |
+| `seed_ineligible reason=<r>` | The seed cannot be used: saved state (`reason=namespace_content` etc.) or a bridge check |
+| `seed_stop_start`, `seed_stopped` | The unused seed is stopped and its files removed |
+| `cold_prepare_start`, `cold_prepare_ack` | A prepared gateway for normal startup is obtained (spawn and module load, up to the preinit acknowledgement) |
+| `gateway_prepared path=seed\|cold` | The gateway path is decided |
+| `session_storage_ready available=<bool>` | Cold path: local state dir set up from the session-storage mirror |
+| `restore_start`, `restore_ready` | S3 workspace restore started and committed (`restore_ready` also ends the seed path) |
+| `config_skills_ready` | Config, legacy import and runtime skills done |
+| `gateway_activate_start`, `gateway_activated` | Prepared gateway released and acknowledged |
+| `proxy_ready`, `gateway_ready` | Proxy port open; gateway passed its readiness and config probe |
+| `browser_ready`, `user_ready` | Browser branch done; persistence started, followed by `USER_READY platform=V2` |
+
 ## Live acceptance gates
 
 Live E2E uses real AWS resources, model/tools and channel messages. Use a dedicated V2 test identity and its saved route. The [runner](operations.md#run-tests) defaults to smoke/lifecycle tests and verifies the manifest even with `--skip-deploy`. `TestColdStart` requires a new identity; `TestFullStartup` checks bound full-OpenClaw completion without a latency floor.
