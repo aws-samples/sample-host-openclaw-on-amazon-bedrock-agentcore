@@ -786,3 +786,48 @@ test("the contract runs the sweep after gateway readiness and before the first t
   const v2Body = contract.slice(v2, contract.indexOf("\n}\n", v2));
   assert.ok(!v2Body.includes("dismissStaleSuspendedDeliveries"), "handleV2Invocation stays untouched");
 });
+
+// ── A run already active on the main session (restart recovery) ─────────────
+// After a container stop with a turn still running, openclaw 2026.9.5 resumes
+// that turn on the next start ("started interrupted main session"). Under the
+// default queue mode ("steer") a chat.send that arrives meanwhile is folded
+// into the resumed run: the ACK and the final carry no text and chat.history
+// has no answer for the new run, so the user got "The request completed
+// without a text response.". With queueMode "interrupt" openclaw stops the
+// resumed run and answers the new message as its own run.
+test("a turn sent while openclaw resumes an interrupted run gets its own answer", async (t) => {
+  const RECOVERY_RUN = "recovered-run";
+  const messages = [userMessage(RECOVERY_RUN, "the interrupted task"), toolOnlyMessage(RECOVERY_RUN, "r")];
+  const sends = [];
+  const gateway = await fakeGateway(t, {
+    methods: HISTORY_METHODS,
+    chat: ({ frame, reply, socket }) => {
+      sends.push(frame.params);
+      const event = (payload) => socket.send(JSON.stringify({ type: "event", event: "chat", payload }));
+      if (frame.params.queueMode !== "interrupt") {
+        // Steered into the recovery run: empty final, no answer for this run.
+        reply(true, { status: "accepted", runId: frame.id });
+        messages.push(userMessage(frame.id, frame.params.message));
+        event({ runId: frame.id, sessionKey: "agent:main:main", state: "final" });
+        return;
+      }
+      // Interrupted: the recovery run is aborted and this message runs alone.
+      reply(true, { status: "accepted", runId: frame.id });
+      event({ runId: RECOVERY_RUN, sessionKey: "agent:main:main", state: "aborted" });
+      messages.push(userMessage(frame.id, frame.params.message),
+        answerMessage(frame.id, "Kilimanjaro is the tallest mountain in Africa."));
+      event({ runId: frame.id, sessionKey: "agent:main:main", state: "final",
+        text: "Kilimanjaro is the tallest mountain in Africa." });
+    },
+    handlers: {
+      "chat.history": ({ reply }) => reply(true, { messages }),
+    },
+  });
+  const result = await gatewayTurn({ url: gateway.url, token: "secret",
+    message: "What is the tallest mountain in Africa?", log: recordingLog() });
+  assert.equal(result.phase, "completed");
+  assert.equal(result.response, "Kilimanjaro is the tallest mountain in Africa.");
+  assert.equal(result.delivery, "history");
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].queueMode, "interrupt");
+});

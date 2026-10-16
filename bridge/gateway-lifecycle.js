@@ -78,6 +78,13 @@ const HISTORY_ATTEMPTS = 2;
 const HISTORY_RETRY_MIN_MS = 100;
 const HISTORY_LIMIT = 100;
 const HISTORY_MAX_CHARS = 500000; // openclaw 2026.9.5 ChatHistoryParamsSchema maximum; default 8000 truncates.
+// The bridge runs one turn at a time, so any run already active on the main
+// session when a turn is sent belongs to nobody waiting on it (for example
+// openclaw's restart recovery of a turn interrupted before a container stop).
+// openclaw 2026.9.5 defaults to "steer": it folds the new message into that run
+// and answers chat.send with an empty final, so the user gets no reply.
+// "interrupt" stops that run and answers this turn as its own run.
+const CHAT_QUEUE_MODE = "interrupt";
 
 function textBlockPhase(block) {
   let signature = block?.textSignature;
@@ -251,7 +258,7 @@ function gatewayTurn({
         runId = randomUUID();
         tracker = createChatRunTracker(runId);
         sent = true; // A lost ACK is not proof that the turn did not run.
-        send(runId, "chat.send", { sessionKey: "global", message, idempotencyKey: runId });
+        send(runId, "chat.send", { sessionKey: "global", message, idempotencyKey: runId, queueMode: CHAT_QUEUE_MODE });
       } else if (stage === "config" && frame.type === "res" && frame.id === configId) {
         if (frame.ok !== true) return finish("not_sent", "Gateway config read rejected");
         configSnapshot = frame.payload;
