@@ -16,6 +16,7 @@ const { preparedSdk } = require("./proxy-sdk-snapshot");
 const { createProxyAuthChild } = require("./proxy-auth-prepare");
 const { createSystemPrefixCache, addToolPrefixCachePoint } = require("./system-prefix-cache");
 const systemPrefixCache = createSystemPrefixCache();
+const { buildRequestMetadata } = require("./request-metadata");
 
 const PORT = 18790;
 // The SDK snapshot owner loads this body only after installing the bound environment.
@@ -161,6 +162,11 @@ function extractSessionMetadata(parsed, headers) {
   }
   const modelOverride = idSource === "identity-file" &&
     typeof identity.modelOverride === "string" ? identity.modelOverride : null;
+  // Per-turn attribution from the contract: the turn kind and the AgentCore
+  // runtime session. Only identifiers; request-metadata.js sanitises them.
+  const trigger = idSource === "identity-file" && identity.trigger === "cron" ? "cron" : "chat";
+  const runtimeSessionId = idSource === "identity-file" &&
+    typeof identity.sessionId === "string" ? identity.sessionId : "";
   if (!actorId && process.env.USER_ID) {
     actorId = process.env.USER_ID;
     channel = process.env.CHANNEL || "unknown";
@@ -177,8 +183,8 @@ function extractSessionMetadata(parsed, headers) {
         `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
       );
     }
-    sessionId = sessionMap.get(key);
-    return { sessionId, actorId, channel, idSource, modelOverride };
+    sessionId = runtimeSessionId || sessionMap.get(key);
+    return { sessionId, actorId, channel, idSource, modelOverride, trigger };
   }
 
   // 1. Check custom headers (future: OpenClaw might set these)
@@ -384,7 +390,7 @@ function extractSessionMetadata(parsed, headers) {
     sessionId = sessionMap.get(key);
   }
 
-  return { sessionId, actorId, channel, idSource };
+  return { sessionId, actorId, channel, idSource, trigger: "chat" };
 }
 
 // Per-user Cognito ID tokens (user provisioning, HMAC-derived password,
@@ -1029,7 +1035,8 @@ function resolveModelId(requestedModel, modelOverride = null) {
  * Call Bedrock Converse API (non-streaming).
  * Accepts optional systemTextOverride and toolConfig for tool use.
  */
-async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel, modelOverride = null) {
+async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel, modelOverride = null,
+  metadataFor = null) {
   const {
     BedrockRuntimeClient,
     ConverseCommand,
@@ -1053,6 +1060,8 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
+  // Attribution for the token_metrics Lambda (see request-metadata.js).
+  if (metadataFor) params.requestMetadata = metadataFor("primary");
   // Without tools on this request, history tool blocks become text (see tool-history.js).
   params.messages = reconcileToolHistory(params.messages, toolConfig);
 
@@ -1135,6 +1144,7 @@ async function invokeBedrockStreaming(
   toolConfig,
   systemPrefix,
   modelOverride = null,
+  metadataFor = null,
 ) {
   if (modelOutcomeUnknown) {
     if (!res.destroyed && !res.writableEnded) {
@@ -1153,11 +1163,13 @@ async function invokeBedrockStreaming(
     fallbackModelId: subagent ? null : FALLBACK_MODEL_ID, response: res,
   });
   try {
-    return await invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix);
+    return await invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix,
+      metadataFor);
   } finally { route?.finish(); }
 }
 
-async function invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix) {
+async function invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix,
+  metadataFor = null) {
   const {
     BedrockRuntimeClient,
     ConverseStreamCommand,
@@ -1187,6 +1199,9 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
       modelId: selectedModelId,
       inferenceConfig: buildInferenceConfig(selectedModelId, temperatureOverride),
       ...(route && modelPolicy.requestFields(selectedModelId)),
+      // Attribution for the token_metrics Lambda; a fallback attempt carries it too.
+      ...(metadataFor && { requestMetadata: metadataFor(
+        route && selectedModelId !== route.modelId(0) ? "fallback" : "primary") }),
     };
     if (params.toolConfig) params.toolConfig = addToolPrefixCachePoint(params.toolConfig, selectedModelId);
     params.system = systemPrefixCache.apply(systemPrefix, params.system, finalSystemText,
@@ -1503,12 +1518,16 @@ const server = http.createServer(async (req, res) => {
         );
 
         // Extract identity for all modes (used for logging + Cognito)
-        const { sessionId, actorId, channel, idSource, modelOverride } =
+        const { sessionId, actorId, channel, idSource, modelOverride, trigger } =
           extractSessionMetadata(parsed, req.headers);
         chatRequestCount++;
 
         // Detect and count subagent requests
         const isSubagent = isSubagentRequest(parsed);
+        // Bedrock requestMetadata for token attribution (identifiers only, sanitised).
+        const metadataFor = (modelRoute) => buildRequestMetadata({
+          actorId, channel, sessionId, subagent: isSubagent, trigger, idSource, modelRoute,
+        });
         if (isSubagent) {
           subagentRequestCount++;
           console.log(
@@ -1640,6 +1659,7 @@ const server = http.createServer(async (req, res) => {
             toolConfig,
             systemPrefix,
             modelOverride,
+            metadataFor,
           );
         } else {
           const result = await invokeBedrock(
@@ -1648,6 +1668,7 @@ const server = http.createServer(async (req, res) => {
             toolConfig,
             parsed.model,
             modelOverride,
+            metadataFor,
           );
           const response = formatChatResponse(result, parsed.model);
           console.log(

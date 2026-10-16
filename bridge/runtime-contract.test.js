@@ -1413,7 +1413,8 @@ test("a linked Slack turn and its Cron retain delivery metadata separately from 
   assert.equal(app.activations[0].env.USER_ID, "telegram:123");
   assert.equal(app.activations[0].env.INTERNAL_USER_ID, "u1");
   const identity = JSON.parse(app.files.get("/tmp/current-identity.json"));
-  assert.deepEqual(identity, { actorId: "telegram:123", channel: "slack", channelActorId: "slack:U456", channelTarget });
+  assert.deepEqual(identity, { actorId: "telegram:123", channel: "slack", channelActorId: "slack:U456", channelTarget,
+    trigger: "chat", sessionId: "session-1" });
   const { schedules, records } = await createCronForIdentity(identity);
   assert.equal(schedules.length, 1);
   assert.match(schedules[0].Name, /^openclaw-telegram_123-/);
@@ -1576,11 +1577,18 @@ test("a payload model override reaches the proxy identity file for that turn onl
   const plain = await app.request({ ...owner, action: "chat", message: "next" });
   assert.equal(plain.body.execution.phase, "completed");
   assert.deepEqual(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)),
-    { actorId: owner.actorId, channel: owner.channel, channelActorId: null, channelTarget: null });
+    { actorId: owner.actorId, channel: owner.channel, channelActorId: null, channelTarget: null,
+      trigger: "chat", sessionId: "session-1" });
 
   const cron = await app.request({ ...owner, action: "cron", message: "scheduled" });
   assert.equal(cron.body.execution.phase, "completed");
   assert.equal(Object.hasOwn(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)), "modelOverride"), false);
+  // The proxy attributes the cron turn's Bedrock calls from this (request-metadata.js).
+  assert.equal(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)).trigger, "cron");
+
+  const next = await app.request({ ...owner, action: "chat", message: "after cron" });
+  assert.equal(next.body.execution.phase, "completed");
+  assert.equal(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)).trigger, "chat");
 });
 
 test("a recycled container applies the override on its first turn", async (t) => {

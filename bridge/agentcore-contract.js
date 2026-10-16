@@ -487,15 +487,20 @@ function stopGateway(waitMs) {
 }
 
 function updateIdentityFile(actorId, channel, channelActorId = null, channelTarget = null,
-  modelOverride = null) {
+  modelOverride = null, { trigger = "chat", sessionId = null } = {}) {
   const tempFile = `${IDENTITY_FILE}.${osRandomUUID()}.tmp`;
   try {
     // modelOverride is per turn: a turn without one (Cron, or no /model choice)
     // rewrites the file without it, so the proxy uses the deployment default.
+    // trigger (chat | cron) and sessionId (the AgentCore runtime session) are
+    // per turn too: the proxy puts them in Bedrock requestMetadata so the
+    // token_metrics Lambda can attribute usage.
     fs.writeFileSync(
       tempFile,
       JSON.stringify({ actorId, channel, channelActorId, channelTarget,
-        ...(modelOverride ? { modelOverride } : {}) }),
+        ...(modelOverride ? { modelOverride } : {}),
+        trigger: trigger === "cron" ? "cron" : "chat",
+        ...(typeof sessionId === "string" && sessionId ? { sessionId } : {}) }),
       "utf-8",
     );
     fs.renameSync(tempFile, IDENTITY_FILE);
@@ -2182,7 +2187,7 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
       stream?.signal.throwIfAborted();
       stream?.ready(v2Lifecycle.snapshot());
       updateIdentityFile(turn.actorId, turn.channel, turn.channelActorId, turn.channelTarget,
-        turn.modelOverride);
+        turn.modelOverride, { trigger: action, sessionId: turn.runtimeSessionId });
       let streamer = null;
       if (action === "chat" && TELEGRAM_BOT_TOKEN && turn.channel === "telegram" &&
           turn.channelActorId && turn.channelTarget) {
