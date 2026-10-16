@@ -349,3 +349,33 @@ test("an empty WS final still reads the answer from chat.history", { skip }, asy
   });
   assert.equal(await loadBridgeMessage(gateway.port, [])("brief please", 5000), BRIEF.trim());
 });
+
+// After a container stop with a turn still running, openclaw 2026.9.5 resumes
+// that turn on the next start. Under its default queue mode ("steer") a
+// chat.send that arrives meanwhile is folded into the resumed run and gets an
+// empty final. queueMode "interrupt" stops the resumed run and answers the
+// new message as its own run.
+test("a turn sent while openclaw resumes an interrupted run gets its own answer", { skip }, async (t) => {
+  const RECOVERY_RUN = "recovered-run";
+  const ANSWER = "Kilimanjaro is the tallest mountain in Africa.";
+  const messages = [userMessage(RECOVERY_RUN, "the interrupted task"), toolOnlyMessage(RECOVERY_RUN, "r")];
+  let queueMode;
+  const gw = await historyGateway(t, {
+    chatEvents: (run) => {
+      queueMode = gw.frames.find((f) => f.method === "chat.send").params.queueMode;
+      if (queueMode !== "interrupt") {
+        messages.push(userMessage(run));
+        return [{ runId: run, sessionKey: MAIN_KEY, seq: 1, state: "final" }];
+      }
+      messages.push(userMessage(run), answerMessage(run, ANSWER));
+      return [{ runId: RECOVERY_RUN, sessionKey: MAIN_KEY, seq: 1, state: "aborted" },
+        { runId: run, sessionKey: MAIN_KEY, seq: 2, state: "final", message: textMsg(ANSWER) }];
+    },
+    history: ({ reply }) => reply(true, { messages }),
+  });
+  const bridgeMessage = loadBridgeMessage(gw.port, []);
+  const text = await bridgeMessage("What is the tallest mountain in Africa?", 5000);
+  assert.equal(text, ANSWER);
+  assert.equal(queueMode, "interrupt");
+  assert.equal(gw.chatSends(), 1);
+});
