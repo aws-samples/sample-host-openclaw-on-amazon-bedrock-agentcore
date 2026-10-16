@@ -99,6 +99,7 @@ function createBrowserFunctions({
       resources: ["credentials", "restore", "skills"] }) },
     currentUserId: binding.userId, currentNamespace: "telegram_1", shuttingDown: false,
     workspaceSync: { assertRestoreReady() {} }, TURN_TIMEOUT_MS: 620000,
+    turnValidityMs: (deadline) => Math.max(620000, deadline - Date.now()) + 60000,
     createHash: require("node:crypto").createHash,
     osRandomUUID: require("./runtime-lifecycle").osRandomUUID,
     randomUUID: replicatedRandomUUID,
