@@ -23,7 +23,16 @@ Earlier images kept a user-neutral OpenClaw gateway (the "live seed") running ac
 
 The bridge therefore starts nothing from OpenClaw before the snapshot. Every activation spawns a fresh gateway process after the snapshot restore (log `seed_ineligible reason=disabled`, then `cold_prepare_start`), so OpenClaw creates its device key and ids from fresh OS entropy. The bridge's own per-user ids (activation generation, run and idempotency keys, proxy session ids) read `/dev/urandom` directly (`osRandomUUID` in `bridge/runtime-lifecycle.js`) and stay safe in the snapshotted contract and proxy processes.
 
-Cost: a new user's first start now pays gateway spawn, module load and boot, like a returning user with small state. See the measured numbers below; new users are no slower than returning users with small state.
+Cost: a new user's first start now pays for the gateway spawn, module load and boot, like a returning user with small state. On us-west-2 staging (16 Oct 2026, Opus 5.5, one plain prompt per fresh session), measured from the invoke:
+
+| Session | Ready (`USER_READY`) | First reply | n |
+|---|---|---|---|
+| New user, live seed (before) | 5.8 s | 9.4-11.9 s | 3 |
+| New user, no seed | 29.4 s median (22.5-74.2) | 35.8 s median (30.9-83.2) | 3, after one first start after the deploy at 51.3 / 60.5 s |
+| Returning, small state | 23.4 s median (23.2-60.7) | 29.9 s median | 3 |
+| Returning, big state (1,276 files) | 30.9 s median (29.1-31.4) | 38.3 s median | 3 |
+
+Most of the new cost is `cold_prepare_start` to `cold_prepare_ack` (spawn and module load: 4-46 s, the long values on some fresh microVMs) and `gateway_activated` to `gateway_ready` (12-18 s). Returning users are unchanged: they already started a fresh gateway. The snapshot no longer holds an OpenClaw process, and bootstrap preparation dropped from about 12-19 s to under 0.1 s.
 
 `OPENCLAW_UNSAFE_SHARED_SEED=1` (exact value; anything else is off) on the AgentCore Runtime environment brings the pre-snapshot seed back for benchmarking. Do not set it for real users: it reintroduces the shared device key and ids described above.
 
