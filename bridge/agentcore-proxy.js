@@ -43,6 +43,7 @@ if (guardrailConfig) {
 
 // Converse inferenceConfig — temperature per model, BEDROCK_TEMPERATURE overrides
 const { buildInferenceConfig, parseTemperatureOverride } = require("./inference-config");
+const { buildRequestMetadata } = require("./request-metadata");
 const temperatureOverride = parseTemperatureOverride(process.env.BEDROCK_TEMPERATURE);
 if (temperatureOverride.invalid !== undefined) {
   console.warn("[proxy] Ignoring invalid BEDROCK_TEMPERATURE=%s (using per-model default)", temperatureOverride.invalid);
@@ -122,6 +123,10 @@ function extractSessionMetadata(parsed, headers) {
   let channel = "unknown";
   let sessionId = "";
   let idSource = "none";
+  // Per-turn attribution from the contract: the turn kind and the AgentCore
+  // runtime session. Only identifiers; request-metadata.js sanitises them.
+  let trigger = "chat";
+  let runtimeSessionId = "";
 
   // 0. Check shared identity file (updated by contract server on each message,
   //    supports cross-channel identity changes for bound users). Falls back to
@@ -134,6 +139,8 @@ function extractSessionMetadata(parsed, headers) {
       actorId = identity.actorId;
       channel = identity.channel || "unknown";
       idSource = "identity-file";
+      if (identity.trigger === "cron") trigger = "cron";
+      if (typeof identity.sessionId === "string") runtimeSessionId = identity.sessionId;
     }
   } catch (_) {
     // File not yet written or unreadable — fall back to env vars
@@ -154,8 +161,8 @@ function extractSessionMetadata(parsed, headers) {
         `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
       );
     }
-    sessionId = sessionMap.get(key);
-    return { sessionId, actorId, channel, idSource };
+    sessionId = runtimeSessionId || sessionMap.get(key);
+    return { sessionId, actorId, channel, idSource, trigger };
   }
 
   // 1. Check custom headers (future: OpenClaw might set these)
@@ -361,7 +368,7 @@ function extractSessionMetadata(parsed, headers) {
     sessionId = sessionMap.get(key);
   }
 
-  return { sessionId, actorId, channel, idSource };
+  return { sessionId, actorId, channel, idSource, trigger: "chat" };
 }
 
 // Per-user Cognito ID tokens (user provisioning, HMAC-derived password,
@@ -997,7 +1004,7 @@ function resolveModelId(requestedModel) {
  * Call Bedrock Converse API (non-streaming).
  * Accepts optional systemTextOverride and toolConfig for tool use.
  */
-async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel) {
+async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel, metadataFor = null) {
   const {
     BedrockRuntimeClient,
     ConverseCommand,
@@ -1020,6 +1027,8 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
+  // Attribution for the token_metrics Lambda (see request-metadata.js).
+  if (metadataFor) params.requestMetadata = metadataFor("primary");
   // Without tools on this request, history tool blocks become text (see tool-history.js).
   params.messages = reconcileToolHistory(params.messages, toolConfig);
 
@@ -1100,6 +1109,7 @@ async function invokeBedrockStreaming(
   model,
   systemTextOverride,
   toolConfig,
+  metadataFor = null,
 ) {
   const {
     BedrockRuntimeClient,
@@ -1123,6 +1133,8 @@ async function invokeBedrockStreaming(
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
+  // Attribution for the token_metrics Lambda; every retry sends the same params.
+  if (metadataFor) params.requestMetadata = metadataFor("primary");
   // Without tools on this request, history tool blocks become text (see tool-history.js).
   params.messages = reconcileToolHistory(params.messages, toolConfig);
 
@@ -1397,12 +1409,16 @@ const server = http.createServer(async (req, res) => {
         );
 
         // Extract identity for all modes (used for logging + Cognito)
-        const { sessionId, actorId, channel, idSource } =
+        const { sessionId, actorId, channel, idSource, trigger } =
           extractSessionMetadata(parsed, req.headers);
         chatRequestCount++;
 
         // Detect and count subagent requests
         const isSubagent = isSubagentRequest(parsed);
+        // Bedrock requestMetadata for token attribution (identifiers only, sanitised).
+        const metadataFor = (modelRoute) => buildRequestMetadata({
+          actorId, channel, sessionId, subagent: isSubagent, trigger, idSource, modelRoute,
+        });
         if (isSubagent) {
           subagentRequestCount++;
           console.log(
@@ -1534,6 +1550,7 @@ const server = http.createServer(async (req, res) => {
             parsed.model,
             systemTextOverride,
             toolConfig,
+            metadataFor,
           );
         } else {
           const result = await invokeBedrock(
@@ -1541,6 +1558,7 @@ const server = http.createServer(async (req, res) => {
             systemTextOverride,
             toolConfig,
             parsed.model,
+            metadataFor,
           );
           const response = formatChatResponse(result, parsed.model);
           console.log(

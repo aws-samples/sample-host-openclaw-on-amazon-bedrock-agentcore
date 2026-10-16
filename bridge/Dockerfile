@@ -177,6 +177,7 @@ COPY cognito-token.js /app/cognito-token.js
 COPY guardrail-scope.js /app/guardrail-scope.js
 COPY tool-history.js /app/tool-history.js
 COPY inference-config.js /app/inference-config.js
+COPY request-metadata.js /app/request-metadata.js
 COPY read-body.js /app/read-body.js
 COPY chat-run-filter.js /app/chat-run-filter.js
 COPY gateway-ops.js /app/gateway-ops.js

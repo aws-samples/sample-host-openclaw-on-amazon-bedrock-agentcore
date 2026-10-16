@@ -232,16 +232,39 @@ function stopGateway(waitMs) {
   });
 }
 
-function updateIdentityFile(actorId, channel) {
+// Token attribution, read by the proxy into Bedrock requestMetadata: the kind
+// of turn now running (chat | cron) and this container's AgentCore runtime
+// session. The trigger changes only when a queued turn is dispatched
+// (setTurnTrigger), so a cron request arriving during a chat turn does not
+// relabel the chat turn's calls.
+let identityTrigger = "chat";
+let identitySessionId = null;
+let lastIdentity = null;
+
+function updateIdentityFile(actorId, channel, { trigger, sessionId } = {}) {
+  if (trigger === "chat" || trigger === "cron") identityTrigger = trigger;
+  if (typeof sessionId === "string" && sessionId) identitySessionId = sessionId;
+  lastIdentity = { actorId, channel };
   try {
     fs.writeFileSync(
       IDENTITY_FILE,
-      JSON.stringify({ actorId, channel }),
+      JSON.stringify({ actorId, channel, trigger: identityTrigger,
+        ...(identitySessionId ? { sessionId: identitySessionId } : {}) }),
       "utf-8",
     );
   } catch (err) {
     console.warn(`[contract] Failed to write identity file: ${err.message}`);
   }
+}
+
+/** The AgentCore runtime session of this invocation (one per container). */
+function runtimeSessionHeader(req) {
+  const value = req?.headers?.["x-amzn-bedrock-agentcore-runtime-session-id"];
+  return typeof value === "string" ? value : null;
+}
+
+function setTurnTrigger(trigger) {
+  if (lastIdentity) updateIdentityFile(lastIdentity.actorId, lastIdentity.channel, { trigger });
 }
 
 /**
@@ -2001,6 +2024,7 @@ async function processMessageQueue() {
     }
 
     try {
+      entry.onDispatch?.();
       const response = await bridgeMessage(message, timeoutMs, onDelta, { outcome: entry.outcome });
       resolve(response);
     } catch (err) {
@@ -2020,10 +2044,11 @@ async function processMessageQueue() {
  *   dropped (rejects "Turn deadline exceeded in queue") and never sent, and a
  *   dispatched turn's WebSocket wait ends by it. Chat turns pass none.
  * @param {object} [opts.outcome] - passed to bridgeMessage (receives `kind`)
+ * @param {function} [opts.onDispatch] - called just before the turn is sent
  */
-function enqueueMessage(message, onDelta, { deadline, outcome } = {}) {
+function enqueueMessage(message, onDelta, { deadline, outcome, onDispatch } = {}) {
   return new Promise((resolve, reject) => {
-    const entry = { message, onDelta, resolve, reject, deadline, outcome };
+    const entry = { message, onDelta, resolve, reject, deadline, outcome, onDispatch };
     if (deadline !== undefined) {
       entry.expiryTimer = setTimeout(() => {
         const index = messageQueue.indexOf(entry);
@@ -2470,11 +2495,11 @@ function cronFailureText(message) {
  * so far and never the lightweight agent (the real gateway is up by now).
  * A turn still queued at the deadline is never sent.
  */
-async function runCronTurn(message, deadline) {
+async function runCronTurn(message, deadline, onDispatch) {
   const outcome = {};
   let text = "";
   try {
-    text = await enqueueMessage(message, undefined, { deadline, outcome });
+    text = await enqueueMessage(message, undefined, { deadline, outcome, onDispatch });
   } catch (err) {
     console.error("[contract] Cron turn not run:", err?.message || "unknown");
     return { response: cronFailureText(message), status: "error" };
@@ -2624,7 +2649,7 @@ const server = http.createServer(async (req, res) => {
           }
 
           // Update shared identity file so proxy picks up cross-channel changes
-          updateIdentityFile(actorId, channel || "unknown");
+          updateIdentityFile(actorId, channel || "unknown", { sessionId: runtimeSessionHeader(req) });
 
           // Block until init completes (unlike chat which returns immediately)
           if (!openclawReady || !proxyReady) {
@@ -2664,7 +2689,7 @@ const server = http.createServer(async (req, res) => {
           let reply;
           try {
             // Serialized with chat messages to prevent WebSocket races.
-            reply = await runCronTurn(message, budget.deadline);
+            reply = await runCronTurn(message, budget.deadline, () => setTurnTrigger("cron"));
           } finally {
             activeTaskCount = Math.max(0, activeTaskCount - 1);
           }
@@ -2692,7 +2717,7 @@ const server = http.createServer(async (req, res) => {
           }
 
           // Update shared identity file so proxy picks up cross-channel changes
-          updateIdentityFile(actorId, channel || "unknown");
+          updateIdentityFile(actorId, channel || "unknown", { sessionId: runtimeSessionHeader(req) });
 
           // Trigger init if not done yet (blocks until proxy is ready)
           if (!proxyReady && !initInProgress) {
@@ -2765,7 +2790,8 @@ const server = http.createServer(async (req, res) => {
             if (openclawReady) {
               // Full OpenClaw path — WebSocket bridge
               try {
-                responseText = await enqueueMessage(bridgeText, onDelta);
+                responseText = await enqueueMessage(bridgeText, onDelta,
+                  { onDispatch: () => setTurnTrigger("chat") });
               } catch (bridgeErr) {
                 console.error(
                   `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,

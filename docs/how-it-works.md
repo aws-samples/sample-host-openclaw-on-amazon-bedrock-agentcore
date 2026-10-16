@@ -350,6 +350,13 @@ Requests that fail validation receive a 401 response and are logged with the sou
 
 Bedrock invocation logs flow to CloudWatch, where a Lambda processor extracts token counts, estimates costs, and writes to DynamoDB (single-table design with 4 GSIs for different query patterns). Custom CloudWatch metrics power the analytics dashboard and budget alarms.
 
+- **Attribution.** The proxy sets Bedrock [`requestMetadata`](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html) on every Converse and ConverseStream call, sub-agent calls and retries included (`bridge/request-metadata.js`). Bedrock copies it into the invocation log record, and `lambda/token_metrics/index.py` attributes usage from it:
+  - `openclaw.actor_id`: the bound actor, or `default-user` when the proxy has no identity (then `openclaw.identity` is `unbound`).
+  - `openclaw.channel`, and `openclaw.session_id` (the AgentCore runtime session).
+  - `openclaw.agent_type`: `main`, `subagent` or `cron` (a sub-agent is `subagent` whatever started it). Also sent: `openclaw.trigger` (`chat` / `cron`, set by the contract when a queued turn is dispatched), `openclaw.id_source` and `openclaw.model_route`.
+  - Values are identifiers only, never message content or secrets. Each is reduced to Bedrock's allowed characters and at most 128 characters; a value that does not fit is sent as a truncated SHA-256 hash.
+  - The DynamoDB sort key is `DATE#<day>#CHANNEL#<channel>#SESSION#<session>#AGENT#<agent_type>`, and the row also stores `agentType` and `attribution` (`request-metadata`, `legacy` or `none`). A record without `requestMetadata` (written before this, or by another caller in the account) keeps the defaults `default-user` / `default-session` / `unknown` and the sort key without `#AGENT#`, so it accumulates into the same row as before. CloudWatch dimensions are unchanged.
+
 ## Implementation Notes
 
 Behaviour that is easy to get wrong when changing the bridge or the stacks (formerly the README's Gotchas section).
