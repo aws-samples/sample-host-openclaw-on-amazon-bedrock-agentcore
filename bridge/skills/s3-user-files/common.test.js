@@ -102,6 +102,10 @@ describe("validateUserId", () => {
     assert.doesNotThrow(() => validateUserId("discord_123456789012345678"));
   });
 
+  it("accepts valid line namespace", () => {
+    assert.doesNotThrow(() => validateUserId("line_U0000000000000000000000000000001"));
+  });
+
   it("accepts valid slack namespace with uppercase ID", () => {
     assert.doesNotThrow(() => validateUserId("slack_U0XXXXXXXX1"));
   });

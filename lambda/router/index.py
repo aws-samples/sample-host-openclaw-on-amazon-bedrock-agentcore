@@ -1,4 +1,4 @@
-"""Router Lambda — Webhook ingestion for Telegram, Slack, Feishu, and WhatsApp.
+"""Router Lambda — Webhook ingestion for Telegram, Slack, Feishu, WhatsApp, Discord, and LINE.
 
 Receives webhook events via API Gateway HTTP API, resolves user identity via
 DynamoDB, invokes the per-user AgentCore Runtime session, and sends responses
@@ -10,6 +10,8 @@ Path routing:
   POST /webhook/feishu    — Feishu Events API webhook
   GET  /webhook/whatsapp  — WhatsApp Cloud API subscription verification
   POST /webhook/whatsapp  — WhatsApp Cloud API webhook (disabled until configured)
+  POST /webhook/discord   — Discord Interactions endpoint (disabled until configured)
+  POST /webhook/line      — LINE Messaging API webhook (disabled until configured)
 """
 
 import hashlib
@@ -43,6 +45,7 @@ from documents import (
 )
 import whatsapp
 import discord_channel
+import line_channel
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -55,6 +58,7 @@ FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 DISCORD_TOKEN_SECRET_ID = os.environ.get("DISCORD_TOKEN_SECRET_ID", "")
 WHATSAPP_TOKEN_SECRET_ID = os.environ.get("WHATSAPP_TOKEN_SECRET_ID", "")
+LINE_TOKEN_SECRET_ID = os.environ.get("LINE_TOKEN_SECRET_ID", "")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
@@ -174,6 +178,13 @@ def _get_whatsapp_config():
     if not WHATSAPP_TOKEN_SECRET_ID:
         return None
     return whatsapp.parse_config(_get_secret(WHATSAPP_TOKEN_SECRET_ID))
+
+
+def _get_line_config():
+    """Return the LINE channel config, or None when the channel is not configured."""
+    if not LINE_TOKEN_SECRET_ID:
+        return None
+    return line_channel.parse_config(_get_secret(LINE_TOKEN_SECRET_ID))
 
 
 def _get_discord_config():
@@ -2272,6 +2283,115 @@ def _handle_whatsapp_message(config, msg):
     whatsapp.send_text(config, wa_id, response_text)
 
 
+LINE_DEDUP_TTL_SECONDS = 86400
+
+
+def _claim_line_event(event_id):
+    """Record a webhookEventId so redeliveries and replays run once. False = duplicate."""
+    try:
+        identity_table.put_item(
+            Item={"PK": f"DEDUP#line:{event_id}", "SK": "DEDUP",
+                  "ttl": int(time.time()) + LINE_DEDUP_TTL_SECONDS},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("LINE dedupe write failed: %s", type(e).__name__)
+        return True
+
+
+def handle_line(body):
+    """Process a verified LINE webhook (async dispatch)."""
+    config = _get_line_config()
+    if config is None:
+        logger.error("LINE: channel not configured; event dropped")
+        return
+    try:
+        payload = json.loads(body) if isinstance(body, str) else body
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("LINE: body is not JSON")
+        return
+    for event in line_channel.extract_events(payload, config["botUserId"]):
+        if not _claim_line_event(event["event_id"]):
+            logger.info("LINE: duplicate event ignored")
+            continue
+        try:
+            _handle_line_event(config, event)
+        except RouteUnavailable as e:
+            logger.error("LINE: route unavailable: %s", type(e).__name__)
+            line_channel.send_text(config, event["user_id"],
+                                   "Sorry, your account needs attention. Please contact the bot admin.",
+                                   event["reply_token"])
+
+
+def _handle_line_event(config, event):
+    line_user_id = event["user_id"]
+    text = event["text"].strip()
+    has_image = bool(event["message_id"])
+    if not text and not has_image:
+        return
+
+    def reply(message):
+        # The reply token is single-use; later sends go through push.
+        token, event["reply_token"] = event["reply_token"], ""
+        line_channel.send_text(config, line_user_id, message, token)
+
+    actor_id = f"line:{line_user_id}"
+    is_bind, code = _is_bind_command(text)
+    if is_bind:
+        _, success = redeem_bind_code(code, "line", line_user_id)
+        reply("Accounts linked successfully! Your sessions are now unified."
+              if success else "Invalid or expired link code. Please try again.")
+        return
+
+    resolved_user_id, _ = resolve_user("line", line_user_id)
+    if resolved_user_id is None:
+        reply(f"Sorry, this bot is private and requires an invitation.\n\n"
+              f"Your ID: line:{line_user_id}\n\n"
+              f"Send this ID to the bot admin to request access.")
+        return
+
+    route = get_or_create_session(resolved_user_id)
+    authorize_channel_actor(identity_table, route, resolved_user_id, actor_id, "line")
+
+    if _is_link_command(text):
+        bind_code = create_bind_code(resolved_user_id)
+        if not bind_code:
+            reply("Account linking requires identity reconciliation.")
+            return
+        reply(f"Your link code is: {bind_code}\n\nEnter this code on another channel within 10 minutes "
+              f"by typing: link {bind_code}")
+        return
+
+    # Handle /model (per-user model switching); the reply is not forwarded to the agent.
+    model_argument = None if has_image else _parse_model_command(text)
+    if model_argument is not None:
+        reply(handle_model_command(resolved_user_id, model_argument, code=False))
+        return
+
+    line_channel.show_loading(config, line_user_id)
+    agent_message = text
+    if has_image:
+        namespace = route.actor_id.replace(":", "_")
+        image_bytes, content_type = line_channel.download_image(
+            config, event["message_id"], ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES)
+        s3_key = _upload_image_to_s3(image_bytes, namespace, content_type) if image_bytes else None
+        if not s3_key:
+            reply("Sorry, I couldn't process that image. Please try again.")
+            return
+        agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
+
+    logger.info("LINE: user=%s actor=%s msg_len=%d has_image=%s redelivery=%s",
+                resolved_user_id, actor_id, len(text), has_image, event["redelivery"])
+    result = invoke_agent_runtime(route, resolved_user_id, actor_id, "line", agent_message,
+                                  channel_target=line_user_id,
+                                  model_override=get_model_override(resolved_user_id))
+    response_text = result.get("response", "Sorry, I couldn't process your message.")
+    reply(_extract_text_from_content_blocks(response_text))
+
+
 def _discord_json(payload):
     return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(payload)}
 
@@ -2435,6 +2555,8 @@ def handler(event, context):
             handle_whatsapp(body)
         elif channel == "discord":
             handle_discord(body)
+        elif channel == "line":
+            handle_line(body)
         return {"statusCode": 200, "body": "ok"}
 
     # --- Function URL entry point ---
@@ -2548,6 +2670,19 @@ def handler(event, context):
 
     elif path.endswith("/webhook/discord"):
         return _discord_entry(headers, body, http_info)
+
+    elif path.endswith("/webhook/line"):
+        # Disabled (404) until the secret holds a complete JSON config.
+        config = _get_line_config()
+        if config is None:
+            return {"statusCode": 404, "body": "Not found"}
+        # Verify the signature over the raw body before parsing anything.
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+        if not line_channel.verify_signature(headers, body_bytes, config["channelSecret"]):
+            logger.warning("LINE webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+        _self_invoke_async("line", body, {})
+        return {"statusCode": 200, "body": "ok"}
 
     return {"statusCode": 404, "body": "Not found"}
 

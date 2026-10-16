@@ -1,4 +1,4 @@
-# Channel Setup: Slack, Feishu and WhatsApp
+# Channel Setup: Slack, Feishu, WhatsApp, Discord and LINE
 
 Detailed setup for the Slack and Feishu channels. Telegram, the quick-start channel, is covered in the [README](../README.md#telegram).
 
@@ -123,3 +123,67 @@ Security model:
 Limits: text and images (WhatsApp sends JPEG and PNG) are supported; other message types are ignored. Replies longer than 4,000 characters are split. WhatsApp only allows free-form messages within 24 hours of the user's last message, so scheduled-task results (cron) reach WhatsApp users only inside that window; outside it Meta rejects the send and the cron Lambda logs a delivery failure. Sending business-initiated template messages is not implemented.
 
 To turn the channel off again, put any non-JSON value back in the secret (for example `aws secretsmanager put-secret-value --secret-id openclaw/channels/whatsapp --secret-string disabled`); both routes return 404 once the cache expires.
+
+## Discord
+
+Discord delivers ordinary chat messages only over its Gateway websocket, which a Lambda cannot keep open. OpenClaw therefore uses Discord's **Interactions endpoint** (`POST /webhook/discord`): users talk to the bot with the `/ask` slash command, in a DM with the bot or in a server. Plain messages that don't use `/ask` are not received. The channel is **off by default**: the route returns 404 until `openclaw/channels/discord` holds a JSON config with `applicationId` and `publicKey`.
+
+Security model:
+- Every request must carry `X-Signature-Ed25519` over `X-Signature-Timestamp` + raw body, verified with the application's public key (OpenSSL Ed25519 via the system `libcrypto`, no extra packages) before the body is parsed. Missing or invalid signatures get 401, which Discord also tests when you save the endpoint URL.
+- Timestamps more than 5 minutes off are rejected, and interaction IDs are recorded for an hour so a replayed request runs once.
+- Interactions for another application ID, from bot users, or for unknown commands are refused. Replies go back through the interaction's webhook (no bot token needed at runtime), with mentions disabled so model output can't ping `@everyone`. In servers, replies are visible only to the person who ran the command.
+- Same allowlist and `link` account binding as other channels. User IDs are `discord:<user ID>`.
+
+1. Create an application at the [Discord Developer Portal](https://discord.com/developers/applications).
+2. On **General Information**, copy the **Application ID** and **Public Key**.
+3. On **Bot**, reset and copy the **token** (only `scripts/setup-discord.py` uses it, to register commands). Privileged intents are not needed.
+4. Store the config:
+   ```bash
+   aws secretsmanager update-secret \
+     --secret-id openclaw/channels/discord \
+     --secret-string '{"applicationId":"123456789012345678","publicKey":"<64 hex chars>","botToken":"<bot token>"}' \
+     --region $CDK_DEFAULT_REGION
+   ```
+5. Register the `/ask` and `/link` commands and print the endpoint URL (use the API URL from the Slack section):
+   ```bash
+   ./scripts/setup-discord.py --region $CDK_DEFAULT_REGION --print-url https://<api-id>.execute-api.<region>.amazonaws.com/
+   ```
+6. On **General Information**, paste the printed URL into **Interactions Endpoint URL** and save. Discord sends a signed PING (and some deliberately bad signatures) and saves only if the endpoint answers correctly. If the secret was just changed, wait up to 15 minutes for the Router Lambda's secret cache to expire.
+7. On **Installation**, enable **User Install** (to use the bot in DMs anywhere) and/or **Guild Install** with the `applications.commands` scope, then open the install link.
+8. Run `/ask prompt: hello`. The bot replies with your ID; allow it:
+   ```bash
+   ./scripts/manage-allowlist.sh add discord:YOUR_USER_ID
+   ```
+
+Limits: one `/ask` is one turn; the reply must arrive within Discord's 15-minute interaction window and is split into 1,900-character messages. Images can be attached with the `image` option (JPEG, PNG, GIF, WebP, up to 3.75 MB). Scheduled-task (cron) results are not delivered to Discord yet, because delivery outside an interaction needs the bot to DM the user with its bot token.
+
+## LINE
+
+LINE uses the **LINE Messaging API** with the Router Lambda as the webhook (`POST /webhook/line`). It is **off by default**: the route returns 404 until `openclaw/channels/line` holds a JSON config with `channelSecret` and `channelAccessToken`.
+
+Security model:
+- Every request must carry `X-Line-Signature` = base64 HMAC-SHA256 of the raw body with the channel secret, compared in constant time before the body is parsed. Missing, malformed or wrong signatures get 401.
+- LINE signs no timestamp, so each event's own `timestamp` must be within 5 minutes (1 hour for events LINE marks as redelivered, which is inside the signed body). `webhookEventId` values are recorded in the identity table for 24 hours, so redeliveries and replays run once.
+- Only 1:1 chats with the bot are handled; group and room messages, standby-mode events and other event types are ignored. If `botUserId` is set in the secret, events addressed to another bot (`destination`) are ignored too.
+- Same allowlist and `link` account-binding flow as other channels. User IDs are `line:U<32 hex>`. Logs never include the channel secret, access token, reply token or message text.
+
+1. In the [LINE Developers Console](https://developers.line.biz/console/), create a provider and a **Messaging API** channel (this also creates a LINE Official Account).
+2. On **Basic settings**, copy the **Channel secret**. On **Messaging API**, issue a **Channel access token (long-lived)**. Optionally look up the bot's own user ID for `botUserId` with `curl -H "Authorization: Bearer <token>" https://api.line.me/v2/bot/info` (field `userId`). **Your user ID** on Basic settings is your own LINE ID, which you'll allowlist in step 6.
+3. Store the config (`botUserId` is optional):
+   ```bash
+   aws secretsmanager put-secret-value \
+     --secret-id openclaw/channels/line \
+     --secret-string '{"channelSecret":"YOUR_CHANNEL_SECRET","channelAccessToken":"YOUR_LONG_LIVED_TOKEN","botUserId":"U0123456789abcdef0123456789abcdef"}' \
+     --region $CDK_DEFAULT_REGION
+   ```
+   The secret is created by the OpenClawSecurity stack. The Router Lambda caches secrets for up to 15 minutes, so a change can take that long to apply.
+4. On **Messaging API** > **Webhook settings**, set the **Webhook URL** to your API URL followed by `webhook/line` (see the Slack section for how to get the API URL), turn on **Use webhook**, and click **Verify** (LINE sends a signed request with no events; the router answers 200). Turning on **Webhook redelivery** is optional; redelivered events are handled once.
+5. In the LINE Official Account Manager (or **Messaging API** > **LINE Official Account features**), turn off **Auto-reply messages** and **Greeting messages** so only OpenClaw answers.
+6. Add the bot as a friend (QR code on the **Messaging API** tab) and send a message. The bot replies with your ID; allow it:
+   ```bash
+   ./scripts/manage-allowlist.sh add line:U0123456789abcdef0123456789abcdef
+   ```
+
+Replies: the router answers with the event's reply token when it is still valid. Agent turns often outlast it, so when LINE rejects the token the reply is sent with the push API instead, which counts against your plan's monthly message quota. While the agent works, LINE's loading animation is shown in the chat (free). Text is split into 4,900-character messages. Images (JPEG, PNG, GIF, WebP, up to 3.75 MB) are supported; other message types are ignored. Scheduled-task (cron) results are delivered with the push API.
+
+To turn the channel off again, put a non-JSON value back in the secret, e.g. `--secret-string disabled-placeholder`; the route returns 404 once the cache expires.

@@ -63,7 +63,8 @@ class SecurityStack(Stack):
         )
 
         # --- Channel bot token placeholders -------------------------------
-        channel_names = ["whatsapp", "telegram", "discord", "slack", "feishu"]
+        # Append new channels at the end so existing construct IDs stay stable.
+        channel_names = ["whatsapp", "telegram", "discord", "slack", "feishu", "line"]
         self.channel_secrets: dict[str, secretsmanager.Secret] = {}
         for channel in channel_names:
             self.channel_secrets[channel] = secretsmanager.Secret(

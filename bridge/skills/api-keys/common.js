@@ -9,7 +9,7 @@ if (!REGION) {
 }
 
 const VALID_KEY_NAME = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
-const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp)_[a-zA-Z0-9_-]{1,64}$/;
+const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp|line)_[a-zA-Z0-9_-]{1,64}$/;
 
 function validateUserId(userId) {
   if (!userId) {

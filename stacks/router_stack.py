@@ -1,9 +1,9 @@
-"""Router Stack — API Gateway HTTP API for Telegram/Slack/Feishu/WhatsApp webhook ingestion.
+"""Router Stack — API Gateway HTTP API for Telegram/Slack/Feishu/WhatsApp/Discord/LINE webhook ingestion.
 
 Deploys the Router Lambda behind an API Gateway HTTP API with explicit
 routes for each webhook path. Webhook secret validation (Telegram
 secret_token header, Slack HMAC signature, Feishu X-Lark-Signature,
-WhatsApp X-Hub-Signature-256)
+WhatsApp X-Hub-Signature-256, Discord Ed25519, LINE X-Line-Signature)
 is enforced inside the Lambda. Also creates the DynamoDB identity table
 for user resolution and cross-channel binding.
 """
@@ -44,6 +44,7 @@ class RouterStack(Stack):
         webhook_secret_name: str,
         whatsapp_token_secret_name: str = "",
         discord_token_secret_name: str = "",
+        line_token_secret_name: str = "",
         cmk_arn: str,
         user_files_bucket_name: str,
         user_files_bucket_arn: str,
@@ -121,6 +122,7 @@ class RouterStack(Stack):
                 "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
                 "WHATSAPP_TOKEN_SECRET_ID": whatsapp_token_secret_name,
                 "DISCORD_TOKEN_SECRET_ID": discord_token_secret_name,
+                "LINE_TOKEN_SECRET_ID": line_token_secret_name,
                 "WEBHOOK_SECRET_ID": webhook_secret_name,
                 "REGISTRATION_OPEN": registration_open,
                 "USER_FILES_BUCKET": user_files_bucket_name,
@@ -172,6 +174,13 @@ class RouterStack(Stack):
         )
         self.http_api.add_routes(
             path="/webhook/discord",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=lambda_integration,
+        )
+        # LINE Messaging API webhook. Returns 404 from the Lambda until the
+        # channel secret is configured.
+        self.http_api.add_routes(
+            path="/webhook/line",
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
@@ -320,12 +329,13 @@ class RouterStack(Stack):
             [
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-APIG4",
-                    reason="External webhooks (Telegram, Slack, Feishu, WhatsApp) cannot use "
+                    reason="External webhooks (Telegram, Slack, Feishu, WhatsApp, Discord, LINE) cannot use "
                     "IAM/JWT auth. Webhook signature validation is enforced in the Lambda "
                     "handler: Telegram X-Telegram-Bot-Api-Secret-Token header, Slack "
                     "X-Slack-Signature HMAC, Feishu X-Lark-Signature and WhatsApp "
                     "X-Hub-Signature-256 HMAC (plus a constant-time verify-token check on "
-                    "its GET subscription route). API Gateway throttling provides rate "
+                    "its GET subscription route), Discord X-Signature-Ed25519 and LINE "
+                    "X-Line-Signature HMAC. API Gateway throttling provides rate "
                     "limiting. Only explicit routes are exposed.",
                 ),
                 cdk_nag.NagPackSuppression(

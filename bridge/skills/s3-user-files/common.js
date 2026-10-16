@@ -89,7 +89,7 @@ function validateUserId(userId) {
   // This prevents prompt injection attacks where a user tricks the AI into using
   // an arbitrary namespace to access another user's files.
   const VALID_NAMESPACE =
-    /^(telegram|slack|discord|whatsapp)_[a-zA-Z0-9_-]{1,64}$/;
+    /^(telegram|slack|discord|whatsapp|line)_[a-zA-Z0-9_-]{1,64}$/;
   if (!VALID_NAMESPACE.test(userId)) {
     console.error(
       `Error: Invalid user_id "${userId}". Must match channel_identifier format (e.g., telegram_123456, slack_username).`,
