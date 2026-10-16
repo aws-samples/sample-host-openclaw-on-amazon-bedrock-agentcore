@@ -119,10 +119,10 @@ V2 lifecycle:
 
 ```mermaid
 flowchart TD
-    B["BOOTSTRAPPING: prepare user-neutral live gateway"] --> S["BOOTSTRAP_READY: snapshot boundary"]
+    B["BOOTSTRAPPING: prepare contract and proxy (no gateway)"] --> S["BOOTSTRAP_READY: snapshot boundary"]
     S --> R["First invocation: bind user, actor, session, generation"]
     R --> A["BINDING: scoped credentials, strict restore"]
-    A --> G["Bind eligible prepared gateway<br/>or start gateway for restored/custom state"]
+    A --> G["Start a fresh gateway after snapshot restore"]
     G --> V["startupz, protocol-4 token handshake, last-heartbeat"]
     V --> P["Browser, skills, persistence ready"]
     P --> U["USER_READY: serialized OpenClaw turns"]

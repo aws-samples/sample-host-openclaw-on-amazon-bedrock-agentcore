@@ -13,12 +13,13 @@ function deferred() {
   return { promise, resolve };
 }
 
-function fixture(t, changes = {}) {
+// Most tests exercise the opt-in shared seed; the default (no seed) has its own tests below.
+function fixture(t, changes = {}, extraEnv = { OPENCLAW_UNSAFE_SHARED_SEED: "1" }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "live-seed-bridge-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const paths = stateStorage.resolvePaths({ homeDir: home });
   const binding = Object.freeze({ actorId: "slack:test-user", userId: "test-user" });
-  const env = { HOME: home, USER_ID: binding.actorId, INTERNAL_USER_ID: binding.userId };
+  const env = { HOME: home, USER_ID: binding.actorId, INTERNAL_USER_ID: binding.userId, ...extraEnv };
   const abort = new AbortController();
   const scope = { generation: "test-generation", signal: abort.signal,
     checkpoint: () => abort.signal.throwIfAborted() };
@@ -89,6 +90,79 @@ function fixture(t, changes = {}) {
       AWS_SDK_LOAD_CONFIG: "1" }, waitMs: 1000 };
   return { bridge, owner, calls, input, current, abort, paths, workspaceSync };
 }
+
+test("by default a new user never binds the seed: nothing starts before the snapshot", async (t) => {
+  let owners = 0, tokens = 0;
+  const f = fixture(t, {
+    createOwner: async () => { owners++; return null; },
+    readToken: async () => { tokens++; return "test-gateway-token"; },
+  }, {});
+  assert.equal(f.bridge.sharedSeedEnabled, false);
+  assert.deepEqual(await f.bridge.prepare(), { status: "deferred" });
+  assert.equal(f.bridge.prepared, false);
+  assert.equal(f.bridge.child, undefined);
+  assert.deepEqual(f.calls, []);
+  assert.equal(fs.existsSync(f.paths.stateDir), false, "no seed files before the snapshot");
+  const phases = [];
+  f.input.onPhase = (name, details) => phases.push(details ? `${name}:${JSON.stringify(details)}` : name);
+  assert.deepEqual(await f.bridge.restoreForBinding(f.input), { status: "cold" });
+  assert.deepEqual(phases, ['seed_ineligible:{"reason":"disabled"}', "cold_prepare_start", "cold_prepare_ack"]);
+  // The gateway is spawned at binding (after restore); the seed restore and bind never run.
+  assert.deepEqual(f.calls, ["cold"]);
+  await f.bridge.activate({ generation: f.input.scope.generation });
+  assert.deepEqual(f.calls, ["cold", "cold-activate"]);
+  assert.equal(owners, 0);
+  assert.equal(tokens, 0);
+  await f.bridge.stop();
+  assert.deepEqual(f.calls, ["cold", "cold-activate", "cold-stop"]);
+});
+
+for (const value of ["", "0", "true", "yes", " 1"]) {
+  test(`OPENCLAW_UNSAFE_SHARED_SEED=${JSON.stringify(value)} keeps the seed off`, async (t) => {
+    const f = fixture(t, {}, { OPENCLAW_UNSAFE_SHARED_SEED: value });
+    assert.equal(f.bridge.sharedSeedEnabled, false);
+    assert.equal((await f.bridge.prepare()).status, "deferred");
+    assert.equal((await f.bridge.restoreForBinding(f.input)).status, "cold");
+    assert.deepEqual(f.calls, ["cold"]);
+  });
+}
+
+test("by default no gateway is spawned before the snapshot even when the seed would be ineligible", async (t) => {
+  // Gateway MCP and a missing token used to start the cold gateway at bootstrap (pre-snapshot).
+  for (const changes of [{ readToken: async () => null }, {}]) {
+    const f = fixture(t, changes, changes.readToken ? {} : { AGENTCORE_GATEWAY_URL: "https://gateway.test" });
+    await f.bridge.prepare();
+    assert.deepEqual(f.calls, []);
+    assert.equal((await f.bridge.restoreForBinding(f.input)).status, "cold");
+    assert.deepEqual(f.calls, ["cold"]);
+  }
+});
+
+test("by default a binding change or stop around the cold spawn cannot activate", async (t) => {
+  const f = fixture(t, {}, {});
+  await f.bridge.prepare();
+  f.current.binding = { actorId: "slack:other", userId: "other" };
+  await assert.rejects(f.bridge.restoreForBinding(f.input), /binding mismatch|changed/);
+  assert.ok(!f.calls.includes("cold"));
+  const g = fixture(t, {}, {});
+  await g.bridge.prepare();
+  await g.bridge.stop();
+  await assert.rejects(g.bridge.restoreForBinding(g.input), /stopped/);
+  await assert.rejects(g.bridge.activate({}), /stopped/);
+  assert.deepEqual(g.calls, []);
+  const h = fixture(t, {}, {});
+  await h.bridge.prepare();
+  h.input.onPhase = (name) => { if (name === "cold_prepare_ack") h.abort.abort(new Error("aborted")); };
+  await assert.rejects(h.bridge.restoreForBinding(h.input), /aborted/);
+  assert.deepEqual(h.calls, ["cold", "cold-stop"]);
+});
+
+test("OPENCLAW_UNSAFE_SHARED_SEED=1 opts back into the pre-snapshot seed", async (t) => {
+  const f = fixture(t);
+  assert.equal(f.bridge.sharedSeedEnabled, true);
+  assert.deepEqual(await f.bridge.prepare(), { status: "prepared", pid: 1234 });
+  assert.deepEqual(f.calls, ["prepare", "child"]);
+});
 
 test("adoption retains full config/AGENTS and the same child through activation", async (t) => {
   const f = fixture(t);

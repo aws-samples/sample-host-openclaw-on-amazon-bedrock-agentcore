@@ -5,7 +5,7 @@ AgentCore Runtime V2 prepares your agent environment once, takes a snapshot, and
 - Consistent cold starts: snapshot restore keeps cold-start latency fast and consistent regardless of concurrency or image size.
 - Lower cost for always-on or bursty agents: billing follows active resource use, while AgentCore Runtime reclaims memory as the agent releases it and reduces platform overhead.
 
-This image prepares a user-neutral OpenClaw gateway; user state is restored during activation.
+This image snapshots the contract server and the Bedrock proxy only. Each user's OpenClaw gateway is started after the snapshot restore, during activation; see [No pre-snapshot gateway](#no-pre-snapshot-gateway).
 
 V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1` and `ap-northeast-1` ([AWS: supported Regions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions)); `V2_REGIONS` in `scripts/runtime_deploy.py` rejects other Regions. For other Regions and for existing V1 deployments, see [the `release/v1` branch](release-v1.md).
 
@@ -13,7 +13,19 @@ The pinned SDK controller explicitly sets `platformVersion="V2"`; CDK manages fo
 
 ## Lifecycle and compatibility
 
-Before healthy `/ping`, bootstrap prepares the live gateway without user state, scoped credentials, external Browser sessions or user model/tool calls. Activation binds the user, acquires credentials and strictly restores state and skills. Eligible empty-state sessions bind the prepared gateway; restored or custom state uses normal gateway startup. Chat and cron wait for `USER_READY`: credentials, proxy, gateway, configured Browser and persistence must all be ready.
+Before healthy `/ping`, bootstrap prepares the contract and the proxy SDK child without user state, scoped credentials, external Browser sessions or user model/tool calls. It starts no OpenClaw gateway. Activation binds the user, acquires credentials, starts the gateway and strictly restores state and skills. New and returning users take the same gateway startup path. Chat and cron wait for `USER_READY`: credentials, proxy, gateway, configured Browser and persistence must all be ready.
+
+### No pre-snapshot gateway
+
+A process that is running when the snapshot is taken resumes with the same random-number state in every restored microVM. AWS documents that snapshot-safe crypto libraries "don't currently reseed after a restore", and recommends generating secrets, keys, tokens and session identifiers while handling a request, from the OS (`/dev/urandom`) rather than a crypto library ([Optimize for Runtime V2: use snapshot-safe cryptographic libraries](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-v2-optimize.html)). Node's `crypto.randomUUID()` cache, OpenSSL's DRBG and `Math.random` all live in process memory, and Node has no API to reseed them.
+
+Earlier images kept a user-neutral OpenClaw gateway (the "live seed") running across the snapshot and bound it to each new user, which made the first start of a new user ready in about 6 s. Every new user bound to the same runtime version then received the same OpenClaw device Ed25519 private key and `device_id`, the same `boot_id`, main session id and transcript/audit event ids, and the same OpenSSL state for TLS until OpenSSL's hourly reseed. The gateway listens only on loopback inside each microVM, so no other user could use the key, but it is still a secret shared across users.
+
+The bridge therefore starts nothing from OpenClaw before the snapshot. Every activation spawns a fresh gateway process after the snapshot restore (log `seed_ineligible reason=disabled`, then `cold_prepare_start`), so OpenClaw creates its device key and ids from fresh OS entropy. The bridge's own per-user ids (activation generation, run and idempotency keys, proxy session ids) read `/dev/urandom` directly (`osRandomUUID` in `bridge/runtime-lifecycle.js`) and stay safe in the snapshotted contract and proxy processes.
+
+Cost: a new user's first start now pays gateway spawn, module load and boot, like a returning user with small state. See the measured numbers below; new users are no slower than returning users with small state.
+
+`OPENCLAW_UNSAFE_SHARED_SEED=1` (exact value; anything else is off) on the AgentCore Runtime environment brings the pre-snapshot seed back for benchmarking. Do not set it for real users: it reintroduces the shared device key and ids described above.
 
 Restore failure, partial failure or timeout blocks activation and uploads. Credentials and gateway/Browser readiness are checked before dispatch. SQLite stays on local disk, mirrored to session storage and backed up to S3; never open its databases directly on the mount. See [state storage](session-storage.md) and [runtime behavior](how-it-works.md).
 
@@ -137,13 +149,14 @@ Each activation logs `[contract] <phase> elapsedMs=<ms> generation=<id>` lines, 
 | Phase | Meaning |
 |---|---|
 | `credentials_ready` | Scoped credentials acquired |
-| `seed_restore_start` | The prepared live seed checks S3 for saved state (empty-state fast path) |
-| `seed_ineligible reason=<r>` | The seed cannot be used: saved state (`reason=namespace_content` etc.) or a bridge check |
-| `seed_stop_start`, `seed_stopped` | The unused seed is stopped and its files removed |
+| `seed_ineligible reason=disabled` | Default: no pre-snapshot gateway exists, so the gateway is started fresh |
+| `seed_restore_start` | `OPENCLAW_UNSAFE_SHARED_SEED=1` only: the prepared live seed checks S3 for saved state |
+| `seed_ineligible reason=<r>` | `OPENCLAW_UNSAFE_SHARED_SEED=1` only: the seed cannot be used, because of saved state (`reason=namespace_content` etc.) or a bridge check |
+| `seed_stop_start`, `seed_stopped` | `OPENCLAW_UNSAFE_SHARED_SEED=1` only: the unused seed is stopped and its files removed |
 | `cold_prepare_start`, `cold_prepare_ack` | A prepared gateway for normal startup is obtained (spawn and module load, up to the preinit acknowledgement) |
-| `gateway_prepared path=seed\|cold` | The gateway path is decided |
+| `gateway_prepared path=seed\|cold` | The gateway path is decided (always `cold` by default) |
 | `session_storage_ready available=<bool>` | Cold path: local state dir set up from the session-storage mirror |
-| `restore_start`, `restore_ready` | S3 workspace restore started and committed (`restore_ready` also ends the seed path) |
+| `restore_start`, `restore_ready` | S3 workspace restore started and committed |
 | `config_skills_ready` | Config, legacy import and runtime skills done |
 | `gateway_activate_start`, `gateway_activated` | Prepared gateway released and acknowledged |
 | `proxy_ready`, `gateway_ready` | Proxy port open; gateway passed its readiness and config probe |

@@ -180,10 +180,10 @@ The OpenAI-compatible `/v1/chat/completions` protocol is independent of AgentCor
 
 ```mermaid
 flowchart LR
-    B["Common bootstrap<br/>User-neutral live gateway"] --> S["BOOTSTRAP_READY<br/>Snapshot boundary"]
+    B["Common bootstrap<br/>Contract and proxy, no gateway"] --> S["BOOTSTRAP_READY<br/>Snapshot boundary"]
     S --> R["First user request<br/>Immutable binding"]
     R --> A["Strict restore<br/>Scoped credentials"]
-    A --> G["Bind eligible prepared gateway<br/>or start gateway for restored/custom state"]
+    A --> G["Start a fresh gateway<br/>after snapshot restore"]
     G --> P["Browser, skills<br/>Persistence"]
     P --> U["USER_READY<br/>Full chat / cron"]
 ```

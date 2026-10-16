@@ -45,7 +45,7 @@ The image supports only AgentCore Runtime V2. See the [AgentCore Runtime V2 runb
 
 ## First-Message Startup Diagram
 
-Eligible empty-state sessions bind the prepared gateway; restored or custom state uses normal startup after strict restore. See the [AgentCore Runtime V2 lifecycle contract](runtime-v2.md#lifecycle-and-compatibility).
+Every session starts a fresh OpenClaw gateway after the snapshot restore, so no key or id is shared between users ([why](runtime-v2.md#no-pre-snapshot-gateway)); restored state is applied strictly before activation. See the [AgentCore Runtime V2 lifecycle contract](runtime-v2.md#lifecycle-and-compatibility).
 
 ```mermaid
 sequenceDiagram
@@ -54,14 +54,13 @@ sequenceDiagram
     participant P as Bedrock proxy
     participant G as OpenClaw gateway
 
-    C->>G: Prepare user-neutral live gateway
-    G-->>C: Preparation acknowledged
+    C->>P: Prepare proxy SDK (no user, no gateway)
     Note over C: BOOTSTRAP_READY permits platform snapshot
     R->>C: POST /invocations (chat, bound user and route)
     C->>C: Scoped credentials, strict mirror / S3 restore
     Note over C: Failure or timeout blocks activation and uploads
     C->>P: Bind user credentials
-    C->>G: Bind eligible prepared gateway or start gateway for restored/custom state
+    C->>G: Spawn a fresh gateway (after snapshot restore), then activate it
     C->>G: /startupz, protocol-4 token handshake, last-heartbeat
     G-->>C: Verified gateway capability
     C->>C: Browser, skills and persistence ready
