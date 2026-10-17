@@ -6,8 +6,9 @@
  * Cancellation and evidence of multiple SDK attempts also prevent fallback.
  * Other failures distinguish a known rejection from observed output or an
  * unknown request outcome, so callers can avoid blindly repeating effects.
- * A caller that closes its response before any model output has cancelled the
- * request itself: it received nothing it could act on, so that outcome is known.
+ * A caller that closes its response before any tool-use output has cancelled the
+ * request itself. Converse has no server-side effects and no tool call reached
+ * the caller, so nothing from that request can run: its outcome is known.
  *
  * The caller sends requests and feeds their results into this tracker; it
  * records attempt metadata and exposes cancellation without issuing requests.
@@ -22,9 +23,10 @@ const UNKNOWN_OUTCOME_ERROR = Object.freeze({
   type: "invalid_request_error",
   message: "Bedrock request outcome is unknown. Reconcile effects before another request.",
 });
-// The caller closed its response before any content, tool, terminal or metadata
-// event. No part of the model's answer was written to it, so no tool call from
-// this request can run; the caller decided to drop the request.
+// The caller closed its response before any tool-use event (text may have
+// streamed). No tool call from this request reached the caller, so none can run;
+// the caller decided to drop the request (an interrupt, a restart abort, or a
+// cancelled compaction summary).
 const CALLER_CANCELLED = "CALLER_CANCELLED_BEFORE_OUTPUT";
 const TEMPORARY_ERRORS = Object.freeze({
   InternalServerException: 500,
@@ -66,7 +68,7 @@ function createStreamingRoute({ primaryModelId, fallbackModelId, response,
   const controller = new AbortController();
   const routeId = osRandomUUID();
   const attempts = [];
-  let outputObserved = false, fallbackSelected = false, finished = false;
+  let outputObserved = false, toolObserved = false, fallbackSelected = false, finished = false;
   // Set only when the caller's response closed before this route finished it.
   let callerCancelled = false;
   let failure;
@@ -109,12 +111,14 @@ function createStreamingRoute({ primaryModelId, fallbackModelId, response,
       // Fallback is safe only before any content, tool, guardrail or terminal event.
       if (event.contentBlockStart || event.contentBlockDelta || event.contentBlockStop ||
           event.messageStop || event.metadata) outputObserved = true;
+      if (event.contentBlockStart?.start?.toolUse || event.contentBlockDelta?.delta?.toolUse) toolObserved = true;
       for (const [key, name] of Object.entries(STREAM_ERRORS)) {
         if (event[key]) throw Object.assign(new Error("Bedrock stream exception"), { name });
       }
       if (Object.keys(event).some((key) => !["messageStart", "contentBlockStart",
         "contentBlockDelta", "contentBlockStop", "messageStop", "metadata"].includes(key))) {
         outputObserved = true;
+        toolObserved = true; // unknown event: assume it may carry an effect
       }
     },
     failed(index, error) {
@@ -134,7 +138,7 @@ function createStreamingRoute({ primaryModelId, fallbackModelId, response,
           Object.values(STREAM_ERRORS).includes(error?.name) ? error.name : "OTHER";
       }
       if (allowed) fallbackSelected = true;
-      else if (attempt && callerCancelled && !outputObserved) {
+      else if (attempt && callerCancelled && !toolObserved) {
         attempt.error_code = CALLER_CANCELLED;
         failure = { code: CALLER_CANCELLED, type: UNKNOWN_OUTCOME_ERROR.type,
           message: "Request cancelled by the caller before any model output." };

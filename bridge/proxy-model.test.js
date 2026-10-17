@@ -526,8 +526,43 @@ for (const [label, closeAfterResolve] of [["before the response resolves", false
   });
 }
 
+test("a caller that cancels after text-only output does not fence the next request", async () => {
+  // e.g. OpenClaw interrupting its own compaction summary mid-stream.
+  const app = streaming((_input, ordinal, response) => ordinal > 1 ? reply() : {
+    $metadata: { requestId: "sdk-request-1", attempts: 1 },
+    stream: (async function* () {
+      yield { contentBlockDelta: { delta: { text: "partial summary" } } };
+      response.destroyed = true;
+      response.emit("close");
+      yield { contentBlockDelta: { delta: { text: "more" } } };
+    })(),
+  });
+  await app.invoke();
+  assert.equal(app.unknownOutcome, false);
+  assert.equal(app.logs[0].attempts[0].error_code, policy.CALLER_CANCELLED);
+  const next = freshResponse();
+  assert.equal(await app.invoke(next), "answer");
+  assert.equal(app.requests.length, 2);
+});
+
+test("an unrecognized stream event before a caller cancel still fences", async () => {
+  const app = streaming((_input, ordinal, response) => ordinal > 1 ? reply() : {
+    $metadata: { requestId: "sdk-request-1", attempts: 1 },
+    stream: (async function* () {
+      yield { futureEffectEvent: {} };
+      response.destroyed = true;
+      response.emit("close");
+      yield { contentBlockDelta: { delta: { text: "more" } } };
+    })(),
+  });
+  await app.invoke();
+  assert.equal(app.unknownOutcome, true);
+});
+
 for (const [label, events] of [
-  ["text", [{ contentBlockDelta: { delta: { text: "partial answer" } } }]],
+  ["tool start", [
+    { contentBlockStart: { contentBlockIndex: 0, start: { toolUse: { toolUseId: "id", name: "test" } } } },
+  ]],
   ["tool", [
     { contentBlockStart: { contentBlockIndex: 0, start: { toolUse: { toolUseId: "id", name: "test" } } } },
     { contentBlockDelta: { delta: { toolUse: { input: "{}" } } } },
@@ -545,7 +580,6 @@ for (const [label, events] of [
       })(),
     });
     await app.invoke();
-    assert.ok(app.frames.length > 0, "some output was written before the close");
     assert.equal(app.unknownOutcome, true);
     assert.equal(app.health().model_outcome_unknown, true);
     const next = freshResponse();
