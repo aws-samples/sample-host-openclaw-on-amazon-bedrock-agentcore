@@ -181,6 +181,14 @@ class CronStack(Stack):
                 resources=[f"{user_files_bucket_arn}/*/*.mp3"],
             )
         )
+        # List the bucket to find a brief mp3 a run uploaded without a BRIEF_AUDIO
+        # line. Keys only; the Lambda lists just the run's own namespace prefix.
+        self.cron_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:ListBucket"],
+                resources=[user_files_bucket_arn],
+            )
+        )
 
         # --- AgentCore Execution Role Additions ---
         # Allow the container to create/manage EventBridge schedules

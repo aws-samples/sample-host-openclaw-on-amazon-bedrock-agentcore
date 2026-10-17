@@ -42,7 +42,7 @@ if (guardrailConfig) {
 }
 
 // Converse inferenceConfig — temperature per model, BEDROCK_TEMPERATURE overrides
-const { buildInferenceConfig, parseTemperatureOverride } = require("./inference-config");
+const { buildInferenceConfig, parseTemperatureOverride, streamUsage } = require("./inference-config");
 const { buildRequestMetadata } = require("./request-metadata");
 const temperatureOverride = parseTemperatureOverride(process.env.BEDROCK_TEMPERATURE);
 if (temperatureOverride.invalid !== undefined) {
@@ -1142,6 +1142,7 @@ async function invokeBedrockStreaming(
   const created = Math.floor(Date.now() / 1000);
   let inputTokens = 0;
   let outputTokens = 0;
+  let streamedUsage = null;
   let fullResponseText = "";
 
   // Track tool use blocks during streaming
@@ -1261,6 +1262,7 @@ async function invokeBedrockStreaming(
         if (event.metadata?.usage) {
           inputTokens = event.metadata.usage.inputTokens || 0;
           outputTokens = event.metadata.usage.outputTokens || 0;
+          streamedUsage = streamUsage(event.metadata.usage);
         }
 
         // Log guardrail trace/intervention from streaming events
@@ -1286,6 +1288,8 @@ async function invokeBedrockStreaming(
             finish_reason: finishReason,
           },
         ],
+        // OpenClaw's preflight compaction sizes the session from this usage.
+        ...(streamedUsage && { usage: streamedUsage }),
       };
       res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       res.write("data: [DONE]\n\n");

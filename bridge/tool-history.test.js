@@ -86,6 +86,7 @@ function proxy({ guardrail = false } = {}) {
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
     guardrailConfig: guardrail ? { guardrailIdentifier: "test-guard", guardrailVersion: "1" } : undefined,
     buildInferenceConfig: require("./inference-config").buildInferenceConfig,
+    streamUsage: require("./inference-config").streamUsage,
     temperatureOverride: undefined,
     console: { log() {}, error() {}, warn() {}, debug() {} },
     SUBAGENT_BEDROCK_MODEL_ID: "subagent-model", SUBAGENT_MODEL_NAME: "bedrock-agentcore-subagent",
