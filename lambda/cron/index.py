@@ -68,6 +68,12 @@ CRON_FAILED_MESSAGE = (
     "Your scheduled task did not return a result this time. "
     "It will run again at the next scheduled time."
 )
+# AgentCore's error when no microVM for a runtime session became healthy within
+# its 120 s start limit. Seen on a session whose session storage started failing
+# (EREMOTEIO): every later start of that session failed the same way, while a
+# new session started normally.
+RUNTIME_INIT_FAILED_CODE = "RuntimeClientError"
+RUNTIME_INIT_FAILED_TEXT = "initialization time exceeded"
 
 
 def _get_secret(secret_id):
@@ -198,6 +204,47 @@ def get_or_create_session(user_id):
     return session_id
 
 
+def _new_session_id(user_id):
+    session_id = f"ses_{user_id}_{uuid.uuid4().hex[:12]}"
+    if len(session_id) < 33:
+        session_id += "_" + uuid.uuid4().hex[: 33 - len(session_id)]
+    return session_id
+
+
+def replace_unstartable_session(user_id, old_session_id):
+    """Point the user at a new runtime session after AgentCore could not start the old one.
+
+    Only replaces the SESSION record if it still names old_session_id, so two
+    briefs failing on the same session at once end up on one new session. The
+    new session starts with empty session storage and restores from the S3
+    backup, as after a runtime version update.
+    """
+    pk = f"USER#{user_id}"
+    new_session_id = _new_session_id(user_id)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        identity_table.update_item(
+            Key={"PK": pk, "SK": "SESSION"},
+            UpdateExpression="SET sessionId = :new, lastActivity = :now",
+            ConditionExpression="sessionId = :old",
+            ExpressionAttributeValues={":new": new_session_id, ":old": old_session_id, ":now": now_iso},
+        )
+        logger.warning("Runtime session %s could not start; user %s moved to new session %s",
+                       old_session_id, user_id, new_session_id)
+        return new_session_id
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            logger.error("Failed to replace runtime session: %s", type(e).__name__)
+            return old_session_id
+    try:
+        current = identity_table.get_item(Key={"PK": pk, "SK": "SESSION"}).get("Item", {}).get("sessionId")
+    except ClientError as e:
+        logger.error("Failed to read replaced runtime session: %s", type(e).__name__)
+        return old_session_id
+    logger.info("Runtime session %s was already replaced by %s", old_session_id, current)
+    return current or old_session_id
+
+
 def resolve_current_user_id(actor_id):
     """Resolve the current internal userId from actorId via CHANNEL# PROFILE lookup.
 
@@ -295,15 +342,34 @@ def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=Non
     except Exception as e:
         # Log the type only: botocore messages embed the runtime ARN and account ID.
         logger.error("AgentCore invocation failed: %s", type(e).__name__)
-        return {"response": INVOCATION_FAILED_RESPONSE, "status": "failed"}
+        failed = {"response": INVOCATION_FAILED_RESPONSE, "status": "failed"}
+        if _runtime_init_failed(e):
+            logger.error("AgentCore could not start runtime session %s", session_id)
+            failed["sessionUnstartable"] = True
+        return failed
+
+
+def _runtime_init_failed(error):
+    """True when AgentCore reports that no microVM for the session started in time."""
+    if not isinstance(error, ClientError):
+        return False
+    err = error.response.get("Error", {})
+    return (err.get("Code") == RUNTIME_INIT_FAILED_CODE
+            and RUNTIME_INIT_FAILED_TEXT in str(err.get("Message", "")).lower())
+
+
+# warmup_and_wait result: AgentCore could not start this runtime session.
+SESSION_UNSTARTABLE = "session_unstartable"
 
 
 def warmup_and_wait(session_id, user_id, actor_id, channel):
     """Send warmup action and poll until the container is ready.
 
-    Returns True if the container is ready, False if warmup timed out.
+    Returns True if the container is ready, False if warmup timed out, and
+    SESSION_UNSTARTABLE if AgentCore could not start the session at all.
     """
     start = time.time()
+    failures = 0
     while time.time() - start < WARMUP_MAX_WAIT_SECONDS:
         result = invoke_agentcore(session_id, "warmup", user_id, actor_id, channel)
         status = result.get("status", "")
@@ -311,6 +377,14 @@ def warmup_and_wait(session_id, user_id, actor_id, channel):
 
         if status == "ready":
             return True
+
+        if result.get("sessionUnstartable"):
+            return SESSION_UNSTARTABLE
+
+        if status == "failed" and failures == 0:
+            # One retry: a 5xx here can precede AgentCore's own start-limit error.
+            failures += 1
+            continue
 
         if status != "initializing":
             # Unexpected status — might already be running or encountered an error
@@ -993,6 +1067,10 @@ def handler(event, context):
 
     # Phase 2: Warm up the container if cold
     warmup_ok = warmup_and_wait(session_id, current_user_id, actor_id, channel)
+    if warmup_ok == SESSION_UNSTARTABLE:
+        # The session itself cannot start; every later run would fail the same way.
+        session_id = replace_unstartable_session(current_user_id, session_id)
+        warmup_ok = warmup_and_wait(session_id, current_user_id, actor_id, channel) is True
     if not warmup_ok:
         error_msg = (
             f"[Scheduled: {schedule_name or schedule_id}] "
@@ -1009,6 +1087,9 @@ def handler(event, context):
     if _cron_run_failed(result):
         status = result.get("status") if isinstance(result, dict) else None
         logger.warning("Scheduled task %s did not complete: status=%s", schedule_id, status)
+        if isinstance(result, dict) and result.get("sessionUnstartable"):
+            # The turn never started; let the next run and the next chat use a new session.
+            replace_unstartable_session(current_user_id, session_id)
         # Never forward the runtime's response text on failure; send a fixed notice.
         deliver_response(channel, channel_target,
                          f"[Scheduled: {schedule_name or schedule_id}] {CRON_FAILED_MESSAGE}")
