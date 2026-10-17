@@ -161,6 +161,8 @@ token_monitoring_stack = TokenMonitoringStack(
     cmk_arn=security_stack.cmk.key_arn,
     env=env,
 )
+# Its scheduled-task alarms filter /openclaw/lambda/cron, which OpenClawCron creates.
+token_monitoring_stack.add_dependency(cron_stack)
 
 # --- cdk-nag security checks ---
 cdk.Aspects.of(app).add(cdk_nag.AwsSolutionsChecks(verbose=True))
