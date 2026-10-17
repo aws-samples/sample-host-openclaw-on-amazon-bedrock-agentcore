@@ -133,6 +133,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
     reconcileToolHistory: require("./tool-history").reconcileToolHistory,
     buildInferenceConfig: require("./inference-config").buildInferenceConfig,
+    streamUsage: require("./inference-config").streamUsage,
     temperatureOverride: undefined, guardrailConfig: undefined,
     buildRequestMetadata,
     chatRequestCount: 0, subagentRequestCount: 0,

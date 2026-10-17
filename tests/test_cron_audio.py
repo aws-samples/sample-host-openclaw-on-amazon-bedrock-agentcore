@@ -22,6 +22,9 @@ NAMESPACE = "telegram_123"  # ACTOR "telegram:123" with ':' -> '_'
 KEY = f"{NAMESPACE}/morning-brief-2026-01-01-en.mp3"
 AUDIO = b"ID3\x04\x00fake-mp3-bytes" * 64
 BRIEF = "Good morning.\n\nHere is your brief."
+# Steps of a real brief prompt that name its audio file.
+BRIEF_PROMPT = ("5. TTS -> /tmp/morning-en.mp3\n7. Send audio via tts() tool\n"
+                "8. aws s3 cp /tmp/morning-en.mp3 s3://bucket/NS/morning-brief-YYYY-MM-DD-en.mp3")
 MARKER = "BRIEF_AUDIO"
 UNREADABLE_WARNING = "Brief audio skipped: marker line present but its key could not be read"
 
@@ -34,6 +37,21 @@ class FakeS3:
     def __init__(self, objects=None):
         self.objects = dict(objects or {})
         self.calls = []
+
+    old = ()  # keys written before the run
+    listed = None  # optional explicit list result: [(key, datetime)]
+
+    def list_objects_v2(self, **kwargs):
+        import datetime
+        self.calls.append(("list_objects_v2", kwargs))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        past = now - datetime.timedelta(days=1)
+        items = self.listed if self.listed is not None else [
+            (key, past if key in self.old else now) for key in self.objects]
+        prefix = kwargs["Prefix"]
+        contents = [{"Key": key, "LastModified": stamp} for key, stamp in items
+                    if key.startswith(prefix) and "/" not in key[len(prefix):]]
+        return {"Contents": contents, "IsTruncated": False}
 
     def head_object(self, **kwargs):
         self.calls.append(("head_object", kwargs))
@@ -82,13 +100,15 @@ def _cron_module(s3, bucket=BUCKET):
     return module
 
 
-def run_brief(response, s3=None, telegram=None, bucket=BUCKET):
+def run_brief(response, s3=None, telegram=None, bucket=BUCKET, message=None):
     s3 = s3 if s3 is not None else FakeS3({KEY: AUDIO})
     telegram = telegram or FakeTelegram()
     module = _cron_module(s3, bucket)
     module.agentcore_client = FakeRuntime([READY, {"response": response}])
     with patch.object(module.urllib_request, "urlopen", telegram):
-        result = module.handler(cron_event(), None)
+        event = cron_event()
+        event["message"] = BRIEF_PROMPT if message is None else message
+        result = module.handler(event, None)
     assert result["statusCode"] == 200
     return telegram, s3
 
@@ -111,10 +131,55 @@ def test_marker_label_is_not_a_secret_name_to_openclaw_redaction():
     assert not prefilter.search(f"{MARKER}: {KEY}")
 
 
-def test_reply_without_marker_is_delivered_exactly_as_before():
-    telegram, s3 = run_brief(BRIEF)
+def test_reply_without_marker_and_no_new_mp3_is_delivered_as_text_only():
+    s3 = FakeS3({KEY: AUDIO})
+    s3.old = (KEY,)
+    telegram, s3 = run_brief(BRIEF, s3=s3)
     assert telegram.methods == ["sendMessage"]
-    assert s3.calls == []
+    assert [call for call, _ in s3.calls] == ["list_objects_v2"]
+    assert s3.calls[0][1]["Prefix"] == f"{NAMESPACE}/"
+    assert s3.calls[0][1]["Delimiter"] == "/"
+
+
+def test_reply_without_marker_sends_the_mp3_this_run_uploaded():
+    """The 16 Oct case: the prompt lost its marker step, the brief still uploaded its mp3."""
+    s3 = FakeS3({KEY: AUDIO, f"{NAMESPACE}/evening-brief-old.mp3": AUDIO, f"{NAMESPACE}/notes.md": 10})
+    s3.old = (f"{NAMESPACE}/evening-brief-old.mp3",)
+    telegram, s3 = run_brief(BRIEF, s3=s3)
+    assert telegram.methods == ["sendMessage", "sendAudio"]
+    assert telegram.texts() == [BRIEF]
+    (audio,) = telegram.audio_requests()
+    assert b'filename="morning-brief-2026-01-01-en.mp3"' in audio.data
+    assert ("get_object", {"Bucket": BUCKET, "Key": KEY}) in s3.calls
+
+
+def test_reply_without_marker_picks_the_newest_run_mp3_and_ignores_other_namespaces():
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    newer = f"{NAMESPACE}/morning-brief-2026-01-01-cn.mp3"
+    s3 = FakeS3({KEY: AUDIO, newer: AUDIO, "telegram_999/x.mp3": AUDIO, f"{NAMESPACE}/sub/y.mp3": AUDIO})
+    s3.listed = [(KEY, now), (newer, now + datetime.timedelta(seconds=1)),
+                 ("telegram_999/x.mp3", now + datetime.timedelta(seconds=1)),
+                 (f"{NAMESPACE}/sub/y.mp3", now + datetime.timedelta(seconds=1))]
+    telegram, s3 = run_brief(BRIEF, s3=s3, message=BRIEF_PROMPT + " then morning-brief-YYYY-MM-DD-cn.mp3")
+    (audio,) = telegram.audio_requests()
+    assert b'filename="morning-brief-2026-01-01-cn.mp3"' in audio.data
+
+
+def test_marker_key_wins_over_the_listing():
+    telegram, s3 = run_brief(f"{BRIEF}\n{MARKER}: {KEY}")
+    assert [call for call, _ in s3.calls] == ["head_object", "get_object"]
+
+
+def test_listing_failure_still_delivers_the_text(caplog):
+    class Failing(FakeS3):
+        def list_objects_v2(self, **kwargs):
+            raise PermissionError("denied " + KEY)
+    with caplog.at_level(logging.INFO):
+        telegram, _ = run_brief(BRIEF, s3=Failing({KEY: AUDIO}))
+    assert telegram.methods == ["sendMessage"]
+    assert "Brief audio lookup failed: PermissionError" in caplog.text
+    assert KEY not in caplog.text
 
 
 def test_valid_key_sends_text_without_marker_then_the_audio():
@@ -189,18 +254,30 @@ def test_invalid_key_sends_no_audio_and_never_touches_s3(key, caplog):
     f"{MARKER}: {KEY} and more words",           # not a single key
 ])
 def test_unreadable_marker_is_stripped_and_logged_without_its_text(line, caplog):
+    s3 = FakeS3({KEY: AUDIO})
+    s3.old = (KEY,)
     with caplog.at_level(logging.INFO):
-        telegram, s3 = run_brief(f"{BRIEF}\n{line}")
+        telegram, s3 = run_brief(f"{BRIEF}\n{line}", s3=s3)
     assert telegram.methods == ["sendMessage"]
-    assert s3.calls == []
+    assert [call for call, _ in s3.calls] == ["list_objects_v2"]
     assert_no_marker(telegram.texts())
     assert caplog.text.count(UNREADABLE_WARNING) == 1
     assert KEY not in caplog.text and "***" not in caplog.text
 
 
-def test_reply_without_marker_logs_no_audio_warning(caplog):
+def test_unreadable_marker_falls_back_to_the_mp3_this_run_uploaded(caplog):
     with caplog.at_level(logging.INFO):
-        run_brief(BRIEF)
+        telegram, _ = run_brief(f"{BRIEF}\n{MARKER}: ***")
+    assert telegram.methods == ["sendMessage", "sendAudio"]
+    assert_no_marker(telegram.texts())
+    assert KEY not in caplog.text
+
+
+def test_reply_without_marker_logs_no_audio_warning(caplog):
+    s3 = FakeS3({KEY: AUDIO})
+    s3.old = (KEY,)
+    with caplog.at_level(logging.INFO):
+        run_brief(BRIEF, s3=s3)
     assert "Brief audio" not in caplog.text
 
 
@@ -313,8 +390,12 @@ def test_cron_role_reads_only_mp3_objects_in_the_user_files_bucket(tmp_path):
         if any(str(action).startswith("s3:") for action in
                (s["Action"] if isinstance(s["Action"], list) else [s["Action"]]))
     ]
-    assert len(s3_statements) == 1, s3_statements
-    (grant,) = s3_statements
+    assert len(s3_statements) == 2, s3_statements
+    (listing,) = [s for s in s3_statements if s["Action"] == "s3:ListBucket"]
+    assert listing["Effect"] == "Allow"
+    assert "UserFilesBucket" in json.dumps(listing["Resource"])
+    assert "/*" not in json.dumps(listing["Resource"])
+    (grant,) = [s for s in s3_statements if s["Action"] != "s3:ListBucket"]
     assert grant["Effect"] == "Allow"
     assert grant["Action"] == "s3:GetObject"
     resource = json.dumps(grant["Resource"])
@@ -329,3 +410,27 @@ def test_cron_role_reads_only_mp3_objects_in_the_user_files_bucket(tmp_path):
     )
     bucket_env = json.dumps(function["Environment"]["Variables"]["USER_FILES_BUCKET"])
     assert "UserFilesBucket" in bucket_env
+
+
+def test_an_mp3_the_schedule_message_does_not_name_is_not_sent():
+    """A task that also renders other audio (e.g. a video voice-over) keeps it to itself."""
+    other = f"{NAMESPACE}/douyin-36-voice-2026-01-01.mp3"
+    s3 = FakeS3({other: AUDIO})
+    telegram, s3 = run_brief(BRIEF, s3=s3)
+    assert telegram.methods == ["sendMessage"]
+    assert not [call for call, _ in s3.calls if call == "get_object"]
+
+
+def test_a_schedule_message_without_an_mp3_never_lists_the_bucket():
+    telegram, s3 = run_brief(BRIEF, message="Summarize my day")
+    assert telegram.methods == ["sendMessage"]
+    assert s3.calls == []
+
+
+def test_audio_name_patterns_expand_the_date_placeholder():
+    module = load_cron_lambda() if "load_cron_lambda" in globals() else None
+    module = module or _cron_module(FakeS3())
+    (pattern,) = module.audio_name_patterns("x s3://b/ns/morning-brief-YYYY-MM-DD-en.mp3 y")
+    assert pattern.match("morning-brief-2026-10-17-en.mp3")
+    assert not pattern.match("morning-brief-2026-10-17-cn.mp3")
+    assert not pattern.match("xmorning-brief-2026-10-17-en.mp3")

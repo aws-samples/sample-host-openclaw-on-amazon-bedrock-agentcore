@@ -67,6 +67,24 @@ function buildInferenceConfig(modelId, override) {
   };
 }
 
+/**
+ * OpenAI chat-completions usage for a finished Bedrock stream. OpenClaw records
+ * it on the turn, and its preflight compaction sizes the session from it.
+ * prompt_tokens counts the whole prompt: Bedrock's inputTokens excludes cache
+ * reads and cache writes, which prompt_tokens_details reports separately.
+ */
+function streamUsage({ inputTokens = 0, outputTokens = 0, cacheReadInputTokens = 0, cacheWriteInputTokens = 0 } = {}) {
+  const count = (value) => (Number.isSafeInteger(value) && value > 0 ? value : 0);
+  const cached = count(cacheReadInputTokens), written = count(cacheWriteInputTokens);
+  const prompt = count(inputTokens) + cached + written, completion = count(outputTokens);
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    prompt_tokens_details: { cached_tokens: cached, cache_write_tokens: written },
+  };
+}
+
 module.exports = {
   MAX_TOKENS,
   DEFAULT_TEMPERATURE,
@@ -74,4 +92,5 @@ module.exports = {
   parseTemperatureOverride,
   resolveTemperature,
   buildInferenceConfig,
+  streamUsage,
 };
