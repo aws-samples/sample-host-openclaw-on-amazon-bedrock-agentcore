@@ -57,6 +57,22 @@ const STATE_DIRNAME = ".openclaw";
 const WORKSPACE_SUBDIR = "workspace";
 const SQLITE_EXT = ".sqlite";
 
+// AgentCore session storage is capped at 1 GiB per session and statfs on the
+// mount always reports it empty, so the mirror keeps its own count of the bytes
+// it has on the mount and never writes past this budget. A write past the cap
+// fails with ENOSPC, and on 16 Oct a session whose mirror reached it started
+// failing with EREMOTEIO and then could not be started again at all. Leaves
+// room for the workspace watcher's writes and for the temp copy of a file
+// being replaced.
+const DEFAULT_MIRROR_BUDGET_BYTES = 850 * 1024 * 1024;
+// Errors that mean the mount itself refused the write (full, quota, broken).
+const MOUNT_WRITE_ERRORS = new Set(["ENOSPC", "EDQUOT", "EREMOTEIO", "EIO", "EROFS"]);
+
+function mirrorBudgetBytes() {
+  const v = Number(process.env.STATE_MIRROR_BUDGET_BYTES);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_MIRROR_BUDGET_BYTES;
+}
+
 // Directories never mirrored or restored (regenerated, large, or caches).
 const SKIP_DIR_NAMES = new Set(["node_modules", ".cache", ".npm"]);
 // Short-lived staging directories OpenClaw creates next to the file it is
@@ -175,7 +191,7 @@ function insideBase(resolvedBase, candidate) {
  * storage mount cannot provide — then copied to `destPath` via a temp file and
  * rename so a reader never sees a partial file.
  */
-async function snapshotSqliteToFile(dbPath, destPath, { sqlite = getNodeSqlite(), stagingDir = os.tmpdir() } = {}) {
+async function snapshotSqliteToFile(dbPath, destPath, { sqlite = getNodeSqlite(), stagingDir = os.tmpdir(), beforePublish } = {}) {
   if (!sqlite || typeof sqlite.backup !== "function") {
     throw new Error("node:sqlite backup API unavailable on this Node runtime");
   }
@@ -195,15 +211,19 @@ async function snapshotSqliteToFile(dbPath, destPath, { sqlite = getNodeSqlite()
   } finally {
     try { source.close(); } catch { /* already closed */ }
   }
+  const tmpDest = `${destPath}.tmp-${process.pid}`;
   try {
+    // The caller may refuse (e.g. no room on the mount); nothing is written then.
+    if (beforePublish && !beforePublish(fs.statSync(stagePath).size)) return null;
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
-    const tmpDest = `${destPath}.tmp-${process.pid}`;
     fs.copyFileSync(stagePath, tmpDest);
     fs.renameSync(tmpDest, destPath);
     return fs.statSync(destPath).size;
   } finally {
     try { fs.unlinkSync(stagePath); } catch { /* best effort */ }
     try { fs.unlinkSync(`${stagePath}-journal`); } catch { /* none */ }
+    // A failed copy must not leave a partial temp file holding mount space.
+    try { fs.unlinkSync(tmpDest); } catch { /* renamed or never created */ }
   }
 }
 
@@ -214,18 +234,116 @@ async function snapshotSqliteToFile(dbPath, destPath, { sqlite = getNodeSqlite()
 function copyFileAtomic(src, dest) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const tmp = `${dest}.tmp-${process.pid}`;
-  fs.copyFileSync(src, tmp);
   try {
-    const st = fs.statSync(src);
-    fs.utimesSync(tmp, st.atime, st.mtime);
-  } catch { /* best effort */ }
-  fs.renameSync(tmp, dest);
+    fs.copyFileSync(src, tmp);
+    try {
+      const st = fs.statSync(src);
+      fs.utimesSync(tmp, st.atime, st.mtime);
+    } catch { /* best effort */ }
+    fs.renameSync(tmp, dest);
+  } finally {
+    // A failed copy must not leave a partial temp file holding mount space.
+    try { fs.unlinkSync(tmp); } catch { /* renamed or never created */ }
+  }
 }
 
 /**
  * True when `dest` already holds a copy of `src` (same size and mtime, to the
  * second — NFS mtime granularity). Used to make the workspace mirror cheap.
  */
+function fileSize(file) {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Bytes held under `dir` on the mount: every regular file, including caches
+ * and temp files the mirror would skip (they count against the quota too).
+ */
+function diskUsageBytes(dir) {
+  let total = 0;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) total += diskUsageBytes(full);
+    else if (entry.isFile()) total += fileSize(full);
+  }
+  return total;
+}
+
+/**
+ * Size + mtime of what a mirror copy of `src` was made from. For SQLite the
+ * -wal is included: a commit that is still only in the WAL changes the
+ * snapshot without touching the main file.
+ */
+function sourceSignature(src, withWal) {
+  try {
+    const st = fs.statSync(src);
+    let sig = `${st.size}:${st.mtimeMs}`;
+    if (withWal) {
+      try {
+        const wal = fs.statSync(`${src}-wal`);
+        sig += `|${wal.size}:${wal.mtimeMs}`;
+      } catch { /* no WAL */ }
+    }
+    return sig;
+  } catch {
+    return null;
+  }
+}
+
+// dest path -> source signature of the copy the mirror last wrote there, for
+// this process. The mount does not keep the mtime the mirror sets (NFS
+// rewrites it on rename), so size+mtime of the mount copy can never match and
+// every file -- including a several-hundred-MB SQLite snapshot -- used to be
+// rewritten every 5 minutes.
+const _mirrored = new Map();
+
+function unchangedSinceMirror(src, dest, withWal) {
+  const sig = sourceSignature(src, withWal);
+  return sig !== null && _mirrored.get(dest) === sig && fs.existsSync(dest);
+}
+
+function isMountWriteError(err) {
+  return Boolean(err && MOUNT_WRITE_ERRORS.has(err.code));
+}
+
+/**
+ * Make room for writing `needed` bytes to `dest` (a temp copy next to the old
+ * one, then rename). If the budget does not allow it, the old mirror copy is
+ * removed first: a file missing from the mount is restored from the S3
+ * backup on the next start, while a mount past its quota breaks. Returns
+ * false (and leaves the file off the mount) if it still does not fit.
+ */
+function makeRoom(acct, dest, needed, rel, log) {
+  if (acct.used + needed <= acct.budget) return true;
+  const old = fileSize(dest);
+  if (old > 0) {
+    try {
+      fs.unlinkSync(dest);
+      acct.used -= old;
+      _mirrored.delete(dest);
+    } catch { /* counted as still there */ }
+  }
+  if (acct.used + needed <= acct.budget) {
+    log.warn(`[state-storage] MOUNT_BUDGET replaced ${rel} without a second copy: ${needed} B more would pass ` +
+      `${acct.budget} B (${acct.used} B in use)`);
+    return true;
+  }
+  log.warn(`[state-storage] MOUNT_BUDGET skipped ${rel} (${needed} B): ${acct.used} B of ${acct.budget} B in use; ` +
+    "the S3 backup keeps this file");
+  acct.skippedForBudget++;
+  return false;
+}
+
 function sameSizeAndMtime(src, dest) {
   try {
     const a = fs.statSync(src);
@@ -305,33 +423,67 @@ function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
  *
  * @returns {Promise<{ files: number, unchanged: number, sqlite: number, skipped: number, pruned: number }>}
  */
-async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite = getNodeSqlite(), stagingDir } = {}) {
-  const result = { files: 0, unchanged: 0, sqlite: 0, skipped: 0, pruned: 0 };
+async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite = getNodeSqlite(), stagingDir,
+  budgetBytes = mirrorBudgetBytes() } = {}) {
+  const result = { files: 0, unchanged: 0, sqlite: 0, skipped: 0, pruned: 0, budgetSkipped: 0, mountErrors: 0 };
   const localFiles = walkFiles(stateDir).filter((rel) => !isTransientFile(rel));
   const localSet = new Set(localFiles);
+  const acct = { used: diskUsageBytes(path.dirname(mountStateDir)), budget: budgetBytes, skippedForBudget: 0 };
   const staging = stagingDir || fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-state-mirror-"));
   try {
     for (const rel of localFiles) {
       const src = path.join(stateDir, rel);
       const dest = path.join(mountStateDir, rel);
+      const isDb = rel.endsWith(SQLITE_EXT);
       try {
-        if (rel.endsWith(SQLITE_EXT)) {
-          await snapshotSqliteToFile(src, dest, { sqlite, stagingDir: staging });
+        if (unchangedSinceMirror(src, dest, isDb)) {
+          result.unchanged++;
+          continue;
+        }
+        const sig = sourceSignature(src, isDb);
+        if (isDb) {
+          let staged = 0;
+          let replaced = 0;
+          const size = await snapshotSqliteToFile(src, dest, {
+            sqlite, stagingDir: staging,
+            beforePublish: (n) => {
+              if (!makeRoom(acct, dest, n, rel, log)) return false;
+              staged = n;
+              replaced = fileSize(dest);
+              return true;
+            },
+          });
+          if (size === null) continue;
+          acct.used += staged - replaced;
           result.sqlite++;
         } else if (sameSizeAndMtime(src, dest)) {
           result.unchanged++;
         } else {
+          const n = fileSize(src);
+          if (!makeRoom(acct, dest, n, rel, log)) continue;
+          const left = fileSize(dest);
           copyFileAtomic(src, dest);
+          acct.used += n - left;
           result.files++;
         }
+        if (sig !== null) _mirrored.set(dest, sig);
       } catch (err) {
-        log.warn(`[state-storage] Failed to mirror ${rel}: ${err.message}`);
+        _mirrored.delete(dest);
         result.skipped++;
+        if (isMountWriteError(err)) {
+          result.mountErrors++;
+          log.warn(`[state-storage] MOUNT_WRITE_FAILED code=${err.code} while mirroring ${rel}; ` +
+            "stopping this mirror pass (the S3 backup is unaffected)");
+          break;
+        }
+        log.warn(`[state-storage] Failed to mirror ${rel}: ${err.message}`);
       }
     }
+    result.budgetSkipped = acct.skippedForBudget;
     // Prune mirror files that were deleted locally. Only when the local walk
-    // produced something — an empty local set means we could not read it.
-    if (localFiles.length > 0) {
+    // produced something — an empty local set means we could not read it —
+    // and the mount did not just refuse a write.
+    if (localFiles.length > 0 && result.mountErrors === 0) {
       for (const rel of walkFiles(mountStateDir)) {
         if (localSet.has(rel)) continue;
         try {
@@ -355,26 +507,44 @@ async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite =
  *
  * @returns {{ files: number, unchanged: number, skipped: number, pruned: number }}
  */
-function mirrorWorkspaceDir({ stateDir, mountStateDir, log = console } = {}) {
+function mirrorWorkspaceDir({ stateDir, mountStateDir, log = console, budgetBytes = mirrorBudgetBytes() } = {}) {
   const result = { files: 0, unchanged: 0, skipped: 0, pruned: 0 };
   const workspaceDir = path.join(stateDir, WORKSPACE_SUBDIR);
   const mountWorkspaceDir = path.join(mountStateDir, WORKSPACE_SUBDIR);
   if (!fs.existsSync(workspaceDir)) return result;
   const localFiles = walkFiles(workspaceDir).filter((rel) => !isTransientFile(rel));
   const localSet = new Set(localFiles);
+  let acct = null;
   for (const rel of localFiles) {
     const src = path.join(workspaceDir, rel);
     const dest = path.join(mountWorkspaceDir, rel);
     try {
-      if (sameSizeAndMtime(src, dest)) {
+      if (unchangedSinceMirror(src, dest, false) || sameSizeAndMtime(src, dest)) {
         result.unchanged++;
       } else {
+        // Count the mount only when something has to be written.
+        acct ||= { used: diskUsageBytes(path.dirname(mountStateDir)), budget: budgetBytes, skippedForBudget: 0 };
+        const sig = sourceSignature(src, false);
+        const n = fileSize(src);
+        if (!makeRoom(acct, dest, n, `workspace/${rel}`, log)) {
+          result.skipped++;
+          continue;
+        }
+        const left = fileSize(dest);
         copyFileAtomic(src, dest);
+        acct.used += n - left;
+        if (sig !== null) _mirrored.set(dest, sig);
         result.files++;
       }
     } catch (err) {
-      log.warn(`[state-storage] Failed to mirror workspace/${rel}: ${err.message}`);
+      _mirrored.delete(dest);
       result.skipped++;
+      if (isMountWriteError(err)) {
+        log.warn(`[state-storage] MOUNT_WRITE_FAILED code=${err.code} while mirroring workspace/${rel}; ` +
+          "stopping this mirror pass (the S3 backup is unaffected)");
+        break;
+      }
+      log.warn(`[state-storage] Failed to mirror workspace/${rel}: ${err.message}`);
     }
   }
   for (const rel of walkFiles(mountWorkspaceDir)) {
@@ -490,7 +660,9 @@ function startPeriodicMirror(opts, intervalMs) {
   _mirrorTimer = setInterval(() => {
     mirrorNow(opts).then(
       (r) => (opts.log || console).log(
-        `[state-storage] Periodic mirror: ${r.files} file(s) copied, ${r.unchanged} unchanged, ${r.sqlite} sqlite snapshot(s), ${r.skipped} skipped, ${r.pruned} pruned`,
+        `[state-storage] Periodic mirror: ${r.files} file(s) copied, ${r.unchanged} unchanged, ${r.sqlite} sqlite snapshot(s), ${r.skipped} skipped, ${r.pruned} pruned` +
+        (r.budgetSkipped ? `, ${r.budgetSkipped} left to S3 (MOUNT_BUDGET)` : "") +
+        (r.mountErrors ? ", mount refused a write (MOUNT_WRITE_FAILED)" : ""),
       ),
       (err) => (opts.log || console).warn(`[state-storage] Periodic mirror failed: ${err.message}`),
     );
@@ -624,6 +796,9 @@ module.exports = {
   stopWorkspaceWatcher,
   flushWorkspaceMirror,
   // Exported for testing
+  DEFAULT_MIRROR_BUDGET_BYTES,
+  diskUsageBytes,
+  _resetMirrorMemo: () => _mirrored.clear(),
   walkFiles,
   isTransientFile,
   isTransientDir,
