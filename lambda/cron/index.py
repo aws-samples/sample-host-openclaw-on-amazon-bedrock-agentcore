@@ -1072,6 +1072,8 @@ def handler(event, context):
         session_id = replace_unstartable_session(current_user_id, session_id)
         warmup_ok = warmup_and_wait(session_id, current_user_id, actor_id, channel) is True
     if not warmup_ok:
+        # Matched by the openclaw-scheduled-task-failures alarm.
+        logger.warning("Scheduled task %s did not complete: the agent failed to start", schedule_id)
         error_msg = (
             f"[Scheduled: {schedule_name or schedule_id}] "
             "Your scheduled task could not run because the agent failed to start. "
