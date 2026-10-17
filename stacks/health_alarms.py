@@ -24,6 +24,7 @@ from aws_cdk import (
     aws_sns as sns,
     custom_resources as cr,
 )
+import cdk_nag
 from constructs import Construct
 
 NAMESPACE = "OpenClaw/Health"
@@ -51,7 +52,7 @@ def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("contai
 
 
 def _ensure_container_group(scope, stack):
-    return cr.AwsCustomResource(
+    ensure = cr.AwsCustomResource(
         scope,
         "EnsureContainerLogGroup",
         on_create=cr.AwsSdkCall(
@@ -72,6 +73,18 @@ def _ensure_container_group(scope, stack):
         ]),
         install_latest_aws_sdk=False,
     )
+    # The policy names the one log group, with and without the ":*" suffix
+    # (log-group ARNs appear in both forms); the wildcard covers only that group.
+    cdk_nag.NagSuppressions.add_resource_suppressions(
+        ensure,
+        [cdk_nag.NagPackSuppression(
+            id="AwsSolutions-IAM5",
+            reason="logs:CreateLogGroup on the single /openclaw/container log group (its ARN ends in :*).",
+            applies_to=[cdk_nag.RegexAppliesTo(regex="/^Resource::arn:aws:logs:.*:log-group:\\/openclaw\\/container:\\*$/")],
+        )],
+        apply_to_children=True,
+    )
+    return ensure
 
 
 def _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_container_group):
