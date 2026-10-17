@@ -12,6 +12,7 @@ brief there. All IDs are placeholders.
 
 import io
 import json
+import logging
 from unittest.mock import patch
 
 from botocore.exceptions import ClientError
@@ -133,7 +134,7 @@ def test_other_invocation_failures_do_not_replace_the_session():
     assert not [u for u in module.identity_table.updates if u.get("ConditionExpression")]
 
 
-def test_a_new_session_that_cannot_start_either_gets_the_start_notice():
+def test_a_new_session_that_cannot_start_either_gets_the_start_notice(caplog):
     module = load_cron_lambda()
     module.identity_table = SessionTable()
 
@@ -143,10 +144,13 @@ def test_a_new_session_that_cannot_start_either_gets_the_start_notice():
             raise init_exceeded()
 
     module.agentcore_client = NothingStarts([init_exceeded()])
-    result, deliver = _run(module)
+    with caplog.at_level(logging.WARNING):
+        result, deliver = _run(module)
     assert result["statusCode"] == 503
     assert [a for _, a in module.agentcore_client.calls] == ["warmup", "warmup"]
     assert "failed to start" in deliver.call_args[0][2]
+    # The scheduled-task failure alarm matches "did not complete".
+    assert "did not complete" in caplog.text
 
 
 def test_a_cron_turn_that_hits_the_start_limit_replaces_the_session_for_the_next_run():

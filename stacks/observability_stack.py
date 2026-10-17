@@ -20,6 +20,7 @@ import cdk_nag
 from constructs import Construct
 
 from stacks import retention_days
+from stacks.health_alarms import add_health_alarms
 
 
 class ObservabilityStack(Stack):
@@ -294,6 +295,9 @@ class ObservabilityStack(Stack):
             comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
             treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
         ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
+
+        # --- Health alarms (session storage, scheduled tasks) --------------
+        add_health_alarms(self, self.alarm_topic)
 
         CfnOutput(
             self,

@@ -132,6 +132,8 @@ observability_stack = ObservabilityStack(
     cmk_arn=security_stack.cmk.key_arn,
     env=env,
 )
+# The health alarms filter /openclaw/lambda/cron, which OpenClawCron creates.
+observability_stack.add_dependency(cron_stack)
 
 # --- Token Monitoring ---
 token_monitoring_stack = TokenMonitoringStack(
