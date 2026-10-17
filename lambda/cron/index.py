@@ -951,6 +951,8 @@ def handler(event, context):
         deadline=lambda_deadline - 60, channel_target=channel_target,
     )
     if not warmup_ok:
+        # Matched by the openclaw-scheduled-task-failures alarm.
+        logger.warning("Scheduled task %s did not complete: the agent failed to start", schedule_id)
         error_msg = (
             f"[Scheduled: {schedule_name or schedule_id}] "
             "Your scheduled task could not run because the agent failed to start. "

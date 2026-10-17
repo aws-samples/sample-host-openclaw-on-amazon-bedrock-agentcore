@@ -20,6 +20,7 @@ import cdk_nag
 from constructs import Construct
 
 from stacks import apply_table_tags
+from stacks.health_alarms import add_health_alarms
 
 
 # Budget alarm defaults. Thresholds are deployment-specific; override them in
@@ -265,6 +266,11 @@ class TokenMonitoringStack(Stack):
         # construct IDs so an upgrade updates them in place instead of
         # replacing them.
         alarm_action = cw_actions.SnsAction(alarm_topic)
+
+        # Scheduled tasks that ended without a result, and runtime sessions AgentCore
+        # could not start (filters on /openclaw/lambda/cron; see stacks/health_alarms.py).
+        add_health_alarms(self, alarm_topic, groups=("cron",))
+
 
         total_tokens.create_alarm(
             self,

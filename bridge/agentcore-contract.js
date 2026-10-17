@@ -463,7 +463,9 @@ async function mirrorStateToSessionStorage(label) {
       assertReady: workspaceSync.assertRestoreReady,
     });
     console.log(
-      `[contract] State mirror (${label}): ${r.files} file(s) copied, ${r.unchanged} unchanged, ${r.sqlite} sqlite snapshot(s), ${r.skipped} skipped, ${r.pruned} pruned`,
+      `[contract] State mirror (${label}): ${r.files} file(s) copied, ${r.unchanged} unchanged, ${r.sqlite} sqlite snapshot(s), ${r.skipped} skipped, ${r.pruned} pruned` +
+        (r.budgetSkipped ? `, ${r.budgetSkipped} left to S3 (MOUNT_BUDGET)` : "") +
+        (r.mountErrors ? ", mount refused a write (MOUNT_WRITE_FAILED)" : ""),
     );
     return r;
   } catch (err) {

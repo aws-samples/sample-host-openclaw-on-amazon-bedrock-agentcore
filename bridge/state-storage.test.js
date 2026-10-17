@@ -365,6 +365,143 @@ describe("mirrorStateDir / restoreStateDir", () => {
   });
 });
 
+// --- session storage quota (1 GiB, statfs always reports it empty) ---
+// 16 Oct: the mirror rewrote every file (incl. a 377 MB SQLite snapshot, as a
+// temp copy next to the old one) every 5 minutes; the session's mount started
+// failing with EREMOTEIO and AgentCore could no longer start the session.
+describe("mirror stays inside the session storage quota", () => {
+  let home, mount, stateDir, mountState, warnings, log;
+  beforeEach(() => {
+    home = mkTmp("ss-budget-home-");
+    mount = mkTmp("ss-budget-mount-");
+    storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
+    stateDir = path.join(home, ".openclaw");
+    mountState = path.join(mount, ".openclaw");
+    warnings = [];
+    log = { log() {}, error() {}, warn: (m) => warnings.push(m) };
+    storage._resetMirrorMemo();
+  });
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(mount, { recursive: true, force: true });
+  });
+  const blob = (kb) => "x".repeat(kb * 1024);
+  const tmpLeft = () => storage.walkFiles(mount).filter((f) => /\.tmp-\d+$/.test(f));
+
+  it("does not re-snapshot an unchanged SQLite database on every pass", sqliteOnly, async () => {
+    const dbPath = path.join(stateDir, "agents/main/agent/openclaw-agent.sqlite");
+    const db = makeDb(dbPath, ["one"]);
+    const r1 = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log });
+    assert.equal(r1.sqlite, 1);
+    const r2 = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log });
+    assert.equal(r2.sqlite, 0, "an unchanged 377 MB database was rewritten every 5 minutes");
+    assert.equal(r2.unchanged, 1);
+    // A commit that is still only in the WAL is a change.
+    db.prepare("INSERT INTO t (v) VALUES (?)").run("two");
+    const r3 = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log });
+    assert.equal(r3.sqlite, 1);
+    assert.deepEqual(readRows(path.join(mountState, "agents/main/agent/openclaw-agent.sqlite")), ["one", "two"]);
+    db.close();
+  });
+
+  it("does not recopy unchanged plain files even when the mount loses their mtime", async () => {
+    write(path.join(stateDir, "workspace/notes.md"), "n");
+    const day = new Date(Date.now() - 86400000);
+    fs.utimesSync(path.join(stateDir, "workspace/notes.md"), day, day);
+    await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log, sqlite: null });
+    // NFS session storage sets its own mtime on rename (seen on staging).
+    const now = new Date();
+    fs.utimesSync(path.join(mountState, "workspace/notes.md"), now, now);
+    const r = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log, sqlite: null });
+    assert.equal(r.files, 0);
+    assert.equal(r.unchanged, 1);
+  });
+
+  it("replaces a file without a second copy when a temp copy would pass the budget", async () => {
+    write(path.join(stateDir, "big.bin"), blob(200));
+    await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log, sqlite: null, budgetBytes: 300 * 1024 });
+    write(path.join(stateDir, "big.bin"), blob(220));
+    const r = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log, sqlite: null,
+      budgetBytes: 300 * 1024 });
+    assert.equal(r.files, 1);
+    assert.equal(fs.statSync(path.join(mountState, "big.bin")).size, 220 * 1024);
+    assert.ok(warnings.some((w) => w.includes("MOUNT_BUDGET replaced big.bin")), warnings.join("\n"));
+    assert.ok(storage.diskUsageBytes(mount) <= 300 * 1024);
+  });
+
+  it("leaves a file that cannot fit to the S3 backup and still mirrors the rest", async () => {
+    write(path.join(stateDir, "agents/main/agent/huge.bin"), blob(400));
+    write(path.join(stateDir, "workspace/notes.md"), "n");
+    const r = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log, sqlite: null,
+      budgetBytes: 300 * 1024 });
+    assert.equal(r.budgetSkipped, 1);
+    assert.equal(fs.existsSync(path.join(mountState, "agents/main/agent/huge.bin")), false);
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/notes.md"), "utf8"), "n");
+    assert.ok(storage.diskUsageBytes(mount) <= 300 * 1024);
+    assert.ok(warnings.some((w) => w.includes("MOUNT_BUDGET skipped agents/main/agent/huge.bin")));
+  });
+
+  it("an over-budget SQLite snapshot is never written, and an older copy is removed rather than kept stale",
+    sqliteOnly, async () => {
+      const dbPath = path.join(stateDir, "state/openclaw.sqlite");
+      const db = makeDb(dbPath, ["a"]);
+      await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log });
+      const mirrored = path.join(mountState, "state/openclaw.sqlite");
+      assert.deepEqual(readRows(mirrored), ["a"]);
+      db.prepare("INSERT INTO t (v) VALUES (?)").run(blob(64));
+      const r = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log, budgetBytes: 16 * 1024 });
+      assert.equal(r.budgetSkipped, 1);
+      // Restore then takes the database from S3 instead of an outdated mount copy.
+      assert.equal(fs.existsSync(mirrored), false);
+      assert.deepEqual(tmpLeft(), []);
+      db.close();
+    });
+
+  it("counts every byte on the mount, including temp files and other directories", () => {
+    write(path.join(mount, "other/x.bin"), blob(10));
+    write(path.join(mountState, "a.tmp-123"), blob(5));
+    assert.equal(storage.diskUsageBytes(mount), 15 * 1024);
+  });
+
+  it("a write the mount refuses leaves no temp file, stops the pass and does not prune", async (t) => {
+    write(path.join(stateDir, "a.json"), "a");
+    write(path.join(stateDir, "b.json"), "b");
+    write(path.join(mountState, "gone.json"), "old mirror file");
+    const real = fs.copyFileSync;
+    let calls = 0;
+    t.mock.method(fs, "copyFileSync", (src, dest) => {
+      calls++;
+      if (String(dest).includes(".tmp-")) {
+        fs.writeFileSync(dest, "partial");
+        throw Object.assign(new Error("EREMOTEIO: remote I/O error, copyfile"), { code: "EREMOTEIO" });
+      }
+      return real(src, dest);
+    });
+    const r = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log, sqlite: null });
+    assert.equal(r.mountErrors, 1);
+    assert.equal(calls, 1, "the pass kept writing to a mount that had refused a write");
+    assert.deepEqual(tmpLeft(), [], "a partial temp copy was left holding mount space");
+    assert.equal(fs.existsSync(path.join(mountState, "gone.json")), true);
+    assert.ok(warnings.some((w) => w.includes("MOUNT_WRITE_FAILED code=EREMOTEIO")));
+  });
+
+  it("copyFileAtomic and snapshotSqliteToFile remove their temp file when the copy fails", sqliteOnly, async (t) => {
+    const dbPath = path.join(stateDir, "state/openclaw.sqlite");
+    makeDb(dbPath, ["a"]).close();
+    const real = fs.copyFileSync;
+    t.mock.method(fs, "copyFileSync", (src, dest) => {
+      if (String(dest).includes(".tmp-")) {
+        fs.writeFileSync(dest, "partial");
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
+      return real(src, dest);
+    });
+    await assert.rejects(storage.snapshotSqliteToFile(dbPath, path.join(mountState, "state/openclaw.sqlite")),
+      /ENOSPC/);
+    assert.deepEqual(tmpLeft(), []);
+  });
+});
+
 // --- wiring in agentcore-contract.js (source-level ordering guarantees) ---
 describe("mirrorWorkspaceDir / workspace watcher", () => {
   let home, mount, stateDir, mountState, ws;
