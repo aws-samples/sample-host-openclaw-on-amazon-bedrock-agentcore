@@ -1219,6 +1219,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
   const created = Math.floor(Date.now() / 1000);
   let inputTokens = 0;
   let outputTokens = 0;
+  let streamedUsage = null;
   let fullResponseText = "";
 
   // Track tool use blocks during streaming
@@ -1351,6 +1352,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
         if (event.metadata?.usage) {
           inputTokens = event.metadata.usage.inputTokens || 0;
           outputTokens = event.metadata.usage.outputTokens || 0;
+          streamedUsage = modelPolicy.streamUsage(event.metadata.usage);
         }
 
         // Log guardrail trace/intervention from streaming events
@@ -1379,6 +1381,8 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
             finish_reason: finishReason,
           },
         ],
+        // OpenClaw's preflight compaction sizes the session from this usage.
+        ...(streamedUsage && { usage: streamedUsage }),
       };
       res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       res.write("data: [DONE]\n\n");
@@ -1403,8 +1407,12 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
   }
 
   const failure = route?.failure;
-  if (failure && failure.code !== "BEDROCK_REQUEST_REJECTED") {
+  if (modelPolicy.outcomeUnknown(failure)) {
     modelOutcomeUnknown = true;
+  } else if (failure?.code === modelPolicy.CALLER_CANCELLED) {
+    // OpenClaw closed the response (an interrupt or its own abort) before any
+    // model output reached it, so later requests stay admitted.
+    console.log("[proxy] Request cancelled by the caller before model output; outcome fence not set");
   }
   // If all retries failed and headers not yet sent
   if (route && (res.destroyed || res.writableEnded)) {

@@ -6,6 +6,8 @@
  * Cancellation and evidence of multiple SDK attempts also prevent fallback.
  * Other failures distinguish a known rejection from observed output or an
  * unknown request outcome, so callers can avoid blindly repeating effects.
+ * A caller that closes its response before any model output has cancelled the
+ * request itself: it received nothing it could act on, so that outcome is known.
  *
  * The caller sends requests and feeds their results into this tracker; it
  * records attempt metadata and exposes cancellation without issuing requests.
@@ -20,6 +22,10 @@ const UNKNOWN_OUTCOME_ERROR = Object.freeze({
   type: "invalid_request_error",
   message: "Bedrock request outcome is unknown. Reconcile effects before another request.",
 });
+// The caller closed its response before any content, tool, terminal or metadata
+// event. No part of the model's answer was written to it, so no tool call from
+// this request can run; the caller decided to drop the request.
+const CALLER_CANCELLED = "CALLER_CANCELLED_BEFORE_OUTPUT";
 const TEMPORARY_ERRORS = Object.freeze({
   InternalServerException: 500,
   ServiceUnavailableException: 503,
@@ -61,8 +67,14 @@ function createStreamingRoute({ primaryModelId, fallbackModelId, response,
   const routeId = osRandomUUID();
   const attempts = [];
   let outputObserved = false, fallbackSelected = false, finished = false;
+  // Set only when the caller's response closed before this route finished it.
+  let callerCancelled = false;
   let failure;
-  const cancel = () => { if (!response.writableEnded) controller.abort(); };
+  const cancel = () => {
+    if (response.writableEnded) return;
+    callerCancelled = true;
+    controller.abort();
+  };
   response.once("close", cancel);
   if (response.destroyed) cancel();
   const active = () => {
@@ -122,7 +134,11 @@ function createStreamingRoute({ primaryModelId, fallbackModelId, response,
           Object.values(STREAM_ERRORS).includes(error?.name) ? error.name : "OTHER";
       }
       if (allowed) fallbackSelected = true;
-      else if (attempt) {
+      else if (attempt && callerCancelled && !outputObserved) {
+        attempt.error_code = CALLER_CANCELLED;
+        failure = { code: CALLER_CANCELLED, type: UNKNOWN_OUTCOME_ERROR.type,
+          message: "Request cancelled by the caller before any model output." };
+      } else if (attempt) {
         const rejected = !(error?.$metadata?.attempts > 1) && !outputObserved &&
           ((expected !== undefined && (status === expected ||
             (status == null && attempt.resolved_ns !== null))) ||
@@ -152,4 +168,28 @@ function createStreamingRoute({ primaryModelId, fallbackModelId, response,
   };
 }
 
-module.exports = { PRIMARY_MODEL_ID, FALLBACK_MODEL_ID, SUBAGENT_MODEL_ID, UNKNOWN_OUTCOME_ERROR, requestFields, createStreamingRoute };
+// Whether a route failure leaves the request's outcome unknown (the proxy's fence).
+function outcomeUnknown(failure) {
+  return !!failure && failure.code !== "BEDROCK_REQUEST_REJECTED" && failure.code !== CALLER_CANCELLED;
+}
+
+/**
+ * OpenAI chat-completions usage for a finished Bedrock stream. OpenClaw records
+ * it on the turn, and its preflight compaction sizes the session from it.
+ * prompt_tokens counts the whole prompt: Bedrock's inputTokens excludes cache
+ * reads and cache writes, which prompt_tokens_details reports separately.
+ */
+function streamUsage({ inputTokens = 0, outputTokens = 0, cacheReadInputTokens = 0, cacheWriteInputTokens = 0 } = {}) {
+  const count = (value) => (Number.isSafeInteger(value) && value > 0 ? value : 0);
+  const cached = count(cacheReadInputTokens), written = count(cacheWriteInputTokens);
+  const prompt = count(inputTokens) + cached + written, completion = count(outputTokens);
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    prompt_tokens_details: { cached_tokens: cached, cache_write_tokens: written },
+  };
+}
+
+module.exports = { PRIMARY_MODEL_ID, FALLBACK_MODEL_ID, SUBAGENT_MODEL_ID, UNKNOWN_OUTCOME_ERROR,
+  CALLER_CANCELLED, requestFields, createStreamingRoute, outcomeUnknown, streamUsage };

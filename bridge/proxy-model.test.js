@@ -483,17 +483,143 @@ for (const name of ["TimeoutError", "Error", "AbortError"]) {
   });
 }
 
-test("a closed response still reports an unknown outcome to the contract", async () => {
-  const app = streaming((_input, _ordinal, response) => {
-    response.destroyed = true;
-    response.emit("close");
-    throw new Error("connection lost");
+// The caller closing its response is how OpenClaw cancels a model request: an
+// interrupt (chat.send queueMode "interrupt") or a restart abort of a resumed run.
+function freshResponse() {
+  const fresh = new EventEmitter();
+  fresh.frames = [];
+  fresh.writeHead = (value) => { fresh.statusCode = value; fresh.headersSent = true; };
+  fresh.write = (value) => { fresh.frames.push(value); return true; };
+  fresh.end = (value) => { if (value) fresh.frames.push(value); fresh.writableEnded = true; };
+  return fresh;
+}
+
+for (const [label, closeAfterResolve] of [["before the response resolves", false], ["after messageStart only", true]]) {
+  test(`a caller that cancels ${label} does not fence the next request`, async () => {
+    const app = streaming((_input, ordinal, response) => {
+      if (ordinal > 1) return reply();
+      if (!closeAfterResolve) {
+        response.destroyed = true;
+        response.emit("close");
+        throw Object.assign(new Error("Request aborted"), { name: "AbortError" });
+      }
+      return { $metadata: { requestId: "sdk-request-1", attempts: 1 },
+        stream: (async function* () {
+          yield { messageStart: { role: "assistant" } };
+          response.destroyed = true;
+          response.emit("close");
+          yield { contentBlockDelta: { delta: { text: "never delivered" } } };
+        })() };
+    });
+    await app.invoke();
+    assert.equal(app.requests.length, 1);
+    assert.equal(app.frames.filter((frame) => frame.includes("never delivered")).length, 0);
+    assert.equal(app.unknownOutcome, false);
+    assert.equal(app.health().model_outcome_unknown, false);
+    assert.equal(app.logs[0].attempts[0].error_code, policy.CALLER_CANCELLED);
+    assert.equal(app.logs[0].fallback_selected, false, "a cancelled request never falls back");
+    // The next turn's request reaches Bedrock and is answered.
+    const next = freshResponse();
+    assert.equal(await app.invoke(next), "answer");
+    assert.equal(app.requests.length, 2);
+    assert.equal(next.frames.at(-1), "data: [DONE]\n\n");
   });
+}
+
+for (const [label, events] of [
+  ["text", [{ contentBlockDelta: { delta: { text: "partial answer" } } }]],
+  ["tool", [
+    { contentBlockStart: { contentBlockIndex: 0, start: { toolUse: { toolUseId: "id", name: "test" } } } },
+    { contentBlockDelta: { delta: { toolUse: { input: "{}" } } } },
+    { contentBlockStop: { contentBlockIndex: 0 } },
+  ]],
+]) {
+  test(`a caller that cancels after ${label} output still fences later requests`, async () => {
+    const app = streaming((_input, ordinal, response) => ordinal > 1 ? reply() : {
+      $metadata: { requestId: "sdk-request-1", attempts: 1 },
+      stream: (async function* () {
+        yield* events;
+        response.destroyed = true;
+        response.emit("close");
+        yield { contentBlockDelta: { delta: { text: "more" } } };
+      })(),
+    });
+    await app.invoke();
+    assert.ok(app.frames.length > 0, "some output was written before the close");
+    assert.equal(app.unknownOutcome, true);
+    assert.equal(app.health().model_outcome_unknown, true);
+    const next = freshResponse();
+    await app.invoke(next);
+    assert.equal(next.statusCode, 400);
+    assert.equal(JSON.parse(next.frames[0]).error.code, "PROVIDER_POST_DISPATCH_AMBIGUITY");
+    assert.equal(app.requests.length, 1);
+  });
+}
+
+test("an SDK abort while the caller is still listening keeps the outcome unknown", async () => {
+  const app = streaming(() => { throw Object.assign(new Error("Request aborted"), { name: "AbortError" }); });
   await app.invoke();
-  assert.equal(app.requests.length, 1);
-  assert.equal(app.frames.length, 0);
+  assert.equal(app.response.destroyed, undefined);
   assert.equal(app.unknownOutcome, true);
-  assert.equal(app.health().model_outcome_unknown, true);
+  assert.equal(JSON.parse(app.frames[0]).error.code, "PROVIDER_POST_DISPATCH_AMBIGUITY");
+});
+
+test("the final stream chunk reports Bedrock usage with cache tokens in prompt_tokens", async () => {
+  const app = streaming(() => reply([
+    { contentBlockDelta: { delta: { text: "answer" } } },
+    { messageStop: { stopReason: "end_turn" } },
+    { metadata: { usage: { inputTokens: 1200, outputTokens: 80, cacheReadInputTokens: 250000,
+      cacheWriteInputTokens: 16000, totalTokens: 267280 } } },
+  ]));
+  assert.equal(await app.invoke(), "answer");
+  const chunks = app.frames.filter((frame) => frame !== "data: [DONE]\n\n")
+    .map((frame) => JSON.parse(frame.slice(6)));
+  const final = chunks.at(-1);
+  assert.equal(final.choices[0].finish_reason, "stop");
+  assert.deepEqual(final.usage, {
+    prompt_tokens: 267200, completion_tokens: 80, total_tokens: 267280,
+    prompt_tokens_details: { cached_tokens: 250000, cache_write_tokens: 16000 },
+  });
+  assert.ok(chunks.slice(0, -1).every((chunk) => chunk.usage === undefined), "only the final chunk carries usage");
+});
+
+test("a stream without Bedrock metadata reports no usage", async () => {
+  const app = streaming(() => reply());
+  await app.invoke();
+  const final = JSON.parse(app.frames.at(-2).slice(6));
+  assert.equal(final.choices[0].finish_reason, "stop");
+  assert.equal(Object.hasOwn(final, "usage"), false);
+});
+
+test("streamUsage ignores missing or invalid counts", () => {
+  assert.deepEqual(policy.streamUsage({ inputTokens: 10, outputTokens: -1, cacheReadInputTokens: "5" }), {
+    prompt_tokens: 10, completion_tokens: 0, total_tokens: 10,
+    prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+  });
+});
+
+test("pinned OpenClaw reads the proxy's final-chunk usage as the turn's prompt size", {
+  skip: !process.env.OPENCLAW_SOURCE_ROOT && "Set OPENCLAW_SOURCE_ROOT to the pinned 2026.9.5 source fixture",
+}, () => {
+  const path = require("node:path");
+  const root = process.env.OPENCLAW_SOURCE_ROOT;
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version, "2026.9.5");
+  const worker = fs.readFileSync(path.join(root, "dist/worker/worker.mjs"), "utf8");
+  const start = worker.indexOf("function parseOpenAICompletionsUsage(");
+  const end = worker.indexOf("function createOpenAIResponseHook(", start);
+  assert.ok(start >= 0 && end > start, "Pinned source boundaries: parseOpenAICompletionsUsage");
+  // The completions stream reader parses `usage` from any chunk that has it.
+  assert.match(worker, /\.usage&&\([A-Za-z_$][\w$]*\.usage=parseOpenAICompletionsUsage\(/);
+  const box = { calculateCost() {}, applyProviderReportedUsageCost() {} };
+  vm.createContext(box);
+  vm.runInContext(worker.slice(start, end), box);
+  const usage = box.parseOpenAICompletionsUsage(policy.streamUsage({ inputTokens: 1200, outputTokens: 80,
+    cacheReadInputTokens: 250000, cacheWriteInputTokens: 16000 }), {}, {});
+  assert.equal(usage.input, 1200);
+  assert.equal(usage.cacheRead, 250000);
+  assert.equal(usage.cacheWrite, 16000);
+  assert.equal(usage.output, 80);
+  assert.equal(usage.totalTokens, 267280);
 });
 
 test("unknown outcome fences fresh streaming requests before another SDK client or route", async () => {

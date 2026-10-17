@@ -749,6 +749,74 @@ def _valid_audio_key(key, namespace):
     return len(name) > len(".mp3")
 
 
+# How long before the cron call an object may have been written and still
+# count as this run's. S3 LastModified has one-second resolution.
+AUDIO_RUN_CLOCK_SLACK_SECONDS = 2
+# Stop listing the namespace with less than this left before the deadline.
+AUDIO_LIST_MIN_SECONDS = 20
+
+
+# An mp3 file name in a schedule message, e.g. "morning-brief-YYYY-MM-DD-en.mp3".
+_MESSAGE_MP3_RE = re.compile(r"[A-Za-z0-9_\-./]+\.mp3")
+_DATE_PLACEHOLDER = "YYYY-MM-DD"
+
+
+def audio_name_patterns(message):
+    """Regexes for the mp3 names a schedule message tells the brief to upload."""
+    patterns = []
+    for token in _MESSAGE_MP3_RE.findall(message or ""):
+        name = token.rsplit("/", 1)[-1]
+        if len(name) <= len(".mp3"):
+            continue
+        parts = [re.escape(part) for part in name.split(_DATE_PLACEHOLDER)]
+        patterns.append(re.compile("^" + r"\d{4}-\d{2}-\d{2}".join(parts) + "$"))
+    return patterns
+
+
+def find_run_audio_key(actor_id, run_started, run_finished, deadline, message=""):
+    """Key of the newest mp3 this run uploaded to the user's namespace, or None.
+
+    A brief that does not end with a BRIEF_AUDIO line (the prompt was edited,
+    or the model skipped the step) still uploads its mp3 in the same run. Only
+    top-level objects of the run's own namespace, written between the cron call
+    and its reply, whose name matches an mp3 name in the schedule message
+    count. Never raises; logs carry fixed messages only.
+    """
+    namespace = _audio_namespace(actor_id)
+    patterns = audio_name_patterns(message)
+    if not patterns or not USER_FILES_BUCKET or not namespace or not isinstance(run_started, (int, float)):
+        return None
+    since = run_started - AUDIO_RUN_CLOCK_SLACK_SECONDS
+    until = run_finished + AUDIO_RUN_CLOCK_SLACK_SECONDS
+    newest = None
+    try:
+        kwargs = {"Bucket": USER_FILES_BUCKET, "Prefix": f"{namespace}/", "Delimiter": "/"}
+        while True:
+            if deadline - time.monotonic() < AUDIO_LIST_MIN_SECONDS:
+                logger.warning("Brief audio lookup stopped: too little time left")
+                return None
+            page = s3_client.list_objects_v2(**kwargs)
+            for obj in page.get("Contents", []):
+                key, modified = obj.get("Key"), obj.get("LastModified")
+                if not _valid_audio_key(key, namespace) or modified is None:
+                    continue
+                if not any(p.match(key.rsplit("/", 1)[-1]) for p in patterns):
+                    continue
+                stamp = modified.timestamp()
+                if since <= stamp <= until and (newest is None or stamp > newest[0]):
+                    newest = (stamp, key)
+            if not page.get("IsTruncated"):
+                break
+            kwargs["ContinuationToken"] = page["NextContinuationToken"]
+    except Exception as e:
+        logger.warning("Brief audio lookup failed: %s", type(e).__name__)
+        return None
+    if newest:
+        logger.info("Brief audio found without a marker line: using the mp3 this run uploaded")
+        return newest[1]
+    return None
+
+
 def _multipart_body(fields, file_field, filename, content_type, data):
     boundary = uuid.uuid4().hex
     parts = []
@@ -965,6 +1033,7 @@ def handler(event, context):
     cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"
     if context:
         lambda_deadline = min(lambda_deadline, time.monotonic() + context.get_remaining_time_in_millis() / 1000)
+    run_started = time.time()
     result = invoke_agentcore(
         session_id, "cron", current_user_id, actor_id, channel, cron_message,
         deadline=lambda_deadline - 15, channel_target=channel_target,
@@ -982,6 +1051,8 @@ def handler(event, context):
     # Phase 4: Deliver response to channel, then the brief's audio (if any)
     logger.info("Delivering response (len=%d) to %s:%s", len(response_text), channel, channel_target)
     deliver_response(channel, channel_target, response_text)
+    if not audio_key and channel == "telegram":
+        audio_key = find_run_audio_key(session_id.actor_id, run_started, time.time(), lambda_deadline, message)
     if audio_key:
         deliver_brief_audio(channel, channel_target, audio_key, session_id.actor_id, lambda_deadline)
 
