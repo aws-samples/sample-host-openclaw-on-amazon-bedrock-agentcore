@@ -666,7 +666,77 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
         return {"response": "No response from agent."}
     except Exception as e:
         logger.error("AgentCore invocation failed: %s", e, exc_info=True)
-        return {"response": f"Sorry, I'm having trouble right now. Please try again later."}
+        failed = {"response": f"Sorry, I'm having trouble right now. Please try again later."}
+        if _runtime_init_failed(e):
+            # Matched by the openclaw-runtime-session-unstartable alarm.
+            logger.error("AgentCore could not start runtime session %s", session_id)
+            failed["sessionUnstartable"] = True
+        return failed
+
+
+# AgentCore's error when no microVM for a runtime session became healthy within
+# its 120 s start limit. On 16 Oct 2026 a session whose session storage had
+# started failing (EREMOTEIO) failed every start this way, while a new session
+# started normally. Same handling as the cron Lambda (#183).
+RUNTIME_INIT_FAILED_CODE = "RuntimeClientError"
+RUNTIME_INIT_FAILED_TEXT = "initialization time exceeded"
+
+
+def _runtime_init_failed(error):
+    """True when AgentCore reports that no microVM for the session started in time."""
+    if not isinstance(error, ClientError):
+        return False
+    err = error.response.get("Error", {})
+    return (err.get("Code") == RUNTIME_INIT_FAILED_CODE
+            and RUNTIME_INIT_FAILED_TEXT in str(err.get("Message", "")).lower())
+
+
+def replace_unstartable_session(user_id, old_session_id):
+    """Point the user at a new runtime session after AgentCore could not start the old one.
+
+    Only replaces the SESSION record if it still names old_session_id, so a
+    chat and a brief failing on the same session at once end up on one new
+    session. The new session starts with empty session storage and restores
+    from the S3 backup, as after a runtime version update.
+    """
+    pk = f"USER#{user_id}"
+    new_session_id = f"ses_{user_id}_{uuid.uuid4().hex[:12]}"
+    if len(new_session_id) < 33:
+        new_session_id += "_" + uuid.uuid4().hex[: 33 - len(new_session_id)]
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        identity_table.update_item(
+            Key={"PK": pk, "SK": "SESSION"},
+            UpdateExpression="SET sessionId = :new, lastActivity = :now",
+            ConditionExpression="sessionId = :old",
+            ExpressionAttributeValues={":new": new_session_id, ":old": old_session_id, ":now": now_iso},
+        )
+        logger.warning("Runtime session %s could not start; user %s moved to new session %s",
+                       old_session_id, user_id, new_session_id)
+        return new_session_id
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            logger.error("Failed to replace runtime session: %s", type(e).__name__)
+            return old_session_id
+    try:
+        current = identity_table.get_item(Key={"PK": pk, "SK": "SESSION"}).get("Item", {}).get("sessionId")
+    except ClientError as e:
+        logger.error("Failed to read replaced runtime session: %s", type(e).__name__)
+        return old_session_id
+    logger.info("Runtime session %s was already replaced by %s", old_session_id, current)
+    return current or old_session_id
+
+
+def invoke_agent_runtime_recovering(session_id, user_id, actor_id, channel, message):
+    """invoke_agent_runtime, plus one retry on a new session if AgentCore cannot start this one."""
+    result = invoke_agent_runtime(session_id, user_id, actor_id, channel, message)
+    if isinstance(result, dict) and result.get("sessionUnstartable"):
+        new_session_id = replace_unstartable_session(user_id, session_id)
+        if new_session_id != session_id:
+            result = invoke_agent_runtime(new_session_id, user_id, actor_id, channel, message)
+    if isinstance(result, dict):
+        result.pop("sessionUnstartable", None)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1719,7 +1789,7 @@ def handle_telegram(body):
     )
     typing_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message)
+        result = invoke_agent_runtime_recovering(session_id, resolved_user_id, actor_id, "telegram", agent_message)
     finally:
         stop_typing.set()
         typing_thread.join(timeout=2)
@@ -1862,7 +1932,7 @@ def handle_slack(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message)
+        result = invoke_agent_runtime_recovering(session_id, resolved_user_id, actor_id, "slack", agent_message)
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -2016,7 +2086,7 @@ def handle_feishu(body, headers=None):
     )
     notify_thread.start()
     try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message)
+        result = invoke_agent_runtime_recovering(session_id, resolved_user_id, actor_id, "feishu", agent_message)
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)

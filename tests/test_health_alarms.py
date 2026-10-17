@@ -22,7 +22,8 @@ def _resources(template, kind):
 def test_each_failure_line_has_a_metric_filter_and_an_alarm(templates):
     obs = templates["OpenClawObservability.template.json"]
     filters = {v["Properties"]["MetricTransformations"][0]["MetricName"]: v["Properties"]
-               for v in _resources(obs, "AWS::Logs::MetricFilter").values()}
+               for v in _resources(obs, "AWS::Logs::MetricFilter").values()
+               if v["Properties"]["LogGroupName"] != "/openclaw/lambda/router"}
     assert filters["SessionStorageWriteErrors"]["LogGroupName"] == "/openclaw/container"
     assert filters["SessionStorageWriteErrors"]["FilterPattern"] == \
         '?"MOUNT_WRITE_FAILED" ?"EREMOTEIO" ?"ENOSPC" ?"EDQUOT"'
@@ -31,6 +32,9 @@ def test_each_failure_line_has_a_metric_filter_and_an_alarm(templates):
     assert filters["ScheduledTaskFailures"]["FilterPattern"] == \
         '?"did not complete" ?"Warmup timed out" ?"Status: timeout"'
     assert filters["RuntimeSessionUnstartable"]["FilterPattern"] == '"could not start runtime session"'
+    router = [v["Properties"] for v in _resources(obs, "AWS::Logs::MetricFilter").values()
+              if v["Properties"]["LogGroupName"] == "/openclaw/lambda/router"]
+    assert len(router) == 1 and router[0]["MetricTransformations"][0]["MetricName"] == "RuntimeSessionUnstartable"
     for props in filters.values():
         t = props["MetricTransformations"][0]
         assert t["MetricNamespace"] == "OpenClaw/Health" and t["MetricValue"] == "1"

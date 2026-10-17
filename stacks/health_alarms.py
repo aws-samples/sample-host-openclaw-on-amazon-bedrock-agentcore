@@ -30,6 +30,7 @@ from constructs import Construct
 NAMESPACE = "OpenClaw/Health"
 CONTAINER_LOG_GROUP = "/openclaw/container"
 CRON_LOG_GROUP = "/openclaw/lambda/cron"
+ROUTER_LOG_GROUP = "/openclaw/lambda/router"
 
 
 def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic) -> list:
@@ -71,8 +72,9 @@ def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic) -> list:
         apply_to_children=True,
     )
     container_group = logs.LogGroup.from_log_group_name(scope, "ContainerLogGroup", CONTAINER_LOG_GROUP)
-    # Owned by OpenClawCron; app.py makes this stack depend on it.
+    # Owned by OpenClawCron and OpenClawRouter; app.py makes this stack depend on both.
     cron_group = logs.LogGroup.from_log_group_name(scope, "CronLogGroup", CRON_LOG_GROUP)
+    router_group = logs.LogGroup.from_log_group_name(scope, "RouterLogGroup", ROUTER_LOG_GROUP)
 
     specs = [
         ("SessionStorageWriteErrors", container_group,
@@ -122,4 +124,15 @@ def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic) -> list:
         )
         alarm.add_alarm_action(action)
         alarms.append(alarm)
+    # The router's chat path logs the same line (and moves the user to a new
+    # session); it feeds the same metric, so the one alarm covers both.
+    logs.MetricFilter(
+        scope,
+        "RuntimeSessionUnstartableRouterFilter",
+        log_group=router_group,
+        filter_pattern=logs.FilterPattern.any_term("could not start runtime session"),
+        metric_namespace=NAMESPACE,
+        metric_name="RuntimeSessionUnstartable",
+        metric_value="1",
+    )
     return alarms
