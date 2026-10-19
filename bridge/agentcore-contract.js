@@ -27,6 +27,7 @@ const {
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
 const stateStorage = require("./state-storage");
+const cronJobs = require("./cron-jobs");
 const legacySessionImport = require("./legacy-session-import");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
@@ -2015,8 +2016,9 @@ async function processMessageQueue() {
     );
 
     // A turn with a caller deadline (cron) runs at most until that deadline,
-    // so its caller hears back while it is still waiting.
-    let timeoutMs = 620000;
+    // so its caller hears back while it is still waiting. An async cron job
+    // (cron_start) is bounded by its own deadline only, not the 620 s cap.
+    let timeoutMs = entry.uncapped && entry.deadline !== undefined ? entry.deadline - Date.now() : 620000;
     if (entry.deadline !== undefined) {
       timeoutMs = Math.min(timeoutMs, entry.deadline - Date.now());
       if (timeoutMs <= 0) {
@@ -2048,9 +2050,9 @@ async function processMessageQueue() {
  * @param {object} [opts.outcome] - passed to bridgeMessage (receives `kind`)
  * @param {function} [opts.onDispatch] - called just before the turn is sent
  */
-function enqueueMessage(message, onDelta, { deadline, outcome, onDispatch } = {}) {
+function enqueueMessage(message, onDelta, { deadline, outcome, onDispatch, uncapped = false } = {}) {
   return new Promise((resolve, reject) => {
-    const entry = { message, onDelta, resolve, reject, deadline, outcome, onDispatch };
+    const entry = { message, onDelta, resolve, reject, deadline, outcome, onDispatch, uncapped };
     if (deadline !== undefined) {
       entry.expiryTimer = setTimeout(() => {
         const index = messageQueue.indexOf(entry);
@@ -2504,11 +2506,11 @@ function cronFailureText(message) {
  * so far and never the lightweight agent (the real gateway is up by now).
  * A turn still queued at the deadline is never sent.
  */
-async function runCronTurn(message, deadline, onDispatch) {
+async function runCronTurn(message, deadline, onDispatch, { uncapped = false } = {}) {
   const outcome = {};
   let text = "";
   try {
-    text = await enqueueMessage(message, undefined, { deadline, outcome, onDispatch });
+    text = await enqueueMessage(message, undefined, { deadline, outcome, onDispatch, uncapped });
   } catch (err) {
     console.error("[contract] Cron turn not run:", err?.message || "unknown");
     return { response: cronFailureText(message), status: "error" };
@@ -2524,6 +2526,98 @@ async function runCronTurn(message, deadline, onDispatch) {
     return { response: cronFailureText(message), status: "error" };
   }
   return { response: text };
+}
+
+/**
+ * Run one cron turn for a cron or cron_start request: wait for init, then send
+ * it through the shared queue as trigger=cron. Returns { code, body }.
+ */
+async function cronTurnReply(payload, req, deadline, { uncapped = false } = {}) {
+  const { actorId, channel, message, userId } = payload;
+  // Update shared identity file so proxy picks up cross-channel changes
+  updateIdentityFile(actorId, channel || "unknown", { sessionId: runtimeSessionHeader(req) });
+
+  // Block until init completes (unlike chat which returns immediately)
+  if (!openclawReady || !proxyReady) {
+    try {
+      if (!initInProgress) {
+        await init(userId, actorId, channel || "unknown");
+      } else {
+        await initPromise;
+      }
+    } catch (err) {
+      console.error(`[contract] Cron init failed: ${err.message}`);
+      return { code: 200, body: { response: "Agent initialization failed for scheduled task.", status: "error" } };
+    }
+  }
+
+  if (!openclawReady || !proxyReady) {
+    return { code: 200, body: { response: "Agent not ready after initialization.", status: "error" } };
+  }
+
+  // Track active task to prevent idle termination during cron processing
+  lastActivityTime = Math.floor(Date.now() / 1000);
+  activeTaskCount++;
+  let reply;
+  try {
+    // Serialized with chat messages to prevent WebSocket races.
+    reply = await runCronTurn(message, deadline, () => setTurnTrigger("cron"), { uncapped });
+  } finally {
+    activeTaskCount = Math.max(0, activeTaskCount - 1);
+  }
+  return { code: 200, body: { ...reply, userId: currentUserId, sessionId: payload.sessionId || null } };
+}
+
+// Async scheduled turns (cron_start / cron_status, see cron-jobs.js).
+const CRON_JOB_BUDGET_MS = cronJobs.envBudgetMs(process.env.CRON_ASYNC_JOB_BUDGET_MS);
+let cronJobStoreInstance = null;
+
+function cronJobStore() {
+  if (!cronJobStoreInstance) {
+    // Session storage keeps the jobs across a container restart; without it, memory only.
+    const dir = fs.existsSync(stateStorage.DEFAULT_MOUNT) ? stateStorage.DEFAULT_MOUNT : null;
+    cronJobStoreInstance = cronJobs.createCronJobStore({ dir, bootId: require("crypto").randomUUID() });
+    cronJobStoreInstance.load();
+  }
+  return cronJobStoreInstance;
+}
+
+/**
+ * cron_start: accept a scheduled turn, reply at once, and run it as a normal
+ * cron turn (trigger=cron) until the job deadline, not the 620 s cap.
+ * cron_status: answer from the job store at once; it is never queued.
+ */
+async function handleCronAsync(payload, req, res) {
+  const reply = (body, status = 200) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  const { action, userId, actorId } = payload;
+  if (!userId || !actorId) return reply({ error: "Missing userId or actorId" }, 400);
+  const store = cronJobStore();
+  if (action === "cron_status") return reply(store.status(payload.jobId, userId));
+  const parsed = cronJobs.parseCronStart(payload, { defaultBudgetMs: CRON_JOB_BUDGET_MS });
+  if (!parsed.ok) return reply({ error: parsed.error }, 400);
+  if (!payload.message) return reply({ error: "Missing message" }, 400);
+  const { jobId } = parsed;
+  const started = store.start(jobId, { userId, deadline: Date.now() + parsed.budgetMs });
+  if (started.duplicate) {
+    console.warn("[contract] cron_start for a known job ignored (state %s)", started.job.state);
+    return reply({ status: "accepted", jobId, duplicate: true, deadline: started.job.deadline });
+  }
+  lastActivityTime = Math.floor(Date.now() / 1000);
+  // Held until the turn ends, so /ping stays HealthyBusy through init as well.
+  activeTaskCount++;
+  cronTurnReply(payload, req, started.job.deadline, { uncapped: true })
+    .then(({ code, body }) => store.finish(jobId, code === 200 ? body : { ...body, status: "error" }))
+    .catch((error) => console.error(`[contract] Async cron turn failed: ${error.message}`))
+    .finally(() => {
+      activeTaskCount = Math.max(0, activeTaskCount - 1);
+      // finish() ignores a job that is already done; this covers a turn that never replied.
+      store.finish(jobId, { status: "error" });
+    });
+  console.log("[contract] cron_start accepted; job budget %s ms", parsed.budgetMs);
+  return reply({ status: "accepted", jobId, deadline: started.job.deadline });
 }
 
 /**
@@ -2639,6 +2733,11 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
+        if (action === "cron_start" || action === "cron_status") {
+          await handleCronAsync({ ...payload, action }, req, res);
+          return;
+        }
+
         // Cron action — blocks until init completes, then bridges the message
         if (action === "cron") {
           const { userId, actorId, channel, message } = payload;
@@ -2657,60 +2756,9 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
-          // Update shared identity file so proxy picks up cross-channel changes
-          updateIdentityFile(actorId, channel || "unknown", { sessionId: runtimeSessionHeader(req) });
-
-          // Block until init completes (unlike chat which returns immediately)
-          if (!openclawReady || !proxyReady) {
-            try {
-              if (!initInProgress) {
-                await init(userId, actorId, channel || "unknown");
-              } else {
-                await initPromise;
-              }
-            } catch (err) {
-              console.error(`[contract] Cron init failed: ${err.message}`);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(
-                JSON.stringify({
-                  response: "Agent initialization failed for scheduled task.",
-                  status: "error",
-                }),
-              );
-              return;
-            }
-          }
-
-          if (!openclawReady || !proxyReady) {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({
-                response: "Agent not ready after initialization.",
-                status: "error",
-              }),
-            );
-            return;
-          }
-
-          // Track active task to prevent idle termination during cron processing
-          lastActivityTime = Math.floor(Date.now() / 1000);
-          activeTaskCount++;
-          let reply;
-          try {
-            // Serialized with chat messages to prevent WebSocket races.
-            reply = await runCronTurn(message, budget.deadline, () => setTurnTrigger("cron"));
-          } finally {
-            activeTaskCount = Math.max(0, activeTaskCount - 1);
-          }
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              ...reply,
-              userId: currentUserId,
-              sessionId: payload.sessionId || null,
-            }),
-          );
+          const { code, body: cronBody } = await cronTurnReply(payload, req, budget.deadline);
+          res.writeHead(code, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(cronBody));
           return;
         }
 
