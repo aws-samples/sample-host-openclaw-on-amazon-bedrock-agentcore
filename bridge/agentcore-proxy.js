@@ -96,6 +96,14 @@ const BASE_DELAY_MS = 500;
 // the worst case is ~4.5 min, well under the lightweight agent's 120s HTTP timeout
 // for non-streaming and the Router Lambda's 600s timeout for streaming.
 const BEDROCK_REQUEST_TIMEOUT_MS = 90_000;
+// ConverseStream: the SDK's HTTP/2 handler applies requestTimeout as "no activity
+// on the stream", which includes the wait for the first event. Opus 5.5 on a
+// 130k-165k token prompt has taken 76-87 s to its first token and sometimes longer
+// than 90 s, and a stream that times out before any event leaves its outcome
+// unknown, which ends the turn. 180 s is about twice the slowest first token seen.
+// Each streaming request makes one attempt, so this bounds one hang well inside the
+// 620 s turn limit.
+const BEDROCK_STREAM_TIMEOUT_MS = 180_000;
 
 /**
  * Cross-region inference profiles (global.* / us.*) require AWS's global
@@ -113,13 +121,17 @@ function isCrossRegionProfile(modelId) {
   return /^(global|us|eu|ap)\.[a-z]/.test(modelId);
 }
 
-function bedrockClientOptions(modelId) {
-  const opts = { requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS };
+function bedrockClientOptions(modelId, requestTimeout = BEDROCK_REQUEST_TIMEOUT_MS) {
+  const opts = { requestTimeout };
   if (isCrossRegionProfile(modelId)) {
     // Force public endpoint — bypasses VPC endpoint Private DNS intercept.
     opts.endpoint = `https://bedrock-runtime.${AWS_REGION}.amazonaws.com`;
   }
   return opts;
+}
+
+function bedrockStreamClientOptions(modelId) {
+  return bedrockClientOptions(modelId, BEDROCK_STREAM_TIMEOUT_MS);
 }
 
 // Session tracking (in-memory, per container instance)
@@ -1177,7 +1189,7 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
   let modelId = route ? route.modelId(0) : resolveModelId(model);
   const client = new BedrockRuntimeClient({
     region: AWS_REGION,
-    requestHandler: bedrockClientOptions(modelId),
+    requestHandler: bedrockStreamClientOptions(modelId),
     ...(route && { maxAttempts: 1 }),
   });
   const { bedrockMessages, systemText } = convertMessages(messages);

@@ -89,7 +89,8 @@ test("the proxy reads the per-turn model override only from the bound identity f
 });
 
 function streaming(send, { subagent = false, subagentModel = "custom-subagent", allowlist = [],
-  mainModel, primaryModel = mainModel ?? policy.PRIMARY_MODEL_ID, fallbackModel = policy.FALLBACK_MODEL_ID } = {}) {
+  mainModel, primaryModel = mainModel ?? policy.PRIMARY_MODEL_ID, fallbackModel = policy.FALLBACK_MODEL_ID,
+  clientOptions = { unary: () => ({}), stream: () => ({}) } } = {}) {
   const requests = [], clients = [], frames = [], logs = [];
   let handler, bodyReads = 0;
   const response = new EventEmitter();
@@ -112,7 +113,8 @@ function streaming(send, { subagent = false, subagentModel = "custom-subagent", 
     MODEL_ID: primaryModel, FALLBACK_MODEL_ID: fallbackModel,
     USER_SELECTABLE_MODEL_IDS: new Set(allowlist),
     AWS_REGION: "us-west-2", MAX_RETRIES: 5, BASE_DELAY_MS: 0,
-    sleep: async () => {}, bedrockClientOptions: () => ({}), structuredClone,
+    sleep: async () => {}, bedrockClientOptions: clientOptions.unary,
+    bedrockStreamClientOptions: clientOptions.stream, structuredClone,
     convertMessages: () => ({
       bedrockMessages: [{ role: "user", content: [{ text: "benign request" }] }],
       systemText: "system",
@@ -190,6 +192,31 @@ function proxyModelDefaults(env) {
     "\n;globalThis.out = { MODEL_ID, FALLBACK_MODEL_ID, SUBAGENT_BEDROCK_MODEL_ID };", box);
   return box.out;
 }
+
+// The proxy's real Bedrock client options (timeouts, cross-region endpoint).
+function proxyClientOptions() {
+  const start = source.indexOf("const BEDROCK_REQUEST_TIMEOUT_MS =");
+  const end = source.indexOf("// Session tracking", start);
+  assert.ok(start > 0 && end > start);
+  const box = { AWS_REGION: "us-west-2" };
+  vm.createContext(box);
+  vm.runInContext(source.slice(start, end) +
+    "\n;globalThis.out = { unary: bedrockClientOptions, stream: bedrockStreamClientOptions };", box);
+  return box.out;
+}
+
+test("a streaming request waits longer than 90 s for Bedrock's first event", async () => {
+  // Staging, 17-18 Oct: three scheduled tasks ended when Opus 5.5 took over 90 s to
+  // start a stream on a 135k-165k token prompt ("no activity for 90000 ms").
+  const clientOptions = proxyClientOptions();
+  const app = streaming(async () => reply(), { clientOptions });
+  await app.invoke();
+  const timeout = app.clients[0].requestHandler.requestTimeout;
+  assert.ok(timeout >= 120_000, `stream timeout ${timeout} ms must cover a 120 s first token`);
+  assert.ok(timeout < 620_000, "one attempt must still fit inside a 620 s turn");
+  // Non-streaming Converse keeps its own 90 s limit (lightweight agent, 3 retries).
+  assert.equal(clientOptions.unary(policy.PRIMARY_MODEL_ID).requestTimeout, 90_000);
+});
 
 test("policy defaults: Opus 5.5 main, Sonnet 5.5 sub-agent and fallback", () => {
   assert.equal(policy.PRIMARY_MODEL_ID, "global.anthropic.claude-opus-5-5");
