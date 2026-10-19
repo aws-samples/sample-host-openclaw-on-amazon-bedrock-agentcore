@@ -80,7 +80,7 @@ function proxy({ guardrail = false } = {}) {
     preparedSdk: () => sdk,
     MODEL_ID: policy.PRIMARY_MODEL_ID, FALLBACK_MODEL_ID: policy.FALLBACK_MODEL_ID,
     AWS_REGION: "us-west-2", MAX_RETRIES: 2, BASE_DELAY_MS: 0, SYSTEM_PROMPT: "default",
-    sleep: async () => {}, bedrockClientOptions: () => ({}), structuredClone,
+    sleep: async () => {}, bedrockClientOptions: () => ({}), bedrockStreamClientOptions: () => ({}), structuredClone,
     extractSystemText: require("./system-messages").extractSystemText,
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
     guardrailConfig: guardrail ? { guardrailIdentifier: "test-guard", guardrailVersion: "1" } : undefined,
