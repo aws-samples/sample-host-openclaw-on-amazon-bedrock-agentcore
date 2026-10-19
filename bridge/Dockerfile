@@ -186,7 +186,7 @@ COPY gateway-mcp.js /app/gateway-mcp.js
 COPY runtime-skills.js /app/runtime-skills.js
 COPY runtime-lifecycle.js /app/runtime-lifecycle.js
 COPY gateway-lifecycle.js /app/gateway-lifecycle.js
-COPY gateway-config.js live-seed-bridge.js model-policy.js invocation-stream.js /app/
+COPY gateway-config.js live-seed-bridge.js model-policy.js invocation-stream.js cron-jobs.js /app/
 COPY proxy-sdk-snapshot.js proxy-auth-prepare.js system-prefix-cache.js /app/
 COPY openclaw-worker-owner.js /app/openclaw-worker-owner.js
 COPY openclaw-preinit.mjs /app/openclaw-preinit.mjs

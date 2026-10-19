@@ -72,6 +72,9 @@ async function main() {
     message,
     scheduleId,
     scheduleName: scheduleName || `Schedule ${scheduleId}`,
+    // EventBridge Scheduler fills this in at each fire; the cron Lambda names the
+    // run <scheduleId>-<fire time> so a repeated fire cannot run twice.
+    scheduledTime: "<aws.scheduler.scheduled-time>",
   });
 
   // Create the EventBridge schedule

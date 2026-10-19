@@ -25,6 +25,7 @@ const {
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
 const stateStorage = require("./state-storage");
+const cronJobs = require("./cron-jobs");
 const legacySessionImport = require("./legacy-session-import");
 const cwLogger = require("./cloudwatch-logger");
 const { createStartupTiming } = require("./startup-timing");
@@ -148,6 +149,10 @@ const CALLER_REPLY_MARGIN_MS = 20000;
 function turnValidityMs(deadline) {
   return Math.max(TURN_TIMEOUT_MS, deadline - Date.now()) + 60000;
 }
+// Async scheduled turns (cron_start / cron_status, see cron-jobs.js). A job runs
+// until its own deadline, not TURN_TIMEOUT_MS or a caller budget.
+const CRON_JOB_BUDGET_MS = cronJobs.envBudgetMs(process.env.CRON_ASYNC_JOB_BUDGET_MS);
+let cronJobStoreInstance = null;
 let proxyModelOutcomeUnknown = false;
 const UNKNOWN_OUTCOME_RESPONSE = "The request outcome is unknown. It has not been automatically retried. Check any resulting changes before retrying.";
 const v2Lifecycle = createRuntimeLifecycle({
@@ -2123,7 +2128,7 @@ function buildBridgeText(message) {
   return String(message);
 }
 
-async function handleV2Invocation(payload, req, res, callerGone, arrival) {
+async function handleV2Invocation(payload, req, res, callerGone, arrival, { jobDeadline = null } = {}) {
   const { action, userId, actorId, message } = payload;
   const reply = (body, status = 200) => {
     res.writeHead(status, { "Content-Type": "application/json" });
@@ -2141,8 +2146,9 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
       callerBudgetMs <= 0 || callerBudgetMs > MAX_CALLER_BUDGET_MS)) {
     return reply({ error: "callerBudgetMs must be a positive integer of at most 900000" }, 400);
   }
-  const callerDeadline = callerBudgetMs === undefined ? null
-    : Date.now() + callerBudgetMs - CALLER_REPLY_MARGIN_MS;
+  // An async cron job (cron_start) brings its own deadline and no caller budget.
+  const callerDeadline = jobDeadline ?? (callerBudgetMs === undefined ? null
+    : Date.now() + callerBudgetMs - CALLER_REPLY_MARGIN_MS);
   if ((runtimeSessionHeader && payload.runtimeSessionId && runtimeSessionHeader !== payload.runtimeSessionId) ||
       (payload.routingGeneration !== undefined &&
         (!Number.isSafeInteger(payload.routingGeneration) || payload.routingGeneration < 0))) {
@@ -2291,6 +2297,57 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival) {
   }
 }
 
+function cronJobStore() {
+  if (!cronJobStoreInstance) {
+    // Session storage keeps the jobs across a container restart; without it, memory only.
+    const dir = fs.existsSync(stateStorage.DEFAULT_MOUNT) ? stateStorage.DEFAULT_MOUNT : null;
+    cronJobStoreInstance = cronJobs.createCronJobStore({ dir, bootId: osRandomUUID() });
+    cronJobStoreInstance.load();
+  }
+  return cronJobStoreInstance;
+}
+
+/**
+ * cron_start: accept a scheduled turn, reply at once, and run it as a normal
+ * cron turn (trigger=cron, so token tags are unchanged) until the job deadline.
+ * cron_status: answer from the job store at once; it is never queued.
+ */
+async function handleCronAsync(payload, req, res) {
+  const reply = (body, status = 200) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  const { action, userId, actorId } = payload;
+  if (!userId || !actorId) return reply({ error: "Missing userId or actorId" }, 400);
+  const store = cronJobStore();
+  if (action === "cron_status") return reply(store.status(payload.jobId, userId));
+  const parsed = cronJobs.parseCronStart(payload, { defaultBudgetMs: CRON_JOB_BUDGET_MS });
+  if (!parsed.ok) return reply({ error: parsed.error }, 400);
+  if (!payload.message) return reply({ error: "Missing message" }, 400);
+  const { jobId } = parsed;
+  const started = store.start(jobId, { userId, deadline: Date.now() + parsed.budgetMs });
+  if (started.duplicate) {
+    console.warn("[contract] cron_start for a known job ignored (state %s)", started.job.state);
+    return reply({ status: "accepted", jobId, duplicate: true, deadline: started.job.deadline });
+  }
+  const capture = {
+    writeHead(code) { this.code = code; },
+    end(body) {
+      let result;
+      try { result = JSON.parse(body); } catch { result = { status: "error" }; }
+      store.finish(jobId, this.code === 200 ? result : { ...result, status: "error" });
+    },
+  };
+  const { callerBudgetMs: _ignored, jobId: _job, jobBudgetMs: _budget, ...turn } = payload;
+  handleV2Invocation({ ...turn, action: "cron" }, req, capture, () => false, null,
+    { jobDeadline: started.job.deadline })
+    .catch((error) => console.error(`[contract] Async cron turn failed: ${error.message}`))
+    // finish() ignores a job that is already done; this covers a turn that never replied.
+    .finally(() => store.finish(jobId, { status: "error" }));
+  console.log("[contract] cron_start accepted; job budget %s ms", parsed.budgetMs);
+  return reply({ status: "accepted", jobId, deadline: started.job.deadline });
+}
+
 // Shape check for the Router's per-user `/model` override. The proxy accepts it
 // only when it is also in BEDROCK_USER_SELECTABLE_MODEL_IDS.
 function payloadModelOverride(value) {
@@ -2372,6 +2429,10 @@ const server = http.createServer(async (req, res) => {
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));
+          return;
+        }
+        if (action === "cron_start" || action === "cron_status") {
+          await handleCronAsync({ ...payload, action }, req, res);
           return;
         }
         if (["warmup", "chat", "cron"].includes(action)) {

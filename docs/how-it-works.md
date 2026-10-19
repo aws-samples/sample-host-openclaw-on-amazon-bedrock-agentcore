@@ -180,9 +180,9 @@ The bot will ask for your **timezone** (e.g., `Australia/Sydney`, `America/New_Y
 
 1. The bot uses the `eventbridge-cron` skill to create an EventBridge Scheduler rule in the `openclaw-cron` schedule group
 2. At the scheduled time, EventBridge invokes the Cron executor Lambda (`openclaw-cron-executor`)
-3. The Lambda resolves the same authoritative route as Router and warms up the user's session. V2 must reach `USER_READY`; gateway readiness alone is insufficient
-4. The Lambda sends the scheduled message to the agent via AgentCore
-5. The agent processes the message and the Lambda delivers the response to the user's chat channel (Telegram responses are split by UTF-16 length like the Router's, see [Per-User Sessions](#per-user-sessions))
+3. The Lambda checks the schedule's owner and channel identity and starts the `openclaw-cron-runner` Step Functions state machine (see [Async scheduled turns](#async-scheduled-turns))
+4. The state machine's first step resolves the same authoritative route as Router and warms up the user's session. V2 must reach `USER_READY`; gateway readiness alone is insufficient. It then sends the scheduled message to the contract with `cron_start`, which replies at once and runs the turn
+5. Every 60 s the state machine asks the contract for the job (`cron_status`). When the turn is done, the Lambda delivers the response to the user's chat channel (Telegram responses are split by UTF-16 length like the Router's, see [Per-User Sessions](#per-user-sessions))
 
 Each user's schedules are isolated — no cross-user access. Schedule metadata is stored in the DynamoDB identity table alongside user profiles and session data.
 
@@ -191,7 +191,29 @@ Each user's schedules are isolated — no cross-user access. Schedule metadata i
 - **Only the final answer is delivered.** OpenClaw's chat stream merges every assistant text item of a run, including status lines written before tool calls. When the run ends, the contract reads the run's transcript (`chat.history`) and delivers the last assistant message that has no tool call. If that answer is shorter than 200 characters and the run wrote earlier answer text, those items are delivered together. If the history can't be read, the contract falls back to the streamed buffer and logs a warning. This applies to chat turns as well as scheduled tasks.
 - **Failures send a fixed notice.** If the AgentCore invocation fails, returns `status: error` or has an unknown outcome, the user gets one fixed message: `[Scheduled: <name>] Your scheduled task did not return a result this time. It will run again at the next scheduled time.` The runtime's own response text and exception text are never forwarded, and the Lambda logs only the exception type.
 - **No duplicate runs.** The Cron Lambda's async invoke config sets `MaximumRetryAttempts: 0`, so a timed-out brief is not re-run by Lambda. The EventBridge Scheduler retry policy is unchanged.
-- **Caller budget.** The Lambda sends `callerBudgetMs`, how long it will keep reading the response (1 to 900000 ms). Turns on one user's session run one at a time, so a second brief that fires while the first is running waits in a queue. The queue wait is bounded by `arrival + callerBudgetMs - 20 s`: a turn whose caller has already given up is not dispatched. A dispatched turn gets `min(now + 620 s, caller deadline)`. Chat turns from the Router send no budget and keep the 620 s limit from arrival. A warm-up that arrives while another turn is running on a ready session replies `ready` at once instead of queueing.
+- **Caller budget (synchronous path only).** With `cron_async=false` the Lambda waits for the turn itself and sends `callerBudgetMs`, how long it will keep reading the response (1 to 900000 ms). Turns on one user's session run one at a time, so a second brief that fires while the first is running waits in a queue. The queue wait is bounded by `arrival + callerBudgetMs - 20 s`: a turn whose caller has already given up is not dispatched. A dispatched turn gets `min(now + 620 s, caller deadline)`. Chat turns from the Router send no budget and keep the 620 s limit from arrival. A warm-up that arrives while another turn is running on a ready session replies `ready` at once instead of queueing.
+
+### Async scheduled turns
+
+A Lambda can run for at most 900 s, and a long brief (many web fetches, large tool calls) can take longer. With async cron (`cron_async`, on by default) the turn runs in the container on its own deadline, and the Lambda only starts it, checks on it and delivers the result:
+
+```text
+EventBridge Scheduler -> openclaw-cron-executor (launch)
+  -> Step Functions openclaw-cron-runner, execution <scheduleId>-<fire time>
+     Start   (Lambda: verify, warm up, cron_start)      -> contract runs the cron turn
+     Wait 60 s -> Poll (Lambda: cron_status) -> ... until done
+     Deliver (Lambda: the same delivery code as before)
+```
+
+- **Turn budget.** `cron_start` gives the job its own deadline: 45 min by default (container env `CRON_ASYNC_JOB_BUDGET_MS`, 1 to 55 min). The 620 s chat limit and the 900 s caller budget do not apply. The cap is the turn's scoped S3 credentials: role chaining limits them to 1 h, and they must stay valid until the deadline. A second brief queued behind the first on the same session waits within its own 45 min, not the first brief's Lambda window.
+- **Token tags.** The job runs as an ordinary cron turn (`trigger=cron`), so `openclaw.trigger` and `openclaw.agent_type` are unchanged.
+- **Status.** `cron_status` is answered at once and never queued: `running`, `done` (with the reply and `outcome`: `completed`, `error` or `unknown_outcome`), or `unknown`. The contract keeps jobs in memory and in `/mnt/workspace/openclaw-cron-jobs.json` on session storage (outside the `.openclaw` mirror), for 24 h or the last 50. After a container restart a job that was running is reported `unknown` (`reason: lost`), because nothing runs it any more.
+- **Failure notice.** The user gets the fixed `did not return a result` notice, and the Lambda logs the `did not complete` line the `openclaw-scheduled-task-failures` alarm counts, when the job ends with `error` or `unknown_outcome`, is unknown or lost, is still running 5 min after its deadline, three status checks in a row fail, the start is refused, or a Start or Poll step itself fails. A failing Deliver step is not retried, so nothing is sent twice.
+- **No duplicate runs.** The execution name is `<scheduleId>-<fire time>`, so a second invocation for the same fire is rejected by Step Functions. Schedules created by the `eventbridge-cron` skill pass `<aws.scheduler.scheduled-time>` in their input (an update adds it); older schedules use the invocation time rounded down to the minute. The contract also ignores a `cron_start` for a job it already has.
+- **Brief audio.** Unchanged: a marker line, or the newest matching mp3 the run uploaded between `cron_start` and the poll that saw the job done.
+- **Rollback.** Deploy the Cron stack with `-c cron_async=false`. The Lambda then runs the original synchronous path. Schedules target the Lambda in both modes, so neither direction changes any schedule. A run already in progress finishes and delivers.
+- **Chat during a long brief.** Turns on one session run one at a time. A user message sent while a 20-30 min brief runs waits behind it, and the Router gives up after 600 s, so that message can go unanswered. This was already true for briefs longer than 10 min.
+- **Route admission.** A running async job holds no Router admission in DynamoDB (each Lambda step takes and releases its own). An `unknown_outcome` result is still retained like the synchronous path's.
 
 ### Brief audio
 
