@@ -370,7 +370,9 @@ def test_least_privilege_between_the_lambda_and_the_runner(cron_template):
 def test_schedules_keep_targeting_the_lambda(cron_template):
     # Async on or off, the scheduler role only invokes the Lambda: no schedule changes.
     role_id, _ = next((k, v) for k, v in cron_template.items() if v["Type"] == "AWS::IAM::Role"
-                      and "scheduler.amazonaws.com" in json.dumps(v["Properties"]["AssumeRolePolicyDocument"]))
+                      and [st.get("Principal", {}).get("Service")
+                           for st in v["Properties"]["AssumeRolePolicyDocument"]["Statement"]]
+                      == ["scheduler.amazonaws.com"])
     actions = {s["Action"] for s in _statements(cron_template, role_id)}
     assert actions == {"lambda:InvokeFunction"}
 
