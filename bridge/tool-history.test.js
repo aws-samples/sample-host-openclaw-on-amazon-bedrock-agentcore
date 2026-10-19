@@ -82,7 +82,7 @@ function proxy({ guardrail = false } = {}) {
     },
     MODEL_ID: "main-model",
     AWS_REGION: "us-west-2", MAX_RETRIES: 2, BASE_DELAY_MS: 0, SYSTEM_PROMPT: "default",
-    sleep: async () => {}, bedrockClientOptions: () => ({}),
+    sleep: async () => {}, bedrockClientOptions: () => ({}), bedrockStreamClientOptions: () => ({}),
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
     guardrailConfig: guardrail ? { guardrailIdentifier: "test-guard", guardrailVersion: "1" } : undefined,
     buildInferenceConfig: require("./inference-config").buildInferenceConfig,
