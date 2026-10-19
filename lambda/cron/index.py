@@ -15,6 +15,7 @@ from urllib import request as urllib_request
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from runtime_routing import admit_route, is_unknown_outcome, resolve_route
 import whatsapp
 import line_channel
@@ -35,6 +36,11 @@ FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn"
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
+# Async cron: when set, a schedule's invocation only starts this state machine,
+# which runs the turn in the container (cron_start) and polls it (cron_status),
+# so a brief is not limited by this Lambda's 900 s timeout. Empty = the original
+# synchronous path (the rollback: deploy with -c cron_async=false).
+CRON_ASYNC_STATE_MACHINE_ARN = os.environ.get("CRON_ASYNC_STATE_MACHINE_ARN", "")
 
 # --- Clients ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION,
@@ -43,6 +49,8 @@ identity_table = dynamodb.Table(IDENTITY_TABLE_NAME)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION,
                          config=Config(connect_timeout=2, read_timeout=10, retries={"max_attempts": 2}))
+sfn_client = boto3.client("stepfunctions", region_name=AWS_REGION,
+                          config=Config(connect_timeout=2, read_timeout=10, retries={"max_attempts": 2}))
 
 
 def runtime_client_factory(*, connect_timeout, read_timeout):
@@ -190,9 +198,11 @@ def resolve_current_user_id(actor_id):
 # AgentCore invocation helpers
 # ---------------------------------------------------------------------------
 
-def invoke_agentcore(route, action, user_id, actor_id, channel, message=None, deadline=None, channel_target=None):
+def invoke_agentcore(route, action, user_id, actor_id, channel, message=None, deadline=None, channel_target=None,
+                     extra=None):
     """Invoke AgentCore Runtime with the given action."""
     payload_dict = {
+        **(extra or {}),
         "action": action,
         "userId": user_id,
         "actorId": route.actor_id,
@@ -946,8 +956,56 @@ def handler(event, context):
         "scheduleName": "Daily email check"
     }
     """
+    phase = event.get("cronPhase")
+    if phase in ASYNC_PHASES:
+        return run_async_phase(phase, event, context)
     logger.info("Cron event received: %s", json.dumps(event)[:1000])
+    if CRON_ASYNC_STATE_MACHINE_ARN:
+        return launch_async(event)
 
+    job, error = verify_cron_event(event)
+    if error:
+        return error
+    channel, channel_target, message = job["channel"], job["channelTarget"], job["message"]
+    schedule_id, schedule_name = job["scheduleId"], job["scheduleName"]
+    current_user_id, actor_id, session_id = job["userId"], job["actorId"], job["route"]
+
+    # Phase 2: Warm up the container if cold
+    remaining = context.get_remaining_time_in_millis() / 1000 if context else LAMBDA_TIMEOUT_SECONDS
+    lambda_deadline = time.monotonic() + remaining
+    warmup_ok = warmup_and_wait(
+        session_id, current_user_id, actor_id, channel,
+        deadline=lambda_deadline - 60, channel_target=channel_target,
+    )
+    if not warmup_ok:
+        deliver_warmup_failure(job)
+        return {"statusCode": 503, "body": "Warmup timeout"}
+
+    # Phase 3: Execute the cron message
+    cron_message = scheduled_message(job)
+    if context:
+        lambda_deadline = min(lambda_deadline, time.monotonic() + context.get_remaining_time_in_millis() / 1000)
+    run_started = time.time()
+    result = invoke_agentcore(
+        session_id, "cron", current_user_id, actor_id, channel, cron_message,
+        deadline=lambda_deadline - 15, channel_target=channel_target,
+    )
+    if (not isinstance(result, dict) or result.get("status") in ("failed", "error")
+            or is_unknown_outcome(result) or result.get("error")):
+        status = result.get("status") if isinstance(result, dict) else None
+        deliver_failure(job, status)
+        return {"statusCode": 503, "body": "Scheduled task invocation failed or outcome unknown"}
+    deliver_result(job, result.get("response", "No response from scheduled task."), run_started, time.time(),
+                   lambda_deadline)
+    return {"statusCode": 200, "body": "OK"}
+
+
+def verify_cron_event(event):
+    """Checks every cron entry makes before it touches the runtime or a channel.
+
+    Returns (job, None) or (None, lambda_response). The job carries the verified
+    identity, the schedule fields and the runtime route.
+    """
     user_id = event.get("userId")
     actor_id = event.get("channelActorId") or event.get("actorId")
     channel = event.get("channel")
@@ -961,7 +1019,7 @@ def handler(event, context):
             "Missing required fields. userId=%s actorId=%s channel=%s target=%s msg=%s",
             user_id, actor_id, channel, channel_target, bool(message),
         )
-        return {"statusCode": 400, "body": "Missing required fields"}
+        return None, {"statusCode": 400, "body": "Missing required fields"}
 
     logger.info(
         "Processing cron: schedule=%s user=%s channel=%s:%s",
@@ -974,7 +1032,7 @@ def handler(event, context):
     # uses the correct userId, and cron shares the same session as chat.
     current_user_id = resolve_current_user_id(actor_id)
     if not current_user_id or not actor_id.startswith(f"{channel}:"):
-        return {"statusCode": 403, "body": "Channel identity verification failed"}
+        return None, {"statusCode": 403, "body": "Channel identity verification failed"}
     if current_user_id != user_id:
         logger.info(
             "actorId=%s resolved to current userId=%s (payload had %s)",
@@ -992,13 +1050,13 @@ def handler(event, context):
                 "Schedule %s not owned by user %s — skipping execution",
                 schedule_id, current_user_id,
             )
-            return {
+            return None, {
                 "statusCode": 403,
                 "body": "Schedule ownership verification failed",
             }
     except Exception as e:
         logger.error("Failed to verify schedule ownership: %s", e)
-        return {
+        return None, {
             "statusCode": 500,
             "body": "Schedule ownership verification error",
         }
@@ -1009,52 +1067,181 @@ def handler(event, context):
         authorize_channel_actor(identity_table, session_id, current_user_id, actor_id, channel)
     except Exception as error:
         logger.error("AgentCore Runtime route unavailable: %s", error)
-        return {"statusCode": 503, "body": "Runtime route unavailable"}
+        return None, {"statusCode": 503, "body": "Runtime route unavailable"}
+    return {
+        "userId": current_user_id, "actorId": actor_id, "channel": channel, "channelTarget": channel_target,
+        "message": message, "scheduleId": schedule_id, "scheduleName": schedule_name, "route": session_id,
+    }, None
 
-    # Phase 2: Warm up the container if cold
-    remaining = context.get_remaining_time_in_millis() / 1000 if context else LAMBDA_TIMEOUT_SECONDS
-    lambda_deadline = time.monotonic() + remaining
-    warmup_ok = warmup_and_wait(
-        session_id, current_user_id, actor_id, channel,
-        deadline=lambda_deadline - 60, channel_target=channel_target,
-    )
-    if not warmup_ok:
-        # Matched by the openclaw-scheduled-task-failures alarm.
-        logger.warning("Scheduled task %s did not complete: the agent failed to start", schedule_id)
-        error_msg = (
-            f"[Scheduled: {schedule_name or schedule_id}] "
-            "Your scheduled task could not run because the agent failed to start. "
-            "It will try again at the next scheduled time."
-        )
-        deliver_response(channel, channel_target, error_msg)
-        return {"statusCode": 503, "body": "Warmup timeout"}
 
-    # Phase 3: Execute the cron message
-    cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"
-    if context:
-        lambda_deadline = min(lambda_deadline, time.monotonic() + context.get_remaining_time_in_millis() / 1000)
-    run_started = time.time()
-    result = invoke_agentcore(
-        session_id, "cron", current_user_id, actor_id, channel, cron_message,
-        deadline=lambda_deadline - 15, channel_target=channel_target,
-    )
-    if (not isinstance(result, dict) or result.get("status") in ("failed", "error")
-            or is_unknown_outcome(result) or result.get("error")):
-        status = result.get("status") if isinstance(result, dict) else None
-        logger.warning("Scheduled task %s did not complete: status=%s", schedule_id, status)
-        # Never forward the runtime's response text on failure; send a fixed notice.
-        deliver_response(channel, channel_target, f"[Scheduled: {schedule_name or schedule_id}] {CRON_FAILED_MESSAGE}")
-        return {"statusCode": 503, "body": "Scheduled task invocation failed or outcome unknown"}
-    response_text = result.get("response", "No response from scheduled task.")
+def scheduled_message(job):
+    return f"[Scheduled task: {job['scheduleName'] or job['scheduleId']}] {job['message']}"
+
+
+def deliver_warmup_failure(job):
+    # Matched by the openclaw-scheduled-task-failures alarm.
+    logger.warning("Scheduled task %s did not complete: the agent failed to start", job["scheduleId"])
+    deliver_response(job["channel"], job["channelTarget"], (
+        f"[Scheduled: {job['scheduleName'] or job['scheduleId']}] "
+        "Your scheduled task could not run because the agent failed to start. "
+        "It will try again at the next scheduled time."
+    ))
+
+
+def deliver_failure(job, status):
+    # Matched by the openclaw-scheduled-task-failures alarm.
+    logger.warning("Scheduled task %s did not complete: status=%s", job["scheduleId"], status)
+    # Never forward the runtime's response text on failure; send a fixed notice.
+    deliver_response(job["channel"], job["channelTarget"],
+                     f"[Scheduled: {job['scheduleName'] or job['scheduleId']}] {CRON_FAILED_MESSAGE}")
+
+
+def deliver_result(job, response_text, run_started, run_finished, deadline):
+    """Phase 4: deliver the reply, then the brief's audio (if any)."""
+    channel, channel_target = job["channel"], job["channelTarget"]
     response_text, audio_key = split_audio_marker(_extract_text_from_content_blocks(response_text))
-
-    # Phase 4: Deliver response to channel, then the brief's audio (if any)
     logger.info("Delivering response (len=%d) to %s:%s", len(response_text), channel, channel_target)
     deliver_response(channel, channel_target, response_text)
     if not audio_key and channel == "telegram":
-        audio_key = find_run_audio_key(session_id.actor_id, run_started, time.time(), lambda_deadline, message)
+        audio_key = find_run_audio_key(job["route"].actor_id, run_started, run_finished, deadline, job["message"])
     if audio_key:
-        deliver_brief_audio(channel, channel_target, audio_key, session_id.actor_id, lambda_deadline)
+        deliver_brief_audio(channel, channel_target, audio_key, job["route"].actor_id, deadline)
+    logger.info("Cron execution complete: schedule=%s", job["scheduleId"])
 
-    logger.info("Cron execution complete: schedule=%s", schedule_id)
-    return {"statusCode": 200, "body": "OK"}
+
+# ---------------------------------------------------------------------------
+# Async cron (Step Functions): launch -> start -> (wait 60 s -> poll)* -> deliver
+# ---------------------------------------------------------------------------
+
+ASYNC_PHASES = ("start", "poll", "deliver")
+# Fields of a schedule's input that the state machine carries between phases.
+ASYNC_EVENT_FIELDS = ("userId", "actorId", "channelActorId", "channel", "channelTarget", "message",
+                      "scheduleId", "scheduleName", "scheduledTime")
+# A running job is given up this long after its own deadline (the contract
+# stops the turn at the deadline; this covers its cleanup and a slow reply).
+ASYNC_DEADLINE_GRACE_SECONDS = 300
+# Consecutive cron_status invocations that may fail before the job is reported failed.
+ASYNC_POLL_MAX_FAILURES = 3
+ASYNC_START_TIMEOUT_SECONDS = 120
+ASYNC_STATUS_TIMEOUT_SECONDS = 60
+_SCHEDULED_TIME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z")
+
+
+def async_job_id(event, now=None):
+    """Execution name and contract jobId: <scheduleId>-<scheduled fire time>.
+
+    One fire of one schedule always maps to the same name, so a repeated
+    invocation cannot start a second run (Step Functions rejects the name).
+    Schedules created by the eventbridge-cron skill pass the scheduled time;
+    older schedules fall back to the invocation time rounded down to the minute.
+    """
+    schedule = re.sub(r"[^A-Za-z0-9_-]", "", str(event.get("scheduleId") or ""))[:48] or "unknown"
+    match = _SCHEDULED_TIME_RE.fullmatch(str(event.get("scheduledTime") or ""))
+    if match:
+        parts = match.groups()
+        stamp = "".join(parts[:3]) + "T" + "".join(parts[3:]) + "Z"
+    else:
+        stamp = time.strftime("%Y%m%dT%H%M00Z", time.gmtime(time.time() if now is None else now))
+    return f"{schedule}-{stamp}"
+
+
+def launch_async(event):
+    """Scheduler entry with async cron on: verify, then start the state machine."""
+    job, error = verify_cron_event(event)
+    if error:
+        return error
+    name = async_job_id(event)
+    state = {key: event[key] for key in ASYNC_EVENT_FIELDS if event.get(key) is not None}
+    state.update({"cronPhase": "start", "jobId": name})
+    try:
+        sfn_client.start_execution(stateMachineArn=CRON_ASYNC_STATE_MACHINE_ARN, name=name, input=json.dumps(state))
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ExecutionAlreadyExists":
+            logger.warning("Scheduled task %s already started for this fire time; not starting it again",
+                           job["scheduleId"])
+            return {"statusCode": 200, "body": "Already started"}
+        logger.error("Async cron start failed: %s", type(e).__name__)
+        deliver_failure(job, "start_failed")
+        return {"statusCode": 503, "body": "Async cron start failed"}
+    except Exception as e:
+        logger.error("Async cron start failed: %s", type(e).__name__)
+        deliver_failure(job, "start_failed")
+        return {"statusCode": 503, "body": "Async cron start failed"}
+    logger.info("Scheduled task %s started as async job", job["scheduleId"])
+    return {"statusCode": 202, "body": "Started"}
+
+
+def run_async_phase(phase, state, context):
+    """One state machine step. Returns the next state; state["next"] picks the branch."""
+    logger.info("Async cron %s: schedule=%s", phase, state.get("scheduleId"))
+    job, error = verify_cron_event(state)
+    if error:
+        # Same as the synchronous path: an unverified schedule gets no delivery.
+        logger.error("Async cron %s stopped: %s", phase, error.get("body"))
+        return {**state, "next": "done"}
+    remaining = context.get_remaining_time_in_millis() / 1000 if context else LAMBDA_TIMEOUT_SECONDS
+    deadline = time.monotonic() + remaining
+    if phase == "start":
+        return _async_start(job, state, deadline)
+    if phase == "poll":
+        return _async_poll(job, state, deadline)
+    return _async_deliver(job, state, deadline)
+
+
+def _to_deliver(state, outcome, **extra):
+    return {**state, **extra, "cronPhase": "deliver", "next": "deliver", "outcome": outcome}
+
+
+def _async_start(job, state, deadline):
+    if not warmup_and_wait(job["route"], job["userId"], job["actorId"], job["channel"],
+                           deadline=deadline - 60, channel_target=job["channelTarget"]):
+        deliver_warmup_failure(job)
+        return {**state, "next": "done"}
+    run_started = time.time()
+    result = invoke_agentcore(
+        job["route"], "cron_start", job["userId"], job["actorId"], job["channel"], scheduled_message(job),
+        deadline=min(deadline - 15, time.monotonic() + ASYNC_START_TIMEOUT_SECONDS),
+        channel_target=job["channelTarget"], extra={"jobId": state["jobId"]},
+    )
+    if isinstance(result, dict) and result.get("status") == "accepted" and result.get("jobId") == state["jobId"]:
+        if result.get("duplicate"):
+            logger.info("Async cron job was already accepted; polling it")
+        return {**state, "cronPhase": "poll", "next": "wait", "runStarted": state.get("runStarted", run_started),
+                "jobDeadline": result.get("deadline"), "pollFailures": 0}
+    status = result.get("status") if isinstance(result, dict) else None
+    return _to_deliver(state, status or "error")
+
+
+def _async_poll(job, state, deadline):
+    result = invoke_agentcore(
+        job["route"], "cron_status", job["userId"], job["actorId"], job["channel"],
+        deadline=min(deadline - 15, time.monotonic() + ASYNC_STATUS_TIMEOUT_SECONDS),
+        channel_target=job["channelTarget"], extra={"jobId": state["jobId"]},
+    )
+    status = result.get("status") if isinstance(result, dict) else None
+    if status == "done":
+        return _to_deliver(state, result.get("outcome") or "error", response=result.get("response") or "",
+                           runFinished=time.time())
+    if status == "unknown":
+        # The container restarted (the job is lost) or never had this job.
+        return _to_deliver(state, "unknown_job")
+    job_deadline = state.get("jobDeadline")
+    late = isinstance(job_deadline, (int, float)) and time.time() * 1000 > job_deadline + ASYNC_DEADLINE_GRACE_SECONDS * 1000
+    if status == "running":
+        return _to_deliver(state, "timeout") if late else {**state, "next": "wait", "pollFailures": 0}
+    failures = int(state.get("pollFailures") or 0) + 1
+    logger.warning("Async cron status check failed (%d of %d)", failures, ASYNC_POLL_MAX_FAILURES)
+    if failures >= ASYNC_POLL_MAX_FAILURES or late:
+        return _to_deliver(state, "status_failed")
+    return {**state, "next": "wait", "pollFailures": failures}
+
+
+def _async_deliver(job, state, deadline):
+    if state.get("outcome") == "completed":
+        run_started = state.get("runStarted")
+        deliver_result(job, state.get("response") or "The scheduled task completed without a text response.",
+                       run_started, state.get("runFinished") or time.time(), deadline)
+    else:
+        # A Start or Poll step that raised reaches here through StepFailed ($.caught).
+        deliver_failure(job, state.get("outcome") or ("step_failed" if "caught" in state else "error"))
+    return {key: value for key, value in state.items() if key != "response"} | {"next": "done"}

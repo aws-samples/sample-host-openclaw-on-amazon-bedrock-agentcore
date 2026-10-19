@@ -114,6 +114,8 @@ async function main() {
   const currentInput = JSON.parse(currentSchedule.Target.Input || "{}");
   if (updates.message) currentInput.message = updates.message;
   if (updates.scheduleName) currentInput.scheduleName = updates.scheduleName;
+  // Older schedules gain the fire time too (see create.js).
+  currentInput.scheduledTime = "<aws.scheduler.scheduled-time>";
 
   // Update EventBridge schedule
   try {

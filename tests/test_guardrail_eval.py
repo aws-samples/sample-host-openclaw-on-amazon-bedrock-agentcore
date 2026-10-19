@@ -179,7 +179,7 @@ class FixturesTest(unittest.TestCase):
         # The eval must send exactly what lambda/cron/index.py sends, or the
         # "does the prefix itself contribute?" measurement is meaningless.
         src = _CRON_LAMBDA.read_text()
-        self.assertIn('cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"', src)
+        self.assertIn("return f\"[Scheduled task: {job['scheduleName'] or job['scheduleId']}] {job['message']}\"", src)
         self.assertEqual(ge.cron_message("Morning brief", "hello"), "[Scheduled task: Morning brief] hello")
 
     def test_schedule_name_expands_to_plain_and_cron_variant(self):

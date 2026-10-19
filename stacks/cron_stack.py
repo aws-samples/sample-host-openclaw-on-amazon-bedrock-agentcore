@@ -9,6 +9,7 @@ EventBridge schedules and write cron records to the identity DynamoDB table.
 """
 
 from aws_cdk import (
+    ArnFormat,
     CfnOutput,
     Duration,
     RemovalPolicy,
@@ -17,6 +18,8 @@ from aws_cdk import (
     aws_lambda as _lambda,
     aws_logs as logs,
     aws_scheduler as scheduler,
+    aws_stepfunctions as sfn,
+    aws_stepfunctions_tasks as tasks,
 )
 import cdk_nag
 from constructs import Construct
@@ -52,6 +55,19 @@ class CronStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("cron_lambda_timeout_seconds") or "600")
         lambda_memory = int(self.node.try_get_context("cron_lambda_memory_mb") or "256")
+        # Async cron (default on): a schedule's Lambda invocation starts the
+        # CronRunner state machine, which runs the turn in the container and polls
+        # it, so a brief is not bound by the Lambda's 900 s limit. Rollback: deploy
+        # this stack with -c cron_async=false. Schedules keep targeting the Lambda
+        # either way, so no schedule changes in either direction.
+        cron_async = str(self.node.try_get_context("cron_async") if self.node.try_get_context("cron_async")
+                         is not None else "true").lower() not in ("false", "0", "no", "off")
+        # Fixed name, so the Lambda can be given the ARN without a circular reference.
+        state_machine_name = "openclaw-cron-runner"
+        state_machine_arn = Stack.of(self).format_arn(
+            service="states", resource="stateMachine", resource_name=state_machine_name,
+            arn_format=ArnFormat.COLON_RESOURCE_NAME,
+        )
 
         # --- EventBridge Scheduler Group ---
         self.schedule_group = scheduler.CfnScheduleGroup(
@@ -109,8 +125,70 @@ class CronStack(Stack):
                 "LINE_TOKEN_SECRET_ID": line_token_secret_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
                 "USER_FILES_BUCKET": user_files_bucket_name,
+                "CRON_ASYNC_STATE_MACHINE_ARN": state_machine_arn if cron_async else "",
             },
             log_group=cron_log_group,
+        )
+
+        # --- Async cron state machine ---
+        # launch (Lambda, from the schedule) -> Start -> (Wait 60 s -> Poll)* -> Deliver.
+        # Every step is the same Lambda; the state's cronPhase selects the step and
+        # its "next" field the branch. Delivery code is the Lambda's own.
+        def lambda_step(step_id):
+            return tasks.LambdaInvoke(
+                self, step_id, lambda_function=self.cron_fn,
+                # No payload: the whole state is the event, and the step's output is the
+                # Lambda's return value (the next state).
+                payload_response_only=True,
+                retry_on_service_exceptions=True,
+            )
+
+        start_step, poll_step, deliver_step = lambda_step("Start"), lambda_step("Poll"), lambda_step("Deliver")
+        done = sfn.Succeed(self, "Done")
+        wait = sfn.Wait(self, "WaitBeforePoll", time=sfn.WaitTime.duration(Duration.seconds(60)))
+        # A Start or Poll step that errors (after the service retries) still sends
+        # the user the fixed failure notice. A failing Deliver is not retried, so
+        # nothing is sent twice.
+        # The catch keeps the step's input (plus $.caught); this only switches it to
+        # the Deliver step, which reports a caught error as step_failed.
+        notice = sfn.Pass(self, "StepFailed", result=sfn.Result.from_string("deliver"), result_path="$.cronPhase")
+        notice.next(deliver_step)
+        start_step.add_catch(notice, result_path="$.caught")
+        poll_step.add_catch(notice, result_path="$.caught")
+        route = (
+            sfn.Choice(self, "NextStep")
+            .when(sfn.Condition.string_equals("$.next", "wait"), wait)
+            .when(sfn.Condition.string_equals("$.next", "deliver"), deliver_step)
+            .otherwise(done)
+        )
+        start_step.next(route)
+        wait.next(poll_step)
+        poll_step.next(route)
+        deliver_step.next(done)
+
+        runner_log_group = logs.LogGroup(
+            self, "CronRunnerLogGroup",
+            log_group_name="/openclaw/states/cron-runner",
+            retention=retention_days(log_retention),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        self.cron_runner = sfn.StateMachine(
+            self, "CronRunner",
+            state_machine_name=state_machine_name,
+            state_machine_type=sfn.StateMachineType.STANDARD,
+            definition_body=sfn.DefinitionBody.from_chainable(start_step),
+            # A job runs at most 55 min (bridge/cron-jobs.js), plus warm-up, the
+            # 5 min poll grace and delivery.
+            timeout=Duration.minutes(75),
+            tracing_enabled=True,
+            # Execution data (brief text, schedule message) stays out of the logs.
+            logs=sfn.LogOptions(destination=runner_log_group, level=sfn.LogLevel.ALL,
+                                include_execution_data=False),
+        )
+        # The Lambda starts the runner (schedule invocation -> execution named
+        # <scheduleId>-<fire time>, which makes a repeated fire a no-op).
+        self.cron_fn.add_to_role_policy(
+            iam.PolicyStatement(actions=["states:StartExecution"], resources=[state_machine_arn])
         )
 
         # Grant scheduler role permission to invoke the Lambda (IAM policy)
@@ -257,6 +335,7 @@ class CronStack(Stack):
             "SchedulerRoleArn",
             value=self.scheduler_role.role_arn,
         )
+        CfnOutput(self, "CronRunnerArn", value=self.cron_runner.state_machine_arn)
 
         # --- cdk-nag suppressions ---
         cdk_nag.NagSuppressions.add_resource_suppressions(
@@ -287,6 +366,22 @@ class CronStack(Stack):
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-L1",
                     reason="Python 3.13 is the latest stable runtime supported in all regions.",
+                ),
+            ],
+            apply_to_children=True,
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            self.cron_runner,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="Generated by CDK for the state machine role: lambda:InvokeFunction on the cron "
+                    "executor's versions (<arn>:*), and X-Ray / CloudWatch Logs delivery actions, which "
+                    "do not support resource-level permissions.",
+                    applies_to=[
+                        "Resource::<CronExecutorFn28CAB097.Arn>:*",
+                        "Resource::*",
+                    ],
                 ),
             ],
             apply_to_children=True,
