@@ -32,7 +32,7 @@ function stream(events) {
     },
     console: { log() {}, error() {}, warn() {}, debug() {} },
     AWS_REGION: "us-west-2", MAX_RETRIES: 1, BASE_DELAY_MS: 0, Date, JSON, Math,
-    sleep: async () => {}, bedrockClientOptions: () => ({}),
+    sleep: async () => {}, bedrockClientOptions: () => ({}), bedrockStreamClientOptions: () => ({}),
     resolveModelId: () => "global.anthropic.claude-opus-5-5",
     convertMessages: () => ({ bedrockMessages: [{ role: "user", content: [{ text: "hi" }] }], systemText: "s" }),
     scopeGuardrailToLatestUserTurn: (messages) => messages,

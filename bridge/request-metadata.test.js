@@ -123,7 +123,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     MODEL_ID: MAIN_MODEL, SUBAGENT_BEDROCK_MODEL_ID: SUBAGENT_MODEL,
     SUBAGENT_MODEL_NAME: "bedrock-agentcore-subagent", COGNITO_USER_POOL_ID: "",
     AWS_REGION: "us-west-2", MAX_RETRIES: 2, BASE_DELAY_MS: 0, SYSTEM_PROMPT: "default",
-    sleep: async () => {}, bedrockClientOptions: () => ({}),
+    sleep: async () => {}, bedrockClientOptions: () => ({}), bedrockStreamClientOptions: () => ({}),
     convertMessages: () => ({ bedrockMessages: [{ role: "user", content: [{ text: "hi" }] }], systemText: "s" }),
     convertTools: () => undefined,
     extractImageReferences: (text) => ({ cleanText: text, images: [] }),
