@@ -294,3 +294,11 @@ test("handleV2Invocation bounds an async job by its own deadline, not a caller b
   assert.equal(seen.deadline, jobDeadline);
   assert.equal(seen.queueDeadline, jobDeadline);
 });
+
+test("a release/v1 reply (no execution block) is completed only with text and no error status", () => {
+  assert.equal(jobs.summarize({ response: "brief" }).outcome, "completed");
+  assert.equal(jobs.summarize({ response: "x", status: "error" }).outcome, "error");
+  assert.equal(jobs.summarize({ status: "error" }).outcome, "error");
+  assert.equal(jobs.summarize({ response: "x", execution: { phase: "error" } }).outcome, "error");
+  assert.equal(jobs.summarize(null).outcome, "error");
+});

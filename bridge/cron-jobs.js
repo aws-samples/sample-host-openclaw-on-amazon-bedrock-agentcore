@@ -61,7 +61,9 @@ function summarize(result) {
   const body = result && typeof result === "object" ? result : {};
   const response = typeof body.response === "string" ? body.response : "";
   const failed = body.error !== undefined || body.status === "error" || body.status === "failed" ||
-    body.status === "unknown_outcome" || body.execution?.phase !== "completed";
+    body.status === "unknown_outcome" || typeof body.response !== "string" ||
+    // release/v1 replies carry no execution block; a V2 reply must say completed.
+    (body.execution !== undefined && body.execution?.phase !== "completed");
   return {
     outcome: body.status === "unknown_outcome" ? "unknown_outcome" : failed ? "error" : "completed",
     response: failed ? "" : response.slice(0, MAX_RESPONSE_CHARS),
