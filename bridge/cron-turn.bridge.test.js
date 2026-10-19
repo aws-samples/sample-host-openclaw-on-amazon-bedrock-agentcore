@@ -211,7 +211,8 @@ test("chat turns queued without a deadline still wait for the turn ahead", { ski
   const chat = await cron.enqueueMessage("chat message");
   assert.equal(chat, "reply 1");
   assert.deepEqual(await first, { response: "reply 0" });
-  assert.match(SRC, /let timeoutMs = 620000;/, "a turn without a deadline keeps the 620 s WebSocket limit");
+  assert.match(SRC, /let timeoutMs = entry\.uncapped && entry\.deadline !== undefined \? entry\.deadline - Date\.now\(\) : 620000;/,
+    "a turn without a deadline keeps the 620 s WebSocket limit; only an async cron job is uncapped");
 });
 
 test("cron caller deadline: 780 s default from arrival, or callerBudgetMs less a 20 s margin", () => {
@@ -245,6 +246,10 @@ test("the cron handler validates callerBudgetMs, runs runCronTurn and has no lig
   assert.doesNotMatch(branch, /agent\.chat\(/, "no shim fallback on cron turns");
   assert.match(branch, /cronCallerDeadline\(requestArrival, payload\.callerBudgetMs\)/);
   assert.match(branch, /writeHead\(400[\s\S]*Invalid callerBudgetMs/);
-  assert.match(branch, /runCronTurn\(message, budget\.deadline, \(\) => setTurnTrigger\("cron"\)\)/);
-  assert.ok(branch.indexOf("cronCallerDeadline(") < branch.indexOf("await init("), "budget is checked before init");
+  assert.match(branch, /cronTurnReply\(payload, req, budget\.deadline\)/);
+  assert.ok(branch.indexOf("cronCallerDeadline(") < branch.indexOf("cronTurnReply("), "budget is checked before init");
+  const shared = SRC.slice(SRC.indexOf("async function cronTurnReply("), SRC.indexOf("// Async scheduled turns"));
+  assert.doesNotMatch(shared, /agent\.chat\(/, "no shim fallback on cron turns");
+  assert.match(shared, /runCronTurn\(message, deadline, \(\) => setTurnTrigger\("cron"\), \{ uncapped \}\)/);
+  assert.ok(shared.indexOf("await init(") < shared.indexOf("runCronTurn("));
 });

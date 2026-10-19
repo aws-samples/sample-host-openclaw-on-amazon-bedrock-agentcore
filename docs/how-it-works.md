@@ -180,11 +180,32 @@ The bot will ask for your **timezone** (e.g., `Australia/Sydney`, `America/New_Y
 
 1. The bot uses the `eventbridge-cron` skill to create an EventBridge Scheduler rule in the `openclaw-cron` schedule group
 2. At the scheduled time, EventBridge invokes the Cron executor Lambda (`openclaw-cron-executor`)
-3. The Lambda warms up the user's AgentCore session (or waits for it to initialize if cold)
-4. The Lambda sends the scheduled message to the agent via AgentCore
-5. The agent processes the message and the Lambda delivers the response to the user's chat channel (Telegram responses are split by UTF-16 length like the Router's, see [Per-User Sessions](#per-user-sessions))
+3. The Lambda checks the schedule's owner and starts the `openclaw-cron-runner` Step Functions state machine (see [Async scheduled turns](#async-scheduled-turns))
+4. The first step warms up the user's AgentCore session (or waits for it to initialize if cold) and sends the scheduled message with `cron_start`; the contract replies at once and runs the turn
+5. Every 60 s the state machine asks for the job (`cron_status`). When it is done, the Lambda delivers the response to the user's chat channel (Telegram responses are split by UTF-16 length like the Router's, see [Per-User Sessions](#per-user-sessions))
 
 Each user's schedules are isolated — no cross-user access. Schedule metadata is stored in the DynamoDB identity table alongside user profiles and session data.
+
+### Async scheduled turns
+
+A Lambda can run for at most 900 s, and a long brief can take longer. Two briefs that fire minutes apart on one session also used to share one Lambda's window: the second waited behind the first and then ran out of time. With async cron (`cron_async`, on by default) the turn runs in the container on its own deadline, and the Lambda only starts it, checks on it and delivers the result:
+
+```text
+EventBridge Scheduler -> openclaw-cron-executor (launch)
+  -> Step Functions openclaw-cron-runner, execution <scheduleId>-<fire time>
+     Start   (Lambda: verify, warm up, cron_start)      -> contract runs the cron turn
+     Wait 60 s -> Poll (Lambda: cron_status) -> ... until done
+     Deliver (Lambda: the same delivery code as before)
+```
+
+- **Turn budget.** Each job gets its own deadline: 45 min by default (container env `CRON_ASYNC_JOB_BUDGET_MS`, 1 to 55 min). The 620 s per-turn limit and the cron caller budget do not apply to it. A second brief queued behind the first waits within its own 45 min.
+- **Token tags.** The job runs as an ordinary cron turn (`trigger=cron`), so the token-metric tags are unchanged.
+- **Status.** `cron_status` is answered at once and never queued: `running`, `done` (with the reply and `outcome`), or `unknown`. Jobs are kept in memory and in `/mnt/workspace/openclaw-cron-jobs.json` on session storage for 24 h or the last 50. After a container restart a job that was running is reported `unknown` (`reason: lost`).
+- **Failure notice.** The fixed `did not return a result` notice is sent, and the `did not complete` line the failure alarm counts is logged, when the job fails, is unknown or lost, is still running 5 min after its deadline, three status checks in a row fail, the start is refused, or a Start or Poll step itself fails. A failing Deliver step is not retried, so nothing is sent twice.
+- **No duplicate runs.** The execution name is `<scheduleId>-<fire time>`, so a second invocation for the same fire is rejected. Schedules created by the `eventbridge-cron` skill pass `<aws.scheduler.scheduled-time>` (an update adds it); older schedules use the invocation time rounded down to the minute.
+- **Unstartable sessions.** The Start step moves the user to a new session when AgentCore cannot start the old one, as before, and the poller follows the session the job was started on.
+- **Rollback.** Deploy the Cron stack with `-c cron_async=false`. Schedules target the Lambda in both modes, so neither direction changes a schedule.
+- **Chat during a long brief.** Turns on one session run one at a time. A message sent while a 20-30 min brief runs waits behind it, and the Router gives up after 600 s, so it can go unanswered.
 
 ## API Key Management
 

@@ -279,7 +279,7 @@ test("identity file carries trigger and runtime session; cron arriving mid-chat 
 });
 
 test("the contract wires dispatch triggers and the runtime session header", () => {
-  assert.match(contractSource, /runCronTurn\(message, budget\.deadline, \(\) => setTurnTrigger\("cron"\)\)/);
+  assert.match(contractSource, /runCronTurn\(message, deadline, \(\) => setTurnTrigger\("cron"\), \{ uncapped \}\)/);
   assert.match(contractSource, /onDispatch: \(\) => setTurnTrigger\("chat"\)/);
   assert.equal(contractSource.split("{ sessionId: runtimeSessionHeader(req) }").length - 1, 2);
 });

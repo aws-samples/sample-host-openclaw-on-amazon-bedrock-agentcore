@@ -271,6 +271,7 @@ All tunable parameters are in `cdk.json`:
 | `user_files_noncurrent_days` | `30` | Days after which noncurrent S3 object versions expire (CDK context key, not set in `cdk.json`; add it there or pass `-c`) |
 | `user_files_noncurrent_keep` | `3` | Newest noncurrent versions always kept per key (CDK context key, not set in `cdk.json`; add it there or pass `-c`) |
 | `cron_lambda_timeout_seconds` | `900` | Cron executor Lambda timeout (must exceed warmup time) |
+| `cron_async` | `true` | Run scheduled turns through the `openclaw-cron-runner` state machine, so a brief can run past the Lambda's 900 s limit (45 min job budget). `false` restores the synchronous path in one Cron stack deploy; schedules are unchanged either way. See [Async scheduled turns](docs/how-it-works.md#async-scheduled-turns) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
