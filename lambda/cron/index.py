@@ -1242,5 +1242,6 @@ def _async_deliver(job, state, deadline):
         deliver_result(job, state.get("response") or "The scheduled task completed without a text response.",
                        run_started, state.get("runFinished") or time.time(), deadline)
     else:
-        deliver_failure(job, state.get("outcome") or "error")
+        # A Start or Poll step that raised reaches here through StepFailed ($.caught).
+        deliver_failure(job, state.get("outcome") or ("step_failed" if "caught" in state else "error"))
     return {key: value for key, value in state.items() if key != "response"} | {"next": "done"}

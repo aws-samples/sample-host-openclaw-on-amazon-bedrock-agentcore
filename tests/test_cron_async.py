@@ -264,6 +264,15 @@ def test_every_failure_sends_the_fixed_notice_and_the_alarm_line(outcome, caplog
     assert "secret partial text" not in caplog.text
 
 
+def test_a_caught_step_error_is_reported_as_step_failed(caplog):
+    module = _lambda()
+    state = _state(cronPhase="deliver", caught={"Error": "Lambda.Unknown", "Cause": "x"})
+    with caplog.at_level(logging.WARNING):
+        assert module.handler(state, Context())["next"] == "done"
+    assert _sent(module) == [FAILED]
+    assert "status=step_failed" in caplog.text
+
+
 def test_a_step_for_an_unverified_schedule_stops_without_delivery():
     module = _lambda()
     module.identity_table.items.pop((f"USER#{USER}", "CRON#schedule123"))
@@ -334,7 +343,7 @@ def test_the_runner_is_a_standard_wait_poll_loop(cron_template):
     for step in ("Start", "Poll"):
         assert steps[step]["Catch"][0]["Next"] == "StepFailed"
     assert steps["StepFailed"]["Next"] == "Deliver"
-    assert steps["StepFailed"]["Parameters"]["outcome"] == "step_failed"
+    assert steps["StepFailed"]["Result"] == "deliver" and steps["StepFailed"]["ResultPath"] == "$.cronPhase"
     # The whole run outlasts the longest job (55 min) but is bounded.
     assert 55 * 60 < states["TimeoutSeconds"] <= 90 * 60
 

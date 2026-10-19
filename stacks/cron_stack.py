@@ -149,12 +149,9 @@ class CronStack(Stack):
         # A Start or Poll step that errors (after the service retries) still sends
         # the user the fixed failure notice. A failing Deliver is not retried, so
         # nothing is sent twice.
-        notice = sfn.Pass(self, "StepFailed", parameters={
-            "cronPhase": "deliver", "outcome": "step_failed",
-            **{f"{field}.$": f"$.{field}" for field in (
-                "userId", "actorId", "channel", "channelTarget", "message", "scheduleId", "jobId")},
-            "channelActorId.$": "$.channelActorId", "scheduleName.$": "$.scheduleName",
-        })
+        # The catch keeps the step's input (plus $.caught); this only switches it to
+        # the Deliver step, which reports a caught error as step_failed.
+        notice = sfn.Pass(self, "StepFailed", result=sfn.Result.from_string("deliver"), result_path="$.cronPhase")
         notice.next(deliver_step)
         start_step.add_catch(notice, result_path="$.caught")
         poll_step.add_catch(notice, result_path="$.caught")
