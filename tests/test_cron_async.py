@@ -322,6 +322,9 @@ def test_the_runner_is_a_standard_wait_poll_loop(cron_template):
     assert states["StartAt"] == "Start"
     steps = states["States"]
     assert steps["Start"]["Next"] == "NextStep"
+    for step in ("Start", "Poll", "Deliver"):
+        # The whole state is the Lambda event (a JSONPath string here would pass the literal "$").
+        assert "Parameters" not in steps[step] and "Payload" not in json.dumps(steps[step])
     assert steps["WaitBeforePoll"] == {"Type": "Wait", "Seconds": 60, "Next": "Poll"}
     assert steps["Poll"]["Next"] == "NextStep"
     choices = {c["StringEquals"]: c["Next"] for c in steps["NextStep"]["Choices"]}

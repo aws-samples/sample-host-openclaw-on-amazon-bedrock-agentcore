@@ -137,7 +137,9 @@ class CronStack(Stack):
         def lambda_step(step_id):
             return tasks.LambdaInvoke(
                 self, step_id, lambda_function=self.cron_fn,
-                payload=sfn.TaskInput.from_json_path_at("$"), payload_response_only=True,
+                # No payload: the whole state is the event, and the step's output is the
+                # Lambda's return value (the next state).
+                payload_response_only=True,
                 retry_on_service_exceptions=True,
             )
 
