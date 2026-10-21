@@ -18,6 +18,7 @@ def project(tmp_path):
     shutil.copy(ROOT / "scripts/deploy.sh", scripts)
     shutil.copy(ROOT / "scripts/build_and_push.sh", scripts)
     shutil.copy(ROOT / "scripts/model_selection.py", scripts)
+    shutil.copytree(ROOT / "scripts/lib", scripts / "lib")
     context = {
         "region": "us-west-2", "runtime_id": "active-1234567890",
         "runtime_endpoint_id": "DEFAULT", "enable_guardrails": True,
@@ -794,3 +795,67 @@ def test_phase3_real_controller_protects_existing_callers(project, existing):
     cdk_calls = [item for item in calls(project) if item["tool"] == "cdk"]
     assert (result.returncode == 0) == (existing == "same"), result.stderr
     assert bool(cdk_calls) == (existing == "same")
+
+
+def test_env_flag_suffixes_stacks_runtime_and_names(project):
+    root, env = project
+    (root / ".env.dev").write_text("MANAGE_BEDROCK_INVOCATION_LOGGING=true\n")
+    result = subprocess.run(["bash", str(root / "scripts/deploy.sh"), "--env", "dev",
+                             "--image-uri", "123456789012.dkr.ecr.us-west-2.amazonaws.com/openclaw-bridge-dev:v1"],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    recorded = calls(project)
+    cdk_calls = [item["args"] for item in recorded if item["tool"] == "cdk"]
+    assert cdk_calls[0][1:6] == ["OpenClawVpc-dev", "OpenClawSecurity-dev", "OpenClawGuardrails-dev",
+                                 "OpenClawAgentCore-dev", "OpenClawObservability-dev"]
+    assert "OpenClawGateway-dev" in cdk_calls[0]
+    assert cdk_calls[-1][1:4] == ["OpenClawRouter-dev", "OpenClawCron-dev", "OpenClawTokenMonitoring-dev"]
+    assert "runtime_manifest=.runtime/runtime-v2-dev.json" in cdk_calls[-1]
+    assert all("manage_bedrock_invocation_logging=true" in args for args in cdk_calls)
+    stacks = [args[args.index("--stack-name") + 1] for args in
+              (item["args"] for item in recorded if item["tool"] == "aws") if "--stack-name" in args]
+    assert stacks and all(name.endswith("-dev") for name in stacks)
+    deployed = next(item["args"] for item in recorded
+                    if item["tool"] == "deployment-python" and item["args"][1:2] == ["deploy"])
+    assert deployed[deployed.index("--runtime-name") + 1] == "openclaw_agent_v2_dev"
+    assert deployed[deployed.index("--manifest") + 1] == ".runtime/runtime-v2-dev.json"
+    runtime_env = next(item["configuration"]["environmentVariables"] for item in recorded
+                       if "configuration" in item)
+    assert runtime_env["GATEWAY_TOKEN_SECRET_ID"] == "openclaw/gateway-token-dev"
+    assert runtime_env["COGNITO_PASSWORD_SECRET_ID"] == "openclaw/cognito-password-secret-dev"
+    assert runtime_env["TELEGRAM_CHANNEL_SECRET_ID"] == "openclaw/channels/telegram-dev"
+    assert runtime_env["IDENTITY_TABLE_NAME"] == "openclaw-identity-dev"
+    assert runtime_env["EVENTBRIDGE_SCHEDULE_GROUP"] == "openclaw-cron-dev"
+
+
+def test_without_env_no_suffix_arguments_are_added(project):
+    root, env = project
+    result = subprocess.run(["bash", str(root / "scripts/deploy.sh"),
+                             "--image-uri", "123456789012.dkr.ecr.us-west-2.amazonaws.com/openclaw-bridge:v1"],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    recorded = calls(project)
+    deployed = next(item["args"] for item in recorded
+                    if item["tool"] == "deployment-python" and item["args"][1:2] == ["deploy"])
+    assert "--runtime-name" not in deployed
+    cdk_calls = [item["args"] for item in recorded if item["tool"] == "cdk"]
+    assert cdk_calls[0][1:6] == ["OpenClawVpc", "OpenClawSecurity", "OpenClawGuardrails",
+                                 "OpenClawAgentCore", "OpenClawObservability"]
+    assert not any("manage_bedrock_invocation_logging" in arg for args in cdk_calls for arg in args)
+
+
+@pytest.mark.parametrize("setup,args,message", [
+    (None, ["--env", "dev"], "expects an env file"),
+    ("OPENCLAW_ENV_SUFFIX=prod\n", ["--env", "dev"], "conflicts with OPENCLAW_ENV_SUFFIX"),
+    (None, ["--env", "Bad_Name"], "--env/OPENCLAW_ENV_NAME"),
+])
+def test_env_flag_errors_stop_before_aws_calls(project, setup, args, message):
+    root, env = project
+    if setup:
+        (root / ".env.dev").write_text(setup)
+    result = subprocess.run(["bash", str(root / "scripts/deploy.sh"), *args],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not any(item["tool"] in {"aws", "cdk", "deployment-python"}
+                   for item in (calls(project) if (root / "calls.jsonl").exists() else []))

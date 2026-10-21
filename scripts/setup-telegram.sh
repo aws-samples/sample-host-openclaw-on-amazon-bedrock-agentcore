@@ -20,8 +20,19 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/openclaw-env.sh"
+load_project_env "$PROJECT_DIR"
+apply_named_environment
+OPENCLAW_ENV_SUFFIX="$(resolve_env_suffix "$PROJECT_DIR")"
+
 REGION="${CDK_DEFAULT_REGION:-${AWS_REGION:-us-west-2}}"
-TABLE_NAME="${IDENTITY_TABLE_NAME:-openclaw-identity}"
+TABLE_NAME="${IDENTITY_TABLE_NAME:-$(with_suffix openclaw-identity)}"
+ROUTER_STACK_NAME="$(with_suffix OpenClawRouter)"
+WEBHOOK_SECRET_ID="$(with_suffix openclaw/webhook-secret)"
+TELEGRAM_SECRET_ID="$(with_suffix openclaw/channels/telegram)"
 PROFILE_ARG=""
 if [ -n "${AWS_PROFILE:-}" ]; then
     PROFILE_ARG="--profile $AWS_PROFILE"
@@ -34,16 +45,16 @@ echo ""
 echo "Step 1: Registering Telegram webhook..."
 
 API_URL=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawRouter \
+    --stack-name "$ROUTER_STACK_NAME" \
     --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
     --output text --region "$REGION" $PROFILE_ARG)
 
 WEBHOOK_SECRET=$(aws secretsmanager get-secret-value \
-    --secret-id openclaw/webhook-secret \
+    --secret-id "$WEBHOOK_SECRET_ID" \
     --region "$REGION" $PROFILE_ARG --query SecretString --output text)
 
 TELEGRAM_TOKEN=$(aws secretsmanager get-secret-value \
-    --secret-id openclaw/channels/telegram \
+    --secret-id "$TELEGRAM_SECRET_ID" \
     --region "$REGION" $PROFILE_ARG --query SecretString --output text)
 
 WEBHOOK_RESULT=$(curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}webhook/telegram&secret_token=${WEBHOOK_SECRET}")

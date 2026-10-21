@@ -26,6 +26,8 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
+from stacks import DeploymentNamer
+
 # Regions where AgentCore Browser (CfnBrowserCustom) is confirmed available.
 BROWSER_SUPPORTED_REGIONS = {"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "ap-southeast-2"}
 
@@ -73,7 +75,15 @@ class AgentCoreStack(Stack):
         )
 
         # --- Execution Role (what the container can do) -----------------------
-        execution_role_name = f"openclaw-agentcore-execution-role-{region}"
+        namer = DeploymentNamer.from_scope(self)
+        execution_role_name = namer.name(f"openclaw-agentcore-execution-role-{region}")
+        # Secret names of this environment (SecurityStack applies the same suffix).
+        gateway_token_secret = namer.name("openclaw/gateway-token")
+        cognito_password_secret = namer.name("openclaw/cognito-password-secret")
+        telegram_channel_secret = namer.name("openclaw/channels/telegram")
+        # Names created by CronStack/RouterStack; referenced in the nag suppressions.
+        cron_schedule_group_name = namer.name("openclaw-cron")
+        identity_table_name = namer.name("openclaw-identity")
         # Deterministic ARN avoids CDK circular dependency when the role
         # references itself in its trust policy and inline policy.
         execution_role_arn_str = f"arn:aws:iam::{account}:role/{execution_role_name}"
@@ -138,9 +148,9 @@ class AgentCoreStack(Stack):
                     "secretsmanager:DescribeSecret",
                 ],
                 resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/gateway-token-*",
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/cognito-password-secret-*",
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/channels/telegram-*",
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:{gateway_token_secret}-*",
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:{cognito_password_secret}-*",
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:{telegram_channel_secret}-*",
                 ],
             )
         )
@@ -326,7 +336,7 @@ class AgentCoreStack(Stack):
         self.user_files_bucket = s3.Bucket(
             self,
             "UserFilesBucket",
-            bucket_name=f"openclaw-user-files-{account}-{region}",
+            bucket_name=namer.name(f"openclaw-user-files-{account}-{region}"),
             encryption=s3.BucketEncryption.KMS,
             encryption_key=user_files_cmk,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
@@ -373,7 +383,7 @@ class AgentCoreStack(Stack):
                 self.browser = agentcore.CfnBrowserCustom(
                     self,
                     "BrowserCustom",
-                    name="openclaw_browser",
+                    name=namer.runtime_name("openclaw_browser"),
                     network_configuration=agentcore.CfnBrowserCustom.BrowserNetworkConfigurationProperty(
                         network_mode="VPC",
                         vpc_config=agentcore.CfnBrowserCustom.VpcConfigProperty(
@@ -439,9 +449,9 @@ class AgentCoreStack(Stack):
                         "Resource::arn:aws:bedrock:*::foundation-model/*",
                         f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",
                         "Resource::arn:aws:bedrock:*::inference-profile/*",
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/gateway-token-*",
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/cognito-password-secret-*",
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/channels/telegram-*",
+                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{gateway_token_secret}-*",
+                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{cognito_password_secret}-*",
+                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{telegram_channel_secret}-*",
                         "Resource::*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*:*",
@@ -458,8 +468,8 @@ class AgentCoreStack(Stack):
                         "Action::kms:ReEncrypt*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*",
                         # EventBridge cron scheduling (added by CronStack)
-                        f"Resource::arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*",
-                        f"Resource::arn:aws:dynamodb:{region}:{account}:table/openclaw-identity/index/*",
+                        f"Resource::arn:aws:scheduler:{region}:{account}:schedule/{cron_schedule_group_name}/*",
+                        f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                         # Per-user API key storage in Secrets Manager (manage_secret tool)
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/user/*",
                         # ECR pull (toolkit-managed repos — Starter Toolkit uses bedrock-agentcore- prefix)

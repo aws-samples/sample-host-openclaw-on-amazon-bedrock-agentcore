@@ -30,6 +30,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from botocore.validate import validate_parameters
 
+from env_suffix import with_suffix
 from postdeploy_warmup import WarmupError, run_warmup
 from runtime_manifest import has_v2_warmup_evidence, validate_v2_enrollment
 
@@ -312,9 +313,11 @@ def resolve_image(ecr, image_uri, region, account):
     return f"{repository_uri}@{digest}", digest
 
 
-def verify_existing_callers(client, manifest):
+def verify_existing_callers(client, manifest, environ=None):
     # Refuse cutover before CDK can remove permissions for saved user routes.
-    for name in ("openclaw-router", "openclaw-cron-executor"):
+    # Function names carry the optional environment suffix (OPENCLAW_ENV_SUFFIX).
+    router = with_suffix("openclaw-router", environ)
+    for name in (router, with_suffix("openclaw-cron-executor", environ)):
         try:
             current = client.get_function_configuration(FunctionName=name)
         except ClientError as error:
@@ -330,7 +333,7 @@ def verify_existing_callers(client, manifest):
             raise DeploymentError(f"{name} has no verified AgentCore Runtime binding; reconcile it before Phase 3")
         if arn != manifest["agentRuntimeArn"]:
             raise DeploymentError(f"{name} uses a different AgentCore Runtime; automatic cutover is not supported")
-        if name == "openclaw-router":
+        if name == router:
             try:
                 target = json.loads(variables.get("RUNTIME_TARGET", "null"))
             except (TypeError, ValueError):

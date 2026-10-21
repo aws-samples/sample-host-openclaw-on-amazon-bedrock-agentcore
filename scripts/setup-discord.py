@@ -19,7 +19,10 @@ import urllib.request
 
 import boto3
 
-SECRET_ID = "openclaw/channels/discord"
+from env_suffix import with_suffix
+
+# openclaw/channels/discord-<suffix> when OPENCLAW_ENV_SUFFIX selects an environment.
+SECRET_ID = with_suffix("openclaw/channels/discord")
 USER_AGENT = "DiscordBot (https://github.com/aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore, 1.0)"
 
 # integration_types: 0 = installed to a server, 1 = installed to a user.

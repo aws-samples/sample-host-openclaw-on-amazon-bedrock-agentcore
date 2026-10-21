@@ -26,7 +26,7 @@ import json
 from constructs import Construct
 
 from scripts.model_selection import CONTEXT_KEY as MODEL_SELECTION_KEY, parse_user_selectable_models
-from stacks import apply_table_tags, retention_days
+from stacks import DeploymentNamer, apply_table_tags, retention_days
 
 
 class RouterStack(Stack):
@@ -53,6 +53,8 @@ class RouterStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        namer = DeploymentNamer.from_scope(self)
+        router_function_name = namer.name("openclaw-router")
         region = Stack.of(self).region
         account = Stack.of(self).account
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
@@ -69,7 +71,7 @@ class RouterStack(Stack):
         self.identity_table = dynamodb.Table(
             self,
             "IdentityTable",
-            table_name="openclaw-identity",
+            table_name=namer.name("openclaw-identity"),
             partition_key=dynamodb.Attribute(
                 name="PK", type=dynamodb.AttributeType.STRING
             ),
@@ -92,7 +94,7 @@ class RouterStack(Stack):
         router_log_group = logs.LogGroup(
             self,
             "RouterLogGroup",
-            log_group_name="/openclaw/lambda/router",
+            log_group_name=namer.name("/openclaw/lambda/router"),
             retention=retention_days(log_retention),
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -101,7 +103,7 @@ class RouterStack(Stack):
         self.router_fn = _lambda.Function(
             self,
             "RouterFn",
-            function_name="openclaw-router",
+            function_name=router_function_name,
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="index.handler",
             code=_lambda.Code.from_asset("lambda/router"),
@@ -145,7 +147,7 @@ class RouterStack(Stack):
         self.http_api = apigwv2.HttpApi(
             self,
             "RouterApi",
-            api_name="openclaw-router",
+            api_name=namer.name("openclaw-router"),
             description="OpenClaw webhook ingestion API (explicit routes only)",
         )
 
@@ -194,7 +196,7 @@ class RouterStack(Stack):
         access_log_group = logs.LogGroup(
             self,
             "ApiAccessLogGroup",
-            log_group_name="/openclaw/api-access",
+            log_group_name=namer.name("/openclaw/api-access"),
             retention=retention_days(log_retention),
             removal_policy=RemovalPolicy.RETAIN,
         )
@@ -234,7 +236,7 @@ class RouterStack(Stack):
             iam.PolicyStatement(
                 actions=["lambda:InvokeFunction"],
                 resources=[
-                    f"arn:aws:lambda:{region}:{account}:function:openclaw-router",
+                    f"arn:aws:lambda:{region}:{account}:function:{router_function_name}",
                 ],
             )
         )

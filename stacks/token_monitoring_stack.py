@@ -19,7 +19,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import apply_table_tags
+from stacks import DeploymentNamer, apply_table_tags
 from stacks.health_alarms import add_health_alarms
 
 
@@ -59,6 +59,7 @@ class TokenMonitoringStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        namer = DeploymentNamer.from_scope(self)
         hourly_token_alarm = _context_threshold(
             self, "hourly_token_alarm", DEFAULT_HOURLY_TOKEN_ALARM
         )
@@ -139,7 +140,7 @@ class TokenMonitoringStack(Stack):
         lambda_log_group = logs.LogGroup(
             self,
             "TokenMetricsLogGroup",
-            log_group_name="/openclaw/lambda/token-metrics",
+            log_group_name=namer.name("/openclaw/lambda/token-metrics"),
             retention=logs.RetentionDays.ONE_MONTH,
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -147,7 +148,7 @@ class TokenMonitoringStack(Stack):
         self.token_lambda = lambda_.Function(
             self,
             "TokenMetricsFunction",
-            function_name="openclaw-token-metrics",
+            function_name=namer.name("openclaw-token-metrics"),
             runtime=lambda_.Runtime.PYTHON_3_12,
             handler="index.handler",
             code=lambda_.Code.from_asset(
@@ -223,7 +224,7 @@ class TokenMonitoringStack(Stack):
         dashboard = cw.Dashboard(
             self,
             "TokenAnalyticsDashboard",
-            dashboard_name="OpenClaw-Token-Analytics",
+            dashboard_name=namer.name("OpenClaw-Token-Analytics"),
         )
 
         dashboard.add_widgets(
@@ -275,7 +276,7 @@ class TokenMonitoringStack(Stack):
         total_tokens.create_alarm(
             self,
             "HourlyTokenSpikeAlarm",
-            alarm_name="openclaw-hourly-token-spike",
+            alarm_name=namer.name("openclaw-hourly-token-spike"),
             alarm_description=(
                 f"OpenClaw TotalTokens summed over 1 hour (3600 s) is greater than "
                 f"{hourly_token_alarm:,} tokens (context hourly_token_alarm)."
@@ -289,7 +290,7 @@ class TokenMonitoringStack(Stack):
         total_tokens.with_(period=Duration.days(1)).create_alarm(
             self,
             "DailyTokenBudgetAlarm",
-            alarm_name="openclaw-daily-token-budget",
+            alarm_name=namer.name("openclaw-daily-token-budget"),
             alarm_description=(
                 f"OpenClaw TotalTokens summed over 1 day (86400 s) is greater than "
                 f"{daily_token_budget:,} tokens (context daily_token_budget)."
@@ -303,7 +304,7 @@ class TokenMonitoringStack(Stack):
         estimated_cost.create_alarm(
             self,
             "HourlyCostSpikeAlarm",
-            alarm_name="openclaw-hourly-cost-spike",
+            alarm_name=namer.name("openclaw-hourly-cost-spike"),
             alarm_description=(
                 f"OpenClaw EstimatedCostUSD summed over 1 hour (3600 s) is greater than "
                 f"${hourly_cost_alarm:,} USD (context hourly_cost_alarm_usd)."
@@ -317,7 +318,7 @@ class TokenMonitoringStack(Stack):
         estimated_cost.with_(period=Duration.days(1)).create_alarm(
             self,
             "DailyCostBudgetAlarm",
-            alarm_name="openclaw-daily-cost-budget",
+            alarm_name=namer.name("openclaw-daily-cost-budget"),
             alarm_description=(
                 f"OpenClaw EstimatedCostUSD summed over 1 day (86400 s) is greater than "
                 f"${daily_cost_budget:,} USD (context daily_cost_budget_usd)."

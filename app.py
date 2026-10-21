@@ -16,6 +16,7 @@ import os
 import aws_cdk as cdk
 import cdk_nag
 
+from stacks import DeploymentNamer
 from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
@@ -28,6 +29,9 @@ from stacks.token_monitoring_stack import TokenMonitoringStack
 from stacks.runtime_config import load_runtime_manifest, runtime_target_from_manifest
 
 app = cdk.App()
+# Optional environment suffix (environment_suffix context / OPENCLAW_ENV_SUFFIX).
+# Empty by default, which leaves every stack and resource name unchanged.
+namer = DeploymentNamer.from_scope(app)
 
 env = cdk.Environment(
     account=app.node.try_get_context("account") or os.environ.get("CDK_DEFAULT_ACCOUNT"),
@@ -35,14 +39,14 @@ env = cdk.Environment(
 )
 
 # --- Foundation ---
-vpc_stack = VpcStack(app, "OpenClawVpc", env=env)
+vpc_stack = VpcStack(app, namer.stack("OpenClawVpc"), env=env)
 
-security_stack = SecurityStack(app, "OpenClawSecurity", env=env)
+security_stack = SecurityStack(app, namer.stack("OpenClawSecurity"), env=env)
 
 # --- Guardrails (Bedrock content filtering — opt-in via enable_guardrails) ---
 guardrails_stack = GuardrailsStack(
     app,
-    "OpenClawGuardrails",
+    namer.stack("OpenClawGuardrails"),
     cmk_arn=security_stack.cmk.key_arn,
     env=env,
 )
@@ -54,7 +58,7 @@ gateway_stack = None
 if app.node.try_get_context("enable_gateway") is True:
     gateway_stack = GatewayStack(
         app,
-        "OpenClawGateway",
+        namer.stack("OpenClawGateway"),
         cognito_issuer_url=security_stack.cognito_issuer_url,
         cognito_client_id=security_stack.user_pool_client_id,
         cmk_arn=security_stack.cmk.key_arn,
@@ -65,7 +69,7 @@ if app.node.try_get_context("enable_gateway") is True:
 # AgentCore Runtime and its endpoints are owned by the SDK controller.
 agentcore_stack = AgentCoreStack(
     app,
-    "OpenClawAgentCore",
+    namer.stack("OpenClawAgentCore"),
     cmk_arn=security_stack.cmk.key_arn,
     vpc=vpc_stack.vpc,
     private_subnet_ids=[s.subnet_id for s in vpc_stack.vpc.private_subnets],
@@ -90,14 +94,14 @@ runtime_target = runtime_target_from_manifest(runtime_manifest)
 runtime_arn = runtime_manifest["agentRuntimeArn"] if runtime_manifest else ""
 runtime_endpoint_name = runtime_manifest["endpointName"] if runtime_manifest else ""
 
-WHATSAPP_SECRET_NAME = "openclaw/channels/whatsapp"
-DISCORD_SECRET_NAME = "openclaw/channels/discord"
-LINE_SECRET_NAME = "openclaw/channels/line"
+WHATSAPP_SECRET_NAME = namer.name("openclaw/channels/whatsapp")
+DISCORD_SECRET_NAME = namer.name("openclaw/channels/discord")
+LINE_SECRET_NAME = namer.name("openclaw/channels/line")
 
 # --- Router (Lambda + API Gateway HTTP API for Telegram/Slack webhooks) ---
 router_stack = RouterStack(
     app,
-    "OpenClawRouter",
+    namer.stack("OpenClawRouter"),
     runtime_arn=runtime_arn,
     runtime_endpoint_name=runtime_endpoint_name,
     runtime_target=runtime_target,
@@ -122,12 +126,12 @@ router_stack = RouterStack(
 # (AgentCore <- Router already exists; CronStack adds policies to AgentCore role)
 _region = env.region or os.environ.get("CDK_DEFAULT_REGION", "")
 _account = env.account or os.environ.get("CDK_DEFAULT_ACCOUNT", "")
-_identity_table_name = "openclaw-identity"
+_identity_table_name = namer.name("openclaw-identity")
 _identity_table_arn = f"arn:aws:dynamodb:{_region}:{_account}:table/{_identity_table_name}"
 
 cron_stack = CronStack(
     app,
-    "OpenClawCron",
+    namer.stack("OpenClawCron"),
     runtime_arn=runtime_arn,
     runtime_endpoint_name=runtime_endpoint_name,
     identity_table_name=_identity_table_name,
@@ -147,7 +151,7 @@ cron_stack = CronStack(
 # --- Observability (dashboards + alarms) ---
 observability_stack = ObservabilityStack(
     app,
-    "OpenClawObservability",
+    namer.stack("OpenClawObservability"),
     cmk_arn=security_stack.cmk.key_arn,
     env=env,
 )
@@ -155,7 +159,7 @@ observability_stack = ObservabilityStack(
 # --- Token Monitoring ---
 token_monitoring_stack = TokenMonitoringStack(
     app,
-    "OpenClawTokenMonitoring",
+    namer.stack("OpenClawTokenMonitoring"),
     invocation_log_group=observability_stack.invocation_log_group,
     alarm_topic=observability_stack.alarm_topic,
     cmk_arn=security_stack.cmk.key_arn,
