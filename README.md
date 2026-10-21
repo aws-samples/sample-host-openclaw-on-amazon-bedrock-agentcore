@@ -208,6 +208,19 @@ A new AgentCore Runtime uses immutable endpoint `release_1`. For image or config
 
 > **Note:** Preserve the generated `.runtime/runtime-v2.json`; the wrapper passes it to CDK as `runtime_manifest`. It is gitignored — do not commit it.
 
+#### Multiple environments (optional)
+
+By default nothing changes: stacks and resources keep their names (`OpenClawRouter`, `openclaw-identity`, ...). To run a second, separate deployment, give it an environment suffix:
+
+```bash
+cp .env.template .env.dev            # optional settings; .env and .env.* are gitignored
+./scripts/deploy.sh --env dev        # OpenClawRouter-dev, openclaw-identity-dev, openclaw_agent_v2_dev, ...
+```
+
+`--env NAME` loads `.env.NAME` and sets `OPENCLAW_ENV_SUFFIX=NAME` (lowercase letters, digits and hyphens, at most 12 characters). The suffix is appended to stack names, secrets (`openclaw/channels/telegram-dev`), tables, functions, the schedule group, the user-files bucket, the ECR repository (`openclaw-bridge-dev`), the AgentCore Runtime name and the manifest (`.runtime/runtime-v2-dev.json`). The same suffix can be set with the `environment_suffix` key in `cdk.json`. The `setup-*.sh` and `manage-allowlist.sh` scripts honour `OPENCLAW_ENV_SUFFIX` / `OPENCLAW_ENV_NAME` and `.env`.
+
+Environments in one account still share a few things: Bedrock model invocation logging is one setting per account and region (by default the unsuffixed environment owns it and suffixed ones reuse `/aws/bedrock/invocation-logs`; set `MANAGE_BEDROCK_INVOCATION_LOGGING=true` for a suffixed environment that is alone in its account), the `/openclaw/container` log group, per-user `openclaw/user/*` API-key secrets, and the `openclaw/*` secret read scope of the Router and Cron functions. Use separate accounts when environments must be isolated.
+
 ### 6. Store your Telegram bot token
 
 > **Timing:** The secret is created (empty) by CDK in Phase 1. Store your bot token any time after Phase 1 completes, before testing the bot. It does not need to be stored before running `./scripts/deploy.sh`.
@@ -556,6 +569,10 @@ The guardrail is applied only when the AgentCore Runtime role has `bedrock:Apply
 - **The AgentCore Runtime is pinned to a numbered version.** `deploy.sh` passes the `GuardrailVersion` output of `OpenClawGuardrails` (the `CfnGuardrailVersion` resource) to the AgentCore Runtime as `BEDROCK_GUARDRAIL_VERSION`. Editing the policies in `stacks/guardrails_stack.py` and deploying updates only the guardrail's working draft; CloudFormation publishes a new version only when the `CfnGuardrailVersion` resource itself changes (for example its `description`). Update V2 with `./scripts/deploy.sh --runtime-only --endpoint-name release_2`, using a new unused endpoint name for each changed release. See [docs/guardrails.md](docs/guardrails.md#updating-guardrail-policies).
 
 ## Cleanup
+
+`./scripts/undeploy.sh` deletes the AgentCore Runtime recorded in the manifest (endpoints first) and the stacks in dependency order, after asking you to type the environment name (`default` without a suffix). `--env NAME` targets a suffixed environment, `--all` also deletes `OpenClawSecurity`, `--delete-user-files-bucket` also deletes the user-files bucket and every object version (asks again for the bucket name), and `--yes` skips the prompts for automation. It keeps the same retained resources listed below.
+
+Or with CDK directly:
 
 ```bash
 cdk destroy --all

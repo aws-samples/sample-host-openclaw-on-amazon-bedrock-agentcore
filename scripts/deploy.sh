@@ -3,6 +3,9 @@
 # Setup: uv venv .venv-deploy
 #        uv pip sync --python .venv-deploy/bin/python requirements-deploy.txt
 # CDK uses .venv; the SDK controller uses .venv-deploy.
+# Environments: --env NAME loads .env.NAME and suffixes every stack and resource
+# name with -NAME (see .env.template). Without --env or OPENCLAW_ENV_SUFFIX the
+# names are unchanged. Runs on the macOS system bash (3.2).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -11,8 +14,9 @@ DEPLOY_PYTHON="${DEPLOY_PYTHON:-$PROJECT_DIR/.venv-deploy/bin/python}"
 MODE=full
 SKIP_WARMUP=false
 ENDPOINT_NAME=""
-MANIFEST=".runtime/runtime-v2.json"
+MANIFEST=""
 IMAGE_URI="${RUNTIME_IMAGE_URI:-}"
+ENV_NAME="${OPENCLAW_ENV_NAME:-}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -21,10 +25,13 @@ while [ "$#" -gt 0 ]; do
     --image-uri) IMAGE_URI="${2:?--image-uri requires a prebuilt ECR image}"; shift 2 ;;
     --skip-warmup) SKIP_WARMUP=true; shift ;;
     --endpoint-name) ENDPOINT_NAME="${2:?--endpoint-name requires a name}"; shift 2 ;;
+    --env) ENV_NAME="${2:?--env requires a name}"; shift 2 ;;
+    --env=*) ENV_NAME="${1#*=}"; [ -n "$ENV_NAME" ] || { echo "ERROR: --env requires a name" >&2; exit 1; }; shift ;;
     --help|-h)
-      echo "Usage: $0 [--phase1|--phase3|--runtime-only|--cdk-only] [--manifest PATH] [--image-uri URI] [--endpoint-name NAME] [--skip-warmup]"
+      echo "Usage: $0 [--env NAME] [--phase1|--phase3|--runtime-only|--cdk-only] [--manifest PATH] [--image-uri URI] [--endpoint-name NAME] [--skip-warmup]"
       echo "Default: AgentCore Runtime V2, .runtime/runtime-v2.json, real billed short-chat warmup."
-      echo "Without --image-uri: local ARM64 Docker build; ECR_REPOSITORY defaults to openclaw-bridge."
+      echo "--env NAME: load .env.NAME and suffix stack/resource names with -NAME (manifest .runtime/runtime-v2-NAME.json)."
+      echo "Without --image-uri: local ARM64 Docker build; ECR_REPOSITORY defaults to openclaw-bridge (openclaw-bridge-NAME with --env)."
       echo "--skip-warmup is allowed only with --runtime-only to prepare an unverified artifact."
       echo "V2 releases keep existing endpoints fixed; use --endpoint-name release_2 for an update."
       exit 0 ;;
@@ -59,7 +66,37 @@ if [ "$MODE" != --runtime-only ]; then
     exit 1
   fi
 fi
+# Env file (.env, .env.NAME or OPENCLAW_ENV_FILE) may set the region, profile and suffix.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/openclaw-env.sh"
+load_project_env "$PROJECT_DIR" "$ENV_NAME"
+apply_named_environment "$ENV_NAME"
 PYTHON=(uv run --no-project --python "$PYTHON_INTERPRETER" python)
+# Read cdk.json only when it sets a non-empty environment_suffix, so a deployment
+# without a suffix runs exactly the same commands as before.
+if [ -z "${OPENCLAW_ENV_SUFFIX:-}" ] && grep -Eq '"environment_suffix"[[:space:]]*:[[:space:]]*"[^"]' cdk.json; then
+  OPENCLAW_ENV_SUFFIX="$("${PYTHON[@]}" -c 'import json; print(json.load(open("cdk.json"))["context"].get("environment_suffix", "") or "")')"
+fi
+OPENCLAW_ENV_SUFFIX="$(normalize_env_suffix "${OPENCLAW_ENV_SUFFIX:-}")"
+# app.py and runtime_config.py read the suffix from the environment.
+export OPENCLAW_ENV_SUFFIX
+STACK_VPC=$(with_suffix OpenClawVpc)
+STACK_SECURITY=$(with_suffix OpenClawSecurity)
+STACK_GUARDRAILS=$(with_suffix OpenClawGuardrails)
+STACK_GATEWAY=$(with_suffix OpenClawGateway)
+STACK_AGENTCORE=$(with_suffix OpenClawAgentCore)
+STACK_OBSERVABILITY=$(with_suffix OpenClawObservability)
+STACK_ROUTER=$(with_suffix OpenClawRouter)
+STACK_CRON=$(with_suffix OpenClawCron)
+STACK_TOKEN_MONITORING=$(with_suffix OpenClawTokenMonitoring)
+if [ -z "$MANIFEST" ]; then
+  MANIFEST=".runtime/$(with_suffix runtime-v2).json"
+fi
+# Context shared by every cdk deploy so all phases synthesize the same app.
+CDK_CONTEXT=()
+if [ -n "${MANAGE_BEDROCK_INVOCATION_LOGGING:-}" ]; then
+  CDK_CONTEXT+=(-c "manage_bedrock_invocation_logging=$MANAGE_BEDROCK_INVOCATION_LOGGING")
+fi
 REGION="${CDK_DEFAULT_REGION:-$("${PYTHON[@]}" -c 'import json; print(json.load(open("cdk.json"))["context"].get("region", ""))')}"
 REGION="${REGION:-$(aws configure get region)}"
 ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text)}"
@@ -81,10 +118,10 @@ phase1_cdk() (
   local enable_gateway gateway=()
   enable_gateway=$("${PYTHON[@]}" -c 'import json; print(str(json.load(open("cdk.json"))["context"].get("enable_gateway", False)).lower())')
   if [ "$enable_gateway" = true ]; then
-    gateway=(OpenClawGateway)
+    gateway=("$STACK_GATEWAY")
   fi
-  cdk deploy OpenClawVpc OpenClawSecurity OpenClawGuardrails OpenClawAgentCore OpenClawObservability \
-    ${gateway[@]+"${gateway[@]}"} -c runtime_manifest= --require-approval never
+  cdk deploy "$STACK_VPC" "$STACK_SECURITY" "$STACK_GUARDRAILS" "$STACK_AGENTCORE" "$STACK_OBSERVABILITY" \
+    ${gateway[@]+"${gateway[@]}"} -c runtime_manifest= ${CDK_CONTEXT[@]+"${CDK_CONTEXT[@]}"} --require-approval never
 )
 
 # --- Read CDK outputs for runtime config ---
@@ -92,45 +129,45 @@ read_cdk_outputs() {
   echo "--- Reading CDK outputs ---"
 
   EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawAgentCore --region "$REGION" \
+    --stack-name "$STACK_AGENTCORE" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" \
     --output text)
 
   SECURITY_GROUP_ID=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawAgentCore --region "$REGION" \
+    --stack-name "$STACK_AGENTCORE" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='SecurityGroupId'].OutputValue" \
     --output text)
 
   PRIVATE_SUBNET_IDS=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawAgentCore --region "$REGION" \
+    --stack-name "$STACK_AGENTCORE" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='PrivateSubnetIds'].OutputValue" \
     --output text)
 
   USER_FILES_BUCKET=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawAgentCore --region "$REGION" \
+    --stack-name "$STACK_AGENTCORE" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='UserFilesBucketName'].OutputValue" \
     --output text)
 
-  GATEWAY_TOKEN_SECRET_ID="openclaw/gateway-token"
+  GATEWAY_TOKEN_SECRET_ID="$(with_suffix openclaw/gateway-token)"
 
   # OpenClawSecurity outputs use hand-chosen OutputKeys (stacks/security_stack.py).
   # Match them exactly — never with contains() on a CDK-generated ExportsOutput*
   # key, which embeds a logical-id hash and silently returns "" when it changes.
   COGNITO_USER_POOL_ID=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
+    --stack-name "$STACK_SECURITY" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue" \
     --output text)
 
   COGNITO_CLIENT_ID=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
+    --stack-name "$STACK_SECURITY" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='CognitoProxyClientId'].OutputValue" \
     --output text)
 
-  COGNITO_PASSWORD_SECRET_ID="openclaw/cognito-password-secret"
-  TELEGRAM_CHANNEL_SECRET_ID="openclaw/channels/telegram"
+  COGNITO_PASSWORD_SECRET_ID="$(with_suffix openclaw/cognito-password-secret)"
+  TELEGRAM_CHANNEL_SECRET_ID="$(with_suffix openclaw/channels/telegram)"
 
   CMK_ARN=$(aws cloudformation describe-stacks \
-    --stack-name OpenClawSecurity --region "$REGION" \
+    --stack-name "$STACK_SECURITY" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='SecretsCmkArn'].OutputValue" \
     --output text)
 
@@ -147,11 +184,11 @@ read_cdk_outputs() {
   GUARDRAIL_VERSION=""
   if [ "$ENABLE_GUARDRAILS" = "true" ]; then
     GUARDRAIL_ID=$(aws cloudformation describe-stacks \
-      --stack-name OpenClawGuardrails --region "$REGION" \
+      --stack-name "$STACK_GUARDRAILS" --region "$REGION" \
       --query "Stacks[0].Outputs[?OutputKey=='GuardrailId'].OutputValue" \
       --output text)
     GUARDRAIL_VERSION=$(aws cloudformation describe-stacks \
-      --stack-name OpenClawGuardrails --region "$REGION" \
+      --stack-name "$STACK_GUARDRAILS" --region "$REGION" \
       --query "Stacks[0].Outputs[?OutputKey=='GuardrailVersion'].OutputValue" \
       --output text)
     # An empty ID would silently deploy the runtime with guardrails OFF while
@@ -170,7 +207,7 @@ read_cdk_outputs() {
   AGENTCORE_GATEWAY_URL=""
   if [ "$ENABLE_GATEWAY" = "true" ]; then
     AGENTCORE_GATEWAY_URL=$(aws cloudformation describe-stacks \
-      --stack-name OpenClawGateway --region "$REGION" \
+      --stack-name "$STACK_GATEWAY" --region "$REGION" \
       --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue" \
       --output text)
     require_cdk_output AGENTCORE_GATEWAY_URL
@@ -184,7 +221,7 @@ read_cdk_outputs() {
   BROWSER_IDENTIFIER=""
   if [ "$ENABLE_BROWSER" = "true" ]; then
     BROWSER_IDENTIFIER=$(aws cloudformation describe-stacks \
-      --stack-name OpenClawAgentCore --region "$REGION" \
+      --stack-name "$STACK_AGENTCORE" --region "$REGION" \
       --query "Stacks[0].Outputs[?OutputKey=='BrowserIdentifier'].OutputValue" \
       --output text)
     require_cdk_output BROWSER_IDENTIFIER
@@ -241,7 +278,7 @@ require_cdk_output() {
   done
   if [ -n "$missing" ]; then
     echo "ERROR: required CDK stack output(s) resolved empty:$missing" >&2
-    echo "       Check 'aws cloudformation describe-stacks --stack-name OpenClawSecurity / OpenClawAgentCore / OpenClawGuardrails / OpenClawGateway --region $REGION'" >&2
+    echo "       Check 'aws cloudformation describe-stacks --stack-name $STACK_SECURITY / $STACK_AGENTCORE / $STACK_GUARDRAILS / $STACK_GATEWAY --region $REGION'" >&2
     echo "       and confirm the OutputKeys queried in scripts/deploy.sh exist in the deployed stacks." >&2
     echo "       Refusing to configure the runtime with empty values." >&2
     exit 1
@@ -255,6 +292,8 @@ phase2_runtime() {
   local runtime_args=() config_file image
   if [ "$SKIP_WARMUP" = true ]; then runtime_args+=(--skip-warmup); fi
   if [ -n "$ENDPOINT_NAME" ]; then runtime_args+=(--endpoint-name "$ENDPOINT_NAME"); fi
+  # A suffixed environment gets its own runtime; the controller default name is openclaw_agent_v2.
+  if [ -n "$OPENCLAW_ENV_SUFFIX" ]; then runtime_args+=(--runtime-name "$(with_suffix openclaw_agent_v2 _)"); fi
   image="$IMAGE_URI"
   if [ -z "$image" ]; then
     if [ "${BUILD_MODE:-local-build}" != local-build ]; then
@@ -263,7 +302,7 @@ phase2_runtime() {
     fi
     local repository_uri
     repository_uri=$("${PYTHON[@]}" "$SCRIPT_DIR/runtime_image.py" --region "$REGION" \
-      --name "${ECR_REPOSITORY:-openclaw-bridge}")
+      --name "${ECR_REPOSITORY:-$(with_suffix openclaw-bridge)}")
     image="${repository_uri}:v${IMAGE_VERSION}"
     bash "$SCRIPT_DIR/build_and_push.sh" "$image" "$REGION"
   fi
@@ -290,8 +329,8 @@ phase3_cdk() (
   "${PYTHON[@]}" "$SCRIPT_DIR/runtime_deploy.py" verify --region "$REGION" \
     --manifest "$MANIFEST" --require-enrollment-ready --check-existing-callers
   source "$PROJECT_DIR/.venv/bin/activate"
-  cdk deploy OpenClawRouter OpenClawCron OpenClawTokenMonitoring \
-    -c "runtime_manifest=$MANIFEST" --require-approval never
+  cdk deploy "$STACK_ROUTER" "$STACK_CRON" "$STACK_TOKEN_MONITORING" \
+    -c "runtime_manifest=$MANIFEST" ${CDK_CONTEXT[@]+"${CDK_CONTEXT[@]}"} --require-approval never
 )
 
 preflight
