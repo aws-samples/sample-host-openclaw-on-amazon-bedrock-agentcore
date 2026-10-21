@@ -44,7 +44,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import retention_days
+from stacks import DeploymentNamer, retention_days
 
 _TOOLS_DIR = pathlib.Path(__file__).resolve().parent.parent / "lambda" / "gateway_tools"
 _SCHEMA_FILE = _TOOLS_DIR / "tool-schemas.json"
@@ -109,11 +109,15 @@ class GatewayStack(Stack):
         # strings (not cross-stack references) mirrors app.py's identity-table
         # handling and keeps this stack deployable in Phase 1 alongside
         # OpenClawSecurity, before the runtime exists.
-        user_files_bucket_arn = f"arn:aws:s3:::openclaw-user-files-{account}-{region}"
-        identity_table_arn = f"arn:aws:dynamodb:{region}:{account}:table/openclaw-identity"
-        cron_lambda_arn = f"arn:aws:lambda:{region}:{account}:function:openclaw-cron-executor"
-        scheduler_role_arn = f"arn:aws:iam::{account}:role/openclaw-cron-scheduler-role-{region}"
-        schedule_arn_pattern = f"arn:aws:scheduler:{region}:{account}:schedule/openclaw-cron/*"
+        namer = DeploymentNamer.from_scope(self)
+        user_files_bucket_name = namer.name(f"openclaw-user-files-{account}-{region}")
+        identity_table_name = namer.name("openclaw-identity")
+        schedule_group_name = namer.name("openclaw-cron")
+        user_files_bucket_arn = f"arn:aws:s3:::{user_files_bucket_name}"
+        identity_table_arn = f"arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}"
+        cron_lambda_arn = f"arn:aws:lambda:{region}:{account}:function:{namer.name('openclaw-cron-executor')}"
+        scheduler_role_arn = f"arn:aws:iam::{account}:role/{namer.name(f'openclaw-cron-scheduler-role-{region}')}"
+        schedule_arn_pattern = f"arn:aws:scheduler:{region}:{account}:schedule/{schedule_group_name}/*"
 
         # One asset for all three functions so lib/ is shared; tests excluded.
         code = _lambda.Code.from_asset(
@@ -130,14 +134,14 @@ class GatewayStack(Stack):
             log_group = logs.LogGroup(
                 self,
                 f"{name}LogGroup",
-                log_group_name=f"/openclaw/lambda/gateway-{name.lower()}",
+                log_group_name=namer.name(f"/openclaw/lambda/gateway-{name.lower()}"),
                 retention=retention_days(log_retention),
                 removal_policy=RemovalPolicy.DESTROY,
             )
             return _lambda.Function(
                 self,
                 f"{name}Fn",
-                function_name=f"openclaw-gateway-{name.lower()}",
+                function_name=namer.name(f"openclaw-gateway-{name.lower()}"),
                 runtime=_lambda.Runtime.NODEJS_22_X,
                 handler=handler,
                 code=code,
@@ -160,7 +164,7 @@ class GatewayStack(Stack):
         self.user_files_fn = _fn(
             "UserFiles",
             "s3_user_files/index.handler",
-            {**common_env, "S3_USER_FILES_BUCKET": f"openclaw-user-files-{account}-{region}"},
+            {**common_env, "S3_USER_FILES_BUCKET": user_files_bucket_name},
             "Gateway MCP target: per-user S3 files (list/read/write/delete)",
         )
         self.user_files_fn.add_to_role_policy(
@@ -189,10 +193,10 @@ class GatewayStack(Stack):
             "eventbridge_cron/index.handler",
             {
                 **common_env,
-                "EVENTBRIDGE_SCHEDULE_GROUP": "openclaw-cron",
+                "EVENTBRIDGE_SCHEDULE_GROUP": schedule_group_name,
                 "CRON_LAMBDA_ARN": cron_lambda_arn,
                 "EVENTBRIDGE_ROLE_ARN": scheduler_role_arn,
-                "IDENTITY_TABLE_NAME": "openclaw-identity",
+                "IDENTITY_TABLE_NAME": identity_table_name,
             },
             "Gateway MCP target: per-user EventBridge schedules (create/list/update/delete)",
         )
@@ -304,7 +308,7 @@ class GatewayStack(Stack):
         self.gateway = agentcore.CfnGateway(
             self,
             "Gateway",
-            name=GATEWAY_NAME,
+            name=namer.name(GATEWAY_NAME),
             description="OpenClaw in-house skills as MCP tools (prototype)",
             protocol_type="MCP",
             protocol_configuration=agentcore.CfnGateway.GatewayProtocolConfigurationProperty(
