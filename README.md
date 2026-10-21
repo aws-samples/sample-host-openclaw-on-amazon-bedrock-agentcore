@@ -98,7 +98,7 @@ See [docs/architecture-detailed.md](docs/architecture-detailed.md) for sequence 
 - **Node.js** 24.x, 24.16 or later (for the CDK CLI and the bridge unit tests; the container image uses Node 24)
 - **Python** >= 3.11 (for CDK app)
 - **uv** ([installation](https://docs.astral.sh/uv/getting-started/installation/))
-- **Docker buildx** with ARM64 support, or a prebuilt ARM64 ECR image supplied with `--image-uri`
+- **Docker buildx** with ARM64 support, or a prebuilt ARM64 ECR image supplied with `--image-uri` (for example one built remotely with [CodeBuild](#build-on-codebuild-no-local-docker))
 - **AWS CDK** v2 (`npm install -g aws-cdk`)
 - **Deployment SDK environment** from `requirements-deploy.txt` (`boto3==1.43.95`, `botocore==1.43.95`)
 - **Telegram Bot Token** from [@BotFather](https://t.me/BotFather)
@@ -194,6 +194,25 @@ By default, the container image is built **locally** with Docker buildx and push
 |------|---------|----------|-------|
 | **local-build** (default) | `./scripts/deploy.sh` | Docker buildx | Builds ARM64 image locally |
 | **prebuilt** | `./scripts/deploy.sh --image-uri "$IMAGE_URI"` | Existing ECR image | Resolves and records the immutable digest |
+| **codebuild** | `BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri "$IMAGE_URI"` | Opt-in `OpenClawBuild` stack | Image built on an ARM64 CodeBuild worker by `scripts/codebuild-push.sh`; no local Docker |
+
+#### Build on CodeBuild (no local Docker)
+
+If you can't run Docker locally, or your network blocks the registries the build needs, the opt-in `OpenClawBuild` stack builds the ARM64 image on an AWS CodeBuild worker instead. It creates a CodeBuild project, a private source bucket and a build log group. The project can push only to the bridge ECR repository (`ECR_REPOSITORY`, default `openclaw-bridge`, the same one `deploy.sh` uses). The stack is only part of the app when `enable_codebuild` is true, so `cdk deploy --all` and the other stacks are unchanged without it.
+
+```bash
+# Once: deploy the build stack (same ECR_REPOSITORY as deploy.sh, if you override it)
+cdk deploy OpenClawBuild -c enable_codebuild=true
+
+# Each image: zip bridge/, upload it, build and push v<image_version> from cdk.json
+IMAGE_URI=$(./scripts/codebuild-push.sh)        # or ./scripts/codebuild-push.sh 71 for tag v71
+
+# Deploy that image (first deploy), or release it as a new endpoint
+BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri "$IMAGE_URI"
+BUILD_MODE=codebuild ./scripts/deploy.sh --runtime-only --image-uri "$IMAGE_URI" --endpoint-name release_2
+```
+
+`codebuild-push.sh` uses `.venv-deploy` like `deploy.sh`, creates the ECR repository on first use, prints progress and the CodeBuild console link on stderr, and prints only the tagged image URI on stdout. The build fails unless the image is `arm64`. `deploy.sh` then pins the image by digest as in the prebuilt mode. Remove the stack with `cdk destroy OpenClawBuild -c enable_codebuild=true`.
 
 #### Running individual phases
 
@@ -561,7 +580,7 @@ The guardrail is applied only when the AgentCore Runtime role has `bedrock:Apply
 cdk destroy --all
 ```
 
-Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys, the Cognito User Pool and the DynamoDB identity and token-usage tables have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed; the DynamoDB tables also have deletion protection, which you must turn off before deleting them. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`.
+Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys, the Cognito User Pool and the DynamoDB identity and token-usage tables have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed; the DynamoDB tables also have deletion protection, which you must turn off before deleting them. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`; likewise `OpenClawBuild` only with `-c enable_codebuild=true`.
 
 ## Contributing
 

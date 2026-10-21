@@ -25,6 +25,7 @@ from stacks.gateway_stack import GatewayStack
 from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
+from stacks.build_stack import BuildStack
 from stacks.runtime_config import load_runtime_manifest, runtime_target_from_manifest
 
 app = cdk.App()
@@ -163,6 +164,21 @@ token_monitoring_stack = TokenMonitoringStack(
 )
 # Its scheduled-task alarms filter /openclaw/lambda/cron, which OpenClawCron creates.
 token_monitoring_stack.add_dependency(cron_stack)
+
+# --- Build (CodeBuild project for ARM64 bridge image builds without local Docker) ---
+# Opt-in like OpenClawGateway: with enable_codebuild unset or false the stack is
+# not in the app, so `cdk deploy --all` and every existing template are unchanged.
+# `-c enable_codebuild=true` on the CLI arrives as the string "true".
+# It pushes to the repository scripts/deploy.sh uses (ECR_REPOSITORY, default
+# openclaw-bridge); scripts/codebuild-push.sh prints the image URI for
+# `BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri URI`.
+if app.node.try_get_context("enable_codebuild") in (True, "true"):
+    build_stack = BuildStack(
+        app,
+        "OpenClawBuild",
+        ecr_repo_name=os.environ.get("ECR_REPOSITORY") or "openclaw-bridge",
+        env=env,
+    )
 
 # --- cdk-nag security checks ---
 cdk.Aspects.of(app).add(cdk_nag.AwsSolutionsChecks(verbose=True))
