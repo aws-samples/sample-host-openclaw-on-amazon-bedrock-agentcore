@@ -3,6 +3,7 @@
   "context": {
     "account": "",
     "region": "",
+    "environment_suffix": "",
     "availability_zones": [],
     "default_model_id": "global.anthropic.claude-opus-5-5",
     "fallback_model_id": "global.anthropic.claude-sonnet-5-5",
