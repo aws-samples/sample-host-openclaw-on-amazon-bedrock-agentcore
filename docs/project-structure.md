@@ -18,6 +18,7 @@ openclaw-on-agentcore/
     guardrails_stack.py           # Bedrock Guardrails (content filters, PII, topic denial)
     cron_stack.py                 # EventBridge Scheduler, Cron executor Lambda, IAM
     gateway_stack.py              # Prototype: AgentCore Gateway (MCP) + interceptor + tool Lambdas; only when enable_gateway=true
+    build_stack.py                # CodeBuild project + source bucket for remote ARM64 image builds; only when enable_codebuild=true
   bridge/
     Dockerfile                    # Container image (node:24-slim, ARM64, pinned openclaw@2026.9.5 + clawhub@0.23.3, 5 owner-pinned ClawHub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
@@ -90,6 +91,7 @@ openclaw-on-agentcore/
     deploy.sh                     # Three-phase deploy (CDK -> pinned SDK controller -> CDK)
     runtime_deploy.py              # AgentCore Runtime SDK controller, manifest readback and chat warmup
     runtime_image.py               # Resolve or create the ECR repository
+    codebuild-push.sh              # Build + push the bridge image on CodeBuild; prints the image URI for deploy.sh --image-uri
     runtime_manifest.py            # Pure deployment/CDK enrollment evidence validation
     e2e-deploy-and-test.sh          # V2 manifest verification + smoke/lifecycle; no route resets
     manage-allowlist.sh           # Add/remove/list users in the allowlist
@@ -100,6 +102,7 @@ openclaw-on-agentcore/
     test_guardrail_eval.py        # Unit tests for scripts/guardrail-eval.py (stubbed ApplyGuardrail, no AWS)
     test_state_bucket_lifecycle_synth.py # User-files bucket lifecycle rules synth test (no AWS)
     test_gateway_stack_synth.py   # OpenClawGateway synth tests: flag off = unchanged templates, flag on = stack + IAM + cdk-nag (10 tests, no AWS)
+    test_build_stack.py           # OpenClawBuild synth (flag, ECR scope, ARM64, cdk-nag) + codebuild-push.sh with fake AWS CLI (no AWS)
     test_table_protection_synth.py # DynamoDB deletion protection, RETAIN and table_tags synth tests (no AWS)
     test_cron_audio.py            # Brief audio marker, key checks and sendAudio delivery (no AWS)
     test_cron_error_text.py       # Cron failures send a fixed notice; no exception text in replies or logs
