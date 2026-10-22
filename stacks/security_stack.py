@@ -15,20 +15,21 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import retention_days
+from stacks import DeploymentNamer, retention_days
 
 
 class SecurityStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        namer = DeploymentNamer.from_scope(self)
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
 
         # --- KMS CMK for Secrets Manager ----------------------------------
         self.cmk = kms.Key(
             self,
             "SecretsCmk",
-            alias="openclaw/secrets",
+            alias=namer.name("openclaw/secrets"),
             description="CMK for OpenClaw secrets encryption",
             enable_key_rotation=True,
             removal_policy=RemovalPolicy.RETAIN,
@@ -53,7 +54,7 @@ class SecurityStack(Stack):
         self.gateway_token_secret = secretsmanager.Secret(
             self,
             "GatewayTokenSecret",
-            secret_name="openclaw/gateway-token",
+            secret_name=namer.name("openclaw/gateway-token"),
             description="Token for CloudFront Web UI access",
             encryption_key=self.cmk,
             generate_secret_string=secretsmanager.SecretStringGenerator(
@@ -70,7 +71,7 @@ class SecurityStack(Stack):
             self.channel_secrets[channel] = secretsmanager.Secret(
                 self,
                 f"{channel.capitalize()}BotTokenSecret",
-                secret_name=f"openclaw/channels/{channel}",
+                secret_name=namer.name(f"openclaw/channels/{channel}"),
                 description=f"Bot token for {channel} channel",
                 encryption_key=self.cmk,
                 generate_secret_string=secretsmanager.SecretStringGenerator(
@@ -122,7 +123,7 @@ class SecurityStack(Stack):
         self.user_pool = cognito.UserPool(
             self,
             "IdentityPool",
-            user_pool_name="openclaw-identity-pool",
+            user_pool_name=namer.name("openclaw-identity-pool"),
             self_sign_up_enabled=False,
             sign_in_aliases=cognito.SignInAliases(username=True),
             password_policy=cognito.PasswordPolicy(
@@ -138,7 +139,7 @@ class SecurityStack(Stack):
 
         self.user_pool_client = self.user_pool.add_client(
             "ProxyClient",
-            user_pool_client_name="openclaw-proxy",
+            user_pool_client_name=namer.name("openclaw-proxy"),
             auth_flows=cognito.AuthFlow(
                 admin_user_password=True,
             ),
@@ -157,7 +158,7 @@ class SecurityStack(Stack):
         self.webhook_secret = secretsmanager.Secret(
             self,
             "WebhookSecret",
-            secret_name="openclaw/webhook-secret",
+            secret_name=namer.name("openclaw/webhook-secret"),
             description="Secret token for validating incoming webhook requests "
             "(Telegram X-Telegram-Bot-Api-Secret-Token, Slack signing secret)",
             encryption_key=self.cmk,
@@ -171,7 +172,7 @@ class SecurityStack(Stack):
         self.cognito_password_secret = secretsmanager.Secret(
             self,
             "CognitoPasswordSecret",
-            secret_name="openclaw/cognito-password-secret",
+            secret_name=namer.name("openclaw/cognito-password-secret"),
             description="HMAC secret for deriving Cognito user passwords",
             encryption_key=self.cmk,
             generate_secret_string=secretsmanager.SecretStringGenerator(

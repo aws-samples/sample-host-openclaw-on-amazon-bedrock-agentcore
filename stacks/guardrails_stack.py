@@ -7,6 +7,8 @@ from aws_cdk import (
 )
 from constructs import Construct
 
+from stacks import DeploymentNamer
+
 
 class GuardrailsStack(Stack):
     def __init__(
@@ -35,7 +37,7 @@ class GuardrailsStack(Stack):
         self.guardrail = bedrock.CfnGuardrail(
             self,
             "ContentGuardrail",
-            name="openclaw_content_guardrail",
+            name=DeploymentNamer.from_scope(self).runtime_name("openclaw_content_guardrail"),
             description="Content filtering for OpenClaw multi-user AI bot",
             blocked_input_messaging=(
                 "I can't process that request. Please rephrase your message."

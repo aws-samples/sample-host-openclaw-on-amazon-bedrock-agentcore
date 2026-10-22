@@ -17,13 +17,14 @@
 # uv, zip, the AWS CLI, and .venv-deploy (same setup as scripts/deploy.sh).
 # ECR_REPOSITORY (default openclaw-bridge) must match the repository the stack
 # was deployed for.
+# OPENCLAW_ENV_SUFFIX (optional, as in the CDK app) selects OpenClawBuild-<suffix>,
+# the stack `cdk deploy` creates with the same suffix.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPLOY_PYTHON="${DEPLOY_PYTHON:-$PROJECT_DIR/.venv-deploy/bin/python}"
-BUILD_STACK="OpenClawBuild"
 REPOSITORY="${ECR_REPOSITORY:-openclaw-bridge}"
 
 log() { echo "$@" >&2; }
@@ -47,6 +48,11 @@ if [ ! -x "$DEPLOY_PYTHON" ]; then
 	exit 1
 fi
 PYTHON=(uv run --no-project --python "$DEPLOY_PYTHON" python)
+
+# Stack name with the optional environment suffix; same rules as the CDK app
+# (scripts/env_suffix.py). Empty keeps OpenClawBuild.
+BUILD_STACK=$("${PYTHON[@]}" -c 'import sys; sys.path.insert(0, "scripts"); from env_suffix import with_suffix; print(with_suffix("OpenClawBuild"))') ||
+	die "OPENCLAW_ENV_SUFFIX must be at most 12 lowercase letters, digits and single hyphens."
 
 # Region and account resolve the same way as scripts/deploy.sh.
 REGION="${CDK_DEFAULT_REGION:-$("${PYTHON[@]}" -c 'import json; print(json.load(open("cdk.json"))["context"].get("region", ""))')}"

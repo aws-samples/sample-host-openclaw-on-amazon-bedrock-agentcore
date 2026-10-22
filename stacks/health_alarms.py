@@ -27,6 +27,8 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
+from stacks import DeploymentNamer
+
 NAMESPACE = "OpenClaw/Health"
 CONTAINER_LOG_GROUP = "/openclaw/container"
 CRON_LOG_GROUP = "/openclaw/lambda/cron"
@@ -46,9 +48,12 @@ def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("contai
     ensure_container_group = None
     if "container" in groups:
         ensure_container_group = _ensure_container_group(scope, stack)
+    namer = DeploymentNamer.from_scope(scope)
+    # The bridge writes /openclaw/container under a fixed name, so suffixed
+    # environments in one account share it; the cron group is per environment.
     container_group = logs.LogGroup.from_log_group_name(scope, "ContainerLogGroup", CONTAINER_LOG_GROUP)
-    cron_group = logs.LogGroup.from_log_group_name(scope, "CronLogGroup", CRON_LOG_GROUP)
-    return _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_container_group)
+    cron_group = logs.LogGroup.from_log_group_name(scope, "CronLogGroup", namer.name(CRON_LOG_GROUP))
+    return _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_container_group, namer)
 
 
 def _ensure_container_group(scope, stack):
@@ -87,7 +92,8 @@ def _ensure_container_group(scope, stack):
     return ensure
 
 
-def _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_container_group):
+def _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_container_group, namer=None):
+    namer = namer or DeploymentNamer()
     specs = [
         ("SessionStorageWriteErrors", container_group,
          logs.FilterPattern.any_term("MOUNT_WRITE_FAILED", "EREMOTEIO", "ENOSPC", "EDQUOT"),
@@ -121,7 +127,8 @@ def _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_cont
             log_group=group,
             filter_pattern=pattern,
             metric_namespace=NAMESPACE,
-            metric_name=metric_name,
+            # Suffixed so alarms of one environment do not count another's events.
+            metric_name=namer.name(metric_name),
             metric_value="1",
         )
         if group is container_group and ensure_container_group is not None:
@@ -129,7 +136,7 @@ def _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_cont
         alarm = mf.metric(statistic="Sum", period=Duration.minutes(5)).create_alarm(
             scope,
             f"{metric_name}Alarm",
-            alarm_name=alarm_name,
+            alarm_name=namer.name(alarm_name),
             alarm_description=description,
             threshold=1,
             evaluation_periods=1,

@@ -12,6 +12,7 @@ import json
 import os
 import sys
 
+from env_suffix import with_suffix
 from runtime_deploy import V2_ENV_LIMIT, environment_size
 
 
@@ -39,11 +40,15 @@ def foundation_configuration(values):
         "BROWSER_IDENTIFIER": "BROWSER_IDENTIFIER", "AGENTCORE_GATEWAY_URL": "AGENTCORE_GATEWAY_URL",
     }
     environment = {target: values[source] for target, source in mapping.items() if values.get(source)}
+    # Names created by OpenClawCron/OpenClawRouter, with the same optional
+    # environment suffix (OPENCLAW_ENV_SUFFIX; empty keeps the names unchanged).
+    cron_function = with_suffix("openclaw-cron-executor", values)
+    scheduler_role = with_suffix(f"openclaw-cron-scheduler-role-{values['REGION']}", values)
     environment.update({
-        "EVENTBRIDGE_SCHEDULE_GROUP": "openclaw-cron",
-        "CRON_LAMBDA_ARN": f"arn:aws:lambda:{values['REGION']}:{values['ACCOUNT']}:function:openclaw-cron-executor",
-        "EVENTBRIDGE_ROLE_ARN": f"arn:aws:iam::{values['ACCOUNT']}:role/openclaw-cron-scheduler-role-{values['REGION']}",
-        "IDENTITY_TABLE_NAME": "openclaw-identity",
+        "EVENTBRIDGE_SCHEDULE_GROUP": with_suffix("openclaw-cron", values),
+        "CRON_LAMBDA_ARN": f"arn:aws:lambda:{values['REGION']}:{values['ACCOUNT']}:function:{cron_function}",
+        "EVENTBRIDGE_ROLE_ARN": f"arn:aws:iam::{values['ACCOUNT']}:role/{scheduler_role}",
+        "IDENTITY_TABLE_NAME": with_suffix("openclaw-identity", values),
     })
     configuration = {
         "roleArn": values["EXECUTION_ROLE_ARN"],

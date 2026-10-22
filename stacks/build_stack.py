@@ -12,6 +12,9 @@ default ``openclaw-bridge``); the repository itself is created by
 
 Trigger via: scripts/codebuild-push.sh, then hand the printed image URI to
 ``BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri URI``.
+
+With an environment suffix (environment_suffix / OPENCLAW_ENV_SUFFIX) the
+stack, project, source bucket and log group names all end in -<suffix>.
 """
 
 from aws_cdk import (
@@ -27,7 +30,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import retention_days
+from stacks import DeploymentNamer, retention_days
 
 # Same prefixes scripts/runtime_deploy.py accepts and the AgentCore execution
 # role may pull from (stacks/agentcore_stack.py).
@@ -50,6 +53,7 @@ class BuildStack(Stack):
                 "ECR repository must use an execution-role prefix: " + ", ".join(ECR_PREFIXES)
             )
 
+        namer = DeploymentNamer.from_scope(self)
         region = Stack.of(self).region
         account = Stack.of(self).account
         partition = Stack.of(self).partition
@@ -71,7 +75,7 @@ class BuildStack(Stack):
         self.source_bucket = s3.Bucket(
             self,
             "BuildSourceBucket",
-            bucket_name=f"openclaw-build-source-{account}-{region}",
+            bucket_name=namer.name(f"openclaw-build-source-{account}-{region}"),
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
@@ -83,7 +87,7 @@ class BuildStack(Stack):
         build_log_group = logs.LogGroup(
             self,
             "BuildLogGroup",
-            log_group_name="/openclaw/codebuild/bridge-build",
+            log_group_name=namer.name("/openclaw/codebuild/bridge-build"),
             retention=retention_days(log_retention),
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -94,7 +98,7 @@ class BuildStack(Stack):
         self.project = codebuild.Project(
             self,
             "BridgeBuildProject",
-            project_name="openclaw-bridge-build",
+            project_name=namer.name("openclaw-bridge-build"),
             description="Builds the OpenClaw bridge ARM64 container and pushes to ECR",
             source=codebuild.Source.s3(
                 bucket=self.source_bucket,
