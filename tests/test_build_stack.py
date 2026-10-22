@@ -54,8 +54,8 @@ def _feature_flags():
     return {k: v for k, v in ctx.items() if k.startswith("@aws-cdk/")}
 
 
-def _synth_build(repo="openclaw-bridge", env=True):
-    app = cdk.App(context=_feature_flags())
+def _synth_build(repo="openclaw-bridge", env=True, **context):
+    app = cdk.App(context={**_feature_flags(), **context})
     stack = BuildStack(app, "OpenClawBuild", ecr_repo_name=repo,
                        env=cdk.Environment(account=_ACCOUNT, region=_REGION) if env else None)
     cdk.Aspects.of(app).add(cdk_nag.AwsSolutionsChecks(verbose=True))
@@ -127,6 +127,29 @@ def test_rejects_repository_the_execution_role_cannot_pull():
         _synth_build(repo="some-other-repo")
 
 
+def _fixed_names(tpl):
+    return (
+        next(iter(tpl.find_resources("AWS::CodeBuild::Project").values()))["Properties"]["Name"],
+        next(iter(tpl.find_resources("AWS::S3::Bucket").values()))["Properties"]["BucketName"],
+        next(iter(tpl.find_resources("AWS::Logs::LogGroup").values()))["Properties"]["LogGroupName"],
+    )
+
+
+def test_names_are_unchanged_without_an_environment_suffix(monkeypatch):
+    monkeypatch.delenv("OPENCLAW_ENV_SUFFIX", raising=False)
+    _, tpl = _synth_build()
+    assert _fixed_names(tpl) == ("openclaw-bridge-build", f"openclaw-build-source-{_ACCOUNT}-{_REGION}",
+                                 "/openclaw/codebuild/bridge-build")
+
+
+def test_environment_suffix_reaches_every_fixed_name(monkeypatch):
+    monkeypatch.delenv("OPENCLAW_ENV_SUFFIX", raising=False)
+    stack, tpl = _synth_build(environment_suffix="dev")
+    assert _fixed_names(tpl) == ("openclaw-bridge-build-dev", f"openclaw-build-source-{_ACCOUNT}-{_REGION}-dev",
+                                 "/openclaw/codebuild/bridge-build-dev")
+    Annotations.from_stack(stack).has_no_error("*", Match.any_value())
+
+
 # --------------------------------------------------------------------------- script
 
 _FAKE = r'''
@@ -162,6 +185,7 @@ if tool == "aws":
 def script_env(tmp_path):
     (tmp_path / "scripts").mkdir()
     shutil.copy(_REPO / "scripts/codebuild-push.sh", tmp_path / "scripts")
+    shutil.copy(_REPO / "scripts/env_suffix.py", tmp_path / "scripts")
     (tmp_path / "bridge").mkdir()
     (tmp_path / "bridge/Dockerfile").write_text("FROM scratch\n")
     (tmp_path / "bridge/patch-openclaw.test.js").write_text("// copied by the Dockerfile\n")
@@ -182,6 +206,7 @@ def script_env(tmp_path):
         "DEPLOY_PYTHON": str(binaries / "deployment-python"),
     }
     env.pop("ECR_REPOSITORY", None)
+    env.pop("OPENCLAW_ENV_SUFFIX", None)
     return tmp_path, env
 
 
@@ -203,6 +228,32 @@ def test_script_prints_only_the_image_uri_for_deploy_sh(script_env):
     assert "BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri" in result.stderr
     start = next(c["args"] for c in _calls(root) if c["args"][:2] == ["codebuild", "start-build"])
     assert "name=IMAGE_TAG,value=v70,type=PLAINTEXT" in start
+
+
+def _stack_names_read(root):
+    return {c["args"][c["args"].index("--stack-name") + 1] for c in _calls(root)
+            if c["args"][:2] == ["cloudformation", "describe-stacks"]}
+
+
+@pytest.mark.parametrize("suffix, stack", [(None, "OpenClawBuild"), ("", "OpenClawBuild"),
+                                           ("dev", "OpenClawBuild-dev"), (" Team-A ", "OpenClawBuild-team-a")])
+def test_script_reads_the_stack_for_the_environment_suffix(script_env, suffix, stack):
+    root, env = script_env
+    if suffix is not None:
+        env["OPENCLAW_ENV_SUFFIX"] = suffix
+    result = _run_script(root, env)
+    assert result.returncode == 0, result.stderr
+    assert _stack_names_read(root) == {stack}
+
+
+@pytest.mark.parametrize("suffix", ["bad_name", "x" * 13])
+def test_script_rejects_an_invalid_suffix_before_any_aws_call(script_env, suffix):
+    root, env = script_env
+    env["OPENCLAW_ENV_SUFFIX"] = suffix
+    result = _run_script(root, env)
+    assert result.returncode != 0
+    assert "OPENCLAW_ENV_SUFFIX" in result.stderr
+    assert not any(c["tool"] == "aws" for c in _calls(root))
 
 
 def test_script_version_argument_overrides_cdk_json(script_env):

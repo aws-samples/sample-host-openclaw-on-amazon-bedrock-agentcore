@@ -179,7 +179,7 @@ token_monitoring_stack.add_dependency(cron_stack)
 if app.node.try_get_context("enable_codebuild") in (True, "true"):
     build_stack = BuildStack(
         app,
-        "OpenClawBuild",
+        namer.stack("OpenClawBuild"),
         ecr_repo_name=os.environ.get("ECR_REPOSITORY") or "openclaw-bridge",
         env=env,
     )

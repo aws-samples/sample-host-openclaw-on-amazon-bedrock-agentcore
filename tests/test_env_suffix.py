@@ -26,7 +26,7 @@ from runtime_config import foundation_configuration  # noqa: E402
 
 ACCOUNT, REGION = "123456789012", "us-west-2"
 STACKS = ["OpenClawVpc", "OpenClawSecurity", "OpenClawGuardrails", "OpenClawGateway", "OpenClawAgentCore",
-          "OpenClawRouter", "OpenClawCron", "OpenClawObservability", "OpenClawTokenMonitoring"]
+          "OpenClawRouter", "OpenClawCron", "OpenClawObservability", "OpenClawTokenMonitoring", "OpenClawBuild"]
 
 
 def _scope(value):
@@ -118,7 +118,8 @@ def test_existing_caller_check_reads_suffixed_functions():
 def _synth(tmp_path, **context_overrides):
     context = json.loads((ROOT / "cdk.json").read_text())["context"]
     context.update({"account": ACCOUNT, "region": REGION,
-                    "availability_zones": [f"{REGION}a", f"{REGION}b"], "enable_gateway": True})
+                    "availability_zones": [f"{REGION}a", f"{REGION}b"], "enable_gateway": True,
+                    "enable_codebuild": True})
     context.update(context_overrides)
     outdir = tmp_path / "cdk.out"
     env = {k: v for k, v in os.environ.items() if k != "OPENCLAW_ENV_SUFFIX"}
@@ -137,7 +138,8 @@ def dev_templates(tmp_path_factory):
 
 def _physical_names(templates):
     keys = ("TableName", "FunctionName", "RoleName", "BucketName", "Name", "AliasName", "LogGroupName",
-            "AlarmName", "DashboardName", "TopicName", "StateMachineName", "UserPoolName", "ClientName")
+            "AlarmName", "DashboardName", "TopicName", "StateMachineName", "UserPoolName", "ClientName",
+            "ProjectName")
     for stack, template in templates.items():
         for logical_id, res in template.get("Resources", {}).items():
             for key in keys:
