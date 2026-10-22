@@ -46,6 +46,22 @@ def _context_threshold(stack: Stack, key: str, default: float) -> float:
     return int(number) if number.is_integer() else number
 
 
+SUBSCRIBE_SHARED_LOGS_KEY = "token_monitoring_subscribe_shared_logs"
+
+
+def _context_flag(stack: Stack, key: str) -> bool:
+    """Read an opt-in boolean context key; unset or empty means false."""
+    value = stack.node.try_get_context(key)
+    if value is None or str(value).strip() == "":
+        return False
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(f"context {key} must be true or false, got {value!r}")
+
+
 class TokenMonitoringStack(Stack):
     def __init__(
         self,
@@ -53,6 +69,7 @@ class TokenMonitoringStack(Stack):
         construct_id: str,
         *,
         invocation_log_group: logs.ILogGroup,
+        owns_invocation_log_group: bool = True,
         alarm_topic: sns.ITopic,
         cmk_arn: str,
         **kwargs,
@@ -60,6 +77,21 @@ class TokenMonitoringStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         namer = DeploymentNamer.from_scope(self)
+        # Metrics, their IAM condition, dashboard and alarms share one namespace,
+        # suffixed per environment so two environments never sum each other's
+        # datapoints. Unsuffixed it stays OpenClaw/TokenUsage.
+        ns = namer.name("OpenClaw/TokenUsage")
+        # /aws/bedrock/invocation-logs is one log group per account and region,
+        # holding every environment's invocations, and allows only two
+        # subscription filters. A suffixed environment that reads it without
+        # owning it (see manage_bedrock_invocation_logging) does not subscribe
+        # unless token_monitoring_subscribe_shared_logs is true; otherwise its
+        # Lambda would count the other environment's usage as its own.
+        self.subscribes_to_invocation_logs = (
+            not namer.suffix
+            or owns_invocation_log_group
+            or _context_flag(self, SUBSCRIBE_SHARED_LOGS_KEY)
+        )
         hourly_token_alarm = _context_threshold(
             self, "hourly_token_alarm", DEFAULT_HOURLY_TOKEN_ALARM
         )
@@ -159,7 +191,7 @@ class TokenMonitoringStack(Stack):
             environment={
                 "TABLE_NAME": self.table.table_name,
                 "TTL_DAYS": str(ttl_days),
-                "METRICS_NAMESPACE": "OpenClaw/TokenUsage",
+                "METRICS_NAMESPACE": ns,
             },
             log_group=lambda_log_group,
         )
@@ -172,23 +204,23 @@ class TokenMonitoringStack(Stack):
                 resources=["*"],
                 conditions={
                     "StringEquals": {
-                        "cloudwatch:namespace": "OpenClaw/TokenUsage"
+                        "cloudwatch:namespace": ns
                     }
                 },
             )
         )
 
         # CloudWatch Logs subscription filter
-        logs.SubscriptionFilter(
-            self,
-            "InvocationLogSubscription",
-            log_group=invocation_log_group,
-            destination=log_destinations.LambdaDestination(self.token_lambda),
-            filter_pattern=logs.FilterPattern.all_events(),
-        )
+        if self.subscribes_to_invocation_logs:
+            logs.SubscriptionFilter(
+                self,
+                "InvocationLogSubscription",
+                log_group=invocation_log_group,
+                destination=log_destinations.LambdaDestination(self.token_lambda),
+                filter_pattern=logs.FilterPattern.all_events(),
+            )
 
         # --- Custom Metrics -----------------------------------------------
-        ns = "OpenClaw/TokenUsage"
         total_tokens = cw.Metric(
             namespace=ns,
             metric_name="TotalTokens",
@@ -364,7 +396,7 @@ class TokenMonitoringStack(Stack):
                     "and is scoped to the specific table's GSIs. KMS wildcards "
                     "(GenerateDataKey*, ReEncrypt*) are added by CDK for CMK-encrypted "
                     "DynamoDB table. cloudwatch:PutMetricData wildcard is constrained "
-                    "by the cloudwatch:namespace condition to OpenClaw/TokenUsage only.",
+                    f"by the cloudwatch:namespace condition to {ns} only.",
                 ),
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-L1",

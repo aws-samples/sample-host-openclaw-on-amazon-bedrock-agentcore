@@ -162,6 +162,7 @@ token_monitoring_stack = TokenMonitoringStack(
     app,
     namer.stack("OpenClawTokenMonitoring"),
     invocation_log_group=observability_stack.invocation_log_group,
+    owns_invocation_log_group=observability_stack.manages_invocation_logging,
     alarm_topic=observability_stack.alarm_topic,
     cmk_arn=security_stack.cmk.key_arn,
     env=env,

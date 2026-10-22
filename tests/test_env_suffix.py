@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from stacks import DeploymentNamer, environment_suffix  # noqa: E402
+from stacks.token_monitoring_stack import SUBSCRIBE_SHARED_LOGS_KEY, _context_flag  # noqa: E402
 import env_suffix  # noqa: E402
 import runtime_deploy  # noqa: E402
 from runtime_config import foundation_configuration  # noqa: E402
@@ -175,3 +176,88 @@ def test_suffixed_environment_can_manage_invocation_logging(tmp_path):
             and r["Properties"]["LogGroupName"] == "/aws/bedrock/invocation-logs"]
     assert [r for r in resources if r["Type"] == "Custom::AWS"
             and "PutModelInvocationLoggingConfiguration" in json.dumps(r)]
+    # It owns the invocation log group, so its token monitoring subscribes to it.
+    assert _subscriptions(templates["OpenClawTokenMonitoring-dev"])
+
+
+# --------------------------------------------------------------------------- token monitoring
+
+def _resources(template, kind):
+    return [r for r in template["Resources"].values() if r["Type"] == kind]
+
+
+def _subscriptions(template):
+    return _resources(template, "AWS::Logs::SubscriptionFilter")
+
+
+def _token_namespaces(template):
+    """Every place the token stack names a metric namespace."""
+    found = []
+    for fn in _resources(template, "AWS::Lambda::Function"):
+        found.append(fn["Properties"]["Environment"]["Variables"]["METRICS_NAMESPACE"])
+    for policy in _resources(template, "AWS::IAM::Policy"):
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+            if statement.get("Action") == "cloudwatch:PutMetricData":
+                found.append(statement["Condition"]["StringEquals"]["cloudwatch:namespace"])
+    for alarm in _resources(template, "AWS::CloudWatch::Alarm"):
+        if alarm["Properties"].get("MetricName") in ("TotalTokens", "EstimatedCostUSD"):
+            found.append(alarm["Properties"]["Namespace"])
+    for detector in _resources(template, "AWS::CloudWatch::AnomalyDetector"):
+        found.append(detector["Properties"]["Namespace"])
+    return found
+
+
+@pytest.fixture(scope="module")
+def plain_templates(tmp_path_factory):
+    return _synth(tmp_path_factory.mktemp("plain"))
+
+
+def test_unsuffixed_token_monitoring_is_unchanged(plain_templates):
+    template = plain_templates["OpenClawTokenMonitoring"]
+    namespaces = _token_namespaces(template)
+    # Lambda env, IAM condition, four budget alarms and the anomaly detector.
+    assert len(namespaces) == 7
+    assert set(namespaces) == {"OpenClaw/TokenUsage"}
+    assert len(_subscriptions(template)) == 1
+
+
+def test_suffixed_token_monitoring_uses_its_own_namespace(dev_templates):
+    template = dev_templates["OpenClawTokenMonitoring-dev"]
+    namespaces = _token_namespaces(template)
+    assert len(namespaces) == 7
+    assert set(namespaces) == {"OpenClaw/TokenUsage-dev"}
+    dashboard = next(r for r in _resources(template, "AWS::CloudWatch::Dashboard")
+                     if r["Properties"]["DashboardName"] == "OpenClaw-Token-Analytics-dev")
+    body = json.dumps(dashboard["Properties"]["DashboardBody"])
+    assert "OpenClaw/TokenUsage-dev" in body
+    assert body.count("OpenClaw/TokenUsage") == body.count("OpenClaw/TokenUsage-dev")
+
+
+def test_suffixed_token_monitoring_skips_the_shared_invocation_logs(dev_templates):
+    template = dev_templates["OpenClawTokenMonitoring-dev"]
+    assert not _subscriptions(template)
+    assert not [p for p in _resources(template, "AWS::Lambda::Permission")
+                if p["Properties"].get("Principal", "").startswith("logs.")]
+
+
+@pytest.mark.parametrize("value", [True, "true"])
+def test_suffixed_token_monitoring_can_opt_in_to_the_shared_invocation_logs(tmp_path, value):
+    templates = _synth(tmp_path, environment_suffix="dev", token_monitoring_subscribe_shared_logs=value)
+    template = templates["OpenClawTokenMonitoring-dev"]
+    subscriptions = _subscriptions(template)
+    assert len(subscriptions) == 1
+    assert subscriptions[0]["Properties"]["LogGroupName"] == "/aws/bedrock/invocation-logs"
+    assert set(_token_namespaces(template)) == {"OpenClaw/TokenUsage-dev"}
+
+
+@pytest.mark.parametrize("value, expected", [(None, False), ("", False), (False, False), ("false", False),
+                                             ("off", False), (True, True), ("true", True), ("YES", True)])
+def test_subscribe_flag_parsing(value, expected):
+    stack = SimpleNamespace(node=SimpleNamespace(try_get_context=lambda key: value))
+    assert _context_flag(stack, SUBSCRIBE_SHARED_LOGS_KEY) is expected
+
+
+def test_subscribe_flag_rejects_other_values():
+    stack = SimpleNamespace(node=SimpleNamespace(try_get_context=lambda key: "maybe"))
+    with pytest.raises(ValueError, match=SUBSCRIBE_SHARED_LOGS_KEY):
+        _context_flag(stack, SUBSCRIBE_SHARED_LOGS_KEY)

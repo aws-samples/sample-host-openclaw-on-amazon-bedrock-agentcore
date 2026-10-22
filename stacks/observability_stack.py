@@ -78,6 +78,8 @@ class ObservabilityStack(Stack):
             manage_bedrock_logging = False
         else:
             raise ValueError("manage_bedrock_invocation_logging must be true or false")
+        # Read by OpenClawTokenMonitoring: it subscribes to a log group it owns.
+        self.manages_invocation_logging = manage_bedrock_logging
         self.logging_cr = None
         if not manage_bedrock_logging:
             self.invocation_log_group = logs.LogGroup.from_log_group_name(
