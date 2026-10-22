@@ -29,6 +29,9 @@ openclaw-on-agentcore/
     chat-run-filter.js            # Chat-event ownership filter: only the run chat.send started (or its sessions_yield successor) ends a bridge request; sub-agent events are ignored
     chat-run-filter.test.js       # Filter unit tests + contract/Dockerfile wiring (node:test, 18 tests)
     chat-run-filter.bridge.test.js # Real bridgeMessage() against a fake protocol-v4 gateway (node:test, 5 tests; skips without ws)
+    late-announce.js              # Forwards a sub-agent announce run that finishes after the main reply to the owner's Telegram chat, once (#148)
+    late-announce.test.js         # Relay unit tests: hold while a turn is active, dedupe, claimed runs, silent replies (node:test)
+    late-announce.bridge.test.js  # Real gatewayTurn() + chat event watcher against a fake broadcasting gateway, plus contract wiring (node:test; skips without ws)
     legacy-session-import.js      # Pre-2.0 sessions.json import receipts (import runs once)
     legacy-session-import.test.js # Import receipt tests (node:test, 23 tests)
     gateway-mcp.js                # mcp.servers.agentcore config + bearer refresh (only when AGENTCORE_GATEWAY_URL is set)

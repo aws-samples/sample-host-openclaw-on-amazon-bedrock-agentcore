@@ -153,7 +153,7 @@ function selectFinalAnswer(messages, { userKey, runIds, extractText = (value) =>
 function gatewayTurn({
   url, token, message, onDelta, extractText = (value) => typeof value === "string" ? value : "",
   deadline = Date.now() + 620000, signal, probeOnly = false, configProbe = false, log = globalThis.console,
-  historyTimeoutMs = HISTORY_TIMEOUT_MS,
+  historyTimeoutMs = HISTORY_TIMEOUT_MS, onOwnRun,
 }) {
   return new Promise((resolve) => {
     let socket;
@@ -271,7 +271,11 @@ function gatewayTurn({
       } else if (stage === "chat" && frame.type === "event" && frame.event === "chat") {
         const payload = frame.payload || {};
         const verdict = tracker.classify(payload);
-        if (verdict.action !== "ignore" && tracker.state.runId) ownRuns.add(tracker.state.runId);
+        if (verdict.action !== "ignore" && tracker.state.runId && !ownRuns.has(tracker.state.runId)) {
+          ownRuns.add(tracker.state.runId);
+          // Lets the late announce relay skip a run this turn returns (#148).
+          try { onOwnRun?.(tracker.state.runId); } catch {}
+        }
         if (verdict.action === "ignore" || verdict.action === "yield") return;
         const text = extractText(payload.message?.content) || extractText(payload.message) ||
           extractText(payload.text) || extractText(payload.content);
@@ -332,8 +336,11 @@ function gatewayTurn({
 /**
  * Open one authenticated operator connection and expose a request helper.
  * Rejects when the handshake fails or the deadline passes; `close()` is idempotent.
+ * With `persistent`, the deadline bounds only the handshake and the connection
+ * stays open until it drops, `signal` aborts or `close()` is called. `onEvent`
+ * receives every event frame after the handshake; `onClose` runs once.
  */
-function openOperatorSession({ url, token, signal, deadline }) {
+function openOperatorSession({ url, token, signal, deadline, persistent = false, onEvent, onClose }) {
   return new Promise((resolve, reject) => {
     const pending = new Map();
     let socket;
@@ -346,9 +353,13 @@ function openOperatorSession({ url, token, signal, deadline }) {
       closed = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      for (const { reject: fail } of pending.values()) fail(new Error(reason));
+      for (const { reject: fail, timer: callTimer } of pending.values()) {
+        clearTimeout(callTimer);
+        fail(new Error(reason));
+      }
       pending.clear();
       try { socket?.terminate(); } catch {}
+      try { onClose?.(); } catch {}
     };
     const fail = (message) => {
       close(message);
@@ -366,10 +377,18 @@ function openOperatorSession({ url, token, signal, deadline }) {
         if (error) fail("Gateway send failed");
       });
     };
-    const call = (method, params) => new Promise((done, failCall) => {
+    const call = (method, params, { timeoutMs } = {}) => new Promise((done, failCall) => {
       if (closed) return failCall(new Error("Gateway connection closed"));
       const id = randomUUID();
-      pending.set(id, { resolve: done, reject: failCall });
+      const entry = { resolve: done, reject: failCall };
+      if (timeoutMs) {
+        entry.timer = setTimeout(() => {
+          if (!pending.delete(id)) return;
+          failCall(new Error("Gateway request timed out"));
+        }, timeoutMs);
+        entry.timer.unref?.();
+      }
+      pending.set(id, entry);
       try { send(id, method, params); } catch { fail("Gateway send failed"); }
     });
     socket = new WebSocket(url); // Loopback token clients must not send an Origin.
@@ -391,18 +410,103 @@ function openOperatorSession({ url, token, signal, deadline }) {
         }
         const methods = frame.payload.features?.methods;
         settled = true;
+        if (persistent) clearTimeout(timer);
         resolve({ methods: Array.isArray(methods) ? methods : [], call, close });
       } else if (frame.type === "res" && pending.has(frame.id)) {
         const entry = pending.get(frame.id);
         pending.delete(frame.id);
+        clearTimeout(entry.timer);
         if (frame.ok === true) entry.resolve(frame.payload);
         else entry.reject(new Error(typeof frame.error?.message === "string"
           ? frame.error.message.slice(0, 200) : "Gateway request rejected"));
+      } else if (settled && frame.type === "event") {
+        try { onEvent?.(frame); } catch {}
       }
     });
     socket.on("error", () => fail("Gateway connection failed"));
     socket.on("close", () => fail("Gateway connection closed"));
   });
+}
+
+const WATCH_HANDSHAKE_MS = 10000;
+const WATCH_RETRY_MS = 5000;
+
+function pause(ms, signal) {
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
+/**
+ * Keep one operator connection open and pass every `chat` event payload to
+ * `onEvent`, reconnecting after `retryMs` when the connection drops. Stops
+ * when `signal` aborts. The gateway broadcasts chat events for every run to
+ * every operator connection, so this sees runs that no turn is waiting on,
+ * such as a sub-agent announce that finishes after the main reply (#148).
+ *
+ * `readRunAnswer` reads one run's answer from chat.history on the current
+ * connection with the same selection as gatewayTurn, falling back to the
+ * run's final text buffer. `ready` resolves on the first connection;
+ * `stopped` resolves when the watcher has stopped.
+ */
+function watchChatEvents({
+  url, token, signal, onEvent, log = globalThis.console, retryMs = WATCH_RETRY_MS,
+  historyTimeoutMs = HISTORY_TIMEOUT_MS,
+}) {
+  let session = null;
+  let markReady;
+  const ready = new Promise((resolve) => { markReady = resolve; });
+  const forward = (frame) => {
+    if (frame.event !== "chat" || !frame.payload || typeof frame.payload !== "object") return;
+    try { onEvent?.(frame.payload); } catch {}
+  };
+  const loop = async () => {
+    while (!signal?.aborted) {
+      let dropped;
+      const closedOnce = new Promise((resolve) => { dropped = resolve; });
+      try {
+        session = await openOperatorSession({
+          url, token, signal, deadline: Date.now() + WATCH_HANDSHAKE_MS, persistent: true,
+          onEvent: forward, onClose: () => dropped(),
+        });
+        markReady();
+        await closedOnce;
+        if (!signal?.aborted) log?.warn?.("[gateway] Chat event watcher disconnected; reconnecting");
+      } catch (error) {
+        if (signal?.aborted) break;
+        log?.warn?.("[gateway] Chat event watcher could not connect:", error?.message || "unknown error");
+      } finally {
+        session?.close();
+        session = null;
+      }
+      if (signal?.aborted) break;
+      await pause(retryMs, signal);
+    }
+    markReady();
+  };
+  const stopped = loop();
+  const readRunAnswer = async ({ runId, sessionKey, buffer = "", extractText }) => {
+    const current = session;
+    if (current && current.methods.includes("chat.history")) {
+      try {
+        const payload = await current.call("chat.history",
+          { sessionKey, limit: HISTORY_LIMIT, maxChars: HISTORY_MAX_CHARS }, { timeoutMs: historyTimeoutMs });
+        const answer = selectFinalAnswer(payload?.messages, { userKey: null, runIds: new Set([runId]), extractText });
+        if (answer) return answer.text;
+        log?.warn?.("[gateway] No answer for the run in chat.history; using its text buffer");
+      } catch (error) {
+        log?.warn?.("[gateway] chat.history for the run failed; using its text buffer:", error?.message || "unknown error");
+      }
+    }
+    return buffer;
+  };
+  return { ready, stopped, readRunAnswer };
 }
 
 const STALE_DELIVERY_MS = 2 * 60 * 60 * 1000;
@@ -508,6 +612,6 @@ async function dismissStaleSuspendedDeliveries({
 }
 
 module.exports = {
-  readStartup, waitForGateway, gatewayTurn, appliedConfigReady,
+  readStartup, waitForGateway, gatewayTurn, appliedConfigReady, watchChatEvents,
   dismissStaleSuspendedDeliveries, isStaleSuspendedDelivery, STALE_DELIVERY_MS, selectFinalAnswer,
 };

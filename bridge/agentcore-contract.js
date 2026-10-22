@@ -39,7 +39,10 @@ const runtimeSkills = require("./runtime-skills");
 const { createCognitoTokenProvider } = require("./cognito-token");
 const { readBody } = require("./read-body");
 const { createRuntimeLifecycle, osRandomUUID } = require("./runtime-lifecycle");
-const { waitForGateway, gatewayTurn, dismissStaleSuspendedDeliveries } = require("./gateway-lifecycle");
+const {
+  waitForGateway, gatewayTurn, dismissStaleSuspendedDeliveries, watchChatEvents,
+} = require("./gateway-lifecycle");
+const { createLateAnnounceRelay } = require("./late-announce");
 const { createPreparedGateway } = require("./openclaw-worker-owner");
 const { renderConfig, renderAgents } = require("./gateway-config");
 const { createLiveSeedBridge, readGatewayToken } = require("./live-seed-bridge");
@@ -153,6 +156,9 @@ function turnValidityMs(deadline) {
 // until its own deadline, not TURN_TIMEOUT_MS or a caller budget.
 const CRON_JOB_BUDGET_MS = cronJobs.envBudgetMs(process.env.CRON_ASYNC_JOB_BUDGET_MS);
 let cronJobStoreInstance = null;
+// Late sub-agent announce relay (#148): forwards an announce run that finishes
+// after the turn that spawned the sub-agent has replied. One per activation.
+let lateAnnounces = null;
 let proxyModelOutcomeUnknown = false;
 const UNKNOWN_OUTCOME_RESPONSE = "The request outcome is unknown. It has not been automatically retried. Check any resulting changes before retrying.";
 const v2Lifecycle = createRuntimeLifecycle({
@@ -279,6 +285,8 @@ function assertUnboundResourcesAbsent(seedPrepared = false) {
 }
 
 async function cleanupV2Resources() {
+  lateAnnounces?.close();
+  lateAnnounces = null;
   const sdkStop = proxySdkOwner?.stop();
   sdkStop?.catch(() => {});
   retireBrowserStartOwner().catch(() => {});
@@ -1774,6 +1782,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
         deadline: Date.now() + 15000,
       });
       checkpoint();
+      startLateAnnounceRelay();
       openclawReady = true;
       activationScope.mark("gateway");
       logActivationPhase("gateway_ready");
@@ -2053,6 +2062,55 @@ function createTelegramStreamer(chatId) {
   return { onDelta, finalize };
 }
 
+/**
+ * Start the late sub-agent announce relay for this activation (#148).
+ * The watcher is a loopback operator connection to the gateway; it stops
+ * when the activation scope ends. Delivery goes through deliverLateAnnounce.
+ * Never throws: activation must not depend on it.
+ */
+function startLateAnnounceRelay() {
+  lateAnnounces?.close();
+  lateAnnounces = null;
+  try {
+    let watcher = null;
+    const relay = createLateAnnounceRelay({
+      fetchAnswer: (entry) => watcher
+        ? watcher.readRunAnswer({ ...entry, extractText: extractTextFromContent }) : entry.buffer,
+      deliver: deliverLateAnnounce,
+    });
+    watcher = watchChatEvents({
+      url: `ws://127.0.0.1:${OPENCLAW_PORT}`, token: GATEWAY_TOKEN, signal: activationScope.signal,
+      onEvent: (payload) => relay.onChatEvent(payload),
+    });
+    activationScope.signal.addEventListener("abort", () => relay.close(), { once: true });
+    lateAnnounces = relay;
+  } catch (error) {
+    console.warn("[contract] Late sub-agent announce relay unavailable: %s", error?.message || "unknown error");
+  }
+}
+
+/**
+ * Send a late announce to the chat of the session owner's latest turn.
+ * Only Telegram for now (the token is already in-process); the route must
+ * belong to the runtime's current user binding. Uses the streamer's send
+ * path for a reply nobody else will deliver: plain text split under the
+ * Telegram limit.
+ */
+async function deliverLateAnnounce(text, route) {
+  if (route.channel !== "telegram" || !route.channelActorId || !route.channelTarget || !TELEGRAM_BOT_TOKEN) {
+    console.warn("[contract] Late sub-agent announce not delivered: channel %s has no bridge delivery",
+      String(route.channel || "unknown"));
+    return;
+  }
+  const binding = v2Lifecycle.snapshot().binding;
+  if (!binding || binding.actorId !== route.actorId) {
+    console.warn("[contract] Late sub-agent announce not delivered: route does not match the user binding");
+    return;
+  }
+  console.log("[contract] Delivering a late sub-agent announce to the owner's chat; chars: %s", text.length);
+  await createTelegramStreamer(route.channelTarget).finalize(text, { callerGone: true });
+}
+
 // Telegram's sendMessage limit is 4096 characters counted in UTF-16 code
 // units. JS string length is already in UTF-16 units. Python equivalent:
 // _split_telegram_text in lambda/router/index.py.
@@ -2128,7 +2186,8 @@ function buildBridgeText(message) {
   return String(message);
 }
 
-async function handleV2Invocation(payload, req, res, callerGone, arrival, { jobDeadline = null } = {}) {
+async function handleV2Invocation(payload, req, res, callerGone, arrival,
+  { jobDeadline = null, deferTurnEnd = null } = {}) {
   const { action, userId, actorId, message } = payload;
   const reply = (body, status = 200) => {
     res.writeHead(status, { "Content-Type": "application/json" });
@@ -2203,6 +2262,9 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival, { jobD
   }
   const stream = action === "chat" && payload.stream === true
     ? require("./invocation-stream").createInvocationStream(req, res, arrival, TURN_TIMEOUT_MS) : null;
+  // Marks this turn active for the late announce relay until its reply is out,
+  // and records the runs it returns so the relay never sends them again.
+  let lateTurn = null;
   try {
     const result = await v2Lifecycle.run(context, async (queued) => {
       // With a caller budget, the turn runs until the caller stops listening.
@@ -2217,6 +2279,10 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival, { jobD
       stream?.ready(v2Lifecycle.snapshot());
       updateIdentityFile(turn.actorId, turn.channel, turn.channelActorId, turn.channelTarget,
         turn.modelOverride, { trigger: action, sessionId: turn.runtimeSessionId });
+      lateTurn = lateAnnounces?.beginTurn({
+        actorId: turn.actorId, channel: turn.channel,
+        channelActorId: turn.channelActorId, channelTarget: turn.channelTarget,
+      }) ?? null;
       let streamer = null;
       if (action === "chat" && TELEGRAM_BOT_TOKEN && turn.channel === "telegram" &&
           turn.channelActorId && turn.channelTarget) {
@@ -2231,6 +2297,7 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival, { jobD
             signal: stream ? AbortSignal.any([activationScope.signal, stream.signal]) : activationScope.signal,
             onDelta: (text) => { streamer?.onDelta(text); stream?.delta(text); },
             extractText: extractTextFromContent,
+            onOwnRun: (runId) => lateTurn?.claim(runId),
           });
         } catch {
           // A thrown transport error cannot prove that no turn ran.
@@ -2293,6 +2360,8 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival, { jobD
     });
   } finally {
     stream?.close();
+    if (lateTurn && deferTurnEnd) deferTurnEnd(lateTurn);
+    else lateTurn?.end();
     activeTaskCount = Math.max(0, activeTaskCount - 1);
   }
 }
@@ -2305,6 +2374,32 @@ function cronJobStore() {
     cronJobStoreInstance.load();
   }
   return cronJobStoreInstance;
+}
+
+// Async cron turns whose late announces wait until the cron Lambda has
+// collected the brief (cron_status "done"), so they do not arrive before it.
+const cronTurnHolds = new Map();
+// The Lambda polls every 60 s; give up holding well after that.
+const CRON_TURN_HOLD_MAX_MS = 5 * 60 * 1000;
+// Time for the Lambda to send the brief after collecting it.
+const CRON_DELIVERY_GRACE_MS = 15000;
+
+/** Keep an async cron turn's late announces waiting until its brief is collected. */
+function holdCronTurn(jobId, handle) {
+  releaseCronTurn(jobId, { graceMs: 0 });
+  const timer = setTimeout(() => releaseCronTurn(jobId, { graceMs: 0 }), CRON_TURN_HOLD_MAX_MS);
+  timer.unref?.();
+  cronTurnHolds.set(jobId, { handle, timer });
+}
+
+function releaseCronTurn(jobId, { graceMs = CRON_DELIVERY_GRACE_MS } = {}) {
+  const hold = cronTurnHolds.get(jobId);
+  if (!hold) return;
+  cronTurnHolds.delete(jobId);
+  clearTimeout(hold.timer);
+  if (!graceMs) return hold.handle.end();
+  const timer = setTimeout(() => hold.handle.end(), graceMs);
+  timer.unref?.();
 }
 
 /**
@@ -2320,7 +2415,12 @@ async function handleCronAsync(payload, req, res) {
   const { action, userId, actorId } = payload;
   if (!userId || !actorId) return reply({ error: "Missing userId or actorId" }, 400);
   const store = cronJobStore();
-  if (action === "cron_status") return reply(store.status(payload.jobId, userId));
+  if (action === "cron_status") {
+    const status = store.status(payload.jobId, userId);
+    // The Lambda now has the brief; late announces may follow it.
+    if (status.status === "done") releaseCronTurn(payload.jobId);
+    return reply(status);
+  }
   const parsed = cronJobs.parseCronStart(payload, { defaultBudgetMs: CRON_JOB_BUDGET_MS });
   if (!parsed.ok) return reply({ error: parsed.error }, 400);
   if (!payload.message) return reply({ error: "Missing message" }, 400);
@@ -2340,7 +2440,7 @@ async function handleCronAsync(payload, req, res) {
   };
   const { callerBudgetMs: _ignored, jobId: _job, jobBudgetMs: _budget, ...turn } = payload;
   handleV2Invocation({ ...turn, action: "cron" }, req, capture, () => false, null,
-    { jobDeadline: started.job.deadline })
+    { jobDeadline: started.job.deadline, deferTurnEnd: (handle) => holdCronTurn(jobId, handle) })
     .catch((error) => console.error(`[contract] Async cron turn failed: ${error.message}`))
     // finish() ignores a job that is already done; this covers a turn that never replied.
     .finally(() => store.finish(jobId, { status: "error" }));
