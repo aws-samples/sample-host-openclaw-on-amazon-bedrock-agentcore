@@ -149,7 +149,7 @@ function failureRuntime(t, p) {
   };
   const box = vm.createContext({
     credentialManager: p.manager, workspaceSync: p.sync, currentNamespace: "telegram_1",
-    shuttingDown: false, openclawReady: true, proxyReady: true,
+    shuttingDown: false, openclawReady: true, proxyReady: true, lateAnnounces: null,
     proxySdkOwner: null, proxyAuthControl: null, scopedLogger: null,
     retireBrowserStartOwner: async () => {},
     browserHeaderRefreshTimer: null,

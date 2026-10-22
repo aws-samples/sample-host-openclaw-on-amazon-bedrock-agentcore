@@ -347,6 +347,10 @@ function loadContract(t, {
         calls.push("gateway:sweep");
         return { phase: "done", listed: 0, candidates: [], dismissed: [], notDismissed: [] };
       },
+      watchChatEvents: () => {
+        calls.push("gateway:watch");
+        return { ready: Promise.resolve(), stopped: Promise.resolve(), readRunAnswer: async () => null };
+      },
       gatewayTurn: async (args) => {
         ready();
         calls.push("chat.send");

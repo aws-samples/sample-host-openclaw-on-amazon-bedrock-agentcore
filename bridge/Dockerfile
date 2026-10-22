@@ -182,6 +182,7 @@ COPY inference-config.js /app/inference-config.js
 COPY request-metadata.js /app/request-metadata.js
 COPY read-body.js /app/read-body.js
 COPY chat-run-filter.js /app/chat-run-filter.js
+COPY late-announce.js /app/late-announce.js
 COPY gateway-mcp.js /app/gateway-mcp.js
 COPY runtime-skills.js /app/runtime-skills.js
 COPY runtime-lifecycle.js /app/runtime-lifecycle.js

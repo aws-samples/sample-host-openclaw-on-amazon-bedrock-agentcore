@@ -244,28 +244,118 @@ describe("late sub-agent announce delivery", { skip: !WebSocket && "ws not insta
 
 describe("contract wiring", () => {
   const src = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
+  const has = (needle, message) => assert.ok(src.includes(needle), message || `missing ${needle}`);
+  const functionBody = (signature) => {
+    const start = src.indexOf(signature);
+    assert.notEqual(start, -1, `missing ${signature}`);
+    return src.slice(start, src.indexOf("\n}\n", start));
+  };
 
   it("each turn claims its own runs so the relay never re-sends them", () => {
-    assert.match(src, /lateAnnounces\?\.beginTurn\(/);
-    assert.match(src, /onOwnRun:/);
+    const handler = functionBody("async function handleV2Invocation(");
+    assert.ok(handler.includes("lateAnnounces?.beginTurn("), "turn is not registered with the relay");
+    assert.ok(handler.includes("onOwnRun: (runId) => lateTurn?.claim(runId)"), "turn does not claim its runs");
+    assert.ok(handler.includes("lateTurn?.end()"), "turn never ends");
   });
 
   it("starts the watcher only after the gateway is ready, scoped to the activation", () => {
     const ready = src.indexOf("await dismissStaleSuspendedDeliveries(");
     assert.notEqual(ready, -1);
-    assert.notEqual(src.indexOf("startLateAnnounceRelay(", ready), -1);
-    assert.match(src, /watchChatEvents\(\{[^}]*signal: activationScope\.signal/s);
+    assert.notEqual(src.indexOf("startLateAnnounceRelay();", ready), -1, "relay not started after readiness");
+    const start = functionBody("function startLateAnnounceRelay(");
+    assert.ok(start.includes("signal: activationScope.signal"), "watcher is not bound to the activation");
+    assert.ok(start.includes("ws://127.0.0.1:"), "watcher must use the loopback gateway");
+    has("lateAnnounces?.close();", "relay is not closed on cleanup");
   });
 
   it("delivers only to a Telegram route of the bound owner, through the streamer's send path", () => {
-    const body = src.slice(src.indexOf("function deliverLateAnnounce("));
-    const fn = body.slice(0, body.indexOf("\n}\n"));
-    assert.match(fn, /route\.channel !== "telegram"/);
-    assert.match(fn, /binding\.actorId !== route\.actorId/);
-    assert.match(fn, /createTelegramStreamer\(route\.channelTarget\)\.finalize\(/);
+    const fn = functionBody("async function deliverLateAnnounce(");
+    assert.ok(fn.includes('route.channel !== "telegram"'), "non-Telegram routes are not refused");
+    assert.ok(fn.includes("binding.actorId !== route.actorId"), "route is not checked against the binding");
+    assert.ok(fn.includes("createTelegramStreamer(route.channelTarget).finalize("), "not the streamer send path");
   });
 
   it("an async cron turn holds late deliveries until its result has been collected", () => {
-    assert.match(src, /cronTurnHolds/);
+    const cron = functionBody("async function handleCronAsync(");
+    assert.ok(cron.includes("deferTurnEnd: (handle) => holdCronTurn(jobId, handle)"), "cron turn is not held");
+    assert.ok(cron.includes('if (status.status === "done") releaseCronTurn(payload.jobId);'), "hold never released");
+  });
+
+  it("the image ships late-announce.js", () => {
+    const dockerfile = fs.readFileSync(path.join(__dirname, "Dockerfile"), "utf-8");
+    assert.ok(dockerfile.includes("COPY late-announce.js /app/late-announce.js"));
+  });
+});
+
+describe("async cron hold", () => {
+  const vm = require("vm");
+  const jobs = require("./cron-jobs");
+  const src = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
+  const start = src.indexOf("function cronJobStore() {");
+  const end = src.indexOf("\n// Shape check for the Router", start);
+
+  function cronBox() {
+    const timers = [];
+    const ended = [];
+    const box = {
+      fs: { existsSync: () => false }, stateStorage: { DEFAULT_MOUNT: "/mnt/workspace" },
+      cronJobs: jobs, osRandomUUID: () => "boot-1", CRON_JOB_BUDGET_MS: 45 * 60 * 1000,
+      cronJobStoreInstance: null, console: quiet, Date,
+      setTimeout: (callback, delay) => {
+        const timer = { callback, delay, cleared: false, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => { if (timer) timer.cleared = true; },
+      handleV2Invocation(payload, req, res, callerGone, arrival, options) {
+        options.deferTurnEnd({ end: () => ended.push(payload.jobId ?? "turn"), claim() {} });
+        res.writeHead(200);
+        res.end(JSON.stringify({ response: "BRIEF", execution: { phase: "completed" } }));
+        return Promise.resolve();
+      },
+    };
+    vm.createContext(box);
+    vm.runInContext(src.slice(start, end), box);
+    const call = async (payload) => {
+      let reply;
+      await box.handleCronAsync(payload, { headers: {} }, {
+        writeHead(code) { this.code = code; },
+        end(body) { reply = JSON.parse(body); },
+      });
+      return reply;
+    };
+    const fire = (delay) => {
+      for (const timer of timers.filter((t) => t.delay === delay && !t.cleared)) {
+        timer.cleared = true;
+        timer.callback();
+      }
+    };
+    return { call, ended, timers, fire };
+  }
+
+  const owner = { userId: "u1", actorId: "telegram:<telegram_id>", channel: "telegram", channelTarget: "<telegram_id>" };
+
+  it("keeps the turn active until cron_status hands the brief to the Lambda, then a grace period", async () => {
+    const box = cronBox();
+    await box.call({ ...owner, action: "cron_start", jobId: "job-1", message: "brief" });
+    await sleep(0);
+    assert.deepEqual(box.ended, [], "turn released before the Lambda collected the brief");
+    const status = await box.call({ ...owner, action: "cron_status", jobId: "job-1" });
+    assert.equal(status.status, "done");
+    assert.deepEqual(box.ended, [], "released without a grace period for the Lambda's send");
+    box.fire(15000);
+    assert.equal(box.ended.length, 1);
+    await box.call({ ...owner, action: "cron_status", jobId: "job-1" });
+    box.fire(15000);
+    assert.equal(box.ended.length, 1, "a repeated status poll must not end the turn twice");
+  });
+
+  it("releases the hold after its maximum if the Lambda never collects the brief", async () => {
+    const box = cronBox();
+    await box.call({ ...owner, action: "cron_start", jobId: "job-2", message: "brief" });
+    await sleep(0);
+    assert.deepEqual(box.ended, []);
+    box.fire(5 * 60 * 1000);
+    assert.equal(box.ended.length, 1);
   });
 });
