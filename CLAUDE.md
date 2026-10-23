@@ -353,9 +353,16 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bri
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
 | `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
+| `router_stage_rate_limit` | `100` | API Gateway stage-wide steady-state throttle (requests/second) shared by every webhook route |
+| `router_stage_burst_limit` | `50` | API Gateway stage-wide burst throttle |
+| `router_get_route_rate_limit` | `10` | Per-route throttle (requests/second) for `GET /health` and `GET /webhook/whatsapp` (Meta's subscription check), the two routes that answer without a channel signature. Signed `POST` webhooks keep the stage-wide limits. Over the limit, API Gateway returns `429` |
+| `router_get_route_burst_limit` | `20` | Per-route burst throttle for the same two `GET` routes |
+| `router_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Router. Caps the Router and guarantees it that many executions; also removes them from the account's unreserved pool, and Lambda rejects a reservation that would leave fewer than 100 unreserved, so the deploy fails in low-limit accounts. Each in-flight chat turn holds one Router execution for up to `router_lambda_timeout_seconds` |
 | `registration_open` | `false` | If true, any user can register. If false, only allowlisted users |
 | `cron_lambda_timeout_seconds` | `600` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
+| `cron_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Cron executor (same trade-off as `router_reserved_concurrency`) |
+| `token_metrics_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the token-metrics Lambda (same trade-off) |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail (S3 bucket + trail). Off by default — most accounts already have one |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model for sub-agents. Empty = bridge default (also Sonnet 5.5) |

@@ -21,6 +21,7 @@ from constructs import Construct
 
 from stacks import DeploymentNamer, apply_table_tags
 from stacks.health_alarms import add_health_alarms
+from stacks.context_limits import reserved_concurrency
 
 
 # Budget alarm defaults. Thresholds are deployment-specific; override them in
@@ -188,6 +189,8 @@ class TokenMonitoringStack(Stack):
             ),
             timeout=Duration.seconds(60),
             memory_size=256,
+            reserved_concurrent_executions=reserved_concurrency(
+                self, "token_metrics_reserved_concurrency"),
             environment={
                 "TABLE_NAME": self.table.table_name,
                 "TTL_DAYS": str(ttl_days),

@@ -27,6 +27,7 @@ from constructs import Construct
 
 from scripts.model_selection import CONTEXT_KEY as MODEL_SELECTION_KEY, parse_user_selectable_models
 from stacks import DeploymentNamer, apply_table_tags, retention_days
+from stacks.context_limits import context_int, reserved_concurrency
 
 
 class RouterStack(Stack):
@@ -60,6 +61,14 @@ class RouterStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
+        # Opt-in reserved concurrency (unset/0 = shared account pool, as before).
+        router_reserved = reserved_concurrency(self, "router_reserved_concurrency")
+        # Stage-wide throttle for every route, plus a lower per-route throttle
+        # on the GET routes that answer without a channel signature.
+        stage_rate_limit = context_int(self, "router_stage_rate_limit", 100, minimum=1)
+        stage_burst_limit = context_int(self, "router_stage_burst_limit", 50, minimum=1)
+        get_rate_limit = context_int(self, "router_get_route_rate_limit", 10)
+        get_burst_limit = context_int(self, "router_get_route_burst_limit", 20)
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
         # Per-user `/model` switching: validated at synth so a bad map never deploys.
         user_selectable_models = parse_user_selectable_models(
@@ -115,6 +124,7 @@ class RouterStack(Stack):
             )],
             timeout=Duration.seconds(lambda_timeout),
             memory_size=lambda_memory,
+            reserved_concurrent_executions=router_reserved,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,
@@ -152,41 +162,42 @@ class RouterStack(Stack):
         )
 
         # Explicit routes — only these paths are reachable
-        self.http_api.add_routes(
+        routes = []
+        routes += self.http_api.add_routes(
             path="/webhook/telegram",
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
-        self.http_api.add_routes(
+        routes += self.http_api.add_routes(
             path="/webhook/slack",
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
-        self.http_api.add_routes(
+        routes += self.http_api.add_routes(
             path="/webhook/feishu",
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
         # WhatsApp: GET is Meta's subscription verification, POST carries events.
         # Both return 404 from the Lambda until the channel secret is configured.
-        self.http_api.add_routes(
+        routes += self.http_api.add_routes(
             path="/webhook/whatsapp",
             methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
-        self.http_api.add_routes(
+        routes += self.http_api.add_routes(
             path="/webhook/discord",
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
         # LINE Messaging API webhook. Returns 404 from the Lambda until the
         # channel secret is configured.
-        self.http_api.add_routes(
+        routes += self.http_api.add_routes(
             path="/webhook/line",
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
-        self.http_api.add_routes(
+        routes += self.http_api.add_routes(
             path="/health",
             methods=[apigwv2.HttpMethod.GET],
             integration=lambda_integration,
@@ -206,10 +217,27 @@ class RouterStack(Stack):
         if default_stage:
             cfn_stage = default_stage.node.default_child
             cfn_stage.default_route_settings = apigwv2.CfnStage.RouteSettingsProperty(
-                throttling_burst_limit=50,
-                throttling_rate_limit=100,
+                throttling_burst_limit=stage_burst_limit,
+                throttling_rate_limit=stage_rate_limit,
                 detailed_metrics_enabled=True,
             )
+            # GET /health and GET /webhook/whatsapp (Meta's one-off subscription
+            # check) answer without a channel signature, so they get their own
+            # lower bucket and cannot use up the stage budget the signed POST
+            # webhooks need. Route settings must name existing route keys, so
+            # the stage waits for the routes. RouteSettings is a raw JSON
+            # property, so the keys are written in CloudFormation's PascalCase
+            # (a RouteSettingsProperty struct would synthesize as camelCase).
+            cfn_stage.route_settings = {
+                route_key: {
+                    "ThrottlingBurstLimit": get_burst_limit,
+                    "ThrottlingRateLimit": get_rate_limit,
+                    "DetailedMetricsEnabled": True,
+                }
+                for route_key in ("GET /health", "GET /webhook/whatsapp")
+            }
+            for route in routes:
+                cfn_stage.node.add_dependency(route)
             cfn_stage.access_log_settings = apigwv2.CfnStage.AccessLogSettingsProperty(
                 destination_arn=access_log_group.log_group_arn,
                 format='{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength","latency":"$context.responseLatency","time":"$context.requestTime"}',
@@ -337,7 +365,8 @@ class RouterStack(Stack):
                     "X-Slack-Signature HMAC, Feishu X-Lark-Signature and WhatsApp "
                     "X-Hub-Signature-256 HMAC (plus a constant-time verify-token check on "
                     "its GET subscription route), Discord X-Signature-Ed25519 and LINE "
-                    "X-Line-Signature HMAC. API Gateway throttling provides rate "
+                    "X-Line-Signature HMAC. API Gateway stage throttling, with a lower "
+                    "per-route throttle on the unsigned GET routes, provides rate "
                     "limiting. Only explicit routes are exposed.",
                 ),
                 cdk_nag.NagPackSuppression(
