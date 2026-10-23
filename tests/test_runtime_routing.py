@@ -143,7 +143,8 @@ class FakeTable:
             keys = sorted(self.items)
             cursor = kwargs.get("ExclusiveStartKey")
             start = keys.index((cursor["PK"], cursor["SK"])) + 1 if cursor else 0
-            page = keys[start:start + kwargs["Limit"]]
+            # Without Limit, 100 items stand in for DynamoDB's 1 MB scan page.
+            page = keys[start:start + kwargs.get("Limit", 100)]
             actor = kwargs["ExpressionAttributeValues"][":actor"]
             items = [copy.deepcopy(self.items[key]) for key in page]
             response = {"Items": [item for item in items if item["PK"].startswith("USER#") and (

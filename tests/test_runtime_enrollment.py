@@ -353,8 +353,19 @@ def test_legacy_reconciliation_continues_after_empty_filtered_page():
         module.resolve_user("telegram", "123")
     scans = [params for operation, params in table.calls if operation == "scan"]
     assert len(scans) == 2
-    assert all(scan["ConsistentRead"] is True for scan in scans)
+    assert all(scan["ConsistentRead"] is True and "Limit" not in scan for scan in scans)
     assert not module.identity_client.calls
+
+
+def test_registration_still_works_after_unrelated_records_grow_past_ten_thousand():
+    module = router()
+    for number in range(20_000):
+        key = (f"DEDUP#whatsapp:{number:05}", "DEDUP")
+        module.identity_table.items[key] = {"PK": key[0], "SK": key[1]}
+    user_id, is_new = module.resolve_user("telegram", "123")
+    assert is_new and user_id == canonical("telegram", "123")
+    scans = [params for operation, params in module.identity_table.calls if operation == "scan"]
+    assert len(scans) == 200
 
 
 @pytest.mark.parametrize("scan_fails", [True, False])

@@ -51,15 +51,20 @@ def read_actor_owner(table, actor_id):
     return owner
 
 
+# Most pages the legacy ownership scan reads before failing closed. Without a
+# Limit each page is up to 1 MB, so this covers about 1 GB of identity table.
+_RECONCILE_SCAN_MAX_PAGES = 1000
+
+
 def reconcile_actor_owner(table, actor_id):
     owner = read_actor_owner(table, actor_id)
     if owner:
         return owner
     cursor = None
     # Missing CHANNEL is not evidence that the actor's state namespace is unused.
-    for _ in range(100):
+    for _ in range(_RECONCILE_SCAN_MAX_PAGES):
         request = {
-            "ConsistentRead": True, "Limit": 100,
+            "ConsistentRead": True,
             "FilterExpression": "begins_with(#pk, :users) AND (#sk = :backref OR #actor = :actor OR #enrolled = :actor)",
             "ExpressionAttributeNames": {
                 "#pk": "PK", "#sk": "SK", "#actor": "actorId", "#enrolled": "enrollmentActorId",

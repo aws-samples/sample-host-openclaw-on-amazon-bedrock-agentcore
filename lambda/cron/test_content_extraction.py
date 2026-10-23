@@ -66,6 +66,49 @@ class TestCronExtractTextFromContentBlocks(unittest.TestCase):
         result = index._extract_text_from_content_blocks('\n\n[{"type":"text","text":"hello')
         self.assertNotIn("[{", result)
 
+    def test_deeply_nested_json_is_kept_as_text(self):
+        """JSON nested too deeply to decode is kept as text instead of raising."""
+        deep = "[" * 20000 + '{"type":"text","text":"x"}' + "]" * 20000
+        result = index._extract_text_from_content_blocks("before " + deep + " after")
+        self.assertTrue(result.startswith("before "), result[:40])
+        self.assertTrue(result.endswith(" after"), result[-40:])
+        chain = '[{"a":' * 20000 + "1"
+        self.assertEqual(index._extract_text_from_content_blocks(chain), chain)
+
+    def test_decode_attempts_are_capped(self):
+        """Text with many '[{' candidates tries JSON decoding a bounded number of times."""
+        calls = []
+        real_decoder = index.json.JSONDecoder
+
+        class CountingDecoder(real_decoder):
+            def raw_decode(self, s, idx=0):
+                calls.append(idx)
+                return super().raw_decode(s, idx)
+
+        original = index.json.JSONDecoder
+        index.json.JSONDecoder = CountingDecoder
+        try:
+            text = '[{"type":0}' * 5000 + "]"
+            self.assertEqual(index._extract_text_from_content_blocks(text), text)
+        finally:
+            index.json.JSONDecoder = original
+        self.assertLessEqual(len(calls), index._MAX_DECODE_ATTEMPTS)
+
+    def test_many_candidates_finish_quickly(self):
+        """Large replies full of '[{' do not take time quadratic in their length."""
+        import time
+        for text in ("[{" * 250000, '[{"type":0}' * 45000 + "]",
+                     '[{"type":"text","text":"\\q"}' * 16000 + "]"):
+            start = time.monotonic()
+            index._extract_text_from_content_blocks(text)
+            self.assertLess(time.monotonic() - start, 15.0)
+
+    def test_content_block_after_many_brackets_is_unwrapped(self):
+        """'[{' that cannot start JSON does not use up the decode budget."""
+        text = "[{" * 5000 + ' [{"type":"text","text":"kept"}]'
+        result = index._extract_text_from_content_blocks(text)
+        self.assertTrue(result.endswith(" kept"), result[-20:])
+
 
 if __name__ == "__main__":
     unittest.main()
