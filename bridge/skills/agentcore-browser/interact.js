@@ -1,5 +1,5 @@
 "use strict";
-const { connectBrowser, applyStealthHeaders, INTERACT_TIMEOUT_MS, WAIT_TIMEOUT_MS } = require("./common");
+const { connectBrowser, applyStealthHeaders, UrlPolicyError, INTERACT_TIMEOUT_MS, WAIT_TIMEOUT_MS } = require("./common");
 
 const VALID_ACTIONS = new Set(["click", "type", "wait", "scroll"]);
 
@@ -20,9 +20,11 @@ async function browserInteract(args) {
     if (!text) return JSON.stringify({ error: "text is required for type" });
   }
 
-  const { page, disconnect } = await connectBrowser();
+  const { page, checkPage, disconnect } = await connectBrowser();
   try {
     await applyStealthHeaders(page);
+    // Refuse to act on a page that sits on a destination the policy blocks.
+    await checkPage();
 
     switch (action) {
       case "click":
@@ -45,6 +47,9 @@ async function browserInteract(args) {
         return JSON.stringify({ error: `Unknown action: ${action}` });
     }
   } catch (err) {
+    if (err instanceof UrlPolicyError) {
+      return JSON.stringify({ error: `Interaction refused: ${err.message}` });
+    }
     if (err.message.includes("Browser session not available")) {
       return JSON.stringify({ error: "Browser is not available. The enable_browser feature must be enabled in CDK configuration." });
     }

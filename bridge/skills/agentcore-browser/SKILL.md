@@ -72,3 +72,4 @@ Returns JSON: `{"success": true, "message": "..."}`
 - Screenshots are uploaded to the user's S3 namespace (no cross-user access)
 - The browser session file is stored at `/tmp/agentcore-browser-session.json`
 - Navigation timeout: 30s, interaction timeout: 10s, wait timeout: 15s
+- Only `http` and `https` URLs open. Hosts that are, or resolve to, loopback, link-local (including the instance metadata service), private (RFC 1918, carrier-grade NAT, IPv6 unique-local) or other non-public addresses are refused, for the page and for everything it loads. A page that a redirect moves onto such an address is blanked and nothing from it is returned or captured

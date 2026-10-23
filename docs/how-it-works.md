@@ -291,6 +291,8 @@ The agent can browse the web through an AgentCore Browser session. `enable_brows
 
 Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as photos to Telegram/Slack via the router's screenshot marker detection.
 
+The skill only opens public `http`/`https` destinations. It refuses other schemes (`file:`, `data:`, `chrome:` ...) and hosts that are or resolve to loopback, link-local (including instance metadata), private VPC/RFC 1918, carrier-grade NAT or IPv6 unique-local addresses, for the page itself and for every request it makes. Playwright routes only the first URL of a redirect chain, so each skill call also checks where every frame ended up and blanks the page instead of returning or capturing it. The browser resolves names itself, so a DNS answer that changes between the check and the connection is not caught by the skill; restrict the browser security group or network path if you need that guarantee.
+
 Browser requires full OpenClaw startup. V2 checks ownership and actual `GetBrowserSession` status before readiness and every turn. `TERMINATED` or local expiry triggers replacement, which must reach `READY`; failed or unknown status blocks dispatch. The configured session timeout is one hour. These boundaries were tested with in-memory SDK transport; live Browser behavior remains unverified.
 
 ## Container Startup Sequence
