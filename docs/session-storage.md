@@ -130,6 +130,19 @@ start re-ran the 57 s restore + 53 s import. Now `uploadStateFile()` treats `*.s
   when the object carries a `sha256` the bytes written must match it or that file's restore fails
   (which closes the upload gate, as any failed restore does). The listing-size skip for `*.sqlite`
   keys uses the SQLite cap below, since a gzip object's size is at most the uncompressed one.
+  A gzip object must carry the `uncompressed-size` its uploader recorded (every gzip upload has);
+  decompression stops as soon as it passes that size, and the file fails unless it decompresses to
+  exactly that size.
+- **Whole-restore limits.** One restore writes at most `WORKSPACE_RESTORE_MAX_BYTES` to local disk
+  (default 17179869184 = 16 GiB, counted after decompression) and accepts at most
+  `WORKSPACE_RESTORE_MAX_FILES` objects under the namespace prefix (default 100000). Past either the
+  restore fails with that reason, like any failed restore. The defaults sit far above what a cold
+  start can restore inside the 180 s default restore wait (the live user's state dir is ~1,350
+  files and a few hundred MB), so they do not change the outcome for an existing workspace; raise
+  them together with `workspace_restore_wait_seconds` if a deployment needs more.
+- Uploads of one file never overlap: the periodic save, the change flush, `saveFile()` and the final
+  save queue per file, so two snapshots of one database cannot finish out of order and leave the
+  older one in S3. Each snapshot is staged under a unique name.
 - **Hard cap:** a database over `WORKSPACE_SYNC_MAX_SQLITE_BYTES` (default 1 GiB, uncompressed) is
   still skipped, and every attempt logs `Skipping <path>: SQLite database is N bytes, above the
   M-byte backup cap (WORKSPACE_SYNC_MAX_SQLITE_BYTES) — its changes are NOT backed up to S3`.

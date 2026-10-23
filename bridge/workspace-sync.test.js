@@ -273,6 +273,45 @@ describe("snapshotSqlite", () => {
   );
 
   it(
+    "two snapshots of one database started in the same millisecond each get their own complete copy",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      const { DatabaseSync } = require("node:sqlite");
+      const dbPath = path.join(tmpDir, "openclaw-agent.sqlite");
+      const writer = new DatabaseSync(dbPath);
+      writer.exec("PRAGMA journal_mode = WAL");
+      writer.exec("CREATE TABLE sessions (id TEXT PRIMARY KEY, body TEXT)");
+      const insert = writer.prepare("INSERT INTO sessions VALUES (?, ?)");
+      writer.exec("BEGIN");
+      for (let i = 0; i < 2000; i++) insert.run(`s${i}`, "x".repeat(400));
+      writer.exec("COMMIT");
+      const realNow = Date.now;
+      Date.now = () => 1700000000000; // the periodic save and the change flush fire together
+      let results;
+      try {
+        results = await Promise.allSettled([
+          workspaceSync.snapshotSqlite(dbPath),
+          workspaceSync.snapshotSqlite(dbPath),
+        ]);
+      } finally {
+        Date.now = realNow;
+        writer.close();
+      }
+      for (const [i, r] of results.entries()) {
+        assert.equal(r.status, "fulfilled", `snapshot ${i}: ${r.reason?.message}`);
+        const snapPath = path.join(tmpDir, `copy-${i}.sqlite`);
+        fs.writeFileSync(snapPath, r.value);
+        const db = new DatabaseSync(snapPath, { readOnly: true });
+        try {
+          assert.equal(db.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+          assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sessions").get().n, 2000);
+        } finally { db.close(); }
+      }
+      assert.deepEqual(fs.readdirSync(tmpDir).filter((f) => f.includes("sqlite-snapshot")), []);
+    },
+  );
+
+  it(
     "saveWorkspace uploads the snapshot, not the raw db, and skips the sidecars",
     { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
     async () => {
@@ -1700,6 +1739,7 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
     const state = {
       objects: {}, metadata: {}, encodings: {}, uploads: {}, aborted: [], calls: [],
       failPart: null, // PartNumber whose UploadPart should throw
+      putHook: null, // async (input) => awaited before a PutObject lands
     };
     let nextUpload = 0;
     state.client = {
@@ -1726,6 +1766,7 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
             if (!(inp.Key in state.objects)) throw new Error("NotFound");
             return { ContentLength: state.objects[inp.Key].length, ...(state.metadata[inp.Key] ? { Metadata: state.metadata[inp.Key] } : {}) };
           case "put":
+            if (state.putHook) await state.putHook(inp);
             state.objects[inp.Key] = Buffer.from(inp.Body);
             state.metadata[inp.Key] = inp.Metadata;
             if (inp.ContentEncoding) state.encodings[inp.Key] = inp.ContentEncoding; else delete state.encodings[inp.Key];
@@ -1883,6 +1924,42 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
     },
   );
 
+  it("never uploads one file twice at once; a save that arrives mid-upload runs after it, with the newer content", async () => {
+    const rel = "workspace/MEMORY.md";
+    const key = `${NS}/.openclaw/${rel}`;
+    const file = path.join(tmpDir, ".openclaw", rel);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "v1");
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const bodies = [];
+    s3.putHook = async (inp) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      bodies.push(Buffer.from(inp.Body).toString());
+      if (bodies.length === 1) await gate;
+      inFlight--;
+    };
+    const first = workspaceSync.uploadStateFile(NS, rel);
+    await new Promise(setImmediate);
+    fs.writeFileSync(file, "v2");
+    const second = workspaceSync.uploadStateFile(NS, rel);
+    const third = workspaceSync.uploadStateFile(NS, rel, { force: true });
+    await new Promise(setImmediate);
+    assert.equal(bodies.length, 1, "the second save waits for the first");
+    release();
+    assert.deepEqual(await Promise.all([first, second, third]), ["uploaded", "uploaded", "uploaded"]);
+    assert.equal(maxInFlight, 1);
+    assert.deepEqual(bodies, ["v1", "v2"], "callers that queued together share one pass");
+    assert.equal(s3.objects[key].toString(), "v2", "S3 ends with the newest content");
+    // The lane is gone once idle: a later save runs at once.
+    fs.writeFileSync(file, "v3");
+    assert.equal(await workspaceSync.uploadStateFile(NS, rel), "uploaded");
+    assert.equal(s3.objects[key].toString(), "v3");
+  });
+
   it(
     "a small database still goes up as one uncompressed PUT (unchanged path)",
     { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
@@ -1946,7 +2023,7 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
       makeDb(src);
       const snapshot = await workspaceSync.snapshotSqlite(src);
       s3.objects[KEY] = zlib.gzipSync(snapshot);
-      s3.metadata[KEY] = { sha256: "0".repeat(64), encoding: "gzip" };
+      s3.metadata[KEY] = { sha256: "0".repeat(64), encoding: "gzip", "uncompressed-size": String(snapshot.length) };
       s3.encodings[KEY] = "gzip";
       const fresh = freshModule();
       await assert.rejects(fresh.restoreWorkspace(NS), /incomplete/);

@@ -127,10 +127,14 @@ describe("parallel workspace restore", () => {
     savedEnv = {
       HOME: process.env.HOME, S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET,
       AWS_REGION: process.env.AWS_REGION, WORKSPACE_RESTORE_CONCURRENCY: process.env.WORKSPACE_RESTORE_CONCURRENCY,
+      WORKSPACE_RESTORE_MAX_BYTES: process.env.WORKSPACE_RESTORE_MAX_BYTES,
+      WORKSPACE_RESTORE_MAX_FILES: process.env.WORKSPACE_RESTORE_MAX_FILES,
     };
     process.env.AWS_REGION = "us-west-2";
     process.env.S3_USER_FILES_BUCKET = "test-bucket";
     delete process.env.WORKSPACE_RESTORE_CONCURRENCY;
+    delete process.env.WORKSPACE_RESTORE_MAX_BYTES;
+    delete process.env.WORKSPACE_RESTORE_MAX_FILES;
     s3 = makeS3();
     realLoad = Module._load;
     Module._load = function (request, ...rest) {
@@ -388,6 +392,94 @@ describe("parallel workspace restore", () => {
     await assert.rejects(sync.restoreWorkspace(NS), /incomplete: 1 file/);
     assert.equal(fs.existsSync(path.join(state(), "b.md")), false);
     assert.equal(s3.gets.filter((k) => k.endsWith("b.md")).length, 1, "not retried");
+  });
+
+  // --- whole-restore limits and declared gzip size ----------------------------
+
+  it("defaults to a 16 GiB / 100,000-object restore budget, read from the env (invalid -> default)", () => {
+    assert.equal(sync._getLimitsForTests().maxRestoreBytes, 16 * 1024 ** 3);
+    assert.equal(sync._getLimitsForTests().maxRestoreFiles, 100000);
+    const load = (bytes, files) => {
+      process.env.WORKSPACE_RESTORE_MAX_BYTES = bytes;
+      process.env.WORKSPACE_RESTORE_MAX_FILES = files;
+      delete require.cache[require.resolve("./workspace-sync")];
+      const l = require("./workspace-sync")._getLimitsForTests();
+      return [l.maxRestoreBytes, l.maxRestoreFiles];
+    };
+    assert.deepEqual(load("1048576", "50"), [1048576, 50]);
+    assert.deepEqual(load("0", "-1"), [16 * 1024 ** 3, 100000]);
+    assert.deepEqual(load("abc", "2.5"), [16 * 1024 ** 3, 100000]);
+    assert.ok(warnings.some((w) => /Ignoring invalid WORKSPACE_RESTORE_MAX_BYTES/.test(w)));
+    assert.ok(warnings.some((w) => /Ignoring invalid WORKSPACE_RESTORE_MAX_FILES/.test(w)));
+  });
+
+  it("a workspace exactly at the byte budget restores; one byte over fails the restore and stops the pool", async () => {
+    for (let i = 0; i < 6; i++) put(`workspace/f${i}.md`, "x".repeat(100));
+    sync._setRestoreTuningForTests({ concurrency: 1 });
+    sync._setLimitsForTests({ maxRestoreBytes: 600 });
+    const r = await sync.restoreWorkspace(NS);
+    assert.equal(r.restored, 6);
+    assert.equal(sync.getRestoreState(), "ready");
+
+    const over = freshModule(path.join(root, "over"), { concurrency: 1 });
+    over._setLimitsForTests({ maxRestoreBytes: 599 });
+    s3.gets.length = 0;
+    await assert.rejects(over.restoreWorkspace(NS), /exceeds 599 bytes on disk \(WORKSPACE_RESTORE_MAX_BYTES\)/);
+    assert.equal(over.getRestoreState(), "failed");
+    assert.equal(s3.gets.length, 6, "stopped at the object that crossed the budget");
+    assert.equal(fs.existsSync(path.join(state(path.join(root, "over")), "workspace/f5.md")), false);
+    assert.deepEqual(tmpLeftovers(state(path.join(root, "over"))), []);
+  });
+
+  it("bytes of a download that broke and was retried are not counted twice", async () => {
+    put("a.md", "y".repeat(100));
+    s3.getHook = async (key, n) => {
+      if (n !== 1) return null;
+      return {
+        Body: (async function* () {
+          yield Buffer.from("y".repeat(60));
+          throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+        })(),
+        Metadata: s3.metadata[key],
+      };
+    };
+    sync._setLimitsForTests({ maxRestoreBytes: 100 });
+    const r = await sync.restoreWorkspace(NS);
+    assert.equal(r.restored, 1);
+    assert.equal(fs.readFileSync(path.join(state(), "a.md"), "utf8"), "y".repeat(100));
+  });
+
+  it("more objects than WORKSPACE_RESTORE_MAX_FILES fails the restore before any download", async () => {
+    for (let i = 0; i < 5; i++) put(`workspace/f${i}.md`, `file ${i}`);
+    sync._setLimitsForTests({ maxRestoreFiles: 5 });
+    assert.equal((await sync.restoreWorkspace(NS)).restored, 5);
+    const over = freshModule(path.join(root, "over"));
+    over._setLimitsForTests({ maxRestoreFiles: 4 });
+    s3.gets.length = 0;
+    await assert.rejects(over.restoreWorkspace(NS), /more than 4 objects .*WORKSPACE_RESTORE_MAX_FILES/);
+    assert.deepEqual(s3.gets, []);
+    assert.equal(over.getRestoreState(), "failed");
+  });
+
+  it("a gzip object that inflates past its declared uncompressed size is refused without writing past it", async () => {
+    const raw = Buffer.alloc(4 * 1024 * 1024); // compresses ~1000:1
+    put("agents/main/agent/openclaw-agent.sqlite", raw, { gzip: true });
+    s3.metadata[`${PREFIX}agents/main/agent/openclaw-agent.sqlite`]["uncompressed-size"] = "4096";
+    await assert.rejects(sync.restoreWorkspace(NS), /incomplete: 1 file/);
+    assert.ok(warnings.some((w) => /exceeds size limit/.test(w)), warnings.join("\n"));
+    assert.equal(fs.existsSync(path.join(state(), "agents/main/agent/openclaw-agent.sqlite")), false);
+    assert.deepEqual(tmpLeftovers(state()), []);
+  });
+
+  it("a gzip object that is shorter than its declared size, or declares none, is refused", async () => {
+    put("short.md", "abc", { gzip: true });
+    s3.metadata[`${PREFIX}short.md`]["uncompressed-size"] = "10";
+    delete s3.metadata[`${PREFIX}short.md`].sha256;
+    put("nometa.md", "abc", { gzip: true });
+    delete s3.metadata[`${PREFIX}nometa.md`]["uncompressed-size"];
+    await assert.rejects(sync.restoreWorkspace(NS), /incomplete: 2 file/);
+    assert.ok(warnings.some((w) => /short\.md: Restored object is 3 bytes, its metadata declares 10/.test(w)), warnings.join("\n"));
+    assert.ok(warnings.some((w) => /nometa\.md: gzip object has no valid uncompressed-size metadata/.test(w)), warnings.join("\n"));
   });
 
   // --- missing-only -----------------------------------------------------------
