@@ -140,7 +140,7 @@ Scoped credentials are checked before turns and persistence operations, and refr
 
 #### Proxy Trust Boundary
 
-The proxy process (`agentcore-proxy.js`) is trusted code and retains full execution role credentials for Bedrock, Cognito, and S3 image access. Application-level namespace enforcement (prefix validation, path traversal checks) provides the security boundary here.
+The proxy process (`agentcore-proxy.js`) is trusted code and retains full execution role credentials for Bedrock, Cognito, and S3 image access. Application-level namespace enforcement (prefix validation, path traversal checks) provides the security boundary here. The proxy runs as root alongside the contract server; because OpenClaw runs as an unprivileged uid (see §3.8 Runtime Privilege Separation), the agent cannot read the proxy's environment (which carries the Cognito password-derivation secret) via `/proc`.
 
 ### 3.5 Encryption
 
@@ -233,6 +233,44 @@ The former startup shim and its custom web-fetch SSRF implementation are removed
 | IPv4 DNS patch | `force-ipv4.js` patches `dns.lookup()` for VPC compatibility (Node.js Happy Eyeballs IPv6 issue) |
 | V8 compile cache | Pre-warmed at build time for faster cold starts (no runtime compilation) |
 | No Docker-in-Docker | Sub-agent sandbox set to `off` — no Docker inside AgentCore microVMs (microVMs already provide isolation) |
+| Unprivileged agent uid | OpenClaw and every shell it spawns run as uid 10001, not root (see Runtime Privilege Separation below) |
+| Metadata endpoint block | Owner-match firewall rule blocks the agent uid from the microVM metadata / credential endpoints (best-effort; see below) |
+
+#### Runtime Privilege Separation
+
+The container starts as root because the contract server is the trusted
+supervisor: it holds the execution role to fetch secrets, assume the per-user
+scoped credentials and run the Bedrock proxy. The untrusted agent is isolated
+*from* that supervisor rather than the whole container being dropped to non-root.
+
+- **Unprivileged agent uid.** The OpenClaw gateway and every process its `exec`
+  tool spawns (tool shells, `clawhub`, `openclaw doctor`) run as uid/gid 10001
+  (`bridge/runtime-privsep.js`), spawned from the root supervisor. Because the
+  kernel only lets the owning uid read another process's `/proc/<pid>/environ`,
+  the agent uid cannot read the supervisor's or the Bedrock proxy's environment
+  (the proxy's environment carries the Cognito password-derivation secret). This
+  layer needs no Linux capability and is active whenever the container is root;
+  the startup log prints a loud warning if it is not.
+- **/proc hidepid (best-effort).** The entrypoint remounts `/proc` with
+  `hidepid=2` so the agent uid cannot see other processes at all. Needs
+  `CAP_SYS_ADMIN`; skipped and logged when unavailable.
+- **Metadata network block (best-effort).** `bridge/mmds-firewall.sh` installs an
+  `iptables`/`ip6tables` owner-match rule dropping traffic **from the agent uid**
+  to the IMDS-style link-local range (`169.254.0.0/16`) and the IPv6 metadata
+  address (`fd00:ec2::254`), while the root supervisor keeps metadata access. This is
+  what stops a tool shell from calling the metadata endpoint and lifting the
+  full, unscoped execution role. It needs `CAP_NET_ADMIN`; when unavailable the
+  script reports the block inactive, the container still starts, and the
+  least-privilege execution role is the remaining control. AWS documents that any
+  code in the microVM can reach the metadata endpoint, so scope the execution
+  role tightly.
+- **State ownership.** The supervisor writes restored state/config into
+  `~/.openclaw` as root, then hands the tree (and the scoped credential files) to
+  the agent uid before `openclaw doctor` and gateway activation, so the non-root
+  gateway can open the restored SQLite databases. The session-storage mount does
+  not enforce POSIX ownership, so only the local state dir needs this.
+
+The startup log states which of the three layers are active in a given runtime.
 
 ### 3.9 Audit, Monitoring & Observability
 

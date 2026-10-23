@@ -48,6 +48,26 @@ function activation(overrides = {}) {
   };
 }
 
+test("childOptions (uid/gid) are spread into the gateway spawn", async (t) => {
+  const f = fixture(t, { childOptions: { uid: 10001, gid: 10001 } });
+  f.owner.prepare().catch(() => {});
+  await Promise.resolve();
+  const [, , spawnOptions] = f.spawns[0];
+  assert.equal(spawnOptions.uid, 10001);
+  assert.equal(spawnOptions.gid, 10001);
+  // The credential-free seed env is still present alongside the uid/gid.
+  assert.equal(spawnOptions.env.OPENCLAW_NO_RESPAWN, "1");
+});
+
+test("no uid/gid is set when childOptions is omitted", async (t) => {
+  const f = fixture(t);
+  f.owner.prepare().catch(() => {});
+  await Promise.resolve();
+  const [, , spawnOptions] = f.spawns[0];
+  assert.equal(spawnOptions.uid, undefined);
+  assert.equal(spawnOptions.gid, undefined);
+});
+
 test("preparation waits for the child and preserves that child for activation", async (t) => {
   const f = fixture(t);
   let ready = false;

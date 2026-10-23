@@ -476,6 +476,17 @@ describe("writeCredentialFiles", () => {
     assert.ok(files.includes("scoped-creds.json"), "scoped-creds.json should exist");
     assert.ok(files.includes("scoped-aws-config"), "scoped-aws-config should exist");
   });
+
+  it("hands the credential directory to the chown hook when one is given", () => {
+    const chowned = [];
+    writeCredentialFiles(CREDS, tmpDir, { chown: (p) => chowned.push(p) });
+    // The hook receives the directory (recursive chown covers both files).
+    assert.deepEqual(chowned, [tmpDir]);
+  });
+
+  it("does not require a chown hook", () => {
+    assert.doesNotThrow(() => writeCredentialFiles(CREDS, tmpDir));
+  });
 });
 
 // --- buildOpenClawEnv ---
@@ -670,6 +681,16 @@ describe("expiry-aware scoped credentials", () => {
     assert.equal(manager.getCredentials().accessKeyId, "key-2");
     assert.deepEqual(published, ["key-1", "key-2"]);
     assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "scoped-creds.json"))).AccessKeyId, "key-2");
+  });
+
+  it("passes chownCredentials through to writeCredentialFiles on each refresh", async () => {
+    const chowned = [];
+    create({ chownCredentials: (p) => chowned.push(p) });
+    await manager.ensureFresh();
+    now += 3600001;
+    await manager.ensureFresh();
+    // One chown per credential write (activation + post-jump refresh).
+    assert.deepEqual(chowned, [dir, dir]);
   });
 
   it("coalesces concurrent activation and refresh calls", async () => {
