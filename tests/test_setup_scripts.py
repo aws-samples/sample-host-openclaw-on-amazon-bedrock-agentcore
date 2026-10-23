@@ -50,6 +50,8 @@ elif args[:2] == ["secretsmanager", "update-secret"]:
     value = args[args.index("--secret-string") + 1]
     if value.startswith("file://"):
         shutil.copy(value[len("file://"):], os.environ["CAPTURED_SECRET"])
+elif args[:2] == ["dynamodb", "get-item"] and os.environ.get("FAKE_USER_ID"):
+    print(os.environ["FAKE_USER_ID"])
 '''
 
 
@@ -208,13 +210,30 @@ def test_allowlist_accepts_every_documented_channel_key(env, command, key):
     'telegram:1", "PK": {"S": "USER#x',
     "telegram:1 2", "telegram:", ":123", "Telegram:123", "telegram:1\\u0022", "telegram:a{b}",
 ])
-@pytest.mark.parametrize("command", ["add", "remove"])
+@pytest.mark.parametrize("command", ["add", "remove", "disable", "enable"])
 def test_allowlist_rejects_keys_that_would_break_the_json_before_any_aws_call(env, command, key):
     root, environment = env
     result = _run("manage-allowlist.sh", environment, command, key)
     assert result.returncode != 0
     assert "ERROR" in result.stderr
     assert not any(c["tool"] == "aws" for c in _calls(root))
+
+
+@pytest.mark.parametrize("key", [
+    "telegram:123456", "slack:U0XXXXXXXX2", "feishu:ou_0123abcd", "whatsapp:15551234567",
+    "discord:123456789012345678", "line:U0123456789abcdef0123456789abcdef",
+])
+@pytest.mark.parametrize("command", ["disable", "enable"])
+def test_allowlist_disable_and_enable_accept_every_documented_channel_key(env, command, key):
+    root, environment = env
+    environment["FAKE_USER_ID"] = "user_0123abcd"
+    result = _run("manage-allowlist.sh", environment, command, key)
+    assert result.returncode == 0, result.stderr
+    lookup, update = (c["args"] for c in _calls(root) if c["tool"] == "aws")
+    assert json.loads(lookup[lookup.index("--key") + 1]) == {
+        "PK": {"S": f"CHANNEL#{key}"}, "SK": {"S": "PROFILE"}}
+    assert json.loads(update[update.index("--key") + 1]) == {
+        "PK": {"S": "USER#user_0123abcd"}, "SK": {"S": "PROFILE"}}
 
 
 def test_allowlist_list_still_works_without_a_profile(env):
