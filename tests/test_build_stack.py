@@ -122,6 +122,25 @@ def test_no_cdk_nag_errors(env):
     Annotations.from_stack(stack).has_no_error("*", Match.any_value())
 
 
+def test_source_bucket_is_versioned_and_expires_superseded_uploads():
+    _, tpl = _synth_build()
+    tpl.has_resource_properties("AWS::S3::Bucket", {
+        "VersioningConfiguration": {"Status": "Enabled"},
+        "LifecycleConfiguration": {"Rules": Match.array_with([Match.object_like({
+            "Status": "Enabled",
+            "NoncurrentVersionExpiration": {"NoncurrentDays": 7},
+        })])},
+    })
+
+
+def test_build_role_can_read_a_pinned_source_version():
+    _, tpl = _synth_build()
+    actions = [a for p in tpl.find_resources("AWS::IAM::Policy").values()
+               for s in p["Properties"]["PolicyDocument"]["Statement"]
+               for a in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])]
+    assert "s3:GetObject*" in actions or "s3:GetObjectVersion" in actions
+
+
 def test_rejects_repository_the_execution_role_cannot_pull():
     with pytest.raises(ValueError, match="execution-role prefix"):
         _synth_build(repo="some-other-repo")
@@ -172,8 +191,11 @@ if tool == "aws":
         print({"BuildProjectName": "openclaw-bridge-build",
                "BuildSourceBucketName": "openclaw-build-source-bucket",
                "EcrRepositoryName": os.environ.get("STACK_REPOSITORY", "openclaw-bridge")}[key])
-    elif args[:2] == ["s3", "cp"]:
-        shutil.copy(args[2], os.environ["UPLOADED_ZIP"])
+    elif args[:2] == ["s3api", "put-object"]:
+        shutil.copy(args[args.index("--body") + 1], os.environ["UPLOADED_ZIP"])
+        print(os.environ.get("SOURCE_VERSION_ID", "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"))
+    elif args[:2] == ["ecr", "describe-images"]:
+        print(os.environ.get("IMAGE_DIGEST", "sha256:" + "a" * 64))
     elif args[:2] == ["codebuild", "start-build"]:
         print("openclaw-bridge-build:00000000-0000-0000-0000-000000000000")
     elif args[:2] == ["codebuild", "batch-get-builds"]:
@@ -278,7 +300,7 @@ def test_script_refuses_a_repository_the_stack_cannot_push_to(script_env):
     result = _run_script(root, env)
     assert result.returncode != 0
     assert "ECR_REPOSITORY" in result.stderr
-    assert not any(c["args"][:2] in (["s3", "cp"], ["codebuild", "start-build"]) for c in _calls(root))
+    assert not any(c["args"][:2] in (["s3api", "put-object"], ["codebuild", "start-build"]) for c in _calls(root))
 
 
 def test_script_fails_when_the_build_fails(script_env):
@@ -296,3 +318,45 @@ def test_script_rejects_an_invalid_version_before_any_aws_call(script_env, versi
     result = _run_script(root, env, version)
     assert result.returncode != 0
     assert not any(c["tool"] == "aws" for c in _calls(root))
+
+
+def _start_build_args(root):
+    return next(c["args"] for c in _calls(root) if c["args"][:2] == ["codebuild", "start-build"])
+
+
+def test_script_pins_the_build_to_the_uploaded_object_version(script_env):
+    root, env = script_env
+    env["SOURCE_VERSION_ID"] = "Ver.sion_1-abc"
+    result = _run_script(root, env)
+    assert result.returncode == 0, result.stderr
+    start = _start_build_args(root)
+    assert start[start.index("--source-version") + 1] == "Ver.sion_1-abc"
+
+
+@pytest.mark.parametrize("version", ["None", "null", ""])
+def test_script_still_builds_from_an_unversioned_bucket(script_env, version):
+    root, env = script_env
+    env["SOURCE_VERSION_ID"] = version
+    result = _run_script(root, env)
+    assert result.returncode == 0, result.stderr
+    assert "--source-version" not in _start_build_args(root)
+    assert "not versioned" in result.stderr
+    assert result.stdout == "123456789012.dkr.ecr.us-west-2.amazonaws.com/openclaw-bridge:v70\n"
+
+
+def test_script_suggests_the_digest_pinned_deploy_command(script_env):
+    root, env = script_env
+    result = _run_script(root, env)
+    assert result.returncode == 0, result.stderr
+    assert ("--image-uri 123456789012.dkr.ecr.us-west-2.amazonaws.com/openclaw-bridge@sha256:"
+            + "a" * 64) in result.stderr
+    assert result.stdout.strip().endswith("/openclaw-bridge:v70")
+
+
+def test_script_falls_back_to_the_tag_when_the_digest_is_unreadable(script_env):
+    root, env = script_env
+    env["IMAGE_DIGEST"] = "None"
+    result = _run_script(root, env)
+    assert result.returncode == 0, result.stderr
+    assert "@sha256:" not in result.stderr
+    assert "--image-uri 123456789012.dkr.ecr.us-west-2.amazonaws.com/openclaw-bridge:v70" in result.stderr

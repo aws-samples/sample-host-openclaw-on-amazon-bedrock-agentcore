@@ -110,14 +110,31 @@ trap 'rm -f "$TMPZIP" "$TMPZIP.zip"' EXIT
 log "    Packaged $(du -sh "$TMPZIP.zip" | cut -f1) -> bridge-source.zip"
 
 # --- Upload to S3 ------------------------------------------------------------
+# put-object returns the VersionId of exactly the object this run wrote, and
+# the build below is pinned to it, so overwriting bridge-source.zip after the
+# upload cannot change what this build consumes. stacks/build_stack.py makes
+# the bucket versioned; a bucket from an older OpenClawBuild deploy returns no
+# VersionId and the build falls back to the latest object, as before.
 log "==> Uploading to S3 ..."
-aws s3 cp "$TMPZIP.zip" "s3://${SOURCE_BUCKET}/bridge-source.zip" \
-	--region "$REGION" --no-progress >&2
+SOURCE_VERSION=$(aws s3api put-object \
+	--bucket "$SOURCE_BUCKET" --key bridge-source.zip \
+	--body "$TMPZIP.zip" \
+	--region "$REGION" \
+	--query VersionId --output text)
+SOURCE_VERSION_ARGS=()
+if [[ "$SOURCE_VERSION" =~ ^[A-Za-z0-9._-]{1,1024}$ && "$SOURCE_VERSION" != "None" && "$SOURCE_VERSION" != "null" ]]; then
+	log "    Source version: ${SOURCE_VERSION}"
+	SOURCE_VERSION_ARGS=(--source-version "$SOURCE_VERSION")
+else
+	log "    WARNING: s3://${SOURCE_BUCKET} is not versioned, so the build uses the latest"
+	log "    bridge-source.zip. Redeploy ${BUILD_STACK} to pin each build to its upload."
+fi
 
 # --- Start CodeBuild build ---------------------------------------------------
 log "==> Starting CodeBuild build ..."
 BUILD_ID=$(aws codebuild start-build \
 	--project-name "$PROJECT_NAME" \
+	${SOURCE_VERSION_ARGS[@]+"${SOURCE_VERSION_ARGS[@]}"} \
 	--environment-variables-override "name=IMAGE_TAG,value=${IMAGE_TAG},type=PLAINTEXT" \
 	--region "$REGION" \
 	--query "build.id" --output text)
@@ -139,8 +156,18 @@ while true; do
 	fi
 	case "$STATUS" in
 	SUCCEEDED)
+		# The tag is mutable: deploy.sh pins whatever it points to at deploy
+		# time. The digest form pins the image this build pushed.
+		IMAGE_DIGEST=$(aws ecr describe-images \
+			--repository-name "$REPOSITORY" --image-ids "imageTag=${IMAGE_TAG}" \
+			--region "$REGION" --query 'imageDetails[0].imageDigest' --output text || true)
 		log "==> Build SUCCEEDED. Deploy with:"
-		log "    BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri ${IMAGE_URI}"
+		if [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+			log "    BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri ${REPOSITORY_URI}@${IMAGE_DIGEST}"
+			log "    (or --image-uri ${IMAGE_URI} to deploy whatever ${IMAGE_TAG} points to at deploy time)"
+		else
+			log "    BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri ${IMAGE_URI}"
+		fi
 		echo "$IMAGE_URI"
 		exit 0
 		;;

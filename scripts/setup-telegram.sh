@@ -46,7 +46,24 @@ TELEGRAM_TOKEN=$(aws secretsmanager get-secret-value \
     --secret-id openclaw/channels/telegram \
     --region "$REGION" $PROFILE_ARG --query SecretString --output text)
 
-WEBHOOK_RESULT=$(curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}webhook/telegram&secret_token=${WEBHOOK_SECRET}")
+# The bot token and webhook secret go to curl as a config file on stdin, so
+# they never appear in the process list (ps, /proc/<pid>/cmdline). Check the
+# formats first: the values are written into quoted config lines and a form
+# body, and must not carry characters that would change either.
+if ! [[ "$TELEGRAM_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+    echo "ERROR: the token in openclaw/channels/telegram is not a Telegram bot token (<digits>:<key>)."
+    exit 1
+fi
+if ! [[ "$WEBHOOK_SECRET" =~ ^[A-Za-z0-9_-]{1,256}$ ]]; then
+    echo "ERROR: openclaw/webhook-secret must be 1-256 characters from A-Z, a-z, 0-9, _ and -."
+    exit 1
+fi
+if ! [[ "$API_URL" =~ ^https://[A-Za-z0-9./_-]+/$ ]]; then
+    echo "ERROR: unexpected OpenClawRouter ApiUrl output: $API_URL"
+    exit 1
+fi
+WEBHOOK_RESULT=$(printf 'url = "https://api.telegram.org/bot%s/setWebhook"\ndata = "url=%s&secret_token=%s"\n' \
+    "$TELEGRAM_TOKEN" "${API_URL}webhook/telegram" "$WEBHOOK_SECRET" | curl -s --config -)
 echo "Webhook result: $WEBHOOK_RESULT"
 
 if ! echo "$WEBHOOK_RESULT" | grep -q '"ok":true'; then

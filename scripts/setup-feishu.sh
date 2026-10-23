@@ -13,6 +13,7 @@
 #   - CDK stacks deployed (OpenClawRouter, OpenClawSecurity)
 #   - Feishu app created at https://open.feishu.cn/app with Bot capability
 #   - aws cli configured with appropriate permissions
+#   - python3 (builds the credential JSON)
 #
 # Environment:
 #   CDK_DEFAULT_REGION -- AWS region (default: us-west-2)
@@ -78,15 +79,29 @@ echo ""
 echo "Find these in your Feishu app's 'Credentials & Basic Info' and 'Event Subscriptions'."
 echo ""
 read -rp "Enter your Feishu App ID: " APP_ID
-read -rp "Enter your Feishu App Secret: " APP_SECRET
-read -rp "Enter your Verification Token: " VERIFICATION_TOKEN
-read -rp "Enter your Encrypt Key: " ENCRYPT_KEY
+# The other three values are secrets: not echoed to the terminal.
+read -rsp "Enter your Feishu App Secret: " APP_SECRET; echo
+read -rsp "Enter your Verification Token: " VERIFICATION_TOKEN; echo
+read -rsp "Enter your Encrypt Key: " ENCRYPT_KEY; echo
 
 echo "Storing credentials in Secrets Manager..."
+# The JSON goes through a private temp file, so the values are escaped
+# properly and never appear on the aws command line (ps, /proc/<pid>/cmdline).
+SECRET_FILE=$(umask 077 && mktemp "${TMPDIR:-/tmp}/openclaw-feishu.XXXXXX")
+trap 'rm -f "$SECRET_FILE"' EXIT
+APP_ID="$APP_ID" APP_SECRET="$APP_SECRET" VERIFICATION_TOKEN="$VERIFICATION_TOKEN" \
+    ENCRYPT_KEY="$ENCRYPT_KEY" SECRET_FILE="$SECRET_FILE" python3 -c '
+import json, os
+with open(os.environ["SECRET_FILE"], "w") as f:
+    json.dump({k: os.environ[e] for k, e in (("appId", "APP_ID"), ("appSecret", "APP_SECRET"),
+               ("verificationToken", "VERIFICATION_TOKEN"), ("encryptKey", "ENCRYPT_KEY"))}, f)
+'
 aws secretsmanager update-secret \
     --secret-id openclaw/channels/feishu \
-    --secret-string "{\"appId\":\"${APP_ID}\",\"appSecret\":\"${APP_SECRET}\",\"verificationToken\":\"${VERIFICATION_TOKEN}\",\"encryptKey\":\"${ENCRYPT_KEY}\"}" \
+    --secret-string "file://${SECRET_FILE}" \
     --region "$REGION" $PROFILE_ARG
+rm -f "$SECRET_FILE"
+unset APP_SECRET VERIFICATION_TOKEN ENCRYPT_KEY
 
 echo "Credentials stored."
 echo ""
@@ -108,6 +123,12 @@ if ! [[ "$FEISHU_USER_ID" =~ ^ou_ ]]; then
         echo "Aborted."
         exit 1
     fi
+fi
+
+# Hard check: the ID is written into the DynamoDB item JSON below.
+if ! [[ "$FEISHU_USER_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
+    echo "ERROR: Feishu open_id may only contain letters, digits, _ and -."
+    exit 1
 fi
 
 CHANNEL_KEY="feishu:${FEISHU_USER_ID}"

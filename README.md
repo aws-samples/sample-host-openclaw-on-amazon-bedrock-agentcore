@@ -212,7 +212,7 @@ BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri "$IMAGE_URI"
 BUILD_MODE=codebuild ./scripts/deploy.sh --runtime-only --image-uri "$IMAGE_URI" --endpoint-name release_2
 ```
 
-`codebuild-push.sh` uses `.venv-deploy` like `deploy.sh`, creates the ECR repository on first use, prints progress and the CodeBuild console link on stderr, and prints only the tagged image URI on stdout. The build fails unless the image is `arm64`. `deploy.sh` then pins the image by digest as in the prebuilt mode. Remove the stack with `cdk destroy OpenClawBuild -c enable_codebuild=true`.
+`codebuild-push.sh` uses `.venv-deploy` like `deploy.sh`, creates the ECR repository on first use, prints progress and the CodeBuild console link on stderr, and prints only the tagged image URI on stdout. Each build runs on the exact S3 object version the script uploaded (the source bucket is versioned; superseded uploads expire after 7 days). The build fails unless the image is `arm64`. `deploy.sh` then pins the image by digest as in the prebuilt mode; the tag is resolved at deploy time, so stderr also prints the `--image-uri <repo>@sha256:...` form that pins the image this build pushed. Remove the stack with `cdk destroy OpenClawBuild -c enable_codebuild=true`.
 
 #### Running individual phases
 

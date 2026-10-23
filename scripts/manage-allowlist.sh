@@ -37,6 +37,7 @@ usage() {
 
 cmd_add() {
     local channel_key="$1"
+    validate_channel_key "$channel_key"
     local now_iso
     now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -56,6 +57,7 @@ cmd_add() {
 
 cmd_remove() {
     local channel_key="$1"
+    validate_channel_key "$channel_key"
 
     echo "Removing $channel_key from allowlist..."
     aws dynamodb delete-item \
@@ -81,6 +83,17 @@ cmd_list() {
         --expression-attribute-values '{":prefix": {"S": "ALLOW#"}}' \
         --query 'Items[].{User: channelKey.S, AddedAt: addedAt.S}' \
         --output table
+}
+
+# channel_key is written into the DynamoDB item/key JSON, so it must not
+# contain quotes, backslashes, braces or whitespace. The ID part covers every
+# channel's user IDs (numeric, Slack/LINE IDs, Feishu ou_..., phone numbers).
+validate_channel_key() {
+    if ! [[ "$1" =~ ^[a-z][a-z0-9_]{0,31}:[A-Za-z0-9_.@+-]{1,128}$ ]]; then
+        echo "ERROR: expected <channel>:<user_id> (e.g. telegram:123456); the user ID may" >&2
+        echo "       only contain letters, digits and _ . @ + -" >&2
+        exit 1
+    fi
 }
 
 if [ $# -lt 1 ]; then
