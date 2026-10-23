@@ -329,7 +329,11 @@ class GatewayStack(Stack):
             ),
             role_arn=self.gateway_role.role_arn,
             kms_key_arn=cmk_arn,
-            exception_level="DEBUG",
+            # Detailed errors go back to the MCP caller, so they are opt-in:
+            # cdk deploy -c gateway_debug_errors=true
+            exception_level=(
+                "DEBUG" if self.node.try_get_context("gateway_debug_errors") in (True, "true") else None
+            ),
             interceptor_configurations=[
                 agentcore.CfnGateway.GatewayInterceptorConfigurationProperty(
                     interception_points=["REQUEST"],

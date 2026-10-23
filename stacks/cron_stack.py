@@ -84,7 +84,13 @@ class CronStack(Stack):
             self,
             "CronSchedulerRole",
             role_name=scheduler_role_name,
-            assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"),
+            # Only schedules in this account may use this role.
+            assumed_by=iam.ServicePrincipal(
+                "scheduler.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": account},
+                },
+            ),
             description="Role assumed by EventBridge Scheduler to invoke the cron executor Lambda",
         )
 
