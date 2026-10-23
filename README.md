@@ -30,6 +30,7 @@ Deploy an AI-powered multi-channel messaging bot (Telegram, Slack, Feishu) on AW
 
 - Per-user Firecracker microVM isolation (AgentCore Runtime)
 - Multi-channel support (Telegram, Slack, Feishu) with cross-channel account linking
+- Telegram groups (off by default): an allowlisted group gets its own shared session, memory and files, and the bot answers only @mentions, replies to its messages and `/command@YourBot` ([Telegram groups](docs/channels.md#telegram-groups))
 - Multimodal: text + image messages via Bedrock ConverseStream
 - STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
 - Custom skills: S3 file storage, EventBridge cron scheduling, API key management, ClawHub skill installer
@@ -265,6 +266,7 @@ All tunable parameters are in `cdk.json`:
 | `router_lambda_timeout_seconds` | `600` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
+| `telegram_groups_enabled` | `false` | If `false`, the bot ignores every Telegram group and supergroup message, commands included. If `true`, it answers allowlisted groups (`ALLOW#telegram_group:<chat_id>`) as the group's own identity. `registration_open` never applies to groups. See [Telegram groups](docs/channels.md#telegram-groups) |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
 | `image_version` | (see `cdk.json`) | Bridge container version tag. Bump to force container redeploy |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
@@ -303,6 +305,7 @@ Telegram is the quick-start channel. Slack and Feishu setup is in [docs/channels
      --region $CDK_DEFAULT_REGION
    ```
 5. Set up the webhook (see Quick Start step 7)
+6. Optional: to use the bot in Telegram groups, set `telegram_groups_enabled` to `true` and follow [Telegram groups](docs/channels.md#telegram-groups)
 
 ### Slack
 

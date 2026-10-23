@@ -4,6 +4,7 @@
 # Usage:
 #   ./scripts/manage-allowlist.sh add telegram:123456
 #   ./scripts/manage-allowlist.sh add slack:U789ABC
+#   ./scripts/manage-allowlist.sh add telegram_group:-1001234567890   (a Telegram group; see docs/channels.md)
 #   ./scripts/manage-allowlist.sh remove telegram:123456
 #   ./scripts/manage-allowlist.sh list
 #

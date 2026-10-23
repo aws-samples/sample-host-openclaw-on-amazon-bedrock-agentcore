@@ -136,6 +136,7 @@ function createHandler(deps = {}) {
       const { scheduler, schedulerCmds, ddb, ddbCmds } = clients();
       const userId = await resolveInternalUserId(identity.actorId);
       const { channel, channelTarget } = channelInfo(identity.actorId);
+      if (channel === "telegram_group") throw new Error("Scheduled tasks are not available in group chats");
       const scheduleId = newId();
       const ebName = buildScheduleName(identity.namespace, scheduleId);
       const displayName = scheduleName || `Schedule ${scheduleId}`;

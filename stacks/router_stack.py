@@ -52,6 +52,9 @@ class RouterStack(Stack):
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
+        # Telegram groups: off by default, so every group message is ignored.
+        telegram_groups_enabled = str(
+            self.node.try_get_context("telegram_groups_enabled") or "false").lower() == "true"
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
@@ -105,6 +108,7 @@ class RouterStack(Stack):
                 "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
                 "WEBHOOK_SECRET_ID": webhook_secret_name,
                 "REGISTRATION_OPEN": registration_open,
+                "TELEGRAM_GROUPS_ENABLED": "true" if telegram_groups_enabled else "false",
                 "USER_FILES_BUCKET": user_files_bucket_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
             },
