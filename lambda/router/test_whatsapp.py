@@ -202,9 +202,18 @@ class TestHandlerEntry(unittest.TestCase):
         self.assertEqual(index.handler(_event("", method="GET", path="/webhook/telegram"), None)["statusCode"], 405)
 
     @patch.object(index, "handle_whatsapp")
-    def test_async_dispatch(self, mock_handle):
-        index.handler({"_async_dispatch": True, "_channel": "whatsapp", "_body": "{}", "_headers": {}}, None)
+    @patch.object(index, "_get_webhook_secret", return_value="test-webhook-secret")
+    def test_async_dispatch(self, _ws, mock_handle):
+        auth = index._sign_async_dispatch("whatsapp", "{}", {})
+        index.handler({"_async_dispatch": True, "_channel": "whatsapp", "_body": "{}", "_headers": {}, "_auth": auth}, None)
         mock_handle.assert_called_once_with("{}")
+
+    @patch.object(index, "handle_whatsapp")
+    @patch.object(index, "_get_webhook_secret", return_value="test-webhook-secret")
+    def test_async_dispatch_rejects_unsigned(self, _ws, mock_handle):
+        result = index.handler({"_async_dispatch": True, "_channel": "whatsapp", "_body": "{}", "_headers": {}}, None)
+        self.assertEqual(result["statusCode"], 401)
+        mock_handle.assert_not_called()
 
 
 class TestExtractMessages(unittest.TestCase):

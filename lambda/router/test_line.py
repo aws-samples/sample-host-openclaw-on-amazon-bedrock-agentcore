@@ -169,8 +169,10 @@ class TestEntry(unittest.TestCase):
         self.assertEqual(index.handler(_api_event(body, _sign(body)), None)["statusCode"], 200)
 
     @patch.object(index, "handle_line")
-    def test_async_dispatch(self, mock_handle):
-        index.handler({"_async_dispatch": True, "_channel": "line", "_body": "{}", "_headers": {}}, None)
+    @patch.object(index, "_get_webhook_secret", return_value="test-webhook-secret")
+    def test_async_dispatch(self, _ws, mock_handle):
+        auth = index._sign_async_dispatch("line", "{}", {})
+        index.handler({"_async_dispatch": True, "_channel": "line", "_body": "{}", "_headers": {}, "_auth": auth}, None)
         mock_handle.assert_called_once_with("{}")
 
 
