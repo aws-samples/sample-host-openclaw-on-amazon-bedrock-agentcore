@@ -1,5 +1,6 @@
 "use strict";
 const fs = require("fs");
+const { defaultPolicy, precheckUrl, installRequestGuard, assertPageAllowed, UrlPolicyError } = require("./url-policy");
 
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const CONTENT_TRUNCATE_CHARS = 8000;
@@ -24,24 +25,38 @@ function getBrowserSession() {
   return data;
 }
 
-async function connectBrowser() {
+/**
+ * Connect to the session's browser over CDP. Every request the context makes
+ * while this process is connected goes through the destination policy in
+ * url-policy.js; callers check the page with checkPage() before returning
+ * anything read from it.
+ */
+async function connectBrowser({ policy = defaultPolicy } = {}) {
   const session = getBrowserSession();
   const { chromium } = require("playwright-core");
   const browser = await chromium.connectOverCDP(session.endpoint, {
     timeout: 15000,
     headers: session.headers || {},
   });
-  const contexts = browser.contexts();
-  const context = contexts.length > 0 ? contexts[0] : await browser.newContext({ ignoreHTTPSErrors: IGNORE_HTTPS_ERRORS });
-  const pages = context.pages();
-  const page = pages.length > 0 ? pages[0] : await context.newPage();
-  return {
-    browser,
-    page,
-    disconnect: async () => {
-      try { await browser.close(); } catch {}
-    },
+  const disconnect = async () => {
+    try { await browser.close(); } catch {}
   };
+  try {
+    const contexts = browser.contexts();
+    const context = contexts.length > 0 ? contexts[0] : await browser.newContext({ ignoreHTTPSErrors: IGNORE_HTTPS_ERRORS });
+    await installRequestGuard(context, policy);
+    const pages = context.pages();
+    const page = pages.length > 0 ? pages[0] : await context.newPage();
+    return {
+      browser,
+      page,
+      checkPage: () => assertPageAllowed(page, policy),
+      disconnect,
+    };
+  } catch (err) {
+    await disconnect();
+    throw err;
+  }
 }
 
 async function uploadScreenshotToS3(imageBuffer) {
@@ -93,6 +108,9 @@ module.exports = {
   applyStealthHeaders,
   uploadScreenshotToS3,
   truncateContent,
+  defaultPolicy,
+  precheckUrl,
+  UrlPolicyError,
   CONTENT_TRUNCATE_CHARS,
   NAV_TIMEOUT_MS,
   INTERACT_TIMEOUT_MS,

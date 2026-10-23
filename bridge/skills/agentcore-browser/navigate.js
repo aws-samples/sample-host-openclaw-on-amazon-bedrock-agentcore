@@ -1,14 +1,34 @@
 "use strict";
-const { connectBrowser, applyStealthHeaders, truncateContent, CONTENT_TRUNCATE_CHARS, NAV_TIMEOUT_MS } = require("./common");
+const {
+  connectBrowser,
+  applyStealthHeaders,
+  truncateContent,
+  defaultPolicy,
+  precheckUrl,
+  UrlPolicyError,
+  CONTENT_TRUNCATE_CHARS,
+  NAV_TIMEOUT_MS,
+} = require("./common");
 
 async function browserNavigate(args) {
   const { url } = args;
   if (!url) return JSON.stringify({ error: "url is required" });
 
-  const { page, disconnect } = await connectBrowser();
+  // Refuse non-http(s) schemes and blocked IP literals before opening the
+  // browser; the DNS check follows once connected (see url-policy.js).
   try {
+    precheckUrl(url);
+  } catch (err) {
+    return JSON.stringify({ error: `url rejected: ${err.message}` });
+  }
+
+  const { page, checkPage, disconnect } = await connectBrowser();
+  try {
+    const target = await defaultPolicy.checkUrl(url);
     await applyStealthHeaders(page);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+    await page.goto(target, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+    // A redirect can land somewhere the first check never saw.
+    await checkPage();
     const title = await page.title();
 
     // Extract readable text — remove script/style noise
@@ -29,6 +49,12 @@ async function browserNavigate(args) {
       content: truncateContent(content.replace(/\s+/g, " ").trim(), CONTENT_TRUNCATE_CHARS),
     });
   } catch (err) {
+    if (err instanceof UrlPolicyError) {
+      return JSON.stringify({ error: `url rejected: ${err.message}` });
+    }
+    if (err.message.includes("ERR_BLOCKED_BY_CLIENT")) {
+      return JSON.stringify({ error: "url rejected: destination not allowed" });
+    }
     if (err.message.includes("Browser session not available")) {
       return JSON.stringify({ error: "Browser is not available. The enable_browser feature must be enabled in CDK configuration." });
     }
