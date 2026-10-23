@@ -465,6 +465,7 @@ def _decrypt_feishu_event(encrypted_body):
     Returns the decrypted JSON string, or None on failure.
     """
     import base64
+    import binascii
 
     _, _, _, encrypt_key = _get_feishu_credentials()
     if not encrypt_key:
@@ -474,8 +475,20 @@ def _decrypt_feishu_event(encrypted_body):
     try:
         data = json.loads(encrypted_body) if isinstance(encrypted_body, str) else encrypted_body
         cipher_text = base64.b64decode(data["encrypt"])
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, binascii.Error) as e:
         logger.error("Feishu decrypt: bad input — %s", e)
+        return None
+
+    # Validate the decoded blob before handing any pointer to libcrypto:
+    # AES-CBC requires at least one 16-byte IV plus one 16-byte ciphertext
+    # block, and the ciphertext body must be an exact multiple of the block
+    # size. A shorter blob would yield an IV under 16 bytes, and libcrypto
+    # always reads 16.
+    if len(cipher_text) < 32 or (len(cipher_text) - 16) % 16 != 0:
+        logger.error(
+            "Feishu decrypt: invalid ciphertext length %d (must be >=32 and 16-byte aligned)",
+            len(cipher_text),
+        )
         return None
 
     key = hashlib.sha256(encrypt_key.encode("utf-8")).digest()
@@ -488,7 +501,11 @@ def _decrypt_feishu_event(encrypted_body):
         logger.error("Feishu decrypt failed: %s", e)
         return None
 
-    return decrypted.decode("utf-8")
+    try:
+        return decrypted.decode("utf-8")
+    except UnicodeDecodeError as e:
+        logger.error("Feishu decrypt: plaintext not valid UTF-8 — %s", e)
+        return None
 
 
 def _aes_cbc_decrypt(key, iv, data):
@@ -542,13 +559,23 @@ def _aes_cbc_decrypt(key, iv, data):
     libcrypto.EVP_aes_256_cbc.restype = ctypes.c_void_p
     libcrypto.EVP_aes_256_cbc.argtypes = []
 
+    # Enforce fixed-size key and IV buffers so a short input can never cause
+    # libcrypto to dereference past the end of a Python bytes buffer. AES-256
+    # requires a 32-byte key; AES-CBC requires a 16-byte IV.
+    if not isinstance(key, (bytes, bytearray)) or len(key) != 32:
+        raise RuntimeError("AES-256 key must be exactly 32 bytes")
+    if not isinstance(iv, (bytes, bytearray)) or len(iv) != 16:
+        raise RuntimeError("AES-CBC IV must be exactly 16 bytes")
+    key_buf = ctypes.create_string_buffer(bytes(key), 32)
+    iv_buf = ctypes.create_string_buffer(bytes(iv), 16)
+
     ctx = libcrypto.EVP_CIPHER_CTX_new()
     if not ctx:
         raise RuntimeError("EVP_CIPHER_CTX_new failed")
 
     try:
         cipher_type = libcrypto.EVP_aes_256_cbc()
-        rc = libcrypto.EVP_DecryptInit_ex(ctx, cipher_type, None, key, iv)
+        rc = libcrypto.EVP_DecryptInit_ex(ctx, cipher_type, None, key_buf, iv_buf)
         if rc != 1:
             raise RuntimeError("EVP_DecryptInit_ex failed")
 
@@ -2157,7 +2184,11 @@ def handle_feishu(body, headers=None):
         if not decrypted:
             logger.error("Feishu: failed to decrypt event")
             return {"statusCode": 200, "body": "ok"}
-        event_data = json.loads(decrypted)
+        try:
+            event_data = json.loads(decrypted)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error("Feishu: decrypted payload is not valid JSON — %s", e)
+            return {"statusCode": 200, "body": "ok"}
         logger.info("Feishu: decrypted event successfully")
 
     # Feishu URL verification challenge (like Slack's url_verification)
