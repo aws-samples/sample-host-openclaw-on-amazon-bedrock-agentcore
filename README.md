@@ -307,6 +307,11 @@ All tunable parameters are in `cdk.json`:
 | `workspace_restore_wait_seconds` | `180` | How long the bridge waits for the S3 `.openclaw/` restore before starting the OpenClaw gateway (passed as `WORKSPACE_RESTORE_WAIT_MS`). The wait ends as soon as the restore finishes; failure or timeout blocks activation |
 | `router_lambda_timeout_seconds` | `600` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
+| `router_stage_rate_limit` | `100` | API Gateway stage-wide steady-state throttle (requests/second) shared by every webhook route |
+| `router_stage_burst_limit` | `50` | API Gateway stage-wide burst throttle |
+| `router_get_route_rate_limit` | `10` | Per-route throttle (requests/second) for `GET /health` and `GET /webhook/whatsapp` (Meta's subscription check), the two routes that answer without a channel signature. Signed `POST` webhooks keep the stage-wide limits. Over the limit, API Gateway returns `429` |
+| `router_get_route_burst_limit` | `20` | Per-route burst throttle for the same two `GET` routes |
+| `router_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Router. Caps the Router and guarantees it that many executions; also removes them from the account's unreserved pool, and Lambda rejects a reservation that would leave fewer than 100 unreserved, so the deploy fails in low-limit accounts. Each in-flight chat turn holds one Router execution for up to `router_lambda_timeout_seconds` |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
 | `image_version` | (see `cdk.json`) | Local build image tag. The SDK controller resolves the ECR digest and updates AgentCore Runtime configuration |
@@ -316,6 +321,8 @@ All tunable parameters are in `cdk.json`:
 | `cron_lambda_timeout_seconds` | `900` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_async` | `true` | Run scheduled turns through the `openclaw-cron-runner` state machine, so a brief can run past the Lambda's 900 s limit (45 min job budget). `false` restores the synchronous path in one Cron stack deploy; schedules are unchanged either way. See [Async scheduled turns](docs/how-it-works.md#async-scheduled-turns) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
+| `cron_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Cron executor (same trade-off as `router_reserved_concurrency`) |
+| `token_metrics_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the token-metrics Lambda (same trade-off) |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. See the [disable procedure](docs/guardrails.md#disable) before changing shared resources |

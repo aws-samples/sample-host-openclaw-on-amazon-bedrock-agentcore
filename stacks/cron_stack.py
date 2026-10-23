@@ -25,6 +25,7 @@ import cdk_nag
 from constructs import Construct
 
 from stacks import DeploymentNamer, retention_days
+from stacks.context_limits import reserved_concurrency
 
 
 class CronStack(Stack):
@@ -117,6 +118,7 @@ class CronStack(Stack):
             # gets a duplicate turn (and its "already ran" reply) instead of the brief.
             retry_attempts=0,
             memory_size=lambda_memory,
+            reserved_concurrent_executions=reserved_concurrency(self, "cron_reserved_concurrency"),
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,
