@@ -144,4 +144,85 @@ describe("cognito-token.createCognitoTokenProvider", () => {
     assert.equal(sent[3].input.AuthFlow, "ADMIN_USER_PASSWORD_AUTH");
     assert.equal(sent[3].input.AuthParameters.PASSWORD, provider.derivePassword("slack:U1"));
   });
+
+  // Fake pool: one user whose stored password and Enabled flag the test sets.
+  function fakePool({ stored, enabled = true, challenge = false, authError = null }) {
+    const state = { stored, sent: [] };
+    const client = {
+      send: async (cmd) => {
+        const n = cmd.constructor.name;
+        state.sent.push(n);
+        if (n === "AdminGetUserCommand") return { Enabled: enabled };
+        if (n === "AdminSetUserPasswordCommand") {
+          state.stored = cmd.input.Password;
+          challenge = false;
+          return {};
+        }
+        if (n === "AdminInitiateAuthCommand") {
+          if (authError) throw Object.assign(new Error("boom"), { name: authError });
+          if (!enabled) throw Object.assign(new Error("User is disabled."), { name: "NotAuthorizedException" });
+          if (challenge) return { ChallengeName: "NEW_PASSWORD_REQUIRED", Session: "s" };
+          if (cmd.input.AuthParameters.PASSWORD !== state.stored) {
+            throw Object.assign(new Error("Incorrect username or password."), { name: "NotAuthorizedException" });
+          }
+          return { AuthenticationResult: { IdToken: "id", AccessToken: "acc", ExpiresIn: 3600 } };
+        }
+        return {};
+      },
+    };
+    return { state, client };
+  }
+
+  it("keeps working without extra calls when the stored password already matches", async () => {
+    const current = createCognitoTokenProvider(cfg).derivePassword("telegram:7");
+    const { state, client } = fakePool({ stored: current });
+    const provider = createCognitoTokenProvider({ ...cfg, client, log: () => {} });
+    assert.equal((await provider.getAccessToken("telegram:7")).token, "acc");
+    assert.deepEqual(state.sent, ["AdminGetUserCommand", "AdminInitiateAuthCommand"]);
+  });
+
+  it("migrates a user whose password came from a previous secret (rotation)", async () => {
+    const old = createCognitoTokenProvider({ ...cfg, passwordSecret: "old-secret" }).derivePassword("telegram:7");
+    const { state, client } = fakePool({ stored: old });
+    const logs = [];
+    const provider = createCognitoTokenProvider({ ...cfg, client, log: (m) => logs.push(m) });
+    assert.equal((await provider.getAccessToken("telegram:7")).token, "acc");
+    assert.deepEqual(state.sent, [
+      "AdminGetUserCommand", "AdminInitiateAuthCommand", "AdminSetUserPasswordCommand", "AdminInitiateAuthCommand",
+    ]);
+    assert.equal(state.stored, provider.derivePassword("telegram:7"));
+    assert.ok(logs.every((m) => !m.includes(old) && !m.includes(state.stored)), "no password in logs");
+  });
+
+  it("finishes a half-provisioned user stuck on NEW_PASSWORD_REQUIRED", async () => {
+    const current = createCognitoTokenProvider(cfg).derivePassword("slack:U2");
+    const { state, client } = fakePool({ stored: current, challenge: true });
+    const provider = createCognitoTokenProvider({ ...cfg, client, log: () => {} });
+    assert.equal((await provider.getIdToken("slack:U2")).token, "id");
+    assert.deepEqual(state.sent.slice(-2), ["AdminSetUserPasswordCommand", "AdminInitiateAuthCommand"]);
+  });
+
+  it("never re-sets the password of a disabled user", async () => {
+    const { state, client } = fakePool({ stored: "x", enabled: false });
+    const provider = createCognitoTokenProvider({ ...cfg, client, log: () => {} });
+    await assert.rejects(provider.getAccessToken("telegram:8"), /disabled/);
+    assert.equal(state.sent.includes("AdminSetUserPasswordCommand"), false);
+    assert.equal(state.stored, "x");
+  });
+
+  it("retries once only and passes other Cognito errors through", async () => {
+    const throttled = fakePool({ stored: "x", authError: "TooManyRequestsException" });
+    await assert.rejects(
+      createCognitoTokenProvider({ ...cfg, client: throttled.client, log: () => {} }).getIdToken("a:1"),
+      { name: "TooManyRequestsException" },
+    );
+    assert.equal(throttled.state.sent.includes("AdminSetUserPasswordCommand"), false);
+
+    const rejected = fakePool({ stored: "x", authError: "NotAuthorizedException" });
+    await assert.rejects(
+      createCognitoTokenProvider({ ...cfg, client: rejected.client, log: () => {} }).getIdToken("a:1"),
+      { name: "NotAuthorizedException" },
+    );
+    assert.equal(rejected.state.sent.filter((n) => n === "AdminInitiateAuthCommand").length, 2);
+  });
 });
