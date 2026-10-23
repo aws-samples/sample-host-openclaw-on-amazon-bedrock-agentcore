@@ -46,6 +46,7 @@ const { createLateAnnounceRelay } = require("./late-announce");
 const { createPreparedGateway } = require("./openclaw-worker-owner");
 const { renderConfig, renderAgents } = require("./gateway-config");
 const { createLiveSeedBridge, readGatewayToken } = require("./live-seed-bridge");
+const privsep = require("./runtime-privsep");
 const { createProxySdkSnapshotOwner } = require("./proxy-sdk-snapshot");
 const { createProxyAuthParent } = require("./proxy-auth-prepare");
 
@@ -220,6 +221,9 @@ async function commonBootstrap() {
   const createCold = () => createPreparedGateway({
     env, port: OPENCLAW_PORT,
     onChild: observeGatewayChild,
+    // Run the gateway (and every shell it spawns) as the unprivileged uid so a
+    // tool shell cannot read another process's /proc environ or lift the role.
+    childOptions: privsep.childPrivilegeOptions(),
     onFailure: (error) => {
       const child = preparedGateway?.child;
       if (shuttingDown || (child && (intentionalGatewayStop === child || openclawProcess !== child))) return;
@@ -266,6 +270,10 @@ async function commonBootstrap() {
   assertUnboundResourcesAbsent(preparedGateway.prepared);
   console.log(`[contract] gateway_seed=${preparedGateway.sharedSeedEnabled === true ? "unsafe_shared" : "off"}`);
   console.log(`[contract] preparation elapsedMs=${Date.now() - preparationStarted}`);
+  for (const line of privsep.formatStartupLines(privsep.describeProtections({
+    networkBlock: process.env.OPENCLAW_MMDS_BLOCK || "unknown",
+    procHidden: process.env.OPENCLAW_PROC_HIDDEN || "unknown",
+  }))) console.log(line);
   console.log("[contract] BOOTSTRAP_READY platform=V2 openclaw=2026.9.5");
 }
 
@@ -335,6 +343,7 @@ function runRuntimeSkillInstall(args) {
   activationScope.checkpoint();
   return new Promise((resolve, reject) => {
     const child = execFile("clawhub", args, {
+      ...privsep.childPrivilegeOptions(),
       encoding: "utf8", timeout: runtimeSkills.REINSTALL_TIMEOUT_MS,
       env: runtimeSkills.clawhubEnv(), signal: activationScope.signal,
       maxBuffer: 4 * 1024 * 1024,
@@ -355,7 +364,7 @@ function runRuntimeSkillInstall(args) {
 function startBoundGateway(env) {
   const child = spawn("openclaw",
     ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
-    { stdio: ["ignore", "pipe", "pipe"], env });
+    { ...privsep.childPrivilegeOptions(), stdio: ["ignore", "pipe", "pipe"], env });
   lastOpenClawEnv = env;
   observeGatewayChild(child);
 }
@@ -658,6 +667,22 @@ function openclawEnvFor(userId) {
 }
 
 /**
+ * Hand the local state dir (and everything restored or written into it) to the
+ * unprivileged OpenClaw uid, so the non-root gateway and `openclaw doctor` can
+ * open the restored SQLite databases and write session state. The root
+ * supervisor wrote those files during restore/config; without this they would
+ * be root-owned and the gateway could not open them. No-op (and silent) when
+ * privilege separation is off. The workspace symlink onto the session-storage
+ * mount is chowned as a link, not descended into — the mount does not enforce
+ * POSIX ownership anyway (AgentCore "permissions are stored but not enforced").
+ */
+function handRuntimeStateToOpenClaw(reason) {
+  if (privsep.chownToOpenClaw(OPENCLAW_DIR, { recursive: true, log: console })) {
+    console.log(`[contract] runtime state dir owned by the OpenClaw uid (${reason})`);
+  }
+}
+
+/**
  * Find pre-2.0 (file-backed) session stores in the state dir.
  * OpenClaw <= 2026.7.x kept `~/.openclaw/agents/<id>/sessions/sessions.json`;
  * 2.0 keeps rows in `~/.openclaw/agents/<id>/agent/openclaw-agent.sqlite`.
@@ -749,7 +774,7 @@ async function migrateLegacySessionStore(env, { forceDoctor = false } = {}) {
       child = spawn(
         "openclaw",
         ["doctor", "--fix", "--non-interactive"],
-        { stdio: ["ignore", "pipe", "pipe"], env },
+        { ...privsep.childPrivilegeOptions(), stdio: ["ignore", "pipe", "pipe"], env },
       );
       migrationProcess = child;
     } catch (err) {
@@ -1522,6 +1547,9 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
     if (!process.env.EXECUTION_ROLE_ARN) throw new Error("V2 requires scoped execution credentials");
     credentialManager = scopedCreds.createCredentialManager(namespace, {
       credDir: SCOPED_CREDS_DIR,
+      // Hand the scoped credential files to the OpenClaw uid so its
+      // credential_process can read them; refreshes re-apply it.
+      chownCredentials: (p) => privsep.chownToOpenClaw(p, { recursive: true, log: console }),
       internalUserId: userId,
       refreshBeforeMs: TURN_TIMEOUT_MS + 60000,
       onRefresh: (creds) => {
@@ -1702,6 +1730,8 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
     // Doctor needs the config above to exist; it may also rewrite it (dropping
     // keys, rotating a .bak), so re-emit our config afterwards.
     const openclawEnv = openclawEnvFor(userId);
+    // doctor runs as the OpenClaw uid, so the restored state must be its own first.
+    handRuntimeStateToOpenClaw("pre-doctor");
     const migrated = liveAdopted ? false : await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 });
     checkpoint();
     if (migrated) {
@@ -1746,6 +1776,9 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
     // uses credential_process for scoped S3 access only (see openclawEnvFor).
     checkpoint();
     lastOpenClawEnv = openclawEnv;
+    // Re-apply after the post-doctor config rewrite and skill reinstall so the
+    // gateway opens every restored file (SQLite included) as its own uid.
+    handRuntimeStateToOpenClaw("pre-activate");
     logActivationPhase("gateway_activate_start");
     await preparedGateway.activate({
       env: openclawEnv, binding: v2Lifecycle.snapshot().binding,

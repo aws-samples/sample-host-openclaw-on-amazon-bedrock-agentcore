@@ -315,7 +315,7 @@ function writePrivateFileAtomic(file, content) {
  * @param {object} creds - Credentials from createScopedCredentials()
  * @param {string} dir - Directory to write files in
  */
-function writeCredentialFiles(creds, dir, { now = Date.now } = {}) {
+function writeCredentialFiles(creds, dir, { now = Date.now, chown } = {}) {
   assertCredentialsFresh(creds, { now });
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 
@@ -343,12 +343,17 @@ function writeCredentialFiles(creds, dir, { now = Date.now } = {}) {
 
   const configPath = path.join(dir, "scoped-aws-config");
   writePrivateFileAtomic(configPath, configContent);
+
+  // Hand the directory and both files to the process that reads them via
+  // credential_process (the unprivileged OpenClaw gateway). No-op when unset.
+  chown?.(dir);
 }
 
 // Requests and persistence share refreshes; drain keeps only persistence active.
 function createCredentialManager(namespace, {
   credDir, internalUserId, stsClient, onRefresh = () => {}, now = Date.now,
   prepareRefresh = () => {},
+  chownCredentials,
   refreshBeforeMs = 5 * 60 * 1000,
   refresh = () => createScopedCredentials(namespace, { internalUserId, stsClient, now }),
 } = {}) {
@@ -389,7 +394,7 @@ function createCredentialManager(namespace, {
       // Draining saves use memory only; stopped or aborted children get no new files.
       if (!draining) {
         // No await between the stop check and synchronous publication.
-        if (credDir) writeCredentialFiles(next, credDir, { now });
+        if (credDir) writeCredentialFiles(next, credDir, { now, chown: chownCredentials });
         const result = onRefresh(next, prepared);
         if (result && typeof result.then === "function") {
           Promise.resolve(result).catch(() => {});
