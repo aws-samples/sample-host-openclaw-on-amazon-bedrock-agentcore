@@ -449,8 +449,12 @@ cdk deploy OpenClawRouter --require-approval never
 # Add a user (after they message the bot and get their ID)
 ./scripts/manage-allowlist.sh add telegram:123456789
 
-# Remove a user
+# Remove an allowlist entry (stops a user who has not registered yet from registering)
 ./scripts/manage-allowlist.sh remove telegram:123456789
+
+# Block a registered user on every linked channel and cron; enable undoes it
+./scripts/manage-allowlist.sh disable telegram:123456789
+./scripts/manage-allowlist.sh enable telegram:123456789
 
 # List all allowed users
 ./scripts/manage-allowlist.sh list
@@ -490,10 +494,12 @@ aws logs start-query \
      --region $CDK_DEFAULT_REGION
    ```
 
-2. **Temporarily disable a user** — Remove from allowlist (existing sessions continue until idle timeout):
+2. **Temporarily disable a user** — Disable the registered user. From the next message, the router rejects turns on every channel linked to that user, and their scheduled tasks stop running. `enable` undoes it:
    ```bash
-   ./scripts/manage-allowlist.sh remove telegram:123456789
+   ./scripts/manage-allowlist.sh disable telegram:123456789
+   ./scripts/manage-allowlist.sh enable telegram:123456789
    ```
+   `remove` only deletes the allowlist entry. It stops a user who has not registered yet from registering; it does not revoke an already registered user.
 
 3. **Force-terminate a session** — Sessions terminate naturally after idle timeout (30 min). No manual kill is needed in normal operation.
 

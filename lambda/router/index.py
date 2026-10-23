@@ -624,10 +624,23 @@ def is_user_allowed(channel, channel_user_id):
     return False
 
 
+# Set by `scripts/manage-allowlist.sh disable` on USER#<id>/PROFILE. Blocks every
+# channel linked to that user and its scheduled tasks until `enable` clears it.
+ACCESS_DISABLED = "DISABLED"
+
+
+def _is_user_disabled(user_id):
+    profile = identity_table.get_item(
+        Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+    ).get("Item") or {}
+    return profile.get("accessStatus") == ACCESS_DISABLED
+
+
 def resolve_user(channel, channel_user_id, display_name=""):
     """Look up or create a user for the given channel identity.
 
-    Returns (user_id, is_new). Returns (None, False) if user is not allowed.
+    Returns (user_id, is_new). Returns (None, False) if user is not allowed,
+    including an enrolled user an operator has disabled.
     """
     channel_key = f"{channel}:{channel_user_id}"
     pk = f"CHANNEL#{channel_key}"
@@ -639,6 +652,9 @@ def resolve_user(channel, channel_user_id, display_name=""):
             owner = read_actor_owner(identity_table, channel_key)
             if owner and owner["userId"] != resp["Item"]["userId"]:
                 raise RouteUnavailable("Channel mapping conflicts with durable actor ownership")
+            if _is_user_disabled(resp["Item"]["userId"]):
+                logger.warning("User for %s is disabled; rejecting turn", channel_key)
+                return None, False
             return resp["Item"]["userId"], False
     except ClientError as e:
         logger.error("DynamoDB get_item failed: %s", e)
@@ -710,6 +726,8 @@ def _binding_route(user_id):
     profile = identity_table.get_item(
         Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
     ).get("Item", {})
+    if profile.get("accessStatus") == ACCESS_DISABLED:
+        raise RouteUnavailable("User is disabled")
     route = get_or_create_session(user_id)
     owner = read_actor_owner(identity_table, route.actor_id)
     if (profile.get("runtimeEnrollment") != "V2" or profile.get("enrollmentActorId") != route.actor_id

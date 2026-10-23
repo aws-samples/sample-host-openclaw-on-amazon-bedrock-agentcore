@@ -147,8 +147,12 @@ When an unauthorized user messages the bot, they receive a rejection message tha
 # Add a user to the allowlist
 ./scripts/manage-allowlist.sh add telegram:123456
 
-# Remove a user
+# Remove an allowlist entry (stops a user who has not registered yet from registering)
 ./scripts/manage-allowlist.sh remove telegram:123456
+
+# Block a registered user on every linked channel and cron; enable undoes it
+./scripts/manage-allowlist.sh disable telegram:123456
+./scripts/manage-allowlist.sh enable telegram:123456
 
 # List all allowed users
 ./scripts/manage-allowlist.sh list
