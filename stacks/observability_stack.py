@@ -80,6 +80,18 @@ class ObservabilityStack(Stack):
             raise ValueError("manage_bedrock_invocation_logging must be true or false")
         # Read by OpenClawTokenMonitoring: it subscribes to a log group it owns.
         self.manages_invocation_logging = manage_bedrock_logging
+        # bedrock_invocation_log_text (default true, unchanged): also deliver
+        # prompt and completion bodies to the invocation log group. false keeps
+        # only metadata and token counts (see docs/security.md).
+        text_raw = self.node.try_get_context("bedrock_invocation_log_text")
+        if text_raw is None or str(text_raw).strip() == "":
+            log_text_data = True
+        elif str(text_raw).strip().lower() in ("true", "1", "yes", "on"):
+            log_text_data = True
+        elif str(text_raw).strip().lower() in ("false", "0", "no", "off"):
+            log_text_data = False
+        else:
+            raise ValueError("bedrock_invocation_log_text must be true or false")
         self.logging_cr = None
         if not manage_bedrock_logging:
             self.invocation_log_group = logs.LogGroup.from_log_group_name(
@@ -115,7 +127,7 @@ class ObservabilityStack(Stack):
                                 "logGroupName": self.invocation_log_group.log_group_name,
                                 "roleArn": bedrock_logging_role.role_arn,
                             },
-                            "textDataDeliveryEnabled": True,
+                            "textDataDeliveryEnabled": log_text_data,
                             "imageDataDeliveryEnabled": False,
                             "embeddingDataDeliveryEnabled": False,
                         },
@@ -131,7 +143,7 @@ class ObservabilityStack(Stack):
                                 "logGroupName": self.invocation_log_group.log_group_name,
                                 "roleArn": bedrock_logging_role.role_arn,
                             },
-                            "textDataDeliveryEnabled": True,
+                            "textDataDeliveryEnabled": log_text_data,
                             "imageDataDeliveryEnabled": False,
                             "embeddingDataDeliveryEnabled": False,
                         },
@@ -321,7 +333,7 @@ class ObservabilityStack(Stack):
         ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
 
         # --- Health alarms: session storage (cron ones are in TokenMonitoring) ---
-        add_health_alarms(self, self.alarm_topic, groups=("container",))
+        add_health_alarms(self, self.alarm_topic, groups=("container",), log_retention=log_retention)
 
         CfnOutput(
             self,

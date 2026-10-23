@@ -27,7 +27,8 @@ PATTERNS = {
         r"AgentCore response \(len=\d+, first \d+ chars\): (.+)", re.DOTALL
     ),
     "response_to_send": re.compile(
-        r"Response to send \(len=(\d+)\): (.+)", re.DOTALL
+        # The text part is logged only when the stack sets router_log_reply_text.
+        r"Response to send \(len=(\d+)\)(?:: (.+))?", re.DOTALL
     ),
     "telegram_sent": re.compile(
         r"Telegram response (?:sent to|already streamed by contract .+ skipping send to) chat_id=(\S+)"
@@ -104,7 +105,7 @@ def _parse_line(line: str, result: TailResult) -> None:
             result.response_len = int(m.group(1))
             # Always update — this is the post-extraction text that
             # actually gets sent to the user
-            result.response_text = m.group(2)
+            result.response_text = m.group(2) or ""
         elif name == "telegram_sent":
             result.telegram_sent = True
         elif name == "new_session":

@@ -317,6 +317,9 @@ All tunable parameters are in `cdk.json`:
 | `cron_async` | `true` | Run scheduled turns through the `openclaw-cron-runner` state machine, so a brief can run past the Lambda's 900 s limit (45 min job budget). `false` restores the synchronous path in one Cron stack deploy; schedules are unchanged either way. See [Async scheduled turns](docs/how-it-works.md#async-scheduled-turns) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
+| `cloudtrail_s3_data_events` | `false` | With `enable_cloudtrail`, also record S3 data events (object reads and writes) on the user-files bucket. Data events are billed per event; leave off if an organization trail already records them |
+| `bedrock_invocation_log_text` | `true` | Include prompt and completion bodies in the Bedrock invocation log group. `false` keeps only metadata and token counts; see [Bedrock invocation logging](docs/security.md#bedrock-invocation-logging) |
+| `router_log_reply_text` | `false` | Test deployments only: the Router logs the first 2000 characters of each Telegram reply, which the E2E suite reads. Leave off in production |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. See the [disable procedure](docs/guardrails.md#disable) before changing shared resources |
 | `guardrails_content_filter_level` | `HIGH` | Not read by the stack: filter strengths are set per category in `stacks/guardrails_stack.py` (`PROMPT_ATTACK` input `HIGH`, `INSULTS` input `MEDIUM`, the rest `HIGH`) |

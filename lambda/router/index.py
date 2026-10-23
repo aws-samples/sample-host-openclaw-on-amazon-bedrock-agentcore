@@ -66,6 +66,9 @@ REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "tru
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 RUNTIME_TARGET = json.loads(os.environ.get("RUNTIME_TARGET", "null"))
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "")
+# Test deployments only: also log the reply text (cdk.json router_log_reply_text),
+# which the E2E log tailer reads. Off by default so replies stay out of logs.
+LOG_REPLY_TEXT = os.environ.get("LOG_REPLY_TEXT", "false").lower() == "true"
 
 
 def _load_user_selectable_models(raw):
@@ -1819,7 +1822,10 @@ def handle_telegram(body):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
     response_text = _extract_text_from_content_blocks(response_text)
-    logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
+    if LOG_REPLY_TEXT:
+        logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
+    else:
+        logger.info("Response to send (len=%d)", len(response_text))
 
     # If contract already streamed progressively to Telegram, skip duplicate send
     if result.get("streamed"):

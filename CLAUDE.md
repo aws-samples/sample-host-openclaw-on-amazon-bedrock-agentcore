@@ -303,6 +303,8 @@ uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_tes
 uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestBrowserFeature  # browser E2E tests (requires enable_browser=true)
 ```
 
+`bot_test.py` checks reply content from the Router log, which carries the reply text only when the test stack is deployed with `router_log_reply_text=true`. Without it, lifecycle and length checks still pass and content checks fail.
+
 ### AgentCore Runtime Operations
 
 ```bash
@@ -357,6 +359,9 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bri
 | `cron_lambda_timeout_seconds` | `600` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail (S3 bucket + trail). Off by default — most accounts already have one |
+| `cloudtrail_s3_data_events` | `false` | With `enable_cloudtrail`, also record S3 data events on the user-files bucket (billed per event) |
+| `bedrock_invocation_log_text` | `true` | Include prompt/completion bodies in `/aws/bedrock/invocation-logs`; `false` keeps metadata and token counts only |
+| `router_log_reply_text` | `false` | Test deployments only: Router logs Telegram reply text for the E2E log tailer |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model for sub-agents. Empty = bridge default (also Sonnet 5.5) |
 | `enable_browser` | `false` | Enable headless Chromium browser. Sets `BROWSER_IDENTIFIER` env var on container |
