@@ -185,9 +185,6 @@ if (!process.env.EVENTBRIDGE_ROLE_ARN && process.env.EXECUTION_ROLE_ARN) {
   }
 }
 
-// OpenClaw process diagnostics (last N lines of stdout/stderr)
-const OPENCLAW_LOG_LIMIT = 50;
-let openclawLogs = [];
 let openclawExitCode = null;
 let lastOpenClawEnv = null;
 
@@ -374,8 +371,6 @@ function observeGatewayChild(child) {
       buffer = lines.pop();
       for (const line of lines.filter((value) => value.trim())) {
         console.log(`[openclaw:${label}] ${line}`);
-        openclawLogs.push(`[${label}] ${line}`);
-        if (openclawLogs.length > OPENCLAW_LOG_LIMIT) openclawLogs.shift();
       }
     });
   }
@@ -2509,23 +2504,27 @@ const server = http.createServer(async (req, res) => {
         if (action === "status") {
           // Fetch proxy /health for request counters (non-blocking — null on failure)
           const proxyHealth = proxyReady ? await checkProxyHealth() : null;
+          // Status needs no binding, so it reports whether one exists but not
+          // the user binding itself, and leaves gateway log lines to CloudWatch.
+          const lifecycle = v2Lifecycle.snapshot();
 
           const diag = {
             buildVersion: BUILD_VERSION,
             uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
-            currentUserId,
             openclawReady,
             proxyReady,
             secretsReady,
             openclawExitCode,
             openclawPid: openclawProcess?.pid || null,
-            openclawLogs: openclawLogs.slice(-20),
             totalRequestCount: proxyHealth?.total_requests ?? null,
             subagentRequestCount: proxyHealth?.subagent_requests ?? null,
             activeTaskCount,
             pingStatus: v2Lifecycle.health(activeTaskCount).body.status,
             runtimePlatform: RUNTIME_PLATFORM,
-            lifecycle: v2Lifecycle.snapshot(),
+            lifecycle: {
+              state: lifecycle.state, generation: lifecycle.generation,
+              resources: lifecycle.resources, bound: Boolean(lifecycle.binding),
+            },
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));
