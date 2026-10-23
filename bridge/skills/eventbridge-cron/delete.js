@@ -9,7 +9,7 @@ const {
   SCHEDULE_GROUP,
   validateUserId,
   validateEnv,
-  buildScheduleName,
+  resolveScheduleName,
   getCronRecord,
   deleteCronRecord,
   extractChannelInfo,
@@ -57,8 +57,8 @@ async function main() {
     process.exit(1);
   }
 
-  const ebScheduleName = buildScheduleName(userId, scheduleId);
   const schedulerClient = new SchedulerClient({ region: REGION });
+  const ebScheduleName = await resolveScheduleName(schedulerClient, userId, scheduleId);
 
   // Delete from EventBridge
   try {

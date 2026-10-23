@@ -22,6 +22,38 @@ const { toolNameFromContext, withErrorEnvelope, logToolCall } = require("../lib/
 
 // --- Validation (same rules as bridge/skills/eventbridge-cron/common.js) ---
 
+const MIN_INTERVAL_MINUTES = 5;
+
+/** Sorted minutes (0-59) a cron() minutes field fires on, or null for syntax it does not accept. */
+function cronMinutes(field) {
+  const minutes = new Set();
+  for (const part of field.split(",")) {
+    const m = part.match(/^(?:\*|(\d{1,2})(?:-(\d{1,2}))?)(?:\/(\d{1,2}))?$/);
+    if (!m) return null;
+    const step = m[3] === undefined ? 1 : Number(m[3]);
+    let start = 0;
+    let end = 59;
+    if (m[1] !== undefined) {
+      start = Number(m[1]);
+      // "5/10" starts at 5 and repeats to the end of the hour; a bare "5" is one minute.
+      end = m[2] !== undefined ? Number(m[2]) : m[3] !== undefined ? 59 : start;
+    }
+    if (step < 1 || start > end || end > 59) return null;
+    for (let minute = start; minute <= end; minute += step) minutes.add(minute);
+  }
+  return [...minutes].sort((a, b) => a - b);
+}
+
+/** Shortest time in minutes between two runs of a cron() minutes field, or null if the field is not accepted. */
+function cronMinuteGap(field) {
+  const minutes = cronMinutes(field);
+  if (!minutes) return null;
+  // From the hour's last run to the next hour's first run.
+  let gap = 60 - minutes[minutes.length - 1] + minutes[0];
+  for (let i = 1; i < minutes.length; i++) gap = Math.min(gap, minutes[i] - minutes[i - 1]);
+  return gap;
+}
+
 function validateExpression(expression) {
   if (typeof expression !== "string") throw new Error("expression is required");
   const atMatch = expression.match(/^at\((\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\)$/);
@@ -42,8 +74,12 @@ function validateExpression(expression) {
     if (fields.length !== 6) {
       throw new Error(`cron() expression must have exactly 6 fields, got ${fields.length}`);
     }
-    if (fields[0] === "*" || fields[0] === "*/1") {
-      throw new Error("Every-minute cron expressions are not allowed (minimum 5 minutes)");
+    const gap = cronMinuteGap(fields[0]);
+    if (gap === null) {
+      throw new Error(`Unsupported cron() minutes field "${fields[0]}". Use numbers 0-59 with , - * or /`);
+    }
+    if (gap < MIN_INTERVAL_MINUTES) {
+      throw new Error("Every-minute cron expressions are not allowed (minimum 5 minutes between runs)");
     }
     return;
   }
@@ -65,11 +101,34 @@ function validateScheduleId(id) {
   return id;
 }
 
+// EventBridge Scheduler names are at most 64 characters. "openclaw-" and
+// "-<8-hex id>" leave 46 for the namespace.
+const MAX_NAME_NAMESPACE = 64 - "openclaw-".length - 9;
+
 function buildScheduleName(namespace, scheduleId) {
-  const prefix = "openclaw-";
-  const suffix = `-${scheduleId}`;
-  const max = 64 - prefix.length - suffix.length;
-  return `${prefix}${namespace.length > max ? namespace.slice(0, max) : namespace}${suffix}`;
+  if (namespace.length <= MAX_NAME_NAMESPACE) return `openclaw-${namespace}-${scheduleId}`;
+  // A longer namespace keeps its first characters plus a digest of the whole
+  // namespace, so two namespaces that share their first 46 characters get
+  // different names.
+  const digest = crypto.createHash("sha256").update(namespace).digest("hex").slice(0, 12);
+  return `openclaw-${namespace.slice(0, MAX_NAME_NAMESPACE - 13)}-${digest}-${scheduleId}`;
+}
+
+/** The name a schedule of a namespace longer than 46 characters had before the digest; null otherwise. */
+function legacyScheduleName(namespace, scheduleId) {
+  return namespace.length > MAX_NAME_NAMESPACE
+    ? `openclaw-${namespace.slice(0, MAX_NAME_NAMESPACE)}-${scheduleId}`
+    : null;
+}
+
+/** Namespace a schedule was created for, from its target input. */
+function scheduleNamespace(schedule) {
+  try {
+    const input = JSON.parse((schedule && schedule.Target && schedule.Target.Input) || "{}");
+    return typeof input.actorId === "string" ? input.actorId.replace(/:/g, "_") : null;
+  } catch {
+    return null;
+  }
 }
 
 function createHandler(deps = {}) {
@@ -124,6 +183,31 @@ function createHandler(deps = {}) {
     return idx === -1
       ? { channel: "unknown", channelTarget: actorId }
       : { channel: actorId.slice(0, idx), channelTarget: actorId.slice(idx + 1) };
+  }
+
+  /**
+   * Name of the caller's schedule. Schedules created before long namespaces
+   * got a digest keep their old name; that name is used only when the
+   * schedule there was created for this caller's namespace.
+   */
+  async function ownScheduleName(namespace, scheduleId) {
+    const name = buildScheduleName(namespace, scheduleId);
+    const legacy = legacyScheduleName(namespace, scheduleId);
+    if (!legacy) return name;
+    const { scheduler, schedulerCmds } = clients();
+    const get = (Name) => scheduler.send(new schedulerCmds.GetScheduleCommand({ Name, GroupName: env.scheduleGroup }));
+    try {
+      await get(name);
+      return name;
+    } catch (err) {
+      if (!err || err.name !== "ResourceNotFoundException") throw err;
+    }
+    try {
+      return scheduleNamespace(await get(legacy)) === namespace ? legacy : name;
+    } catch (err) {
+      if (!err || err.name !== "ResourceNotFoundException") throw err;
+      return name;
+    }
   }
 
   const tools = {
@@ -256,7 +340,7 @@ function createHandler(deps = {}) {
       );
       if (!rec.Item) return { error: "not_found", message: `Schedule ${scheduleId} not found for this user` };
 
-      const ebName = buildScheduleName(identity.namespace, scheduleId);
+      const ebName = await ownScheduleName(identity.namespace, scheduleId);
       const current = await scheduler.send(
         new schedulerCmds.GetScheduleCommand({ Name: ebName, GroupName: env.scheduleGroup }),
       );
@@ -313,7 +397,7 @@ function createHandler(deps = {}) {
         }),
       );
       if (!rec.Item) return { error: "not_found", message: `Schedule ${scheduleId} not found for this user` };
-      const ebName = buildScheduleName(identity.namespace, scheduleId);
+      const ebName = await ownScheduleName(identity.namespace, scheduleId);
       try {
         await scheduler.send(
           new schedulerCmds.DeleteScheduleCommand({ Name: ebName, GroupName: env.scheduleGroup }),
@@ -347,4 +431,6 @@ async function handler(event, context) {
   return _handler(event, context);
 }
 
-module.exports = { handler, createHandler, validateExpression, validateTimezone, buildScheduleName };
+module.exports = {
+  handler, createHandler, validateExpression, validateTimezone, buildScheduleName, legacyScheduleName, cronMinuteGap,
+};

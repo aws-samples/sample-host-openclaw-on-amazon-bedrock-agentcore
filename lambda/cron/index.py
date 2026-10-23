@@ -5,6 +5,7 @@ if cold, sends the cron message, and delivers the response to the user's
 channel (Telegram, Slack or Feishu).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -1104,6 +1105,28 @@ def verify_cron_event(event):
             "body": "Schedule ownership verification error",
         }
 
+    # The CRON# record, not the schedule's input, decides who the schedule
+    # speaks as, where it delivers and what it runs. The skill and the gateway
+    # tool write both at create and update time, so they only differ when the
+    # input was changed outside them.
+    record_actor = cron_record.get("channelActorId") or cron_record.get("actorId")
+    if record_actor and record_actor != actor_id:
+        logger.error("Schedule %s input names a different channel identity than its record", schedule_id)
+        return None, {"statusCode": 403, "body": "Channel identity verification failed"}
+    bound = {}
+    for field, value in (("channel", channel), ("channelTarget", channel_target), ("message", message),
+                         ("scheduleName", schedule_name)):
+        stored = cron_record.get(field)
+        if stored is not None and stored != "":
+            if str(stored) != str(value):
+                logger.warning("Schedule %s input %s differs from its record; using the record", schedule_id, field)
+            value = stored
+        bound[field] = value
+    channel, channel_target, message = bound["channel"], bound["channelTarget"], bound["message"]
+    schedule_name = bound["scheduleName"]
+    if not actor_id.startswith(f"{channel}:"):
+        return None, {"statusCode": 403, "body": "Channel identity verification failed"}
+
     # Phase 1: Get or create session
     try:
         session_id = get_or_create_session(current_user_id)
@@ -1170,22 +1193,26 @@ ASYNC_STATUS_TIMEOUT_SECONDS = 60
 _SCHEDULED_TIME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z")
 
 
-def async_job_id(event, now=None):
-    """Execution name and contract jobId: <scheduleId>-<scheduled fire time>.
+def async_job_id(event, user_id, now=None):
+    """Execution name and contract jobId: <scheduleId>-<owner>-<scheduled fire time>.
 
     One fire of one schedule always maps to the same name, so a repeated
     invocation cannot start a second run (Step Functions rejects the name).
+    <owner> is a digest of the verified userId, so schedules of different users
+    never share a name even when their scheduleIds match.
     Schedules created by the eventbridge-cron skill pass the scheduled time;
     older schedules fall back to the invocation time rounded down to the minute.
+    Step Functions allows 80 characters: 48 + 1 + 12 + 1 + 16 = 78.
     """
     schedule = re.sub(r"[^A-Za-z0-9_-]", "", str(event.get("scheduleId") or ""))[:48] or "unknown"
+    owner = hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()[:12]
     match = _SCHEDULED_TIME_RE.fullmatch(str(event.get("scheduledTime") or ""))
     if match:
         parts = match.groups()
         stamp = "".join(parts[:3]) + "T" + "".join(parts[3:]) + "Z"
     else:
         stamp = time.strftime("%Y%m%dT%H%M00Z", time.gmtime(time.time() if now is None else now))
-    return f"{schedule}-{stamp}"
+    return f"{schedule}-{owner}-{stamp}"
 
 
 def launch_async(event):
@@ -1193,7 +1220,7 @@ def launch_async(event):
     job, error = verify_cron_event(event)
     if error:
         return error
-    name = async_job_id(event)
+    name = async_job_id(event, job["userId"])
     state = {key: event[key] for key in ASYNC_EVENT_FIELDS if event.get(key) is not None}
     state.update({"cronPhase": "start", "jobId": name})
     try:

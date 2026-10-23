@@ -7,6 +7,7 @@ end without a result sends the fixed failure notice and logs the line the
 openclaw-scheduled-task-failures alarm matches.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -64,16 +65,28 @@ FAILED = "[Scheduled: Desk] " + "Your scheduled task did not return a result thi
 
 # --- execution name / jobId ----------------------------------------------------
 
-def test_job_id_is_the_schedule_and_its_scheduled_fire_time():
+OWNER = hashlib.sha256(USER.encode()).hexdigest()[:12]
+JOB_ID = f"schedule123-{OWNER}-20261019T084700Z"
+
+
+def test_job_id_is_the_schedule_its_owner_and_its_scheduled_fire_time():
     module = _lambda()
     event = {**cron_event(), "scheduledTime": "2026-10-19T08:47:00Z"}
-    assert module.async_job_id(event) == "schedule123-20261019T084700Z"
+    assert module.async_job_id(event, USER) == JOB_ID
     # Older schedules carry no scheduled time: the invocation time, to the minute.
     fired = time.mktime((2026, 10, 19, 8, 47, 4, 0, 0, 0)) - time.timezone
-    assert module.async_job_id(cron_event(), now=fired) == "schedule123-20261019T084700Z"
+    assert module.async_job_id(cron_event(), USER, now=fired) == JOB_ID
     # Only characters Step Functions accepts in an execution name.
-    name = module.async_job_id({"scheduleId": "a:b/c d#e", "scheduledTime": "bogus"}, now=fired)
-    assert name == "abcde-20261019T084700Z"
+    name = module.async_job_id({"scheduleId": "a:b/c d#e", "scheduledTime": "bogus"}, USER, now=fired)
+    assert name == f"abcde-{OWNER}-20261019T084700Z"
+    # The longest scheduleId still fits Step Functions' 80-character name limit.
+    assert len(module.async_job_id({**event, "scheduleId": "x" * 100}, USER)) <= 80
+
+
+def test_the_same_schedule_id_and_fire_time_of_another_user_is_a_different_run():
+    module = _lambda()
+    event = {**cron_event(), "scheduledTime": "2026-10-19T08:47:00Z"}
+    assert module.async_job_id(event, USER) != module.async_job_id(event, "another-user")
 
 
 def test_new_schedules_pass_their_scheduled_fire_time():
@@ -91,7 +104,7 @@ def test_launch_starts_one_named_execution_and_does_not_run_the_turn():
     assert module.handler(event, Context())["statusCode"] == 202
     (call,) = module.sfn_client.start_execution.call_args_list
     assert call.kwargs["stateMachineArn"] == SM_ARN
-    assert call.kwargs["name"] == "schedule123-20261019T084700Z"
+    assert call.kwargs["name"] == JOB_ID
     state = json.loads(call.kwargs["input"])
     assert state["cronPhase"] == "start" and state["jobId"] == call.kwargs["name"]
     assert state["message"] == "hi" and state["channelTarget"] == "123"
