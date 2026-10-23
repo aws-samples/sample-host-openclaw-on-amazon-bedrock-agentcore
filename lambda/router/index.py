@@ -666,6 +666,14 @@ _BLOCK_CLOSE_RE = re.compile(r'\}\s*,?\s*\]')
 _MALFORMED_TEXT_BLOCK_RE = re.compile(
     r'"type"\s*:\s*"text"\s*,\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"'
 )
+# Start of what looks like content-block JSON: '[{"type":'.
+_BLOCK_PREFIX_RE = re.compile(r'\[\{\s*"type"\s*:')
+# A '[{' the JSON decoder could read as a list of objects: a key or '}' next.
+_DECODABLE_START_RE = re.compile(r'\[\{\s*["}]')
+# JSON decode attempts per call. A failed attempt can cost time in proportion
+# to the text length, so the cap bounds the worst case; past it the rest of
+# the text is kept as it is.
+_MAX_DECODE_ATTEMPTS = 1000
 
 
 def _extract_text_from_content_blocks(text):
@@ -678,16 +686,29 @@ def _extract_text_from_content_blocks(text):
 
     Scans for '[{' positions and attempts JSON parse at each to handle
     complex nested/escaped content blocks from subagent responses.
+
+    Work is bounded: a pass never copies or rescans the rest of the string
+    for each '[{', JSON decoding is tried at most _MAX_DECODE_ATTEMPTS times,
+    and JSON nested too deeply to decode is kept as plain text.
     """
     if not text or not isinstance(text, str):
         return text
     result = text
     decoder = json.JSONDecoder(strict=False)
+    attempts = 0
     for _ in range(10):
         prev = result
         # Scan for all '[{' positions and try to parse JSON arrays
         rebuilt = []
         i = 0
+        # A '[{' that starts here is the bare tail of the string.
+        bare_tail = len(result.rstrip()) - 2
+        # Next block close at or after the scan position, cached until the
+        # scan passes it, and the last position before it already known not
+        # to yield text from the regex fallback.
+        close = None
+        close_searched = False
+        no_text_until = -1
         while i < len(result):
             pos = result.find("[{", i)
             if pos == -1:
@@ -695,46 +716,61 @@ def _extract_text_from_content_blocks(text):
                 break
             rebuilt.append(result[i:pos])
             # Try to parse a JSON array starting at pos
-            try:
-                blocks, end = decoder.raw_decode(result, pos)
-                if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
-                    # Check if this looks like a content block array (dicts with "type" keys)
-                    has_typed_blocks = any(b.get("type") for b in blocks)
-                    if has_typed_blocks:
-                        parts = [
-                            b.get("text", "")
-                            for b in blocks
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        ]
-                        # Always advance past the block — image-only blocks produce empty text
-                        rebuilt.append("".join(parts))
-                        i = end
-                        continue
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+            if _DECODABLE_START_RE.match(result, pos):
+                if attempts >= _MAX_DECODE_ATTEMPTS:
+                    rebuilt.append(result[pos:])
+                    break
+                attempts += 1
+                try:
+                    blocks, end = decoder.raw_decode(result, pos)
+                    if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
+                        # Check if this looks like a content block array (dicts with "type" keys)
+                        has_typed_blocks = any(b.get("type") for b in blocks)
+                        if has_typed_blocks:
+                            parts = [
+                                b.get("text", "")
+                                for b in blocks
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            ]
+                            # Always advance past the block — image-only blocks produce empty text
+                            rebuilt.append("".join(parts))
+                            i = end
+                            continue
+                except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+                    # RecursionError: nested too deeply to decode; keep as text.
+                    pass
             # Not a valid content block array. If it looks like content-block
             # JSON (e.g. '[{"type":' ...), only an unterminated fragment that
             # runs to the end of the string is dropped (a partial stream tail).
             # A closed but malformed array keeps the text around it.
-            remainder = result[pos:]
-            if re.match(r'^\[\{\s*"type"\s*:', remainder) or remainder.strip() == "[{":
-                close = _BLOCK_CLOSE_RE.search(remainder)
+            if _BLOCK_PREFIX_RE.match(result, pos) or pos == bare_tail:
+                if not close_searched or close.start() < pos:
+                    close = _BLOCK_CLOSE_RE.search(result, pos)
+                    close_searched = True
+                    no_text_until = -1
                 if close is None:
                     # Truncated content block JSON at the tail — skip the rest
                     break
-                span = remainder[:close.end()]
-                texts = _MALFORMED_TEXT_BLOCK_RE.findall(span)
-                if texts:
-                    try:
-                        rebuilt.append("".join(json.loads('"' + t + '"') for t in texts))
-                        i = pos + close.end()
-                        continue
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-            rebuilt.append("[")
-            i = pos + 1
+                if pos > no_text_until:
+                    texts = []
+                    for match in _MALFORMED_TEXT_BLOCK_RE.finditer(result, pos, close.end()):
+                        try:
+                            texts.append(json.loads('"' + match.group(1) + '"'))
+                        except (json.JSONDecodeError, ValueError):
+                            # Every '[{' up to this block also reaches it.
+                            no_text_until = match.start()
+                            break
+                    else:
+                        if texts:
+                            rebuilt.append("".join(texts))
+                            i = close.end()
+                            continue
+                        no_text_until = close.end()
+            # Keep the '[{' as text. The next '[{' cannot start at the '{'.
+            rebuilt.append("[{")
+            i = pos + 2
         result = "".join(rebuilt)
-        if result == prev:
+        if result == prev or attempts >= _MAX_DECODE_ATTEMPTS:
             break
     return result
 
