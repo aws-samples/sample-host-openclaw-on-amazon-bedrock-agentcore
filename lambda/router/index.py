@@ -14,12 +14,14 @@ Path routing:
   POST /webhook/line      — LINE Messaging API webhook (disabled until configured)
 """
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -637,13 +639,27 @@ def get_or_create_session(user_id):
 # Cross-channel binding
 # ---------------------------------------------------------------------------
 
+BIND_CODE_BYTES = 10  # 80 bits -> 16 base32 characters
+
+
+def _generate_bind_code():
+    """Return a 16-character base32 bind code (80 bits from the OS CSPRNG).
+
+    Redemption has no attempt limiter, so the code itself carries the entropy:
+    guessing one live code at the API's throttle ceiling for its whole TTL
+    stays far below one in a billion. The base32 alphabet (A-Z, 2-7) has no
+    0/O or 1/I pairs to mistype.
+    """
+    return base64.b32encode(secrets.token_bytes(BIND_CODE_BYTES)).decode("ascii")
+
+
 def create_bind_code(user_id):
-    """Generate an 8-char bind code and store it in DynamoDB with TTL."""
+    """Generate a bind code and store it in DynamoDB with TTL."""
     try:
         route = _binding_route(user_id)
     except RouteUnavailable:
         return None
-    code = uuid.uuid4().hex[:8].upper()  # 16^8 = 4.3B keyspace
+    code = _generate_bind_code()
     ttl = int(time.time()) + BIND_CODE_TTL_SECONDS
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -1666,14 +1682,34 @@ def _upload_document_to_s3(data, namespace, kind):
 # Webhook handlers
 # ---------------------------------------------------------------------------
 
+LINK_DM_ONLY_MESSAGE = (
+    "Account linking only works in a direct message. "
+    "Open a 1:1 chat with me and send `link` there."
+)
+
+
+def _is_slack_dm(event):
+    """True for a plain message event in a 1:1 DM (not an app_mention or a channel)."""
+    if event.get("type") != "message":
+        return False
+    channel_type = event.get("channel_type")
+    if channel_type:
+        return channel_type == "im"
+    return str(event.get("channel", "")).startswith("D")
+
+
 def _is_bind_command(text):
-    """Check if the message is a bind-code command (e.g. 'link ABCD1234')."""
+    """Check if the message is a bind-code command (e.g. 'link ABCDEFGH23456723').
+
+    Accepts 8-32 alphanumeric characters: new codes are 16 characters, and
+    8-character codes issued before an upgrade stay redeemable until they expire.
+    """
     if not text:
         return False, ""
     parts = text.strip().split()
     if len(parts) == 2 and parts[0].lower() in ("link", "bind"):
         code = parts[1].strip().upper()
-        if len(code) == 8 and code.isalnum():
+        if 8 <= len(code) <= 32 and code.isascii() and code.isalnum():
             return True, code
     return False, ""
 
@@ -1837,8 +1873,12 @@ def handle_telegram(body):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "telegram")
 
-    # Handle link-accounts command (generate bind code for existing users)
+    # Handle link-accounts command (generate bind code for existing users).
+    # A bind code links whoever redeems it first, so it is only sent in a 1:1 chat.
     if _is_link_command(text):
+        if message.get("chat", {}).get("type") != "private" or str(chat_id) != user_id_tg:
+            send_telegram_message(chat_id, LINK_DM_ONLY_MESSAGE, token)
+            return
         code = create_bind_code(resolved_user_id)
         if not code:
             send_telegram_message(chat_id, "Account linking requires identity reconciliation.", token)
@@ -2034,8 +2074,12 @@ def handle_slack(body, headers=None):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "slack")
 
-    # Handle link-accounts command (generate bind code for existing users)
+    # Handle link-accounts command (generate bind code for existing users).
+    # A bind code links whoever redeems it first, so it is only sent in a DM.
     if _is_link_command(text):
+        if not _is_slack_dm(event):
+            send_slack_message(channel_id, LINK_DM_ONLY_MESSAGE, bot_token)
+            return {"statusCode": 200, "body": "ok"}
         code = create_bind_code(resolved_user_id)
         if not code:
             send_slack_message(channel_id, "Account linking requires identity reconciliation.", bot_token)
@@ -2203,8 +2247,12 @@ def handle_feishu(body, headers=None):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "feishu")
 
-    # Handle link-accounts command
+    # Handle link-accounts command. A bind code links whoever redeems it
+    # first, so it is only sent in a 1:1 (p2p) chat.
     if _is_link_command(text):
+        if message.get("chat_type") != "p2p":
+            send_feishu_message(chat_id, LINK_DM_ONLY_MESSAGE.replace("`", ""))
+            return {"statusCode": 200, "body": "ok"}
         bind_code = create_bind_code(resolved_user_id)
         if not bind_code:
             send_feishu_message(chat_id, "Account linking requires identity reconciliation.")
