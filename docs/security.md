@@ -95,12 +95,14 @@ During user activation, the contract server calls `STS:AssumeRole` on the execut
 | Resource | Scope |
 |---|---|
 | S3 objects | `arn:aws:s3:::{bucket}/{namespace}/*` only |
-| S3 list | Prefix condition: `{namespace}/*` and `{namespace}` |
-| Secrets Manager | `openclaw/user/{namespace}/*` — per-user API key storage, max 10 secrets |
-| DynamoDB | `ForAllValues:StringLike` on `dynamodb:LeadingKeys`: `USER#{actorId}`, `CHANNEL#{actorId}`, and `USER#{internalUserId}` (for CRON# and SESSION records stored under the internal user ID) |
-| EventBridge | Schedule group: `openclaw-cron/*` |
-| IAM PassRole | Only the EventBridge scheduler role |
-| KMS | `kms:Decrypt`, `kms:GenerateDataKey`, `kms:GenerateDataKeyWithoutPlaintext` on project CMK only (when set) |
+| S3 list | `s3:ListBucket` with an `s3:prefix` condition of `{namespace}/*` |
+| Secrets Manager | `openclaw/user/{namespace}/*` (get, put, create, delete, tag). `ListSecrets` has no resource-level permissions, so it stays on `*`; the skill filters by the user's prefix and the call returns names, not values |
+| DynamoDB | Identity table only, with `ForAllValues:StringEquals` on `dynamodb:LeadingKeys` = `USER#{internalUserId}` (the partition that holds the user's `CRON#` records) |
+| EventBridge Scheduler | Create, get, update and delete on `schedule/{group}/openclaw-{namespace}-*` only. A namespace longer than 46 characters uses the same digest prefix as its schedule names; the older truncated names are not granted |
+| IAM PassRole | Only the EventBridge scheduler role, only to `scheduler.amazonaws.com` |
+| KMS | `kms:Decrypt` and `kms:GenerateDataKey` only through S3, DynamoDB and Secrets Manager (`kms:ViaService`) |
+
+A statement whose resource cannot be named (for example, no identity table configured) is left out rather than widened. The policy must stay under the 2,048-character STS limit; `buildSessionPolicy()` refuses to build a larger one, and the contract server logs the `PackedPolicySize` STS reports at activation.
 
 Implementation: `bridge/scoped-credentials.js` — `buildSessionPolicy()` constructs the JSON policy, `createScopedCredentials()` calls STS.
 

@@ -1,5 +1,6 @@
 /**
- * Tests for the api-keys skill scripts (migrate.js, native.js).
+ * Tests for the api-keys skill scripts (migrate.js, native.js, secret.js,
+ * retrieve.js).
  * Run: node --test skills/api-keys/migrate.test.js
  *
  * Each script runs in a child process with HOME pointed at a temp dir and a
@@ -62,6 +63,8 @@ function run(script, args, extraEnv = {}) {
     PATH: process.env.PATH,
     HOME: tmp,
     AWS_REGION: "us-west-2",
+    // The session's own user ("channel:id"); scripts refuse any other user_id.
+    USER_ID: USER_ID.replace("_", ":"),
     SM_STUB_LOG: logPath,
     ...extraEnv,
   };
@@ -170,5 +173,40 @@ describe("native.js set", () => {
     const r = run(NATIVE, [USER_ID, "set", KEY_NAME, SECRET_VALUE]);
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(JSON.parse(fs.readFileSync(keysPath, "utf-8")), { demo_key: SECRET_VALUE });
+  });
+});
+
+describe("user_id must be this session's user", () => {
+  const SECRET = path.join(__dirname, "secret.js");
+  const RETRIEVE = path.join(__dirname, "retrieve.js");
+  const OTHER_USER = "telegram_654321";
+
+  for (const [name, script, args] of [
+    ["secret.js get", SECRET, [OTHER_USER, "get", KEY_NAME]],
+    ["secret.js set", SECRET, [OTHER_USER, "set", KEY_NAME, SECRET_VALUE]],
+    ["secret.js list", SECRET, [OTHER_USER, "list"]],
+    ["retrieve.js", RETRIEVE, [OTHER_USER, KEY_NAME]],
+    ["migrate.js", MIGRATE, [OTHER_USER, KEY_NAME, "secure-to-native"]],
+    ["native.js", NATIVE, [OTHER_USER, "set", KEY_NAME, SECRET_VALUE]],
+  ]) {
+    it(`${name} refuses another user's namespace before any AWS call`, () => {
+      const r = run(script, args);
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /does not match the user this session belongs to/);
+      assert.deepEqual(smCalls(), []);
+    });
+  }
+
+  it("refuses every user_id when the session's user is unknown", () => {
+    const r = run(RETRIEVE, [USER_ID, KEY_NAME], { USER_ID: "" });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /user identity is not available/);
+    assert.deepEqual(smCalls(), []);
+  });
+
+  it("accepts the session's own namespace", () => {
+    const r = run(SECRET, [USER_ID, "get", KEY_NAME]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(smCalls().map((c) => c.input.SecretId), [`openclaw/user/${USER_ID}/${KEY_NAME}`]);
   });
 });

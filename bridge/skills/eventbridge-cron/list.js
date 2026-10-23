@@ -7,7 +7,7 @@ const {
   validateUserId,
   validateEnv,
   listCronRecords,
-  extractChannelInfo,
+  ownerUserId,
 } = require("./common");
 
 const DAY_NAMES = { "1": "Sunday", "2": "Monday", "3": "Tuesday", "4": "Wednesday", "5": "Thursday", "6": "Friday", "7": "Saturday",
@@ -77,29 +77,7 @@ async function main() {
   validateUserId(userId);
   validateEnv();
 
-  // Look up real userId from DynamoDB using channel info
-  const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-  const { DynamoDBDocumentClient, GetCommand } = require("@aws-sdk/lib-dynamodb");
-  const REGION = process.env.AWS_REGION;
-  const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
-
-  let realUserId = null;
-  try {
-    const { channel, channelTarget } = extractChannelInfo(userId);
-    const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }));
-    const channelKey = `${channel}:${channelTarget}`;
-    const resp = await docClient.send(new GetCommand({
-      TableName: IDENTITY_TABLE_NAME,
-      Key: { PK: `CHANNEL#${channelKey}`, SK: "PROFILE" },
-    }));
-    if (resp.Item) {
-      realUserId = resp.Item.userId;
-    }
-  } catch (err) {
-    // Fall through to using userId as-is
-  }
-
-  const records = await listCronRecords(realUserId || userId);
+  const records = await listCronRecords(ownerUserId(userId));
 
   if (records.length === 0) {
     console.log("No scheduled tasks found.");
