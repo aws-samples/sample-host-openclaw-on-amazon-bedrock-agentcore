@@ -87,14 +87,21 @@ class AgentCoreStack(Stack):
         # Deterministic ARN avoids CDK circular dependency when the role
         # references itself in its trust policy and inline policy.
         execution_role_arn_str = f"arn:aws:iam::{account}:role/{execution_role_name}"
+        # Only AgentCore (Runtime and the custom Browser below) assumes this role,
+        # and only for resources in this account and Region. Trust policy from
+        # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-permissions.html
         self.execution_role = iam.Role(
             self,
             "OpenClawExecutionRole",
             role_name=execution_role_name,
-            assumed_by=iam.CompositePrincipal(
-                iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-                iam.ServicePrincipal("bedrock.amazonaws.com"),
-                iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
+            assumed_by=iam.ServicePrincipal(
+                "bedrock-agentcore.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": account},
+                    "ArnLike": {
+                        "aws:SourceArn": f"arn:aws:bedrock-agentcore:{region}:{account}:*"
+                    },
+                },
             ),
         )
 

@@ -35,7 +35,9 @@ class SecurityStack(Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
-        # Allow CloudWatch Alarms to publish to KMS-encrypted SNS topics
+        # Allow CloudWatch Alarms to publish to KMS-encrypted SNS topics.
+        # Limited to this account's alarms (SNS "encrypted topics" guidance):
+        # https://docs.aws.amazon.com/sns/latest/dg/sns-key-management.html
         self.cmk.add_to_resource_policy(
             iam.PolicyStatement(
                 actions=[
@@ -46,6 +48,12 @@ class SecurityStack(Stack):
                     iam.ServicePrincipal("cloudwatch.amazonaws.com"),
                 ],
                 resources=["*"],
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": self.account},
+                    "ArnLike": {
+                        "aws:SourceArn": f"arn:aws:cloudwatch:{self.region}:{self.account}:alarm:*",
+                    },
+                },
             )
         )
 
