@@ -1090,6 +1090,13 @@ def verify_cron_event(event):
                 "statusCode": 403,
                 "body": "Schedule ownership verification failed",
             }
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{current_user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
+        if profile.get("accessStatus") == "DISABLED":
+            # Set by scripts/manage-allowlist.sh disable; no run, no delivery.
+            logger.warning("Schedule %s skipped: user is disabled", schedule_id)
+            return None, {"statusCode": 403, "body": "User is disabled"}
     except Exception as e:
         logger.error("Failed to verify schedule ownership: %s", e)
         return None, {

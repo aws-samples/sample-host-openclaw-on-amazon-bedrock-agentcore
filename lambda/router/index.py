@@ -14,12 +14,14 @@ Path routing:
   POST /webhook/line      — LINE Messaging API webhook (disabled until configured)
 """
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -231,6 +233,129 @@ def _get_feishu_tenant_token():
 # Webhook validation helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Async self-invocation authenticator
+# ---------------------------------------------------------------------------
+#
+# The handler re-enters itself via lambda:Invoke to finish processing after
+# ACK'ing the platform (see `_self_invoke_async`). The re-entry event carries
+# an HMAC over the channel, body and forwarded headers, keyed from the router's
+# webhook secret, so the re-entry branch only dispatches events this function
+# produced after the per-channel verifier passed.
+
+_ASYNC_DISPATCH_LABEL = b"openclaw-async-dispatch-v1"
+# Covers Lambda's async retries of a timed-out run (two retries of a run of up
+# to LAMBDA_TIMEOUT_SECONDS plus backoff). Older events are dropped rather than
+# answered hours late.
+_ASYNC_DISPATCH_MAX_AGE_SECONDS = 3 * LAMBDA_TIMEOUT_SECONDS + 600
+
+
+def _async_dispatch_key():
+    """Derive a dedicated subkey for signing async-dispatch envelopes.
+
+    The webhook secret is also Telegram's X-Telegram-Bot-Api-Secret-Token, so
+    the envelope is signed with a key derived from it, never with it directly.
+
+    Returns an empty bytes string when no webhook secret is configured; the
+    verifier treats that as fail-closed.
+    """
+    secret = _get_webhook_secret()
+    if not secret:
+        return b""
+    secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else secret
+    return hmac.new(secret_bytes, _ASYNC_DISPATCH_LABEL, hashlib.sha256).digest()
+
+
+def _canonical_async_dispatch_message(timestamp, nonce, channel, body, headers):
+    """Build the canonical byte string the MAC is computed over.
+
+    The body and headers can be arbitrarily large or structured; we hash each
+    before concatenating so field boundaries are unambiguous.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        body_bytes = bytes(body)
+    elif isinstance(body, str):
+        body_bytes = body.encode("utf-8")
+    else:
+        body_bytes = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    headers_bytes = json.dumps(
+        headers or {}, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+    body_digest = hashlib.sha256(body_bytes).hexdigest()
+    headers_digest = hashlib.sha256(headers_bytes).hexdigest()
+
+    return "|".join([
+        "v1",
+        str(timestamp),
+        str(nonce),
+        str(channel or ""),
+        body_digest,
+        headers_digest,
+    ]).encode("utf-8")
+
+
+def _sign_async_dispatch(channel, body, headers):
+    """Return the auth envelope that `_self_invoke_async` attaches to the event.
+
+    Returns None if no signing key is available; callers must then refuse to
+    dispatch rather than send an unsigned payload.
+    """
+    key = _async_dispatch_key()
+    if not key:
+        return None
+    timestamp = int(time.time())
+    nonce = uuid.uuid4().hex
+    message = _canonical_async_dispatch_message(timestamp, nonce, channel, body, headers)
+    mac = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return {"v": 1, "ts": timestamp, "nonce": nonce, "mac": mac}
+
+
+def _verify_async_dispatch(event):
+    """Verify the HMAC envelope on an incoming async-dispatch event.
+
+    Returns True only when the MAC matches a message built from the exact
+    channel/body/headers on the event and the timestamp is within the
+    allowed window. Any missing field, stale timestamp, or MAC mismatch is
+    rejected (fail-closed).
+    """
+    auth = event.get("_auth")
+    if not isinstance(auth, dict):
+        return False
+    if auth.get("v") != 1:
+        return False
+    ts = auth.get("ts")
+    nonce = auth.get("nonce")
+    provided_mac = auth.get("mac")
+    if not isinstance(ts, int) or not isinstance(nonce, str) or not isinstance(provided_mac, str):
+        return False
+    now = int(time.time())
+    if abs(now - ts) > _ASYNC_DISPATCH_MAX_AGE_SECONDS:
+        return False
+
+    message = _canonical_async_dispatch_message(
+        ts,
+        nonce,
+        event.get("_channel"),
+        event.get("_body"),
+        event.get("_headers", {}),
+    )
+    for attempt in range(2):
+        key = _async_dispatch_key()
+        if not key:
+            logger.error("Async dispatch verification failed: no webhook secret configured")
+            return False
+        expected_mac = hmac.new(key, message, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected_mac, provided_mac):
+            return True
+        if attempt == 0:
+            # The signer may hold a newer webhook secret than this container's
+            # cached copy (rotation); re-read it once before rejecting.
+            _token_cache.pop(WEBHOOK_SECRET_ID, None)
+    return False
+
+
 def validate_telegram_webhook(headers):
     """Validate Telegram webhook using X-Telegram-Bot-Api-Secret-Token header.
 
@@ -340,6 +465,7 @@ def _decrypt_feishu_event(encrypted_body):
     Returns the decrypted JSON string, or None on failure.
     """
     import base64
+    import binascii
 
     _, _, _, encrypt_key = _get_feishu_credentials()
     if not encrypt_key:
@@ -349,8 +475,20 @@ def _decrypt_feishu_event(encrypted_body):
     try:
         data = json.loads(encrypted_body) if isinstance(encrypted_body, str) else encrypted_body
         cipher_text = base64.b64decode(data["encrypt"])
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, binascii.Error) as e:
         logger.error("Feishu decrypt: bad input — %s", e)
+        return None
+
+    # Validate the decoded blob before handing any pointer to libcrypto:
+    # AES-CBC requires at least one 16-byte IV plus one 16-byte ciphertext
+    # block, and the ciphertext body must be an exact multiple of the block
+    # size. A shorter blob would yield an IV under 16 bytes, and libcrypto
+    # always reads 16.
+    if len(cipher_text) < 32 or (len(cipher_text) - 16) % 16 != 0:
+        logger.error(
+            "Feishu decrypt: invalid ciphertext length %d (must be >=32 and 16-byte aligned)",
+            len(cipher_text),
+        )
         return None
 
     key = hashlib.sha256(encrypt_key.encode("utf-8")).digest()
@@ -363,7 +501,11 @@ def _decrypt_feishu_event(encrypted_body):
         logger.error("Feishu decrypt failed: %s", e)
         return None
 
-    return decrypted.decode("utf-8")
+    try:
+        return decrypted.decode("utf-8")
+    except UnicodeDecodeError as e:
+        logger.error("Feishu decrypt: plaintext not valid UTF-8 — %s", e)
+        return None
 
 
 def _aes_cbc_decrypt(key, iv, data):
@@ -417,13 +559,23 @@ def _aes_cbc_decrypt(key, iv, data):
     libcrypto.EVP_aes_256_cbc.restype = ctypes.c_void_p
     libcrypto.EVP_aes_256_cbc.argtypes = []
 
+    # Enforce fixed-size key and IV buffers so a short input can never cause
+    # libcrypto to dereference past the end of a Python bytes buffer. AES-256
+    # requires a 32-byte key; AES-CBC requires a 16-byte IV.
+    if not isinstance(key, (bytes, bytearray)) or len(key) != 32:
+        raise RuntimeError("AES-256 key must be exactly 32 bytes")
+    if not isinstance(iv, (bytes, bytearray)) or len(iv) != 16:
+        raise RuntimeError("AES-CBC IV must be exactly 16 bytes")
+    key_buf = ctypes.create_string_buffer(bytes(key), 32)
+    iv_buf = ctypes.create_string_buffer(bytes(iv), 16)
+
     ctx = libcrypto.EVP_CIPHER_CTX_new()
     if not ctx:
         raise RuntimeError("EVP_CIPHER_CTX_new failed")
 
     try:
         cipher_type = libcrypto.EVP_aes_256_cbc()
-        rc = libcrypto.EVP_DecryptInit_ex(ctx, cipher_type, None, key, iv)
+        rc = libcrypto.EVP_DecryptInit_ex(ctx, cipher_type, None, key_buf, iv_buf)
         if rc != 1:
             raise RuntimeError("EVP_DecryptInit_ex failed")
 
@@ -472,10 +624,23 @@ def is_user_allowed(channel, channel_user_id):
     return False
 
 
+# Set by `scripts/manage-allowlist.sh disable` on USER#<id>/PROFILE. Blocks every
+# channel linked to that user and its scheduled tasks until `enable` clears it.
+ACCESS_DISABLED = "DISABLED"
+
+
+def _is_user_disabled(user_id):
+    profile = identity_table.get_item(
+        Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+    ).get("Item") or {}
+    return profile.get("accessStatus") == ACCESS_DISABLED
+
+
 def resolve_user(channel, channel_user_id, display_name=""):
     """Look up or create a user for the given channel identity.
 
-    Returns (user_id, is_new). Returns (None, False) if user is not allowed.
+    Returns (user_id, is_new). Returns (None, False) if user is not allowed,
+    including an enrolled user an operator has disabled.
     """
     channel_key = f"{channel}:{channel_user_id}"
     pk = f"CHANNEL#{channel_key}"
@@ -487,6 +652,9 @@ def resolve_user(channel, channel_user_id, display_name=""):
             owner = read_actor_owner(identity_table, channel_key)
             if owner and owner["userId"] != resp["Item"]["userId"]:
                 raise RouteUnavailable("Channel mapping conflicts with durable actor ownership")
+            if _is_user_disabled(resp["Item"]["userId"]):
+                logger.warning("User for %s is disabled; rejecting turn", channel_key)
+                return None, False
             return resp["Item"]["userId"], False
     except ClientError as e:
         logger.error("DynamoDB get_item failed: %s", e)
@@ -514,13 +682,27 @@ def get_or_create_session(user_id):
 # Cross-channel binding
 # ---------------------------------------------------------------------------
 
+BIND_CODE_BYTES = 10  # 80 bits -> 16 base32 characters
+
+
+def _generate_bind_code():
+    """Return a 16-character base32 bind code (80 bits from the OS CSPRNG).
+
+    Redemption has no attempt limiter, so the code itself carries the entropy:
+    guessing one live code at the API's throttle ceiling for its whole TTL
+    stays far below one in a billion. The base32 alphabet (A-Z, 2-7) has no
+    0/O or 1/I pairs to mistype.
+    """
+    return base64.b32encode(secrets.token_bytes(BIND_CODE_BYTES)).decode("ascii")
+
+
 def create_bind_code(user_id):
-    """Generate an 8-char bind code and store it in DynamoDB with TTL."""
+    """Generate a bind code and store it in DynamoDB with TTL."""
     try:
         route = _binding_route(user_id)
     except RouteUnavailable:
         return None
-    code = uuid.uuid4().hex[:8].upper()  # 16^8 = 4.3B keyspace
+    code = _generate_bind_code()
     ttl = int(time.time()) + BIND_CODE_TTL_SECONDS
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -544,6 +726,8 @@ def _binding_route(user_id):
     profile = identity_table.get_item(
         Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
     ).get("Item", {})
+    if profile.get("accessStatus") == ACCESS_DISABLED:
+        raise RouteUnavailable("User is disabled")
     route = get_or_create_session(user_id)
     owner = read_actor_owner(identity_table, route.actor_id)
     if (profile.get("runtimeEnrollment") != "V2" or profile.get("enrollmentActorId") != route.actor_id
@@ -1579,14 +1763,34 @@ def _upload_document_to_s3(data, namespace, kind):
 # Webhook handlers
 # ---------------------------------------------------------------------------
 
+LINK_DM_ONLY_MESSAGE = (
+    "Account linking only works in a direct message. "
+    "Open a 1:1 chat with me and send `link` there."
+)
+
+
+def _is_slack_dm(event):
+    """True for a plain message event in a 1:1 DM (not an app_mention or a channel)."""
+    if event.get("type") != "message":
+        return False
+    channel_type = event.get("channel_type")
+    if channel_type:
+        return channel_type == "im"
+    return str(event.get("channel", "")).startswith("D")
+
+
 def _is_bind_command(text):
-    """Check if the message is a bind-code command (e.g. 'link ABCD1234')."""
+    """Check if the message is a bind-code command (e.g. 'link ABCDEFGH23456723').
+
+    Accepts 8-32 alphanumeric characters: new codes are 16 characters, and
+    8-character codes issued before an upgrade stay redeemable until they expire.
+    """
     if not text:
         return False, ""
     parts = text.strip().split()
     if len(parts) == 2 and parts[0].lower() in ("link", "bind"):
         code = parts[1].strip().upper()
-        if len(code) == 8 and code.isalnum():
+        if 8 <= len(code) <= 32 and code.isascii() and code.isalnum():
             return True, code
     return False, ""
 
@@ -1750,8 +1954,12 @@ def handle_telegram(body):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "telegram")
 
-    # Handle link-accounts command (generate bind code for existing users)
+    # Handle link-accounts command (generate bind code for existing users).
+    # A bind code links whoever redeems it first, so it is only sent in a 1:1 chat.
     if _is_link_command(text):
+        if message.get("chat", {}).get("type") != "private" or str(chat_id) != user_id_tg:
+            send_telegram_message(chat_id, LINK_DM_ONLY_MESSAGE, token)
+            return
         code = create_bind_code(resolved_user_id)
         if not code:
             send_telegram_message(chat_id, "Account linking requires identity reconciliation.", token)
@@ -1947,8 +2155,12 @@ def handle_slack(body, headers=None):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "slack")
 
-    # Handle link-accounts command (generate bind code for existing users)
+    # Handle link-accounts command (generate bind code for existing users).
+    # A bind code links whoever redeems it first, so it is only sent in a DM.
     if _is_link_command(text):
+        if not _is_slack_dm(event):
+            send_slack_message(channel_id, LINK_DM_ONLY_MESSAGE, bot_token)
+            return {"statusCode": 200, "body": "ok"}
         code = create_bind_code(resolved_user_id)
         if not code:
             send_slack_message(channel_id, "Account linking requires identity reconciliation.", bot_token)
@@ -2026,7 +2238,11 @@ def handle_feishu(body, headers=None):
         if not decrypted:
             logger.error("Feishu: failed to decrypt event")
             return {"statusCode": 200, "body": "ok"}
-        event_data = json.loads(decrypted)
+        try:
+            event_data = json.loads(decrypted)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error("Feishu: decrypted payload is not valid JSON — %s", e)
+            return {"statusCode": 200, "body": "ok"}
         logger.info("Feishu: decrypted event successfully")
 
     # Feishu URL verification challenge (like Slack's url_verification)
@@ -2116,8 +2332,12 @@ def handle_feishu(body, headers=None):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "feishu")
 
-    # Handle link-accounts command
+    # Handle link-accounts command. A bind code links whoever redeems it
+    # first, so it is only sent in a 1:1 (p2p) chat.
     if _is_link_command(text):
+        if message.get("chat_type") != "p2p":
+            send_feishu_message(chat_id, LINK_DM_ONLY_MESSAGE.replace("`", ""))
+            return {"statusCode": 200, "body": "ok"}
         bind_code = create_bind_code(resolved_user_id)
         if not bind_code:
             send_feishu_message(chat_id, "Account linking requires identity reconciliation.")
@@ -2577,6 +2797,12 @@ def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
+        # Only dispatch events signed by `_self_invoke_async`, which runs after
+        # the per-channel signature check.
+        if not _verify_async_dispatch(event):
+            logger.warning("Async dispatch rejected: missing or invalid authenticator")
+            return {"statusCode": 401, "body": "Unauthorized"}
+
         channel = event.get("_channel")
         body = event.get("_body")
         headers = event.get("_headers", {})
@@ -2725,6 +2951,13 @@ def handler(event, context):
 
 def _self_invoke_async(channel, body, headers):
     """Invoke this Lambda asynchronously to process the webhook in the background."""
+    filtered_headers = {k: v for k, v in (headers or {}).items()
+                        if k.startswith(("x-slack-", "x-lark-"))}
+    auth = _sign_async_dispatch(channel, body, filtered_headers)
+    if auth is None:
+        # The receiver would reject an unsigned envelope; log the failure here.
+        logger.error("Self-invoke aborted: cannot sign async dispatch (no webhook secret)")
+        return
     try:
         lambda_client.invoke(
             FunctionName=LAMBDA_FUNCTION_NAME,
@@ -2733,8 +2966,8 @@ def _self_invoke_async(channel, body, headers):
                 "_async_dispatch": True,
                 "_channel": channel,
                 "_body": body,
-                "_headers": {k: v for k, v in (headers or {}).items()
-                             if k.startswith(("x-slack-", "x-lark-"))},
+                "_headers": filtered_headers,
+                "_auth": auth,
             }).encode(),
         )
     except Exception as e:

@@ -236,8 +236,10 @@ class TestEntry(unittest.TestCase):
         mock_async.assert_not_called()
 
     @patch.object(index, "handle_discord")
-    def test_async_dispatch(self, mock_handle):
-        index.handler({"_async_dispatch": True, "_channel": "discord", "_body": "{}", "_headers": {}}, None)
+    @patch.object(index, "_get_webhook_secret", return_value="test-webhook-secret")
+    def test_async_dispatch(self, _ws, mock_handle):
+        auth = index._sign_async_dispatch("discord", "{}", {})
+        index.handler({"_async_dispatch": True, "_channel": "discord", "_body": "{}", "_headers": {}, "_auth": auth}, None)
         mock_handle.assert_called_once_with("{}")
 
 

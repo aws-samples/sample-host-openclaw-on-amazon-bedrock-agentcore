@@ -119,9 +119,10 @@ Users can send photos alongside text messages. The system supports JPEG, PNG, GI
 
 By default, each channel creates a separate user identity. Link an unowned second channel to the canonical user before independently registering it. Existing independent owners are not merged:
 
-1. **On your first channel** (e.g., Telegram), send: `link`
-   - The bot responds with an 8-character code (e.g., `A1B2C3D4`) valid for 10 minutes
-2. **On your second channel** (e.g., Slack), send: `link A1B2C3D4`
+1. **In a direct message on your first channel** (e.g., Telegram), send: `link`
+   - The bot responds with a 16-character code (e.g., `K7QX2MFA4ZP3HRN5`) valid for 10 minutes
+   - In a group chat or channel the bot asks you to DM it instead and sends no code
+2. **On your second channel** (e.g., Slack), send: `link K7QX2MFA4ZP3HRN5`
    - The bot confirms the accounts are linked
 
 After linking, both channels route to the same user, the same AgentCore session, and the same conversation history. The bind code is stored in DynamoDB with a 10-minute TTL and deleted after use.
@@ -146,8 +147,12 @@ When an unauthorized user messages the bot, they receive a rejection message tha
 # Add a user to the allowlist
 ./scripts/manage-allowlist.sh add telegram:123456
 
-# Remove a user
+# Remove an allowlist entry (stops a user who has not registered yet from registering)
 ./scripts/manage-allowlist.sh remove telegram:123456
+
+# Block a registered user on every linked channel and cron; enable undoes it
+./scripts/manage-allowlist.sh disable telegram:123456
+./scripts/manage-allowlist.sh enable telegram:123456
 
 # List all allowed users
 ./scripts/manage-allowlist.sh list

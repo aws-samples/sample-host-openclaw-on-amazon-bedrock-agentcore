@@ -5,6 +5,8 @@
 #   ./scripts/manage-allowlist.sh add telegram:123456
 #   ./scripts/manage-allowlist.sh add slack:U789ABC
 #   ./scripts/manage-allowlist.sh remove telegram:123456
+#   ./scripts/manage-allowlist.sh disable telegram:123456
+#   ./scripts/manage-allowlist.sh enable telegram:123456
 #   ./scripts/manage-allowlist.sh list
 #
 # Uses the openclaw-identity DynamoDB table.
@@ -21,12 +23,14 @@ if [ -n "${AWS_PROFILE:-}" ]; then
 fi
 
 usage() {
-    echo "Usage: $0 {add|remove|list} [channel:user_id]"
+    echo "Usage: $0 {add|remove|disable|enable|list} [channel:user_id]"
     echo ""
     echo "Commands:"
-    echo "  add    <channel:user_id>  — Allow a user (e.g. telegram:123456)"
-    echo "  remove <channel:user_id>  — Revoke a user's access"
-    echo "  list                      — List all allowed users"
+    echo "  add     <channel:user_id>  — Allow a user to register (e.g. telegram:123456)"
+    echo "  remove  <channel:user_id>  — Stop a user who has not registered yet from registering"
+    echo "  disable <channel:user_id>  — Block a registered user on all linked channels and cron"
+    echo "  enable  <channel:user_id>  — Undo disable"
+    echo "  list                       — List all allowed users"
     echo ""
     echo "Environment:"
     echo "  AWS_REGION   — AWS region (default: us-west-2)"
@@ -68,8 +72,74 @@ cmd_remove() {
             \"PK\": {\"S\": \"ALLOW#${channel_key}\"},
             \"SK\": {\"S\": \"ALLOW\"}
         }"
-    echo "Done. $channel_key is no longer allowed."
-    echo "Note: If the user already has a session, they can still use it until it expires."
+    echo "Done. $channel_key is no longer allowed to register."
+    echo "Note: an already registered user keeps access. Run '$0 disable $channel_key' to block them."
+}
+
+# Resolve channel:user_id to the internal user ID it is bound to.
+resolve_user_id() {
+    local channel_key="$1"
+    local user_id
+    user_id=$(aws dynamodb get-item \
+        --table-name "$TABLE_NAME" \
+        --region "$REGION" \
+        $PROFILE_ARG \
+        --consistent-read \
+        --key "{
+            \"PK\": {\"S\": \"CHANNEL#${channel_key}\"},
+            \"SK\": {\"S\": \"PROFILE\"}
+        }" \
+        --query 'Item.userId.S' \
+        --output text)
+    if [[ ! "$user_id" =~ ^[A-Za-z0-9_-]+$ ]] || [ "$user_id" = "None" ]; then
+        echo "Error: $channel_key is not registered." >&2
+        exit 1
+    fi
+    echo "$user_id"
+}
+
+# Router and cron reject a user whose PROFILE has accessStatus = DISABLED.
+cmd_disable() {
+    local channel_key="$1"
+    local user_id now_iso
+    user_id=$(resolve_user_id "$channel_key")
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    echo "Disabling $user_id (bound to $channel_key)..."
+    aws dynamodb update-item \
+        --table-name "$TABLE_NAME" \
+        --region "$REGION" \
+        $PROFILE_ARG \
+        --key "{
+            \"PK\": {\"S\": \"USER#${user_id}\"},
+            \"SK\": {\"S\": \"PROFILE\"}
+        }" \
+        --condition-expression "attribute_exists(PK)" \
+        --update-expression "SET accessStatus = :disabled, disabledAt = :now" \
+        --expression-attribute-values "{
+            \":disabled\": {\"S\": \"DISABLED\"},
+            \":now\": {\"S\": \"${now_iso}\"}
+        }"
+    echo "Done. Messages on every channel linked to $user_id and its scheduled tasks are rejected from the next turn."
+}
+
+cmd_enable() {
+    local channel_key="$1"
+    local user_id
+    user_id=$(resolve_user_id "$channel_key")
+
+    echo "Enabling $user_id (bound to $channel_key)..."
+    aws dynamodb update-item \
+        --table-name "$TABLE_NAME" \
+        --region "$REGION" \
+        $PROFILE_ARG \
+        --key "{
+            \"PK\": {\"S\": \"USER#${user_id}\"},
+            \"SK\": {\"S\": \"PROFILE\"}
+        }" \
+        --condition-expression "attribute_exists(PK)" \
+        --update-expression "REMOVE accessStatus, disabledAt"
+    echo "Done. $user_id is enabled."
 }
 
 cmd_list() {
@@ -108,6 +178,14 @@ case "$1" in
     remove)
         [ $# -lt 2 ] && usage
         cmd_remove "$2"
+        ;;
+    disable)
+        [ $# -lt 2 ] && usage
+        cmd_disable "$2"
+        ;;
+    enable)
+        [ $# -lt 2 ] && usage
+        cmd_enable "$2"
         ;;
     list)
         cmd_list
