@@ -146,6 +146,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     buildUserIdentityContext: async () => "",
     extractSystemText: require("./system-messages").extractSystemText,
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
+    blockedGuardrailInput: require("./guardrail-scope").createBlockedInputRegistry(),
     reconcileToolHistory: require("./tool-history").reconcileToolHistory,
     buildInferenceConfig: require("./inference-config").buildInferenceConfig,
     temperatureOverride: undefined, guardrailConfig: undefined,
@@ -244,13 +245,10 @@ test("without an identity file the environment identity is used with the proxy's
   assert.match(metadata["openclaw.session_id"], /^ses-/);
 });
 
-test("an unbound proxy with no identity sends default-user, marked unbound", async () => {
+test("an unbound proxy with no identity makes no Bedrock call", async () => {
   const app = proxy({ identity: undefined, env: {}, bound: "" });
   await app.chat(MAIN);
-  const metadata = app.requests[0].input.requestMetadata;
-  assert.equal(metadata["openclaw.actor_id"], "default-user");
-  assert.equal(metadata["openclaw.identity"], "unbound");
-  assert.equal(metadata["openclaw.id_source"], "fallback");
+  assert.equal(app.requests.length, 0);
 });
 
 test("message content never reaches requestMetadata", async () => {

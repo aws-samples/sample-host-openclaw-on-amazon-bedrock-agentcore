@@ -83,6 +83,7 @@ function proxy({ guardrail = false } = {}) {
     sleep: async () => {}, bedrockClientOptions: () => ({}), bedrockStreamClientOptions: () => ({}), structuredClone,
     extractSystemText: require("./system-messages").extractSystemText,
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
+    blockedGuardrailInput: require("./guardrail-scope").createBlockedInputRegistry(),
     guardrailConfig: guardrail ? { guardrailIdentifier: "test-guard", guardrailVersion: "1" } : undefined,
     buildInferenceConfig: require("./inference-config").buildInferenceConfig,
     temperatureOverride: undefined,

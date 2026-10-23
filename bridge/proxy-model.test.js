@@ -30,7 +30,8 @@ test("each route obtains its ID from the OS entropy helper, including restored m
   assert.equal(new Set(records.map((record) => record.route_id)).size, 4);
 });
 
-for (const bound of [true, false]) {
+{
+  const bound = true;
   test(`request session IDs use fresh OS entropy and retain per-user reuse: bound=${bound}`, () => {
     let calls = 0;
     const ids = [];
@@ -120,6 +121,7 @@ function streaming(send, { subagent = false, subagentModel = "custom-subagent", 
       systemText: "system",
     }),
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
+    blockedGuardrailInput: require("./guardrail-scope").createBlockedInputRegistry(),
     reconcileToolHistory: require("./tool-history").reconcileToolHistory,
     guardrailConfig: { guardrailIdentifier: "test-guard", guardrailVersion: "1" },
     buildInferenceConfig: require("./inference-config").buildInferenceConfig,
