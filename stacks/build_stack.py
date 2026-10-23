@@ -19,6 +19,7 @@ stack, project, source bucket and log group names all end in -<suffix>.
 
 from aws_cdk import (
     CfnOutput,
+    Duration,
     RemovalPolicy,
     Stack,
     Token,
@@ -71,7 +72,9 @@ class BuildStack(Stack):
         )
 
         # --- S3 bucket for bridge source uploads ---------------------------------
-        # Receives a zip of bridge/ uploaded by scripts/codebuild-push.sh
+        # Receives a zip of bridge/ uploaded by scripts/codebuild-push.sh.
+        # Versioned so the script can start each build on the exact object
+        # version it uploaded (--source-version). Superseded uploads expire.
         self.source_bucket = s3.Bucket(
             self,
             "BuildSourceBucket",
@@ -80,7 +83,14 @@ class BuildStack(Stack):
             auto_delete_objects=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
-            versioned=False,
+            versioned=True,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="ExpireSupersededBuildSources",
+                    noncurrent_version_expiration=Duration.days(7),
+                    abort_incomplete_multipart_upload_after=Duration.days(1),
+                )
+            ],
         )
 
         # --- CloudWatch log group for build logs ---------------------------------

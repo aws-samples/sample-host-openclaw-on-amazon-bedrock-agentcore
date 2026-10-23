@@ -79,6 +79,12 @@ if ! [[ "$SLACK_USER_ID" =~ ^U[A-Z0-9]+$ ]]; then
 fi
 
 # --- Step 3: Add to allowlist ---
+# Hard check: the ID is written into the DynamoDB item JSON below.
+if ! [[ "$SLACK_USER_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
+    echo "ERROR: Slack member ID may only contain letters, digits, _ and -."
+    exit 1
+fi
+
 CHANNEL_KEY="slack:${SLACK_USER_ID}"
 NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
