@@ -35,6 +35,7 @@
     "router_get_route_burst_limit": 20,
     "router_reserved_concurrency": 0,
     "registration_open": false,
+    "telegram_groups_enabled": false,
     "cron_lambda_timeout_seconds": 900,
     "cron_lambda_memory_mb": 256,
     "cron_reserved_concurrency": 0,

@@ -34,6 +34,7 @@ AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-
 
 - Per-user Firecracker microVM isolation (AgentCore Runtime)
 - Multi-channel support (Telegram, Slack, Feishu, WhatsApp, Discord slash commands, LINE) with cross-channel account linking
+- Telegram groups (off by default): an allowlisted group gets its own shared session, memory and files, and the bot answers only @mentions, replies to its messages and `/command@YourBot` ([Telegram groups](docs/channels.md#telegram-groups))
 - Multimodal: text + image messages via Bedrock ConverseStream
 - Per-user model switching with a `/model` chat command, limited to an operator allowlist
 - STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
@@ -313,6 +314,7 @@ All tunable parameters are in `cdk.json`:
 | `router_get_route_burst_limit` | `20` | Per-route burst throttle for the same two `GET` routes |
 | `router_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Router. Caps the Router and guarantees it that many executions; also removes them from the account's unreserved pool, and Lambda rejects a reservation that would leave fewer than 100 unreserved, so the deploy fails in low-limit accounts. Each in-flight chat turn holds one Router execution for up to `router_lambda_timeout_seconds` |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
+| `telegram_groups_enabled` | `false` | If `false`, the bot ignores every Telegram group and supergroup message, commands included. If `true`, it answers allowlisted groups (`ALLOW#telegram_group:<chat_id>`) as the group's own identity. `registration_open` never applies to groups. See [Telegram groups](docs/channels.md#telegram-groups) |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
 | `image_version` | (see `cdk.json`) | Local build image tag. The SDK controller resolves the ECR digest and updates AgentCore Runtime configuration |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
@@ -346,7 +348,7 @@ Users can change the model that answers their own messages from any channel:
 | `/model <alias>` | Use that model for this user's messages, e.g. `/model opus` |
 | `/model default` | Go back to the deployment's `default_model_id` |
 
-The Router Lambda handles the command before anything reaches the agent and replies directly; the command is not part of the conversation. Only a message that starts with `/model` is a command (`/model@YourBot opus` also works in Telegram groups). In Slack, type a space before the slash (` /model opus`), otherwise the Slack client treats it as an unknown slash command and does not send it. In Discord, put the command in the `/ask` prompt (`/ask prompt: /model opus`).
+The Router Lambda handles the command before anything reaches the agent and replies directly; the command is not part of the conversation. Only a message that starts with `/model` is a command. `/model` is not available in [Telegram groups](docs/channels.md#telegram-groups): a group always uses the default model. In Slack, type a space before the slash (` /model opus`), otherwise the Slack client treats it as an unknown slash command and does not send it. In Discord, put the command in the `/ask` prompt (`/ask prompt: /model opus`).
 
 The choice is stored as `modelOverride` (the model ID, not the alias) on the user's `USER#<userId>` / `PROFILE` item in the identity table, so it applies on every linked channel and survives session idle timeouts and container recycling. The Router sends it with every chat invocation.
 
@@ -384,6 +386,7 @@ Telegram is the quick-start channel. Slack, Feishu, WhatsApp, Discord and LINE s
      --region $CDK_DEFAULT_REGION
    ```
 5. Set up the webhook (see Quick Start step 7)
+6. Optional: to use the bot in Telegram groups, set `telegram_groups_enabled` to `true` and follow [Telegram groups](docs/channels.md#telegram-groups)
 
 ### Slack
 

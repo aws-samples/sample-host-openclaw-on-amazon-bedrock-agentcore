@@ -19,6 +19,8 @@ const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
 // The contract server writes the bound user's identity here and sets USER_ID
 // ("channel:id") before OpenClaw runs a skill.
 const IDENTITY_FILE = "/tmp/current-identity.json";
+// Group conversations (one identity shared by a whole group) cannot schedule tasks.
+const GROUP_CHANNELS = new Set(["telegram_group"]);
 
 /**
  * Namespaces ("channel_id") of the user this AgentCore Runtime session is
@@ -330,6 +332,9 @@ function resolveScheduleDelivery(userId, { channel, channelTarget } = {}) {
       !identity.channelActorId.startsWith(`${identity.channel}:`) ||
       !identity.channelActorId.slice(identity.channel.length + 1)) {
     throw new Error("Current channel delivery identity is unavailable");
+  }
+  if (GROUP_CHANNELS.has(identity.channel) || GROUP_CHANNELS.has(identity.actorId.split(":", 1)[0])) {
+    throw new Error("Scheduled tasks are not available in group chats");
   }
   if (channel && channel !== identity.channel) {
     throw new Error("Schedule channel must match the current conversation");
