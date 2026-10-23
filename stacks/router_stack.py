@@ -114,6 +114,11 @@ class RouterStack(Stack):
                 description="Shared per-user AgentCore Runtime route resolution and admission",
             )],
             timeout=Duration.seconds(lambda_timeout),
+            # Webhooks are processed by an asynchronous self-invocation. Lambda's
+            # default two async retries would re-run a turn that timed out or
+            # crashed after the agent replied, so the user gets a duplicate turn.
+            # Mirrors stacks/cron_stack.py.
+            retry_attempts=0,
             memory_size=lambda_memory,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
