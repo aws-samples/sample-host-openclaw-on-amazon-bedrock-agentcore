@@ -4,6 +4,7 @@
 # Usage:
 #   ./scripts/manage-allowlist.sh add telegram:123456
 #   ./scripts/manage-allowlist.sh add slack:U789ABC
+#   ./scripts/manage-allowlist.sh add telegram_group:-1001234567890   (a Telegram group; see docs/channels.md)
 #   ./scripts/manage-allowlist.sh remove telegram:123456
 #   ./scripts/manage-allowlist.sh disable telegram:123456
 #   ./scripts/manage-allowlist.sh enable telegram:123456
@@ -31,6 +32,8 @@ usage() {
     echo "  disable <channel:user_id>  — Block a registered user on all linked channels and cron"
     echo "  enable  <channel:user_id>  — Undo disable"
     echo "  list                       — List all allowed users"
+    echo ""
+    echo "  A Telegram group is allowed with telegram_group:<chat_id> (e.g. telegram_group:-1001234567890)."
     echo ""
     echo "Environment:"
     echo "  AWS_REGION   — AWS region (default: us-west-2)"

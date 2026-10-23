@@ -1394,7 +1394,7 @@ for (const deadline of [false, true]) {
   });
 }
 
-async function createCronForIdentity(identity, args = []) {
+async function createCronForIdentity(identity, args = [], namespace = "telegram_123") {
   const schedules = [];
   const records = [];
   const errors = [];
@@ -1404,7 +1404,7 @@ async function createCronForIdentity(identity, args = []) {
     EVENTBRIDGE_ROLE_ARN: "scheduler-role", IDENTITY_TABLE_NAME: "identity", INTERNAL_USER_ID: "u1",
   };
   const processStub = {
-    env, argv: ["node", "create.js", "telegram_123", "rate(1 hour)", "UTC", "remind me", ...args],
+    env, argv: ["node", "create.js", namespace, "rate(1 hour)", "UTC", "remind me", ...args],
     exit(code) { throw new Error(`Skill exited with code ${code}: ${errors.join(" ")}`); },
   };
   const requireStub = (name) => {
@@ -1541,6 +1541,20 @@ for (const failedOperation of ["write", "rename"]) {
   });
 }
 
+test("a Telegram group turn is not streamed by the contract, so the router can thread the reply", async (t) => {
+  const deliveries = [];
+  const app = loadContract(t);
+  app.stubTelegramApi(deliveries);
+  const reply = await app.request({
+    ...owner, channel: "telegram_group", channelActorId: "telegram_group:-100777",
+    channelTarget: "-100777", action: "chat", message: "hello",
+  }, "POST", "/invocations", true);
+  assert.equal(reply.body.actorId, owner.actorId);
+  assert.equal(typeof reply.body.response, "string");
+  assert.notEqual(reply.body.streamed, true);
+  assert.deepEqual(deliveries, []);
+});
+
 test("Telegram fallback delivery uses the channel target instead of the canonical or sender identity", async (t) => {
   const deliveries = [];
   const app = loadContract(t);
@@ -1559,6 +1573,15 @@ test("Cron creation rejects missing delivery metadata and cannot infer Telegram 
   await assert.rejects(createCronForIdentity({
     actorId: "telegram:123", channel: "slack", channelActorId: "slack:U456", channelTarget: "C789",
   }, ["telegram", "123"]), /channel must match the current conversation/);
+});
+
+test("Cron creation is refused in a Telegram group, before any schedule is written", async () => {
+  const group = "telegram_group:-1001234567890";
+  for (const args of [[], ["", ""], ["telegram", "-1001234567890"]]) {
+    await assert.rejects(createCronForIdentity({
+      actorId: group, channel: "telegram_group", channelActorId: group, channelTarget: "-1001234567890",
+    }, args, "telegram_group_-1001234567890"), /not available in group chats/);
+  }
 });
 
 for (const args of [["", ""], ["slack", ""], ["", "C789"], ["", "", "named reminder"], [null, null]]) {

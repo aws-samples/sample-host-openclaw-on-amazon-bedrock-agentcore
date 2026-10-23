@@ -185,3 +185,24 @@ test("the system prompt names the Feishu channel instead of unknown", async () =
   assert.equal((await app.request()).status, 200);
   assert.match(app.model[0].system.map((block) => block.text || "").join(""), /on channel: feishu\./);
 });
+
+test("a Telegram group gets its own namespace and the shared-group rules in the system prompt", async () => {
+  const group = "telegram_group:-1001234567890";
+  const app = proxy(group);
+  app.identity({ actorId: group, channel: "telegram_group",
+    channelActorId: group, channelTarget: "-1001234567890" });
+  assert.equal((await app.request()).status, 200);
+  assert.deepEqual(app.cognito, [group]);
+  assert.ok(app.s3.length > 0);
+  assert.ok(app.s3.every((request) => request.Key.startsWith("telegram_group_-1001234567890/")));
+  const system = JSON.stringify(app.model[0].system);
+  assert.match(system, /on channel: telegram_group/);
+  assert.match(system, /shared group chat/);
+  assert.match(system, /Scheduled tasks \(cron\) are not available in group chats/);
+});
+
+test("a private chat's system prompt has no group rules", async () => {
+  const app = proxy("slack:owner");
+  assert.equal((await app.request()).status, 200);
+  assert.doesNotMatch(JSON.stringify(app.model[0].system), /shared group chat/);
+});

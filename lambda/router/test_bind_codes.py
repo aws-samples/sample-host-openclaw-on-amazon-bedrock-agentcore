@@ -88,8 +88,18 @@ class TestTelegramLink(_LinkCommandBase):
         self.assertIn(CODE, send.call_args[0][1])
 
     def test_group_chats_get_no_code(self):
-        for chat in ({"id": -100000002, "type": "group"}, {"id": -100000003, "type": "supergroup"},
-                     {"id": 100000009, "type": "private"}, {"id": 100000001}):
+        # Groups are ignored outright while telegram_groups_enabled is off, and a
+        # group never reaches the sender's link flow when it is on.
+        for groups_enabled in (False, True):
+            for chat in ({"id": -100000002, "type": "group"}, {"id": -100000003, "type": "supergroup"}):
+                with self.subTest(chat=chat, groups_enabled=groups_enabled), \
+                        patch.object(index, "TELEGRAM_GROUPS_ENABLED", groups_enabled), \
+                        patch.object(index, "_telegram_bot_username", return_value="TestBot"):
+                    self.create_bind_code.reset_mock()
+                    send = self._send(chat)
+                    self.create_bind_code.assert_not_called()
+                    self.assertFalse(any(CODE in str(c) for c in send.call_args_list))
+        for chat in ({"id": 100000009, "type": "private"}, {"id": 100000001}):
             with self.subTest(chat=chat):
                 self.create_bind_code.reset_mock()
                 send = self._send(chat)

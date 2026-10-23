@@ -70,6 +70,9 @@ class RouterStack(Stack):
         get_rate_limit = context_int(self, "router_get_route_rate_limit", 10)
         get_burst_limit = context_int(self, "router_get_route_burst_limit", 20)
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
+        # Telegram groups: off by default, so every group message is ignored.
+        telegram_groups_enabled = str(
+            self.node.try_get_context("telegram_groups_enabled") or "false").lower() == "true"
         # Per-user `/model` switching: validated at synth so a bad map never deploys.
         user_selectable_models = parse_user_selectable_models(
             self.node.try_get_context(MODEL_SELECTION_KEY))
@@ -142,6 +145,7 @@ class RouterStack(Stack):
                 "LINE_TOKEN_SECRET_ID": line_token_secret_name,
                 "WEBHOOK_SECRET_ID": webhook_secret_name,
                 "REGISTRATION_OPEN": registration_open,
+                "TELEGRAM_GROUPS_ENABLED": "true" if telegram_groups_enabled else "false",
                 "USER_FILES_BUCKET": user_files_bucket_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
                 "RUNTIME_TARGET": json.dumps(runtime_target, separators=(",", ":")),
