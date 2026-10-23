@@ -41,14 +41,14 @@ try {
     for (const skill of onDisk) {
       const entry = persisted[skill];
       const tag = entry
-        ? ` (installed by you${entry.version ? `, v${entry.version}` : ""}; reinstalled automatically in new sessions)`
+        ? ` (installed by you${entry.version ? `, v${entry.version}` : ""}; reinstalled automatically in new sessions${entry.integrity ? "" : ", not checksum-verified"})`
         : "";
       console.log(`  - ${skill}${tag}`);
     }
   }
   if (pending.length > 0) {
     console.log(
-      `\nRecorded for automatic reinstall but not on disk yet (${pending.length}) — the reinstall runs a few seconds after a session starts; if a skill stays here, its last reinstall failed:\n`,
+      `\nRecorded for automatic reinstall but not on disk yet (${pending.length}) — the reinstall runs a few seconds after a session starts; if a skill stays here, its last reinstall failed or its downloaded files no longer matched the recorded checksum (install it again to accept the current files):\n`,
     );
     for (const skill of pending) {
       const v = persisted[skill].version;

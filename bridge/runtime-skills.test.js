@@ -469,6 +469,137 @@ describe("runtime-skills.reinstallFromManifest", () => {
   });
 });
 
+describe("runtime-skills integrity", () => {
+  let dir;
+  let skillsDir;
+  let manifestFile;
+  beforeEach(() => {
+    dir = mkTmp("rs-integrity-");
+    skillsDir = path.join(dir, "skills");
+    fs.mkdirSync(skillsDir);
+    manifestFile = path.join(dir, "state", "runtime-skills.json");
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  /** A fake clawhub that writes `files` (relpath -> content) for each slug. */
+  function serving(files) {
+    const calls = [];
+    const run = async (args) => {
+      calls.push(args);
+      const slug = args[1];
+      const root = path.join(skillsDir, slug);
+      for (const [rel, content] of Object.entries(files[slug] || {})) {
+        fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+        fs.writeFileSync(path.join(root, rel), content);
+      }
+      fs.mkdirSync(path.join(root, ".clawhub"), { recursive: true });
+      fs.writeFileSync(path.join(root, ".clawhub", "origin.json"), JSON.stringify({ installedVersion: "1.0.0", installedAt: Date.now() }));
+      return { stdout: "", stderr: "" };
+    };
+    return { run, calls };
+  }
+
+  const v1 = { "SKILL.md": "---\nname: alpha\n---\n", "scripts/run.js": "console.log(1)\n" };
+
+  it("computeSkillIntegrity is stable across installs, ignores clawhub metadata, and changes with content, names or symlinks", () => {
+    placeSkill(skillsDir, "alpha", { version: "1.0.0" });
+    fs.mkdirSync(path.join(skillsDir, "alpha", "lib"));
+    fs.writeFileSync(path.join(skillsDir, "alpha", "lib", "a.js"), "a");
+    const first = rs.computeSkillIntegrity("alpha", skillsDir);
+    assert.ok(rs.isValidIntegrity(first), first);
+    fs.writeFileSync(path.join(skillsDir, "alpha", ".clawhub", "origin.json"), JSON.stringify({ installedAt: 2 }));
+    assert.equal(rs.computeSkillIntegrity("alpha", skillsDir), first, ".clawhub metadata is excluded");
+    fs.writeFileSync(path.join(skillsDir, "alpha", "lib", "a.js"), "b");
+    const changed = rs.computeSkillIntegrity("alpha", skillsDir);
+    assert.notEqual(changed, first);
+    fs.renameSync(path.join(skillsDir, "alpha", "lib", "a.js"), path.join(skillsDir, "alpha", "lib", "c.js"));
+    assert.notEqual(rs.computeSkillIntegrity("alpha", skillsDir), changed);
+    const beforeLink = rs.computeSkillIntegrity("alpha", skillsDir);
+    fs.symlinkSync("/etc/hostname", path.join(skillsDir, "alpha", "link"));
+    assert.notEqual(rs.computeSkillIntegrity("alpha", skillsDir), beforeLink);
+    assert.equal(rs.computeSkillIntegrity("absent", skillsDir), null);
+    assert.equal(rs.computeSkillIntegrity("../alpha", skillsDir), null);
+  });
+
+  it("isValidIntegrity accepts only sha256:<64 hex>", () => {
+    assert.equal(rs.isValidIntegrity(`sha256:${"a".repeat(64)}`), true);
+    for (const bad of [null, undefined, "", `sha256:${"A".repeat(64)}`, `sha512:${"a".repeat(64)}`, `sha256:${"a".repeat(63)}`, 42]) {
+      assert.equal(rs.isValidIntegrity(bad), false, String(bad));
+    }
+  });
+
+  it("recordInstall stores the integrity; read/write round-trip it; an invalid value drops the entry", () => {
+    const integrity = `sha256:${"b".repeat(64)}`;
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { integrity, log: quietLog });
+    rs.recordInstall(manifestFile, "beta", "1.0.0", { integrity: "garbage", log: quietLog });
+    const m = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(m.skills.alpha.integrity, integrity);
+    assert.equal(Object.hasOwn(m.skills.beta, "integrity"), false, "invalid value is not written");
+    fs.writeFileSync(manifestFile, JSON.stringify({ version: 1, skills: { alpha: { version: "1.0.0", integrity: "sha256:zz" } } }));
+    const bad = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(bad.invalid, 1);
+    assert.deepEqual(bad.skills, {});
+  });
+
+  it("reinstall verifies a recorded integrity and loads matching files", async () => {
+    const { run } = serving({ alpha: v1 });
+    await run(rs.installArgs("alpha", "1.0.0", skillsDir));
+    const integrity = rs.computeSkillIntegrity("alpha", skillsDir);
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { integrity, log: quietLog });
+    fs.rmSync(path.join(skillsDir, "alpha"), { recursive: true });
+    const log = collectingLog();
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log });
+    assert.equal(r.reinstalled, 1);
+    assert.equal(r.failed, 0);
+    assert.equal(r.unverified, 0);
+    assert.equal(rs.isSkillPresent("alpha", skillsDir), true);
+    assert.ok(log.lines.some((l) => /Reinstalled alpha@1\.0\.0 \(checksum verified\)/.test(l)), log.lines.join("\n"));
+  });
+
+  it("reinstall removes files that do not match the recorded integrity and reports a failure", async () => {
+    const original = serving({ alpha: v1 });
+    await original.run(rs.installArgs("alpha", "1.0.0", skillsDir));
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { integrity: rs.computeSkillIntegrity("alpha", skillsDir), log: quietLog });
+    fs.rmSync(path.join(skillsDir, "alpha"), { recursive: true });
+    const before = fs.readFileSync(manifestFile, "utf8");
+    const swapped = serving({ alpha: { ...v1, "scripts/run.js": "console.log(2)\n" } });
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run: swapped.run, log: quietLog });
+    assert.equal(r.reinstalled, 0);
+    assert.equal(r.failed, 1);
+    assert.match(r.results[0].error, /do not match the checksum/);
+    assert.equal(fs.existsSync(path.join(skillsDir, "alpha")), false, "mismatching files must not stay where OpenClaw loads skills");
+    assert.equal(fs.readFileSync(manifestFile, "utf8"), before, "manifest untouched");
+  });
+
+  it("entries recorded before integrity existed still reinstall, counted as unverified", async () => {
+    fs.mkdirSync(path.dirname(manifestFile), { recursive: true });
+    fs.writeFileSync(manifestFile, JSON.stringify({ version: 1, skills: { alpha: { version: "1.0.0", installedAt: "2026-01-01T00:00:00.000Z" }, beta: { version: null } } }));
+    const { run, calls } = serving({ alpha: v1, beta: { "SKILL.md": "x" } });
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.equal(r.reinstalled, 2);
+    assert.equal(r.unverified, 2);
+    assert.equal(r.failed, 0);
+    assert.deepEqual(calls.map((a) => a.slice(0, 4)), [["install", "alpha", "--version", "1.0.0"], ["install", "beta", "--no-input", "--workdir"]]);
+  });
+
+  it("stops starting installs once the total budget is used and defers the rest", async () => {
+    for (const slug of ["alpha", "beta", "gamma"]) rs.recordInstall(manifestFile, slug, "1.0.0", { log: quietLog });
+    let clock = 0;
+    const calls = [];
+    const run = async (args) => {
+      calls.push(args[1]);
+      clock += 100;
+      const err = new Error("ETIMEDOUT");
+      throw err;
+    };
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog, totalBudgetMs: 150, now: () => clock });
+    assert.deepEqual(calls, ["alpha", "beta"]);
+    assert.equal(r.failed, 2);
+    assert.equal(r.deferred, 1);
+    assert.deepEqual(r.results.find((x) => x.slug === "gamma"), { slug: "gamma", version: "1.0.0", status: "deferred" });
+  });
+});
+
 describe("runtime-skills.watchManifest", () => {
   let dir;
   let watcher;
@@ -545,12 +676,13 @@ describe("runtime-skills.watchManifest", () => {
 describe("agentcore-contract.js wiring", () => {
   const source = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
 
-  it("awaits required skill restoration before activating the prepared gateway", () => {
+  it("awaits skill restoration before activating the prepared gateway without making it a readiness gate", () => {
     const reinstall = source.indexOf("await runtimeSkills.reinstallFromManifest(");
     const activate = source.indexOf("await preparedGateway.activate(");
     assert.ok(reinstall > 0 && activate > reinstall);
     assert.match(source, /runtimeSkills\.manifestPath\(OPENCLAW_DIR\)/);
-    assert.match(source, /if \(skills\.failed \|\| skills\.corrupt \|\| skills\.invalid\) throw new Error/);
+    assert.doesNotMatch(source, /Required runtime skills could not be restored/, "restore outcome must not gate readiness");
+    assert.match(source, /Runtime skills partly restored/);
   });
 
   it("backs the manifest up to S3 on change via watchManifest + workspaceSync.saveFile, started with the periodic save", () => {

@@ -48,7 +48,7 @@ node {baseDir}/list.js
 
 ## Notes
 
-- Installs go to `/skills` and are recorded, with the installed version pinned, in the user's persistent state (`~/.openclaw/runtime-skills.json`). `/skills` itself does not survive a cold start, so a few seconds after a new session starts the bridge reinstalls every recorded skill in the background. Until that finishes (a few seconds per skill) a recorded skill may briefly be missing; `list_skills` shows any that are still pending or whose reinstall failed.
+- Installs go to `/skills` and are recorded, with the installed version pinned and a checksum of the installed files, in the user's persistent state (`~/.openclaw/runtime-skills.json`). A reinstall whose downloaded files no longer match that checksum is discarded; install the skill again to accept the new files. `/skills` itself does not survive a cold start, so a few seconds after a new session starts the bridge reinstalls every recorded skill in the background. Until that finishes (a few seconds per skill) a recorded skill may briefly be missing; `list_skills` shows any that are still pending or whose reinstall failed.
 - OpenClaw picks a newly installed or removed skill up when it next refreshes its skill list (on file change, or at the latest at the next session start).
 - Installs never bypass ClawHub's security review: a skill flagged as suspicious or malicious is refused with an explanation rather than installed. Tell the user why and do not retry with other flags.
 - Only valid ClawHub skill names are accepted (letters, numbers, hyphens; no `@owner/` prefix).

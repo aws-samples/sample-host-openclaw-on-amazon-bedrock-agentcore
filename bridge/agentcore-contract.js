@@ -1719,7 +1719,12 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
       manifestFile: runtimeSkills.manifestPath(OPENCLAW_DIR), log: console, run: runRuntimeSkillInstall,
     });
     checkpoint();
-    if (skills.failed || skills.corrupt || skills.invalid) throw new Error("Required runtime skills could not be restored");
+    // Not a readiness gate: an entry that can never be restored would
+    // otherwise block this user's every session. Missing skills show up in
+    // clawhub-manage list.js.
+    if (skills.failed || skills.deferred || skills.corrupt || skills.invalid) {
+      console.warn(`[contract] Runtime skills partly restored: total=${skills.total} reinstalled=${skills.reinstalled} present=${skills.present} failed=${skills.failed} deferred=${skills.deferred} corrupt=${skills.corrupt} invalid=${skills.invalid}`);
+    }
     activationScope.mark("skills");
     logActivationPhase("config_skills_ready");
 

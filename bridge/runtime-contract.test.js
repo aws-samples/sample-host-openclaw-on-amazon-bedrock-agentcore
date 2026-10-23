@@ -687,6 +687,17 @@ test("poisoned bootstrap stays unhealthy without user activation", async (t) => 
   assert.ok(!app.calls.includes("secrets"));
 });
 
+test("runtime skills that could not be restored do not block USER_READY", async (t) => {
+  const app = loadContract(t, {
+    skills: Promise.resolve({ total: 3, reinstalled: 0, present: 0, failed: 2, deferred: 1, corrupt: true, invalid: 1 }),
+  });
+  await tick();
+  const result = await app.request({ ...owner, action: "chat", message: { text: "hi" } });
+  assert.equal(result.body.phase, "USER_READY", app.errors.join("\n"));
+  assert.equal(result.body.response, "reply");
+  assert.equal(app.activations.length, 1);
+});
+
 test("HTTP chat activates the same child after restore, config, migration and skills, then waits for readiness", async (t) => {
   const restore = deferred();
   const skills = deferred();
