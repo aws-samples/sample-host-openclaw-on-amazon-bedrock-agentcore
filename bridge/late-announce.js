@@ -22,6 +22,12 @@
  * - Each announce run id is handled at most once per container.
  * - The destination is the route of the latest turn, which the contract has
  *   already checked against the runtime's user binding.
+ * - The announce run does not say which turn spawned the sub-agent, so the
+ *   latest route is only known to be the spawning conversation while this
+ *   activation has served a single conversation (channel + chat). Once a
+ *   second one appears (a group chat, another linked channel), announces are
+ *   not delivered: the answer stays in the transcript for the next turn
+ *   rather than going to a chat that may not have asked for it.
  */
 const { isSubagentSessionKey } = require("./chat-run-filter");
 
@@ -54,6 +60,11 @@ function boundedSet(limit) {
   };
 }
 
+/** Where a reply to this route goes: the channel and its chat. */
+function conversationKey(route) {
+  return JSON.stringify([route.channel ?? null, route.channelTarget ?? null]);
+}
+
 function bufferText(payload) {
   const content = payload?.message?.content;
   if (typeof content === "string") return content;
@@ -75,6 +86,8 @@ function createLateAnnounceRelay({
   const pending = [];
   const activeTurns = new Set();
   let route = null;
+  let firstConversation = null; // channel + chat of the first routed turn
+  let multipleConversations = false;
   let closed = false;
   let timer = null;
   let draining = null;
@@ -94,6 +107,10 @@ function createLateAnnounceRelay({
       const target = route;
       if (!target) {
         log?.warn?.("[late-announce] No delivery route yet; announce run not delivered");
+        continue;
+      }
+      if (multipleConversations) {
+        log?.warn?.("[late-announce] Runtime served more than one conversation; announce run not delivered");
         continue;
       }
       try {
@@ -131,7 +148,12 @@ function createLateAnnounceRelay({
   const beginTurn = (turnRoute) => {
     const token = {};
     activeTurns.add(token);
-    if (turnRoute && typeof turnRoute === "object") route = Object.freeze({ ...turnRoute });
+    if (turnRoute && typeof turnRoute === "object") {
+      route = Object.freeze({ ...turnRoute });
+      const conversation = conversationKey(route);
+      if (firstConversation === null) firstConversation = conversation;
+      else if (conversation !== firstConversation) multipleConversations = true;
+    }
     if (timer) {
       clearTimeout(timer);
       timer = null;

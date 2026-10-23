@@ -170,14 +170,43 @@ describe("late announce relay", () => {
     relay.close();
   });
 
-  it("sends to the latest turn's route", async () => {
+  it("sends to the latest turn's route while every turn used the same chat", async () => {
     const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "X" } });
     relay.beginTurn(ROUTE).end();
-    const group = { ...ROUTE, channelTarget: "-100<telegram_id>" };
-    relay.beginTurn(group).end();
+    // A cron turn to the same chat (older schedules carry no channelActorId).
+    relay.beginTurn({ ...ROUTE, channelActorId: null }).end();
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     await relay.idle();
-    assert.equal(delivered[0].route.channelTarget, "-100<telegram_id>");
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].route.channelTarget, ROUTE.channelTarget);
+    relay.close();
+  });
+
+  it("does not send a private chat's announce into a group chat used later (#148)", async () => {
+    const warnings = [];
+    const delivered = [];
+    const relay = createLateAnnounceRelay({
+      settleMs: 10, log: { ...quiet, warn: (...args) => warnings.push(args.join(" ")) },
+      fetchAnswer: async () => "private research result",
+      deliver: async (text, route) => { delivered.push({ text, route }); },
+    });
+    relay.beginTurn(ROUTE).end(); // spawns the sub-agent in the private chat
+    relay.beginTurn({ ...ROUTE, channelTarget: "-100<telegram_id>" }).end(); // later group turn
+    relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
+    await relay.idle();
+    assert.deepEqual(delivered, []);
+    assert.ok(warnings.some((line) => line.includes("more than one conversation")));
+    relay.close();
+  });
+
+  it("does not deliver when a second conversation starts before the held announce drains", async () => {
+    const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "X" } });
+    const first = relay.beginTurn(ROUTE);
+    relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
+    first.end();
+    relay.beginTurn({ ...ROUTE, channel: "slack", channelActorId: "slack:U0XXXXXXX", channelTarget: "C0XXXXXXX" }).end();
+    await relay.idle();
+    assert.deepEqual(delivered, []);
     relay.close();
   });
 
