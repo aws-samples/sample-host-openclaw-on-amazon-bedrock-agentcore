@@ -1578,7 +1578,9 @@ test("Cron optional empty arguments preserve owner and channel validation", asyn
   const identity = { actorId: "telegram:123", channel: "slack", channelActorId: "slack:U456", channelTarget: "C789" };
   await assert.rejects(createCronForIdentity(identity, ["telegram", ""]), /channel must match the current conversation/);
   await assert.rejects(createCronForIdentity(identity, [" ", ""]), /channel must match the current conversation/);
-  await assert.rejects(createCronForIdentity({ ...identity, actorId: "telegram:999" }, ["", ""]), /namespace does not match/);
+  // validateUserId refuses another owner before create.js resolves delivery.
+  await assert.rejects(createCronForIdentity({ ...identity, actorId: "telegram:999" }, ["", ""]),
+    /does not match the user this session belongs to/);
   await assert.rejects(createCronForIdentity({ ...identity, channelActorId: "telegram:123" }, ["", ""]), /delivery identity is unavailable/);
 });
 

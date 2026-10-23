@@ -12,7 +12,7 @@ const {
   resolveScheduleName,
   getCronRecord,
   deleteCronRecord,
-  extractChannelInfo,
+  ownerUserId,
 } = require("./common");
 
 async function main() {
@@ -27,28 +27,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Look up real userId from DynamoDB
-  const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-  const { DynamoDBDocumentClient, GetCommand } = require("@aws-sdk/lib-dynamodb");
-  const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
-
-  let realUserId = null;
-  try {
-    const { channel, channelTarget } = extractChannelInfo(userId);
-    const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }));
-    const channelKey = `${channel}:${channelTarget}`;
-    const resp = await docClient.send(new GetCommand({
-      TableName: IDENTITY_TABLE_NAME,
-      Key: { PK: `CHANNEL#${channelKey}`, SK: "PROFILE" },
-    }));
-    if (resp.Item) {
-      realUserId = resp.Item.userId;
-    }
-  } catch (err) {
-    // Fall through
-  }
-
-  const lookupUserId = realUserId || userId;
+  const lookupUserId = ownerUserId(userId);
 
   // Verify the schedule exists for this user
   const record = await getCronRecord(lookupUserId, scheduleId);

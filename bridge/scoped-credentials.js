@@ -1,9 +1,11 @@
 /**
- * Scoped S3 Credentials — Per-user IAM isolation via STS session policies.
+ * Scoped Credentials — Per-user IAM scoping via STS session policies.
  *
- * Creates STS AssumeRole session credentials that restrict S3 access to
- * a single user's namespace prefix. Prevents cross-user data access even
- * if OpenClaw's bash/code execution tools are used to call the AWS CLI/SDK.
+ * Creates STS AssumeRole session credentials for the OpenClaw process whose
+ * AWS access (S3, Secrets Manager, DynamoDB, EventBridge Scheduler) is limited
+ * to a single user's resources: the user's S3 prefix, the user's
+ * openclaw/user/<namespace>/ secrets, the user's USER#<id> identity-table
+ * partition and the user's openclaw-<namespace>- schedules.
  *
  * Usage:
  *   const { createScopedCredentials, writeCredentialFiles, buildOpenClawEnv } = require("./scoped-credentials");
@@ -81,74 +83,137 @@ const FORWARDED_ENV_KEYS = [
   "INTERNAL_USER_ID",
 ];
 
+// EventBridge schedule names are "openclaw-<namespace>-<8 hex id>", capped at
+// 64 characters. A namespace longer than 46 characters is named
+// "openclaw-<first 33>-<12-hex sha256 of the namespace>-<id>", the same rule as
+// buildScheduleName in skills/eventbridge-cron/common.js. The session policy
+// matches that prefix only. The pre-digest name of a long namespace
+// ("openclaw-<first 46>-<id>") is not granted: two namespaces that share their
+// first 46 characters share it.
+const SCHEDULE_NAME_PREFIX = "openclaw-";
+const SCHEDULE_NAMESPACE_MAX = 64 - SCHEDULE_NAME_PREFIX.length - "-00000000".length;
+
+function scheduleNamePrefix(namespace) {
+  if (namespace.length <= SCHEDULE_NAMESPACE_MAX) return `${SCHEDULE_NAME_PREFIX}${namespace}-`;
+  const digest = require("crypto").createHash("sha256").update(namespace).digest("hex").slice(0, 12);
+  return `${SCHEDULE_NAME_PREFIX}${namespace.slice(0, SCHEDULE_NAMESPACE_MAX - 13)}-${digest}-`;
+}
+
+// Internal user IDs ("user_<hex>") are placed in an IAM condition value, so
+// they must not carry IAM wildcards or JSON metacharacters.
+const VALID_INTERNAL_USER_ID = /^[a-zA-Z0-9_-]{1,128}$/;
+
+// AWS rejects a session policy whose plain-text JSON exceeds 2048 characters.
+const MAX_SESSION_POLICY_LENGTH = 2048;
+
 /**
- * Build an IAM session policy JSON string that scopes S3 access to a user's namespace.
+ * Build the IAM session policy for one user's scoped credentials.
+ *
+ * The effective permissions are the intersection of this policy and the
+ * execution role, so every statement names only the resources that belong to
+ * this user. A statement whose resource cannot be named (missing table, group
+ * or role) is left out rather than widened.
  *
  * @param {object} opts
  * @param {string} opts.bucket - S3 bucket name
  * @param {string} opts.namespace - User namespace (e.g. "telegram_12345")
- * @param {string} [opts.cmkArn] - KMS CMK ARN for encrypted bucket
+ * @param {string} [opts.internalUserId] - Internal user ID ("user_<hex>"); scopes DynamoDB to USER#<id>
  * @param {string} [opts.eventbridgeRoleArn] - EventBridge scheduler role ARN for iam:PassRole
- * @param {string} [opts.identityTableArn] - DynamoDB identity table ARN (scopes DynamoDB access)
- * @param {string} [opts.scheduleGroupArn] - EventBridge schedule group ARN (scopes scheduler access)
+ * @param {string} [opts.identityTableArn] - DynamoDB identity table ARN
+ * @param {string} [opts.scheduleGroupArn] - EventBridge schedule group ARN
+ * @param {string} [opts.region] - AWS region
+ * @param {string} [opts.account] - AWS account ID
  * @returns {string} JSON policy document
  */
-function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn, eventbridgeRoleArn, identityTableArn, scheduleGroupArn, region, account }) {
+function buildSessionPolicy({ bucket, namespace, internalUserId, eventbridgeRoleArn, identityTableArn, scheduleGroupArn, region, account }) {
   validateNamespace(namespace);
+  if (internalUserId !== undefined && internalUserId !== null &&
+      (typeof internalUserId !== "string" || !VALID_INTERNAL_USER_ID.test(internalUserId))) {
+    throw new Error("Invalid internalUserId for session policy");
+  }
 
-  // EventBridge Scheduler resources:
-  // - CRUD actions (Create/Update/Delete/Get) operate on individual schedules
-  //   ARN format: arn:aws:scheduler:REGION:ACCOUNT:schedule/GROUP/SCHEDULE
-  // - ListSchedules operates on the schedule-group resource
-  const scheduleCrudArn = scheduleGroupArn
-    ? scheduleGroupArn.replace(":schedule-group/", ":schedule/") + "/*"
-    : "*";
-  const scheduleListArn = scheduleGroupArn || "*";
+  const statements = [
+    {
+      Effect: "Allow",
+      // AbortMultipartUpload: workspace-sync uploads large SQLite snapshots
+      // as multipart uploads and aborts a failed one so no billed parts linger.
+      Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+      Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
+    },
+    {
+      // Listing is limited to the user's own prefix (skills and workspace-sync
+      // always list "<namespace>/..."). A listing without a prefix is refused.
+      Effect: "Allow",
+      Action: "s3:ListBucket",
+      Resource: `arn:aws:s3:::${bucket}`,
+      Condition: { StringLike: { "s3:prefix": `${namespace}/*` } },
+    },
+  ];
 
-  // DynamoDB resources: table + GSI indexes
-  const dynamoResources = identityTableArn
-    ? [identityTableArn, `${identityTableArn}/index/*`]
-    : "*";
+  if (region && account) {
+    // api-keys skill: secrets live at openclaw/user/<namespace>/<key>. The
+    // trailing "/" keeps telegram_1 from matching telegram_12's secrets.
+    statements.push({
+      Effect: "Allow",
+      Action: [
+        "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret",
+        "secretsmanager:DeleteSecret", "secretsmanager:TagResource",
+      ],
+      Resource: `arn:aws:secretsmanager:${region}:${account}:secret:openclaw/user/${namespace}/*`,
+    });
+  }
+  // ListSecrets has no resource-level permissions. The api-keys skill uses it
+  // (prefix-filtered) for `list` and the per-user secret limit; it returns
+  // secret names and metadata, never values.
+  statements.push({ Effect: "Allow", Action: "secretsmanager:ListSecrets", Resource: "*" });
 
-  // Build a minimal session policy that fits within the 2048-byte AWS packed limit.
-  // The execution role (attached to the runtime) provides the broad permissions.
-  // This session policy only RESTRICTS to the user's namespace — it cannot grant
-  // permissions the role doesn't have. So we only need S3 namespace scoping here.
-  // DynamoDB/Scheduler/SecretsManager scoping is enforced at the application level
-  // (skill scripts validate namespace before every operation).
-  const policy = {
-    Version: "2012-10-17",
-    Statement: [
-      {
-        Effect: "Allow",
-        // AbortMultipartUpload: workspace-sync uploads large SQLite snapshots
-        // as multipart uploads and aborts a failed one so no billed parts linger.
-        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
-        Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
+  if (identityTableArn && internalUserId) {
+    // eventbridge-cron skill: CRON# items under the user's own partition only.
+    // Every granted action names a partition key, so LeadingKeys is always set.
+    statements.push({
+      Effect: "Allow",
+      Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query"],
+      Resource: identityTableArn,
+      Condition: { "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": [`USER#${internalUserId}`] } },
+    });
+  }
+
+  if (scheduleGroupArn) {
+    // eventbridge-cron skill: only schedules named for this user.
+    statements.push({
+      Effect: "Allow",
+      Action: ["scheduler:CreateSchedule", "scheduler:GetSchedule", "scheduler:UpdateSchedule", "scheduler:DeleteSchedule"],
+      Resource: `${scheduleGroupArn.replace(":schedule-group/", ":schedule/")}/${scheduleNamePrefix(namespace)}*`,
+    });
+  }
+
+  if (eventbridgeRoleArn) {
+    statements.push({
+      Effect: "Allow",
+      Action: "iam:PassRole",
+      Resource: eventbridgeRoleArn,
+      Condition: { StringEquals: { "iam:PassedToService": "scheduler.amazonaws.com" } },
+    });
+  }
+
+  // KMS only on behalf of the services above (S3 objects, the identity table
+  // and Secrets Manager); no direct KMS API calls.
+  statements.push({
+    Effect: "Allow",
+    Action: ["kms:Decrypt", "kms:GenerateDataKey"],
+    Resource: "*",
+    Condition: {
+      StringLike: {
+        "kms:ViaService": ["s3", "dynamodb", "secretsmanager"].map((s) => `${s}.${region || "*"}.amazonaws.com`),
       },
-      {
-        Effect: "Allow",
-        Action: "s3:ListBucket",
-        Resource: `arn:aws:s3:::${bucket}`,
-      },
-      // Scheduler, DynamoDB, SecretsManager, KMS, PassRole — allowed by the
-      // execution role; no further restriction needed in the session policy.
-      // Application-level namespace enforcement in skill scripts provides isolation.
-      {
-        Effect: "Allow",
-        Action: [
-          "scheduler:*",
-          "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
-          "kms:Decrypt", "kms:GenerateDataKey",
-          "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets", "secretsmanager:TagResource",
-          "iam:PassRole",
-        ],
-        Resource: "*",
-      },
-    ],
-  };
+    },
+  });
 
-  return JSON.stringify(policy);
+  const policy = JSON.stringify({ Version: "2012-10-17", Statement: statements });
+  if (policy.length > MAX_SESSION_POLICY_LENGTH) {
+    throw new Error(`Session policy is ${policy.length} characters; the limit is ${MAX_SESSION_POLICY_LENGTH}`);
+  }
+  return policy;
 }
 
 /**
@@ -164,7 +229,6 @@ async function createScopedCredentials(namespace, opts = {}) {
   validateNamespace(namespace);
   const bucket = process.env.S3_USER_FILES_BUCKET;
   const roleArn = process.env.EXECUTION_ROLE_ARN;
-  const cmkArn = process.env.CMK_ARN;
   const eventbridgeRoleArn = process.env.EVENTBRIDGE_ROLE_ARN;
   const region = process.env.AWS_REGION;
 
@@ -190,13 +254,8 @@ async function createScopedCredentials(namespace, opts = {}) {
     ? `arn:aws:scheduler:${region}:${account}:schedule-group/${scheduleGroup}`
     : undefined;
 
-  // Derive actorId from namespace (namespace uses underscores, actorId uses colons)
-  // e.g. namespace "telegram_123456" -> actorId "telegram:123456"
-  const actorId = namespace.replace(/_/, ":");
-
   const sessionPolicy = buildSessionPolicy({
-    bucket, namespace, actorId, internalUserId: opts.internalUserId,
-    cmkArn, eventbridgeRoleArn,
+    bucket, namespace, internalUserId: opts.internalUserId, eventbridgeRoleArn,
     identityTableArn, scheduleGroupArn, region, account,
   });
 
@@ -221,6 +280,10 @@ async function createScopedCredentials(namespace, opts = {}) {
   }
 
   const resp = await stsClient.send(command);
+  // How close the session policy is to the STS packed-size limit (percent).
+  if (Number.isFinite(resp.PackedPolicySize)) {
+    console.log("[scoped-creds] session policy packed size %d%%", resp.PackedPolicySize);
+  }
 
   const creds = {
     accessKeyId: resp.Credentials.AccessKeyId,

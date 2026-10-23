@@ -16,6 +16,54 @@ const CRON_LAMBDA_ARN = process.env.CRON_LAMBDA_ARN;
 const EVENTBRIDGE_ROLE_ARN = process.env.EVENTBRIDGE_ROLE_ARN;
 const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
 
+// The contract server writes the bound user's identity here and sets USER_ID
+// ("channel:id") before OpenClaw runs a skill.
+const IDENTITY_FILE = "/tmp/current-identity.json";
+
+/**
+ * Namespaces ("channel_id") of the user this AgentCore Runtime session is
+ * bound to, from the identity file and USER_ID. Empty when neither is set.
+ */
+function boundNamespaces() {
+  const namespaces = [];
+  try {
+    const identity = JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8"));
+    if (typeof identity?.actorId === "string" && identity.actorId) {
+      namespaces.push(identity.actorId.replace(/:/g, "_"));
+    }
+  } catch {
+    // No readable identity file: fall back to USER_ID alone.
+  }
+  if (process.env.USER_ID) namespaces.push(process.env.USER_ID.replace(/:/g, "_"));
+  return namespaces;
+}
+
+/**
+ * Exit unless userId is the namespace of the user this session is bound to.
+ * The scoped credentials only reach that user's resources, so any other
+ * namespace would fail at AWS anyway; this gives a clear error first.
+ */
+function assertOwnNamespace(userId) {
+  const bound = boundNamespaces();
+  if (bound.length === 0) {
+    console.error("Error: This session's user identity is not available.");
+    process.exit(1);
+  }
+  if (bound.some((namespace) => namespace !== userId)) {
+    console.error("Error: user_id does not match the user this session belongs to. Use the user_id from your system prompt.");
+    process.exit(1);
+  }
+}
+
+/**
+ * Internal user ID whose USER#<id> partition holds this user's CRON# records:
+ * the ID the contract server bound this session to (create.js stores records
+ * there too), or the namespace on deployments that do not set it.
+ */
+function ownerUserId(userId) {
+  return process.env.INTERNAL_USER_ID || userId;
+}
+
 /**
  * Validate that userId is present, not the default-user fallback,
  * and matches the expected channel_identifier namespace pattern.
@@ -39,6 +87,7 @@ function validateUserId(userId) {
     );
     process.exit(1);
   }
+  assertOwnNamespace(userId);
 }
 
 /**
@@ -272,7 +321,7 @@ function extractChannelInfo(userId) {
  * Read the current turn's delivery destination without changing its storage owner.
  */
 function resolveScheduleDelivery(userId, { channel, channelTarget } = {}) {
-  const identity = JSON.parse(fs.readFileSync("/tmp/current-identity.json", "utf8"));
+  const identity = JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8"));
   if (typeof identity.actorId !== "string" || identity.actorId.replace(/:/g, "_") !== userId) {
     throw new Error("Schedule namespace does not match the AgentCore Runtime owner");
   }
@@ -403,6 +452,8 @@ module.exports = {
   EVENTBRIDGE_ROLE_ARN,
   IDENTITY_TABLE_NAME,
   validateUserId,
+  assertOwnNamespace,
+  ownerUserId,
   validateEnv,
   validateExpression,
   validateTimezone,

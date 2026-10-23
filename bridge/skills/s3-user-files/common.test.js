@@ -89,25 +89,54 @@ describe("buildKey", () => {
   });
 });
 
+// validateUserId also requires the user_id to be this session's own user,
+// read from /tmp/current-identity.json or USER_ID ("channel:id").
+function asUser(actorId, fn) {
+  const saved = process.env.USER_ID;
+  if (actorId === undefined) delete process.env.USER_ID;
+  else process.env.USER_ID = actorId;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.USER_ID;
+    else process.env.USER_ID = saved;
+  }
+}
+
+function exitCodeOf(fn) {
+  const originalExit = process.exit;
+  let exitCode = null;
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("process.exit called");
+  };
+  try {
+    assert.throws(fn, /process\.exit/);
+  } finally {
+    process.exit = originalExit;
+  }
+  return exitCode;
+}
+
 describe("validateUserId", () => {
   it("accepts valid telegram namespace", () => {
-    assert.doesNotThrow(() => validateUserId("telegram_123456789"));
+    asUser("telegram:123456789", () => assert.doesNotThrow(() => validateUserId("telegram_123456789")));
   });
 
   it("accepts valid slack namespace", () => {
-    assert.doesNotThrow(() => validateUserId("slack_sen-outlook"));
+    asUser("slack:sen-outlook", () => assert.doesNotThrow(() => validateUserId("slack_sen-outlook")));
   });
 
   it("accepts valid discord namespace", () => {
-    assert.doesNotThrow(() => validateUserId("discord_123456789012345678"));
+    asUser("discord:123456789012345678", () => assert.doesNotThrow(() => validateUserId("discord_123456789012345678")));
   });
 
   it("accepts valid line namespace", () => {
-    assert.doesNotThrow(() => validateUserId("line_U0000000000000000000000000000001"));
+    asUser("line:U0000000000000000000000000000001", () => assert.doesNotThrow(() => validateUserId("line_U0000000000000000000000000000001")));
   });
 
   it("accepts valid slack namespace with uppercase ID", () => {
-    assert.doesNotThrow(() => validateUserId("slack_U0XXXXXXXX1"));
+    asUser("slack:U0XXXXXXXX1", () => assert.doesNotThrow(() => validateUserId("slack_U0XXXXXXXX1")));
   });
 
   it("rejects empty userId", () => {
@@ -169,5 +198,17 @@ describe("validateUserId", () => {
     } finally {
       process.exit = originalExit;
     }
+  });
+
+  it("rejects a valid namespace that is not this session's user", () => {
+    asUser("telegram:123456789", () => assert.equal(exitCodeOf(() => validateUserId("telegram_987654321")), 1));
+  });
+
+  it("rejects a longer namespace that shares the session user's prefix", () => {
+    asUser("telegram:1", () => assert.equal(exitCodeOf(() => validateUserId("telegram_12")), 1));
+  });
+
+  it("rejects every user_id when the session's user is unknown", () => {
+    asUser(undefined, () => assert.equal(exitCodeOf(() => validateUserId("telegram_123456789")), 1));
   });
 });
