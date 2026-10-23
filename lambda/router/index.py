@@ -38,6 +38,7 @@ from documents import (
     classify_document,
     zip_listing,
 )
+import telegram_group
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -54,6 +55,9 @@ WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
+# Off: every Telegram group/supergroup message is ignored. On: allowlisted groups
+# are answered as their own identity (see telegram_group.py).
+TELEGRAM_GROUPS_ENABLED = os.environ.get("TELEGRAM_GROUPS_ENABLED", "false").lower() == "true"
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
 # --- Clients (lazy init on cold start) ---
@@ -895,12 +899,25 @@ def _markdown_to_telegram_html(text):
     return text
 
 
-def send_telegram_message(chat_id, text, token):
+def _telegram_reply_fields(reply_to):
+    """sendMessage fields that thread a message under reply_to (a message ID)."""
+    if reply_to is None:
+        return {}
+    return {"reply_parameters": {"message_id": reply_to, "allow_sending_without_reply": True}}
+
+
+def _reply_kwargs(reply_to):
+    """Pass reply_to on only when set, so private-chat sends keep their old call shape."""
+    return {} if reply_to is None else {"reply_to": reply_to}
+
+
+def send_telegram_message(chat_id, text, token, reply_to=None):
     """Send a message via Telegram Bot API.
 
     Converts Markdown to Telegram HTML for rich formatting. Falls back to
     plain text if Telegram rejects the HTML (e.g., malformed tags). Returns
-    True if either send was accepted, False otherwise.
+    True if either send was accepted, False otherwise. reply_to threads the
+    message under that message ID (used in groups).
     """
     if not token:
         logger.error("No Telegram token available")
@@ -913,6 +930,7 @@ def send_telegram_message(chat_id, text, token):
         "chat_id": chat_id,
         "text": html_text,
         "parse_mode": "HTML",
+        **_telegram_reply_fields(reply_to),
     }).encode()
     req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
@@ -925,6 +943,7 @@ def send_telegram_message(chat_id, text, token):
     data = json.dumps({
         "chat_id": chat_id,
         "text": text,
+        **_telegram_reply_fields(reply_to),
     }).encode()
     req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
@@ -993,7 +1012,7 @@ def _split_telegram_text(text, limit=TELEGRAM_CHUNK_UTF16_UNITS):
     return chunks
 
 
-def _send_telegram_chunks(chat_id, text, token, limit=TELEGRAM_CHUNK_UTF16_UNITS, retry=True):
+def _send_telegram_chunks(chat_id, text, token, limit=TELEGRAM_CHUNK_UTF16_UNITS, retry=True, reply_to=None):
     """Send text as one or more Telegram messages within the UTF-16 limit.
 
     Each chunk goes through send_telegram_message (HTML, then plain text).
@@ -1004,7 +1023,7 @@ def _send_telegram_chunks(chat_id, text, token, limit=TELEGRAM_CHUNK_UTF16_UNITS
     chunks = _split_telegram_text(text, limit)
     delivered_all = True
     for n, chunk in enumerate(chunks, 1):
-        if send_telegram_message(chat_id, chunk, token):
+        if send_telegram_message(chat_id, chunk, token, **_reply_kwargs(reply_to)):
             continue
         size = _utf16_len(chunk)
         if retry and size > limit // 2:
@@ -1012,7 +1031,7 @@ def _send_telegram_chunks(chat_id, text, token, limit=TELEGRAM_CHUNK_UTF16_UNITS
                 "Telegram chunk %d/%d (%d UTF-16 units) rejected; retrying in smaller pieces",
                 n, len(chunks), size,
             )
-            if _send_telegram_chunks(chat_id, chunk, token, limit // 2, retry=False):
+            if _send_telegram_chunks(chat_id, chunk, token, limit // 2, retry=False, **_reply_kwargs(reply_to)):
                 continue
         else:
             logger.error(
@@ -1036,7 +1055,7 @@ def send_telegram_typing(chat_id, token):
         pass
 
 
-def _periodic_typing(chat_id, token, stop_event, interval=4, notify_after_s=30):
+def _periodic_typing(chat_id, token, stop_event, interval=4, notify_after_s=30, reply_to=None):
     """Send typing indicator every `interval` seconds until stop_event is set.
 
     Runs in a background thread. Telegram typing indicators expire after ~5s,
@@ -1056,6 +1075,7 @@ def _periodic_typing(chat_id, token, stop_event, interval=4, notify_after_s=30):
                 "\u23f3 Working on your request \u2014 this may take a few minutes. "
                 "I'll send the full response when it's ready.",
                 token,
+                **_reply_kwargs(reply_to),
             )
             notified = True
 
@@ -1576,6 +1596,84 @@ def _is_link_command(text):
     return text.strip().lower() in ("link accounts", "link account", "link")
 
 
+def _telegram_document_kind(document, doc_mime, reply):
+    """Classify a Telegram document, or reply with the reason and return None."""
+    doc_kind = classify_document(doc_mime, document.get("file_name", ""))
+    doc_size = document.get("file_size") or 0
+    doc_size = doc_size if isinstance(doc_size, int) else 0
+    if doc_kind is None:
+        logger.info("Telegram: rejected document kind=unsupported type=%r size=%d", doc_mime[:64], doc_size)
+        reply(UNSUPPORTED_DOCUMENT_REPLY)
+        return None
+    if doc_size > MAX_DOCUMENT_BYTES:
+        logger.info("Telegram: rejected document kind=%s size=%d reason=too_large", doc_kind, doc_size)
+        reply(DOCUMENT_TOO_LARGE_REPLY)
+        return None
+    return doc_kind
+
+
+def _telegram_agent_message(message, text, document, doc_kind, has_image, namespace, token, reply):
+    """Build the agent payload, storing any file or image under namespace.
+
+    Returns the plain text, or a structured message for a file or image, or
+    None after replying with the reason a file or image could not be used.
+    """
+    if doc_kind:
+        doc_bytes, reason = _download_telegram_document(document.get("file_id"), token)
+        if reason == "too_large":
+            logger.info("Telegram: rejected document kind=%s reason=too_large", doc_kind)
+            reply(DOCUMENT_TOO_LARGE_REPLY)
+            return None
+        if doc_bytes is None:
+            reply("Sorry, I couldn't download that file. Please try again.")
+            return None
+        listing = None
+        if doc_kind == KIND_ZIP:
+            try:
+                listing = zip_listing(doc_bytes)
+            except ZipListingError:
+                logger.info("Telegram: rejected document kind=zip size=%d reason=malformed", len(doc_bytes))
+                reply(BAD_ZIP_REPLY)
+                return None
+        s3_key = _upload_document_to_s3(doc_bytes, namespace, doc_kind)
+        if not s3_key:
+            reply("Sorry, I couldn't store that file. Please try again.")
+            return None
+        stored_name = s3_key[len(namespace) + 1:]
+        logger.info("Telegram: document accepted kind=%s size=%d", doc_kind, len(doc_bytes))
+        return build_document_message(
+            text, doc_kind, doc_bytes, stored_name, document.get("file_name", ""), listing,
+        )
+    if has_image:
+        image_bytes, content_type, _ = _download_telegram_image(message, token)
+        if not image_bytes:
+            reply("Sorry, I couldn't download that image. Please try again.")
+            return None
+        s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+        if not s3_key:
+            reply("Sorry, I couldn't process that image. Please try again.")
+            return None
+        return _build_structured_message(text, s3_key, content_type)
+    return text
+
+
+def _invoke_with_typing(chat_id, token, invoke, reply_to=None):
+    """Run invoke() while a background thread keeps the typing indicator on."""
+    stop_typing = threading.Event()
+    typing_thread = threading.Thread(
+        target=_periodic_typing,
+        args=(chat_id, token, stop_typing),
+        kwargs={"reply_to": reply_to} if reply_to is not None else {},
+        daemon=True,
+    )
+    typing_thread.start()
+    try:
+        return invoke()
+    finally:
+        stop_typing.set()
+        typing_thread.join(timeout=2)
+
+
 def handle_telegram(body):
     """Process a Telegram webhook update."""
     update = json.loads(body) if isinstance(body, str) else body
@@ -1603,7 +1701,19 @@ def handle_telegram(body):
         logger.warning("Telegram channel_user_id too long (%d chars), rejecting", len(user_id_tg))
         return
 
+    # A group is never answered as the sender's personal session.
+    kind = telegram_group.chat_kind(message)
+    if kind == "group":
+        _handle_telegram_group(message, text, document, doc_mime, has_image, has_document)
+        return
+    if kind != "private":
+        logger.info("Telegram: ignoring message from an unsupported chat type")
+        return
+
     token = _get_telegram_token()
+
+    def reply(reply_text):
+        send_telegram_message(chat_id, reply_text, token)
 
     # Handle bind commands BEFORE allowlist check — cross-channel binding
     # bypasses the allowlist since it links to an already-approved user.
@@ -1643,63 +1753,18 @@ def handle_telegram(body):
 
     doc_kind = None
     if has_document:
-        doc_kind = classify_document(doc_mime, document.get("file_name", ""))
-        doc_size = document.get("file_size") or 0
-        doc_size = doc_size if isinstance(doc_size, int) else 0
+        doc_kind = _telegram_document_kind(document, doc_mime, reply)
         if doc_kind is None:
-            logger.info("Telegram: rejected document kind=unsupported type=%r size=%d", doc_mime[:64], doc_size)
-            send_telegram_message(chat_id, UNSUPPORTED_DOCUMENT_REPLY, token)
-            return
-        if doc_size > MAX_DOCUMENT_BYTES:
-            logger.info("Telegram: rejected document kind=%s size=%d reason=too_large", doc_kind, doc_size)
-            send_telegram_message(chat_id, DOCUMENT_TOO_LARGE_REPLY, token)
             return
 
     # Send typing indicator
     send_telegram_typing(chat_id, token)
 
     # Build message payload (structured if image, plain string if text-only)
-    agent_message = text
-    if has_document:
-        namespace = actor_id.replace(":", "_")
-        doc_bytes, reason = _download_telegram_document(document.get("file_id"), token)
-        if reason == "too_large":
-            logger.info("Telegram: rejected document kind=%s reason=too_large", doc_kind)
-            send_telegram_message(chat_id, DOCUMENT_TOO_LARGE_REPLY, token)
-            return
-        if doc_bytes is None:
-            send_telegram_message(chat_id, "Sorry, I couldn't download that file. Please try again.", token)
-            return
-        listing = None
-        if doc_kind == KIND_ZIP:
-            try:
-                listing = zip_listing(doc_bytes)
-            except ZipListingError:
-                logger.info("Telegram: rejected document kind=zip size=%d reason=malformed", len(doc_bytes))
-                send_telegram_message(chat_id, BAD_ZIP_REPLY, token)
-                return
-        s3_key = _upload_document_to_s3(doc_bytes, namespace, doc_kind)
-        if not s3_key:
-            send_telegram_message(chat_id, "Sorry, I couldn't store that file. Please try again.", token)
-            return
-        stored_name = s3_key[len(namespace) + 1:]
-        agent_message = build_document_message(
-            text, doc_kind, doc_bytes, stored_name, document.get("file_name", ""), listing,
-        )
-        logger.info("Telegram: document accepted kind=%s size=%d", doc_kind, len(doc_bytes))
-    elif has_image:
-        namespace = actor_id.replace(":", "_")
-        image_bytes, content_type, _ = _download_telegram_image(message, token)
-        if image_bytes:
-            s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
-            if s3_key:
-                agent_message = _build_structured_message(text, s3_key, content_type)
-            else:
-                send_telegram_message(chat_id, "Sorry, I couldn't process that image. Please try again.", token)
-                return
-        else:
-            send_telegram_message(chat_id, "Sorry, I couldn't download that image. Please try again.", token)
-            return
+    namespace = actor_id.replace(":", "_")
+    agent_message = _telegram_agent_message(message, text, document, doc_kind, has_image, namespace, token, reply)
+    if agent_message is None:
+        return
 
     # Get or create session
     session_id = get_or_create_session(resolved_user_id)
@@ -1711,18 +1776,8 @@ def handle_telegram(body):
     )
 
     # Invoke AgentCore with periodic typing indicator
-    stop_typing = threading.Event()
-    typing_thread = threading.Thread(
-        target=_periodic_typing,
-        args=(chat_id, token, stop_typing),
-        daemon=True,
-    )
-    typing_thread.start()
-    try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message)
-    finally:
-        stop_typing.set()
-        typing_thread.join(timeout=2)
+    result = _invoke_with_typing(chat_id, token, lambda: invoke_agent_runtime(
+        session_id, resolved_user_id, actor_id, "telegram", agent_message))
     logger.info("AgentCore result keys: %s", list(result.keys()) if isinstance(result, dict) else type(result))
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
@@ -1737,6 +1792,210 @@ def handle_telegram(body):
     # Send response, split to Telegram's 4096 UTF-16-unit limit
     _send_telegram_chunks(chat_id, response_text, token)
     logger.info("Telegram response sent to chat_id=%s", chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Telegram groups (see telegram_group.py for the rules)
+# ---------------------------------------------------------------------------
+
+TELEGRAM_GROUP_LINK_MESSAGE = "Account linking only works in a private chat with me."
+TELEGRAM_GROUP_MODEL_MESSAGE = "Model switching is not available in group chats."
+TELEGRAM_GROUP_ALLOWED_MESSAGE = (
+    "This group is now allowed. Mention me, reply to one of my messages, or use a "
+    "/command@ with my name, and I'll answer here. This group has its own memory and "
+    "files, shared by everyone in it; nobody's private chat with me is used here."
+)
+TELEGRAM_GROUP_ALREADY_ALLOWED_MESSAGE = "This group is already allowed."
+TELEGRAM_GROUP_REFUSED_MESSAGE = (
+    "Only an admin of this group who is also an allowlisted user of this bot can allow the group."
+)
+TELEGRAM_GROUP_ALLOW_FAILED_MESSAGE = "Sorry, I couldn't allow this group. Please try again."
+
+# Bot user ID -> username, from getMe (stable for a token, so cached per container).
+_telegram_bot_usernames = {}
+
+
+def _telegram_api(method, payload, token, timeout=10):
+    """Call a Telegram Bot API method and return its result, or None on any failure."""
+    if not token:
+        return None
+    req = urllib_request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001 -- the caller treats every failure as "no answer"
+        logger.warning("Telegram %s failed: %s", method, type(e).__name__)
+        return None
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        return None
+    return body.get("result")
+
+
+def _telegram_bot_username(token):
+    """This bot's @username (without the @), or None if it cannot be read."""
+    bot_id = telegram_group.bot_id_from_token(token)
+    if bot_id is None:
+        return None
+    if bot_id in _telegram_bot_usernames:
+        return _telegram_bot_usernames[bot_id]
+    me = _telegram_api("getMe", {}, token)
+    username = me.get("username") if isinstance(me, dict) and me.get("id") == bot_id else None
+    if not isinstance(username, str) or not telegram_group.BOT_USERNAME_RE.fullmatch(username):
+        logger.warning("Telegram: bot username unavailable; only replies to the bot are answered in groups")
+        return None
+    _telegram_bot_usernames[bot_id] = username
+    return username
+
+
+def _is_telegram_group_allowed(group_id):
+    """True if ALLOW#telegram_group:<group_id> exists. Checked on every group message."""
+    try:
+        resp = identity_table.get_item(
+            Key={"PK": f"ALLOW#{telegram_group.CHANNEL}:{group_id}", "SK": "ALLOW"}, ConsistentRead=True,
+        )
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        logger.error("Telegram group allowlist check failed: %s", type(e).__name__)
+        return False
+    return "Item" in resp
+
+
+def _is_allowlisted_telegram_user(user_id_tg):
+    """True if the Telegram user is on the user allowlist.
+
+    Registration being open does not count: the user needs their own
+    ALLOW#telegram:<id> record.
+    """
+    try:
+        allowed = identity_table.get_item(
+            Key={"PK": f"ALLOW#telegram:{user_id_tg}", "SK": "ALLOW"}, ConsistentRead=True,
+        )
+        return "Item" in allowed
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        logger.error("Telegram user allowlist check failed: %s", type(e).__name__)
+        return False
+
+
+def _allow_telegram_group(message, group_id, user_id_tg, token, reply):
+    """/allowgroup@BotName: allowlist this group.
+
+    The sender must be an allowlisted user of the bot and, per Telegram's own
+    getChatMember answer, the group's creator or an administrator.
+    """
+    if not _is_allowlisted_telegram_user(user_id_tg):
+        logger.warning("Telegram: /allowgroup refused for group %s: sender is not an allowlisted user", group_id)
+        reply(TELEGRAM_GROUP_REFUSED_MESSAGE)
+        return
+    member = _telegram_api("getChatMember", {"chat_id": int(group_id), "user_id": int(user_id_tg)}, token)
+    status = member.get("status") if isinstance(member, dict) else None
+    if status not in telegram_group.ADMIN_STATUSES:
+        logger.warning("Telegram: /allowgroup refused for group %s: sender is not a group admin", group_id)
+        reply(TELEGRAM_GROUP_REFUSED_MESSAGE)
+        return
+    title = str((message.get("chat") or {}).get("title") or "")[:128]
+    channel_key = f"{telegram_group.CHANNEL}:{group_id}"
+    try:
+        identity_table.put_item(
+            Item={
+                "PK": f"ALLOW#{channel_key}", "SK": "ALLOW", "channelKey": channel_key,
+                "addedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "addedBy": f"telegram:{user_id_tg}", "groupTitle": title,
+            },
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+    except Exception as e:  # noqa: BLE001 -- reported to the admin
+        if getattr(e, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            reply(TELEGRAM_GROUP_ALREADY_ALLOWED_MESSAGE)
+            return
+        logger.error("Telegram: /allowgroup write failed: %s", type(e).__name__)
+        reply(TELEGRAM_GROUP_ALLOW_FAILED_MESSAGE)
+        return
+    logger.info("Telegram: group %s allowlisted by an admin", group_id)
+    reply(TELEGRAM_GROUP_ALLOWED_MESSAGE)
+
+
+def _handle_telegram_group(message, text, document, doc_mime, has_image, has_document):
+    """Answer a group message as the group's own identity, never the sender's."""
+    if not TELEGRAM_GROUPS_ENABLED:
+        logger.info("Telegram: group message ignored (telegram_groups_enabled is off)")
+        return
+    group_id = str((message.get("chat") or {}).get("id", ""))
+    user = message.get("from") or {}
+    user_id_tg = str(user.get("id", ""))
+    if (not telegram_group.GROUP_ID_RE.fullmatch(group_id) or not telegram_group.USER_ID_RE.fullmatch(user_id_tg)
+            or user.get("is_bot") or message.get("sender_chat")):
+        logger.info("Telegram: group message ignored (no individual sender)")
+        return
+
+    token = _get_telegram_token()
+    text = telegram_group.addressed_text(
+        message, text, telegram_group.bot_id_from_token(token), _telegram_bot_username(token),
+    )
+    if text is None:
+        logger.info("Telegram: group message ignored (not addressed to the bot)")
+        return
+
+    message_id = message.get("message_id")
+    reply_to = message_id if isinstance(message_id, int) and not isinstance(message_id, bool) else None
+
+    def reply(reply_text):
+        send_telegram_message(group_id, reply_text, token, reply_to=reply_to)
+
+    command, _ = (None, "") if (has_image or has_document) else telegram_group.parse_command(text)
+    if command == telegram_group.ALLOW_COMMAND:
+        _allow_telegram_group(message, group_id, user_id_tg, token, reply)
+        return
+    if not _is_telegram_group_allowed(group_id):
+        logger.info("Telegram: group message ignored (group %s is not allowlisted)", group_id)
+        return
+    if command == "model":
+        reply(TELEGRAM_GROUP_MODEL_MESSAGE)
+        return
+    if _is_bind_command(text)[0] or _is_link_command(text):
+        reply(TELEGRAM_GROUP_LINK_MESSAGE)
+        return
+
+    title = str((message.get("chat") or {}).get("title") or "")[:128]
+    group_user_id, _ = resolve_user(telegram_group.CHANNEL, group_id, title)
+    if group_user_id is None:
+        logger.warning("Telegram: group %s has no usable identity (disabled or not enrolled)", group_id)
+        return
+    session_id = get_or_create_session(group_user_id)
+    actor_id = f"{telegram_group.CHANNEL}:{group_id}"
+
+    doc_kind = None
+    if has_document:
+        doc_kind = _telegram_document_kind(document, doc_mime, reply)
+        if doc_kind is None:
+            return
+
+    send_telegram_typing(group_id, token)
+    namespace = actor_id.replace(":", "_")
+    agent_message = _telegram_agent_message(
+        message, telegram_group.agent_text(user, text or "hi"), document, doc_kind, has_image,
+        namespace, token, reply,
+    )
+    if agent_message is None:
+        return
+
+    image_count = 0 if isinstance(agent_message, str) else len(agent_message.get("images", []))
+    logger.info(
+        "Telegram group: user=%s actor=%s session=%s text_len=%d images=%d document=%s",
+        group_user_id, actor_id, session_id, len(text), image_count, doc_kind or "none",
+    )
+    # The group has its own session (and microVM), never the sender's.
+    result = _invoke_with_typing(group_id, token, lambda: invoke_agent_runtime(
+        session_id, group_user_id, actor_id, telegram_group.CHANNEL, agent_message), reply_to=reply_to)
+    response_text = result.get("response", "Sorry, I couldn't process your message.")
+    response_text = _extract_text_from_content_blocks(response_text)
+    if result.get("streamed"):
+        logger.info("Telegram group response already streamed by contract")
+        return
+    _send_telegram_chunks(group_id, response_text, token, reply_to=reply_to)
+    logger.info("Telegram group response sent to group %s", group_id)
 
 
 def handle_slack(body, headers=None):

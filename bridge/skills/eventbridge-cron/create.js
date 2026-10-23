@@ -48,6 +48,14 @@ async function main() {
   validateExpression(expression);
   validateTimezone(timezone);
 
+  // A Telegram group is one identity shared by the whole group: no scheduled tasks.
+  if (userId.startsWith("telegram_group_") || process.env.CHANNEL === "telegram_group" ||
+      channelArg === "telegram_group") {
+    console.error("Error: Scheduled tasks are not available in group chats.");
+    process.exit(1);
+    return;
+  }
+
   // Determine channel info
   const extracted = extractChannelInfo(userId);
   const channel = channelArg || extracted.channel;

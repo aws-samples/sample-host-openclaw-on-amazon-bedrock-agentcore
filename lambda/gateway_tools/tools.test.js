@@ -278,3 +278,15 @@ it("withErrorEnvelope logs a gateway_tool_error line and returns the envelope", 
   assert.equal(lines[0].tool, "create_schedule");
   assert.equal(lines[0].name, "AccessDeniedException");
 });
+
+describe("schedules in group chats", () => {
+  it("refuses to create a schedule for a Telegram group identity", async () => {
+    const { scheduler, handler } = cronHandler();
+    const out = await handler(
+      { expression: "rate(1 hour)", timezone: "UTC", message: "m", [RESERVED_ARG]: h.idToken("telegram_group:-1001234567890") },
+      h.gatewayContext("schedules", "create_schedule"),
+    );
+    assert.match(out.message || "", /not available in group chats/);
+    assert.equal(scheduler.sent.length, 0);
+  });
+});
