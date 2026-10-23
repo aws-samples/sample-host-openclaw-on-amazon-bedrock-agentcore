@@ -489,7 +489,8 @@ class AgentCoreStack(Stack):
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-S1",
                     reason="Server access logging not required for user file storage — "
-                    "CloudTrail S3 data events provide sufficient audit trail.",
+                    "object access is audited with CloudTrail S3 data events "
+                    "(cloudtrail_s3_data_events, or an organization trail).",
                 ),
             ],
         )

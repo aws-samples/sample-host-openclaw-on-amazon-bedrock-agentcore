@@ -27,27 +27,34 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import DeploymentNamer
+from stacks import _RETENTION_MAP, DeploymentNamer, retention_days
 
 NAMESPACE = "OpenClaw/Health"
 CONTAINER_LOG_GROUP = "/openclaw/container"
 CRON_LOG_GROUP = "/openclaw/lambda/cron"
 
 
-def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("container", "cron")) -> list:
+def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("container", "cron"),
+                      log_retention=None) -> list:
     """Add the filters and alarms for the given log groups to `scope`. Returns the alarms.
 
     On main, "container" goes in OpenClawObservability (phase 1) and "cron" in
     OpenClawTokenMonitoring (phase 3, deployed after OpenClawCron, which owns
     /openclaw/lambda/cron).
+
+    `log_retention` (days) is applied to /openclaw/container; it defaults to
+    the cloudwatch_log_retention_days context key like every other group.
     """
     stack = Stack.of(scope)
+    if log_retention is None:
+        log_retention = scope.node.try_get_context("cloudwatch_log_retention_days") or 30
     # The container creates /openclaw/container itself on first boot, so it may
     # not exist yet on a fresh deployment. Create it if missing. An existing
     # group (and its events) is left as it is, also when this stack is deleted.
     ensure_container_group = None
     if "container" in groups:
         ensure_container_group = _ensure_container_group(scope, stack)
+        _container_group_retention(scope, stack, ensure_container_group, log_retention)
     namer = DeploymentNamer.from_scope(scope)
     # The bridge writes /openclaw/container under a fixed name, so suffixed
     # environments in one account share it; the cron group is per environment.
@@ -90,6 +97,53 @@ def _ensure_container_group(scope, stack):
         apply_to_children=True,
     )
     return ensure
+
+
+def _container_group_retention(scope, stack, ensure, log_retention):
+    """Set retention on /openclaw/container.
+
+    createLogGroup (here or in the bridge on first boot) leaves the group with
+    no retention, so its events were kept forever. This sets the configured
+    retention on create, which also covers a group that already exists, and
+    again whenever the configured value changes. Deleting the stack leaves the
+    retention as it is.
+    """
+    # The same valid CloudWatch value retention_days() picks for the other groups.
+    wanted = retention_days(int(log_retention))
+    days = next(d for d, v in _RETENTION_MAP.items() if v == wanted)
+    call = cr.AwsSdkCall(
+        service="CloudWatchLogs",
+        action="putRetentionPolicy",
+        parameters={"logGroupName": CONTAINER_LOG_GROUP, "retentionInDays": days},
+        physical_resource_id=cr.PhysicalResourceId.of(f"{CONTAINER_LOG_GROUP}:retention"),
+    )
+    retention = cr.AwsCustomResource(
+        scope,
+        "ContainerLogGroupRetention",
+        on_create=call,
+        on_update=call,
+        policy=cr.AwsCustomResourcePolicy.from_statements([
+            iam.PolicyStatement(
+                actions=["logs:PutRetentionPolicy"],
+                resources=[
+                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:{CONTAINER_LOG_GROUP}",
+                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:{CONTAINER_LOG_GROUP}:*",
+                ],
+            ),
+        ]),
+        install_latest_aws_sdk=False,
+    )
+    retention.node.add_dependency(ensure)
+    cdk_nag.NagSuppressions.add_resource_suppressions(
+        retention,
+        [cdk_nag.NagPackSuppression(
+            id="AwsSolutions-IAM5",
+            reason="logs:PutRetentionPolicy on the single /openclaw/container log group (its ARN ends in :*).",
+            applies_to=[cdk_nag.RegexAppliesTo(regex="/^Resource::arn:aws:logs:.*:log-group:\\/openclaw\\/container:\\*$/")],
+        )],
+        apply_to_children=True,
+    )
+    return retention
 
 
 def _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_container_group, namer=None):

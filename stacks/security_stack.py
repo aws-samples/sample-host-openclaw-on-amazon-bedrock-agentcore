@@ -101,11 +101,13 @@ class SecurityStack(Stack):
                 auto_delete_objects=False,
             )
 
+            # RETAIN like the trail bucket: audit records outlive the stack.
+            # The group has a generated name, so a redeploy never collides.
             trail_log_group = logs.LogGroup(
                 self,
                 "CloudTrailLogGroup",
                 retention=retention_days(log_retention),
-                removal_policy=RemovalPolicy.DESTROY,
+                removal_policy=RemovalPolicy.RETAIN,
             )
 
             self.trail = cloudtrail.Trail(
@@ -118,6 +120,22 @@ class SecurityStack(Stack):
                 include_global_service_events=True,
                 enable_file_validation=True,
             )
+
+            # Optional S3 data events (object reads and writes) on the
+            # user-files bucket, which OpenClawAgentCore owns under this fixed
+            # name. Off by default: data events are billed per event, and an
+            # organization trail may already record them.
+            if str(self.node.try_get_context("cloudtrail_s3_data_events") or "false").lower() == "true":
+                user_files_bucket = s3.Bucket.from_bucket_name(
+                    self,
+                    "UserFilesBucketForTrail",
+                    namer.name(f"openclaw-user-files-{self.account}-{self.region}"),
+                )
+                self.trail.add_s3_event_selector(
+                    [cloudtrail.S3EventSelector(bucket=user_files_bucket)],
+                    read_write_type=cloudtrail.ReadWriteType.ALL,
+                    include_management_events=True,
+                )
 
         # --- Cognito User Pool (admin-provisioned identities) ---------------
         self.user_pool = cognito.UserPool(

@@ -245,7 +245,10 @@ To enable it, set `"enable_cloudtrail": true` in `cdk.json` and redeploy. This c
 | API call audit trail | Multi-region disabled (single-region deployment), global service events included |
 | File validation | Enabled — cryptographic integrity checks detect log tampering |
 | Storage | Dedicated S3 bucket (SSE-S3, versioned, SSL enforced, public access blocked) |
-| CloudWatch delivery | Trail logs also sent to CloudWatch log group for real-time analysis |
+| CloudWatch delivery | Trail logs also sent to CloudWatch log group for real-time analysis (retained when the stack is deleted, like the bucket) |
+| S3 data events | Off unless `"cloudtrail_s3_data_events": true`: then object reads and writes on the user-files bucket are recorded. Data events are billed per event |
+
+Per-user isolation on the user-files bucket is enforced by session-scoped credentials, so object-level records are the way to audit which namespace a principal read or wrote. If an organization trail already records S3 data events for this account, you do not need either flag.
 
 #### CloudWatch Dashboards
 
@@ -275,7 +278,11 @@ CloudWatch anomaly detector on `TotalTokens` metric (OpenClaw/TokenUsage namespa
 
 #### Bedrock Invocation Logging
 
-All Bedrock model invocations logged to `/aws/bedrock/invocation-logs` (text data only; image data delivery disabled for privacy). A subscription filter routes logs to the token metrics Lambda for processing.
+All Bedrock model invocations logged to `/aws/bedrock/invocation-logs` (image and embedding data delivery disabled). A subscription filter routes logs to the token metrics Lambda for processing.
+
+By default the records include the prompt and completion bodies (`textDataDeliveryEnabled`), so the group holds every user's conversation text, including tool output the agent read. Limit read access to this group to operators. Set `"bedrock_invocation_log_text": false` to keep only metadata (model, `requestMetadata` attribution) and token counts. Before switching it off, check that your records carry `input.cacheReadInputTokenCount` / `input.cacheWriteInputTokenCount`: for non-streaming calls the token metrics Lambda otherwise reads prompt-cache counts from the response body, and without the body those tokens are not costed.
+
+The Router does not log Telegram reply text unless `router_log_reply_text` is set (test deployments only). The `/openclaw/container` log group, which the container creates without retention, gets the `cloudwatch_log_retention_days` retention from `OpenClawObservability`.
 
 #### Namespace Restriction
 
