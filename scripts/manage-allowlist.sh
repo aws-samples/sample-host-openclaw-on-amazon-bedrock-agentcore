@@ -101,6 +101,7 @@ resolve_user_id() {
 # Router and cron reject a user whose PROFILE has accessStatus = DISABLED.
 cmd_disable() {
     local channel_key="$1"
+    validate_channel_key "$channel_key"
     local user_id now_iso
     user_id=$(resolve_user_id "$channel_key")
     now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -125,6 +126,7 @@ cmd_disable() {
 
 cmd_enable() {
     local channel_key="$1"
+    validate_channel_key "$channel_key"
     local user_id
     user_id=$(resolve_user_id "$channel_key")
 
