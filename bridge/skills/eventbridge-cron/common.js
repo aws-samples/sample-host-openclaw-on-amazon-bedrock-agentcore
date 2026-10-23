@@ -59,6 +59,38 @@ function validateEnv() {
   }
 }
 
+const MIN_INTERVAL_MINUTES = 5;
+
+/** Sorted minutes (0-59) a cron() minutes field fires on, or null for syntax it does not accept. */
+function cronMinutes(field) {
+  const minutes = new Set();
+  for (const part of field.split(",")) {
+    const m = part.match(/^(?:\*|(\d{1,2})(?:-(\d{1,2}))?)(?:\/(\d{1,2}))?$/);
+    if (!m) return null;
+    const step = m[3] === undefined ? 1 : Number(m[3]);
+    let start = 0;
+    let end = 59;
+    if (m[1] !== undefined) {
+      start = Number(m[1]);
+      // "5/10" starts at 5 and repeats to the end of the hour; a bare "5" is one minute.
+      end = m[2] !== undefined ? Number(m[2]) : m[3] !== undefined ? 59 : start;
+    }
+    if (step < 1 || start > end || end > 59) return null;
+    for (let minute = start; minute <= end; minute += step) minutes.add(minute);
+  }
+  return [...minutes].sort((a, b) => a - b);
+}
+
+/** Shortest time in minutes between two runs of a cron() minutes field, or null if the field is not accepted. */
+function cronMinuteGap(field) {
+  const minutes = cronMinutes(field);
+  if (!minutes) return null;
+  // From the hour's last run to the next hour's first run.
+  let gap = 60 - minutes[minutes.length - 1] + minutes[0];
+  for (let i = 1; i < minutes.length; i++) gap = Math.min(gap, minutes[i] - minutes[i - 1]);
+  return gap;
+}
+
 /**
  * Validate a schedule expression: cron(...), rate(...), or at(...).
  * - cron() must have exactly 6 space-separated fields (Minutes Hours Day Month DayOfWeek Year)
@@ -110,9 +142,18 @@ function validateExpression(expression) {
       process.exit(1);
     }
 
-    // Reject every-minute cron expressions (wildcard or */1 in minutes field)
+    // Reject cron expressions that run more often than every 5 minutes
+    // (*, */2, 0-59, 0/1, 0,1,2, ...): measure the minutes field's real gap.
     const minutesField = fields[0];
-    if (minutesField === "*" || minutesField === "*/1") {
+    const gap = cronMinuteGap(minutesField);
+    if (gap === null) {
+      console.error(
+        'Error: Unsupported cron() minutes field "%s". Use numbers 0-59 with , - * or /.',
+        minutesField,
+      );
+      process.exit(1);
+    }
+    if (gap < MIN_INTERVAL_MINUTES) {
       console.error(
         "Error: Every-minute cron expressions are not allowed. " +
         "Minimum interval is 5 minutes. Use */5 or higher.",
@@ -154,19 +195,62 @@ function generateScheduleId() {
   return randomBytes(4).toString("hex");
 }
 
+// EventBridge Scheduler names are at most 64 characters. "openclaw-" and
+// "-<8-hex id>" leave 46 for the userId namespace.
+const MAX_NAME_NAMESPACE = 64 - "openclaw-".length - 9;
+
 /**
  * Build the EventBridge schedule name from userId and scheduleId.
- * Format: openclaw-{userId}-{scheduleId}
- * EventBridge schedule names have a 64-character limit.
+ * Format: openclaw-{userId}-{scheduleId}. A userId longer than 46 characters
+ * keeps its first characters plus a digest of the whole userId, so two userIds
+ * that share their first 46 characters get different names.
+ * Same rule as lambda/gateway_tools/eventbridge_cron/index.js.
  */
 function buildScheduleName(userId, scheduleId) {
-  const prefix = "openclaw-";
-  const suffix = `-${scheduleId}`;
-  const maxUserIdLen = 64 - prefix.length - suffix.length;
-  const truncatedUserId = userId.length > maxUserIdLen
-    ? userId.slice(0, maxUserIdLen)
-    : userId;
-  return `${prefix}${truncatedUserId}${suffix}`;
+  if (userId.length <= MAX_NAME_NAMESPACE) return `openclaw-${userId}-${scheduleId}`;
+  const { createHash } = require("crypto");
+  const digest = createHash("sha256").update(userId).digest("hex").slice(0, 12);
+  return `openclaw-${userId.slice(0, MAX_NAME_NAMESPACE - 13)}-${digest}-${scheduleId}`;
+}
+
+/** The name a schedule of a userId longer than 46 characters had before the digest; null otherwise. */
+function legacyScheduleName(userId, scheduleId) {
+  return userId.length > MAX_NAME_NAMESPACE
+    ? `openclaw-${userId.slice(0, MAX_NAME_NAMESPACE)}-${scheduleId}`
+    : null;
+}
+
+/**
+ * Name of this user's schedule. Schedules created before long userIds got a
+ * digest keep their old name; that name is used only when the schedule there
+ * was created for this userId (its target input's actorId).
+ */
+async function resolveScheduleName(schedulerClient, userId, scheduleId) {
+  const name = buildScheduleName(userId, scheduleId);
+  const legacy = legacyScheduleName(userId, scheduleId);
+  if (!legacy) return name;
+  const { GetScheduleCommand } = require("@aws-sdk/client-scheduler");
+  const get = (Name) => schedulerClient.send(new GetScheduleCommand({ Name, GroupName: SCHEDULE_GROUP }));
+  try {
+    await get(name);
+    return name;
+  } catch (err) {
+    if (!err || err.name !== "ResourceNotFoundException") throw err;
+  }
+  let schedule;
+  try {
+    schedule = await get(legacy);
+  } catch (err) {
+    if (!err || err.name !== "ResourceNotFoundException") throw err;
+    return name;
+  }
+  let actorId = null;
+  try {
+    actorId = JSON.parse(schedule.Target?.Input || "{}").actorId;
+  } catch {
+    // Unreadable input: not provably this user's schedule.
+  }
+  return typeof actorId === "string" && actorId.replace(/:/g, "_") === userId ? legacy : name;
 }
 
 /**
@@ -322,8 +406,11 @@ module.exports = {
   validateEnv,
   validateExpression,
   validateTimezone,
+  cronMinuteGap,
   generateScheduleId,
   buildScheduleName,
+  legacyScheduleName,
+  resolveScheduleName,
   extractChannelInfo,
   resolveScheduleDelivery,
   getDynamoClient,

@@ -14,7 +14,7 @@ const {
   validateEnv,
   validateExpression,
   validateTimezone,
-  buildScheduleName,
+  resolveScheduleName,
   getCronRecord,
   updateCronRecord,
   extractChannelInfo,
@@ -95,8 +95,8 @@ async function main() {
     process.exit(1);
   }
 
-  const ebScheduleName = buildScheduleName(userId, scheduleId);
   const schedulerClient = new SchedulerClient({ region: REGION });
+  const ebScheduleName = await resolveScheduleName(schedulerClient, userId, scheduleId);
 
   // Get current schedule from EventBridge
   let currentSchedule;
