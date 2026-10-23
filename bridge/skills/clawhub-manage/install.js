@@ -5,10 +5,10 @@
  *
  * The skill is downloaded into /skills (where OpenClaw scans for skills and
  * where it can resolve /app/node_modules) and recorded, with its pinned
- * version, in the per-user manifest ~/.openclaw/runtime-skills.json. That
- * manifest is part of the state that survives a microVM cold start, and the
- * bridge reinstalls every skill in it in the background shortly after a new
- * session starts — /skills itself is not persisted.
+ * version and a sha256 of the installed files, in the per-user manifest
+ * ~/.openclaw/runtime-skills.json. That manifest is part of the state that
+ * survives a microVM cold start, and the bridge reinstalls every skill in it
+ * shortly after a new session starts — /skills itself is not persisted.
  *
  * No `--force`: clawhub uses that flag to bypass its "flagged for security
  * review" check in non-interactive mode. A flagged skill therefore fails here
@@ -38,6 +38,7 @@ if (runtimeSkills.isSkillPresent(skillName)) {
 }
 
 let installedVersion = null;
+let installedIntegrity = null;
 try {
   const output = execFileSync("clawhub", runtimeSkills.installArgs(skillName), {
     encoding: "utf-8",
@@ -49,6 +50,7 @@ try {
     throw new Error(`clawhub reported success but ${runtimeSkills.SKILLS_DIR}/${skillName}/SKILL.md is missing`);
   }
   installedVersion = runtimeSkills.readInstalledVersion(skillName);
+  installedIntegrity = runtimeSkills.computeSkillIntegrity(skillName);
   console.log(`Successfully installed skill: ${skillName}${installedVersion ? ` (v${installedVersion})` : ""}`);
   if (output.trim()) console.log(output.trim());
 } catch (err) {
@@ -70,11 +72,14 @@ try {
 // failure must not be reported as an install failure — the skill IS on disk —
 // but the user needs to know it will not persist.
 try {
-  runtimeSkills.recordInstall(manifestFile, skillName, installedVersion);
+  runtimeSkills.recordInstall(manifestFile, skillName, installedVersion, { integrity: installedIntegrity });
   runtimeSkills.mirrorManifest(manifestFile);
   console.log(
     "\nOpenClaw loads the skill when it next refreshes its skill list (on file change, or at the latest " +
-      "at the next session start). It is reinstalled automatically a few seconds after each new session starts.",
+      "at the next session start). It is reinstalled automatically a few seconds after each new session starts" +
+      (installedIntegrity
+        ? ", and only if the downloaded files match the ones installed now."
+        : " (its files could not be checksummed, so the reinstall is not verified)."),
   );
 } catch (err) {
   console.error(

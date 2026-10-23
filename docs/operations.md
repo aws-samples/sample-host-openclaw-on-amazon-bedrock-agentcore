@@ -54,7 +54,7 @@ cd bridge && node --test read-body.test.js             # UTF-8 request body deco
 cd bridge && node --test openclaw-tool-deny.test.js    # channel-delivery tools denied in openclaw.json (7 tests)
 cd bridge/skills/api-keys && node --test migrate.test.js # api-keys migrate.js/native.js key-loss tests (9 tests)
 cd bridge && node --test gateway-mcp.test.js           # Gateway MCP config and Cognito token provider (8 tests)
-cd bridge && node --test runtime-skills.test.js        # runtime skill manifest + cold-start reinstall (42 tests)
+cd bridge && node --test runtime-skills.test.js        # runtime skill manifest + cold-start reinstall (48 tests)
 node --test lambda/gateway_tools/*.test.js             # Gateway tool Lambdas: JWT verification, namespace scoping, interceptor (31 tests, Node 24)
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 PYTHONPATH=lambda/shared/python:lambda/router uv run --no-project --python .venv/bin/python python -m pytest lambda/router -q
