@@ -241,18 +241,38 @@ class RouterStack(Stack):
             )
         )
 
-        # Secrets Manager (channel tokens)
-        self.router_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "secretsmanager:GetSecretValue",
-                    "secretsmanager:DescribeSecret",
-                ],
-                resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
-                ],
+        # Secrets Manager read: only the channel-token and webhook secrets the
+        # Lambda reads (the same names it gets as *_SECRET_ID env vars). The
+        # Cognito password secret, gateway token and per-user secrets under
+        # openclaw/user/ are deliberately not readable here.
+        router_secret_names = [
+            telegram_token_secret_name,
+            slack_token_secret_name,
+            feishu_token_secret_name,
+            whatsapp_token_secret_name,
+            discord_token_secret_name,
+            line_token_secret_name,
+            webhook_secret_name,
+        ]
+        # "-??????" is the 6-character suffix Secrets Manager appends to every
+        # secret ARN; it matches exactly one secret per name (a "-*" would also
+        # match e.g. "<name>-stg-XXXXXX" of a suffixed deployment in the same
+        # account).
+        router_secret_resources = [
+            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-??????"
+            for name in router_secret_names
+            if name
+        ]
+        if router_secret_resources:
+            self.router_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "secretsmanager:GetSecretValue",
+                        "secretsmanager:DescribeSecret",
+                    ],
+                    resources=router_secret_resources,
+                )
             )
-        )
 
         # KMS decrypt for secrets
         self.router_fn.add_to_role_policy(
@@ -306,13 +326,11 @@ class RouterStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
-                    "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
-                    "grant_read_write_data adds index wildcards and KMS wildcards "
-                    "for CMK-encrypted table. S3 PutObject scoped to */_uploads/* "
-                    "prefix for image uploads.",
+                    "DynamoDB grant_read_write_data adds index wildcards and KMS "
+                    "wildcards for CMK-encrypted table. S3 PutObject scoped to "
+                    "*/_uploads/* prefix for image uploads.",
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
                         "Action::kms:GenerateDataKey*",

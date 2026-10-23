@@ -12,6 +12,13 @@
  * password derived as HMAC-SHA256(COGNITO_PASSWORD_SECRET, actorId). Both
  * callers MUST derive the password identically, which is why this lives in
  * one module.
+ *
+ * The stored password is re-set to the current derivation when Cognito
+ * rejects it (NotAuthorizedException / PasswordResetRequiredException) or
+ * asks for a new one (NEW_PASSWORD_REQUIRED after a partial provisioning),
+ * then authentication is retried once. Rotating COGNITO_PASSWORD_SECRET
+ * therefore migrates existing users on their next token mint instead of
+ * locking them out. Disabled users are never re-set.
  */
 "use strict";
 
@@ -55,33 +62,54 @@ function createCognitoTokenProvider(config) {
     return _client;
   }
 
+  async function setDerivedPassword(actorId) {
+    const { AdminSetUserPasswordCommand } = sdk();
+    await getClient().send(
+      new AdminSetUserPasswordCommand({
+        UserPoolId: userPoolId,
+        Username: actorId,
+        Password: derivePassword(actorId),
+        Permanent: true,
+      }),
+    );
+  }
+
+  /** Create the user if missing. Resolves `{ enabled }` (false only for a disabled user). */
   async function ensureUser(actorId) {
-    const { AdminGetUserCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } = sdk();
+    const { AdminGetUserCommand, AdminCreateUserCommand } = sdk();
     const c = getClient();
     try {
-      await c.send(new AdminGetUserCommand({ UserPoolId: userPoolId, Username: actorId }));
+      const user = await c.send(new AdminGetUserCommand({ UserPoolId: userPoolId, Username: actorId }));
+      return { enabled: user?.Enabled !== false };
     } catch (err) {
       if (err.name !== "UserNotFoundException") throw err;
-      const password = derivePassword(actorId);
       await c.send(
         new AdminCreateUserCommand({
           UserPoolId: userPoolId,
           Username: actorId,
           MessageAction: "SUPPRESS",
-          TemporaryPassword: password,
+          TemporaryPassword: derivePassword(actorId),
         }),
       );
-      await c.send(
-        new AdminSetUserPasswordCommand({
-          UserPoolId: userPoolId,
-          Username: actorId,
-          Password: password,
-          Permanent: true,
-        }),
-      );
+      await setDerivedPassword(actorId);
       log(`[cognito] user provisioned: ${actorId}`);
+      return { enabled: true };
     }
   }
+
+  async function initiateAuth(actorId) {
+    const { AdminInitiateAuthCommand } = sdk();
+    return getClient().send(
+      new AdminInitiateAuthCommand({
+        UserPoolId: userPoolId,
+        ClientId: clientId,
+        AuthFlow: "ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters: { USERNAME: actorId, PASSWORD: derivePassword(actorId) },
+      }),
+    );
+  }
+
+  const STALE_PASSWORD_ERRORS = new Set(["NotAuthorizedException", "PasswordResetRequiredException"]);
 
   /**
    * Authenticate actorId and cache both tokens (until 60 s before expiry;
@@ -93,17 +121,25 @@ function createCognitoTokenProvider(config) {
     const cached = tokenCache.get(actorId);
     if (!force && cached && cached.expiresAt > Date.now()) return cached;
 
-    await ensureUser(actorId);
-    const { AdminInitiateAuthCommand } = sdk();
-    const response = await getClient().send(
-      new AdminInitiateAuthCommand({
-        UserPoolId: userPoolId,
-        ClientId: clientId,
-        AuthFlow: "ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters: { USERNAME: actorId, PASSWORD: derivePassword(actorId) },
-      }),
-    );
-    const result = response.AuthenticationResult;
+    const { enabled } = await ensureUser(actorId);
+    let response;
+    let stale = false;
+    try {
+      response = await initiateAuth(actorId);
+      stale = response?.ChallengeName === "NEW_PASSWORD_REQUIRED";
+    } catch (err) {
+      if (!enabled || !STALE_PASSWORD_ERRORS.has(err.name)) throw err;
+      stale = true;
+    }
+    if (stale) {
+      // The stored password predates the current secret (rotation) or never
+      // became permanent. Re-set it to the current derivation, retry once.
+      await setDerivedPassword(actorId);
+      log("[cognito] stored password re-set to the current derivation");
+      response = await initiateAuth(actorId);
+    }
+    const result = response?.AuthenticationResult;
+    if (!result) throw new Error("Cognito returned no AuthenticationResult");
     const expiresIn = result.ExpiresIn || 3600;
     const expiresAt = Date.now() + (expiresIn - 60) * 1000;
     const entry = {

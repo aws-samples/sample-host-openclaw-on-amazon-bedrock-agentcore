@@ -238,18 +238,34 @@ class CronStack(Stack):
             )
         )
 
-        # Secrets Manager read (channel tokens)
-        self.cron_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "secretsmanager:GetSecretValue",
-                    "secretsmanager:DescribeSecret",
-                ],
-                resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
-                ],
+        # Secrets Manager read: only the channel-token secrets the Lambda
+        # delivers through (the same names it gets as *_SECRET_ID env vars).
+        # The Cognito password secret, gateway token and per-user secrets
+        # under openclaw/user/ are deliberately not readable here.
+        cron_secret_names = [
+            telegram_token_secret_name,
+            slack_token_secret_name,
+            feishu_token_secret_name,
+            whatsapp_token_secret_name,
+            line_token_secret_name,
+        ]
+        # "-??????" is the 6-character suffix Secrets Manager appends to every
+        # secret ARN; it matches exactly one secret per name.
+        cron_secret_resources = [
+            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-??????"
+            for name in cron_secret_names
+            if name
+        ]
+        if cron_secret_resources:
+            self.cron_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "secretsmanager:GetSecretValue",
+                        "secretsmanager:DescribeSecret",
+                    ],
+                    resources=cron_secret_resources,
+                )
             )
-        )
 
         # KMS decrypt for secrets (and for the user-files bucket, which uses the same CMK)
         self.cron_fn.add_to_role_policy(
@@ -355,13 +371,11 @@ class CronStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
-                    "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
-                    "index wildcard needed for query operations. S3 GetObject "
-                    "limited to */*.mp3 brief audio; the per-user namespace "
-                    "check is enforced in code.",
+                    "DynamoDB index wildcard needed for query operations. S3 "
+                    "GetObject limited to */*.mp3 brief audio; the per-user "
+                    "namespace check is enforced in code.",
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/*.mp3",
                     ],
