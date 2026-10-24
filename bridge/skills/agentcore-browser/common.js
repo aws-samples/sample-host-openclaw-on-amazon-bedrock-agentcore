@@ -1,6 +1,9 @@
 "use strict";
 const fs = require("fs");
-const { defaultPolicy, precheckUrl, installRequestGuard, assertPageAllowed, UrlPolicyError } = require("./url-policy");
+const net = require("net");
+const dns = require("dns").promises;
+const urlPolicy = require("./url-policy");
+const { installRequestGuard, assertPageAllowed, UrlPolicyError, isBlockedIp } = urlPolicy;
 
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const CONTENT_TRUNCATE_CHARS = 8000;
@@ -13,6 +16,95 @@ const WAIT_TIMEOUT_MS = 15000;
 // default and require an explicit opt-in via BROWSER_IGNORE_HTTPS_ERRORS=true,
 // intended only for VPC environments that terminate TLS with a private CA.
 const IGNORE_HTTPS_ERRORS = process.env.BROWSER_IGNORE_HTTPS_ERRORS === "true";
+
+// --- Operator restrictions on top of url-policy.js ---
+//
+// Optional, set only through the container environment (never tool args):
+//   BROWSER_HOST_ALLOWLIST  comma-separated exact hostnames; when set, every
+//                           other host is refused (subresources included).
+//   BROWSER_BLOCKED_CIDRS   comma-separated extra IPv4/IPv6 CIDRs to refuse,
+//                           e.g. a VPC range that uses public addresses.
+// An unparseable CIDR fails closed: every URL is refused until it is fixed.
+
+function envList(value) {
+  return (value || "").split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function hostAllowlist(env = process.env) {
+  const items = envList(env.BROWSER_HOST_ALLOWLIST).map((h) => h.toLowerCase().replace(/\.$/, ""));
+  return items.length ? new Set(items) : null;
+}
+
+function extraBlockList(env = process.env) {
+  const cidrs = envList(env.BROWSER_BLOCKED_CIDRS);
+  if (!cidrs.length) return null;
+  const list = new net.BlockList();
+  for (const cidr of cidrs) {
+    const [addr, bitsStr] = cidr.split("/");
+    const family = net.isIPv4(addr) ? "ipv4" : net.isIPv6(addr) ? "ipv6" : null;
+    const bits = Number(bitsStr);
+    const max = family === "ipv4" ? 32 : 128;
+    if (!family || !/^\d+$/.test(bitsStr || "") || bits > max) {
+      return { invalid: cidr };
+    }
+    list.addSubnet(addr, bits, family);
+  }
+  return { list };
+}
+
+/** url-policy precheck plus the operator host allowlist (no DNS). */
+function precheckUrl(input, env = process.env) {
+  const result = urlPolicy.precheckUrl(input);
+  const allow = hostAllowlist(env);
+  if (allow && !allow.has(result.host)) {
+    throw new UrlPolicyError(`destination not allowed: ${result.host} is not on the configured host allowlist`);
+  }
+  return result;
+}
+
+/**
+ * Wrap a url-policy policy with the operator restrictions above. Returns the
+ * base policy unchanged when neither variable is set.
+ */
+function withOperatorRestrictions(base, { env = process.env, lookup = dns.lookup } = {}) {
+  const allow = hostAllowlist(env);
+  const extra = extraBlockList(env);
+  if (!allow && !extra) return base;
+  const cache = new Map();
+  const addressesOf = (host) => {
+    if (!cache.has(host)) {
+      cache.set(host, (async () => {
+        try {
+          return (await lookup(host, { all: true, verbatim: true })).map((r) => r.address);
+        } catch (err) {
+          throw new UrlPolicyError(`could not resolve ${host} (${err.code || "lookup failed"})`);
+        }
+      })());
+    }
+    return cache.get(host);
+  };
+  return {
+    async checkUrl(input) {
+      const href = await base.checkUrl(input);
+      const { host } = precheckUrl(input, env);
+      if (extra) {
+        if (extra.invalid) {
+          throw new UrlPolicyError(`BROWSER_BLOCKED_CIDRS has an invalid entry: ${extra.invalid}`);
+        }
+        const addrs = net.isIP(host) ? [host] : await addressesOf(host);
+        for (const addr of addrs) {
+          const ip = addr.split("%")[0];
+          if (extra.list.check(ip, net.isIPv6(ip) ? "ipv6" : "ipv4")) {
+            throw new UrlPolicyError(`destination not allowed: ${host} is in a blocked range`);
+          }
+        }
+      }
+      return href;
+    },
+  };
+}
+
+const defaultPolicy = withOperatorRestrictions(urlPolicy.defaultPolicy);
 
 function getBrowserSession() {
   if (!fs.existsSync(BROWSER_SESSION_FILE)) {
@@ -110,6 +202,8 @@ module.exports = {
   truncateContent,
   defaultPolicy,
   precheckUrl,
+  withOperatorRestrictions,
+  isBlockedIp,
   UrlPolicyError,
   CONTENT_TRUNCATE_CHARS,
   NAV_TIMEOUT_MS,

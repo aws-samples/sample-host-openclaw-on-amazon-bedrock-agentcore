@@ -518,6 +518,9 @@ def test_bound_channel_cron_uses_canonical_session_and_delivers_to_scheduled_cha
     assert module.redeem_bind_code("LINKCODE", "slack", "456") == (user, True)
     module.identity_table.items[(f"USER#{user}", "CRON#schedule123")] = {
         "PK": f"USER#{user}", "SK": "CRON#schedule123",
+        "channel": "slack", "channelTarget": "C123",
+        "channelActorId": "slack:456", "actorId": "telegram:owner",
+        "message": "hi",
     }
     cron = load_lambda("cron")
     cron.identity_table = module.identity_table

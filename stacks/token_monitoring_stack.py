@@ -175,7 +175,9 @@ class TokenMonitoringStack(Stack):
             "TokenMetricsLogGroup",
             log_group_name=namer.name("/openclaw/lambda/token-metrics"),
             retention=logs.RetentionDays.ONE_MONTH,
-            removal_policy=RemovalPolicy.DESTROY,
+            # RETAIN so token-metrics history survives stack delete/replace;
+            # matches the API access and VPC flow log groups.
+            removal_policy=RemovalPolicy.RETAIN,
         )
 
         self.token_lambda = lambda_.Function(

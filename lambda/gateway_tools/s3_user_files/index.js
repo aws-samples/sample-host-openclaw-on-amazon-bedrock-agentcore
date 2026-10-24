@@ -13,7 +13,7 @@
 "use strict";
 
 const { createVerifier, resolveCaller } = require("../lib/identity");
-const { toolNameFromContext, sanitizeFilename, withErrorEnvelope, logToolCall } = require("../lib/mcp");
+const { toolNameFromContext, sanitizeFilename, withErrorEnvelope, logToolCall, SYSTEM_PREFIX } = require("../lib/mcp");
 
 const MAX_CONTENT_BYTES = 1 * 1024 * 1024;
 
@@ -56,6 +56,10 @@ function createHandler(deps = {}) {
       );
       const files = (resp.Contents || [])
         .filter((o) => o.Key !== prefix)
+        // Hide the reserved _system/ sub-prefix: it is not a user-writable
+        // location (see sanitizeFilename) and listing it would advertise an
+        // instruction channel the user cannot modify.
+        .filter((o) => !o.Key.startsWith(`${prefix}${SYSTEM_PREFIX}`))
         .map((o) => ({
           name: o.Key.slice(prefix.length),
           size: o.Size,

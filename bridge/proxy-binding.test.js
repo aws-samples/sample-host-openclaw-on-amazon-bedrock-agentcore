@@ -5,7 +5,7 @@ const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 const { createProxyAuthChild } = require("./proxy-auth-prepare");
 
-function proxy(actor = "slack:owner") {
+function proxy(actor = "slack:owner", { onExit } = {}) {
   let handler, identity = actor ? { actorId: actor, channel: "slack" } : null;
   const cognito = [], s3 = [], model = [];
   const tokens = {
@@ -38,7 +38,7 @@ function proxy(actor = "slack:owner") {
     ...(actor ? { USER_ID: actor, CHANNEL: "slack" } : {}),
   };
   process.connected = false;
-  process.exit = () => assert.fail("Proxy must not exit");
+  process.exit = onExit || (() => assert.fail("Proxy must not exit"));
   const mocks = {
     http: { createServer(callback) {
       handler = callback;
@@ -94,14 +94,17 @@ test("linked-channel delivery changes retain the canonical actor and namespace",
   assert.equal((await app.request({ "x-openclaw-actor-id": "discord:foreign" })).status, 200);
   assert.deepEqual(app.cognito, ["slack:owner"]);
   assert.ok(app.s3.length > 0);
-  assert.ok(app.s3.every((request) => request.Key.startsWith("slack_owner/")));
+  assert.ok(app.s3.every((request) => request.Key.startsWith("slack_owner/") ||
+    request.Key.startsWith("_system/slack_owner/")));
   assert.equal(app.model.length, 1);
 });
 
-test("missing identity metadata uses the fixed actor; a later environment rewrite cannot rebind it", async () => {
+test("missing identity metadata fails closed; a later environment rewrite cannot rebind it", async () => {
   const app = proxy();
   app.identity(null);
-  assert.equal((await app.request()).status, 200);
+  // Fail closed: with the identity file absent, the proxy must refuse to
+  // serve the request rather than derive the actor from the request itself.
+  assert.equal((await app.request()).status, 502);
   app.cognito.length = app.s3.length = app.model.length = 0;
   app.process.env.USER_ID = "slack:foreign";
   app.identity({ actorId: "slack:foreign", channel: "slack" });
@@ -142,7 +145,19 @@ test("a bound proxy ignores identity claims in headers and message text", async 
     { user: "discord:foreign", messages: [{ role: "user", content: envelope }] });
   assert.equal(response.status, 200);
   assert.deepEqual(app.cognito, ["slack:owner"]);
-  assert.ok(app.s3.length > 0 && app.s3.every((request) => request.Key.startsWith("slack_owner/")));
+  assert.ok(app.s3.length > 0 && app.s3.every((request) => request.Key.startsWith("slack_owner/") ||
+    request.Key.startsWith("_system/slack_owner/")));
+});
+
+test("a bound actor outside the format allowlist stops the proxy at load", () => {
+  let exitCode = null;
+  assert.throws(() => proxy("unknown_channel:owner", {
+    onExit: (code) => {
+      exitCode = code;
+      throw new Error(`process.exit(${code})`);
+    },
+  }), /process\.exit\(1\)/);
+  assert.equal(exitCode, 1);
 });
 
 test("a neutral auth factory cannot adopt its first caller, and a bound factory rejects foreign actors", async () => {
@@ -194,7 +209,8 @@ test("a Telegram group gets its own namespace and the shared-group rules in the 
   assert.equal((await app.request()).status, 200);
   assert.deepEqual(app.cognito, [group]);
   assert.ok(app.s3.length > 0);
-  assert.ok(app.s3.every((request) => request.Key.startsWith("telegram_group_-1001234567890/")));
+  assert.ok(app.s3.every((request) => request.Key.startsWith("telegram_group_-1001234567890/") ||
+    request.Key.startsWith("_system/telegram_group_-1001234567890/")));
   const system = JSON.stringify(app.model[0].system);
   assert.match(system, /on channel: telegram_group/);
   assert.match(system, /shared group chat/);

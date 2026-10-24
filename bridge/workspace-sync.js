@@ -112,6 +112,12 @@ const DEFAULT_UPLOAD_PART_SIZE = 8 * 1024 * 1024;
 // Override with WORKSPACE_RESTORE_MAX_BYTES / WORKSPACE_RESTORE_MAX_FILES.
 const DEFAULT_MAX_RESTORE_BYTES = 16 * 1024 * 1024 * 1024; // 16 GiB
 const DEFAULT_MAX_RESTORE_FILES = 100000;
+// Free disk space a restore must leave on the local filesystem. A download
+// that would eat into it fails the restore with a clear reason before it is
+// written, instead of running the microVM's disk out (ENOSPC) and leaving the
+// restore failed with uploads disabled. Override with
+// WORKSPACE_RESTORE_FREE_DISK_RESERVE_BYTES.
+const DEFAULT_RESTORE_FREE_DISK_RESERVE_BYTES = 256 * 1024 * 1024; // 256 MiB
 
 function parseRestoreLimit(name, fallback) {
   const raw = process.env[name];
@@ -136,6 +142,10 @@ const _limits = {
   uploadPartSize: DEFAULT_UPLOAD_PART_SIZE,
   maxRestoreBytes: parseRestoreLimit("WORKSPACE_RESTORE_MAX_BYTES", DEFAULT_MAX_RESTORE_BYTES),
   maxRestoreFiles: parseRestoreLimit("WORKSPACE_RESTORE_MAX_FILES", DEFAULT_MAX_RESTORE_FILES),
+  restoreFreeDiskReserveBytes: parseRestoreLimit(
+    "WORKSPACE_RESTORE_FREE_DISK_RESERVE_BYTES",
+    DEFAULT_RESTORE_FREE_DISK_RESERVE_BYTES,
+  ),
 };
 
 // Files with this extension are SQLite databases and are uploaded via
@@ -828,12 +838,17 @@ async function runRestore(namespace, overwrite, attempt) {
       }
 
       // Validate object size before downloading (uses ListObjectsV2 Size field).
-      // A SQLite object may be a gzip snapshot, so its listed size is at most
-      // the uncompressed one — the SQLite cap applies to it.
-      const sizeCap = relativePath.endsWith(SQLITE_EXT) ? _limits.maxSqliteFileSize : _limits.maxFileSize;
-      if (obj.Size > sizeCap) {
+      // obj.Size is the STORED (compressed) size. A large SQLite database is
+      // uploaded as a gzip snapshot that can itself be well above the
+      // non-SQLite cap, so `.sqlite` keys are listed against the SQLite cap.
+      // The key suffix only widens this pre-download filter: the bytes
+      // written to disk are bounded in writeRestoredObject by the object's
+      // metadata (declared uncompressed size for gzip, the non-SQLite cap
+      // otherwise) and the whole-restore budget.
+      const listedCap = relativePath.endsWith(SQLITE_EXT) ? _limits.maxSqliteFileSize : _limits.maxFileSize;
+      if (obj.Size > listedCap) {
         console.warn(
-          `[workspace-sync] Skipping oversized file: ${obj.Key} (${obj.Size} bytes > ${sizeCap})`,
+          `[workspace-sync] Skipping oversized file: ${obj.Key} (${obj.Size} stored bytes > ${listedCap})`,
         );
         failed++;
         continue;
@@ -895,7 +910,7 @@ async function runRestore(namespace, overwrite, attempt) {
   let totalFiles = 0;
   let totalBytes = 0;
   const stats = { retries: 0 };
-  const budget = createRestoreBudget(_limits.maxRestoreBytes);
+  const budget = createRestoreBudget(_limits.maxRestoreBytes, _limits.restoreFreeDiskReserveBytes);
   await runBounded(downloads, concurrency, async (item) => {
     assertRestoreActive(attempt);
     try {
@@ -941,12 +956,14 @@ let _restoreTmpSeq = 0;
 /**
  * Bytes one restore may write to local disk, shared by the download pool.
  * Bytes of a download that fails (and is retried or dropped) are released, so
- * only what lands on disk counts.
+ * only what lands on disk counts. `freeDiskReserveBytes` is the free space
+ * assertRestoreDiskHeadroom() keeps on the local filesystem.
  */
-function createRestoreBudget(maxBytes) {
+function createRestoreBudget(maxBytes, freeDiskReserveBytes = 0) {
   return {
     used: 0,
     exceeded: null,
+    freeDiskReserveBytes,
     reserve(n) {
       if (this.exceeded) throw this.exceeded;
       if (this.used + n > maxBytes) {
@@ -961,6 +978,37 @@ function createRestoreBudget(maxBytes) {
       this.used -= n;
     },
   };
+}
+
+/**
+ * Fail the restore before a download is written when the local filesystem does
+ * not have `needed` bytes plus the budget's free-disk reserve available. A
+ * full disk would otherwise end in ENOSPC, which fails the restore and keeps
+ * uploads disabled; failing here names the reason. Sets budget.exceeded so the
+ * download pool stops (every remaining file would hit the same wall).
+ *
+ * Skipped when fs.statfsSync is unavailable or the directory cannot be read;
+ * the byte budget still bounds what the restore writes.
+ */
+function assertRestoreDiskHeadroom(dir, needed, budget) {
+  if (!budget || typeof fs.statfsSync !== "function") return;
+  let stat;
+  try {
+    stat = fs.statfsSync(dir);
+  } catch {
+    return;
+  }
+  const avail = Number(stat.bavail) * Number(stat.bsize);
+  if (!Number.isFinite(avail) || avail <= 0) return;
+  const reserve = Math.max(0, budget.freeDiskReserveBytes || 0);
+  if (avail < needed + reserve) {
+    budget.exceeded ||= new Error(
+      "Workspace restore aborted: not enough free disk space " +
+        `(need ${needed} B + ${reserve} B reserve, ${avail} B available) ` +
+        "(WORKSPACE_RESTORE_FREE_DISK_RESERVE_BYTES)",
+    );
+    throw budget.exceeded;
+  }
 }
 
 /**
@@ -1000,8 +1048,19 @@ async function writeRestoredObject(getResp, localFile, attempt, budget) {
   // (and to no more than the per-file cap), and must decompress to exactly it.
   const declared = gzipped ? declaredUncompressedSize(meta) : null;
   const fileCap = localFile.endsWith(SQLITE_EXT) ? _limits.maxSqliteFileSize : _limits.maxFileSize;
-  const cap = declared === null ? fileCap : Math.min(declared, fileCap);
   if (declared !== null && declared > fileCap) throw new Error("Restored object exceeds size limit");
+  // A body without gzip is written byte for byte, and the uploader only ever
+  // stores one that way when it is at most maxFileSize (a larger SQLite
+  // database always goes up as a gzip snapshot). So a raw body is held to
+  // maxFileSize whatever its key suffix: the key name is tenant-chosen and
+  // must not widen the cap to the SQLite one.
+  const cap = declared === null ? _limits.maxFileSize : declared;
+  // Free-disk reserve, checked against what this object will write.
+  const length = Number(getResp.ContentLength);
+  const expectedBytes = declared !== null
+    ? declared
+    : (Number.isSafeInteger(length) && length >= 0 ? Math.min(length, cap) : cap);
+  if (budget) assertRestoreDiskHeadroom(path.dirname(localFile), expectedBytes, budget);
   const tmpFile = `${localFile}.tmp-${process.pid}-${++_restoreTmpSeq}`;
   const hash = crypto.createHash("sha256");
   let size = 0;
@@ -1014,7 +1073,11 @@ async function writeRestoredObject(getResp, localFile, attempt, budget) {
       assertRestoreActive(attempt);
       const n = Buffer.byteLength(chunk);
       size += n;
-      if (size > cap) throw new Error("Restored object exceeds size limit");
+      if (size > cap) {
+        throw new Error(
+          `Restored object exceeds size limit (${size} bytes so far exceeds declared size or cap of ${cap})`,
+        );
+      }
       if (budget) {
         budget.reserve(n);
         reserved += n;
@@ -1395,11 +1458,22 @@ async function uploadSqliteFile(key, localFile, relativePath, stat, force) {
       return "uploaded";
     }
     // Large database: never in memory whole.
+    const statAtHash = fs.statSync(stagePath);
     const hash = await hashFile(stagePath);
     if (!force && _uploadedHashes.get(relativePath) === hash) return "unchanged";
     scanForCredentials(relativePath, readFileHead(stagePath, 64 * 1024));
     const started = Date.now();
-    const { bytes, parts } = await uploadCompressedFile(key, stagePath, { hash, size });
+    // Pass the size/mtime captured at hash time so uploadCompressedFile can
+    // confirm the staged file still matches right before CompleteMultipartUpload.
+    // That guarantees the body uploaded to S3 is the exact bytes we hashed,
+    // closing the hash-then-reread window (if some other code path mutates or
+    // unlinks this staging file the upload is aborted rather than publishing
+    // an object whose body disagrees with its sha256 metadata).
+    const { bytes, parts } = await uploadCompressedFile(key, stagePath, {
+      hash,
+      size,
+      verify: { size: statAtHash.size, mtimeMs: statAtHash.mtimeMs },
+    });
     _uploadedHashes.set(relativePath, hash);
     _lastLargeUploadAt.set(relativePath, Date.now());
     console.log(
@@ -1422,10 +1496,32 @@ async function uploadSqliteFile(key, localFile, relativePath, stat, force) {
  *
  * @returns {Promise<{ bytes: number, parts: number }>} compressed bytes sent
  */
-async function uploadCompressedFile(key, filePath, { hash, size }) {
+async function uploadCompressedFile(key, filePath, { hash, size, verify } = {}) {
   assertRestoreReady();
   const s3 = getS3Client();
   const sdk = getS3Sdk();
+  // Confirm the staged bytes we hashed are still on disk unchanged. If another
+  // concurrent save path mutated or unlinked the staging file between hashFile()
+  // and here, abort rather than publishing an S3 object whose body contradicts
+  // the sha256 we store in its metadata (which would make the next restore
+  // reject the object with "sha256 mismatch after download").
+  const assertStageUnchanged = () => {
+    if (!verify) return;
+    let cur;
+    try {
+      cur = fs.statSync(filePath);
+    } catch (err) {
+      throw new Error(
+        `Staged snapshot ${path.basename(filePath)} disappeared before upload completed: ${err.message}`,
+      );
+    }
+    if (cur.size !== verify.size || cur.mtimeMs !== verify.mtimeMs) {
+      throw new Error(
+        `Staged snapshot ${path.basename(filePath)} changed under us before upload completed ` +
+          `(size ${verify.size}->${cur.size}, mtimeMs ${verify.mtimeMs}->${cur.mtimeMs}); aborting`,
+      );
+    }
+  };
   const base = {
     Bucket: BUCKET,
     Key: key,
@@ -1477,6 +1573,8 @@ async function uploadCompressedFile(key, filePath, { hash, size }) {
       }
     }
     const tail = Buffer.concat(pending);
+    // The staged bytes we hashed must still be the exact bytes we just streamed.
+    assertStageUnchanged();
     assertRestoreReady();
     getS3Client();
     if (!uploadId) {
@@ -1484,6 +1582,7 @@ async function uploadCompressedFile(key, filePath, { hash, size }) {
       return { bytes: total, parts: 1 };
     }
     if (tail.length > 0) await sendPart(tail);
+    assertStageUnchanged();
     assertRestoreReady();
     getS3Client();
     await s3.send(new sdk.CompleteMultipartUploadCommand({

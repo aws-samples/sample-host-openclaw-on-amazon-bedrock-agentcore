@@ -111,6 +111,9 @@ function validateEnv() {
 }
 
 const MIN_INTERVAL_MINUTES = 5;
+// Per-user cap on CRON# records (CWE-770), checked by create.js. Same limit as
+// lambda/gateway_tools/eventbridge_cron/index.js.
+const MAX_SCHEDULES_PER_USER = 20;
 
 /** Sorted minutes (0-59) a cron() minutes field fires on, or null for syntax it does not accept. */
 function cronMinutes(field) {
@@ -456,6 +459,8 @@ module.exports = {
   CRON_LAMBDA_ARN,
   EVENTBRIDGE_ROLE_ARN,
   IDENTITY_TABLE_NAME,
+  MIN_INTERVAL_MINUTES,
+  MAX_SCHEDULES_PER_USER,
   validateUserId,
   assertOwnNamespace,
   ownerUserId,

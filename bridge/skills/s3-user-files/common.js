@@ -37,20 +37,64 @@ function sanitize(str) {
 // list.js prints; any further "/" or ".." is still flattened by sanitize().
 const UPLOADS_PREFIX = "_uploads/";
 
+// The proxy sources the system-prompt files (AGENTS.md, SOUL.md, USER.md,
+// IDENTITY.md, TOOLS.md, MEMORY.md) from "_system/<namespace>/" at the bucket
+// root (bridge/workspace-files-s3.js), outside every user's prefix. Refusing
+// a "_system/" filename here keeps user files from looking like those
+// sources, and refusing the reserved names stops the agent from saving data
+// under a name it would expect to see in its system prompt.
+const SYSTEM_PREFIX = "_system/";
+
+// Filenames the Bedrock proxy concatenates verbatim into the Converse `system`
+// text block (bridge/agentcore-proxy.js WORKSPACE_FILES). Any writer surface
+// that lets a user-authored string reach these keys becomes a persistent
+// prompt-injection channel that the Bedrock guardrail never sees, so these
+// names are refused by both skill surfaces. Keep in sync with WORKSPACE_FILES
+// in bridge/agentcore-proxy.js and sanitizeFilename in
+// lambda/gateway_tools/lib/mcp.js.
+const RESERVED_SYSTEM_FILENAMES = new Set([
+  "AGENTS.md",
+  "SOUL.md",
+  "USER.md",
+  "IDENTITY.md",
+  "TOOLS.md",
+  "MEMORY.md",
+]);
+
+function isReservedSystemFilename(name) {
+  return RESERVED_SYSTEM_FILENAMES.has(name);
+}
+
 /**
  * Build the S3 key from userId and optional filename.
  * Returns "sanitized_userId/", "sanitized_userId/sanitized_filename", or
  * "sanitized_userId/_uploads/sanitized_name" for router-stored uploads.
+ * Refuses the reserved _system/ sub-prefix and the six reserved
+ * system-prompt filenames so the user-files skill cannot overwrite the
+ * sources the proxy injects into the Converse `system` block.
  */
 function buildKey(userId, filename) {
   const prefix = sanitize(userId);
   if (!filename) return `${prefix}/`;
+  if (filename.startsWith(SYSTEM_PREFIX) || filename === "_system") {
+    throw new Error(
+      `Invalid filename: "${filename}" — "${SYSTEM_PREFIX}" is reserved for system-prompt sources and is not user-writable.`,
+    );
+  }
   if (filename.startsWith(UPLOADS_PREFIX)) {
     const name = sanitize(filename.slice(UPLOADS_PREFIX.length));
     if (!name) throw new Error("Invalid filename: empty name after _uploads/");
     return `${prefix}/${UPLOADS_PREFIX}${name}`;
   }
-  return `${prefix}/${sanitize(filename)}`;
+  const sanitized = sanitize(filename);
+  if (isReservedSystemFilename(sanitized)) {
+    throw new Error(
+      `Invalid filename: "${sanitized}" is a reserved system-prompt source ` +
+        `and is not writable through the user-files skill. The proxy sources ` +
+        `it from "${SYSTEM_PREFIX}<namespace>/${sanitized}", which is not user-writable.`,
+    );
+  }
+  return `${prefix}/${sanitized}`;
 }
 
 // download_user_file refuses objects above this size (Telegram uploads are
@@ -110,9 +154,11 @@ function assertOwnNamespace(userId) {
 }
 
 /**
- * Validate that userId is present, not the default-user fallback,
- * and matches the expected channel_identifier namespace pattern.
- * Exits the process with an error message if validation fails.
+ * Validate that userId is present, not the default-user fallback, matches the
+ * expected channel_identifier namespace pattern, AND is the namespace of the
+ * user this session is bound to. The last check is what prevents an LLM /
+ * prompt-injection attacker from choosing another tenant's namespace as the
+ * argv argument. Exits the process with an error message if validation fails.
  */
 function validateUserId(userId) {
   if (!userId) {
@@ -126,8 +172,7 @@ function validateUserId(userId) {
     process.exit(1);
   }
   // Namespace must match channel_identifier pattern (e.g., telegram_123456789, slack_U0XXXXXXXX1).
-  // This prevents prompt injection attacks where a user tricks the AI into using
-  // an arbitrary namespace to access another user's files.
+  // This is a format gate only; assertOwnNamespace below proves ownership.
   const VALID_NAMESPACE =
     /^(telegram|slack|discord|whatsapp|line)_[a-zA-Z0-9_-]{1,64}$/;
   if (!VALID_NAMESPACE.test(userId)) {
@@ -172,4 +217,7 @@ module.exports = {
   assertOwnNamespace,
   validateBucket,
   streamToString,
+  SYSTEM_PREFIX,
+  RESERVED_SYSTEM_FILENAMES,
+  isReservedSystemFilename,
 };

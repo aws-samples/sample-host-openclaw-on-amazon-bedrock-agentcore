@@ -8,11 +8,19 @@
  * version and a sha256 of the installed files, in the per-user manifest
  * ~/.openclaw/runtime-skills.json. That manifest is part of the state that
  * survives a microVM cold start, and the bridge reinstalls every skill in it
- * shortly after a new session starts — /skills itself is not persisted.
+ * shortly after a new session starts — /skills itself is not persisted. The
+ * reinstall refuses (and quarantines) files that do not match the recorded
+ * sha256.
  *
  * No `--force`: clawhub uses that flag to bypass its "flagged for security
  * review" check in non-interactive mode. A flagged skill therefore fails here
  * with a clear message instead of being installed silently.
+ *
+ * When the deployment operator has set `RUNTIME_SKILLS_ALLOWLIST`, this
+ * script refuses to install any slug that is not in that allowlist. The
+ * allowlist lives in the container env, which the agent context cannot
+ * modify in a way the next cold-start sees, so an operator-pinned
+ * allowlist bounds the persistence effect of a prompt-injected install.
  */
 const { execFileSync } = require("child_process");
 const { validateSkillName, runtimeSkills } = require("./common");
@@ -26,6 +34,20 @@ try {
   process.exit(2);
 }
 const manifestFile = runtimeSkills.manifestPath();
+
+// Operator allowlist: if configured, fail fast so a refused slug never
+// touches /skills or the manifest, and the same decision applies at cold
+// start (reinstallFromManifest enforces it there too).
+const allowlist = runtimeSkills.parseAllowlist(process.env, {
+  log: { log() {}, warn() {}, error() {} },
+});
+if (allowlist && !runtimeSkills.isAllowed(skillName, allowlist)) {
+  console.error(
+    `Refused to install skill "${skillName}": not in this deployment's ${runtimeSkills.ALLOWLIST_ENV} ` +
+      `(operator-controlled allowlist). Ask the deployment operator to add it if you need it.`,
+  );
+  process.exit(1);
+}
 
 if (runtimeSkills.isSkillPresent(skillName)) {
   const manifest = runtimeSkills.readManifest(manifestFile);
@@ -81,6 +103,18 @@ try {
         ? ", and only if the downloaded files match the ones installed now."
         : " (its files could not be checksummed, so the reinstall is not verified)."),
   );
+  if (!installedVersion) {
+    console.log(
+      "Note: ClawHub reported no release version for this skill, so new sessions reinstall its current " +
+        "release. If that release's files differ from the ones installed now, the skill is not loaded and " +
+        "list_skills shows it as quarantined; install it again to accept the new files.",
+    );
+  }
+  if (!installedIntegrity) {
+    console.log(
+      "Note: could not compute a digest of the installed files; it is recorded at the next reinstall instead.",
+    );
+  }
 } catch (err) {
   console.error(
     `Warning: installed, but could not record "${skillName}" for reinstall on new sessions (${err.message}). ` +

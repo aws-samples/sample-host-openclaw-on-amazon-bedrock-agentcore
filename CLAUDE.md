@@ -363,7 +363,7 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bri
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `cron_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Cron executor (same trade-off as `router_reserved_concurrency`) |
 | `token_metrics_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the token-metrics Lambda (same trade-off) |
-| `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail (S3 bucket + trail). Off by default — most accounts already have one |
+| `enable_cloudtrail` | `false` | Deploy a dedicated multi-region CloudTrail (S3 bucket + trail) that also records S3 data events on the user-files bucket. Off by default — most accounts already have one |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model for sub-agents. Empty = bridge default (also Sonnet 5.5) |
 | `enable_browser` | `false` | Enable headless Chromium browser. Sets `BROWSER_IDENTIFIER` env var on container |

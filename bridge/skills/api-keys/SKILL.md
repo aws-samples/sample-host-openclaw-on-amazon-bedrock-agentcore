@@ -88,6 +88,8 @@ node {baseDir}/migrate.js <user_id> <key_name> <direction>
 
 - Native mode: Keys stored in `.openclaw/user-api-keys.json`, synced to S3 with KMS encryption
 - Secrets Manager mode: Keys stored at `openclaw/user/{namespace}/{key_name}`, auditable via CloudTrail
-- Per-user isolation via STS session-scoped credentials
+- Per-user isolation enforced in two layers:
+  - `validateUserId` (common.js) refuses any `user_id` argument that does not match the container's bound identity (`INTERNAL_USER_ID` / `USER_ID`, falling back to `/tmp/current-identity.json`). This blocks the agent (or indirect prompt injection) from passing another tenant's namespace.
+  - The STS session policy restricts Secrets Manager CRUD to `arn:aws:secretsmanager:<region>:<account>:secret:openclaw/user/<namespace>/*`. `ListSecrets` stays wildcard (AWS does not support resource-level restrictions on it) and is prefix-filtered in code.
 - Max 10 secrets per user in Secrets Manager
 - Key names: alphanumeric, starting with letter, max 64 chars

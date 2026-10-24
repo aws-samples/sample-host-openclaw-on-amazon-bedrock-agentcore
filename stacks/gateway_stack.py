@@ -329,7 +329,13 @@ class GatewayStack(Stack):
             ),
             role_arn=self.gateway_role.role_arn,
             kms_key_arn=cmk_arn,
-            exception_level="DEBUG",
+            # Default to the Gateway's generic error level so verbose internal
+            # diagnostics (target ARNs, interceptor/target payload fragments)
+            # are not returned to MCP callers in production. Operators can opt
+            # in for local debugging with `cdk --context gateway_debug_errors=true`.
+            exception_level=(
+                "DEBUG" if self.node.try_get_context("gateway_debug_errors") is True else None
+            ),
             interceptor_configurations=[
                 agentcore.CfnGateway.GatewayInterceptorConfigurationProperty(
                     interception_points=["REQUEST"],
