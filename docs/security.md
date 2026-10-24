@@ -73,7 +73,7 @@ The Router API Gateway HTTP API uses explicit routes — only three paths are ex
 |---|---|
 | User allowlist | `registration_open=false` by default; new users require an `ALLOW#` record in DynamoDB |
 | DynamoDB identity table | `CHANNEL#`, `USER#`, `SESSION`, `BIND#`, `ALLOW#`, `CRON#` record types with composite key schema |
-| Cognito User Pool | Self-signup disabled (`self_sign_up_enabled=False`); users auto-provisioned by proxy via `AdminCreateUser` |
+| Cognito User Pool | Self-signup disabled (`self_sign_up_enabled=False`); users auto-provisioned by proxy via `AdminCreateUser`. Threat protection is opt-in via `cognito_advanced_security_mode` (`AUDIT` or `ENFORCED`, default `OFF`); enabling it moves the pool to the Plus feature plan, billed per monthly active user |
 | HMAC-derived passwords | `HMAC-SHA256(secret, actorId).slice(0, 32)` — deterministic, never stored or transmitted to end users |
 | Account recovery disabled | `AccountRecovery.NONE` — no password reset flows (passwords are derived, not chosen) |
 | Cross-channel binding | Time-limited bind codes (10-min TTL in DynamoDB, one-time use). Binding bypasses allowlist since it links to an already-approved user |

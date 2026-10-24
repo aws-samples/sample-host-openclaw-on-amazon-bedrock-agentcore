@@ -326,6 +326,7 @@ All tunable parameters are in `cdk.json`:
 | `cron_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Cron executor (same trade-off as `router_reserved_concurrency`) |
 | `token_metrics_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the token-metrics Lambda (same trade-off) |
 | `enable_cloudtrail` | `false` | Deploy a dedicated multi-region CloudTrail trail that also records S3 data events on the user-files bucket. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost, including per-event data-event charges) |
+| `cognito_advanced_security_mode` | `OFF` | Cognito threat protection for the user pool: `OFF`, `AUDIT` or `ENFORCED`. Off by default. `AUDIT` and `ENFORCED` also switch the pool to the Plus feature plan, which is billed per monthly active user |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. See the [disable procedure](docs/guardrails.md#disable) before changing shared resources |
 | `guardrails_content_filter_level` | `HIGH` | Not read by the stack: filter strengths are set per category in `stacks/guardrails_stack.py` (`PROMPT_ATTACK` input `HIGH`, `INSULTS` input `MEDIUM`, the rest `HIGH`) |

@@ -18,6 +18,27 @@ from constructs import Construct
 from stacks import DeploymentNamer, retention_days
 
 
+COGNITO_ADVANCED_SECURITY_MODES = ("OFF", "AUDIT", "ENFORCED")
+
+
+def cognito_advanced_security_mode(scope: Construct) -> str:
+    """Read the cognito_advanced_security_mode context key (default OFF).
+
+    AUDIT and ENFORCED turn on Cognito threat protection and the Plus feature
+    plan it requires, which is billed per monthly active user.
+    """
+    raw = scope.node.try_get_context("cognito_advanced_security_mode")
+    if raw is None or str(raw).strip() == "":
+        return "OFF"
+    value = str(raw).strip().upper()
+    if value not in COGNITO_ADVANCED_SECURITY_MODES:
+        raise ValueError(
+            "cognito_advanced_security_mode must be one of OFF, AUDIT or ENFORCED, "
+            f"got {raw!r}"
+        )
+    return value
+
+
 class SecurityStack(Stack):
     def __init__(
         self,
@@ -179,6 +200,16 @@ class SecurityStack(Stack):
         # (bridge/cognito-token.js) is responsible for producing passwords
         # that satisfy this policy for machine-provisioned users; see the
         # cdk-nag COG1 note below.
+        advanced_security_mode = cognito_advanced_security_mode(self)
+        threat_protection_props = {}
+        if advanced_security_mode != "OFF":
+            threat_protection_props = {
+                "feature_plan": cognito.FeaturePlan.PLUS,
+                "standard_threat_protection_mode": {
+                    "AUDIT": cognito.StandardThreatProtectionMode.AUDIT_ONLY,
+                    "ENFORCED": cognito.StandardThreatProtectionMode.FULL_FUNCTION,
+                }[advanced_security_mode],
+            }
         self.user_pool = cognito.UserPool(
             self,
             "IdentityPool",
@@ -197,13 +228,10 @@ class SecurityStack(Stack):
                 # above anything a symbol requirement would add.
                 require_symbols=False,
             ),
-            # Enable Cognito advanced security (threat protection) so that
-            # anomalous admin-initiated authentications - e.g. token minting
-            # for many distinct usernames in a short window, which is the
-            # observable signature of the shared-secret abuse this hardening
-            # defends against - are scored and surfaced in CloudWatch instead
-            # of being completely invisible.
-            advanced_security_mode=cognito.AdvancedSecurityMode.ENFORCED,
+            # Threat protection is opt-in (cognito_advanced_security_mode).
+            # It needs the Plus feature plan, which is billed per monthly
+            # active user, so the default leaves both unset.
+            **threat_protection_props,
             removal_policy=RemovalPolicy.RETAIN,
             account_recovery=cognito.AccountRecovery.NONE,
         )
@@ -311,3 +339,28 @@ class SecurityStack(Stack):
                 ),
             ],
         )
+        threat_protection_suppressions = []
+        if advanced_security_mode != "ENFORCED":
+            threat_protection_suppressions.append(
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-COG3",
+                    reason="Threat protection is opt-in through the "
+                    "cognito_advanced_security_mode context key because it is billed per "
+                    "monthly active user. All auth is admin-initiated.",
+                ),
+            )
+        if advanced_security_mode == "OFF":
+            threat_protection_suppressions.append(
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-COG8",
+                    reason="The Plus feature plan only adds threat protection, which is "
+                    "opt-in through the cognito_advanced_security_mode context key. This "
+                    "pool has no user-facing sign-in: self sign-up is off, and the only "
+                    "client is the bridge, which provisions users and authenticates them "
+                    "via ADMIN_USER_PASSWORD_AUTH.",
+                ),
+            )
+        if threat_protection_suppressions:
+            cdk_nag.NagSuppressions.add_resource_suppressions(
+                self.user_pool, threat_protection_suppressions,
+            )
