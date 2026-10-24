@@ -6,25 +6,27 @@
  * is in the transcript, every later turn in that session can be blocked
  * too, including "hello".
  *
- * Wrapping text in guardContent makes the guardrail assess only the wrapped
- * blocks (model output is still assessed in full). This tags the text blocks
- * of the trailing user turn — the messages after the last assistant turn —
- * without excluding text based on markers the user can supply. When the
- * trailing turn carries only tool results (the model is mid tool-call), the
- * most recent earlier user turn is tagged instead: tool results cannot carry
- * guardContent, and leaving the request untagged would fall back to assessing
- * the whole conversation — exactly the behaviour this module exists to avoid.
+ * Wrapping text and images in guardContent makes the guardrail assess only the
+ * wrapped blocks (model output is still assessed in full). This tags the text
+ * and image blocks of the trailing user turn — the messages after the last
+ * assistant turn — without excluding text based on markers the user can
+ * supply. When the trailing turn carries only tool results (the model is mid
+ * tool-call), the most recent earlier user turn is tagged instead: tool
+ * results cannot carry guardContent, and leaving the request untagged would
+ * fall back to assessing the whole conversation — exactly the behaviour this
+ * module exists to avoid.
  */
 
 const crypto = require("crypto");
 
 /**
- * Return a copy of `bedrockMessages` where the text blocks of the trailing
- * user turn are wrapped in guardContent. Tool results and images are left
- * as they are. If the trailing
- * turn has no taggable text (e.g. it is only tool results), the nearest
- * earlier user turn is tagged instead. Only when the conversation has
- * no user text at all is the input returned unchanged (default scope).
+ * Return a copy of `bedrockMessages` where the text and image blocks of the
+ * trailing user turn are wrapped in guardContent. Tool results are left as they
+ * are (Bedrock does not permit guardContent on toolResult blocks). If the
+ * trailing turn has no taggable text or image (e.g. it is only tool results),
+ * the nearest earlier user turn is tagged instead. Only when the conversation
+ * has no user text or image at all is the input returned unchanged (default
+ * scope).
  */
 function scopeGuardrailToLatestUserTurn(bedrockMessages) {
   if (!Array.isArray(bedrockMessages) || bedrockMessages.length === 0) return bedrockMessages;
@@ -34,12 +36,17 @@ function scopeGuardrailToLatestUserTurn(bedrockMessages) {
   while (start > 0 && bedrockMessages[start - 1].role === "user") start--;
   if (start === bedrockMessages.length) return bedrockMessages;
 
-  const taggable = (block) => typeof block.text === "string";
+  const isTextBlock = (block) => typeof block.text === "string";
+  const isImageBlock = (block) => block && typeof block === "object" && block.image && typeof block.image === "object";
+  const taggable = (block) => isTextBlock(block) || isImageBlock(block);
+  const wrap = (block) => {
+    if (isTextBlock(block)) return { guardContent: { text: { text: block.text } } };
+    if (isImageBlock(block)) return { guardContent: { image: block.image } };
+    return block;
+  };
   const tagMessage = (msg) => ({
     ...msg,
-    content: (msg.content || []).map((block) =>
-      taggable(block) ? { guardContent: { text: { text: block.text } } } : block,
-    ),
+    content: (msg.content || []).map(wrap),
   });
 
   const out = bedrockMessages.slice();

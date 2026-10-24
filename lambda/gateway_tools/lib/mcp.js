@@ -24,17 +24,53 @@ function toolNameFromContext(context) {
 }
 
 /**
+ * Reserved "_system/" filename prefix; see
+ * bridge/skills/s3-user-files/common.js SYSTEM_PREFIX. The proxy's sources
+ * live at "_system/<namespace>/" at the bucket root, outside the user prefix;
+ * this mirror keeps both tool surfaces refusing the same names.
+ */
+const SYSTEM_PREFIX = "_system/";
+
+/**
+ * Filenames the proxy injects verbatim into the Converse `system` block.
+ * Blocking them here closes the second write surface identified in the
+ * "User-writable S3 workspace files are injected into the Bedrock system
+ * block" finding (CWE-501). Keep in sync with
+ * bridge/skills/s3-user-files/common.js RESERVED_SYSTEM_FILENAMES.
+ */
+const RESERVED_SYSTEM_FILENAMES = new Set([
+  "AGENTS.md",
+  "SOUL.md",
+  "USER.md",
+  "IDENTITY.md",
+  "TOOLS.md",
+  "MEMORY.md",
+]);
+
+/**
  * Sanitize a file name for use as an S3 key component. Mirrors
  * bridge/skills/s3-user-files/common.js so both tool surfaces address the
- * same objects.
+ * same objects, and refuses the reserved _system/ sub-prefix and the six
+ * reserved system-prompt filenames so this surface cannot plant persistent
+ * instructions in the Converse `system` block.
  */
 function sanitizeFilename(str) {
   if (typeof str !== "string" || !str) throw new Error("filename is required");
+  if (str.startsWith(SYSTEM_PREFIX) || str === "_system") {
+    throw new Error(
+      `Invalid filename "${str}": "${SYSTEM_PREFIX}" is reserved for system-prompt sources and is not user-writable.`,
+    );
+  }
   let result = str;
   while (result.includes("..")) result = result.replace(/\.\./g, "");
   result = result.replace(/[^a-zA-Z0-9_\-.]/g, "_").slice(0, 256);
   if (!result || result.startsWith(".") || result.endsWith(".")) {
     throw new Error(`Invalid filename "${result}": leading/trailing dots not allowed`);
+  }
+  if (RESERVED_SYSTEM_FILENAMES.has(result)) {
+    throw new Error(
+      `Invalid filename "${result}": reserved system-prompt source, not writable through the gateway user-files tool.`,
+    );
   }
   return result;
 }
@@ -80,4 +116,4 @@ function logToolCall(tool, identity, log = console.log) {
   );
 }
 
-module.exports = { TOOL_NAME_DELIMITER, toolNameFromContext, sanitizeFilename, withErrorEnvelope, logToolCall };
+module.exports = { TOOL_NAME_DELIMITER, toolNameFromContext, sanitizeFilename, withErrorEnvelope, logToolCall, SYSTEM_PREFIX, RESERVED_SYSTEM_FILENAMES };

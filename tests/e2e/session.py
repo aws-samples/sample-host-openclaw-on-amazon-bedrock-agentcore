@@ -106,11 +106,12 @@ def get_agent_status(cfg: E2EConfig) -> dict:
     if status.get("lifecycle", {}).get("state") == "USER_READY" and not isinstance(binding, dict):
         raise RuntimeError("Ready status lacks immutable binding evidence")
     if binding is not None:
-        expected = {
-            "userId": route.user_id, "actorId": route.actor_id,
-            "runtimeSessionId": route.session_id, "routingGeneration": route.generation,
-        }
-        if any(binding.get(key) != value for key, value in expected.items()):
+        # Status always names the owner; runtimeSessionId and routingGeneration
+        # are left out of the bridge status, so compare them only when present.
+        owner = {"userId": route.user_id, "actorId": route.actor_id}
+        route_fields = {"runtimeSessionId": route.session_id, "routingGeneration": route.generation}
+        if (any(binding.get(key) != value for key, value in owner.items())
+                or any(key in binding and binding[key] != value for key, value in route_fields.items())):
             raise RuntimeError("Status binding differs from the saved V2 route")
     return status
 

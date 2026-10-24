@@ -39,7 +39,18 @@ describe("buildKey with the _uploads/ prefix", () => {
 
   it("leaves other filenames unchanged", () => {
     assert.equal(common.buildKey(USER, "notes/today.md"), `${USER}/notes_today.md`);
-    assert.equal(common.buildKey(USER, "IDENTITY.md"), `${USER}/IDENTITY.md`);
+    assert.equal(common.buildKey(USER, "notes.md"), `${USER}/notes.md`);
+  });
+
+  it("rejects reserved system-prompt filenames (now sourced from _system/<ns>/)", () => {
+    assert.throws(
+      () => common.buildKey(USER, "IDENTITY.md"),
+      /reserved system-prompt source/,
+    );
+    assert.throws(
+      () => common.buildKey(USER, "AGENTS.md"),
+      /reserved system-prompt source/,
+    );
   });
 });
 

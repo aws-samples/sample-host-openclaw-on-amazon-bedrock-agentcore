@@ -246,6 +246,39 @@ def test_gateway_role_can_only_invoke_the_three_functions_and_use_the_cmk():
     assert trust["Condition"]["StringEquals"] == {"aws:SourceAccount": _ACCOUNT}
 
 
+def test_gateway_default_does_not_set_debug_exception_level():
+    """The deployed template must not carry ExceptionLevel=DEBUG by default.
+
+    DEBUG makes the Gateway return verbose internal errors (target ARNs,
+    interceptor payload fragments) to the MCP caller; it must be an explicit
+    opt-in via the ``gateway_debug_errors`` cdk context flag, not the default.
+    """
+    _, tpl = _synth_gateway()
+    gateways = tpl.find_resources("AWS::BedrockAgentCore::Gateway")
+    assert len(gateways) == 1
+    props = next(iter(gateways.values()))["Properties"]
+    assert props.get("ExceptionLevel") != "DEBUG", props.get("ExceptionLevel")
+
+
+def test_gateway_debug_errors_opt_in_sets_debug_exception_level():
+    """With ``gateway_debug_errors=true`` the Gateway opts in to DEBUG errors."""
+    app = cdk.App(context=_base_context(enable_gateway=True, gateway_debug_errors=True))
+    env = cdk.Environment(account=_ACCOUNT, region=_REGION)
+    security = SecurityStack(app, "OpenClawSecurity", env=env)
+    gateway = GatewayStack(
+        app,
+        "OpenClawGateway",
+        cognito_issuer_url=security.cognito_issuer_url,
+        cognito_client_id=security.user_pool_client_id,
+        cmk_arn=security.cmk.key_arn,
+        env=env,
+    )
+    tpl = Template.from_stack(gateway)
+    tpl.has_resource_properties(
+        "AWS::BedrockAgentCore::Gateway", {"ExceptionLevel": "DEBUG"}
+    )
+
+
 def test_cdk_nag_has_no_errors():
     stack, _ = _synth_gateway()
     errors = Annotations.from_stack(stack).find_error("*", Match.string_like_regexp("AwsSolutions-.*"))

@@ -44,6 +44,9 @@ async function browserNavigate(args) {
     }
 
     return JSON.stringify({
+      // Mark the returned payload as untrusted tool output so callers
+      // (prompt builders) do not treat it as model instructions.
+      source: "untrusted-web-content",
       url: page.url(),
       title,
       content: truncateContent(content.replace(/\s+/g, " ").trim(), CONTENT_TRUNCATE_CHARS),

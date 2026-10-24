@@ -5,7 +5,35 @@
  * AWS access (S3, Secrets Manager, DynamoDB, EventBridge Scheduler) is limited
  * to a single user's resources: the user's S3 prefix, the user's
  * openclaw/user/<namespace>/ secrets, the user's USER#<id> identity-table
- * partition and the user's openclaw-<namespace>- schedules.
+ * partition and the user's openclaw-<namespace>- schedules. It writes them to
+ * a credential_process file and builds a child environment that points the
+ * AWS SDK/CLI at that file instead of the container's ambient credentials.
+ *
+ * Threat-model caveat — read before extending this module:
+ *
+ *   The child OpenClaw process currently runs as uid 0 in the same PID,
+ *   mount and network namespace as this contract server (bridge/Dockerfile
+ *   has no USER directive; bridge/entrypoint.sh does `exec node
+ *   agentcore-contract.js` so the contract server is PID 1). A root process
+ *   in that namespace can read /proc/1/environ or reach the container
+ *   credential endpoint directly (AWS_EC2_METADATA_DISABLED is only an SDK
+ *   hint and no network rule blocks the container or instance credential
+ *   endpoints). That means stripping credential environment variables from
+ *   the child env does NOT, on its own, prevent an attacker who achieves
+ *   code execution through OpenClaw's exec tool from recovering the full
+ *   execution-role credentials.
+ *
+ *   Real cross-user isolation therefore requires EITHER (a) running the
+ *   OpenClaw child under a dedicated unprivileged uid with hidepid / a
+ *   separate PID namespace plus an iptables owner-match rule blocking the
+ *   container credential endpoint for that uid, OR (b) exchanging the
+ *   ambient credentials once at bootstrap, scrubbing
+ *   AWS_CONTAINER_CREDENTIALS_* / AWS_CONTAINER_AUTHORIZATION_TOKEN* from
+ *   this process and dropping network access to the credential endpoint.
+ *   Until one of those holds, treat the per-user AgentCore microVM as the
+ *   enforced tenant boundary and treat the child env filter below as a
+ *   defence-in-depth hardening against accidental SDK fallback — not as
+ *   the isolation mechanism.
  *
  * Usage:
  *   const { createScopedCredentials, writeCredentialFiles, buildOpenClawEnv } = require("./scoped-credentials");
@@ -50,15 +78,31 @@ function assertCredentialsFresh(creds, { now = Date.now, minValidityMs = 0 } = {
   return creds;
 }
 
-// ENV vars that MUST be excluded from OpenClaw to prevent credential leakage
+// ENV vars that MUST be excluded from the OpenClaw child so the AWS SDK/CLI
+// in that child cannot resolve ambient container credentials through its
+// default provider chain. This is defence-in-depth: see the module header
+// for why a stripped env alone is NOT a tenant-isolation boundary when the
+// child shares a uid and PID namespace with this contract server. Every
+// known AWS credential source the SDK consults is listed here, including
+// the authorization-token variables used with the container credential
+// endpoint (previously missing — their presence let the child reach the
+// endpoint directly). Keep this list in sync with the lists in
+// bridge/openclaw-worker-owner.js, bridge/openclaw-preinit.mjs,
+// bridge/live-gateway-seed-common.mjs and bridge/sqlite-receiver-control.mjs.
 const CREDENTIAL_ENV_BLOCKLIST = [
   "AWS_ACCESS_KEY_ID",
   "AWS_SECRET_ACCESS_KEY",
   "AWS_SESSION_TOKEN",
+  "AWS_SECURITY_TOKEN",
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
   "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
   "AWS_WEB_IDENTITY_TOKEN_FILE",
   "AWS_ROLE_ARN",
+  "AWS_ROLE_SESSION_NAME",
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "AWS_PROFILE",
 ];
 
 // ENV vars forwarded from baseEnv to OpenClaw process
@@ -417,9 +461,16 @@ function createCredentialManager(namespace, {
 /**
  * Build a clean environment for the OpenClaw child process.
  *
- * Includes scoped credential config and app env vars.
- * Explicitly EXCLUDES all AWS credential env vars to prevent
- * OpenClaw from accessing the container's full execution role.
+ * Includes scoped credential config and app env vars, and strips every
+ * known AWS credential source (CREDENTIAL_ENV_BLOCKLIST) from the forwarded
+ * variables so the SDK/CLI inside the child defaults to the scoped
+ * credential_process file. This filter is defence-in-depth only: it does
+ * NOT, by itself, prevent a child that runs as root in the same PID
+ * namespace as this contract server from reading /proc/1/environ or
+ * contacting the container credential endpoint. See the module header for
+ * the required container-level controls (dedicated uid, hidepid / PID
+ * namespace, iptables owner-match on the credential endpoint, or ambient
+ * credentials scrubbed from this process after bootstrap).
  *
  * @param {object} opts
  * @param {string} opts.credDir - Directory containing scoped credential files

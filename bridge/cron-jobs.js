@@ -114,13 +114,39 @@ function createCronJobStore({ dir = null, now = Date.now, bootId, log = console 
     prune();
   }
 
+  // The full session binding keys a job: userId alone is self-asserted in the
+  // same request body and so cannot be the only authorizer for cron_status or
+  // the duplicate-jobId gate.
+  function bindingMatches(job, binding) {
+    if (!job || !binding) return false;
+    return job.userId === binding.userId &&
+      (job.actorId ?? null) === (binding.actorId ?? null) &&
+      (job.runtimeSessionId ?? null) === (binding.runtimeSessionId ?? null);
+  }
+
+  // Accept either the full binding object (preferred) or a bare userId string.
+  // The bare-userId form is for the legacy single-tenant callers; it still has
+  // to supply actorId/runtimeSessionId=null on both sides of the compare.
+  function asBinding(value) {
+    if (typeof value === "string") return { userId: value, actorId: null, runtimeSessionId: null };
+    if (!value || typeof value !== "object") return null;
+    return {
+      userId: value.userId,
+      actorId: value.actorId ?? null,
+      runtimeSessionId: value.runtimeSessionId ?? null,
+    };
+  }
+
   return {
     load,
     /** Register a job. Returns { duplicate: true, job } when the jobId is known. */
-    start(jobId, { userId, deadline }) {
+    start(jobId, { userId, actorId = null, runtimeSessionId = null, deadline }) {
       const existing = jobs.get(jobId);
       if (existing) return { duplicate: true, job: existing };
-      const job = { jobId, userId, state: "running", bootId, acceptedAt: now(), deadline };
+      const job = {
+        jobId, userId, actorId, runtimeSessionId,
+        state: "running", bootId, acceptedAt: now(), deadline,
+      };
       jobs.set(jobId, job);
       prune();
       save();
@@ -133,9 +159,9 @@ function createCronJobStore({ dir = null, now = Date.now, bootId, log = console 
       save();
     },
     /** cron_status answer. Never queued and never waits on a turn. */
-    status(jobId, userId) {
+    status(jobId, binding) {
       const job = typeof jobId === "string" ? jobs.get(jobId) : undefined;
-      if (!job || job.userId !== userId) return { status: "unknown", jobId };
+      if (!bindingMatches(job, asBinding(binding))) return { status: "unknown", jobId };
       if (job.state === "lost") return { status: "unknown", jobId, reason: "lost" };
       if (job.state === "running") return { status: "running", jobId, deadline: job.deadline };
       return {
@@ -144,6 +170,12 @@ function createCronJobStore({ dir = null, now = Date.now, bootId, log = console 
         execution: { phase: job.outcome },
         ...(job.truncated ? { truncated: true } : {}),
       };
+    },
+    /** Does this binding already own this jobId? Used by cron_start to tell a
+     *  legitimate idempotent retry from a jobId squatted by a different binding. */
+    isOwnedBy(jobId, binding) {
+      const job = typeof jobId === "string" ? jobs.get(jobId) : undefined;
+      return bindingMatches(job, asBinding(binding));
     },
     size: () => jobs.size,
   };

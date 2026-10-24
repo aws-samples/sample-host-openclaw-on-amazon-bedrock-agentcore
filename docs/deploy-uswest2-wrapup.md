@@ -129,7 +129,7 @@ pip3 install --break-system-packages bedrock-agentcore-starter-toolkit
 
 # Invoke (test)
 ~/.local/bin/agentcore invoke '{"prompt": "hi"}' -a openclaw_agent
-~/.local/bin/agentcore invoke '{"action":"status"}' -a openclaw_agent
+~/.local/bin/agentcore invoke '{"action":"status","userId":"test","actorId":"test:123"}' -a openclaw_agent
 ~/.local/bin/agentcore invoke '{"action":"chat","userId":"test","actorId":"test:123","channel":"test","message":"hello"}' -a openclaw_agent
 ```
 

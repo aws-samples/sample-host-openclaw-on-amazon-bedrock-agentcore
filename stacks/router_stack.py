@@ -108,7 +108,10 @@ class RouterStack(Stack):
             "RouterLogGroup",
             log_group_name=namer.name("/openclaw/lambda/router"),
             retention=retention_days(log_retention),
-            removal_policy=RemovalPolicy.DESTROY,
+            # RETAIN to match the API access log group so router history is
+            # preserved across stack delete/replace. Operational retention
+            # (30 d) still applies.
+            removal_policy=RemovalPolicy.RETAIN,
         )
 
         # --- Lambda Function ---
@@ -278,18 +281,37 @@ class RouterStack(Stack):
             )
         )
 
-        # Secrets Manager (channel tokens)
-        self.router_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "secretsmanager:GetSecretValue",
-                    "secretsmanager:DescribeSecret",
-                ],
-                resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
-                ],
+        # Secrets Manager — scoped to the exact channel-token and webhook
+        # validation secrets the Router Lambda actually reads. The names come
+        # in as constructor arguments and are already present as fixed env
+        # vars on the function, so an enumerated resource list is feasible.
+        # Must NOT include openclaw/cognito-password-secret, openclaw/gateway-token
+        # or openclaw/user/* — this function is internet-facing and those
+        # secrets would widen the blast radius of any webhook-parsing defect.
+        router_secret_names = [
+            telegram_token_secret_name,
+            slack_token_secret_name,
+            feishu_token_secret_name,
+            whatsapp_token_secret_name,
+            discord_token_secret_name,
+            line_token_secret_name,
+            webhook_secret_name,
+        ]
+        router_secret_resources = [
+            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+            for name in router_secret_names
+            if name
+        ]
+        if router_secret_resources:
+            self.router_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "secretsmanager:GetSecretValue",
+                        "secretsmanager:DescribeSecret",
+                    ],
+                    resources=router_secret_resources,
+                )
             )
-        )
 
         # KMS decrypt for secrets
         self.router_fn.add_to_role_policy(
@@ -343,13 +365,19 @@ class RouterStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
-                    "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
-                    "grant_read_write_data adds index wildcards and KMS wildcards "
-                    "for CMK-encrypted table. S3 PutObject scoped to */_uploads/* "
-                    "prefix for image uploads.",
+                    "Secrets Manager resources are each a single secret with the "
+                    "mandatory '-*' Secrets Manager random suffix; the enumerated "
+                    "list covers only the channel/webhook secrets this Lambda reads. "
+                    "DynamoDB grant_read_write_data adds index wildcards and KMS "
+                    "wildcards for CMK-encrypted table. S3 PutObject scoped to "
+                    "*/_uploads/* prefix for image uploads.",
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
+                        *[
+                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+                            for name in router_secret_names
+                            if name
+                        ],
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
                         "Action::kms:GenerateDataKey*",

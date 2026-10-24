@@ -22,7 +22,11 @@ def ensure_repository(client, name):
         if error.response["Error"]["Code"] != "RepositoryNotFoundException":
             raise
         try:
-            return client.create_repository(repositoryName=name)["repository"]["repositoryUri"]
+            return client.create_repository(
+                repositoryName=name,
+                imageTagMutability="IMMUTABLE",
+                imageScanningConfiguration={"scanOnPush": True},
+            )["repository"]["repositoryUri"]
         except ClientError as create_error:
             if create_error.response["Error"]["Code"] != "RepositoryAlreadyExistsException":
                 raise

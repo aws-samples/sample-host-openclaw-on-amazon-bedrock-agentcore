@@ -218,6 +218,8 @@ function contractHandler(telemetry) {
     v2Lifecycle: {
       health: () => ({ statusCode: 503, body: { status: "HealthyBusy" } }),
       snapshot: () => ({ state: "BOOTSTRAP_READY", binding: null, generation: undefined, resources: [] }),
+      assertBinding: () => {},
+      checkpoint: () => {},
     },
     console: { log() {}, error() {} },
   });

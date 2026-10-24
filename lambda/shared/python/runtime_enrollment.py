@@ -56,10 +56,42 @@ def read_actor_owner(table, actor_id):
 _RECONCILE_SCAN_MAX_PAGES = 1000
 
 
+def _derived_user_id(actor_id):
+    return f"user_{hashlib.sha256(actor_id.encode()).hexdigest()[:16]}"
+
+
+def _deterministic_actor_residue(table, actor_id):
+    """Probe the derived USER# partition for residue of a prior V2 enrollment.
+
+    These O(1) reads find V2 residue without depending on table size; the
+    filtered scan that follows only has to find legacy (random user id) records.
+    """
+    partition = f"USER#{_derived_user_id(actor_id)}"
+    backref = table.get_item(
+        Key={"PK": partition, "SK": f"CHANNEL#{actor_id}"}, ConsistentRead=True,
+    ).get("Item")
+    if backref:
+        return True
+    profile = table.get_item(
+        Key={"PK": partition, "SK": "PROFILE"}, ConsistentRead=True,
+    ).get("Item") or {}
+    if profile.get("enrollmentActorId") == actor_id:
+        return True
+    session = table.get_item(
+        Key={"PK": partition, "SK": "SESSION"}, ConsistentRead=True,
+    ).get("Item") or {}
+    return session.get("actorId") == actor_id
+
+
 def reconcile_actor_owner(table, actor_id):
     owner = read_actor_owner(table, actor_id)
     if owner:
         return owner
+    # Fast deterministic path: residue of a prior V2 enrollment for this actor
+    # always lives under the derived USER#<sha256(actor_id)> partition and is
+    # retrievable with O(1) get_item calls that do not depend on table size.
+    if _deterministic_actor_residue(table, actor_id):
+        raise RouteUnavailable("Actor has retained ownership; reconciliation required")
     cursor = None
     # Missing CHANNEL is not evidence that the actor's state namespace is unused.
     for _ in range(_RECONCILE_SCAN_MAX_PAGES):

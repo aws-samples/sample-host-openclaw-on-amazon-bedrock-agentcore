@@ -155,6 +155,30 @@ describe("schedules target", () => {
     assert.equal(put.Item.actorId, "telegram:123456");
   });
 
+  it("create_schedule stores every delivery field the Cron Lambda checks the payload against", async () => {
+    // lambda/cron/index.py verify_cron_event refuses a run unless the CRON#
+    // record has channel, channelTarget, channelActorId, actorId and message,
+    // and the payload's values equal them (actor = channelActorId or actorId).
+    const { scheduler, ddb, handler } = cronHandler();
+    await handler(
+      { expression: "cron(0 9 * * ? *)", timezone: "UTC", message: "stand up", [RESERVED_ARG]: TOKEN },
+      h.gatewayContext("schedules", "create_schedule"),
+    );
+    const input = JSON.parse(scheduler.sent.find((c) => c.kind === "CreateScheduleCommand").input.Target.Input);
+    const item = ddb.sent.find((c) => c.kind === "PutCommand").input.Item;
+    for (const field of ["channel", "channelTarget", "channelActorId", "actorId", "message"]) {
+      assert.equal(typeof item[field], "string", `${field} missing from the CRON# record`);
+      assert.ok(item[field], `${field} empty on the CRON# record`);
+    }
+    assert.equal(item.channelActorId, "telegram:123456");
+    assert.ok(item.channelActorId.startsWith(`${item.channel}:`));
+    assert.equal(input.channel, item.channel);
+    assert.equal(input.channelTarget, item.channelTarget);
+    assert.equal(input.channelActorId || input.actorId, item.channelActorId);
+    assert.equal(input.actorId, item.actorId);
+    assert.equal(input.message, item.message);
+  });
+
   it("create_schedule rolls back the EventBridge schedule if the DynamoDB write fails", async () => {
     const { scheduler, handler } = cronHandler({
       ddbAnswer: (cmd) => {
