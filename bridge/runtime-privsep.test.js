@@ -98,3 +98,50 @@ test("startup lines warn loudly when privilege separation is inactive", () => {
   // And when the network block is down it must say the execution role is still reachable.
   assert.match(lines, /can still reach the metadata endpoint/);
 });
+
+test("startup summary line names every layer and normalises inactive to INACTIVE", () => {
+  const state = privsep.describeProtections({ proc: rootProc, env: {}, networkBlock: "inactive", procHidden: "inactive" });
+  assert.equal(state.networkBlock, "INACTIVE");
+  assert.equal(state.procHidden, "INACTIVE");
+  const lines = privsep.formatStartupLines(state).join("\n");
+  assert.match(lines, /\[privsep\] protections: uid_split=active proc_environ_isolation=active proc_hidepid=INACTIVE metadata_block=INACTIVE/);
+  const unknown = privsep.describeProtections({ proc: rootProc, env: {}, networkBlock: "", procHidden: "weird" });
+  assert.equal(unknown.networkBlock, "unknown");
+  assert.equal(unknown.procHidden, "unknown");
+});
+
+test("credential endpoint shape: relative URI only is covered and logged without values", () => {
+  const env = { AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/secret-path" };
+  const shape = privsep.credentialEndpointShape(env);
+  assert.deepEqual(shape, { relativeUri: true, fullUri: "none", tokenFile: "none" });
+  const lines = privsep.formatStartupLines(privsep.describeProtections({ proc: rootProc, env, networkBlock: "active", procHidden: "active" })).join("\n");
+  assert.match(lines, /container credential endpoint: relative_uri=set full_uri=none token_file=none/);
+  assert.doesNotMatch(lines, /secret-path/);
+  assert.doesNotMatch(lines, /may be able to reach the container credential endpoint/);
+});
+
+test("credential endpoint shape: a full URI on the firewalled credential address is covered", () => {
+  const shape = privsep.credentialEndpointShape({ AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://169.254.170.2/v1/creds" });
+  assert.equal(shape.fullUri, "covered by the firewall");
+  const v6 = privsep.credentialEndpointShape({ AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://[fd00:ec2::254]/creds" });
+  assert.equal(v6.fullUri, "covered by the firewall");
+});
+
+test("credential endpoint shape: a loopback full URI and a world-readable token file are flagged", () => {
+  const fs = { statSync: () => ({ mode: 0o100644 }) };
+  const env = {
+    AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://127.0.0.1:1338/creds",
+    AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: "/var/run/token",
+  };
+  const shape = privsep.credentialEndpointShape(env, fs);
+  assert.equal(shape.fullUri, "NOT covered by the firewall (host 127.0.0.1)");
+  assert.equal(shape.tokenFile, "readable by other uids");
+  const lines = privsep.formatStartupLines(privsep.describeProtections({ proc: rootProc, env, networkBlock: "active", procHidden: "active", fs })).join("\n");
+  assert.match(lines, /NOTE: the agent uid may be able to reach the container credential endpoint/);
+});
+
+test("credential endpoint shape: owner-only, missing and unparseable inputs never throw", () => {
+  assert.equal(privsep.credentialEndpointShape({ AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: "/t" }, { statSync: () => ({ mode: 0o100600 }) }).tokenFile, "owner-only");
+  assert.equal(privsep.credentialEndpointShape({ AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: "/t" }, { statSync: () => { throw new Error("ENOENT"); } }).tokenFile, "set but not readable");
+  assert.equal(privsep.credentialEndpointShape({ AWS_CONTAINER_CREDENTIALS_FULL_URI: "not a url" }).fullUri, "unparseable (NOT covered by the firewall)");
+});

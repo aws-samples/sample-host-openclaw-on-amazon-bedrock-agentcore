@@ -66,7 +66,7 @@ if command -v mount >/dev/null 2>&1 && mount -o remount,hidepid=2 /proc 2>/dev/n
     echo "[openclaw-agentcore] /proc remounted with hidepid=2 (other processes hidden from the agent uid)"
 else
     export OPENCLAW_PROC_HIDDEN="inactive"
-    echo "[openclaw-agentcore] /proc hidepid not applied (needs CAP_SYS_ADMIN); uid split still blocks cross-process environ reads"
+    echo "[openclaw-agentcore] /proc hidepid INACTIVE (remount refused; needs CAP_SYS_ADMIN); uid split still blocks cross-process environ reads"
 fi
 
 # Layer 2: block the agent uid from the metadata / container-credential endpoints.

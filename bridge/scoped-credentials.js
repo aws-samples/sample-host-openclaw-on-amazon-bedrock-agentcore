@@ -11,29 +11,26 @@
  *
  * Threat-model caveat — read before extending this module:
  *
- *   The child OpenClaw process currently runs as uid 0 in the same PID,
- *   mount and network namespace as this contract server (bridge/Dockerfile
- *   has no USER directive; bridge/entrypoint.sh does `exec node
- *   agentcore-contract.js` so the contract server is PID 1). A root process
- *   in that namespace can read /proc/1/environ or reach the container
+ *   Stripping credential environment variables from the child env does NOT,
+ *   on its own, stop code running through OpenClaw's exec tool from
+ *   recovering the full execution role: a process with the supervisor's
+ *   privileges can read /proc/1/environ or query the container/instance
  *   credential endpoint directly (AWS_EC2_METADATA_DISABLED is only an SDK
- *   hint and no network rule blocks the container or instance credential
- *   endpoints). That means stripping credential environment variables from
- *   the child env does NOT, on its own, prevent an attacker who achieves
- *   code execution through OpenClaw's exec tool from recovering the full
- *   execution-role credentials.
+ *   hint). The execution role can read every user's
+ *   openclaw/cognito-user/* secret, so recovering it crosses users.
  *
- *   Real cross-user isolation therefore requires EITHER (a) running the
- *   OpenClaw child under a dedicated unprivileged uid with hidepid / a
- *   separate PID namespace plus an iptables owner-match rule blocking the
- *   container credential endpoint for that uid, OR (b) exchanging the
- *   ambient credentials once at bootstrap, scrubbing
- *   AWS_CONTAINER_CREDENTIALS_* / AWS_CONTAINER_AUTHORIZATION_TOKEN* from
- *   this process and dropping network access to the credential endpoint.
- *   Until one of those holds, treat the per-user AgentCore microVM as the
- *   enforced tenant boundary and treat the child env filter below as a
- *   defence-in-depth hardening against accidental SDK fallback — not as
- *   the isolation mechanism.
+ *   The enforced controls live in bridge/runtime-privsep.js and the
+ *   entrypoint: the OpenClaw gateway and its tool shells run as an
+ *   unprivileged uid (10001), so the kernel refuses their reads of the root
+ *   supervisor's /proc/<pid>/environ; /proc is remounted with hidepid=2; and
+ *   bridge/mmds-firewall.sh drops traffic from that uid to the metadata and
+ *   credential endpoints. The last two need CAP_SYS_ADMIN / CAP_NET_ADMIN
+ *   and are best-effort; the contract server's startup log states which
+ *   layers are active. Where the network block is inactive, or the runtime
+ *   supplies a credential endpoint the firewall does not cover (see
+ *   docs/security.md), treat the per-user AgentCore microVM and a
+ *   least-privilege execution role as the boundary, and treat the env filter
+ *   below as defence in depth against accidental SDK fallback.
  *
  * Usage:
  *   const { createScopedCredentials, writeCredentialFiles, buildOpenClawEnv } = require("./scoped-credentials");

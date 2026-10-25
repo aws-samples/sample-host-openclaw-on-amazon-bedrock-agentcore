@@ -41,25 +41,50 @@ function status(result) {
   return match[1];
 }
 
-test("installs owner-match drops for both metadata addresses and reports active", (t) => {
+// Destination addresses of every rule appended (-A), in order.
+function appendedDestinations(rules) {
+  return rules.split("\n").filter((line) => / -A /.test(line)).map((line) => /-d (\S+)/.exec(line)[1]);
+}
+
+const METADATA_V4 = "169.254.169.254/32";
+const CREDENTIALS_V4 = "169.254.170.2/32";
+const METADATA_V6 = "fd00:ec2::254";
+
+test("installs owner-match drops for the metadata and credential addresses and reports active", (t) => {
   const box = sandbox(t, { exitCode: 0 });
   const result = box.run();
   assert.equal(result.status, 0);
   assert.equal(status(result), "active");
   const rules = box.rules();
-  // IPv4 link-local metadata blocked from the agent uid, not uid 0.
-  assert.match(rules, /iptables -A OUTPUT -m owner --uid-owner 10001 -d 169\.254\.0\.0\/16 -j DROP/);
-  // IPv6 metadata blocked too.
-  assert.match(rules, /ip6tables -A OUTPUT -m owner --uid-owner 10001 -d fd00:ec2::254 -j DROP/);
+  assert.deepEqual(appendedDestinations(rules), [METADATA_V4, CREDENTIALS_V4, METADATA_V6]);
+  assert.ok(rules.includes(`iptables -A OUTPUT -m owner --uid-owner 10001 -d ${METADATA_V4} -j DROP`));
+  assert.ok(rules.includes(`iptables -A OUTPUT -m owner --uid-owner 10001 -d ${CREDENTIALS_V4} -j DROP`));
+  assert.ok(rules.includes(`ip6tables -A OUTPUT -m owner --uid-owner 10001 -d ${METADATA_V6} -j DROP`));
   // Idempotent: it deletes a prior copy before adding.
-  assert.match(rules, /iptables -D OUTPUT -m owner --uid-owner 10001 -d 169\.254\.0\.0\/16 -j DROP/);
+  assert.ok(rules.includes(`iptables -D OUTPUT -m owner --uid-owner 10001 -d ${METADATA_V4} -j DROP`));
+  assert.ok(rules.includes(`iptables -D OUTPUT -m owner --uid-owner 10001 -d ${CREDENTIALS_V4} -j DROP`));
+});
+
+test("does not block the whole link-local range, so DNS and time sync keep working", (t) => {
+  const box = sandbox(t, { exitCode: 0 });
+  box.run();
+  const rules = box.rules();
+  // No /16 (or any wider prefix) over link-local: the VPC resolver (.253) and
+  // the time sync service (.123) must stay reachable for the agent uid.
+  assert.ok(!rules.includes("169.254.0.0/16"), rules);
+  for (const dest of appendedDestinations(rules)) {
+    if (dest.includes(".")) assert.ok(dest.endsWith("/32"), `IPv4 rule must be a single host, got ${dest}`);
+  }
+  assert.ok(!rules.includes("169.254.169.253"));
+  assert.ok(!rules.includes("169.254.169.123"));
 });
 
 test("honours an overridden agent uid", (t) => {
   const box = sandbox(t, { exitCode: 0 });
   const result = box.run({ OPENCLAW_RUNTIME_UID: "20002" });
   assert.equal(status(result), "active");
-  assert.match(box.rules(), /--uid-owner 20002 -d 169\.254\.0\.0\/16/);
+  assert.ok(box.rules().includes(`--uid-owner 20002 -d ${METADATA_V4}`));
+  assert.ok(box.rules().includes(`--uid-owner 20002 -d ${CREDENTIALS_V4}`));
 });
 
 test("fails safe (inactive, exit 0) when the firewall tool is absent", (t) => {
@@ -68,6 +93,7 @@ test("fails safe (inactive, exit 0) when the firewall tool is absent", (t) => {
   assert.equal(result.status, 0, "must not fail the container");
   assert.equal(status(result), "inactive");
   assert.match(result.stdout, /not present/);
+  assert.match(result.stdout, /INACTIVE/);
 });
 
 test("fails safe (inactive, exit 0) when the rule is refused (no CAP_NET_ADMIN)", (t) => {
@@ -76,6 +102,7 @@ test("fails safe (inactive, exit 0) when the rule is refused (no CAP_NET_ADMIN)"
   assert.equal(result.status, 0, "must not fail the container");
   assert.equal(status(result), "inactive");
   assert.match(result.stdout, /refused the rule|NOT blocked/);
+  assert.match(result.stdout, /INACTIVE/);
 });
 
 test("reports inactive if only IPv6 cannot be blocked", (t) => {
@@ -83,5 +110,5 @@ test("reports inactive if only IPv6 cannot be blocked", (t) => {
   const box = sandbox(t, { tools: ["iptables"], exitCode: 0 });
   const result = box.run();
   assert.equal(status(result), "inactive");
-  assert.match(box.rules(), /iptables -A OUTPUT .* -d 169\.254\.0\.0\/16 -j DROP/);
+  assert.deepEqual(appendedDestinations(box.rules()), [METADATA_V4, CREDENTIALS_V4]);
 });

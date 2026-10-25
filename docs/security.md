@@ -126,7 +126,7 @@ AWS_SHARED_CREDENTIALS_FILE
 AWS_PROFILE
 ```
 
-OpenClaw receives credentials only via `AWS_CONFIG_FILE` pointing to a `credential_process` that reads the scoped credential file. This filter prevents accidental ambient-credential pickup by the SDK; it does **not** prevent a root process in the same container from re-reading those variables from `/proc/1/environ` or from querying the container credential endpoint. See the module header of `bridge/scoped-credentials.js` for the container-level controls (dedicated uid, hidepid / PID namespace, iptables owner-match on the credential endpoint) required to make this an enforced boundary.
+OpenClaw receives credentials only via `AWS_CONFIG_FILE` pointing to a `credential_process` that reads the scoped credential file. This filter prevents accidental ambient-credential pickup by the SDK; on its own it does **not** prevent a process with the supervisor's privileges from re-reading those variables from `/proc/1/environ` or from querying the container credential endpoint. The enforced controls are the ones in §3.8 Runtime Privilege Separation: OpenClaw runs as an unprivileged uid, `/proc` is remounted with `hidepid=2`, and an owner-match firewall rule blocks that uid from the metadata and credential endpoints.
 
 #### Trust Policy Condition
 
@@ -146,7 +146,7 @@ Scoped credentials are checked before turns and persistence operations, and refr
 
 #### Proxy Trust Boundary
 
-The proxy process (`agentcore-proxy.js`) is trusted code and retains full execution role credentials for Bedrock, Cognito, and S3 image access. Application-level namespace enforcement (prefix validation, path traversal checks) provides the security boundary here. The proxy runs as root alongside the contract server; because OpenClaw runs as an unprivileged uid (see §3.8 Runtime Privilege Separation), the agent cannot read the proxy's environment (which carries the Cognito password-derivation secret) via `/proc`.
+The proxy process (`agentcore-proxy.js`) is trusted code and retains full execution role credentials for Bedrock, Cognito, and S3 image access. Application-level namespace enforcement (prefix validation, path traversal checks) provides the security boundary here. The proxy runs as root alongside the contract server; because OpenClaw runs as an unprivileged uid (see §3.8 Runtime Privilege Separation), the agent cannot read the proxy's or the supervisor's environment via `/proc` and so cannot recover the execution role, which can read every user's `openclaw/cognito-user/*` secret.
 
 ### 3.5 Encryption
 
@@ -254,8 +254,9 @@ scoped credentials and run the Bedrock proxy. The untrusted agent is isolated
   tool spawns (tool shells, `clawhub`, `openclaw doctor`) run as uid/gid 10001
   (`bridge/runtime-privsep.js`), spawned from the root supervisor. Because the
   kernel only lets the owning uid read another process's `/proc/<pid>/environ`,
-  the agent uid cannot read the supervisor's or the Bedrock proxy's environment
-  (the proxy's environment carries the Cognito password-derivation secret). This
+  the agent uid cannot read the supervisor's or the Bedrock proxy's environment,
+  and so cannot recover the execution role from it. That matters because the
+  execution role can read every user's `openclaw/cognito-user/*` secret. This
   layer needs no Linux capability and is active whenever the container is root;
   the startup log prints a loud warning if it is not.
 - **/proc hidepid (best-effort).** The entrypoint remounts `/proc` with
@@ -263,10 +264,13 @@ scoped credentials and run the Bedrock proxy. The untrusted agent is isolated
   `CAP_SYS_ADMIN`; skipped and logged when unavailable.
 - **Metadata network block (best-effort).** `bridge/mmds-firewall.sh` installs an
   `iptables`/`ip6tables` owner-match rule dropping traffic **from the agent uid**
-  to the IMDS-style link-local range (`169.254.0.0/16`) and the IPv6 metadata
-  address (`fd00:ec2::254`), while the root supervisor keeps metadata access. This is
-  what stops a tool shell from calling the metadata endpoint and lifting the
-  full, unscoped execution role. It needs `CAP_NET_ADMIN`; when unavailable the
+  to the metadata service (`169.254.169.254/32`), the container credential
+  endpoint (`169.254.170.2/32`) and the IPv6 metadata address (`fd00:ec2::254`),
+  while the root supervisor keeps metadata access. It does not block the rest of
+  `169.254.0.0/16`, so the Amazon VPC DNS resolver (`169.254.169.253`) and the
+  Amazon Time Sync Service (`169.254.169.123`) keep working for the agent uid.
+  This is what stops a tool shell from calling the metadata endpoint and lifting
+  the full, unscoped execution role. It needs `CAP_NET_ADMIN`; when unavailable the
   script reports the block inactive, the container still starts, and the
   least-privilege execution role is the remaining control. AWS documents that any
   code in the microVM can reach the metadata endpoint, so scope the execution
@@ -277,7 +281,28 @@ scoped credentials and run the Bedrock proxy. The untrusted agent is isolated
   gateway can open the restored SQLite databases. The session-storage mount does
   not enforce POSIX ownership, so only the local state dir needs this.
 
-The startup log states which of the three layers are active in a given runtime.
+The startup log states which of the three layers are active in a given runtime,
+in a `[privsep] protections: uid_split=... proc_environ_isolation=...
+proc_hidepid=... metadata_block=...` line; an inactive layer reads `INACTIVE`.
+
+**Credential endpoint caveat.** The firewall rules cover the credential endpoint
+only when it is served on `169.254.170.2` (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`)
+or on one of the metadata addresses. If the runtime instead provides
+`AWS_CONTAINER_CREDENTIALS_FULL_URI` on another address (for example a loopback
+listener), the agent uid can reach it, and the remaining protection is the
+authorization token: `AWS_CONTAINER_AUTHORIZATION_TOKEN` in the supervisor's
+environment is hidden by the uid split, but an
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` readable by other uids is not. The
+startup line `[privsep] container credential endpoint: relative_uri=...
+full_uri=... token_file=...` reports which shape a runtime uses (without printing
+any credential) and adds a NOTE when the shape is not covered. Check it in a
+staging startup log; the Bedrock proxy's `[proxy] Credential env:` line shows
+the same variables.
+
+**Staging checks.** The AgentCore microVM may refuse `CAP_NET_ADMIN` (the
+firewall) or the `/proc` remount (`CAP_SYS_ADMIN`). Both fail safe: the
+container still starts, the layer is logged `INACTIVE`, and the uid split stays
+in force. Confirm in a staging startup log which layers are active.
 
 ### 3.9 Audit, Monitoring & Observability
 

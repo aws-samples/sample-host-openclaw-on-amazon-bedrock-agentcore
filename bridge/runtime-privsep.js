@@ -10,10 +10,13 @@
  * https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-security-best-practices.html
  * ("Understand credential exposure within the VM"). OpenClaw exposes an `exec`
  * tool, so a shell the model runs could:
- *   - read another process's /proc/<pid>/environ (the proxy child carries
- *     COGNITO_PASSWORD_SECRET in its environment), or
- *   - curl the MMDS address and lift the full, unscoped execution role,
- * bypassing the per-user scoped STS credentials (PR #206).
+ *   - read another process's /proc/<pid>/environ and recover the execution
+ *     role's credentials from the supervisor or proxy, or
+ *   - query the MMDS / container credential endpoint and lift the full,
+ *     unscoped execution role,
+ * bypassing the per-user scoped STS credentials (PR #206). The execution role
+ * can read every user's openclaw/cognito-user/* secret (and so mint any user's
+ * Cognito tokens), so the agent must not be able to recover it.
  *
  * The contract server (and the Bedrock proxy it owns) are the trusted
  * supervisor: they legitimately hold the execution role to fetch secrets,
@@ -139,13 +142,58 @@ function chownRecursiveSync(dir, uid, gid, fs) {
   return true;
 }
 
+// Normalise a status reported by the entrypoint to "active" / "INACTIVE" /
+// "unknown", so an inactive layer always reads the same way in the log.
+function normaliseStatus(value) {
+  const v = String(value ?? "").trim().toLowerCase();
+  if (v === "active") return "active";
+  if (v === "inactive") return "INACTIVE";
+  return "unknown";
+}
+
+// Hosts the mmds-firewall.sh rules cover (keep in sync with that script).
+const FIREWALLED_HOSTS = new Set(["169.254.169.254", "169.254.170.2", "fd00:ec2::254"]);
+
 /**
- * A structured statement of the protections in force, for the startup log and
- * the fix39 report. `networkBlock` and `procHidden` are set by the entrypoint
- * (it owns the iptables/hidepid attempts); this module reports the uid layer,
- * which it owns, and composes the full picture.
+ * Describe the container credential endpoint the runtime handed us, without
+ * printing any credential: whether a relative URI is set (always served on the
+ * firewalled 169.254.170.2), whether a full URI is set and whether its host is
+ * one the firewall covers, and whether an authorization token file exists and
+ * is readable by other uids. Never throws.
  */
-function describeProtections({ proc = process, env = process.env, networkBlock = "unknown", procHidden = "unknown" } = {}) {
+function credentialEndpointShape(env = process.env, fs = realFs) {
+  const shape = { relativeUri: Boolean(env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI), fullUri: "none", tokenFile: "none" };
+  const fullUri = env.AWS_CONTAINER_CREDENTIALS_FULL_URI;
+  if (fullUri) {
+    let host = null;
+    try {
+      host = new URL(fullUri).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    } catch {
+      host = null;
+    }
+    if (host === null) shape.fullUri = "unparseable (NOT covered by the firewall)";
+    else if (FIREWALLED_HOSTS.has(host)) shape.fullUri = "covered by the firewall";
+    else shape.fullUri = `NOT covered by the firewall (host ${host})`;
+  }
+  const tokenFile = env.AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE;
+  if (tokenFile) {
+    try {
+      const mode = fs.statSync(tokenFile).mode;
+      shape.tokenFile = (mode & 0o044) ? "readable by other uids" : "owner-only";
+    } catch {
+      shape.tokenFile = "set but not readable";
+    }
+  }
+  return shape;
+}
+
+/**
+ * A structured statement of the protections in force, for the startup log.
+ * `networkBlock` and `procHidden` are set by the entrypoint (it owns the
+ * iptables/hidepid attempts); this module reports the uid layer, which it
+ * owns, and composes the full picture.
+ */
+function describeProtections({ proc = process, env = process.env, networkBlock = "unknown", procHidden = "unknown", fs = realFs } = {}) {
   const dropped = canDropPrivileges(proc, env);
   return {
     uidSplit: dropped ? "active" : "INACTIVE",
@@ -153,13 +201,16 @@ function describeProtections({ proc = process, env = process.env, networkBlock =
     gid: dropped ? openClawGid(env) : null,
     // The uid split alone closes the cross-process /proc/<pid>/environ read.
     procEnvironIsolated: dropped ? "active" : "INACTIVE",
-    procHidden,
-    networkBlock,
+    procHidden: normaliseStatus(procHidden),
+    networkBlock: normaliseStatus(networkBlock),
+    credentialEndpoint: credentialEndpointShape(env, fs),
   };
 }
 
 function formatStartupLines(state) {
   const lines = [];
+  lines.push(`[privsep] protections: uid_split=${state.uidSplit} proc_environ_isolation=${state.procEnvironIsolated} ` +
+    `proc_hidepid=${state.procHidden} metadata_block=${state.networkBlock}`);
   if (state.uidSplit === "active") {
     lines.push(`[privsep] OpenClaw gateway + tool shells run as uid=${state.uid} gid=${state.gid} (supervisor stays root)`);
     lines.push("[privsep] /proc/<pid>/environ of the supervisor and proxy is unreadable to the agent uid (kernel-enforced)");
@@ -173,6 +224,15 @@ function formatStartupLines(state) {
     lines.push("[privsep] NOTE: with the network block inactive, a tool shell can still reach the metadata endpoint " +
       "and read the full execution role. Scope the execution role tightly (least privilege) as the remaining control.");
   }
+  const endpoint = state.credentialEndpoint;
+  if (endpoint) {
+    lines.push(`[privsep] container credential endpoint: relative_uri=${endpoint.relativeUri ? "set" : "unset"} ` +
+      `full_uri=${endpoint.fullUri} token_file=${endpoint.tokenFile}`);
+    if (/^NOT covered|^unparseable/.test(endpoint.fullUri) || endpoint.tokenFile === "readable by other uids") {
+      lines.push("[privsep] NOTE: the agent uid may be able to reach the container credential endpoint; " +
+        "the metadata firewall does not cover this endpoint shape.");
+    }
+  }
   return lines;
 }
 
@@ -185,6 +245,7 @@ module.exports = {
   canDropPrivileges,
   childPrivilegeOptions,
   chownToOpenClaw,
+  credentialEndpointShape,
   describeProtections,
   formatStartupLines,
 };
