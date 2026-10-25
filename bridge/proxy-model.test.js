@@ -30,42 +30,43 @@ test("each route obtains its ID from the OS entropy helper, including restored m
   assert.equal(new Set(records.map((record) => record.route_id)).size, 4);
 });
 
-{
-  const bound = true;
-  test(`request session IDs use fresh OS entropy and retain per-user reuse: bound=${bound}`, () => {
-    let calls = 0;
-    const ids = [];
-    const start = source.indexOf("function extractSessionMetadata(");
-    const end = source.indexOf("// Per-user Cognito", start);
-    const helperImport = 'const { osRandomUUID } = require("./runtime-lifecycle");';
-    assert.ok(source.includes(helperImport));
-    assert.ok(start > 0 && end > start);
-    for (let restore = 0; restore < 2; restore++) {
-      const box = {
-        require(name) {
-          assert.equal(name, "./runtime-lifecycle");
-          return { osRandomUUID: () => `00000000-0000-4000-8000-${String(++calls).padStart(12, "0")}` };
-        },
-        crypto: { createHash: require("node:crypto").createHash,
-          randomBytes() { assert.fail("Request IDs must not use the snapshot-restored DRBG"); } },
-        Date: { now: () => 1234567890 },
-        fs: { readFileSync: () => "{}" }, BOUND_ACTOR_ID: bound ? "slack:owner" : "",
-        process: { env: bound ? { USER_ID: "slack:owner", CHANNEL: "slack" } : {} },
-        sessionMap: new Map(), console: { log() {} },
-      };
-      vm.createContext(box);
-      vm.runInContext(helperImport + source.slice(start, end), box);
-      const headers = { "x-openclaw-actor-id": "slack:owner", "x-openclaw-channel": "slack" };
-      const first = box.extractSessionMetadata({}, headers).sessionId;
-      assert.equal(box.extractSessionMetadata({}, headers).sessionId, first);
-      assert.equal(calls, restore + 1);
-      assert.ok(first.includes(`00000000-0000-4000-8000-${String(calls).padStart(12, "0")}`));
-      assert.ok(first.length >= 33);
-      ids.push(first);
-    }
-    assert.notEqual(ids[0], ids[1]);
-  });
-}
+test("request session IDs use fresh OS entropy and retain per-user reuse", () => {
+  let calls = 0;
+  const ids = [];
+  const start = source.indexOf("function extractSessionMetadata(");
+  const end = source.indexOf("// Per-user Cognito", start);
+  const helperImport = 'const { osRandomUUID } = require("./runtime-lifecycle");';
+  assert.ok(source.includes(helperImport));
+  assert.ok(start > 0 && end > start);
+  for (let restore = 0; restore < 2; restore++) {
+    const box = {
+      require(name) {
+        assert.equal(name, "./runtime-lifecycle");
+        return { osRandomUUID: () => `00000000-0000-4000-8000-${String(++calls).padStart(12, "0")}` };
+      },
+      crypto: { createHash: require("node:crypto").createHash,
+        randomBytes() { assert.fail("Request IDs must not use the snapshot-restored DRBG"); } },
+      Date: { now: () => 1234567890 },
+      fs: { readFileSync: () => JSON.stringify({ actorId: "slack:owner", channel: "slack" }) },
+      BOUND_ACTOR_ID: "slack:owner",
+      VALID_ACTOR_ID: /^(telegram|slack|discord|whatsapp|line|feishu):[A-Za-z0-9_-]{1,64}$/,
+      process: { env: { USER_ID: "slack:owner", CHANNEL: "slack" } },
+      sessionMap: new Map(), console: { log() {} },
+    };
+    vm.createContext(box);
+    const allowStart = source.indexOf("const VALID_CHANNELS = new Set([");
+    vm.runInContext(source.slice(allowStart, source.indexOf("\nasync function retrieveMemoryContext(", allowStart)), box);
+    vm.runInContext(helperImport + source.slice(start, end), box);
+    const headers = { "x-openclaw-actor-id": "slack:owner", "x-openclaw-channel": "slack" };
+    const first = box.extractSessionMetadata({}, headers).sessionId;
+    assert.equal(box.extractSessionMetadata({}, headers).sessionId, first);
+    assert.equal(calls, restore + 1);
+    assert.ok(first.includes(`00000000-0000-4000-8000-${String(calls).padStart(12, "0")}`));
+    assert.ok(first.length >= 33);
+    ids.push(first);
+  }
+  assert.notEqual(ids[0], ids[1]);
+});
 
 test("the proxy reads the per-turn model override only from the bound identity file", () => {
   const start = source.indexOf("function extractSessionMetadata(");
@@ -74,10 +75,13 @@ test("the proxy reads the per-turn model override only from the bound identity f
     const box = {
       require: () => ({ osRandomUUID: () => "00000000-0000-4000-8000-000000000001" }),
       crypto: require("node:crypto"), Date, BOUND_ACTOR_ID: "slack:owner",
+      VALID_ACTOR_ID: /^(telegram|slack|discord|whatsapp|line|feishu):[A-Za-z0-9_-]{1,64}$/,
       fs: { readFileSync: () => { if (fileText === null) throw new Error("ENOENT"); return fileText; } },
       process: { env }, sessionMap: new Map(), console: { log() {} },
     };
     vm.createContext(box);
+    const allowStart = source.indexOf("const VALID_CHANNELS = new Set([");
+    vm.runInContext(source.slice(allowStart, source.indexOf("\nasync function retrieveMemoryContext(", allowStart)), box);
     vm.runInContext('const { osRandomUUID } = require("./runtime-lifecycle");' + source.slice(start, end), box);
     return box.extractSessionMetadata({}, {});
   };
@@ -85,7 +89,8 @@ test("the proxy reads the per-turn model override only from the bound identity f
   assert.equal(load(JSON.stringify(identity)).modelOverride, "global.anthropic.claude-opus-5-5");
   assert.equal(load(JSON.stringify({ ...identity, modelOverride: 5 })).modelOverride, null);
   assert.equal(load(JSON.stringify({ actorId: "slack:owner", channel: "slack" })).modelOverride, null);
-  assert.equal(load(null).modelOverride, null, "no identity file: environment identity, no override");
+  assert.throws(() => load(null), /identity file missing bound actor/,
+    "missing identity file must fail closed, not fall back to environment identity");
   assert.throws(() => load(JSON.stringify({ ...identity, actorId: "slack:intruder" })), /canonical actor changed/);
 });
 

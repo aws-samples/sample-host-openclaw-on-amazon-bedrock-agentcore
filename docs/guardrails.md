@@ -4,11 +4,13 @@
 
 OpenClaw deploys AWS Bedrock Guardrails via the `OpenClawGuardrails` CDK stack to provide content-level defense on every Bedrock Converse/ConverseStream API call. The proxy (`agentcore-proxy.js`) injects `guardrailConfig` into every request — Bedrock evaluates the guardrail server-side.
 
-**Input scope.** The proxy wraps every text block in the latest user turn in `guardContent` (`bridge/guardrail-scope.js`). Input filters assess that turn instead of reassessing blocked text from earlier turns. Text is never exempted because it begins with an internal-looking marker such as `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>`. When the trailing turn contains only tool results, all text in the most recent earlier user turn is tagged instead; tool results remain unchanged. If no user text exists, the request retains the default assessment scope. Model output is always assessed in full. The headless provider configuration keeps OpenClaw's generated Runtime metadata in system messages; see [AgentCore Runtime V2 compatibility](runtime-v2.md#lifecycle-and-compatibility).
+**Input scope.** The proxy wraps every text block in the latest user turn in `guardContent` (`bridge/guardrail-scope.js`). Image blocks of the same user turn are also wrapped (`{ guardContent: { image: ... } }`) so customer-uploaded images are assessed by the content filters that support the IMAGE modality (HATE, INSULTS, SEXUAL, VIOLENCE — see the content-filter table below). MISCONDUCT and PROMPT_ATTACK are text-only in Bedrock; text-in-image jailbreak content is therefore outside guardrail scope. Input filters assess that turn instead of reassessing blocked text from earlier turns. Text is never exempted because it begins with an internal-looking marker such as `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>`. When the trailing turn contains only tool results, all text in the most recent earlier user turn is tagged instead; tool results remain unchanged (Bedrock does not permit `guardContent` on `toolResult` blocks). If no user text or image exists, the request retains the default assessment scope. Model output is always assessed in full. The headless provider configuration keeps OpenClaw's generated Runtime metadata in system messages; see [AgentCore Runtime V2 compatibility](runtime-v2.md#lifecycle-and-compatibility).
+
+**Untagged history is never re-assessed.** Once any block in a Converse request carries `guardContent`, Bedrock evaluates input filters only against the tagged blocks. Every other message in `messages[]` — including earlier user turns the client replays — is forwarded to the model without input assessment. The input policy therefore only applies to the current turn, which is why an intervention must be made sticky at the proxy (see **Blocked text in history** below). Model output is still assessed in full regardless.
 
 **Blocked text in history.** Only the tagged turn is assessed, so text the guardrail stopped would otherwise reach the model untagged as history on the next request. When a Converse or ConverseStream call ends with `stopReason: guardrail_intervened`, the proxy records a SHA-256 digest of each tagged text block of that request (`bridge/guardrail-scope.js`). Later requests replace matching untagged text with `[An earlier message was blocked by the content policy and is not shown.]`; tagged text is left for the guardrail to assess again. Digests are kept in proxy memory only (at most 256, oldest dropped) and are lost when the session's container restarts. Bedrock reports input and output interventions with the same stop reason, so a message whose reply was blocked is also left out of later history.
 
-**Not assessed: the system prompt and images.** Input filters do not assess the Converse `system` block. That block includes the per-user workspace files the proxy reads from S3 (`AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`, `MEMORY.md`), which users can change through the file tools. Image blocks are not tagged either, and the content filters are configured for text only, so images are not assessed on input. Model output is still assessed in full. Weigh two trade-offs before assessing either: persona-style rules, which these files hold, are a common prompt-attack false positive (see [scheduled-task prompts](#known-limitation-scheduled-task-prompts)), and Bedrock image filters accept PNG and JPEG only (the proxy also forwards GIF and WebP) and are in preview in some Regions.
+**Not assessed: the system prompt.** Input filters do not assess the Converse `system` block. That block includes the per-user workspace files the proxy reads from S3 (`AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`, `MEMORY.md`), which users can change through the file tools. Model output is still assessed in full. Persona-style rules, which these files hold, are a common prompt-attack false positive (see [scheduled-task prompts](#known-limitation-scheduled-task-prompts)), so weigh that before assessing them. Images in the latest user turn are assessed (see **Input scope**), but Bedrock image filters accept PNG and JPEG only (the proxy also forwards GIF and WebP) and are in preview in some Regions.
 
 **Stack**: `OpenClawGuardrails` (`stacks/guardrails_stack.py`)
 **Default**: Enabled (`enable_guardrails = true`)
@@ -19,14 +21,14 @@ OpenClaw deploys AWS Bedrock Guardrails via the `OpenClawGuardrails` CDK stack t
 
 ### Content Filters
 
-| Category | Input Strength | Output Strength |
-|----------|---------------|-----------------|
-| HATE | HIGH | HIGH |
-| INSULTS | MEDIUM | HIGH |
-| SEXUAL | HIGH | HIGH |
-| VIOLENCE | HIGH | HIGH |
-| MISCONDUCT | HIGH | HIGH |
-| PROMPT_ATTACK | HIGH | NONE (input only) |
+| Category | Input Strength | Output Strength | Input Modalities |
+|----------|---------------|-----------------|------------------|
+| HATE | HIGH | HIGH | TEXT, IMAGE |
+| INSULTS | MEDIUM | HIGH | TEXT, IMAGE |
+| SEXUAL | HIGH | HIGH | TEXT, IMAGE |
+| VIOLENCE | HIGH | HIGH | TEXT, IMAGE |
+| MISCONDUCT | HIGH | HIGH | TEXT (image modality not supported by Bedrock) |
+| PROMPT_ATTACK | HIGH | NONE (input only) | TEXT (image modality not supported by Bedrock) |
 
 ### Topic Denial (6 denied topics)
 

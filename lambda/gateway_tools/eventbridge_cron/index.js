@@ -65,7 +65,9 @@ function validateExpression(expression) {
   }
   if (/^rate\(\d+\s+(minute|minutes|hour|hours|day|days)\)$/.test(expression)) {
     const m = expression.match(/^rate\((\d+)\s+(minute|minutes)\)$/);
-    if (m && parseInt(m[1], 10) < 5) throw new Error("Minimum rate interval is 5 minutes");
+    if (m && parseInt(m[1], 10) < MIN_INTERVAL_MINUTES) {
+      throw new Error(`Minimum rate interval is ${MIN_INTERVAL_MINUTES} minutes`);
+    }
     return;
   }
   const cronMatch = expression.match(/^cron\((.+)\)$/);
@@ -130,6 +132,12 @@ function scheduleNamespace(schedule) {
     return null;
   }
 }
+
+// Hard cap on how many CRON# records a single OpenClaw user may own at once.
+// Each schedule fire warms the user's AgentCore session and runs a full agent
+// turn (shared cron-executor Lambda concurrency + Bedrock throughput), so the
+// gateway surface refuses to allocate more than this many per caller.
+const MAX_SCHEDULES_PER_USER = 20;
 
 function createHandler(deps = {}) {
   const env = {
@@ -219,10 +227,37 @@ function createHandler(deps = {}) {
         typeof args.schedule_name === "string" && args.schedule_name ? args.schedule_name : "";
       const { scheduler, schedulerCmds, ddb, ddbCmds } = clients();
       const userId = await resolveInternalUserId(identity.actorId);
+
+      // Per-caller schedule quota. CWE-770: each schedule the caller owns can
+      // fire up to once every MIN_INTERVAL_MINUTES minutes and run a full
+      // agent turn, so cap how many we will allocate at once. Count only the
+      // caller's own `USER#<userId>` / `CRON#` records.
+      const existing = await ddb.send(
+        new ddbCmds.QueryCommand({
+          TableName: env.tableName,
+          KeyConditionExpression: "PK = :pk AND begins_with(SK, :sk)",
+          ExpressionAttributeValues: { ":pk": `USER#${userId}`, ":sk": "CRON#" },
+          Select: "COUNT",
+        }),
+      );
+      const count = typeof existing.Count === "number"
+        ? existing.Count
+        : (existing.Items ? existing.Items.length : 0);
+      if (count >= MAX_SCHEDULES_PER_USER) {
+        throw new Error(
+          `Schedule quota exceeded: this user already owns ${count} schedules ` +
+          `(max ${MAX_SCHEDULES_PER_USER}). Delete an existing schedule before creating another.`,
+        );
+      }
+
       const { channel, channelTarget } = channelInfo(identity.actorId);
+      if (channel === "telegram_group") throw new Error("Scheduled tasks are not available in group chats");
       const scheduleId = newId();
       const ebName = buildScheduleName(identity.namespace, scheduleId);
       const displayName = scheduleName || `Schedule ${scheduleId}`;
+      // ebName is recorded for operators only. update/delete re-derive the
+      // name from the verified namespace (ownScheduleName), so a CRON# record
+      // can never point them at another caller's schedule.
 
       await scheduler.send(
         new schedulerCmds.CreateScheduleCommand({
@@ -238,6 +273,7 @@ function createHandler(deps = {}) {
             Input: JSON.stringify({
               userId,
               actorId: identity.actorId,
+              channelActorId: identity.actorId,
               channel,
               channelTarget,
               message: args.message,
@@ -259,12 +295,16 @@ function createHandler(deps = {}) {
               SK: `CRON#${scheduleId}`,
               scheduleId,
               scheduleName: displayName,
+              ebName,
               expression: args.expression,
               timezone: args.timezone,
               message: args.message,
               channel,
               channelTarget,
               actorId: identity.actorId,
+              // The Cron Lambda delivers to the record's channelActorId. A
+              // gateway schedule delivers on the caller's own channel.
+              channelActorId: identity.actorId,
               enabled: true,
               createdAt: now,
               updatedAt: now,
@@ -433,4 +473,5 @@ async function handler(event, context) {
 
 module.exports = {
   handler, createHandler, validateExpression, validateTimezone, buildScheduleName, legacyScheduleName, cronMinuteGap,
+  MAX_SCHEDULES_PER_USER, MIN_INTERVAL_MINUTES,
 };

@@ -231,6 +231,153 @@ describe("uploadScreenshotToS3 key format", () => {
   });
 });
 
+// --- SSRF URL validation ---
+
+describe("browserNavigate SSRF guard", () => {
+  it("rejects file:// scheme", async () => {
+    const { execFileSync } = require("child_process");
+    const result = execFileSync("node", [
+      path.join(__dirname, "skills/agentcore-browser/navigate.js"),
+      JSON.stringify({ url: "file:///etc/passwd" }),
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(result.trim());
+    assert.ok(parsed.error, `expected error, got ${result}`);
+    assert.ok(/url rejected/.test(parsed.error));
+    assert.ok(/scheme not allowed/.test(parsed.error));
+  });
+
+  it("rejects data: scheme", async () => {
+    const { execFileSync } = require("child_process");
+    const result = execFileSync("node", [
+      path.join(__dirname, "skills/agentcore-browser/navigate.js"),
+      JSON.stringify({ url: "data:text/html,<h1>x</h1>" }),
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(result.trim());
+    assert.ok(/scheme not allowed/.test(parsed.error));
+  });
+
+  it("rejects ftp: scheme", async () => {
+    const { execFileSync } = require("child_process");
+    const result = execFileSync("node", [
+      path.join(__dirname, "skills/agentcore-browser/navigate.js"),
+      JSON.stringify({ url: "ftp://example.com/x" }),
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(result.trim());
+    assert.ok(/scheme not allowed/.test(parsed.error));
+  });
+
+  it("rejects link-local IMDS address", async () => {
+    const { execFileSync } = require("child_process");
+    const result = execFileSync("node", [
+      path.join(__dirname, "skills/agentcore-browser/navigate.js"),
+      JSON.stringify({ url: "http://169.254.169.254/latest/meta-data/" }),
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(result.trim());
+    assert.ok(/destination not allowed/.test(parsed.error));
+  });
+
+  it("rejects loopback IPv4 literal", async () => {
+    const { execFileSync } = require("child_process");
+    const result = execFileSync("node", [
+      path.join(__dirname, "skills/agentcore-browser/navigate.js"),
+      JSON.stringify({ url: "http://127.0.0.1:9222/json" }),
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(result.trim());
+    assert.ok(/destination not allowed/.test(parsed.error));
+  });
+
+  it("rejects IPv6 loopback literal", async () => {
+    const { execFileSync } = require("child_process");
+    const result = execFileSync("node", [
+      path.join(__dirname, "skills/agentcore-browser/navigate.js"),
+      JSON.stringify({ url: "http://[::1]/" }),
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(result.trim());
+    assert.ok(/destination not allowed/.test(parsed.error));
+  });
+
+  it("rejects RFC1918 private IPv4", async () => {
+    const { execFileSync } = require("child_process");
+    const result = execFileSync("node", [
+      path.join(__dirname, "skills/agentcore-browser/navigate.js"),
+      JSON.stringify({ url: "http://10.0.0.5/" }),
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(result.trim());
+    assert.ok(/destination not allowed/.test(parsed.error));
+  });
+
+  it("rejects localhost hostname", async () => {
+    const { execFileSync } = require("child_process");
+    const result = execFileSync("node", [
+      path.join(__dirname, "skills/agentcore-browser/navigate.js"),
+      JSON.stringify({ url: "http://localhost/" }),
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(result.trim());
+    assert.ok(/destination not allowed/.test(parsed.error));
+  });
+
+  it("rejects malformed URL", async () => {
+    const { execFileSync } = require("child_process");
+    const result = execFileSync("node", [
+      path.join(__dirname, "skills/agentcore-browser/navigate.js"),
+      JSON.stringify({ url: "not-a-url" }),
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(result.trim());
+    assert.ok(/not a valid absolute URL/.test(parsed.error));
+  });
+});
+
+describe("parseTargetUrl / isBlockedIp", () => {
+  it("blocks 169.254.169.254", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("169.254.169.254"), true);
+  });
+  it("blocks 127.0.0.1", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("127.0.0.1"), true);
+  });
+  it("blocks 10.1.2.3", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("10.1.2.3"), true);
+  });
+  it("blocks 192.168.1.1", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("192.168.1.1"), true);
+  });
+  it("blocks 172.16.5.5", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("172.16.5.5"), true);
+  });
+  it("blocks 100.64.0.1 (CGNAT)", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("100.64.0.1"), true);
+  });
+  it("allows 8.8.8.8", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("8.8.8.8"), false);
+  });
+  it("allows 1.1.1.1", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("1.1.1.1"), false);
+  });
+  it("blocks ::1", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("::1"), true);
+  });
+  it("blocks fd00::1 (ULA)", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("fd00::1"), true);
+  });
+  it("blocks fe80::1 (link-local)", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("fe80::1"), true);
+  });
+  it("allows 2606:4700:4700::1111", () => {
+    const { isBlockedIp } = require("./skills/agentcore-browser/common");
+    assert.equal(isBlockedIp("2606:4700:4700::1111"), false);
+  });
+});
+
 // --- Constants ---
 
 describe("common constants", () => {

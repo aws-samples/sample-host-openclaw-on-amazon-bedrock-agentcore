@@ -37,7 +37,9 @@ function boundNamespaces() {
 /**
  * Exit unless userId is the namespace of the user this session is bound to.
  * The scoped credentials only reach that user's resources, so any other
- * namespace would fail at AWS anyway; this gives a clear error first.
+ * namespace would fail at AWS anyway; this gives a clear error first and
+ * stops the agent (or an indirect prompt injection) from naming another
+ * tenant's namespace to read, overwrite or delete their API keys.
  */
 function assertOwnNamespace(userId) {
   const bound = boundNamespaces();

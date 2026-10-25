@@ -152,6 +152,11 @@ describe("late sub-agent announce delivery", { skip: !WebSocket && "ws not insta
       gw.setHistory([]);
       gw.setScript((runId) => [
         { runId, sessionKey: MAIN_KEY, seq: 1, state: "delta", message: assistant(runId, "Working") },
+        // The sub-agent emits an event during the main turn; this is what
+        // ties its sessionKey to the originating turn's route so a late
+        // announce for it is delivered to this conversation, not a later one.
+        { runId: "sub-run-1", sessionKey: SUB_KEY, seq: 1, state: "delta",
+          message: assistant("sub-run-1", "spawning sub-agent"), spawnedBy: MAIN_KEY },
         { runId, sessionKey: MAIN_KEY, seq: 2, state: "final", message: assistant(runId, "MAIN BRIEF") },
       ]);
       const { result, turn } = await runTurn(gw, relay);
@@ -185,6 +190,9 @@ describe("late sub-agent announce delivery", { skip: !WebSocket && "ws not insta
       gw.setHistory([assistant(ANNOUNCE_RUN, "EARLY SUB-AGENT SUMMARY")]);
       gw.setScript((runId) => [
         { runId, sessionKey: MAIN_KEY, seq: 1, state: "delta", message: assistant(runId, "Working") },
+        // Sub-agent event during the main turn captures the originating route.
+        { runId: "sub-run-1", sessionKey: SUB_KEY, seq: 1, state: "delta",
+          message: assistant("sub-run-1", "spawning sub-agent"), spawnedBy: MAIN_KEY },
         { runId: ANNOUNCE_RUN, sessionKey: MAIN_KEY, seq: 1, state: "final",
           message: assistant(ANNOUNCE_RUN, "EARLY SUB-AGENT SUMMARY") },
         60,
@@ -225,7 +233,13 @@ describe("late sub-agent announce delivery", { skip: !WebSocket && "ws not insta
   it("the watcher reconnects after the gateway drops its connection", async () => {
     const { relay, delivered, stop } = await startRelay(gw);
     try {
-      relay.beginTurn(ROUTE).end();
+      const turn = relay.beginTurn(ROUTE);
+      // Observe a sub-agent event under this active turn so the relay captures
+      // its originating route; the announce arriving later maps back to it.
+      relay.onChatEvent({ runId: "sub-run-reconnect", sessionKey: SUB_KEY, seq: 1,
+        state: "delta", spawnedBy: MAIN_KEY,
+        message: { role: "assistant", content: [{ type: "text", text: "spawning" }] } });
+      turn.end();
       await waitFor(() => gw.connections() === 1);
       gw.dropAll();
       await waitFor(() => gw.connections() === 0);
@@ -271,6 +285,8 @@ describe("contract wiring", () => {
   it("delivers only to a Telegram route of the bound owner, through the streamer's send path", () => {
     const fn = functionBody("async function deliverLateAnnounce(");
     assert.ok(fn.includes('route.channel !== "telegram"'), "non-Telegram routes are not refused");
+    assert.ok(fn.includes("knownDeliveryRoutes.has(tripleKey)"),
+      "delivery triple is not checked against routes owned by the current binding");
     assert.ok(fn.includes("binding.actorId !== route.actorId"), "route is not checked against the binding");
     assert.ok(fn.includes("createTelegramStreamer(route.channelTarget).finalize("), "not the streamer send path");
   });
@@ -300,7 +316,8 @@ describe("async cron hold", () => {
     const box = {
       fs: { existsSync: () => false }, stateStorage: { DEFAULT_MOUNT: "/mnt/workspace" },
       cronJobs: jobs, osRandomUUID: () => "boot-1", CRON_JOB_BUDGET_MS: 45 * 60 * 1000,
-      cronJobStoreInstance: null, console: quiet, Date,
+      cronJobStoreInstance: null, console: quiet, Date, Object, Number,
+      v2Lifecycle: { assertBinding() {}, checkpoint() {} },
       setTimeout: (callback, delay) => {
         const timer = { callback, delay, cleared: false, unref() {} };
         timers.push(timer);

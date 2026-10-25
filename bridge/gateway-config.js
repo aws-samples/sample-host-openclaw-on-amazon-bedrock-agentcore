@@ -71,7 +71,7 @@ function renderConfig({ gatewayToken } = {}) {
         "write", // Local writes don't persist — use S3 skill instead
         "edit", // Local edits are ephemeral — use S3 skill instead
         "apply_patch", // Code patching not needed for chat assistant
-        "read", // Blocks local file reads — prevents reading sibling process environ; use s3-user-files
+        "read", // Blocks the model's `read` tool — defence-in-depth against reading /proc/<pid>/environ via a convenience path. Note: this does NOT stop `exec` from running `cat /proc/1/environ`; the real control for that is container-level uid / PID-namespace isolation (see bridge/scoped-credentials.js module header). Use the s3-user-files skill for user data.
         "browser", // Deny built-in browser tool — use agentcore-browser skill instead (via exec)
         "canvas", // No UI rendering in headless chat context
         "cron", // EventBridge handles scheduling, not OpenClaw's built-in cron
@@ -103,8 +103,15 @@ function renderConfig({ gatewayToken } = {}) {
         "conversations_turn", // Send + wait for an external reply
       ],
       // Note: `exec` is intentionally NOT denied — skills like clawhub-manage
-      // need Bash(node:*) to run scripts. Scoped STS credentials ensure
-      // OpenClaw only has access to the user's S3 namespace prefix.
+      // need Bash(node:*) to run scripts. The scoped STS credential_process
+      // narrows the AWS SDK/CLI access to the user's namespace, but it is
+      // NOT a tenant-isolation boundary: the exec shell runs as root in the
+      // same PID namespace as this contract server and can therefore read
+      // /proc/1/environ or reach the container credential endpoint to
+      // recover the full execution-role credentials. Treat the per-user
+      // AgentCore microVM as the enforced tenant boundary; cross-user
+      // isolation requires container-level uid/PID-namespace controls on
+      // top of this env filtering (see bridge/scoped-credentials.js header).
     },
     skills: {
       allowBundled: [],

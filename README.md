@@ -34,6 +34,7 @@ AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-
 
 - Per-user Firecracker microVM isolation (AgentCore Runtime)
 - Multi-channel support (Telegram, Slack, Feishu, WhatsApp, Discord slash commands, LINE) with cross-channel account linking
+- Telegram groups (off by default): an allowlisted group gets its own shared session, memory and files, and the bot answers only @mentions, replies to its messages and `/command@YourBot` ([Telegram groups](docs/channels.md#telegram-groups))
 - Multimodal: text + image messages via Bedrock ConverseStream
 - Per-user model switching with a `/model` chat command, limited to an operator allowlist
 - STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
@@ -313,6 +314,7 @@ All tunable parameters are in `cdk.json`:
 | `router_get_route_burst_limit` | `20` | Per-route burst throttle for the same two `GET` routes |
 | `router_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Router. Caps the Router and guarantees it that many executions; also removes them from the account's unreserved pool, and Lambda rejects a reservation that would leave fewer than 100 unreserved, so the deploy fails in low-limit accounts. Each in-flight chat turn holds one Router execution for up to `router_lambda_timeout_seconds` |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
+| `telegram_groups_enabled` | `false` | If `false`, the bot ignores every Telegram group and supergroup message, commands included. If `true`, it answers allowlisted groups (`ALLOW#telegram_group:<chat_id>`) as the group's own identity. `registration_open` never applies to groups. See [Telegram groups](docs/channels.md#telegram-groups) |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
 | `image_version` | (see `cdk.json`) | Local build image tag. The SDK controller resolves the ECR digest and updates AgentCore Runtime configuration |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
@@ -323,7 +325,8 @@ All tunable parameters are in `cdk.json`:
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `cron_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Cron executor (same trade-off as `router_reserved_concurrency`) |
 | `token_metrics_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the token-metrics Lambda (same trade-off) |
-| `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost) |
+| `enable_cloudtrail` | `false` | Deploy a dedicated multi-region CloudTrail trail that also records S3 data events on the user-files bucket. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost, including per-event data-event charges) |
+| `cognito_advanced_security_mode` | `OFF` | Cognito threat protection for the user pool: `OFF`, `AUDIT` or `ENFORCED`. Off by default. `AUDIT` and `ENFORCED` also switch the pool to the Plus feature plan, which is billed per monthly active user |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. See the [disable procedure](docs/guardrails.md#disable) before changing shared resources |
 | `guardrails_content_filter_level` | `HIGH` | Not read by the stack: filter strengths are set per category in `stacks/guardrails_stack.py` (`PROMPT_ATTACK` input `HIGH`, `INSULTS` input `MEDIUM`, the rest `HIGH`) |
@@ -346,7 +349,7 @@ Users can change the model that answers their own messages from any channel:
 | `/model <alias>` | Use that model for this user's messages, e.g. `/model opus` |
 | `/model default` | Go back to the deployment's `default_model_id` |
 
-The Router Lambda handles the command before anything reaches the agent and replies directly; the command is not part of the conversation. Only a message that starts with `/model` is a command (`/model@YourBot opus` also works in Telegram groups). In Slack, type a space before the slash (` /model opus`), otherwise the Slack client treats it as an unknown slash command and does not send it. In Discord, put the command in the `/ask` prompt (`/ask prompt: /model opus`).
+The Router Lambda handles the command before anything reaches the agent and replies directly; the command is not part of the conversation. Only a message that starts with `/model` is a command. `/model` is not available in [Telegram groups](docs/channels.md#telegram-groups): a group always uses the default model. In Slack, type a space before the slash (` /model opus`), otherwise the Slack client treats it as an unknown slash command and does not send it. In Discord, put the command in the `/ask` prompt (`/ask prompt: /model opus`).
 
 The choice is stored as `modelOverride` (the model ID, not the alias) on the user's `USER#<userId>` / `PROFILE` item in the identity table, so it applies on every linked channel and survives session idle timeouts and container recycling. The Router sends it with every chat invocation.
 
@@ -384,6 +387,7 @@ Telegram is the quick-start channel. Slack, Feishu, WhatsApp, Discord and LINE s
      --region $CDK_DEFAULT_REGION
    ```
 5. Set up the webhook (see Quick Start step 7)
+6. Optional: to use the bot in Telegram groups, set `telegram_groups_enabled` to `true` and follow [Telegram groups](docs/channels.md#telegram-groups)
 
 ### Slack
 
@@ -540,7 +544,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Per-user isolation**: Each user runs in their own AgentCore microVM with dedicated S3 namespace
 - **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3 and DynamoDB to the user's namespace/records — prevents cross-user data access even through shell tools
 - **Encryption**: All data encrypted at rest with customer-managed KMS key (S3, DynamoDB, SNS, Secrets Manager) and in transit (TLS)
-- **CloudTrail**: Optional dedicated trail (`enable_cloudtrail` in cdk.json). Off by default — most AWS accounts already have an organization or account-level trail. Enabling adds a dedicated S3 bucket + trail for this project's audit logs
+- **CloudTrail**: Optional dedicated multi-region trail with S3 data events on the user-files bucket (`enable_cloudtrail` in cdk.json). Off by default — most AWS accounts already have an organization or account-level trail; if yours does, add an S3 data-event selector for the user-files bucket there to get object-level history
 - **Least-privilege IAM**: Tightly scoped permissions per component
 - **Bedrock Guardrails**: Content filtering on every Bedrock API call — content filters (hate, violence, prompt attacks), topic denial (6 categories), PII redaction, word filters, and custom regex for credential patterns. Opt-out via `enable_guardrails: false` in `cdk.json`. Known limitations (ordinary scheduled-task prompts blocked as prompt attacks, version pinning): see [Guardrails known limitations](#guardrails-known-limitations)
 - **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; OpenClaw's channel-delivery tools (`message`, `conversations_send`, `conversations_turn`) denied because OpenClaw has no bot tokens and replies are delivered by the Router/Cron Lambda; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
@@ -587,7 +591,7 @@ The guardrail is applied only when the AgentCore Runtime role has `bedrock:Apply
 cdk destroy --all
 ```
 
-Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys, the Cognito User Pool and the DynamoDB identity and token-usage tables have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed; the DynamoDB tables also have deletion protection, which you must turn off before deleting them. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`; likewise `OpenClawBuild` only with `-c enable_codebuild=true`.
+Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys, the Cognito User Pool, the DynamoDB identity and token-usage tables and the CloudWatch log groups (`/openclaw/*`, `/aws/bedrock/invocation-logs` and the VPC flow log and CloudTrail groups) have `RETAIN` removal policies and will not be deleted automatically. Delete the named log groups before deploying again into the same account and region, or the deploy fails because they already exist. Remove them manually if needed; the DynamoDB tables also have deletion protection, which you must turn off before deleting them. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`; likewise `OpenClawBuild` only with `-c enable_codebuild=true`.
 
 ## Contributing
 

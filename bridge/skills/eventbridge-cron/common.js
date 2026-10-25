@@ -19,6 +19,8 @@ const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
 // The contract server writes the bound user's identity here and sets USER_ID
 // ("channel:id") before OpenClaw runs a skill.
 const IDENTITY_FILE = "/tmp/current-identity.json";
+// Group conversations (one identity shared by a whole group) cannot schedule tasks.
+const GROUP_CHANNELS = new Set(["telegram_group"]);
 
 /**
  * Namespaces ("channel_id") of the user this AgentCore Runtime session is
@@ -109,6 +111,9 @@ function validateEnv() {
 }
 
 const MIN_INTERVAL_MINUTES = 5;
+// Per-user cap on CRON# records (CWE-770), checked by create.js. Same limit as
+// lambda/gateway_tools/eventbridge_cron/index.js.
+const MAX_SCHEDULES_PER_USER = 20;
 
 /** Sorted minutes (0-59) a cron() minutes field fires on, or null for syntax it does not accept. */
 function cronMinutes(field) {
@@ -331,6 +336,9 @@ function resolveScheduleDelivery(userId, { channel, channelTarget } = {}) {
       !identity.channelActorId.slice(identity.channel.length + 1)) {
     throw new Error("Current channel delivery identity is unavailable");
   }
+  if (GROUP_CHANNELS.has(identity.channel) || GROUP_CHANNELS.has(identity.actorId.split(":", 1)[0])) {
+    throw new Error("Scheduled tasks are not available in group chats");
+  }
   if (channel && channel !== identity.channel) {
     throw new Error("Schedule channel must match the current conversation");
   }
@@ -451,6 +459,8 @@ module.exports = {
   CRON_LAMBDA_ARN,
   EVENTBRIDGE_ROLE_ARN,
   IDENTITY_TABLE_NAME,
+  MIN_INTERVAL_MINUTES,
+  MAX_SCHEDULES_PER_USER,
   validateUserId,
   assertOwnNamespace,
   ownerUserId,

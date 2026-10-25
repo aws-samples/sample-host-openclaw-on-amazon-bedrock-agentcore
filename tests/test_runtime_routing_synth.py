@@ -33,13 +33,14 @@ def manifest():
     }
 
 
-def run_app(tmp_path, runtime=None, expect_failure=False):
+def run_app(tmp_path, runtime=None, expect_failure=False, context_overrides=None):
     context = json.loads((ROOT / "cdk.json").read_text())["context"]
     context.update({
         "account": ACCOUNT, "region": REGION, "availability_zones": [REGION + "a", REGION + "b"],
         "runtime_manifest": "",
         f"availability-zones:account={ACCOUNT}:region={REGION}": [REGION + "a", REGION + "b"],
     })
+    context.update(context_overrides or {})
     if runtime:
         path = tmp_path / "runtime.json"
         path.write_text(json.dumps(runtime))

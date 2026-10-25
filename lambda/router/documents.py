@@ -73,14 +73,17 @@ def classify_document(mime_type, file_name):
 def safe_display_name(name, limit=ZIP_MAX_NAME_CHARS):
     """Make a user-supplied name safe to show on one line of the agent's turn.
 
-    Control and format characters (newlines, bidi overrides) and the Unicode
-    line and paragraph separators (U+2028, U+2029) become "?", so a name cannot
-    start a new line or reorder text, and long names are cut.
+    Control and format characters (newlines, bidi overrides), the Unicode line
+    and paragraph separators (U+2028, U+2029) and any other character
+    ``str.splitlines`` treats as a line break (e.g. \\x0b \\x0c \\x1c-\\x1e
+    \\x85) become "?", so a name cannot start a new line or reorder text, and
+    long names are cut.
     """
     out = []
     for ch in str(name or ""):
         category = unicodedata.category(ch)
-        out.append("?" if category[0] == "C" or category in ("Zl", "Zp") else ch)
+        breaks_line = ch != "\n" and len(ch.splitlines()) > 1
+        out.append("?" if category[0] == "C" or category in ("Zl", "Zp") or breaks_line else ch)
     text = "".join(out)
     if len(text) > limit:
         text = text[:limit] + "…"

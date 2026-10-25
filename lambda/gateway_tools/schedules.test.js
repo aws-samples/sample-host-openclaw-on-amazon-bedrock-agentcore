@@ -162,3 +162,15 @@ describe("schedule names", () => {
     assert.deepEqual(deletes, [name]);
   });
 });
+
+describe("schedules in group chats", () => {
+  it("refuses to create a schedule for a Telegram group identity", async () => {
+    const { scheduler, handler, token } = handlerFor("telegram_group:-1001234567890");
+    const out = await handler(
+      { expression: "rate(1 hour)", timezone: "UTC", message: "m", [RESERVED_ARG]: token },
+      h.gatewayContext("schedules", "create_schedule"),
+    );
+    assert.match(out.message || "", /not available in group chats/);
+    assert.equal(scheduler.sent.length, 0);
+  });
+});

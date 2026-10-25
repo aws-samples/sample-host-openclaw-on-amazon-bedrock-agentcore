@@ -128,6 +128,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     crypto: require("node:crypto"), Date, structuredClone, process: { env },
     fs: { readFileSync: () => { if (identity === undefined) throw new Error("ENOENT"); return JSON.stringify(identity); } },
     BOUND_ACTOR_ID: bound, sessionMap: new Map(),
+    VALID_ACTOR_ID: /^(telegram|slack|discord|whatsapp|line|feishu):[A-Za-z0-9_-]{1,64}$/,
     console: { log() {}, error() {}, warn() {}, debug() {} },
     http: { createServer(callback) { handler = callback; return {}; } },
     modelPolicy: { ...policy, createStreamingRoute: (options) =>
@@ -156,6 +157,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     modelOutcomeUnknown: false, chatRequestCount: 0, subagentRequestCount: 0,
   };
   vm.createContext(box);
+  vm.runInContext(slice("const VALID_CHANNELS = new Set([", "\nasync function retrieveMemoryContext("), box);
   vm.runInContext('const { osRandomUUID } = require("./runtime-lifecycle");' +
     slice("function extractSessionMetadata(", "// Per-user Cognito"), box);
   vm.runInContext('const { readBody } = require("./read-body");', box);
@@ -235,19 +237,23 @@ test("non-streaming Converse requests carry it too, on every retry", async () =>
   }
 });
 
-test("without an identity file the environment identity is used with the proxy's own session", async () => {
+test("without an identity file the proxy refuses to serve (no fallback to environment identity)", async () => {
+  // The identity file is a required per-turn signal from the contract server
+  // for the bound actor. If it is absent, the resolver fails closed rather
+  // than falling back to an environment-only identity derivation.
   const app = proxy({ identity: undefined });
-  await app.chat(MAIN);
-  const metadata = app.requests[0].input.requestMetadata;
-  assert.equal(metadata["openclaw.actor_id"], "telegram:1001");
-  assert.equal(metadata["openclaw.id_source"], "environment");
-  assert.equal(metadata["openclaw.trigger"], "chat");
-  assert.match(metadata["openclaw.session_id"], /^ses-/);
+  const status = await app.chat(MAIN);
+  assert.equal(status, 502);
+  assert.equal(app.requests.length, 0);
 });
 
-test("an unbound proxy with no identity makes no Bedrock call", async () => {
+test("an unbound proxy refuses to serve requests and makes no Bedrock call", async () => {
+  // Identity resolution is fail-closed: the proxy never consults request
+  // data to derive the actor, and refuses to serve requests whose bound
+  // actor is missing. There is no legitimate "default-user" / fallback path.
   const app = proxy({ identity: undefined, env: {}, bound: "" });
-  await app.chat(MAIN);
+  const status = await app.chat(MAIN);
+  assert.equal(status, 502);
   assert.equal(app.requests.length, 0);
 });
 
@@ -259,10 +265,18 @@ test("message content never reaches requestMetadata", async () => {
   assert.equal(values.includes("hunter2"), false);
 });
 
-test("a malformed identity-file session is hashed, not forwarded", async () => {
+test("a malformed identity-file session is refused before any Bedrock request", async () => {
   const app = proxy({ identity: { ...IDENTITY, sessionId: "bad session\nid" } });
-  await app.chat(MAIN);
-  assert.match(app.requests[0].input.requestMetadata["openclaw.session_id"], /^sha256:[0-9a-f]{32}$/);
+  assert.notEqual(await app.chat(MAIN), 200);
+  assert.equal(app.requests.length, 0);
+});
+
+test("an identity-file channel or trigger outside the proxy allowlists is refused", async () => {
+  for (const identity of [{ ...IDENTITY, channel: "email" }, { ...IDENTITY, trigger: "webhook" }]) {
+    const app = proxy({ identity });
+    assert.notEqual(await app.chat(MAIN), 200);
+    assert.equal(app.requests.length, 0);
+  }
 });
 
 test("the image ships request-metadata.js next to the proxy", () => {

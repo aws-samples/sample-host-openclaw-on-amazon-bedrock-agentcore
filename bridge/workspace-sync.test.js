@@ -2034,6 +2034,41 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
   );
 
   it(
+    "restores a gzip snapshot whose stored size is above the non-SQLite cap",
+    { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
+    async () => {
+      // A large history database still compresses to more than 10 MB, so the
+      // listing pass must not hold a gzip snapshot to the non-SQLite cap.
+      const src = path.join(tmpDir, "src.sqlite");
+      makeDb(src, 1500, "big");
+      const snapshot = await workspaceSync.snapshotSqlite(src);
+      const stored = zlib.gzipSync(snapshot);
+      assert.ok(stored.length > LIMITS.maxFileSize, `fixture must exceed maxFileSize (${stored.length})`);
+      s3.objects[KEY] = stored;
+      s3.metadata[KEY] = { sha256: sha256(snapshot), encoding: "gzip", "uncompressed-size": String(snapshot.length) };
+      s3.encodings[KEY] = "gzip";
+      const fresh = freshModule();
+      const r = await fresh.restoreWorkspace(NS);
+      assert.equal(r.failed, 0, warnings.join("\n"));
+      assert.equal(fresh.getRestoreState(), "ready");
+      assert.equal(sha256(fs.readFileSync(path.join(tmpDir, ".openclaw", REL))), sha256(snapshot));
+    },
+  );
+
+  it(
+    "refuses an uncompressed .sqlite object above the non-SQLite cap while streaming it",
+    async () => {
+      // Without gzip size metadata the per-object cap is maxFileSize, whatever
+      // the key's suffix, so a raw body cannot use the SQLite cap.
+      s3.objects[KEY] = Buffer.alloc(LIMITS.maxFileSize + 1024);
+      const fresh = freshModule();
+      await assert.rejects(fresh.restoreWorkspace(NS), /incomplete/);
+      assert.equal(fs.existsSync(path.join(tmpDir, ".openclaw", REL)), false, "nothing handed to the gateway");
+      assert.ok(warnings.some((w) => /exceeds declared size/.test(w)), warnings.join("\n"));
+    },
+  );
+
+  it(
     "does not re-upload an unchanged large database (in-process hash, and HeadObject on a same-session restart), but uploads new commits",
     { skip: !hasNodeSqlite && "node:sqlite not available on this Node" },
     async () => {
@@ -2083,7 +2118,7 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
       // The cap is also applied to the listing on restore.
       s3.objects[KEY] = Buffer.alloc(101 * 1024);
       const fresh = freshModule();
-      fresh._setLimitsForTests({ maxSqliteFileSize: 100 * 1024 });
+      fresh._setLimitsForTests({ maxFileSize: 100 * 1024, maxSqliteFileSize: 100 * 1024 });
       await assert.rejects(fresh.restoreWorkspace(NS), /incomplete/);
       assert.ok(warnings.some((x) => /Skipping oversized file/.test(x)));
     },

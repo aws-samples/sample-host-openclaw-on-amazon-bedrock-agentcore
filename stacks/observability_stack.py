@@ -91,7 +91,9 @@ class ObservabilityStack(Stack):
                 "BedrockInvocationLogGroup",
                 log_group_name="/aws/bedrock/invocation-logs",
                 retention=retention_days(log_retention),
-                removal_policy=RemovalPolicy.DESTROY,
+                # RETAIN so Bedrock model-invocation history survives stack
+                # delete/replace. Operational retention still applies.
+                removal_policy=RemovalPolicy.RETAIN,
             )
 
             # IAM role for Bedrock to write to CloudWatch Logs
@@ -115,7 +117,12 @@ class ObservabilityStack(Stack):
                                 "logGroupName": self.invocation_log_group.log_group_name,
                                 "roleArn": bedrock_logging_role.role_arn,
                             },
-                            "textDataDeliveryEnabled": True,
+                            # Disable prompt/completion body capture: the token-metrics
+                            # consumer only needs usage fields and requestMetadata, which
+                            # Bedrock logs regardless of this flag. Leaving text delivery
+                            # on would persist full chat transcripts (and any secret-bearing
+                            # tool output) to a shared CloudWatch group (CWE-312).
+                            "textDataDeliveryEnabled": False,
                             "imageDataDeliveryEnabled": False,
                             "embeddingDataDeliveryEnabled": False,
                         },
@@ -131,7 +138,9 @@ class ObservabilityStack(Stack):
                                 "logGroupName": self.invocation_log_group.log_group_name,
                                 "roleArn": bedrock_logging_role.role_arn,
                             },
-                            "textDataDeliveryEnabled": True,
+                            # See on_create: text delivery is disabled to avoid persisting
+                            # prompts, completions, and secret-bearing tool output.
+                            "textDataDeliveryEnabled": False,
                             "imageDataDeliveryEnabled": False,
                             "embeddingDataDeliveryEnabled": False,
                         },
@@ -321,7 +330,7 @@ class ObservabilityStack(Stack):
         ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
 
         # --- Health alarms: session storage (cron ones are in TokenMonitoring) ---
-        add_health_alarms(self, self.alarm_topic, groups=("container",))
+        add_health_alarms(self, self.alarm_topic, groups=("container",), log_retention=log_retention)
 
         CfnOutput(
             self,

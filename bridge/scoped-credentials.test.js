@@ -238,6 +238,47 @@ describe("buildSessionPolicy", () => {
       assert.throws(() => buildSessionPolicy({ bucket: "my-bucket", namespace }), /invalid namespace/i);
     }
   });
+
+  it("grants the identity table only, not its indexes", () => {
+    const stmt = statementFor(fullPolicy(), "dynamodb:GetItem");
+    for (const resource of [].concat(stmt.Resource)) {
+      assert.ok(!resource.includes("/index/"), resource);
+    }
+  });
+
+  it("does not grant ListSchedules (it would list other users' schedule names)", () => {
+    assert.equal(statementFor(fullPolicy(), "scheduler:ListSchedules"), undefined);
+  });
+
+  it("stays under the 2048-character STS limit for a 46-character Feishu namespace", () => {
+    const namespace = "feishu_ou_" + "0123456789abcdef".repeat(2) + "abcd";
+    assert.equal(namespace.length, 46);
+    const region = "ap-southeast-2";
+    const policy = buildSessionPolicy({
+      bucket: `openclaw-user-files-${ACCOUNT}-${region}-production`,
+      namespace,
+      internalUserId: "user_0123456789abcdef",
+      eventbridgeRoleArn: `arn:aws:iam::${ACCOUNT}:role/openclaw-cron-scheduler-role-${region}-production`,
+      identityTableArn: `arn:aws:dynamodb:${region}:${ACCOUNT}:table/openclaw-identity-production`,
+      scheduleGroupArn: `arn:aws:scheduler:${region}:${ACCOUNT}:schedule-group/openclaw-cron-production`,
+      region,
+      account: ACCOUNT,
+    });
+    assert.ok(policy.length <= 2048, `policy is ${policy.length} characters`);
+  });
+
+  it("never grants the per-user Cognito password secrets (openclaw/cognito-user/*)", () => {
+    const { defaultSecretId } = require("./cognito-token");
+    const name = defaultSecretId("telegram:12345", "us-west-2_POOL");
+    const arn = `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:${name}-AbCdEf`;
+    const matches = (pattern) => new RegExp("^" + pattern.split("*").map(
+      (part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(arn);
+    for (const stmt of fullPolicy().Statement) {
+      const actions = [].concat(stmt.Action);
+      if (!actions.some((a) => a.startsWith("secretsmanager:") && a !== "secretsmanager:ListSecrets")) continue;
+      assert.ok(![].concat(stmt.Resource).some(matches), "session policy must not reach " + name);
+    }
+  });
 });
 
 // --- createScopedCredentials ---

@@ -182,6 +182,7 @@ RUN mkdir -p /root/.openclaw && \
 COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY workspace-sync.js /app/workspace-sync.js
+COPY workspace-files-s3.js /app/workspace-files-s3.js
 COPY state-storage.js /app/state-storage.js
 COPY legacy-session-import.js /app/legacy-session-import.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js

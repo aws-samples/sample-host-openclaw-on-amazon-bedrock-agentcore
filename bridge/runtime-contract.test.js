@@ -762,12 +762,12 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   assert.equal(result.body.runtimeSessionId, owner.runtimeSessionId);
   assert.equal(result.body.actorId, owner.actorId);
   assert.equal(result.body.routingGeneration, owner.routingGeneration);
-  const statusText = (await app.request({ action: "status" })).body.response;
+  const statusText = (await app.request({ ...owner, action: "status" })).body.response;
   const status = JSON.parse(statusText);
   assert.equal(status.lifecycle.generation, result.body.activationGeneration);
   assert.equal(activation.generation, result.body.activationGeneration);
   assert.equal(status.lifecycle.state, "USER_READY");
-  // Status takes no binding, so it does not hand the binding back.
+  // Status reports whether a binding exists, never the binding itself.
   assert.equal(status.lifecycle.bound, true);
   assert.equal(Object.hasOwn(status.lifecycle, "binding"), false);
   assert.equal(Object.hasOwn(status, "currentUserId"), false);
@@ -775,6 +775,15 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   for (const value of [owner.userId, owner.actorId, owner.runtimeSessionId]) {
     assert.equal(statusText.includes(value), false, value);
   }
+  // Status for a different binding, or with no binding at all, is refused.
+  for (const probe of [{ action: "status" }, { ...owner, actorId: "telegram:999", action: "status" },
+    { ...owner, routingGeneration: owner.routingGeneration + 1, action: "status" }]) {
+    const refused = (await app.request(probe)).body;
+    assert.equal(refused.status, "error");
+    assert.equal(refused.response, "This AgentCore Runtime cannot accept the requested user binding.");
+  }
+  // An action-less payload no longer falls into the status branch.
+  assert.match((await app.request({ ...owner })).body.response, /Unknown action/);
   assert.ok(app.calls.some((call) => call.includes("[OPENCLAW_IMAGES:")));
   // The stale suspended-delivery sweep runs once, after readiness, before the first turn.
   assert.equal(app.calls.filter((call) => call === "gateway:sweep").length, 1);
@@ -1427,17 +1436,18 @@ for (const deadline of [false, true]) {
   });
 }
 
-async function createCronForIdentity(identity, args = []) {
+async function createCronForIdentity(identity, args = [], namespace = "telegram_123") {
   const schedules = [];
   const records = [];
   const errors = [];
   class Command { constructor(input) { this.input = input; } }
+  class QueryCommand extends Command {}
   const env = {
     AWS_REGION: "us-west-2", EVENTBRIDGE_SCHEDULE_GROUP: "group", CRON_LAMBDA_ARN: "cron",
     EVENTBRIDGE_ROLE_ARN: "scheduler-role", IDENTITY_TABLE_NAME: "identity", INTERNAL_USER_ID: "u1",
   };
   const processStub = {
-    env, argv: ["node", "create.js", "telegram_123", "rate(1 hour)", "UTC", "remind me", ...args],
+    env, argv: ["node", "create.js", namespace, "rate(1 hour)", "UTC", "remind me", ...args],
     exit(code) { throw new Error(`Skill exited with code ${code}: ${errors.join(" ")}`); },
   };
   const requireStub = (name) => {
@@ -1447,8 +1457,14 @@ async function createCronForIdentity(identity, args = []) {
     } };
     if (name === "@aws-sdk/client-dynamodb") return { DynamoDBClient: class {} };
     if (name === "@aws-sdk/lib-dynamodb") return {
-      DynamoDBDocumentClient: { from: () => ({ async send(command) { records.push(command.input.Item); } }) },
-      PutCommand: Command,
+      DynamoDBDocumentClient: { from: () => ({ async send(command) {
+        // create.js counts the caller's CRON# records before creating one.
+        if (command instanceof QueryCommand) return { Items: records.slice(), Count: records.length };
+        records.push(command.input.Item);
+        return {};
+      } }) },
+      PutCommand: Command, GetCommand: Command, DeleteCommand: Command, UpdateCommand: Command,
+      QueryCommand,
     };
     if (name === "@aws-sdk/client-scheduler") return {
       SchedulerClient: class { async send(command) { schedules.push(command.input); return {}; } },
@@ -1574,6 +1590,20 @@ for (const failedOperation of ["write", "rename"]) {
   });
 }
 
+test("a Telegram group turn is not streamed by the contract, so the router can thread the reply", async (t) => {
+  const deliveries = [];
+  const app = loadContract(t);
+  app.stubTelegramApi(deliveries);
+  const reply = await app.request({
+    ...owner, channel: "telegram_group", channelActorId: "telegram_group:-100777",
+    channelTarget: "-100777", action: "chat", message: "hello",
+  }, "POST", "/invocations", true);
+  assert.equal(reply.body.actorId, owner.actorId);
+  assert.equal(typeof reply.body.response, "string");
+  assert.notEqual(reply.body.streamed, true);
+  assert.deepEqual(deliveries, []);
+});
+
 test("Telegram fallback delivery uses the channel target instead of the canonical or sender identity", async (t) => {
   const deliveries = [];
   const app = loadContract(t);
@@ -1592,6 +1622,15 @@ test("Cron creation rejects missing delivery metadata and cannot infer Telegram 
   await assert.rejects(createCronForIdentity({
     actorId: "telegram:123", channel: "slack", channelActorId: "slack:U456", channelTarget: "C789",
   }, ["telegram", "123"]), /channel must match the current conversation/);
+});
+
+test("Cron creation is refused in a Telegram group, before any schedule is written", async () => {
+  const group = "telegram_group:-1001234567890";
+  for (const args of [[], ["", ""], ["telegram", "-1001234567890"]]) {
+    await assert.rejects(createCronForIdentity({
+      actorId: group, channel: "telegram_group", channelActorId: group, channelTarget: "-1001234567890",
+    }, args, "telegram_group_-1001234567890"), /not available in group chats/);
+  }
 });
 
 for (const args of [["", ""], ["slack", ""], ["", "C789"], ["", "", "named reminder"], [null, null]]) {
