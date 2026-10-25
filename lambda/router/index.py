@@ -359,13 +359,37 @@ def _verify_async_dispatch(event):
             logger.error("Async dispatch verification failed: no webhook secret configured")
             return False
         expected_mac = hmac.new(key, message, hashlib.sha256).hexdigest()
-        if hmac.compare_digest(expected_mac, provided_mac):
+        if _safe_compare(expected_mac, provided_mac):
             return True
         if attempt == 0:
             # The signer may hold a newer webhook secret than this container's
             # cached copy (rotation); re-read it once before rejecting.
             _token_cache.pop(WEBHOOK_SECRET_ID, None)
     return False
+
+
+def _safe_compare(expected, provided):
+    """Constant-time comparison of two header/secret strings.
+
+    hmac.compare_digest raises TypeError for str arguments that contain
+    non-ASCII characters, so both sides are compared as UTF-8 bytes. Any
+    non-str value (for example a missing header) compares unequal.
+    """
+    if not isinstance(expected, str) or not isinstance(provided, str):
+        return False
+    try:
+        return hmac.compare_digest(expected.encode("utf-8"), provided.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
+
+
+def _parse_json_object(body):
+    """Return the request body parsed as a JSON object, or None if it is not one."""
+    try:
+        data = json.loads(body) if isinstance(body, (str, bytes)) else body
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def validate_telegram_webhook(headers):
@@ -383,7 +407,7 @@ def validate_telegram_webhook(headers):
         logger.warning("Telegram webhook missing X-Telegram-Bot-Api-Secret-Token header")
         return False
 
-    if not hmac.compare_digest(token, webhook_secret):
+    if not _safe_compare(webhook_secret, token):
         logger.warning("Telegram webhook secret token mismatch")
         return False
 
@@ -427,7 +451,7 @@ def validate_slack_webhook(headers, body):
         hashlib.sha256,
     ).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
+    if not _safe_compare(expected, signature):
         logger.warning("Slack webhook signature mismatch")
         return False
 
@@ -462,11 +486,11 @@ def validate_feishu_webhook(headers, body_bytes):
         logger.warning("Feishu webhook invalid timestamp: %s", timestamp)
         return False
 
-    body_b = body_bytes if isinstance(body_bytes, bytes) else body_bytes.encode("utf-8")
+    body_b = body_bytes if isinstance(body_bytes, bytes) else str(body_bytes or "").encode("utf-8")
     content = f"{timestamp}{nonce}{encrypt_key}".encode() + body_b
     expected = hashlib.sha256(content).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
+    if not _safe_compare(expected, signature):
         logger.warning("Feishu webhook signature mismatch")
         return False
 
@@ -3304,6 +3328,21 @@ def _handle_discord_command(command, reply):
 
 def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
+    try:
+        return _handle_event(event, context)
+    except Exception as e:
+        # Last-resort guard: answer with a plain error instead of failing the
+        # invocation. Only the exception type is logged; request bodies,
+        # headers and secrets are not.
+        logger.error("Unhandled router error: %s", type(e).__name__)
+        return {"statusCode": 500, "body": "Internal Server Error"}
+
+
+def _handle_event(event, context):
+    """Route one Lambda event; wrapped by ``handler``."""
+    if not isinstance(event, dict):
+        return {"statusCode": 400, "body": "Bad Request"}
+
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
         # Only dispatch events signed by `_self_invoke_async`, which runs after
@@ -3341,10 +3380,10 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     # --- Function URL entry point ---
-    request_context = event.get("requestContext", {})
-    http_info = request_context.get("http", {})
+    request_context = event.get("requestContext") or {}
+    http_info = request_context.get("http") or {}
     method = http_info.get("method", "")
-    path = http_info.get("path", event.get("rawPath", ""))
+    path = http_info.get("path", event.get("rawPath", "")) or ""
 
     # Health check
     if method == "GET" and path == "/health":
@@ -3359,7 +3398,7 @@ def handler(event, context):
     if method != "POST":
         return {"statusCode": 405, "body": "Method not allowed"}
 
-    headers = event.get("headers", {})
+    headers = event.get("headers") or {}
 
     # Reject oversized payloads before any parsing, base64 decoding or HMAC
     # work. Check Content-Length first so a declared-huge base64 body is
@@ -3377,12 +3416,18 @@ def handler(event, context):
         except (TypeError, ValueError):
             pass
 
-    body = event.get("body", "")
+    body = event.get("body")
+    if body is None:
+        body = ""
     if isinstance(body, str) and len(body) > MAX_BODY_BYTES:
         return {"statusCode": 413, "body": "Payload too large"}
     if event.get("isBase64Encoded"):
-        import base64
-        body = base64.b64decode(body).decode("utf-8")
+        try:
+            body = base64.b64decode(body).decode("utf-8")
+        except (ValueError, TypeError):
+            # binascii.Error and UnicodeDecodeError are ValueError subclasses.
+            logger.warning("Rejecting webhook with undecodable body from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 400, "body": "Bad Request"}
     if isinstance(body, (bytes, str)) and len(body) > MAX_BODY_BYTES:
         return {"statusCode": 413, "body": "Payload too large"}
 
@@ -3392,6 +3437,9 @@ def handler(event, context):
         if not validate_telegram_webhook(headers):
             logger.warning("Telegram webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
             return {"statusCode": 401, "body": "Unauthorized"}
+
+        if _parse_json_object(body) is None:
+            return {"statusCode": 400, "body": "Bad Request"}
 
         # Self-invoke async and return immediately
         _self_invoke_async("telegram", body, headers)
@@ -3406,21 +3454,21 @@ def handler(event, context):
             logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
             return {"statusCode": 401, "body": "Unauthorized"}
 
+        event_data = _parse_json_object(body)
+        if event_data is None:
+            return {"statusCode": 400, "body": "Bad Request"}
+
         # Slack url_verification — respond synchronously after signature check
-        try:
-            event_data = json.loads(body) if isinstance(body, str) else body
-            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
-                # Validate challenge format before echoing (defense in depth)
-                challenge = str(event_data.get("challenge", ""))
-                if not re.match(r'^[a-zA-Z0-9_\-\.]{1,100}$', challenge):
-                    return {"statusCode": 400, "body": "Invalid challenge format"}
-                return {
-                    "statusCode": 200,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({"challenge": challenge}),
-                }
-        except (json.JSONDecodeError, TypeError):
-            pass
+        if event_data.get("type") == "url_verification":
+            # Validate challenge format before echoing (defense in depth)
+            challenge = str(event_data.get("challenge", ""))
+            if not re.match(r'^[a-zA-Z0-9_\-\.]{1,100}$', challenge):
+                return {"statusCode": 400, "body": "Invalid challenge format"}
+            return {
+                "statusCode": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"challenge": challenge}),
+            }
 
         # Ignore Slack retries
         if headers.get("x-slack-retry-num"):
@@ -3445,19 +3493,18 @@ def handler(event, context):
         # Plaintext url_verification (only reachable with a valid signature);
         # respond synchronously. Encrypted url_verification bodies are
         # handled inside handle_feishu after decryption.
-        try:
-            event_data = json.loads(body) if isinstance(body, str) else body
-            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
-                challenge = str(event_data.get("challenge", ""))
-                if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
-                    return {"statusCode": 400, "body": "Invalid challenge format"}
-                return {
-                    "statusCode": 200,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({"challenge": challenge}),
-                }
-        except (json.JSONDecodeError, TypeError):
-            pass
+        event_data = _parse_json_object(body)
+        if event_data is None:
+            return {"statusCode": 400, "body": "Bad Request"}
+        if event_data.get("type") == "url_verification":
+            challenge = str(event_data.get("challenge", ""))
+            if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
+                return {"statusCode": 400, "body": "Invalid challenge format"}
+            return {
+                "statusCode": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"challenge": challenge}),
+            }
 
         # Self-invoke async for actual processing
         _self_invoke_async("feishu", body, headers)
@@ -3473,6 +3520,8 @@ def handler(event, context):
         if not whatsapp.verify_signature(headers, body_bytes, config["appSecret"]):
             logger.warning("WhatsApp webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
             return {"statusCode": 401, "body": "Unauthorized"}
+        if _parse_json_object(body) is None:
+            return {"statusCode": 400, "body": "Bad Request"}
         _self_invoke_async("whatsapp", body, {})
         return {"statusCode": 200, "body": "ok"}
 
@@ -3489,6 +3538,8 @@ def handler(event, context):
         if not line_channel.verify_signature(headers, body_bytes, config["channelSecret"]):
             logger.warning("LINE webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
             return {"statusCode": 401, "body": "Unauthorized"}
+        if _parse_json_object(body) is None:
+            return {"statusCode": 400, "body": "Bad Request"}
         _self_invoke_async("line", body, {})
         return {"statusCode": 200, "body": "ok"}
 
