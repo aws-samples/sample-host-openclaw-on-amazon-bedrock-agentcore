@@ -303,6 +303,8 @@ uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_tes
 uv run --no-project --python .venv/bin/python python -m pytest tests/e2e/bot_test.py -v -k TestBrowserFeature  # browser E2E tests (requires enable_browser=true)
 ```
 
+The Router logs only the length of a Telegram reply. Tests that check reply text need a test deployment with `router_log_reply_text` set to `true`; without it `TailResult.response_text` stays empty.
+
 ### AgentCore Runtime Operations
 
 ```bash
@@ -340,7 +342,8 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bri
 | `default_model_id`, `fallback_model_id` | [README Configuration](README.md#configuration) | Primary and fallback Bedrock model IDs |
 | `runtime_manifest` | (empty for foundation) | Verified V2 manifest; wrapper default `.runtime/runtime-v2.json`, required for dependent stacks |
 | `image_version` | `1` | Local build image tag; changed releases require a new immutable endpoint through the SDK controller |
-| `cloudwatch_log_retention_days` | `30` | Log retention |
+| `cloudwatch_log_retention_days` | `30` | Log retention, rounded up to a CloudWatch Logs value (1 to 3653); also applied to `/openclaw/container` |
+| `router_log_reply_text` | `false` | Test deployments only: the Router also logs Telegram reply text, which `tests/e2e/log_tailer.py` needs to check replies |
 | `hourly_token_alarm` | `5000000` | `openclaw-hourly-token-spike` threshold (TotalTokens Sum over 1 h) |
 | `daily_token_budget` | `18000000` | `openclaw-daily-token-budget` threshold (TotalTokens Sum over 1 day). Was compared per hour before the alarm split |
 | `hourly_cost_alarm_usd` | `30` | `openclaw-hourly-cost-spike` threshold (EstimatedCostUSD Sum over 1 h) |

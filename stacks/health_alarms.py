@@ -15,6 +15,7 @@ stack's SNS alarm topic that fires on one occurrence in 5 minutes.
 """
 
 from aws_cdk import (
+    Annotations,
     Duration,
     Stack,
     aws_cloudwatch as cw,
@@ -27,14 +28,14 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import DeploymentNamer
+from stacks import DeploymentNamer, normalize_retention_days
 
 NAMESPACE = "OpenClaw/Health"
 CONTAINER_LOG_GROUP = "/openclaw/container"
 CRON_LOG_GROUP = "/openclaw/lambda/cron"
 
 
-def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("container", "cron"), log_retention: int | None = None) -> list:
+def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("container", "cron"), log_retention=None) -> list:
     """Add the filters and alarms for the given log groups to `scope`. Returns the alarms.
 
     On main, "container" goes in OpenClawObservability (phase 1) and "cron" in
@@ -42,18 +43,27 @@ def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("contai
     /openclaw/lambda/cron).
 
     `log_retention` is the retention (in days) applied to the container log
-    group when this stack creates it; defaults to the `cloudwatch_log_retention_days`
-    context key, matching every other log group in the deployment.
+    group; defaults to the `cloudwatch_log_retention_days` context key,
+    matching every other log group in the deployment. It is rounded up to a
+    value CloudWatch Logs accepts, as for the other groups.
     """
     stack = Stack.of(scope)
     if log_retention is None:
-        log_retention = int(scope.node.try_get_context("cloudwatch_log_retention_days") or 30)
+        log_retention = scope.node.try_get_context("cloudwatch_log_retention_days") or 30
+    requested = log_retention
+    log_retention = normalize_retention_days(requested)
+    if str(requested).strip() != str(log_retention):
+        Annotations.of(scope).add_warning(
+            f"cloudwatch_log_retention_days={requested!r} is not a CloudWatch Logs retention "
+            f"value; log groups use {log_retention} days."
+        )
     # The container creates /openclaw/container itself on first boot, so it may
     # not exist yet on a fresh deployment. Create it if missing. An existing
     # group (and its events) is left as it is, also when this stack is deleted.
     ensure_container_group = None
     if "container" in groups:
         ensure_container_group = _ensure_container_group(scope, stack, log_retention)
+        _container_group_retention(scope, stack, ensure_container_group, log_retention)
     namer = DeploymentNamer.from_scope(scope)
     # The bridge writes /openclaw/container under a fixed name, so suffixed
     # environments in one account share it; the cron group is per environment.
@@ -84,7 +94,7 @@ def _ensure_container_group(scope, stack, log_retention):
             action="putRetentionPolicy",
             parameters={
                 "logGroupName": CONTAINER_LOG_GROUP,
-                "retentionInDays": int(log_retention),
+                "retentionInDays": log_retention,
             },
             physical_resource_id=cr.PhysicalResourceId.of(CONTAINER_LOG_GROUP),
         ),
@@ -111,6 +121,51 @@ def _ensure_container_group(scope, stack, log_retention):
         apply_to_children=True,
     )
     return ensure
+
+
+def _container_group_retention(scope, stack, ensure, log_retention):
+    """Apply the retention to /openclaw/container on create as well as on update.
+
+    EnsureContainerLogGroup can make only one call per event: createLogGroup on
+    create and putRetentionPolicy on update. Its parameters change only when
+    the configured retention changes, so on a fresh install the group (created
+    here or by the bridge on first boot) kept its events forever. This resource
+    sets the retention once the group exists, and again whenever the value
+    changes. Deleting the stack leaves the retention as it is.
+    """
+    call = cr.AwsSdkCall(
+        service="CloudWatchLogs",
+        action="putRetentionPolicy",
+        parameters={"logGroupName": CONTAINER_LOG_GROUP, "retentionInDays": log_retention},
+        physical_resource_id=cr.PhysicalResourceId.of(f"{CONTAINER_LOG_GROUP}:retention"),
+    )
+    retention = cr.AwsCustomResource(
+        scope,
+        "ContainerLogGroupRetention",
+        on_create=call,
+        on_update=call,
+        policy=cr.AwsCustomResourcePolicy.from_statements([
+            iam.PolicyStatement(
+                actions=["logs:PutRetentionPolicy"],
+                resources=[
+                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:{CONTAINER_LOG_GROUP}",
+                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:{CONTAINER_LOG_GROUP}:*",
+                ],
+            ),
+        ]),
+        install_latest_aws_sdk=False,
+    )
+    retention.node.add_dependency(ensure)
+    cdk_nag.NagSuppressions.add_resource_suppressions(
+        retention,
+        [cdk_nag.NagPackSuppression(
+            id="AwsSolutions-IAM5",
+            reason="logs:PutRetentionPolicy on the single /openclaw/container log group (its ARN ends in :*).",
+            applies_to=[cdk_nag.RegexAppliesTo(regex="/^Resource::arn:aws:logs:.*:log-group:\\/openclaw\\/container:\\*$/")],
+        )],
+        apply_to_children=True,
+    )
+    return retention
 
 
 def _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_container_group, namer=None):
