@@ -131,6 +131,8 @@ aws cloudformation describe-stacks --stack-name OpenClawGateway \
   --query "Stacks[0].Outputs[?OutputKey=='GatewayUrl'].OutputValue" --output text
 ```
 
+The Gateway returns generic errors to MCP callers by default. To see detailed errors while debugging, set `context.gateway_debug_errors` to `true` in `cdk.json`, or pass `-c gateway_debug_errors=true` to a direct `cdk deploy OpenClawGateway` (either sets `ExceptionLevel: DEBUG`). Remove it and redeploy afterwards, because detailed errors are returned to the caller, which is the agent.
+
 A fresh installation uses `./scripts/deploy.sh` and initial endpoint `release_1`. Shared-stack updates require the verified `.runtime/runtime-v2.json` manifest through `runtime_manifest`. Configuration changes use a new immutable release endpoint; existing saved routes remain unchanged. See [AgentCore Runtime V2 deployment](runtime-v2.md#deploy-and-verify-v2).
 
 To verify a user's live session, set the active ARN, endpoint and session variables from its

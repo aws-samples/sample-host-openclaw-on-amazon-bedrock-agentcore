@@ -77,6 +77,9 @@ class RouterStack(Stack):
         user_selectable_models = parse_user_selectable_models(
             self.node.try_get_context(MODEL_SELECTION_KEY))
         default_model_id = self.node.try_get_context("default_model_id") or ""
+        # Test deployments only: log the Telegram reply text for the E2E log tailer.
+        log_reply_text = str(
+            self.node.try_get_context("router_log_reply_text") or "false").strip().lower() == "true"
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
@@ -154,6 +157,7 @@ class RouterStack(Stack):
                 "RUNTIME_TARGET": json.dumps(runtime_target, separators=(",", ":")),
                 "USER_SELECTABLE_MODELS": json.dumps(user_selectable_models, separators=(",", ":")),
                 "DEFAULT_MODEL_ID": default_model_id,
+                **({"LOG_REPLY_TEXT": "true"} if log_reply_text else {}),
             },
             log_group=router_log_group,
         )
@@ -298,7 +302,7 @@ class RouterStack(Stack):
             webhook_secret_name,
         ]
         router_secret_resources = [
-            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-??????"
             for name in router_secret_names
             if name
         ]
@@ -366,7 +370,7 @@ class RouterStack(Stack):
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
                     "Secrets Manager resources are each a single secret with the "
-                    "mandatory '-*' Secrets Manager random suffix; the enumerated "
+                    "six-character Secrets Manager random suffix ('-??????'); the enumerated "
                     "list covers only the channel/webhook secrets this Lambda reads. "
                     "DynamoDB grant_read_write_data adds index wildcards and KMS "
                     "wildcards for CMK-encrypted table. S3 PutObject scoped to "
@@ -374,7 +378,7 @@ class RouterStack(Stack):
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
                         *[
-                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-??????"
                             for name in router_secret_names
                             if name
                         ],

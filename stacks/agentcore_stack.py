@@ -87,7 +87,12 @@ class AgentCoreStack(Stack):
         # Deterministic ARN avoids CDK circular dependency when the role
         # references itself in its trust policy and inline policy.
         execution_role_arn_str = f"arn:aws:iam::{account}:role/{execution_role_name}"
-        # Trust policy: AgentCore Runtime (bedrock-agentcore) assumes this role.
+        # Trust policy: AgentCore (bedrock-agentcore) assumes this role for the
+        # Runtime and for the optional custom Browser below, which passes the
+        # same role as its execution_role_arn. The SourceArn therefore covers
+        # any AgentCore resource in this account and Region (the form AWS
+        # documents for Browser execution roles) rather than runtime/* only,
+        # which would refuse the Browser.
         # Confused-deputy guards (aws:SourceAccount / aws:SourceArn) match the
         # pattern used by the Gateway role (stacks/gateway_stack.py) and the
         # AgentCore Runtime trust-policy recommendation. The previously trusted
@@ -104,7 +109,7 @@ class AgentCoreStack(Stack):
                 conditions={
                     "StringEquals": {"aws:SourceAccount": account},
                     "ArnLike": {
-                        "aws:SourceArn": f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/*"
+                        "aws:SourceArn": f"arn:aws:bedrock-agentcore:{region}:{account}:*"
                     },
                 },
             ),
