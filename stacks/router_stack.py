@@ -298,7 +298,7 @@ class RouterStack(Stack):
             webhook_secret_name,
         ]
         router_secret_resources = [
-            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-??????"
             for name in router_secret_names
             if name
         ]
@@ -366,7 +366,7 @@ class RouterStack(Stack):
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
                     "Secrets Manager resources are each a single secret with the "
-                    "mandatory '-*' Secrets Manager random suffix; the enumerated "
+                    "six-character Secrets Manager random suffix ('-??????'); the enumerated "
                     "list covers only the channel/webhook secrets this Lambda reads. "
                     "DynamoDB grant_read_write_data adds index wildcards and KMS "
                     "wildcards for CMK-encrypted table. S3 PutObject scoped to "
@@ -374,7 +374,7 @@ class RouterStack(Stack):
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
                         *[
-                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-??????"
                             for name in router_secret_names
                             if name
                         ],

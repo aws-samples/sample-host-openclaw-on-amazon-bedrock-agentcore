@@ -278,7 +278,7 @@ class CronStack(Stack):
             line_token_secret_name,
         ]
         cron_secret_resources = [
-            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-??????"
             for name in cron_secret_names
             if name
         ]
@@ -397,7 +397,7 @@ class CronStack(Stack):
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
                     "Secrets Manager resources are each a single secret with the "
-                    "mandatory '-*' Secrets Manager random suffix; the enumerated "
+                    "six-character Secrets Manager random suffix ('-??????'); the enumerated "
                     "list covers only the channel-token secrets this Lambda reads. "
                     "DynamoDB index wildcard needed for query operations. S3 "
                     "GetObject limited to */*.mp3 brief audio; the per-user "
@@ -405,7 +405,7 @@ class CronStack(Stack):
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
                         *[
-                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-??????"
                             for name in cron_secret_names
                             if name
                         ],
