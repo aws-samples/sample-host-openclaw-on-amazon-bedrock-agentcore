@@ -21,7 +21,15 @@ REGION = "us-west-2"
 
 def synth_app(**context_overrides):
     """Return {stack name: template} for app.py with cdk.json context plus overrides."""
-    return _synth(json.dumps(context_overrides, sort_keys=True))
+    return _synth(json.dumps(context_overrides, sort_keys=True))[0]
+
+
+def synth_errors(**context_overrides):
+    """Return the assembly's error annotations (cdk-nag findings without a suppression).
+
+    `cdk deploy` refuses to deploy a stack that carries any of these.
+    """
+    return _synth(json.dumps(context_overrides, sort_keys=True))[1]
 
 
 @functools.lru_cache(maxsize=None)
@@ -40,7 +48,11 @@ def _synth(overrides_json):
     templates = {p.name.removesuffix(".template.json"): json.loads(p.read_text())
                  for p in Path(outdir).glob("*.template.json")}
     assert templates, "app.py synthesized no stacks"
-    return templates
+    errors = [f"{path}: {str(entry.get('data'))[:300]}"
+              for p in Path(outdir).glob("*.metadata.json")
+              for path, entries in json.loads(p.read_text()).items()
+              for entry in entries if entry.get("type") == "aws:cdk:error"]
+    return templates, sorted(errors)
 
 
 def resources(templates, res_type):

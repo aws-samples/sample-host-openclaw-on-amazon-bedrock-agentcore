@@ -401,7 +401,9 @@ class CronStack(Stack):
                     "list covers only the channel-token secrets this Lambda reads. "
                     "DynamoDB index wildcard needed for query operations. S3 "
                     "GetObject limited to */*.mp3 brief audio; the per-user "
-                    "namespace check is enforced in code.",
+                    "namespace check is enforced in code. DescribeExecution is "
+                    "limited to executions of this stack's cron runner state machine; "
+                    "execution names are generated per schedule fire.",
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
                         *[
@@ -411,6 +413,7 @@ class CronStack(Stack):
                         ],
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/*.mp3",
+                        f"Resource::arn:aws:states:{region}:{account}:execution:{state_machine_name}:*",
                     ],
                 ),
                 cdk_nag.NagPackSuppression(
