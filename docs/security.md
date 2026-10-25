@@ -259,6 +259,13 @@ scoped credentials and run the Bedrock proxy. The untrusted agent is isolated
   execution role can read every user's `openclaw/cognito-user/*` secret. This
   layer needs no Linux capability and is active whenever the container is root;
   the startup log prints a loud warning if it is not.
+- **Agent uid files.** HOME stays `/root` (mode 0711) for the agent uid, so it can
+  reach its state dir in `/root/.openclaw` but cannot list or create anything else
+  in `/root`. Its caches, config and temp files go to `/home/openclaw` instead
+  (owned by uid 10001, mode 0700): the supervisor sets `XDG_CACHE_HOME`,
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `TMPDIR` and
+  `npm_config_cache` for every agent-uid child. `scripts/smoke-agent-uid-dirs.sh`
+  checks a built image for this.
 - **/proc hidepid (best-effort).** The entrypoint remounts `/proc` with
   `hidepid=2` so the agent uid cannot see other processes at all. Needs
   `CAP_SYS_ADMIN`; skipped and logged when unavailable.
