@@ -546,13 +546,15 @@ function isSecurityRefusal(text) {
 }
 
 /**
- * Minimal environment for the clawhub child: PATH/HOME/locale plus clawhub's
+ * Minimal environment for the clawhub child: PATH/HOME/locale/TMPDIR/XDG dirs plus clawhub's
  * own CLAWHUB_ / CLAWDHUB_ settings. No AWS credential variables — clawhub
  * only talks to the ClawHub registry.
  */
 function clawhubEnv(base = process.env) {
   const env = {};
-  for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "NODE_PATH", "TMPDIR"]) {
+  for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "NODE_PATH", "TMPDIR",
+    // Set for the unprivileged agent uid, whose HOME (/root) is not writable.
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"]) {
     if (base[key]) env[key] = base[key];
   }
   for (const [key, value] of Object.entries(base)) {

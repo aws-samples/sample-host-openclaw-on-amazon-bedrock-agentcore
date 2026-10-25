@@ -277,6 +277,8 @@ async function commonBootstrap() {
     fs.readFileSync(`/skills/${skill}/SKILL.md`, "utf8");
   }
   assertUnboundResourcesAbsent();
+  // Before any agent-uid child exists: its own cache/config/temp directories.
+  privsep.ensureAgentDirs({ log: console });
   const env = scopedCreds.buildOpenClawEnv({ credDir: SCOPED_CREDS_DIR, baseEnv: process.env });
   Object.assign(env, preparedGatewayStateEnv());
   delete env.USER_ID;
@@ -409,7 +411,7 @@ function runRuntimeSkillInstall(args) {
     const child = execFile("clawhub", args, {
       ...privsep.childPrivilegeOptions(),
       encoding: "utf8", timeout: runtimeSkills.REINSTALL_TIMEOUT_MS,
-      env: runtimeSkills.clawhubEnv(), signal: activationScope.signal,
+      env: runtimeSkills.clawhubEnv({ ...process.env, ...privsep.agentDirEnv() }), signal: activationScope.signal,
       maxBuffer: 4 * 1024 * 1024,
     }, (error, stdout, stderr) => {
       runtimeSkillChildren.delete(child);
@@ -698,6 +700,9 @@ async function cleanupLockFiles() {
 function preparedGatewayStateEnv() {
   return {
     ...stateStorage.gatewayStateEnv(OPENCLAW_DIR),
+    // The agent uid cannot write under HOME (/root is 0711): send its caches,
+    // config and temp files to its own directory. Empty without the uid split.
+    ...privsep.agentDirEnv(),
     HOME: process.env.HOME || "/root",
     OPENCLAW_CONFIG_PATH: `${OPENCLAW_DIR}/openclaw.json`,
     OPENCLAW_WORKSPACE_DIR: `${OPENCLAW_DIR}/workspace`,

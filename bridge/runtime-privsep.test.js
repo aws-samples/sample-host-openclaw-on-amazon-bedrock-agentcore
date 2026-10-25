@@ -145,3 +145,120 @@ test("credential endpoint shape: owner-only, missing and unparseable inputs neve
   assert.equal(privsep.credentialEndpointShape({ AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: "/t" }, { statSync: () => { throw new Error("ENOENT"); } }).tokenFile, "set but not readable");
   assert.equal(privsep.credentialEndpointShape({ AWS_CONTAINER_CREDENTIALS_FULL_URI: "not a url" }).fullUri, "unparseable (NOT covered by the firewall)");
 });
+
+// --- agent uid's own cache/config/temp directories ---------------------------
+
+const realFs = require("node:fs");
+const os = require("node:os");
+const nodePath = require("node:path");
+
+test("agentDirEnv points XDG dirs, TMPDIR and the npm cache at the agent dir as root, and is empty otherwise", () => {
+  assert.deepEqual(privsep.agentDirEnv(rootProc, {}), {
+    XDG_CACHE_HOME: "/home/openclaw/.cache",
+    XDG_CONFIG_HOME: "/home/openclaw/.config",
+    XDG_DATA_HOME: "/home/openclaw/.local/share",
+    XDG_STATE_HOME: "/home/openclaw/.local/state",
+    npm_config_cache: "/home/openclaw/.npm",
+    TMPDIR: "/home/openclaw/tmp",
+  });
+  // Nothing under HOME (/root): the agent uid cannot create entries there.
+  for (const value of Object.values(privsep.agentDirEnv(rootProc, { HOME: "/root" }))) {
+    assert.equal(value.startsWith("/root"), false, value);
+  }
+  assert.deepEqual(privsep.agentDirEnv(nonRootProc, {}), {});
+  assert.deepEqual(privsep.agentDirEnv(noUidProc, {}), {});
+});
+
+test("agentDir accepts only a clean absolute override", () => {
+  assert.equal(privsep.agentDir({}), privsep.DEFAULT_AGENT_DIR);
+  assert.equal(privsep.agentDir({ OPENCLAW_RUNTIME_AGENT_DIR: "/var/lib/agent/" }), "/var/lib/agent");
+  for (const bad of ["relative/dir", "/", "/tmp/../root", ""]) {
+    assert.equal(privsep.agentDir({ OPENCLAW_RUNTIME_AGENT_DIR: bad }), privsep.DEFAULT_AGENT_DIR, bad);
+  }
+});
+
+test("ensureAgentDirs creates each directory parent-first, 0700, owned by the agent uid", () => {
+  const ops = [];
+  const fs = {
+    mkdirSync: (p, o) => ops.push(["mkdir", p, o.mode]),
+    lstatSync: () => ({ isDirectory: () => true, isSymbolicLink: () => false }),
+    lchownSync: (p, u, g) => ops.push(["lchown", p, u, g]),
+    chmodSync: (p, m) => ops.push(["chmod", p, m]),
+  };
+  assert.equal(privsep.ensureAgentDirs({ proc: rootProc, env: {}, fs }), true);
+  const made = ops.filter((op) => op[0] === "mkdir").map((op) => op[1]);
+  assert.deepEqual(made, privsep.agentDirLayout({}).map((entry) => entry.path));
+  assert.equal(made[0], "/home/openclaw");
+  assert.ok(ops.filter((op) => op[0] === "mkdir").every((op) => op[2] === 0o700));
+  assert.ok(ops.filter((op) => op[0] === "lchown").every((op) => op[2] === 10001 && op[3] === 10001));
+  assert.equal(ops.filter((op) => op[0] === "lchown").length, made.length);
+});
+
+test("ensureAgentDirs is a no-op when not root", () => {
+  let touched = 0;
+  const fs = { mkdirSync: () => { touched += 1; } };
+  assert.equal(privsep.ensureAgentDirs({ proc: nonRootProc, env: {}, fs }), false);
+  assert.equal(touched, 0);
+});
+
+test("ensureAgentDirs never chowns through a symlink and never throws", () => {
+  const warnings = [];
+  const ops = [];
+  const fs = {
+    mkdirSync: () => { throw Object.assign(new Error("exists"), { code: "EEXIST" }); },
+    lstatSync: () => ({ isDirectory: () => false, isSymbolicLink: () => true }),
+    lchownSync: () => ops.push("lchown"),
+    chownSync: () => ops.push("chown"),
+    chmodSync: () => ops.push("chmod"),
+  };
+  assert.equal(privsep.ensureAgentDirs({ proc: rootProc, env: {}, fs, log: { warn: (m) => warnings.push(m) } }), false);
+  assert.deepEqual(ops, []);
+  assert.match(warnings[0], /not a directory/);
+  const failing = { mkdirSync: () => { throw Object.assign(new Error("read-only"), { code: "EROFS" }); } };
+  assert.equal(privsep.ensureAgentDirs({ proc: rootProc, env: {}, fs: failing, log: { warn: (m) => warnings.push(m) } }), false);
+  assert.match(warnings[1], /could not prepare \/home\/openclaw/);
+});
+
+test("ensureAgentDirs on a real filesystem: creates 0700 dirs and leaves a planted symlink alone", (t) => {
+  if (typeof process.getuid !== "function" || process.getuid() === 0) return t.skip("needs a non-root uid");
+  const base = realFs.mkdtempSync(nodePath.join(os.tmpdir(), "privsep-agentdir-"));
+  t.after(() => realFs.rmSync(base, { recursive: true, force: true }));
+  // Pretend to be root but "drop" to our own uid, so lchown succeeds without privileges.
+  const env = {
+    OPENCLAW_RUNTIME_UID: String(process.getuid()), OPENCLAW_RUNTIME_GID: String(process.getgid()),
+    OPENCLAW_RUNTIME_AGENT_DIR: nodePath.join(base, "agent"),
+  };
+  assert.equal(privsep.ensureAgentDirs({ proc: rootProc, env }), true);
+  for (const value of Object.values(privsep.agentDirEnv(rootProc, env))) {
+    const stat = realFs.lstatSync(value);
+    assert.ok(stat.isDirectory(), value);
+    assert.equal(stat.mode & 0o777, 0o700, value);
+  }
+  // A symlink in place of a directory is reported, not followed.
+  const outside = nodePath.join(base, "outside");
+  realFs.mkdirSync(outside, { mode: 0o755 });
+  const planted = { ...env, OPENCLAW_RUNTIME_AGENT_DIR: nodePath.join(base, "agent2") };
+  realFs.mkdirSync(planted.OPENCLAW_RUNTIME_AGENT_DIR, { mode: 0o700 });
+  realFs.symlinkSync(outside, nodePath.join(planted.OPENCLAW_RUNTIME_AGENT_DIR, ".cache"));
+  assert.equal(privsep.ensureAgentDirs({ proc: rootProc, env: planted, log: { warn() {} } }), false);
+  assert.equal(realFs.statSync(outside).mode & 0o777, 0o755);
+});
+
+test("Dockerfile creates every agent dir owned by the agent uid and keeps /root traverse-only", () => {
+  const dockerfile = realFs.readFileSync(nodePath.join(__dirname, "Dockerfile"), "utf8").replace(/\\\n/g, " ");
+  const runs = dockerfile.split("\n").filter((line) => line.startsWith("RUN "));
+  const block = runs.find((line) => line.includes("mkdir") && line.includes("/home/openclaw"));
+  assert.ok(block, "a RUN step prepares /home/openclaw");
+  for (const { path: dir } of privsep.agentDirLayout({})) {
+    assert.ok(block.split(/\s+/).includes(dir) || dir === "/home/openclaw" || dir === "/home/openclaw/.local",
+      `${dir} is created`);
+  }
+  assert.match(block, /chown -R 10001:10001 \/home\/openclaw(\s|$)/);
+  assert.match(block, /chmod -R 0700 \/home\/openclaw(\s|$)/);
+  assert.match(block, /chmod 0711 \/root(\s|$)/);
+  // /root is only ever made traverse-only, never writable or handed to the agent uid.
+  const rootModes = [...dockerfile.matchAll(/chmod (?:-R )?(\S+) \/root(?=\s|$)/g)].map((m) => m[1]);
+  assert.deepEqual(rootModes, ["0711"]);
+  assert.equal(/chown (?:-R )?\S+ \/root(?=\s|$)/.test(dockerfile), false);
+  assert.match(dockerfile, /useradd --uid 10001 --gid 10001 --home-dir \/home\/openclaw /);
+});

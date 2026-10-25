@@ -1120,4 +1120,16 @@ describe("agentcore-contract.js wiring", () => {
     assert.match(agents, /restored before requests are accepted in each new session/);
     assert.equal(/After install\/uninstall, the skill will be available on the next session start/.test(agents), false);
   });
+
+  it("clawhubEnv forwards the agent uid's TMPDIR and XDG dirs (HOME is not writable for it)", () => {
+    const dirs = {
+      TMPDIR: "/home/openclaw/tmp",
+      XDG_CACHE_HOME: "/home/openclaw/.cache",
+      XDG_CONFIG_HOME: "/home/openclaw/.config",
+      XDG_DATA_HOME: "/home/openclaw/.local/share",
+      XDG_STATE_HOME: "/home/openclaw/.local/state",
+    };
+    const env = rs.clawhubEnv({ PATH: "/usr/bin", HOME: "/root", ...dirs, npm_config_cache: "/x" });
+    assert.deepEqual(env, { PATH: "/usr/bin", HOME: "/root", ...dirs });
+  });
 });

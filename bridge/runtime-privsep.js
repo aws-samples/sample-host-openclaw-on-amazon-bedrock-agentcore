@@ -142,6 +142,94 @@ function chownRecursiveSync(dir, uid, gid, fs) {
   return true;
 }
 
+// --- Writable locations for the agent uid ---------------------------------
+//
+// HOME stays /root for every OpenClaw-family child: the state dir, the config
+// path and the live-seed layout checks are all derived from it, and /root is
+// 0711 (traverse only), so the agent uid cannot create anything directly under
+// it. OpenClaw, clawhub and the tools they run still write per-user caches and
+// temp files relative to HOME or the XDG base directories, e.g. OpenClaw's
+// SQLite snapshot staging root ($XDG_CACHE_HOME, else $HOME/.cache) and npm's
+// cache ($HOME/.npm). Left alone those resolve under /root and fail with
+// EACCES (gateway activation and `openclaw doctor` both stop on it). Point them
+// at a directory the agent uid owns instead. The Dockerfile creates it; the
+// supervisor re-creates it at startup if it is missing.
+const DEFAULT_AGENT_DIR = "/home/openclaw";
+
+function agentDir(env = process.env) {
+  const raw = env.OPENCLAW_RUNTIME_AGENT_DIR;
+  if (typeof raw === "string" && raw.length > 1 && raw.startsWith("/") &&
+      !raw.split("/").includes("..") && !raw.includes("\0")) {
+    return raw.replace(/\/+$/, "");
+  }
+  return DEFAULT_AGENT_DIR;
+}
+
+/** Directories (parent first) the agent uid needs to own, and the env var for each. */
+function agentDirLayout(env = process.env) {
+  const root = agentDir(env);
+  return [
+    { path: root },
+    { path: `${root}/.cache`, env: "XDG_CACHE_HOME" },
+    { path: `${root}/.config`, env: "XDG_CONFIG_HOME" },
+    { path: `${root}/.local` },
+    { path: `${root}/.local/share`, env: "XDG_DATA_HOME" },
+    { path: `${root}/.local/state`, env: "XDG_STATE_HOME" },
+    { path: `${root}/.npm`, env: "npm_config_cache" },
+    { path: `${root}/tmp`, env: "TMPDIR" },
+  ];
+}
+
+/**
+ * Environment entries that send the agent uid's caches, config and temp files
+ * to its own directory. Merge into the env of every child spawned with
+ * childPrivilegeOptions(). Empty when privilege separation is off: the child
+ * then runs with the supervisor's uid and its usual HOME-relative locations.
+ */
+function agentDirEnv(proc = process, env = process.env) {
+  if (!canDropPrivileges(proc, env)) return {};
+  const out = {};
+  for (const entry of agentDirLayout(env)) {
+    if (entry.env) out[entry.env] = entry.path;
+  }
+  return out;
+}
+
+/**
+ * Create the agent uid's directories (mode 0700, owned by the agent uid) when
+ * they are missing. Call once at startup, before any agent-uid child exists, so
+ * nothing the agent controls can be in the way. An existing entry that is not a
+ * plain directory (e.g. a symlink) is left untouched and reported: chown and
+ * chmod here never follow a link. Never throws.
+ *
+ * @returns {boolean} true when every directory is in place and owned by the agent uid.
+ */
+function ensureAgentDirs({ proc = process, env = process.env, fs = realFs, log } = {}) {
+  if (!canDropPrivileges(proc, env)) return false;
+  const uid = openClawUid(env);
+  const gid = openClawGid(env);
+  for (const { path: dir } of agentDirLayout(env)) {
+    try {
+      try {
+        fs.mkdirSync(dir, { mode: 0o700 });
+      } catch (error) {
+        if (!error || error.code !== "EEXIST") throw error;
+      }
+      const stat = fs.lstatSync(dir);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        log?.warn?.(`[privsep] ${dir} is not a directory; agent uid caches and temp files may fail`);
+        return false;
+      }
+      (fs.lchownSync || fs.chownSync)(dir, uid, gid);
+      fs.chmodSync(dir, 0o700);
+    } catch (error) {
+      log?.warn?.(`[privsep] could not prepare ${dir} for ${uid}:${gid}: ${error.message}`);
+      return false;
+    }
+  }
+  return true;
+}
+
 // Normalise a status reported by the entrypoint to "active" / "INACTIVE" /
 // "unknown", so an inactive layer always reads the same way in the log.
 function normaliseStatus(value) {
@@ -245,6 +333,11 @@ module.exports = {
   canDropPrivileges,
   childPrivilegeOptions,
   chownToOpenClaw,
+  DEFAULT_AGENT_DIR,
+  agentDir,
+  agentDirLayout,
+  agentDirEnv,
+  ensureAgentDirs,
   credentialEndpointShape,
   describeProtections,
   formatStartupLines,

@@ -1098,6 +1098,9 @@ test("privilege separation: gateway + doctor spawn unprivileged, state dir hande
   const privsepMock = {
     childPrivilegeOptions: () => ({ uid: 10001, gid: 10001 }),
     chownToOpenClaw: (p) => { privsepMock._chowns.push(p); return true; },
+    agentDirEnv: () => ({ XDG_CACHE_HOME: "/home/openclaw/.cache", TMPDIR: "/home/openclaw/tmp" }),
+    ensureAgentDirs: () => { privsepMock._ensured += 1; return true; },
+    _ensured: 0,
     describeProtections: (x) => ({ uidSplit: "active", uid: 10001, networkBlock: x.networkBlock, procHidden: x.procHidden }),
     formatStartupLines: (st) => [`[privsep] uid-split=${st.uidSplit} mmds=${st.networkBlock} hidepid=${st.procHidden}`],
     _chowns: [],
@@ -1121,6 +1124,16 @@ test("privilege separation: gateway + doctor spawn unprivileged, state dir hande
   assert.ok(app.preparations.length);
   assert.ok(privsepMock._chowns.filter((p) => p === "/test-home/.openclaw").length >= 2,
     `state dir chowned, got: ${JSON.stringify(privsepMock._chowns)}`);
+  // The agent uid gets writable cache/temp dirs (HOME=/root is not writable for
+  // it): created once at bootstrap, and in the env of the prepared gateway, the
+  // activation and doctor. HOME itself is unchanged.
+  assert.equal(privsepMock._ensured, 1);
+  for (const [name, env] of [["prepared", app.preparations[0].env], ["activation", app.activations[0].env],
+    ["doctor", doctor.env]]) {
+    assert.equal(env.XDG_CACHE_HOME, "/home/openclaw/.cache", name);
+    assert.equal(env.TMPDIR, "/home/openclaw/tmp", name);
+    assert.equal(env.HOME, "/test-home", name);
+  }
   // The startup log states which protections are active.
   assert.ok(app.logs.includes("[privsep] uid-split=active mmds=active hidepid=inactive"),
     "privsep status logged at bootstrap");

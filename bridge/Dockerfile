@@ -169,14 +169,24 @@ WORKDIR /app
 # endpoint. The id is NUMERIC (10001) to avoid the AgentCore >53-layer
 # "424 / Failed to mount overlay" issue with non-numeric users.
 RUN groupadd --gid 10001 openclaw && \
-    useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin openclaw
+    useradd --uid 10001 --gid 10001 --home-dir /home/openclaw --no-create-home --shell /usr/sbin/nologin openclaw
 
 # Pre-create the OpenClaw state dir owned by the agent uid. HOME stays /root
 # (the proxy snapshot pins HOME=/root), so the agent traverses into /root to
 # reach its state dir: 0711 lets it enter without listing root's other files.
+# Because the agent cannot create anything else under /root, its caches, config
+# and temp files go to /home/openclaw instead: the contract server points
+# XDG_CACHE_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, TMPDIR and
+# npm_config_cache there for every agent-uid child (runtime-privsep.js). Without
+# it OpenClaw's SQLite snapshot staging dir resolves to /root/.cache and the
+# gateway and `openclaw doctor` stop with EACCES.
 RUN mkdir -p /root/.openclaw && \
     chown -R 10001:10001 /root/.openclaw && \
-    chmod 0711 /root
+    chmod 0711 /root && \
+    mkdir -p /home/openclaw/.cache /home/openclaw/.config /home/openclaw/.local/share \
+      /home/openclaw/.local/state /home/openclaw/.npm /home/openclaw/tmp && \
+    chown -R 10001:10001 /home/openclaw && \
+    chmod -R 0700 /home/openclaw
 
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
