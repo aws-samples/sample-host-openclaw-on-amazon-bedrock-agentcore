@@ -154,12 +154,16 @@ test("old finished jobs are pruned; running jobs are kept", () => {
 
 // --- the contract's cron_start / cron_status handler -------------------------
 
-function cronHandler({ turn = async () => {} } = {}) {
+function cronHandler({ turn = async () => {}, lifecycle = {} } = {}) {
   const turns = [];
+  const assertBinding = lifecycle.assertBinding ?? (() => {});
+  const checkpoint = lifecycle.checkpoint ?? (() => {});
   const box = {
     fs: { existsSync: () => false }, stateStorage: { DEFAULT_MOUNT: "/mnt/workspace" },
     cronJobs: jobs, osRandomUUID: () => "boot-1", CRON_JOB_BUDGET_MS: 45 * 60 * 1000,
-    cronJobStoreInstance: null, console: { log() {}, warn() {}, error() {} }, Date,
+    cronJobStoreInstance: null, console: { log() {}, warn() {}, error() {} },
+    Date, Object, Number,
+    v2Lifecycle: { assertBinding, checkpoint },
     handleV2Invocation(payload, req, res, callerGone, arrival, options) {
       turns.push({ payload, options, callerGone: callerGone() });
       return turn(res, payload, options);
@@ -167,9 +171,9 @@ function cronHandler({ turn = async () => {} } = {}) {
   };
   vm.createContext(box);
   vm.runInContext(slice("function cronJobStore() {", "\n// Shape check for the Router"), box);
-  const call = async (payload) => {
+  const call = async (payload, { headers = {} } = {}) => {
     let reply;
-    await box.handleCronAsync(payload, { headers: {} }, {
+    await box.handleCronAsync(payload, { headers }, {
       writeHead(code) { this.code = code; },
       end(body) { reply = { code: this.code, body: JSON.parse(body) }; },
     });
@@ -255,6 +259,46 @@ test("cron_start rejects a bad jobId, a caller budget or a missing message witho
   assert.equal(app.turns.length, 0);
 });
 
+// --- security hardening: binding is checked before the job store is touched -
+
+test("a rejected user binding does not touch the job store (no job registered, no turn)", async () => {
+  const app = cronHandler({
+    turn: () => new Promise(() => {}),
+    lifecycle: { assertBinding: () => { throw new Error("bad binding"); } },
+  });
+  const reply = await app.call({ ...owner, action: "cron_start", jobId: "j1", message: "m" });
+  assert.equal(reply.body.status, "error");
+  assert.equal(app.turns.length, 0);
+  assert.equal(app.store().size(), 0);
+  // The same jobId is still free for the real binding afterwards.
+  const good = cronHandler({ turn: () => new Promise(() => {}) });
+  const accepted = await good.call({ ...owner, action: "cron_start", jobId: "j1", message: "m" });
+  assert.equal(accepted.body.status, "accepted");
+  assert.equal(accepted.body.duplicate, undefined);
+});
+
+test("cron_status requires the full session binding, not just the asserted userId", async () => {
+  const app = cronHandler({ turn: () => new Promise(() => {}) });
+  await app.call({ ...owner, action: "cron_start", jobId: "j1", message: "m" }, { headers: { "x-amzn-bedrock-agentcore-runtime-session-id": "sessA" } });
+  // Same userId but a different actorId / runtimeSessionId is NOT the owner.
+  const foreign = (await app.call({ userId: "u1", actorId: "telegram:9", action: "cron_status", jobId: "j1" }, { headers: { "x-amzn-bedrock-agentcore-runtime-session-id": "sessA" } })).body;
+  assert.equal(foreign.status, "unknown");
+  const foreignSession = (await app.call({ ...owner, action: "cron_status", jobId: "j1" }, { headers: { "x-amzn-bedrock-agentcore-runtime-session-id": "sessB" } })).body;
+  assert.equal(foreignSession.status, "unknown");
+  // The real binding still sees it.
+  const own = (await app.call({ ...owner, action: "cron_status", jobId: "j1" }, { headers: { "x-amzn-bedrock-agentcore-runtime-session-id": "sessA" } })).body;
+  assert.equal(own.status, "running");
+});
+
+test("a duplicate jobId held by a different binding is an error, not accepted", async () => {
+  const app = cronHandler({ turn: () => new Promise(() => {}) });
+  await app.call({ ...owner, action: "cron_start", jobId: "j1", message: "m" }, { headers: { "x-amzn-bedrock-agentcore-runtime-session-id": "sessA" } });
+  const squatted = await app.call({ ...owner, action: "cron_start", jobId: "j1", message: "m" }, { headers: { "x-amzn-bedrock-agentcore-runtime-session-id": "sessB" } });
+  assert.equal(squatted.code, 409);
+  assert.equal(squatted.body.status, undefined);
+  assert.equal(app.turns.length, 1);
+});
+
 // --- wiring ------------------------------------------------------------------
 
 test("the HTTP server routes cron_start and cron_status to the async handler", () => {
@@ -272,9 +316,11 @@ test("handleV2Invocation bounds an async job by its own deadline, not a caller b
     proxyModelOutcomeUnknown: false, activeTaskCount: 0, lastActivityTime: 0, RUNTIME_PLATFORM: "V2",
     OPENCLAW_PORT: 1, GATEWAY_TOKEN: "t", TELEGRAM_BOT_TOKEN: "", activationScope: { signal: undefined },
     lateAnnounces: null, payloadModelOverride: () => null, buildBridgeText: (m) => m, extractTextFromContent: (x) => x,
+    knownDeliveryRoutes: new Set(), routeTripleKey: () => null,
     checkProxyHealth: async () => ({ model_outcome_unknown: false }),
     verifyV2Resources: async () => {},
     updateIdentityFile: (...args) => { seen.trigger = args[5].trigger; },
+    assertChannelOwnership: async () => ({ decision: "allow", reason: "self_channel" }),
     gatewayTurn: async ({ deadline }) => { seen.deadline = deadline; return { phase: "completed", response: "ok", runId: "r" }; },
     v2Lifecycle: {
       assertBinding() {}, checkpoint() {}, fail: async () => {},

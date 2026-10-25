@@ -47,7 +47,21 @@ const { createPreparedGateway } = require("./openclaw-worker-owner");
 const { renderConfig, renderAgents } = require("./gateway-config");
 const { createLiveSeedBridge, readGatewayToken } = require("./live-seed-bridge");
 const { createProxySdkSnapshotOwner } = require("./proxy-sdk-snapshot");
+const workspaceFilesS3 = require("./workspace-files-s3");
+
+// Execution-role S3 client for operator-owned keys outside the user's
+// namespace prefix (the AGENTS.md upload). The scoped-credential client in
+// workspace-sync.js has no access there.
+let _executionRoleS3Client = null;
+function executionRoleS3Client() {
+  if (!_executionRoleS3Client) {
+    const { S3Client } = require("@aws-sdk/client-s3");
+    _executionRoleS3Client = new S3Client({ region: process.env.AWS_REGION });
+  }
+  return _executionRoleS3Client;
+}
 const { createProxyAuthParent } = require("./proxy-auth-prepare");
+const { createChannelOwnershipVerifier } = require("./channel-authz");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -80,9 +94,10 @@ let GATEWAY_TOKEN = null;
 // Used for typing indicator during processing + single final message delivery.
 let TELEGRAM_BOT_TOKEN = null;
 
-// Cognito password secret — fetched during user activation.
-// Stored in-process only, never written to process.env.
-let COGNITO_PASSWORD_SECRET = null;
+// Cognito passwords are per user: generated with crypto.randomBytes and stored
+// in Secrets Manager at openclaw/cognito-user/<poolId>/<namespace> (see
+// cognito-token.js). No password-derivation key is held by the contract server
+// or passed into the proxy child.
 
 // Maximum request body size (1MB) to prevent memory exhaustion
 const MAX_BODY_SIZE = 1 * 1024 * 1024;
@@ -159,6 +174,22 @@ let cronJobStoreInstance = null;
 // Late sub-agent announce relay (#148): forwards an announce run that finishes
 // after the turn that spawned the sub-agent has replied. One per activation.
 let lateAnnounces = null;
+// Delivery triples (channel|channelActorId|channelTarget) that at least one
+// turn passed assertBinding against during this activation. deliverLateAnnounce
+// uses this as the ownership check on channelTarget: the lifecycle binding
+// forces one userId/actorId per activation, but it does not carry the chat
+// target, so a late announce destination has to be matched against the set of
+// targets this bound owner has actually used (#148 CWE-359 fix). Reset on
+// cleanup / activation reset together with `lateAnnounces`.
+let knownDeliveryRoutes = new Set();
+function routeTripleKey(route) {
+  if (!route || typeof route !== "object") return null;
+  const channel = typeof route.channel === "string" ? route.channel : "";
+  const actorId = typeof route.channelActorId === "string" ? route.channelActorId : "";
+  const target = typeof route.channelTarget === "string" ? route.channelTarget : "";
+  if (!channel || !actorId || !target) return null;
+  return `${channel}|${actorId}|${target}`;
+}
 let proxyModelOutcomeUnknown = false;
 const UNKNOWN_OUTCOME_RESPONSE = "The request outcome is unknown. It has not been automatically retried. Check any resulting changes before retrying.";
 const v2Lifecycle = createRuntimeLifecycle({
@@ -171,6 +202,38 @@ const v2Lifecycle = createRuntimeLifecycle({
   cleanup: cleanupV2Resources,
   activationTimeoutMs: ACTIVATION_TIMEOUT_MS,
 });
+
+// Per-turn delivery identity (channel/channelActorId/channelTarget) carried in
+// the request body is NOT part of the activation binding, so it must be
+// authorized separately against the activated user before updateIdentityFile()
+// or createTelegramStreamer() acts on it. See bridge/channel-authz.js for the
+// contract. In production (IDENTITY_TABLE_NAME set) a cross-channel turn's
+// channelActorId must have a CHANNEL#<actorId> PROFILE record whose userId
+// equals binding.userId. When the identity table is unset (local dev harness,
+// unit tests) the verifier logs a one-time warning and allows the turn so
+// developer loops keep working; production deployments always set the env.
+let channelOwnershipVerifier = createChannelOwnershipVerifier({
+  identityTable: process.env.IDENTITY_TABLE_NAME || null,
+  region: process.env.AWS_REGION || "us-west-2",
+  allowWithoutTable: !process.env.IDENTITY_TABLE_NAME,
+});
+let warnedChannelAuthzUnavailable = false;
+async function assertChannelOwnership(binding, context) {
+  const result = await channelOwnershipVerifier.verify(binding, context);
+  if (result.decision === "deny") {
+    const error = new Error(`Channel delivery identity rejected: ${result.reason}`);
+    error.channelAuthzReason = result.reason;
+    throw error;
+  }
+  if (result.reason === "identity_table_unavailable" && !warnedChannelAuthzUnavailable) {
+    warnedChannelAuthzUnavailable = true;
+    console.warn(
+      "[contract] IDENTITY_TABLE_NAME is unset; cross-channel delivery authorization is advisory. " +
+      "Set the identity table on the AgentCore runtime container to enforce it.",
+    );
+  }
+  return result;
+}
 
 // Derive EVENTBRIDGE_ROLE_ARN from EXECUTION_ROLE_ARN + AWS_REGION if not already set.
 // The agentcore toolkit doesn't support injecting arbitrary env vars into the container,
@@ -284,6 +347,7 @@ function assertUnboundResourcesAbsent(seedPrepared = false) {
 async function cleanupV2Resources() {
   lateAnnounces?.close();
   lateAnnounces = null;
+  knownDeliveryRoutes = new Set();
   const sdkStop = proxySdkOwner?.stop();
   sdkStop?.catch(() => {});
   retireBrowserStartOwner().catch(() => {});
@@ -545,16 +609,8 @@ async function prefetchSecrets() {
     }
   }
 
-  const cognitoSecretId = process.env.COGNITO_PASSWORD_SECRET_ID;
-  if (cognitoSecretId) {
-    const resp = await smClient.send(
-      new GetSecretValueCommand({ SecretId: cognitoSecretId }),
-    );
-    if (resp.SecretString) {
-      COGNITO_PASSWORD_SECRET = resp.SecretString;
-      console.log("[contract] Cognito password secret pre-fetched");
-    }
-  }
+  // No Cognito password key is fetched: per-user passwords are generated and
+  // stored in Secrets Manager on first use (cognito-token.js).
 
   const telegramSecretId = process.env.TELEGRAM_CHANNEL_SECRET_ID;
   if (telegramSecretId) {
@@ -990,6 +1046,10 @@ function writeOpenClawConfig({ preserveSeedFiles = false } = {}) {
     // Also upload to S3 so the proxy's system prompt injection picks it up.
     // The proxy reads AGENTS.md from S3 (not local filesystem), so without
     // this sync the proxy would inject the stale 156-byte default template.
+    // Publish to "_system/<namespace>/AGENTS.md" at the bucket root
+    // (bridge/workspace-files-s3.js). That key is outside the user's
+    // namespace prefix, so the scoped-credential client cannot write it;
+    // this upload uses the contract server's execution-role client.
     const namespace = currentNamespace;
     const bucket = process.env.S3_USER_FILES_BUCKET;
     if (bucket && namespace) {
@@ -997,14 +1057,14 @@ function writeOpenClawConfig({ preserveSeedFiles = false } = {}) {
       const publish = (async () => {
         try {
           const { PutObjectCommand } = require("@aws-sdk/client-s3");
-          // Use the bound persistence client for the proxy's system prompt.
-          const s3 = workspaceSync.getS3Client();
-          await s3.send(new PutObjectCommand({
-            Bucket: bucket,
-            Key: `${namespace}/AGENTS.md`,
-            Body: agentsContent,
-            ContentType: "text/markdown",
-          }), { abortSignal: activationScope.signal });
+          await workspaceFilesS3.publishAgentsMd({
+            s3: executionRoleS3Client(),
+            commands: { PutObjectCommand },
+            bucket,
+            namespace,
+            content: agentsContent,
+            abortSignal: activationScope.signal,
+          });
           console.log(`[contract] AGENTS.md synced to S3 (${agentsContent.length} bytes)`);
         } catch (err) {
           console.warn(`[contract] Failed to sync AGENTS.md to S3: ${err.message}`);
@@ -1444,7 +1504,6 @@ async function setupGatewayBearer(actorId) {
   const provider = createCognitoTokenProvider({
     userPoolId: process.env.COGNITO_USER_POOL_ID || "",
     clientId: process.env.COGNITO_CLIENT_ID || "",
-    passwordSecret: COGNITO_PASSWORD_SECRET || "",
     region: process.env.AWS_REGION || "us-west-2",
     log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[contract] Cognito")),
   });
@@ -1577,7 +1636,9 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
         BEDROCK_FALLBACK_MODEL_ID: process.env.BEDROCK_FALLBACK_MODEL_ID || "",
         COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
         COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
-        COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
+        // No Cognito password key is forwarded: the proxy reads the bound
+        // user's own per-user password secret (cognito-token.js) with the
+        // execution role.
         S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
         SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
         SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
@@ -1608,7 +1669,6 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
             currentUserId !== userId || currentNamespace !== namespace ||
             process.env.USER_ID !== actorId || process.env.INTERNAL_USER_ID !== userId ||
             !secretsReady || !GATEWAY_TOKEN || credentialManager !== credentials ||
-            (COGNITO_PASSWORD_SECRET || "") !== proxyEnv.COGNITO_PASSWORD_SECRET ||
             !current.resources.includes("restore") || !current.resources.includes("credentials") ||
             (AGENTCORE_GATEWAY_URL && !gatewayBearer?.token) ||
             ["BEDROCK_MODEL_ID", "BEDROCK_FALLBACK_MODEL_ID", "COGNITO_USER_POOL_ID", "COGNITO_CLIENT_ID",
@@ -1714,11 +1774,22 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
       manifestFile: runtimeSkills.manifestPath(OPENCLAW_DIR), log: console, run: runRuntimeSkillInstall,
     });
     checkpoint();
+    if (skills.refused) {
+      // An operator-pinned allowlist refused one or more manifest entries:
+      // the slug is in the manifest but the deployment operator has not
+      // permitted it. Surface it in the cold-start logs.
+      for (const r of skills.results || []) {
+        if (r.status === "refused") {
+          console.warn("[contract] Runtime skill %s refused by operator allowlist and NOT reinstalled", r.slug);
+        }
+      }
+    }
     // Not a readiness gate: an entry that can never be restored would
-    // otherwise block this user's every session. Missing skills show up in
+    // otherwise block this user's every session. Entries that keep failing
+    // are quarantined by runtime-skills.js; missing skills show up in
     // clawhub-manage list.js.
-    if (skills.failed || skills.deferred || skills.corrupt || skills.invalid) {
-      console.warn(`[contract] Runtime skills partly restored: total=${skills.total} reinstalled=${skills.reinstalled} present=${skills.present} failed=${skills.failed} deferred=${skills.deferred} corrupt=${skills.corrupt} invalid=${skills.invalid}`);
+    if (skills.failed || skills.deferred || skills.quarantined || skills.corrupt || skills.invalid) {
+      console.warn(`[contract] Runtime skills partly restored: total=${skills.total || 0} reinstalled=${skills.reinstalled || 0} present=${skills.present || 0} failed=${skills.failed || 0} deferred=${skills.deferred || 0} quarantined=${skills.quarantined || 0} refused=${skills.refused || 0} corrupt=${skills.corrupt ? 1 : 0} invalid=${skills.invalid || 0}`);
     }
     activationScope.mark("skills");
     logActivationPhase("config_skills_ready");
@@ -2071,6 +2142,7 @@ function createTelegramStreamer(chatId) {
 function startLateAnnounceRelay() {
   lateAnnounces?.close();
   lateAnnounces = null;
+  knownDeliveryRoutes = new Set();
   try {
     let watcher = null;
     const relay = createLateAnnounceRelay({
@@ -2090,11 +2162,13 @@ function startLateAnnounceRelay() {
 }
 
 /**
- * Send a late announce to the chat of the session owner's latest turn.
- * Only Telegram for now (the token is already in-process); the route must
- * belong to the runtime's current user binding. Uses the streamer's send
- * path for a reply nobody else will deliver: plain text split under the
- * Telegram limit.
+ * Send a late announce to the chat of the TURN THAT SPAWNED the sub-agent
+ * (the route the relay captured when it first observed the sub-agent's
+ * session), not to the latest turn's chat. Only Telegram for now (the token
+ * is already in-process); the delivery triple (channel, channelActorId,
+ * channelTarget) must be one the current user binding has already used
+ * during this activation. Uses the streamer's send path for a reply nobody
+ * else will deliver: plain text split under the Telegram limit.
  */
 async function deliverLateAnnounce(text, route) {
   if (route.channel !== "telegram" || !route.channelActorId || !route.channelTarget || !TELEGRAM_BOT_TOKEN) {
@@ -2103,7 +2177,33 @@ async function deliverLateAnnounce(text, route) {
     return;
   }
   const binding = v2Lifecycle.snapshot().binding;
-  if (!binding || binding.actorId !== route.actorId) {
+  if (!binding) {
+    console.warn("[contract] Late sub-agent announce not delivered: no active user binding");
+    return;
+  }
+  // Ownership check on the full delivery triple (channel, channelActorId,
+  // channelTarget). The lifecycle binding only carries userId/actorId/
+  // runtimeSessionId/routingGeneration, so comparing route.actorId against
+  // binding.actorId is tautological under assertBinding and does not stop a
+  // sub-agent answer produced for a private chat from being posted into a
+  // group chat the same user spoke in afterwards (#148 CWE-359). Require
+  // that the destination triple be one this activation's turns have already
+  // validated against the user binding.
+  const tripleKey = routeTripleKey(route);
+  if (!tripleKey || !knownDeliveryRoutes.has(tripleKey)) {
+    console.warn(
+      "[contract] Late sub-agent announce not delivered: delivery triple not owned by the current binding (channel=%s, channelActorId=%s, channelTarget=%s)",
+      String(route.channel || "unknown"),
+      String(route.channelActorId || ""),
+      String(route.channelTarget || ""),
+    );
+    return;
+  }
+  // Backwards-compatible invariant: the lifecycle binding forces one actorId
+  // per activation, so an owned triple can never belong to a different user.
+  // Keep the comparison explicit (binding.actorId !== route.actorId) as a
+  // last-resort sanity check in case the binding is mutated unexpectedly.
+  if (binding.actorId !== route.actorId) {
     console.warn("[contract] Late sub-agent announce not delivered: route does not match the user binding");
     return;
   }
@@ -2277,12 +2377,40 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival,
       if (action === "warmup" && dispatchAllowed) return { status: "ready" };
       stream?.signal.throwIfAborted();
       stream?.ready(v2Lifecycle.snapshot());
+      // Authorize the per-turn delivery identity against the activated user
+      // before it reaches updateIdentityFile() or createTelegramStreamer().
+      // Shape checks above do not prove ownership; the request body is
+      // controlled by whichever process in the microVM is calling the
+      // unauthenticated contract server. channel-authz looks up the DynamoDB
+      // CHANNEL# record (same contract runtime_enrollment.py writes) and
+      // compares its userId against the activation binding.
+      const activeBinding = v2Lifecycle.snapshot().binding;
+      try {
+        await assertChannelOwnership(activeBinding, {
+          channel: turn.channel, channelActorId: turn.channelActorId, channelTarget: turn.channelTarget,
+        });
+      } catch (error) {
+        console.warn(`[contract] Rejected per-turn delivery identity: ${error.channelAuthzReason || error.message}`);
+        throw error;
+      }
       updateIdentityFile(turn.actorId, turn.channel, turn.channelActorId, turn.channelTarget,
         turn.modelOverride, { trigger: action, sessionId: turn.runtimeSessionId });
       lateTurn = lateAnnounces?.beginTurn({
         actorId: turn.actorId, channel: turn.channel,
         channelActorId: turn.channelActorId, channelTarget: turn.channelTarget,
       }) ?? null;
+      // Record this turn's full delivery triple as an owned route for the
+      // current binding. assertBinding has already run, so the triple is
+      // associated with the bound user. deliverLateAnnounce uses this set
+      // as the ownership check on channelTarget (#148 CWE-359 fix).
+      {
+        const ownedKey = routeTripleKey({
+          channel: turn.channel,
+          channelActorId: turn.channelActorId,
+          channelTarget: turn.channelTarget,
+        });
+        if (ownedKey) knownDeliveryRoutes.add(ownedKey);
+      }
       let streamer = null;
       if (action === "chat" && TELEGRAM_BOT_TOKEN && turn.channel === "telegram" &&
           turn.channelActorId && turn.channelTarget) {
@@ -2414,9 +2542,31 @@ async function handleCronAsync(payload, req, res) {
   };
   const { action, userId, actorId } = payload;
   if (!userId || !actorId) return reply({ error: "Missing userId or actorId" }, 400);
+  // Construct the binding context the same way handleV2Invocation does so
+  // cron_start / cron_status are authorized against the live user binding
+  // (userId + actorId + runtimeSessionId + routingGeneration), not just the
+  // self-asserted userId. This has to run before cronJobStore() is touched so
+  // a rejected caller cannot occupy or persist a jobId.
+  const runtimeSessionHeader = req.headers["x-amzn-bedrock-agentcore-runtime-session-id"];
+  if ((runtimeSessionHeader && payload.runtimeSessionId && runtimeSessionHeader !== payload.runtimeSessionId) ||
+      (payload.routingGeneration !== undefined &&
+        (!Number.isSafeInteger(payload.routingGeneration) || payload.routingGeneration < 0))) {
+    return reply({ error: "Invalid AgentCore Runtime session binding" }, 400);
+  }
+  const bindingContext = Object.freeze({
+    userId, actorId,
+    runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
+    routingGeneration: payload.routingGeneration ?? null,
+  });
+  try {
+    v2Lifecycle.assertBinding(bindingContext);
+    v2Lifecycle.checkpoint();
+  } catch {
+    return reply({ response: "This AgentCore Runtime cannot accept the requested user binding.", status: "error" });
+  }
   const store = cronJobStore();
   if (action === "cron_status") {
-    const status = store.status(payload.jobId, userId);
+    const status = store.status(payload.jobId, bindingContext);
     // The Lambda now has the brief; late announces may follow it.
     if (status.status === "done") releaseCronTurn(payload.jobId);
     return reply(status);
@@ -2425,8 +2575,20 @@ async function handleCronAsync(payload, req, res) {
   if (!parsed.ok) return reply({ error: parsed.error }, 400);
   if (!payload.message) return reply({ error: "Missing message" }, 400);
   const { jobId } = parsed;
-  const started = store.start(jobId, { userId, deadline: Date.now() + parsed.budgetMs });
+  const started = store.start(jobId, {
+    userId, actorId,
+    runtimeSessionId: bindingContext.runtimeSessionId,
+    deadline: Date.now() + parsed.budgetMs,
+  });
   if (started.duplicate) {
+    // Only the binding that first registered the job may collect the idempotent
+    // "accepted" reply. A duplicate jobId whose record belongs to a different
+    // binding (or a legacy record with no binding fields) is an error: it was
+    // never produced by an accepted turn of this caller.
+    if (!store.isOwnedBy(jobId, bindingContext)) {
+      console.warn("[contract] cron_start jobId %s is held by a different binding", jobId);
+      return reply({ error: "jobId is already in use" }, 409);
+    }
     console.warn("[contract] cron_start for a known job ignored (state %s)", started.job.state);
     return reply({ status: "accepted", jobId, duplicate: true, deadline: started.job.deadline });
   }
@@ -2503,14 +2665,36 @@ const server = http.createServer(async (req, res) => {
       try {
         const payload = body ? JSON.parse(body) : {};
         startupTiming.recordHttpHandler(handlerArrival, payload?.startupAttemptId);
-        const action = payload.action || "status";
+        const action = payload.action;
 
-        // Status check (no init needed)
+        // Status check — bound to the active user binding like every other action.
+        // No action defaulting: an action-less payload is not an authenticated
+        // caller for the diagnostic branch; verbose runtime detail stays in
+        // CloudWatch rather than in an invocation reply.
         if (action === "status") {
+          const runtimeSessionHeader = req.headers["x-amzn-bedrock-agentcore-runtime-session-id"];
+          const statusContext = Object.freeze({
+            userId: payload.userId,
+            actorId: payload.actorId,
+            runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
+            routingGeneration: payload.routingGeneration ?? null,
+          });
+          try {
+            v2Lifecycle.assertBinding(statusContext);
+            v2Lifecycle.checkpoint();
+          } catch {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              response: "This AgentCore Runtime cannot accept the requested user binding.",
+              status: "error",
+            }));
+            return;
+          }
           // Fetch proxy /health for request counters (non-blocking — null on failure)
           const proxyHealth = proxyReady ? await checkProxyHealth() : null;
-          // Status needs no binding, so it reports whether one exists but not
-          // the user binding itself, and leaves gateway log lines to CloudWatch.
+          // Even for the bound caller the reply reports only whether a binding
+          // exists, not the binding itself; the raw session id, currentUserId
+          // and gateway log lines stay in CloudWatch.
           const lifecycle = v2Lifecycle.snapshot();
 
           const diag = {

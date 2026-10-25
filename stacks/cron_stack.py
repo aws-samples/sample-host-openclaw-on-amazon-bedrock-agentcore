@@ -85,7 +85,14 @@ class CronStack(Stack):
             self,
             "CronSchedulerRole",
             role_name=scheduler_role_name,
-            assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"),
+            # Confused-deputy guard: scheduler.amazonaws.com may only assume
+            # this role on behalf of a schedule in this account.
+            assumed_by=iam.ServicePrincipal(
+                "scheduler.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": account},
+                },
+            ),
             description="Role assumed by EventBridge Scheduler to invoke the cron executor Lambda",
         )
 
@@ -95,7 +102,10 @@ class CronStack(Stack):
             "CronLogGroup",
             log_group_name=namer.name("/openclaw/lambda/cron"),
             retention=retention_days(log_retention),
-            removal_policy=RemovalPolicy.DESTROY,
+            # RETAIN so cron execution history survives stack delete/replace;
+            # matches the API access and VPC flow log groups. Operational
+            # retention (30 d) still applies.
+            removal_policy=RemovalPolicy.RETAIN,
         )
 
         # --- Cron Executor Lambda ---
@@ -175,7 +185,9 @@ class CronStack(Stack):
             self, "CronRunnerLogGroup",
             log_group_name=namer.name("/openclaw/states/cron-runner"),
             retention=retention_days(log_retention),
-            removal_policy=RemovalPolicy.DESTROY,
+            # RETAIN so cron-runner state machine history survives stack
+            # delete/replace. Operational retention (30 d) still applies.
+            removal_policy=RemovalPolicy.RETAIN,
         )
         self.cron_runner = sfn.StateMachine(
             self, "CronRunner",
@@ -194,6 +206,18 @@ class CronStack(Stack):
         # <scheduleId>-<fire time>, which makes a repeated fire a no-op).
         self.cron_fn.add_to_role_policy(
             iam.PolicyStatement(actions=["states:StartExecution"], resources=[state_machine_arn])
+        )
+        # On an "already exists" start, the Lambda reads that execution's input to
+        # confirm it belongs to the same schedule owner.
+        self.cron_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["states:DescribeExecution"],
+                resources=[Stack.of(self).format_arn(
+                    service="states", resource="execution",
+                    resource_name=f"{state_machine_name}:*",
+                    arn_format=ArnFormat.COLON_RESOURCE_NAME,
+                )],
+            )
         )
 
         # Grant scheduler role permission to invoke the Lambda (IAM policy)
@@ -240,18 +264,34 @@ class CronStack(Stack):
             )
         )
 
-        # Secrets Manager read (channel tokens)
-        self.cron_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "secretsmanager:GetSecretValue",
-                    "secretsmanager:DescribeSecret",
-                ],
-                resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
-                ],
+        # Secrets Manager read — scoped to the exact channel-token secrets
+        # the Cron Lambda delivers through. Names come in as constructor
+        # arguments and are already present as fixed env vars on the function.
+        # Must NOT include openclaw/cognito-password-secret, openclaw/gateway-token
+        # or openclaw/user/* — those would widen the blast radius of any defect
+        # inside this function.
+        cron_secret_names = [
+            telegram_token_secret_name,
+            slack_token_secret_name,
+            feishu_token_secret_name,
+            whatsapp_token_secret_name,
+            line_token_secret_name,
+        ]
+        cron_secret_resources = [
+            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+            for name in cron_secret_names
+            if name
+        ]
+        if cron_secret_resources:
+            self.cron_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "secretsmanager:GetSecretValue",
+                        "secretsmanager:DescribeSecret",
+                    ],
+                    resources=cron_secret_resources,
+                )
             )
-        )
 
         # KMS decrypt for secrets (and for the user-files bucket, which uses the same CMK)
         self.cron_fn.add_to_role_policy(
@@ -262,22 +302,21 @@ class CronStack(Stack):
         )
 
         # S3 read of brief audio (BRIEF_AUDIO marker -> Telegram sendAudio).
-        # Read-only and mp3-only. IAM can't scope this per user, so the Lambda
-        # checks that the key sits under the run's own namespace before reading.
+        # Read-only and mp3-only. IAM can't scope this per user from a shared
+        # Lambda role, so the Lambda checks that the key sits under the run's
+        # own namespace before reading (see _valid_audio_key in lambda/cron).
         self.cron_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["s3:GetObject"],
                 resources=[f"{user_files_bucket_arn}/*/*.mp3"],
             )
         )
-        # List the bucket to find a brief mp3 a run uploaded without a BRIEF_AUDIO
-        # line. Keys only; the Lambda lists just the run's own namespace prefix.
-        self.cron_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=["s3:ListBucket"],
-                resources=[user_files_bucket_arn],
-            )
-        )
+        # NOTE: bucket-wide s3:ListBucket was intentionally removed. The
+        # fallback discovery in find_run_audio_key() (listing a namespace to
+        # locate an mp3 uploaded without a BRIEF_AUDIO marker) will now return
+        # None gracefully; briefs that emit the BRIEF_AUDIO marker continue to
+        # work unchanged. This drops cross-tenant listing exposure flagged by
+        # the "least privilege violation" finding.
 
         # --- AgentCore Execution Role Additions ---
         # Allow the container to create/manage EventBridge schedules
@@ -357,13 +396,19 @@ class CronStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
-                    "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
-                    "index wildcard needed for query operations. S3 GetObject "
-                    "limited to */*.mp3 brief audio; the per-user namespace "
-                    "check is enforced in code.",
+                    "Secrets Manager resources are each a single secret with the "
+                    "mandatory '-*' Secrets Manager random suffix; the enumerated "
+                    "list covers only the channel-token secrets this Lambda reads. "
+                    "DynamoDB index wildcard needed for query operations. S3 "
+                    "GetObject limited to */*.mp3 brief audio; the per-user "
+                    "namespace check is enforced in code.",
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
+                        *[
+                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+                            for name in cron_secret_names
+                            if name
+                        ],
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/*.mp3",
                     ],

@@ -43,17 +43,25 @@ describe("scopeGuardrailToLatestUserTurn", () => {
     }
   });
 
-  it("leaves tool results and images alone, tags the text beside them", () => {
+  it("wraps image blocks and tags the text beside them, leaving tool results alone", () => {
     const msgs = [
       u("run it"),
       { role: "assistant", content: [{ toolUse: { toolUseId: "t1", name: "exec", input: {} } }] },
       { role: "user", content: [{ toolResult: { toolUseId: "t1", content: [{ text: "ok" }] } }, { text: "and then?" }, { image: { format: "png", source: {} } }] },
     ];
     const out = scopeGuardrailToLatestUserTurn(msgs);
-    assert.deepEqual(out[2].content[0], msgs[2].content[0]);
+    assert.deepEqual(out[2].content[0], msgs[2].content[0], "tool results are not wrappable in guardContent");
     assert.deepEqual(out[2].content[1], guarded("and then?"));
-    assert.deepEqual(out[2].content[2], msgs[2].content[2]);
+    assert.deepEqual(out[2].content[2], { guardContent: { image: msgs[2].content[2].image } });
     assert.deepEqual(out[0], msgs[0], "earlier user turn untouched");
+  });
+
+  it("wraps an image-only trailing user turn so uploads are assessed", () => {
+    const imageBlock = { image: { format: "jpeg", source: { bytes: new Uint8Array([1, 2, 3]) } } };
+    const msgs = [u("earlier"), a("ok"), { role: "user", content: [imageBlock] }];
+    const out = scopeGuardrailToLatestUserTurn(msgs);
+    assert.deepEqual(out[0], msgs[0], "earlier user turn untouched");
+    assert.deepEqual(out[2].content, [{ guardContent: { image: imageBlock.image } }]);
   });
 
   it("tags the latest earlier user text when the trailing turn is only tool results", () => {

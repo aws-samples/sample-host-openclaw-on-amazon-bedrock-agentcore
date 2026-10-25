@@ -6,6 +6,7 @@ channel (Telegram, Slack or Feishu).
 """
 
 import hashlib
+import html as _html
 import json
 import logging
 import os
@@ -13,11 +14,12 @@ import re
 import time
 import uuid
 from urllib import request as urllib_request
+from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from runtime_routing import admit_route, is_unknown_outcome, resolve_route
+from runtime_routing import RouteUnavailable, admit_route, is_unknown_outcome, resolve_route
 import whatsapp
 import line_channel
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
@@ -163,8 +165,31 @@ def _get_feishu_tenant_token():
 # DynamoDB session management (reuse pattern from router Lambda)
 # ---------------------------------------------------------------------------
 
+def _is_user_disabled(user_id):
+    """Operator kill switch: USER#<id>/PROFILE.accessStatus == DISABLED blocks routing.
+
+    Same rule as the router's copy: the legacy ``status`` attribute written by
+    earlier fork releases of manage-allowlist.sh is honoured too, and an
+    unreadable profile counts as disabled (fail closed).
+    """
+    try:
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
+    except Exception as e:
+        logger.error("User status read failed for %s: %s", user_id, e)
+        return True
+    return "DISABLED" in (profile.get("accessStatus"), profile.get("status"))
+
+
 def get_or_create_session(user_id):
-    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation."""
+    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation.
+
+    Honours the operator kill switch (``_is_user_disabled``) on every path that
+    resolves a scheduled route, before any AgentCore invocation.
+    """
+    if _is_user_disabled(user_id):
+        raise RouteUnavailable("User is administratively disabled")
     return resolve_route(identity_table, user_id)
 
 
@@ -521,12 +546,25 @@ def _markdown_to_telegram_html(text):
     text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
-    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection
+    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection.
+    # Reject any URL containing characters that could break out of the href attribute
+    # (quotes, angle brackets, whitespace, control/NUL — incl. placeholder markers), then
+    # validate the full scheme (not just a prefix) and HTML-escape for attribute context.
+    _LINK_URL_FORBIDDEN = re.compile(r'[\x00-\x20"\'<>]')
+    _LINK_ALLOWED_SCHEMES = {"http", "https", "tg", "mailto"}
+
     def _safe_link(m):
         link_text, link_url = m.group(1), m.group(2)
-        if re.match(r'^(https?://|tg://|mailto:)', link_url):
-            return f'<a href="{link_url}">{link_text}</a>'
-        return m.group(0)  # leave non-http links as plain text
+        if _LINK_URL_FORBIDDEN.search(link_url):
+            return m.group(0)  # unsafe characters — leave as plain text
+        try:
+            scheme = urlparse(link_url).scheme.lower()
+        except ValueError:
+            return m.group(0)
+        if scheme not in _LINK_ALLOWED_SCHEMES:
+            return m.group(0)  # leave non-allowlisted links as plain text
+        safe_url = _html.escape(link_url, quote=True)
+        return f'<a href="{safe_url}">{link_text}</a>'
 
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
     text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
@@ -663,13 +701,27 @@ def _send_telegram_chunks(chat_id, text, token, limit=TELEGRAM_CHUNK_UTF16_UNITS
     return delivered_all
 
 
+def _escape_slack_text(text):
+    """Neutralize Slack control characters per Slack's documented escaping rules.
+
+    Replaces ``&`` with ``&amp;``, ``<`` with ``&lt;``, and ``>`` with ``&gt;`` so
+    that attacker-influenced content (e.g. model output) cannot inject mrkdwn link
+    syntax (``<url|label>``) or broadcast/user mention tokens (``<!channel>``,
+    ``<!here>``, ``<@U...>``, ``<!subteam^ID>``) into chat.postMessage ``text``.
+    See https://api.slack.com/reference/surfaces/formatting#escaping.
+    """
+    if not isinstance(text, str):
+        return text
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def send_slack_message(channel_id, text, bot_token):
     """Send a message via Slack Web API."""
     if not bot_token:
         logger.error("No Slack bot token available")
         return
     url = "https://slack.com/api/chat.postMessage"
-    data = json.dumps({"channel": channel_id, "text": text}).encode()
+    data = json.dumps({"channel": channel_id, "text": _escape_slack_text(text)}).encode()
     req = urllib_request.Request(
         url,
         data=data,
@@ -996,7 +1048,13 @@ def handler(event, context):
     phase = event.get("cronPhase")
     if phase in ASYNC_PHASES:
         return run_async_phase(phase, event, context)
-    logger.info("Cron event received: %s", json.dumps(event)[:1000])
+    logger.info(
+        "Cron event received: schedule=%s user=%s channel=%s msg_len=%d",
+        event.get("scheduleId"),
+        event.get("userId"),
+        event.get("channel"),
+        len(event.get("message") or ""),
+    )
     if CRON_ASYNC_STATE_MACHINE_ARN:
         return launch_async(event)
 
@@ -1113,6 +1171,13 @@ def verify_cron_event(event):
     if record_actor and record_actor != actor_id:
         logger.error("Schedule %s input names a different channel identity than its record", schedule_id)
         return None, {"statusCode": 403, "body": "Channel identity verification failed"}
+    # A record of a bound channel stores the canonical actor beside the channel
+    # actor; an input that names a different canonical actor was changed
+    # outside the skill and the gateway tool.
+    if (cron_record.get("channelActorId") and cron_record.get("actorId")
+            and event.get("actorId") and event.get("actorId") != cron_record.get("actorId")):
+        logger.error("Schedule %s input names a different actor than its record", schedule_id)
+        return None, {"statusCode": 403, "body": "Channel identity verification failed"}
     bound = {}
     for field, value in (("channel", channel), ("channelTarget", channel_target), ("message", message),
                          ("scheduleName", schedule_name)):
@@ -1199,7 +1264,8 @@ def async_job_id(event, user_id, now=None):
     One fire of one schedule always maps to the same name, so a repeated
     invocation cannot start a second run (Step Functions rejects the name).
     <owner> is a digest of the verified userId, so schedules of different users
-    never share a name even when their scheduleIds match.
+    never share a name even when their scheduleIds match, and a caller that
+    chooses scheduledTime can only pick names in its own namespace.
     Schedules created by the eventbridge-cron skill pass the scheduled time;
     older schedules fall back to the invocation time rounded down to the minute.
     Step Functions allows 80 characters: 48 + 1 + 12 + 1 + 16 = 78.
@@ -1215,6 +1281,36 @@ def async_job_id(event, user_id, now=None):
     return f"{schedule}-{owner}-{stamp}"
 
 
+def _existing_execution_belongs_to(job, name):
+    """Best-effort ownership check for an ``ExecutionAlreadyExists`` collision.
+
+    The verified owner is already part of the execution name, so a collision
+    with another owner's run is improbable; this is defence in depth. Returns
+    True when the existing execution's input names the same owner and
+    schedule, False when it names a different one, and None when the check
+    cannot be performed (the name's owner digest is then trusted).
+    """
+    sm_arn = CRON_ASYNC_STATE_MACHINE_ARN
+    marker = ":stateMachine:"
+    if marker not in sm_arn:
+        return None
+    prefix, _, sm_name = sm_arn.partition(marker)
+    execution_arn = f"{prefix}:execution:{sm_name}:{name}"
+    try:
+        description = sfn_client.describe_execution(executionArn=execution_arn)
+    except ClientError as e:
+        logger.warning("describe_execution for %s failed: %s", name, e.response.get("Error", {}).get("Code"))
+        return None
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning("describe_execution for %s failed: %s", name, type(e).__name__)
+        return None
+    try:
+        existing = json.loads(description.get("input") or "{}")
+    except (TypeError, ValueError):
+        return False
+    return existing.get("userId") == job["userId"] and existing.get("scheduleId") == job["scheduleId"]
+
+
 def launch_async(event):
     """Scheduler entry with async cron on: verify, then start the state machine."""
     job, error = verify_cron_event(event)
@@ -1222,11 +1318,27 @@ def launch_async(event):
         return error
     name = async_job_id(event, job["userId"])
     state = {key: event[key] for key in ASYNC_EVENT_FIELDS if event.get(key) is not None}
+    # Carry the verified values (current owner, record-bound destination,
+    # message and name) rather than whatever the schedule's input claimed.
+    state.update({key: job[key] for key in ("userId", "channel", "channelTarget", "message", "scheduleName")
+                  if job.get(key) is not None})
     state.update({"cronPhase": "start", "jobId": name})
     try:
         sfn_client.start_execution(stateMachineArn=CRON_ASYNC_STATE_MACHINE_ARN, name=name, input=json.dumps(state))
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ExecutionAlreadyExists":
+            same_owner = _existing_execution_belongs_to(job, name)
+            if same_owner is False:
+                # Different owner holds this name: the owner hash in the name
+                # makes this cryptographically improbable, so if it ever fires
+                # it is a signal worth alarming on. Match the
+                # openclaw-scheduled-task-failures alarm pattern.
+                logger.error(
+                    "Scheduled task %s did not complete: execution name %s is held by a different owner",
+                    job["scheduleId"], name,
+                )
+                deliver_failure(job, "name_collision")
+                return {"statusCode": 409, "body": "Execution name collision"}
             logger.warning("Scheduled task %s already started for this fire time; not starting it again",
                            job["scheduleId"])
             return {"statusCode": 200, "body": "Already started"}

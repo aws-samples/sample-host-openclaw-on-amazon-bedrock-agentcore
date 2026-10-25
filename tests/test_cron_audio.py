@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.test_runtime_routing import FakeRuntime, cron_event, cron_table, load_lambda
+from tests.test_runtime_routing import USER, FakeRuntime, cron_event, cron_table, load_lambda
 from tests.test_runtime_routing_synth import run_app
 
 BUCKET = "test-user-files-bucket"
@@ -115,6 +115,9 @@ def run_brief(response, s3=None, telegram=None, bucket=BUCKET, message=None):
     with patch.object(module.urllib_request, "urlopen", telegram):
         event = cron_event()
         event["message"] = BRIEF_PROMPT if message is None else message
+        # The Lambda runs the message stored on the CRON# record and refuses a
+        # payload that differs from it, so the record carries the same text.
+        module.identity_table.items[(f"USER#{USER}", "CRON#schedule123")]["message"] = event["message"]
         result = module.handler(event, None)
     assert result["statusCode"] == 200
     return telegram, s3
@@ -382,12 +385,11 @@ def test_cron_role_reads_only_mp3_objects_in_the_user_files_bucket(tmp_path):
         if any(str(action).startswith("s3:") for action in
                (s["Action"] if isinstance(s["Action"], list) else [s["Action"]]))
     ]
-    assert len(s3_statements) == 2, s3_statements
-    (listing,) = [s for s in s3_statements if s["Action"] == "s3:ListBucket"]
-    assert listing["Effect"] == "Allow"
-    assert "UserFilesBucket" in json.dumps(listing["Resource"])
-    assert "/*" not in json.dumps(listing["Resource"])
-    (grant,) = [s for s in s3_statements if s["Action"] != "s3:ListBucket"]
+    # The role has no s3:ListBucket: a brief without a BRIEF_AUDIO line falls
+    # back to text only (see test_listing_failure_still_delivers_the_text).
+    assert len(s3_statements) == 1, s3_statements
+    assert not [s for s in s3_statements if "s3:ListBucket" in json.dumps(s["Action"])]
+    (grant,) = s3_statements
     assert grant["Effect"] == "Allow"
     assert grant["Action"] == "s3:GetObject"
     resource = json.dumps(grant["Resource"])

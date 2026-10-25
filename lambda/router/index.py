@@ -17,6 +17,7 @@ Path routing:
 import base64
 import hashlib
 import hmac
+import html as _html
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ import threading
 import time
 import uuid
 from urllib import request as urllib_request
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import boto3
 from botocore.config import Config
@@ -72,6 +73,13 @@ TELEGRAM_GROUPS_ENABLED = os.environ.get("TELEGRAM_GROUPS_ENABLED", "false").low
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 RUNTIME_TARGET = json.loads(os.environ.get("RUNTIME_TARGET", "null"))
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "")
+
+# Maximum accepted webhook body size (bytes). Matches the 1 MB cap enforced by
+# the WhatsApp/LINE/Discord verifiers (lambda/shared/python/*.py). Oversized
+# bodies are rejected with 413 before any parsing, base64 decoding or HMAC work
+# runs, so an unauthenticated client cannot force the 256 MB router Lambda to
+# materialise a multi-megabyte JSON document pre-signature.
+MAX_BODY_BYTES = 1_000_000
 
 
 def _load_user_selectable_models(raw):
@@ -445,6 +453,15 @@ def validate_feishu_webhook(headers, body_bytes):
         logger.warning("Feishu webhook missing signature headers")
         return False
 
+    # Reject requests older than 5 minutes to prevent replay attacks
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            logger.warning("Feishu webhook timestamp too old (replay attack prevention)")
+            return False
+    except (ValueError, TypeError):
+        logger.warning("Feishu webhook invalid timestamp: %s", timestamp)
+        return False
+
     body_b = body_bytes if isinstance(body_bytes, bytes) else body_bytes.encode("utf-8")
     content = f"{timestamp}{nonce}{encrypt_key}".encode() + body_b
     expected = hashlib.sha256(content).hexdigest()
@@ -606,25 +623,67 @@ def _aes_cbc_decrypt(key, iv, data):
 # DynamoDB identity helpers
 # ---------------------------------------------------------------------------
 
+def _allow_record_exists(channel_key):
+    """Return True iff ALLOW#<channel_key> currently exists (consistent read).
+
+    Uses a consistent read so that an operator revocation via
+    scripts/manage-allowlist.sh is observed on the very next turn.
+    """
+    try:
+        resp = identity_table.get_item(
+            Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"}, ConsistentRead=True,
+        )
+    except ClientError as e:
+        # Fail closed on allowlist read errors so revocation is never silently
+        # bypassed by a transient DynamoDB fault.
+        logger.error("Allowlist check failed for %s: %s", channel_key, e)
+        return False
+    return "Item" in resp
+
+
 def is_user_allowed(channel, channel_user_id):
-    """Check if a new user is permitted to register.
+    """Check if the given channel identity is currently permitted.
 
     Returns True if:
-    - REGISTRATION_OPEN is true (anyone can register), OR
-    - An ALLOW#{channel}:{channel_user_id} record exists in DynamoDB
+    - REGISTRATION_OPEN is true (anyone may use the bot), OR
+    - An ALLOW#{channel}:{channel_user_id} record exists in DynamoDB.
 
-    This is only called for NEW users (no existing CHANNEL# record).
-    Existing users and bind-code redemptions bypass this check.
+    This is now consulted on *every* turn by ``resolve_user`` (not only on
+    first enrollment) so that removing a user from the allowlist actually
+    revokes their access.
+    """
+    if REGISTRATION_OPEN:
+        return True
+    return _allow_record_exists(f"{channel}:{channel_user_id}")
+
+
+def _is_currently_authorized(channel, channel_user_id, user_id):
+    """Re-evaluate per-turn authorization for an already-enrolled identity.
+
+    An enrolled identity remains authorized only while REGISTRATION_OPEN is
+    on, an ALLOW# record exists for its own channel key, OR — for linked
+    secondary channels — an ALLOW# record exists for the owning user's
+    original enrollment actor. Fails closed on missing / unreadable records
+    so operator revocation via scripts/manage-allowlist.sh takes effect on
+    the next webhook turn.
     """
     if REGISTRATION_OPEN:
         return True
     channel_key = f"{channel}:{channel_user_id}"
+    if _allow_record_exists(channel_key):
+        return True
+    # Linked secondary channel: honour the primary enrollment actor's ALLOW#.
     try:
-        resp = identity_table.get_item(Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"})
-        if "Item" in resp:
-            return True
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
     except ClientError as e:
-        logger.error("Allowlist check failed: %s", e)
+        logger.error("Authorization profile read failed for %s: %s", user_id, e)
+        return False
+    enrollment_actor = profile.get("enrollmentActorId")
+    if isinstance(enrollment_actor, str) and enrollment_actor and enrollment_actor != channel_key:
+        if _allow_record_exists(enrollment_actor):
+            return True
     return False
 
 
@@ -634,17 +693,29 @@ ACCESS_DISABLED = "DISABLED"
 
 
 def _is_user_disabled(user_id):
-    profile = identity_table.get_item(
-        Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
-    ).get("Item") or {}
-    return profile.get("accessStatus") == ACCESS_DISABLED
+    """Operator kill switch: USER#<id>/PROFILE.accessStatus == DISABLED blocks routing.
+
+    The legacy ``status`` attribute written by earlier fork releases of
+    manage-allowlist.sh is honoured too. An unreadable profile counts as
+    disabled (fail closed).
+    """
+    try:
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
+    except ClientError as e:
+        logger.error("User status read failed for %s: %s", user_id, e)
+        return True
+    return ACCESS_DISABLED in (profile.get("accessStatus"), profile.get("status"))
 
 
 def resolve_user(channel, channel_user_id, display_name=""):
     """Look up or create a user for the given channel identity.
 
-    Returns (user_id, is_new). Returns (None, False) if user is not allowed,
-    including an enrolled user an operator has disabled.
+    Returns (user_id, is_new). Returns (None, False) if the identity is not
+    currently authorized: it was never enrolled and is not on the allowlist,
+    its ALLOW# record has since been removed, or an operator has disabled the
+    owning user.
     """
     channel_key = f"{channel}:{channel_user_id}"
     pk = f"CHANNEL#{channel_key}"
@@ -653,13 +724,24 @@ def resolve_user(channel, channel_user_id, display_name=""):
     try:
         resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"}, ConsistentRead=True)
         if "Item" in resp:
+            existing_user_id = resp["Item"]["userId"]
             owner = read_actor_owner(identity_table, channel_key)
-            if owner and owner["userId"] != resp["Item"]["userId"]:
+            if owner and owner["userId"] != existing_user_id:
                 raise RouteUnavailable("Channel mapping conflicts with durable actor ownership")
-            if _is_user_disabled(resp["Item"]["userId"]):
+            # Re-evaluate authorization on every turn so that an operator
+            # removing the ALLOW# record (the documented revocation step)
+            # actually revokes service, instead of only blocking first-time
+            # enrollment. See docs/security.md "Revoking access".
+            if not _is_currently_authorized(channel, channel_user_id, existing_user_id):
+                logger.warning(
+                    "Enrolled identity %s is no longer on the allowlist; rejecting turn",
+                    channel_key,
+                )
+                return None, False
+            if _is_user_disabled(existing_user_id):
                 logger.warning("User for %s is disabled; rejecting turn", channel_key)
                 return None, False
-            return resp["Item"]["userId"], False
+            return existing_user_id, False
     except ClientError as e:
         logger.error("DynamoDB get_item failed: %s", e)
         raise
@@ -678,7 +760,14 @@ def resolve_user(channel, channel_user_id, display_name=""):
 
 
 def get_or_create_session(user_id):
-    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation."""
+    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation.
+
+    Also honours the operator kill switch (``_is_user_disabled``): a disabled
+    user is refused before any AgentCore invocation on every path that
+    resolves a route, not only on the webhook entry points.
+    """
+    if _is_user_disabled(user_id):
+        raise RouteUnavailable("User is administratively disabled")
     return resolve_route(identity_table, user_id)
 
 
@@ -700,16 +789,69 @@ def _generate_bind_code():
     return base64.b32encode(secrets.token_bytes(BIND_CODE_BYTES)).decode("ascii")
 
 
+def _invalidate_previous_bind_code(user_id):
+    """Best-effort: delete any outstanding BIND code previously issued to user.
+
+    Caps outstanding bind codes per user to one by resolving a per-user pointer
+    item (``USER#<id> / BIND_POINTER``) that records the most recently issued
+    code and deleting the matching ``BIND#<code>`` item. Any failure here is
+    non-fatal: the new code will be written regardless and the stale code will
+    expire via its own TTL.
+    """
+    pointer_key = {"PK": f"USER#{user_id}", "SK": "BIND_POINTER"}
+    try:
+        resp = identity_table.get_item(Key=pointer_key, ConsistentRead=True)
+    except ClientError as e:
+        logger.warning("create_bind_code: pointer lookup failed for %s: %s", user_id, e)
+        return
+    prev = (resp.get("Item") or {}).get("code")
+    if not prev:
+        return
+    try:
+        identity_table.delete_item(
+            Key={"PK": f"BIND#{prev}", "SK": "BIND"},
+            ConditionExpression="userId = :user",
+            ExpressionAttributeValues={":user": user_id},
+        )
+    except ClientError as e:
+        # ConditionalCheckFailed just means the code was already redeemed or
+        # expired/evicted; nothing to clean up.
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            logger.warning("create_bind_code: stale code delete failed for %s: %s", user_id, e)
+
+
 def create_bind_code(user_id):
-    """Generate a bind code and store it in DynamoDB with TTL."""
+    """Generate a bind code and store it in DynamoDB with TTL.
+
+    Any previous outstanding bind code issued to the same user is invalidated
+    first, so at most one code is live per user at a time.
+    """
     try:
         route = _binding_route(user_id)
     except RouteUnavailable:
         return None
+    # Cap outstanding codes per user to one: delete any prior live code first.
+    _invalidate_previous_bind_code(user_id)
     code = _generate_bind_code()
     ttl = int(time.time()) + BIND_CODE_TTL_SECONDS
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    # Record the pointer before the code so the next request can invalidate
+    # this one. A pointer to a code whose write then fails is harmless: its
+    # conditional delete finds nothing.
+    try:
+        identity_table.put_item(
+            Item={
+                "PK": f"USER#{user_id}",
+                "SK": "BIND_POINTER",
+                "userId": user_id,
+                "code": code,
+                "createdAt": now_iso,
+                "ttl": ttl,
+            },
+        )
+    except ClientError as e:
+        logger.warning("create_bind_code: pointer write failed for %s: %s", user_id, e)
     identity_table.put_item(
         Item={
             "PK": f"BIND#{code}",
@@ -769,6 +911,19 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
                 or item.get("sessionId") != route.session_id):
             return None, False
         link_actor(IDENTITY_TABLE_NAME, identity_client, channel_key, user_id, current, owner, code, display_name, route)
+
+        # Clear the per-user BIND_POINTER so the user is immediately eligible
+        # to request a fresh code. The underlying BIND# item is deleted inside
+        # link_actor's transact_write_items; the pointer is best-effort state.
+        try:
+            identity_table.delete_item(
+                Key={"PK": f"USER#{user_id}", "SK": "BIND_POINTER"},
+                ConditionExpression="code = :code",
+                ExpressionAttributeValues={":code": code},
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                logger.warning("redeem_bind_code: pointer cleanup failed for %s: %s", user_id, e)
 
         logger.info("Bind code %s redeemed: %s -> %s", code, channel_key, user_id)
         return user_id, True
@@ -1081,12 +1236,25 @@ def _markdown_to_telegram_html(text):
     # Strikethrough: ~~text~~
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
-    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection
+    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection.
+    # Reject any URL containing characters that could break out of the href attribute
+    # (quotes, angle brackets, whitespace, control/NUL — incl. placeholder markers), then
+    # validate the full scheme (not just a prefix) and HTML-escape for attribute context.
+    _LINK_URL_FORBIDDEN = re.compile(r'[\x00-\x20"\'<>]')
+    _LINK_ALLOWED_SCHEMES = {"http", "https", "tg", "mailto"}
+
     def _safe_link(m):
         link_text, link_url = m.group(1), m.group(2)
-        if re.match(r'^(https?://|tg://|mailto:)', link_url):
-            return f'<a href="{link_url}">{link_text}</a>'
-        return m.group(0)  # leave non-http links as plain text
+        if _LINK_URL_FORBIDDEN.search(link_url):
+            return m.group(0)  # unsafe characters — leave as plain text
+        try:
+            scheme = urlparse(link_url).scheme.lower()
+        except ValueError:
+            return m.group(0)
+        if scheme not in _LINK_ALLOWED_SCHEMES:
+            return m.group(0)  # leave non-allowlisted links as plain text
+        safe_url = _html.escape(link_url, quote=True)
+        return f'<a href="{safe_url}">{link_text}</a>'
 
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
 
@@ -1286,6 +1454,20 @@ def _periodic_typing(chat_id, token, stop_event, interval=4, notify_after_s=30, 
             notified = True
 
 
+def _escape_slack_text(text):
+    """Neutralize Slack control characters per Slack's documented escaping rules.
+
+    Replaces ``&`` with ``&amp;``, ``<`` with ``&lt;``, and ``>`` with ``&gt;`` so
+    that attacker-influenced content (e.g. model output) cannot inject mrkdwn link
+    syntax (``<url|label>``) or broadcast/user mention tokens (``<!channel>``,
+    ``<!here>``, ``<@U...>``, ``<!subteam^ID>``) into chat.postMessage ``text``.
+    See https://api.slack.com/reference/surfaces/formatting#escaping.
+    """
+    if not isinstance(text, str):
+        return text
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def send_slack_message(channel_id, text, bot_token):
     """Send a message via Slack Web API."""
     if not bot_token:
@@ -1294,7 +1476,7 @@ def send_slack_message(channel_id, text, bot_token):
     url = "https://slack.com/api/chat.postMessage"
     data = json.dumps({
         "channel": channel_id,
-        "text": text,
+        "text": _escape_slack_text(text),
     }).encode()
     req = urllib_request.Request(
         url,
@@ -1645,17 +1827,26 @@ def _download_telegram_image(message, token):
             logger.warning("Telegram getFile returned no file_path for file_id=%s", file_id)
             return None, None, None
 
-        # Check file size before downloading (Telegram includes it)
-        file_size = data.get("result", {}).get("file_size", 0)
+        # Check file size before downloading (Telegram includes it).
+        # Treat a missing file_size as a rejection rather than defaulting to 0,
+        # so we never trust "size absent" as "size zero".
+        file_size = data.get("result", {}).get("file_size")
+        if not isinstance(file_size, int) or file_size <= 0:
+            logger.warning("Telegram file missing or invalid file_size; rejecting")
+            return None, None, None
         if file_size > MAX_IMAGE_BYTES:
             logger.warning("Telegram file too large: %d bytes", file_size)
             return None, None, None
 
-        # Download the file
+        # Download the file. Bound the transfer itself in addition to the
+        # declared size, matching the sibling helpers (document/WhatsApp/LINE/Feishu).
         download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
         req = urllib_request.Request(download_url)
         resp = urllib_request.urlopen(req, timeout=15)
-        image_bytes = resp.read()
+        image_bytes = resp.read(MAX_IMAGE_BYTES + 1)
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            logger.warning("Telegram image exceeded %d bytes during download", MAX_IMAGE_BYTES)
+            return None, None, None
 
         filename = file_path.split("/")[-1] if "/" in file_path else file_path
         return image_bytes, content_type, filename
@@ -1673,7 +1864,12 @@ def _download_slack_file(file_info, bot_token):
     if mimetype not in ALLOWED_IMAGE_TYPES:
         return None, None, None
 
-    file_size = file_info.get("size", 0)
+    # Treat a missing size as a rejection rather than defaulting to 0; Slack
+    # omits `size` on some file objects and we must not trust that as "empty".
+    file_size = file_info.get("size")
+    if not isinstance(file_size, int) or file_size <= 0:
+        logger.warning("Slack file missing or invalid size; rejecting")
+        return None, None, None
     if file_size > MAX_IMAGE_BYTES:
         logger.warning("Slack file too large: %d bytes", file_size)
         return None, None, None
@@ -1689,7 +1885,12 @@ def _download_slack_file(file_info, bot_token):
             headers={"Authorization": f"Bearer {bot_token}"},
         )
         resp = urllib_request.urlopen(req, timeout=15)
-        image_bytes = resp.read()
+        # Bound the transfer itself so an understated or absent declared size
+        # cannot cause an unbounded read into Lambda memory.
+        image_bytes = resp.read(MAX_IMAGE_BYTES + 1)
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            logger.warning("Slack image exceeded %d bytes during download", MAX_IMAGE_BYTES)
+            return None, None, None
         filename = file_info.get("name", "image")
         return image_bytes, mimetype, filename
     except Exception as e:
@@ -2117,7 +2318,7 @@ def handle_telegram(body):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
     response_text = _extract_text_from_content_blocks(response_text)
-    logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
+    logger.info("Telegram response ready (len=%d, streamed=%s)", len(response_text), bool(result.get("streamed")))
 
     # If contract already streamed progressively to Telegram, skip duplicate send
     if result.get("streamed"):
@@ -2507,6 +2708,25 @@ def handle_slack(body, headers=None):
     return {"statusCode": 200, "body": "ok"}
 
 
+FEISHU_DEDUP_TTL_SECONDS = 86400
+
+
+def _claim_feishu_event(event_id):
+    """Record a Feishu header.event_id so a replayed/retried delivery runs once. False = duplicate."""
+    try:
+        identity_table.put_item(
+            Item={"PK": f"DEDUP#feishu:{event_id}", "SK": "DEDUP",
+                  "ttl": int(time.time()) + FEISHU_DEDUP_TTL_SECONDS},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("Feishu dedupe write failed: %s", type(e).__name__)
+        return True
+
+
 def handle_feishu(body, headers=None):
     """Process a Feishu Events API webhook.
 
@@ -2542,6 +2762,13 @@ def handle_feishu(body, headers=None):
     header = event_data.get("header", {})
     event = event_data.get("event", {})
     event_type = header.get("event_type", "")
+
+    # Idempotency: claim header.event_id so replays/retries run at most once
+    event_id = header.get("event_id", "")
+    if event_id:
+        if not _claim_feishu_event(event_id):
+            logger.info("Feishu: duplicate event ignored")
+            return {"statusCode": 200, "body": "ok"}
 
     if event_type != "im.message.receive_v1":
         logger.info("Feishu: ignoring event type: %s", event_type)
@@ -3089,18 +3316,28 @@ def handler(event, context):
         body = event.get("_body")
         headers = event.get("_headers", {})
 
-        if channel == "telegram":
-            handle_telegram(body)
-        elif channel == "slack":
-            handle_slack(body, headers)
-        elif channel == "feishu":
-            handle_feishu(body, headers)
-        elif channel == "whatsapp":
-            handle_whatsapp(body)
-        elif channel == "discord":
-            handle_discord(body)
-        elif channel == "line":
-            handle_line(body)
+        # Wrap the per-channel dispatch so that an unexpected formatting or
+        # delivery failure does not fail the asynchronous invocation. If the
+        # Lambda handler raises, Lambda's async retry policy would re-invoke
+        # the event (default 2 retries) and re-run the paid AgentCore turn,
+        # so we log and return 200 instead. retry_attempts=0 and a DLQ are
+        # also configured on the Router Lambda in stacks/router_stack.py as
+        # defense in depth.
+        try:
+            if channel == "telegram":
+                handle_telegram(body)
+            elif channel == "slack":
+                handle_slack(body, headers)
+            elif channel == "feishu":
+                handle_feishu(body, headers)
+            elif channel == "whatsapp":
+                handle_whatsapp(body)
+            elif channel == "discord":
+                handle_discord(body)
+            elif channel == "line":
+                handle_line(body)
+        except Exception:
+            logger.exception("Async dispatch failed for channel=%s", channel)
         return {"statusCode": 200, "body": "ok"}
 
     # --- Function URL entry point ---
@@ -3122,12 +3359,32 @@ def handler(event, context):
     if method != "POST":
         return {"statusCode": 405, "body": "Method not allowed"}
 
+    headers = event.get("headers", {})
+
+    # Reject oversized payloads before any parsing, base64 decoding or HMAC
+    # work. Check Content-Length first so a declared-huge base64 body is
+    # refused without allocating the decoded copy; then re-check the resolved
+    # body length because Content-Length is attacker-controlled.
+    content_length_header = (
+        headers.get("content-length")
+        or headers.get("Content-Length")
+        or ""
+    )
+    if content_length_header:
+        try:
+            if int(content_length_header) > MAX_BODY_BYTES:
+                return {"statusCode": 413, "body": "Payload too large"}
+        except (TypeError, ValueError):
+            pass
+
     body = event.get("body", "")
+    if isinstance(body, str) and len(body) > MAX_BODY_BYTES:
+        return {"statusCode": 413, "body": "Payload too large"}
     if event.get("isBase64Encoded"):
         import base64
         body = base64.b64decode(body).decode("utf-8")
-
-    headers = event.get("headers", {})
+    if isinstance(body, (bytes, str)) and len(body) > MAX_BODY_BYTES:
+        return {"statusCode": 413, "body": "Payload too large"}
 
     # Determine channel from path
     if path.endswith("/webhook/telegram"):
@@ -3141,14 +3398,19 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     elif path.endswith("/webhook/slack"):
-        # Slack url_verification — only allowed during initial setup
+        # Validate Slack request signature BEFORE dispatching on the body.
+        # Slack signs url_verification requests too, so verifying first does
+        # not break the Request URL setup handshake and prevents an
+        # unauthenticated caller from echoing an attacker-chosen challenge.
+        if not validate_slack_webhook(headers, body):
+            logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+
+        # Slack url_verification — respond synchronously after signature check
         try:
             event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
-                if os.environ.get("SLACK_VERIFIED") == "true":
-                    logger.warning("Slack url_verification rejected — already verified")
-                    return {"statusCode": 403, "body": "Already verified"}
-                # Validate challenge format before echoing (prevent injection)
+            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
+                # Validate challenge format before echoing (defense in depth)
                 challenge = str(event_data.get("challenge", ""))
                 if not re.match(r'^[a-zA-Z0-9_\-\.]{1,100}$', challenge):
                     return {"statusCode": 400, "body": "Invalid challenge format"}
@@ -3160,11 +3422,6 @@ def handler(event, context):
         except (json.JSONDecodeError, TypeError):
             pass
 
-        # Validate Slack request signature before processing
-        if not validate_slack_webhook(headers, body):
-            logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
-
         # Ignore Slack retries
         if headers.get("x-slack-retry-num"):
             return {"statusCode": 200, "body": "ok"}
@@ -3174,10 +3431,23 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     elif path.endswith("/webhook/feishu"):
-        # Feishu URL verification challenge — must respond synchronously
+        # Validate Feishu signature BEFORE dispatching on the body. Once an
+        # Encrypt Key is configured, Feishu signs every event (including
+        # url_verification) and delivers url_verification encrypted inside an
+        # {"encrypt": "..."} envelope that is handled downstream in
+        # handle_feishu after decryption, so verifying first does not break
+        # a genuine setup flow.
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        if not validate_feishu_webhook(headers, body_bytes):
+            logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+
+        # Plaintext url_verification (only reachable with a valid signature);
+        # respond synchronously. Encrypted url_verification bodies are
+        # handled inside handle_feishu after decryption.
         try:
             event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
+            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
                 challenge = str(event_data.get("challenge", ""))
                 if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
                     return {"statusCode": 400, "body": "Invalid challenge format"}
@@ -3188,12 +3458,6 @@ def handler(event, context):
                 }
         except (json.JSONDecodeError, TypeError):
             pass
-
-        # Validate Feishu signature
-        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
-        if not validate_feishu_webhook(headers, body_bytes):
-            logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
 
         # Self-invoke async for actual processing
         _self_invoke_async("feishu", body, headers)

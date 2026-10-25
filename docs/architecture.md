@@ -264,12 +264,13 @@ V2 uses the ports, proxy and OpenClaw `2026.9.5` shown below, with the readiness
   USER_ID env var set by contract server (e.g. "telegram:123456789")
          |
          v
-  derivePassword(actorId) = HMAC-SHA256(secret, actorId).slice(0, 32)
+  Cognito AdminGetUser (check if exists)
          |
-         +-- Cognito AdminGetUser (check if exists)
-         |      |
-         |      +-- Not found: AdminCreateUser + AdminSetUserPassword
-         |      +-- Found: continue
+         +-- Not found: claim a random password in Secrets Manager
+         |      (openclaw/cognito-user/<poolId>/<namespace>), then
+         |      AdminCreateUser + AdminSetUserPassword
+         +-- Found, secret stored: use the stored password
+         +-- Found, no secret (older user): claim one, AdminSetUserPassword
          |
          v
   AdminInitiateAuth (ADMIN_USER_PASSWORD_AUTH)

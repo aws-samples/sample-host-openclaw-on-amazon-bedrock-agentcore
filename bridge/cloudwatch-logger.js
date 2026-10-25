@@ -11,11 +11,35 @@ const {
   CreateLogGroupCommand,
   CreateLogStreamCommand,
   PutLogEventsCommand,
+  PutRetentionPolicyCommand,
 } = require("@aws-sdk/client-cloudwatch-logs");
 
 const LOG_GROUP = "/openclaw/container";
 const FLUSH_INTERVAL_MS = 5000;
 const MAX_BATCH_SIZE = 100;
+// Keep per-user container stream data from accumulating forever. This matches
+// the `cloudwatch_log_retention_days` CDK context key (default 30), and is a
+// defense-in-depth fallback: the CDK EnsureContainerLogGroup custom resource
+// is the authoritative place where retention is set on this group.
+const LOG_RETENTION_DAYS = Number.parseInt(process.env.OPENCLAW_LOG_RETENTION_DAYS || "", 10) || 30;
+
+async function applyRetention(cwClient, options = {}) {
+  // Best-effort: never fail logger initialization because retention could not
+  // be applied here. The CDK side (stacks/health_alarms.py) owns this policy.
+  if (!PutRetentionPolicyCommand || !cwClient) return;
+  try {
+    await cwClient.send(
+      new PutRetentionPolicyCommand({
+        logGroupName: LOG_GROUP,
+        retentionInDays: LOG_RETENTION_DAYS,
+      }),
+      options
+    );
+  } catch {
+    // Non-fatal — the group may be owned by CDK which already sets retention,
+    // or the task role may lack logs:PutRetentionPolicy on this group.
+  }
+}
 
 let client = null;
 let logStreamName = null;
@@ -45,6 +69,8 @@ async function init(streamName) {
       // Non-fatal — group may already exist from a previous session
     }
   }
+  // Apply retention policy so per-user streams expire. Non-fatal.
+  await applyRetention(client);
 
   // Create log stream (ignore if already exists)
   try {
@@ -278,6 +304,10 @@ function startOwned(streamName, { binding, generation, signal } = {}) {
         // Preserve the original non-fatal group-error behavior.
       }
     }
+    if (retired) return false;
+    // Apply retention policy on the shared container group so per-user streams
+    // expire. Non-fatal and bounded by the init abort signal.
+    await applyRetention(ownerClient, { abortSignal: initController.signal });
     if (retired) return false;
     try {
       await ownerClient.send(new CreateLogStreamCommand({

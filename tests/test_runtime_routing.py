@@ -361,11 +361,43 @@ def test_router_identity_lookup_failure_cannot_replace_canonical_user():
     assert not module.identity_table.items
 
 
+def allow_record(actor=ACTOR):
+    return {"PK": f"ALLOW#{actor}", "SK": "ALLOW", "channelKey": actor}
+
+
 def test_router_keeps_old_random_user_id():
     module = load_lambda("router")
     module.identity_table = FakeTable({"PK": f"CHANNEL#{ACTOR}", "SK": "PROFILE", "userId": USER})
+    module.identity_table.items[(f"ALLOW#{ACTOR}", "ALLOW")] = allow_record()
     assert module.resolve_user("telegram", "123") == (USER, False)
     assert module.identity_table.calls[0][1]["ConsistentRead"] is True
+
+
+def test_router_denies_an_enrolled_identity_whose_allow_record_was_removed():
+    module = load_lambda("router")
+    module.identity_table = FakeTable({"PK": f"CHANNEL#{ACTOR}", "SK": "PROFILE", "userId": USER})
+    assert module.resolve_user("telegram", "123") == (None, False)
+    module.identity_table.items[(f"ALLOW#{ACTOR}", "ALLOW")] = allow_record()
+    assert module.resolve_user("telegram", "123") == (USER, False)
+
+
+def test_router_linked_channel_is_allowed_through_the_owner_enrollment_actor():
+    module = load_lambda("router")
+    linked = "slack:U456"
+    module.identity_table = FakeTable({"PK": f"CHANNEL#{linked}", "SK": "PROFILE", "userId": USER})
+    module.identity_table.items[(f"USER#{USER}", "PROFILE")] = {
+        "PK": f"USER#{USER}", "SK": "PROFILE", "enrollmentActorId": ACTOR,
+    }
+    assert module.resolve_user("slack", "U456") == (None, False)
+    module.identity_table.items[(f"ALLOW#{ACTOR}", "ALLOW")] = allow_record()
+    assert module.resolve_user("slack", "U456") == (USER, False)
+
+
+def test_router_open_registration_skips_the_allow_record_check():
+    module = load_lambda("router")
+    module.REGISTRATION_OPEN = True
+    module.identity_table = FakeTable({"PK": f"CHANNEL#{ACTOR}", "SK": "PROFILE", "userId": USER})
+    assert module.resolve_user("telegram", "123") == (USER, False)
 
 
 def cron_event():
@@ -382,7 +414,11 @@ def cron_table():
     }
     table.items[(f"USER#{USER}", "CRON#schedule123")] = {
         "PK": f"USER#{USER}", "SK": "CRON#schedule123",
+        "channel": "telegram", "channelTarget": "123",
+        "channelActorId": ACTOR, "actorId": ACTOR,
+        "message": "hi",
     }
+    table.items[(f"ALLOW#{ACTOR}", "ALLOW")] = allow_record()
     return table
 
 

@@ -9,6 +9,7 @@ const {
   SCHEDULE_GROUP,
   CRON_LAMBDA_ARN,
   EVENTBRIDGE_ROLE_ARN,
+  MAX_SCHEDULES_PER_USER,
   validateUserId,
   validateEnv,
   validateExpression,
@@ -17,6 +18,7 @@ const {
   buildScheduleName,
   resolveScheduleDelivery,
   saveCronRecord,
+  listCronRecords,
 } = require("./common");
 
 async function main() {
@@ -62,6 +64,23 @@ async function main() {
   // Telegram/Slack account has multiple internal userIds (session rotation history).
   const realUserId = process.env.INTERNAL_USER_ID || null;
 
+  // Per-caller schedule quota. CWE-770: cap how many CRON# records this user
+  // may own at once so a single actor cannot allocate an unbounded number of
+  // every-minute agent turns. Mirrors the gateway MCP target.
+  try {
+    const existing = await listCronRecords(realUserId || userId);
+    if (Array.isArray(existing) && existing.length >= MAX_SCHEDULES_PER_USER) {
+      console.error(
+        `Error: Schedule quota exceeded: this user already owns ${existing.length} schedules ` +
+        `(max ${MAX_SCHEDULES_PER_USER}). Delete an existing schedule before creating another.`,
+      );
+      process.exit(1);
+    }
+  } catch (err) {
+    console.error(`Error checking existing schedules: ${err.message}`);
+    process.exit(1);
+  }
+
   // Build target input with real userId if found
   const lambdaInput = JSON.stringify({
     userId: realUserId || userId,
@@ -105,6 +124,11 @@ async function main() {
     await saveCronRecord(realUserId || userId, {
       scheduleId,
       scheduleName: scheduleName || `Schedule ${scheduleId}`,
+      // Persist the exact EventBridge name created here so update/delete
+      // bind to this object instead of recomputing a name from the user
+      // namespace at call time (preventing name-collision cross-tenant
+      // addressing if the derivation ever changes).
+      ebName: ebScheduleName,
       expression,
       timezone,
       message,

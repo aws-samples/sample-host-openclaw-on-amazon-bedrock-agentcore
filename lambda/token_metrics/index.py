@@ -483,11 +483,17 @@ def handler(event, context):
             if not message:
                 continue
 
-            # Parse the JSON log entry
+            # Parse the JSON log entry. On failure, log only metadata about the
+            # entry (size and error type) — never the message content, which may
+            # contain prompt/completion text or secret-bearing tool output.
             try:
                 log_entry = json.loads(message)
-            except json.JSONDecodeError:
-                logger.warning("Skipping non-JSON log entry: %s", message[:200])
+            except json.JSONDecodeError as parse_err:
+                logger.warning(
+                    "Skipping non-JSON log entry: size=%d error=%s",
+                    len(message),
+                    type(parse_err).__name__,
+                )
                 continue
 
             process_log_entry(log_entry)

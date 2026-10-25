@@ -24,7 +24,7 @@ node {baseDir}/read.js <user_id> <filename>
 ```
 
 - `user_id` (required): The user's unique identifier (e.g., `telegram_12345`)
-- `filename` (required): The file name to read (e.g., `IDENTITY.md`)
+- `filename` (required): The file name to read (e.g., `notes.md`)
 
 ### write_user_file
 
@@ -97,7 +97,7 @@ When a user sends a Markdown (`.md`) file or a ZIP (`.zip`) archive, the router 
 
 - "Save my preferences" -> write_user_file with the user's preferences
 - "What do you remember about me?" -> read_user_file to check stored notes
-- "What's your name?" -> read_user_file IDENTITY.md for this user
+- "What's your name?" -> use the Agent Identity section already in the system prompt
 - "Forget everything about me" -> delete_user_file on each stored file
 - "What files do you have for me?" -> list_user_files
 - "Give me a download link for that file" -> presign_user_file
@@ -111,3 +111,15 @@ When a user sends a Markdown (`.md`) file or a ZIP (`.zip`) archive, the router 
 - Bucket enforces SSL-only access
 - Path traversal attempts are sanitized (removes `..`, restricts characters)
 - Never use `default_user` as user_id — scripts reject it with an error
+
+## Reserved filenames (NOT writable through this skill)
+
+The filenames `AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`,
+and `MEMORY.md` are reserved for workspace files that the Bedrock proxy
+concatenates into the model's system prompt. They are sourced from the
+operator prefix `_system/{user_id}/` at the bucket root and are not writable through
+`write_user_file`, `delete_user_file`, or the gateway MCP `write_file` /
+`delete_file` tools; attempts return an error. Any `write_user_file` call
+that targets one of these filenames (or the `_system/` sub-prefix) is
+refused by `buildKey`. Store user notes under a different filename
+(e.g. `notes.md`, `preferences.md`).

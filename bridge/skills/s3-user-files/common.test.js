@@ -65,8 +65,8 @@ describe("sanitize", () => {
 describe("buildKey", () => {
   it("builds key with userId and filename", () => {
     assert.equal(
-      buildKey("telegram_12345", "IDENTITY.md"),
-      "telegram_12345/IDENTITY.md",
+      buildKey("telegram_12345", "notes.md"),
+      "telegram_12345/notes.md",
     );
   });
 
@@ -85,6 +85,34 @@ describe("buildKey", () => {
     assert.equal(
       buildKey("../admin", "../../etc/passwd"),
       "_admin/__etc_passwd",
+    );
+  });
+
+  it("rejects reserved system-prompt filenames", () => {
+    for (const name of [
+      "AGENTS.md",
+      "SOUL.md",
+      "USER.md",
+      "IDENTITY.md",
+      "TOOLS.md",
+      "MEMORY.md",
+    ]) {
+      assert.throws(
+        () => buildKey("telegram_12345", name),
+        /reserved system-prompt source/,
+        `expected ${name} to be rejected`,
+      );
+    }
+  });
+
+  it("rejects filenames inside the reserved _system/ sub-prefix", () => {
+    assert.throws(
+      () => buildKey("telegram_12345", "_system/SOUL.md"),
+      /_system\/.*reserved/,
+    );
+    assert.throws(
+      () => buildKey("telegram_12345", "_system"),
+      /_system\/.*reserved/,
     );
   });
 });
@@ -140,64 +168,19 @@ describe("validateUserId", () => {
   });
 
   it("rejects empty userId", () => {
-    // validateUserId calls process.exit, so we mock it
-    const originalExit = process.exit;
-    let exitCode = null;
-    process.exit = (code) => {
-      exitCode = code;
-      throw new Error("process.exit called");
-    };
-    try {
-      assert.throws(() => validateUserId(""), /process\.exit/);
-      assert.equal(exitCode, 1);
-    } finally {
-      process.exit = originalExit;
-    }
+    asUser("telegram:123456789", () => assert.equal(exitCodeOf(() => validateUserId("")), 1));
   });
 
   it("rejects default-user", () => {
-    const originalExit = process.exit;
-    let exitCode = null;
-    process.exit = (code) => {
-      exitCode = code;
-      throw new Error("process.exit called");
-    };
-    try {
-      assert.throws(() => validateUserId("default-user"), /process\.exit/);
-      assert.equal(exitCode, 1);
-    } finally {
-      process.exit = originalExit;
-    }
+    asUser("telegram:123456789", () => assert.equal(exitCodeOf(() => validateUserId("default-user")), 1));
   });
 
   it("rejects arbitrary namespace without channel prefix", () => {
-    const originalExit = process.exit;
-    let exitCode = null;
-    process.exit = (code) => {
-      exitCode = code;
-      throw new Error("process.exit called");
-    };
-    try {
-      assert.throws(() => validateUserId("my-custom-id"), /process\.exit/);
-      assert.equal(exitCode, 1);
-    } finally {
-      process.exit = originalExit;
-    }
+    asUser("telegram:123456789", () => assert.equal(exitCodeOf(() => validateUserId("my-custom-id")), 1));
   });
 
   it("rejects path traversal attempts", () => {
-    const originalExit = process.exit;
-    let exitCode = null;
-    process.exit = (code) => {
-      exitCode = code;
-      throw new Error("process.exit called");
-    };
-    try {
-      assert.throws(() => validateUserId("../other_user"), /process\.exit/);
-      assert.equal(exitCode, 1);
-    } finally {
-      process.exit = originalExit;
-    }
+    asUser("telegram:123456789", () => assert.equal(exitCodeOf(() => validateUserId("../other_user")), 1));
   });
 
   it("rejects a valid namespace that is not this session's user", () => {
@@ -210,5 +193,18 @@ describe("validateUserId", () => {
 
   it("rejects every user_id when the session's user is unknown", () => {
     asUser(undefined, () => assert.equal(exitCodeOf(() => validateUserId("telegram_123456789")), 1));
+  });
+
+  it("does not treat INTERNAL_USER_ID as the session's namespace", () => {
+    // INTERNAL_USER_ID carries the internal user id, not the channel_id
+    // namespace, so it must never authorize a user_id on its own.
+    const saved = process.env.INTERNAL_USER_ID;
+    process.env.INTERNAL_USER_ID = "telegram:123456789";
+    try {
+      asUser(undefined, () => assert.equal(exitCodeOf(() => validateUserId("telegram_123456789")), 1));
+    } finally {
+      if (saved === undefined) delete process.env.INTERNAL_USER_ID;
+      else process.env.INTERNAL_USER_ID = saved;
+    }
   });
 });

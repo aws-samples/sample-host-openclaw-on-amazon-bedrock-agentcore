@@ -54,21 +54,30 @@ class GuardrailsStack(Stack):
                         type="HATE",
                         input_strength="HIGH",
                         output_strength="HIGH",
+                        # Bedrock image-modality support: HATE/INSULTS/SEXUAL/VIOLENCE only.
+                        input_modalities=["TEXT", "IMAGE"],
+                        output_modalities=["TEXT"],
                     ),
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
                         type="INSULTS",
                         input_strength="MEDIUM",
                         output_strength="HIGH",
+                        input_modalities=["TEXT", "IMAGE"],
+                        output_modalities=["TEXT"],
                     ),
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
                         type="SEXUAL",
                         input_strength="HIGH",
                         output_strength="HIGH",
+                        input_modalities=["TEXT", "IMAGE"],
+                        output_modalities=["TEXT"],
                     ),
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
                         type="VIOLENCE",
                         input_strength="HIGH",
                         output_strength="HIGH",
+                        input_modalities=["TEXT", "IMAGE"],
+                        output_modalities=["TEXT"],
                     ),
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
                         type="MISCONDUCT",
@@ -226,7 +235,7 @@ class GuardrailsStack(Stack):
             self,
             "ContentGuardrailVersion",
             guardrail_identifier=self.guardrail.attr_guardrail_id,
-            description="Initial guardrail version",
+            description="v2: enable IMAGE input modality on HATE/INSULTS/SEXUAL/VIOLENCE filters",
         )
 
         # --- Outputs ---

@@ -34,20 +34,26 @@ CONTAINER_LOG_GROUP = "/openclaw/container"
 CRON_LOG_GROUP = "/openclaw/lambda/cron"
 
 
-def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("container", "cron")) -> list:
+def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("container", "cron"), log_retention: int | None = None) -> list:
     """Add the filters and alarms for the given log groups to `scope`. Returns the alarms.
 
     On main, "container" goes in OpenClawObservability (phase 1) and "cron" in
     OpenClawTokenMonitoring (phase 3, deployed after OpenClawCron, which owns
     /openclaw/lambda/cron).
+
+    `log_retention` is the retention (in days) applied to the container log
+    group when this stack creates it; defaults to the `cloudwatch_log_retention_days`
+    context key, matching every other log group in the deployment.
     """
     stack = Stack.of(scope)
+    if log_retention is None:
+        log_retention = int(scope.node.try_get_context("cloudwatch_log_retention_days") or 30)
     # The container creates /openclaw/container itself on first boot, so it may
     # not exist yet on a fresh deployment. Create it if missing. An existing
     # group (and its events) is left as it is, also when this stack is deleted.
     ensure_container_group = None
     if "container" in groups:
-        ensure_container_group = _ensure_container_group(scope, stack)
+        ensure_container_group = _ensure_container_group(scope, stack, log_retention)
     namer = DeploymentNamer.from_scope(scope)
     # The bridge writes /openclaw/container under a fixed name, so suffixed
     # environments in one account share it; the cron group is per environment.
@@ -56,7 +62,7 @@ def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("contai
     return _alarms(scope, alarm_topic, groups, container_group, cron_group, ensure_container_group, namer)
 
 
-def _ensure_container_group(scope, stack):
+def _ensure_container_group(scope, stack, log_retention):
     ensure = cr.AwsCustomResource(
         scope,
         "EnsureContainerLogGroup",
@@ -67,9 +73,24 @@ def _ensure_container_group(scope, stack):
             physical_resource_id=cr.PhysicalResourceId.of(CONTAINER_LOG_GROUP),
             ignore_error_codes_matching="ResourceAlreadyExistsException",
         ),
+        # The group is created without retention by default (and the bridge
+        # creates it the same way on first boot), which keeps events forever.
+        # Give it the deployment-wide retention so per-user stream names and
+        # identity diagnostics expire like every other OpenClaw log group.
+        # on_update runs on every deploy, so an existing group picks this up
+        # without needing to be recreated.
+        on_update=cr.AwsSdkCall(
+            service="CloudWatchLogs",
+            action="putRetentionPolicy",
+            parameters={
+                "logGroupName": CONTAINER_LOG_GROUP,
+                "retentionInDays": int(log_retention),
+            },
+            physical_resource_id=cr.PhysicalResourceId.of(CONTAINER_LOG_GROUP),
+        ),
         policy=cr.AwsCustomResourcePolicy.from_statements([
             iam.PolicyStatement(
-                actions=["logs:CreateLogGroup"],
+                actions=["logs:CreateLogGroup", "logs:PutRetentionPolicy"],
                 resources=[
                     f"arn:aws:logs:{stack.region}:{stack.account}:log-group:{CONTAINER_LOG_GROUP}",
                     f"arn:aws:logs:{stack.region}:{stack.account}:log-group:{CONTAINER_LOG_GROUP}:*",
@@ -84,7 +105,7 @@ def _ensure_container_group(scope, stack):
         ensure,
         [cdk_nag.NagPackSuppression(
             id="AwsSolutions-IAM5",
-            reason="logs:CreateLogGroup on the single /openclaw/container log group (its ARN ends in :*).",
+            reason="logs:CreateLogGroup and logs:PutRetentionPolicy on the single /openclaw/container log group (its ARN ends in :*).",
             applies_to=[cdk_nag.RegexAppliesTo(regex="/^Resource::arn:aws:logs:.*:log-group:\\/openclaw\\/container:\\*$/")],
         )],
         apply_to_children=True,

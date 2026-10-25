@@ -761,12 +761,12 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   assert.equal(result.body.runtimeSessionId, owner.runtimeSessionId);
   assert.equal(result.body.actorId, owner.actorId);
   assert.equal(result.body.routingGeneration, owner.routingGeneration);
-  const statusText = (await app.request({ action: "status" })).body.response;
+  const statusText = (await app.request({ ...owner, action: "status" })).body.response;
   const status = JSON.parse(statusText);
   assert.equal(status.lifecycle.generation, result.body.activationGeneration);
   assert.equal(activation.generation, result.body.activationGeneration);
   assert.equal(status.lifecycle.state, "USER_READY");
-  // Status takes no binding, so it does not hand the binding back.
+  // Status reports whether a binding exists, never the binding itself.
   assert.equal(status.lifecycle.bound, true);
   assert.equal(Object.hasOwn(status.lifecycle, "binding"), false);
   assert.equal(Object.hasOwn(status, "currentUserId"), false);
@@ -774,6 +774,15 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   for (const value of [owner.userId, owner.actorId, owner.runtimeSessionId]) {
     assert.equal(statusText.includes(value), false, value);
   }
+  // Status for a different binding, or with no binding at all, is refused.
+  for (const probe of [{ action: "status" }, { ...owner, actorId: "telegram:999", action: "status" },
+    { ...owner, routingGeneration: owner.routingGeneration + 1, action: "status" }]) {
+    const refused = (await app.request(probe)).body;
+    assert.equal(refused.status, "error");
+    assert.equal(refused.response, "This AgentCore Runtime cannot accept the requested user binding.");
+  }
+  // An action-less payload no longer falls into the status branch.
+  assert.match((await app.request({ ...owner })).body.response, /Unknown action/);
   assert.ok(app.calls.some((call) => call.includes("[OPENCLAW_IMAGES:")));
   // The stale suspended-delivery sweep runs once, after readiness, before the first turn.
   assert.equal(app.calls.filter((call) => call === "gateway:sweep").length, 1);
@@ -1399,6 +1408,7 @@ async function createCronForIdentity(identity, args = [], namespace = "telegram_
   const records = [];
   const errors = [];
   class Command { constructor(input) { this.input = input; } }
+  class QueryCommand extends Command {}
   const env = {
     AWS_REGION: "us-west-2", EVENTBRIDGE_SCHEDULE_GROUP: "group", CRON_LAMBDA_ARN: "cron",
     EVENTBRIDGE_ROLE_ARN: "scheduler-role", IDENTITY_TABLE_NAME: "identity", INTERNAL_USER_ID: "u1",
@@ -1414,8 +1424,14 @@ async function createCronForIdentity(identity, args = [], namespace = "telegram_
     } };
     if (name === "@aws-sdk/client-dynamodb") return { DynamoDBClient: class {} };
     if (name === "@aws-sdk/lib-dynamodb") return {
-      DynamoDBDocumentClient: { from: () => ({ async send(command) { records.push(command.input.Item); } }) },
-      PutCommand: Command,
+      DynamoDBDocumentClient: { from: () => ({ async send(command) {
+        // create.js counts the caller's CRON# records before creating one.
+        if (command instanceof QueryCommand) return { Items: records.slice(), Count: records.length };
+        records.push(command.input.Item);
+        return {};
+      } }) },
+      PutCommand: Command, GetCommand: Command, DeleteCommand: Command, UpdateCommand: Command,
+      QueryCommand,
     };
     if (name === "@aws-sdk/client-scheduler") return {
       SchedulerClient: class { async send(command) { schedules.push(command.input); return {}; } },

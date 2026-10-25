@@ -41,6 +41,7 @@
     "cron_reserved_concurrency": 0,
     "token_metrics_reserved_concurrency": 0,
     "enable_cloudtrail": false,
+    "cognito_advanced_security_mode": "OFF",
     "enable_browser": true,
     "enable_gateway": false,
     "runtime_manifest": "",
