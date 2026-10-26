@@ -476,7 +476,8 @@ class AgentCoreStack(Stack):
                     "Bedrock guardrail ARNs require wildcard for guardrail version. "
                     "aws-marketplace:ViewSubscriptions/Subscribe (Bedrock model access "
                     "checks) do not support resource-level permissions and require '*'. "
-                    "Custom logs and Secrets Manager use the project prefix (openclaw/*). "
+                    "Custom logs and Secrets Manager use the project prefix (openclaw/*); per-user "
+                    "Cognito passwords are one secret per user under openclaw/cognito-user/<pool id>/. "
                     "AgentCore Runtime logs use the documented service prefix, with log group "
                     "discovery scoped to the current account and region. Metrics and X-Ray "
                     "do not support resource-level permissions. Cognito scoped to specific user pool.",
@@ -507,6 +508,11 @@ class AgentCoreStack(Stack):
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                         # Per-user API key storage in Secrets Manager (manage_secret tool)
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/user/*",
+                        # Per-user Cognito passwords (cognito-token.js), one secret per
+                        # user namespace under this deployment's user pool id. The pool
+                        # id is imported from OpenClawSecurity (user pool construct
+                        # "IdentityPool"), which cdk-nag renders as its logical id.
+                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/cognito-user/<IdentityPoolEC8A1A0D>/*",
                         # ECR pull (toolkit-managed repos — Starter Toolkit uses bedrock-agentcore- prefix)
                         f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw-bridge*",
                         f"Resource::arn:aws:ecr:{region}:{account}:repository/openclaw_agent*",
