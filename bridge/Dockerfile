@@ -180,8 +180,15 @@ RUN groupadd --gid 10001 openclaw && \
 # npm_config_cache there for every agent-uid child (runtime-privsep.js). Without
 # it OpenClaw's SQLite snapshot staging dir resolves to /root/.cache and the
 # gateway and `openclaw doctor` stop with EACCES.
+# OpenClaw also watches $HOME/.agents/skills for personal skills. When that
+# path is missing its watcher falls back to the nearest existing parent, /root,
+# which the agent uid cannot list ("EACCES: permission denied, watch '/root'").
+# Pre-create it root-owned and read-only (0755): the agent uid can watch it but
+# cannot write to it, and /root itself stays 0711.
 RUN mkdir -p /root/.openclaw && \
     chown -R 10001:10001 /root/.openclaw && \
+    mkdir -p /root/.agents/skills && \
+    chmod 0755 /root/.agents /root/.agents/skills && \
     chmod 0711 /root && \
     mkdir -p /home/openclaw/.cache /home/openclaw/.config /home/openclaw/.local/share \
       /home/openclaw/.local/state /home/openclaw/.npm /home/openclaw/tmp && \

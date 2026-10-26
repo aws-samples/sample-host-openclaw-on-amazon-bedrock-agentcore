@@ -262,3 +262,20 @@ test("Dockerfile creates every agent dir owned by the agent uid and keeps /root 
   assert.equal(/chown (?:-R )?\S+ \/root(?=\s|$)/.test(dockerfile), false);
   assert.match(dockerfile, /useradd --uid 10001 --gid 10001 --home-dir \/home\/openclaw /);
 });
+
+test("Dockerfile pre-creates $HOME/.agents/skills read-only so OpenClaw's skills watcher never falls back to /root", () => {
+  // OpenClaw watches path.join(os.homedir(), ".agents", "skills"); when it is
+  // missing the watcher climbs to the nearest existing parent (/root, 0711) and
+  // logs "EACCES: permission denied, watch '/root'" for the agent uid.
+  const dockerfile = realFs.readFileSync(nodePath.join(__dirname, "Dockerfile"), "utf8").replace(/\\\n/g, " ");
+  const runs = dockerfile.split("\n").filter((line) => line.startsWith("RUN "));
+  const block = runs.find((line) => line.includes("/root/.agents/skills"));
+  assert.ok(block, "a RUN step creates /root/.agents/skills");
+  assert.match(block, /mkdir -p \/root\/\.agents\/skills(\s|$)/);
+  assert.match(block, /chmod 0755 \/root\/\.agents \/root\/\.agents\/skills(\s|$)/);
+  // Root-owned: readable (watchable) by the agent uid, not writable by it.
+  assert.equal(/chown (?:-R )?\S+ \/root\/\.agents/.test(dockerfile), false);
+  // It must be created in the same step that keeps /root traverse-only, so a
+  // later edit cannot reorder it after the chmod or drop it silently.
+  assert.match(block, /chmod 0711 \/root(\s|$)/);
+});
