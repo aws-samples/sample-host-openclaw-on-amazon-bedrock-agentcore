@@ -296,7 +296,7 @@ All tunable parameters are in `cdk.json`:
 | `fallback_model_id` | `global.anthropic.claude-sonnet-5-5` | Fallback for eligible primary API failures before content starts; never replays partial output or a Guardrail intervention |
 | `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model ID for sub-agents. Empty = the bridge default, also Sonnet 5.5. Sub-agents never use the fallback model |
 | `user_selectable_models` | `haiku`, `sonnet`, `opus` (Claude 5.5 global profiles) | Aliases users can pick with `/model <alias>`, mapped to Bedrock model IDs. Set to `{}` to disable switching. See [Per-user model switching](#per-user-model-switching) |
-| `cloudwatch_log_retention_days` | `30` | Log retention in days. Rounded up to a value CloudWatch Logs accepts (for example 45 becomes 60); a value that is not a whole number from 1 to 3653 fails synth. Also applied to `/openclaw/container` |
+| `cloudwatch_log_retention_days` | `30` | Log retention in days. Rounded up to a value CloudWatch Logs accepts (for example 45 becomes 60); a value that is not a whole number from 1 to 3653 fails synth. Also applied to `/openclaw/container` and `/openclaw/lambda/token-metrics` |
 | `hourly_token_alarm` | `5000000` | Threshold of the `openclaw-hourly-token-spike` alarm: `TotalTokens` summed over **1 hour** |
 | `daily_token_budget` | `18000000` | Threshold of the `openclaw-daily-token-budget` alarm: `TotalTokens` summed over **1 day** (86400 s) |
 | `hourly_cost_alarm_usd` | `30` | Threshold (USD) of the `openclaw-hourly-cost-spike` alarm: estimated cost summed over **1 hour** |
@@ -337,6 +337,8 @@ All tunable parameters are in `cdk.json`:
 | `anomaly_band_width` | `2` | Standard-deviation band for the token-usage anomaly detector alarm |
 | `runtime_manifest` | (empty for foundation) | Verified V2 manifest required for dependent stacks; wrapper default `.runtime/runtime-v2.json` |
 | `table_tags` | `{}` | Extra tags put on every DynamoDB table (identity and token-usage). CloudFormation does not copy its own stack tags onto DynamoDB tables, so if your account runs an automated cleanup job that deletes untagged tables, set the opt-out tag it honours, for example `{"auto-delete": "no"}` (or `-c 'table_tags={"auto-delete":"no"}'`). Deletion protection is on for both tables regardless of this setting |
+
+The boolean keys `enable_gateway`, `enable_codebuild`, `enable_guardrails` and `enable_cloudtrail` accept `true`/`false` in any case, so `-c enable_gateway=true` on the CDK CLI works the same as `"enable_gateway": true` in `cdk.json`; any other value fails synth.
 
 > **Guardrails cost**: Bedrock Guardrails are enabled by default and add ~$0.75 per 1,000 text units on top of model inference costs. Before disabling, follow the [dependency check](docs/guardrails.md#disable). See [AWS Bedrock Guardrails Pricing](https://aws.amazon.com/bedrock/pricing/#Guardrails). Disabling removes content-level protections but other security layers (STS scoping, tool deny list) remain active.
 
