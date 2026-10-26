@@ -7,7 +7,7 @@ from aws_cdk import (
 )
 from constructs import Construct
 
-from stacks import DeploymentNamer
+from stacks import DeploymentNamer, context_flag
 
 
 class GuardrailsStack(Stack):
@@ -21,9 +21,8 @@ class GuardrailsStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        enable_guardrails = self.node.try_get_context("enable_guardrails")
-        if enable_guardrails is None:
-            enable_guardrails = True  # default ON — security-first
+        # Default ON. `-c enable_guardrails=false` arrives as a string.
+        enable_guardrails = context_flag(self.node, "enable_guardrails", default=True)
 
         if not enable_guardrails:
             # Guardrails disabled — export None so downstream stacks don't break

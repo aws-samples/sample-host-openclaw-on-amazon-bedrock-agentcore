@@ -70,6 +70,27 @@ def retention_days(days) -> logs.RetentionDays:
     return _RETENTION_MAP[normalize_retention_days(days)]
 
 
+def context_flag(node: Node, key: str, default: bool = False) -> bool:
+    """Read a boolean context key from cdk.json or ``-c``.
+
+    ``cdk -c key=value`` passes the value as a string, so ``"true"`` and
+    ``"false"`` (any case) count the same as the JSON booleans in cdk.json.
+    Unset or empty returns ``default``. Any other value raises ValueError at
+    synth time, so a typo cannot silently turn a feature on or off.
+    """
+    value = node.try_get_context(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    raise ValueError(f"context {key} must be true or false, got {value!r}")
+
+
 # Lowercase letters/digits, single hyphens between segments. At most 12
 # characters so the longest suffixed physical names stay inside AWS limits
 # (S3 bucket 63, IAM role 64, with the longest supported region names).

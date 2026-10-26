@@ -19,7 +19,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import DeploymentNamer, apply_table_tags
+from stacks import DeploymentNamer, apply_table_tags, retention_days
 from stacks.health_alarms import add_health_alarms
 from stacks.context_limits import reserved_concurrency
 
@@ -174,7 +174,9 @@ class TokenMonitoringStack(Stack):
             self,
             "TokenMetricsLogGroup",
             log_group_name=namer.name("/openclaw/lambda/token-metrics"),
-            retention=logs.RetentionDays.ONE_MONTH,
+            retention=retention_days(
+                self.node.try_get_context("cloudwatch_log_retention_days") or 30
+            ),
             # RETAIN so token-metrics history survives stack delete/replace;
             # matches the API access and VPC flow log groups.
             removal_policy=RemovalPolicy.RETAIN,
