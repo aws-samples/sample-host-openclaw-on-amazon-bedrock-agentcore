@@ -15,7 +15,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import DeploymentNamer, retention_days
+from stacks import DeploymentNamer, context_flag, retention_days
 
 
 COGNITO_ADVANCED_SECURITY_MODES = ("OFF", "AUDIT", "ENFORCED")
@@ -132,7 +132,7 @@ class SecurityStack(Stack):
         # cdk.json. When enabled it is multi-region and also records S3 data
         # events on the user-files bucket, whose per-user namespace boundary is
         # enforced in application code.
-        enable_cloudtrail = bool(self.node.try_get_context("enable_cloudtrail") or False)
+        enable_cloudtrail = context_flag(self.node, "enable_cloudtrail")
         self.trail = None
         trail_bucket = None
 

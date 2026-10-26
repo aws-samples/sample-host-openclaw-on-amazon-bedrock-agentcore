@@ -16,7 +16,7 @@ import os
 import aws_cdk as cdk
 import cdk_nag
 
-from stacks import DeploymentNamer
+from stacks import DeploymentNamer, context_flag
 from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
@@ -56,7 +56,7 @@ guardrails_stack = GuardrailsStack(
 # Only instantiated when the flag is on so that, with the default (false),
 # the synthesized templates of every existing stack are unchanged.
 gateway_stack = None
-if app.node.try_get_context("enable_gateway") is True:
+if context_flag(app.node, "enable_gateway"):
     gateway_stack = GatewayStack(
         app,
         namer.stack("OpenClawGateway"),
@@ -177,7 +177,7 @@ token_monitoring_stack.add_dependency(cron_stack)
 # It pushes to the repository scripts/deploy.sh uses (ECR_REPOSITORY, default
 # openclaw-bridge); scripts/codebuild-push.sh prints the image URI for
 # `BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri URI`.
-if app.node.try_get_context("enable_codebuild") in (True, "true"):
+if context_flag(app.node, "enable_codebuild"):
     build_stack = BuildStack(
         app,
         namer.stack("OpenClawBuild"),
