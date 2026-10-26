@@ -333,8 +333,12 @@ class GatewayStack(Stack):
             # diagnostics (target ARNs, interceptor/target payload fragments)
             # are not returned to MCP callers in production. Operators can opt
             # in for local debugging with `cdk --context gateway_debug_errors=true`.
+            # A -c value arrives as a string, so "true" counts as well as a
+            # JSON boolean true from cdk.json.
             exception_level=(
-                "DEBUG" if self.node.try_get_context("gateway_debug_errors") is True else None
+                "DEBUG"
+                if str(self.node.try_get_context("gateway_debug_errors")).strip().lower() == "true"
+                else None
             ),
             interceptor_configurations=[
                 agentcore.CfnGateway.GatewayInterceptorConfigurationProperty(

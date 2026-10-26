@@ -74,7 +74,10 @@ def verify_signature(headers, body_bytes, channel_secret):
         return False
     expected = base64.b64encode(
         hmac.new(channel_secret.encode("utf-8"), body_bytes, hashlib.sha256).digest()).decode("ascii")
-    return hmac.compare_digest(expected, signature)
+    try:
+        return hmac.compare_digest(expected.encode("ascii"), signature.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
 
 
 def extract_events(payload, bot_user_id="", now=None):

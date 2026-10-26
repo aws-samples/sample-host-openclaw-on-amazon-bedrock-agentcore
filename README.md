@@ -296,7 +296,7 @@ All tunable parameters are in `cdk.json`:
 | `fallback_model_id` | `global.anthropic.claude-sonnet-5-5` | Fallback for eligible primary API failures before content starts; never replays partial output or a Guardrail intervention |
 | `subagent_model_id` | `global.anthropic.claude-sonnet-5-5` | Bedrock model ID for sub-agents. Empty = the bridge default, also Sonnet 5.5. Sub-agents never use the fallback model |
 | `user_selectable_models` | `haiku`, `sonnet`, `opus` (Claude 5.5 global profiles) | Aliases users can pick with `/model <alias>`, mapped to Bedrock model IDs. Set to `{}` to disable switching. See [Per-user model switching](#per-user-model-switching) |
-| `cloudwatch_log_retention_days` | `30` | Log retention in days |
+| `cloudwatch_log_retention_days` | `30` | Log retention in days. Rounded up to a value CloudWatch Logs accepts (for example 45 becomes 60); a value that is not a whole number from 1 to 3653 fails synth. Also applied to `/openclaw/container` |
 | `hourly_token_alarm` | `5000000` | Threshold of the `openclaw-hourly-token-spike` alarm: `TotalTokens` summed over **1 hour** |
 | `daily_token_budget` | `18000000` | Threshold of the `openclaw-daily-token-budget` alarm: `TotalTokens` summed over **1 day** (86400 s) |
 | `hourly_cost_alarm_usd` | `30` | Threshold (USD) of the `openclaw-hourly-cost-spike` alarm: estimated cost summed over **1 hour** |
@@ -315,6 +315,7 @@ All tunable parameters are in `cdk.json`:
 | `router_reserved_concurrency` | `0` (unset) | Opt-in Lambda reserved concurrency for the Router. Caps the Router and guarantees it that many executions; also removes them from the account's unreserved pool, and Lambda rejects a reservation that would leave fewer than 100 unreserved, so the deploy fails in low-limit accounts. Each in-flight chat turn holds one Router execution for up to `router_lambda_timeout_seconds` |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
 | `telegram_groups_enabled` | `false` | If `false`, the bot ignores every Telegram group and supergroup message, commands included. If `true`, it answers allowlisted groups (`ALLOW#telegram_group:<chat_id>`) as the group's own identity. `registration_open` never applies to groups. See [Telegram groups](docs/channels.md#telegram-groups) |
+| `router_log_reply_text` | `false` | Test deployments only. If `true`, the Router also logs the text of each Telegram reply, which the E2E tests in `tests/e2e/` need to check replies. Keep it `false` in production |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
 | `image_version` | (see `cdk.json`) | Local build image tag. The SDK controller resolves the ECR digest and updates AgentCore Runtime configuration |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |

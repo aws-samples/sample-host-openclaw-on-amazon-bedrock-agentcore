@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from aws_cdk import Tags, aws_logs as logs
 from constructs import Construct, Node
 
-# Map integer days to the nearest valid RetentionDays enum member.
+# The retention values CloudWatch Logs accepts, as RetentionDays members.
 _RETENTION_MAP = {
     1: logs.RetentionDays.ONE_DAY,
     3: logs.RetentionDays.THREE_DAYS,
@@ -27,18 +27,47 @@ _RETENTION_MAP = {
     731: logs.RetentionDays.TWO_YEARS,
     1096: logs.RetentionDays.THREE_YEARS,
     1827: logs.RetentionDays.FIVE_YEARS,
+    2192: logs.RetentionDays.SIX_YEARS,
+    2557: logs.RetentionDays.SEVEN_YEARS,
+    2922: logs.RetentionDays.EIGHT_YEARS,
+    3288: logs.RetentionDays.NINE_YEARS,
+    3653: logs.RetentionDays.TEN_YEARS,
 }
+_MAX_RETENTION_DAYS = max(_RETENTION_MAP)
 
 
-def retention_days(days: int) -> logs.RetentionDays:
-    """Convert an integer number of days to a RetentionDays enum value."""
-    if days in _RETENTION_MAP:
-        return _RETENTION_MAP[days]
-    # Find the closest valid value that is >= the requested days
-    for d in sorted(_RETENTION_MAP):
-        if d >= days:
-            return _RETENTION_MAP[d]
-    return logs.RetentionDays.ONE_YEAR
+def normalize_retention_days(days) -> int:
+    """Return the CloudWatch Logs retention value (in days) to use for `days`.
+
+    `days` is the `cloudwatch_log_retention_days` context value: an int from
+    cdk.json or a string from `-c`. A value between two valid CloudWatch
+    values is rounded up to the next one (45 becomes 60). Anything that is not
+    a whole number from 1 to 3653 raises ValueError at synth time instead of
+    failing the deployment.
+    """
+    if isinstance(days, bool):
+        value = None
+    elif isinstance(days, int):
+        value = days
+    else:
+        text = str(days).strip()
+        value = int(text) if re.fullmatch(r"\d+", text) else None
+    if value is None or not 1 <= value <= _MAX_RETENTION_DAYS:
+        raise ValueError(
+            f"cloudwatch_log_retention_days must be a whole number of days from 1 to "
+            f"{_MAX_RETENTION_DAYS}, got {days!r}. CloudWatch Logs accepts "
+            f"{', '.join(str(d) for d in sorted(_RETENTION_MAP))}; other values are "
+            "rounded up to the next of these."
+        )
+    return next(d for d in sorted(_RETENTION_MAP) if d >= value)
+
+
+def retention_days(days) -> logs.RetentionDays:
+    """Convert a number of days to a RetentionDays enum value.
+
+    See normalize_retention_days for the accepted input and the rounding.
+    """
+    return _RETENTION_MAP[normalize_retention_days(days)]
 
 
 # Lowercase letters/digits, single hyphens between segments. At most 12
