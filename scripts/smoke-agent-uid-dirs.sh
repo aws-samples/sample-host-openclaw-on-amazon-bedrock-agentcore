@@ -22,10 +22,21 @@
 # ("Failed migrating legacy shared auth store ... owns this state directory")
 # whenever it cannot get it. A used state carries the row and skips it.
 #
+# Host preflight: OpenClaw takes its state lock with openat2(2), which Linux
+# has from 5.6. Where the container cannot use it (an older host kernel, such as
+# the 4.14 kernel of CodeBuild's arm64 build hosts, or a seccomp profile without
+# openat2), every OpenClaw command that takes the lock fails, as root too (on
+# such a kernel with "Function not implemented (os error 38)"), so the host
+# cannot test the uid split at all. The preflight asks the kernel for openat2 from inside the image;
+# if it is missing, or the check cannot tell and the kernel is older than 5.6,
+# the script prints SKIP with the reason and exits 0 without running the three
+# runs. Every other host runs them.
+#
 # Usage: scripts/smoke-agent-uid-dirs.sh <image>
 # Needs Docker and an image whose platform the host can run (for a local
 # check, build bridge/Dockerfile for the host platform). No network or AWS
-# access is used (--network none). Exit 0 only when all three runs behave.
+# access is used (--network none). Exit 0 when all three runs behave, or with
+# SKIP on a host that cannot run OpenClaw (see above); non-zero otherwise.
 # SMOKE_TIMEOUT (seconds, default 120) bounds each OpenClaw command; raise it on
 # slow or emulated hosts.
 set -euo pipefail
@@ -142,6 +153,55 @@ smoke() {
   docker run --rm -i --network none --entrypoint bash "$IMAGE" -s -- "$1" "$SMOKE_TIMEOUT" < <(inner)
 }
 
+# Runs inside the image: the host kernel version and whether openat2 exists.
+preflight_probe() {
+  cat <<'PREFLIGHT'
+echo "kernel=$(uname -r)"
+if command -v python3 >/dev/null 2>&1; then
+  # openat2(AT_FDCWD, "/", NULL, 0) fails with EINVAL where the call exists,
+  # before any file is touched. ENOSYS means the kernel does not have it; ENOSYS
+  # or EPERM can also come from a seccomp profile that does not allow it.
+  python3 -c '
+import ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+rc = libc.syscall(ctypes.c_long(437), ctypes.c_int(-100), ctypes.c_char_p(b"/"), ctypes.c_void_p(0), ctypes.c_size_t(0))
+blocked = rc < 0 and ctypes.get_errno() in (errno.ENOSYS, errno.EPERM)
+print("openat2=" + ("missing" if blocked else "present"))
+' 2>/dev/null || echo "openat2=unknown"
+else
+  echo "openat2=unknown"
+fi
+PREFLIGHT
+}
+
+older_than_5_6() {  # $1: uname -r, e.g. 4.14.355-287.753.amzn2.aarch64
+  local version="${1%%-*}" major minor
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  (( major < 5 || (major == 5 && minor < 6) ))
+}
+
+host_preflight() {
+  local out kernel openat2 reason=""
+  out="$(docker run --rm -i --network none --entrypoint bash "$IMAGE" -s -- preflight < <(preflight_probe))"
+  kernel="$(printf "%s\n" "$out" | sed -n "s/^kernel=//p")"
+  openat2="$(printf "%s\n" "$out" | sed -n "s/^openat2=//p")"
+  case "$openat2" in
+    present) ;;
+    missing) reason="openat2(2) is not available in the container (host kernel ${kernel:-unknown})" ;;
+    *) if older_than_5_6 "$kernel"; then reason="host kernel $kernel is older than Linux 5.6, which added openat2(2)"; fi ;;
+  esac
+  if [ -n "$reason" ]; then
+    echo "SKIP: $reason. OpenClaw takes its state lock with openat2, so every OpenClaw command fails on this host, as root too, and the uid split cannot be tested here. Run this check on a host with Linux 5.6 or newer whose container runtime allows openat2."
+    exit 0
+  fi
+  echo "preflight: host kernel ${kernel:-unknown}, openat2 ${openat2:-unknown}"
+}
+
+host_preflight
 smoke root
 smoke agent
 if smoke negative; then

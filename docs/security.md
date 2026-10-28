@@ -265,7 +265,10 @@ scoped credentials and run the Bedrock proxy. The untrusted agent is isolated
   (owned by uid 10001, mode 0700): the supervisor sets `XDG_CACHE_HOME`,
   `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `TMPDIR` and
   `npm_config_cache` for every agent-uid child. `scripts/smoke-agent-uid-dirs.sh`
-  checks a built image for this.
+  checks a built image for this. It needs a host with Linux 5.6 or newer, because
+  OpenClaw takes its state lock with `openat2`; on an older kernel (for example
+  CodeBuild's arm64 build hosts, kernel 4.14) it prints `SKIP` with the reason and
+  exits 0.
 - **/proc hidepid (best-effort).** The entrypoint remounts `/proc` with
   `hidepid=2` so the agent uid cannot see other processes at all. Needs
   `CAP_SYS_ADMIN`; skipped and logged when unavailable.
