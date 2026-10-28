@@ -20,7 +20,7 @@ function loadContract(t, {
   browser = Promise.resolve(), outcome = { phase: "completed", response: "reply" },
   poisoned = false, failCredentialsAfter = Infinity, gatewayMcpEnabled = false,
   signBrowser, cleanup = async () => {}, activationTimeoutMs = 1000,
-  managerFactory, persistenceSave, gatewayTurnImpl,
+  managerFactory, persistenceSave, gatewayTurnImpl, privsepMock,
   prepare = Promise.resolve(), gatewayActivation = Promise.resolve(), migration,
   migrationExitCode = 0, remainingLegacy = false,
   home = "/test-home", beforeFsOperation, proxyHealth, runtimeEnv = {},
@@ -87,6 +87,7 @@ function loadContract(t, {
   class GetBrowser extends Command {}
   const mocks = {
     fs: fakeFs,
+    "./runtime-privsep": privsepMock || require("./runtime-privsep"),
     http: {
       createServer(callback) {
         handler = callback;
@@ -119,7 +120,7 @@ function loadContract(t, {
         const child = new EventEmitter();
         Object.assign(child, {
           stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null,
-          kind, command, args, env: { ...options.env },
+          kind, command, args, env: { ...options.env }, uid: options.uid, gid: options.gid,
         });
         child.kill = () => { child.exitCode = 0; child.emit("exit", 0); };
         children.push(child);
@@ -1091,6 +1092,51 @@ test("proxy outcome health probes have an absolute deadline and bounded response
     assert.equal(cleared, 1);
     assert.equal(destroyed, mode === "aborted" ? 0 : 1);
   }
+});
+
+test("privilege separation: gateway + doctor spawn unprivileged, state dir handed over, status logged", async (t) => {
+  const privsepMock = {
+    childPrivilegeOptions: () => ({ uid: 10001, gid: 10001 }),
+    chownToOpenClaw: (p) => { privsepMock._chowns.push(p); return true; },
+    agentDirEnv: () => ({ XDG_CACHE_HOME: "/home/openclaw/.cache", TMPDIR: "/home/openclaw/tmp" }),
+    ensureAgentDirs: () => { privsepMock._ensured += 1; return true; },
+    _ensured: 0,
+    describeProtections: (x) => ({ uidSplit: "active", uid: 10001, networkBlock: x.networkBlock, procHidden: x.procHidden }),
+    formatStartupLines: (st) => [`[privsep] uid-split=${st.uidSplit} mmds=${st.networkBlock} hidepid=${st.procHidden}`],
+    _chowns: [],
+  };
+  const app = loadContract(t, {
+    privsepMock, migration: Promise.resolve(),
+    runtimeEnv: { OPENCLAW_MMDS_BLOCK: "active", OPENCLAW_PROC_HIDDEN: "inactive" },
+  });
+  await tick();
+  const reply = await app.request({ ...owner, action: "chat", message: "hello" });
+  assert.equal(reply.body.execution.phase, "completed", app.errors.join("\n"));
+  assert.equal(reply.body.response, "reply");
+  // The prepared gateway was told to run as the unprivileged uid/gid.
+  assert.deepEqual(app.preparations[0].childOptions, { uid: 10001, gid: 10001 });
+  // openclaw doctor ran with the same uid/gid.
+  const doctor = app.children.find((child) => child.kind === "doctor");
+  assert.ok(doctor, "doctor was spawned");
+  assert.equal(doctor.uid, 10001);
+  assert.equal(doctor.gid, 10001);
+  // The state dir was handed to the OpenClaw uid (before doctor and before activate).
+  assert.ok(app.preparations.length);
+  assert.ok(privsepMock._chowns.filter((p) => p === "/test-home/.openclaw").length >= 2,
+    `state dir chowned, got: ${JSON.stringify(privsepMock._chowns)}`);
+  // The agent uid gets writable cache/temp dirs (HOME=/root is not writable for
+  // it): created once at bootstrap, and in the env of the prepared gateway, the
+  // activation and doctor. HOME itself is unchanged.
+  assert.equal(privsepMock._ensured, 1);
+  for (const [name, env] of [["prepared", app.preparations[0].env], ["activation", app.activations[0].env],
+    ["doctor", doctor.env]]) {
+    assert.equal(env.XDG_CACHE_HOME, "/home/openclaw/.cache", name);
+    assert.equal(env.TMPDIR, "/home/openclaw/tmp", name);
+    assert.equal(env.HOME, "/test-home", name);
+  }
+  // The startup log states which protections are active.
+  assert.ok(app.logs.includes("[privsep] uid-split=active mmds=active hidepid=inactive"),
+    "privsep status logged at bootstrap");
 });
 
 for (const platform of ["V1", "", "v2", " V2 ", "V3"]) {

@@ -117,7 +117,7 @@ FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.21.0-slim@sha2
 # own bundled roots and is unaffected, which is why this went unnoticed. The
 # final test fails the build if a future edit drops the package again.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl jq python3 && \
+    apt-get install -y --no-install-recommends ca-certificates curl jq python3 iptables && \
     rm -rf /var/lib/apt/lists/* && \
     test -f /etc/ssl/certs/ca-certificates.crt
 
@@ -161,8 +161,39 @@ RUN mkdir -p /skills && ln -s /app/node_modules /skills/node_modules
 
 WORKDIR /app
 
-# Pre-create OpenClaw workspace directory (avoids mkdir at runtime)
-RUN mkdir -p /root/.openclaw
+# --- Privilege separation: a dedicated unprivileged account for OpenClaw ---
+# The container starts as root (the contract server is the trusted supervisor
+# that holds the execution role to fetch secrets and AssumeRole). OpenClaw — the
+# untrusted agent — and every shell it spawns run as this uid instead, so a tool
+# shell cannot read another process's /proc environ or reach the metadata
+# endpoint. The id is NUMERIC (10001) to avoid the AgentCore >53-layer
+# "424 / Failed to mount overlay" issue with non-numeric users.
+RUN groupadd --gid 10001 openclaw && \
+    useradd --uid 10001 --gid 10001 --home-dir /home/openclaw --no-create-home --shell /usr/sbin/nologin openclaw
+
+# Pre-create the OpenClaw state dir owned by the agent uid. HOME stays /root
+# (the proxy snapshot pins HOME=/root), so the agent traverses into /root to
+# reach its state dir: 0711 lets it enter without listing root's other files.
+# Because the agent cannot create anything else under /root, its caches, config
+# and temp files go to /home/openclaw instead: the contract server points
+# XDG_CACHE_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, TMPDIR and
+# npm_config_cache there for every agent-uid child (runtime-privsep.js). Without
+# it OpenClaw's SQLite snapshot staging dir resolves to /root/.cache and the
+# gateway and `openclaw doctor` stop with EACCES.
+# OpenClaw also watches $HOME/.agents/skills for personal skills. When that
+# path is missing its watcher falls back to the nearest existing parent, /root,
+# which the agent uid cannot list ("EACCES: permission denied, watch '/root'").
+# Pre-create it root-owned and read-only (0755): the agent uid can watch it but
+# cannot write to it, and /root itself stays 0711.
+RUN mkdir -p /root/.openclaw && \
+    chown -R 10001:10001 /root/.openclaw && \
+    mkdir -p /root/.agents/skills && \
+    chmod 0755 /root/.agents /root/.agents/skills && \
+    chmod 0711 /root && \
+    mkdir -p /home/openclaw/.cache /home/openclaw/.config /home/openclaw/.local/share \
+      /home/openclaw/.local/state /home/openclaw/.npm /home/openclaw/tmp && \
+    chown -R 10001:10001 /home/openclaw && \
+    chmod -R 0700 /home/openclaw
 
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
@@ -192,6 +223,9 @@ COPY gateway-lifecycle.js /app/gateway-lifecycle.js
 COPY gateway-config.js live-seed-bridge.js model-policy.js invocation-stream.js cron-jobs.js /app/
 COPY proxy-sdk-snapshot.js proxy-auth-prepare.js system-prefix-cache.js /app/
 COPY openclaw-worker-owner.js /app/openclaw-worker-owner.js
+COPY runtime-privsep.js /app/runtime-privsep.js
+COPY mmds-firewall.sh /app/mmds-firewall.sh
+RUN chmod +x /app/mmds-firewall.sh
 COPY openclaw-preinit.mjs /app/openclaw-preinit.mjs
 COPY live-gateway-seed-owner.mjs live-gateway-seed-child.mjs live-gateway-seed-common.mjs /app/
 COPY session-diff-worker-prewarm.mjs session-diff-worker-bootstrap.mjs /app/
@@ -231,6 +265,12 @@ COPY CLAUDE.md /app/CLAUDE.md
 # Copy entrypoint
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# Hand the directories the unprivileged gateway writes (runtime-installed skills)
+# or reads/writes (the V8 compile cache) to the agent uid. `chown -R` does not
+# dereference the /skills/node_modules symlink, so /app/node_modules is untouched.
+RUN chown -R 10001:10001 /skills && \
+    chown -R 10001:10001 /app/.compile-cache
 
 # Record the final application bytes after all functional patches and copies.
 RUN node <<'NODE'
@@ -277,6 +317,9 @@ EXPOSE 8080
 
 # AgentCore Runtime uses /ping for health checks (not Docker HEALTHCHECK)
 # No HEALTHCHECK directive needed — AgentCore manages this via /ping endpoint
-# Note: container runs as root inside a per-user AgentCore microVM (already isolated).
+# Note: the container STARTS as root (the contract server is the trusted
+# supervisor). OpenClaw and its tool shells are dropped to uid 10001 at spawn
+# time (runtime-privsep.js); no USER directive, because the supervisor needs
+# root to setuid its children and to hold the execution role. See docs/security.md.
 
 ENTRYPOINT ["/app/entrypoint.sh"]

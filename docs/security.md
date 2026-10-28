@@ -126,7 +126,7 @@ AWS_SHARED_CREDENTIALS_FILE
 AWS_PROFILE
 ```
 
-OpenClaw receives credentials only via `AWS_CONFIG_FILE` pointing to a `credential_process` that reads the scoped credential file. This filter prevents accidental ambient-credential pickup by the SDK; it does **not** prevent a root process in the same container from re-reading those variables from `/proc/1/environ` or from querying the container credential endpoint. See the module header of `bridge/scoped-credentials.js` for the container-level controls (dedicated uid, hidepid / PID namespace, iptables owner-match on the credential endpoint) required to make this an enforced boundary.
+OpenClaw receives credentials only via `AWS_CONFIG_FILE` pointing to a `credential_process` that reads the scoped credential file. This filter prevents accidental ambient-credential pickup by the SDK; on its own it does **not** prevent a process with the supervisor's privileges from re-reading those variables from `/proc/1/environ` or from querying the container credential endpoint. The controls for that are in §3.8 Runtime Privilege Separation: OpenClaw runs as an unprivileged uid, which closes `/proc/<pid>/environ`; a `/proc` remount with `hidepid=2` and an owner-match firewall rule for the metadata and credential endpoints are best-effort and depend on the runtime's capabilities (on AgentCore Runtime the firewall is inactive, see §3.8).
 
 #### Trust Policy Condition
 
@@ -146,7 +146,7 @@ Scoped credentials are checked before turns and persistence operations, and refr
 
 #### Proxy Trust Boundary
 
-The proxy process (`agentcore-proxy.js`) is trusted code and retains full execution role credentials for Bedrock, Cognito, and S3 image access. Application-level namespace enforcement (prefix validation, path traversal checks) provides the security boundary here.
+The proxy process (`agentcore-proxy.js`) is trusted code and retains full execution role credentials for Bedrock, Cognito, and S3 image access. Application-level namespace enforcement (prefix validation, path traversal checks) provides the security boundary here. The proxy runs as root alongside the contract server; because OpenClaw runs as an unprivileged uid (see §3.8 Runtime Privilege Separation), the agent cannot read the proxy's or the supervisor's environment via `/proc` and so cannot recover the execution role, which can read every user's `openclaw/cognito-user/*` secret.
 
 ### 3.5 Encryption
 
@@ -240,6 +240,85 @@ The former startup shim and its custom web-fetch SSRF implementation are removed
 | IPv4 DNS patch | `force-ipv4.js` patches `dns.lookup()` for VPC compatibility (Node.js Happy Eyeballs IPv6 issue) |
 | V8 compile cache | Pre-warmed at build time for faster cold starts (no runtime compilation) |
 | No Docker-in-Docker | Sub-agent sandbox set to `off` — no Docker inside AgentCore microVMs (microVMs already provide isolation) |
+| Unprivileged agent uid | OpenClaw and every shell it spawns run as uid 10001, not root (see Runtime Privilege Separation below) |
+| Metadata endpoint block | Owner-match firewall rule for the agent uid to the microVM metadata / credential endpoints (best-effort; inactive on AgentCore Runtime, which has no `CAP_NET_ADMIN`; see below) |
+
+#### Runtime Privilege Separation
+
+The container starts as root because the contract server is the trusted
+supervisor: it holds the execution role to fetch secrets, assume the per-user
+scoped credentials and run the Bedrock proxy. The untrusted agent is isolated
+*from* that supervisor rather than the whole container being dropped to non-root.
+
+- **Unprivileged agent uid.** The OpenClaw gateway and every process its `exec`
+  tool spawns (tool shells, `clawhub`, `openclaw doctor`) run as uid/gid 10001
+  (`bridge/runtime-privsep.js`), spawned from the root supervisor. Because the
+  kernel only lets the owning uid read another process's `/proc/<pid>/environ`,
+  the agent uid cannot read the supervisor's or the Bedrock proxy's environment,
+  and so cannot recover the execution role from that environment. That matters because the
+  execution role can read every user's `openclaw/cognito-user/*` secret. This
+  layer needs no Linux capability and is active whenever the container is root;
+  the startup log prints a loud warning if it is not.
+- **Agent uid files.** HOME stays `/root` (mode 0711) for the agent uid, so it can
+  reach its state dir in `/root/.openclaw` but cannot list or create anything else
+  in `/root`. Its caches, config and temp files go to `/home/openclaw` instead
+  (owned by uid 10001, mode 0700): the supervisor sets `XDG_CACHE_HOME`,
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `TMPDIR` and
+  `npm_config_cache` for every agent-uid child. `scripts/smoke-agent-uid-dirs.sh`
+  checks a built image for this. It needs a host with Linux 5.6 or newer, because
+  OpenClaw takes its state lock with `openat2`; on an older kernel (for example
+  CodeBuild's arm64 build hosts, kernel 4.14) it prints `SKIP` with the reason and
+  exits 0.
+- **/proc hidepid (best-effort).** The entrypoint remounts `/proc` with
+  `hidepid=2` so the agent uid cannot see other processes at all. Needs
+  `CAP_SYS_ADMIN`; skipped and logged when unavailable.
+- **Metadata network block (best-effort).** `bridge/mmds-firewall.sh` installs an
+  `iptables`/`ip6tables` owner-match rule dropping traffic **from the agent uid**
+  to the metadata service (`169.254.169.254/32`), the container credential
+  endpoint (`169.254.170.2/32`) and the IPv6 metadata address (`fd00:ec2::254`),
+  while the root supervisor keeps metadata access. It does not block the rest of
+  `169.254.0.0/16`, so the Amazon VPC DNS resolver (`169.254.169.253`) and the
+  Amazon Time Sync Service (`169.254.169.123`) keep working for the agent uid.
+  Where it is active, it stops a tool shell from calling the metadata endpoint
+  for the full, unscoped execution role. It needs `CAP_NET_ADMIN`; when unavailable the
+  script reports the block inactive, the container still starts, and the
+  least-privilege execution role is the remaining control. AWS documents that any
+  code in the microVM can reach the metadata endpoint, so scope the execution
+  role tightly.
+- **State ownership.** The supervisor writes restored state/config into
+  `~/.openclaw` as root, then hands the tree (and the scoped credential files) to
+  the agent uid before `openclaw doctor` and gateway activation, so the non-root
+  gateway can open the restored SQLite databases. The session-storage mount does
+  not enforce POSIX ownership, so only the local state dir needs this.
+
+The startup log states which of the three layers are active in a given runtime,
+in a `[privsep] protections: uid_split=... proc_environ_isolation=...
+proc_hidepid=... metadata_block=...` line; an inactive layer reads `INACTIVE`.
+
+**Credential endpoint caveat.** The firewall rules cover the credential endpoint
+only when it is served on `169.254.170.2` (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`)
+or on one of the metadata addresses. If the runtime instead provides
+`AWS_CONTAINER_CREDENTIALS_FULL_URI` on another address (for example a loopback
+listener), the agent uid can reach it, and the remaining protection is the
+authorization token: `AWS_CONTAINER_AUTHORIZATION_TOKEN` in the supervisor's
+environment is hidden by the uid split, but an
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` readable by other uids is not. The
+startup line `[privsep] container credential endpoint: relative_uri=...
+full_uri=... token_file=...` reports which shape a runtime uses (without printing
+any credential) and adds a NOTE when the shape is not covered. Check it in a
+staging startup log; the Bedrock proxy's `[proxy] Credential env:` line shows
+the same variables.
+
+**Measured on AgentCore Runtime (staging).** The uid split and `/proc`
+environ isolation are active and `hidepid` is active. The metadata firewall is
+**inactive**: the microVM has no `CAP_NET_ADMIN`, so the agent uid can still
+reach the instance metadata service (a token-less request gets HTTP 401, which
+means it is reachable and requires IMDSv2). Whether IMDSv2 hands the execution
+role's credentials to the agent uid was not measured. The runtime provided
+credentials through the metadata service only: no `AWS_CONTAINER_*` variable
+was set. Until that path is closed, scope the execution role as tightly as
+possible; reducing its scope is the remaining control for this path. Other
+runtimes may differ, so check the startup log's `[privsep]` lines.
 
 ### 3.9 Audit, Monitoring & Observability
 

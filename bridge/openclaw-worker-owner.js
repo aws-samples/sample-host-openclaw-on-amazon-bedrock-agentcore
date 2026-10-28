@@ -23,7 +23,7 @@ const BINDING_KEYS = ["userId", "actorId", "routingGeneration", "runtimeSessionI
 
 function createPreparedGateway({
   env, port = 18789, onChild = () => {}, onFailure = () => {},
-  prepareTimeoutMs = 120000, spawn = spawnChild,
+  prepareTimeoutMs = 120000, spawn = spawnChild, childOptions = {},
 }) {
   if (!env || !Number.isFinite(prepareTimeoutMs) || prepareTimeoutMs <= 0 ||
       !Number.isInteger(port) || port < 1 || port > 65535) {
@@ -123,6 +123,9 @@ function createPreparedGateway({
         "/usr/local/lib/node_modules/openclaw/openclaw.mjs",
         "gateway", "run", "--port", String(port), "--verbose",
       ], {
+        // childOptions carries { uid, gid } so the gateway (and every shell it
+        // spawns) runs unprivileged; empty when privilege separation is off.
+        ...childOptions,
         env: seed, stdio: ["ignore", "pipe", "pipe", "ipc"],
       });
       child.on("message", onMessage);
