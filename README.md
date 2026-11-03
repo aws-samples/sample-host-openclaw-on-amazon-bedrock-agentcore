@@ -267,6 +267,7 @@ All tunable parameters are in `cdk.json`:
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
 | `telegram_groups_enabled` | `false` | If `false`, the bot ignores every Telegram group and supergroup message, commands included. If `true`, it answers allowlisted groups (`ALLOW#telegram_group:<chat_id>`) as the group's own identity. `registration_open` never applies to groups. See [Telegram groups](docs/channels.md#telegram-groups) |
+| `router_log_reply_text` | `false` | Test deployments only. If `true`, the Router also logs the text of each Telegram reply, which the E2E tests in `tests/e2e/` need to check replies. Keep it `false` in production |
 | `token_ttl_days` | `90` | DynamoDB token usage record TTL |
 | `image_version` | (see `cdk.json`) | Bridge container version tag. Bump to force container redeploy |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |

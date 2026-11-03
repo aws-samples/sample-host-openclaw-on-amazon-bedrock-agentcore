@@ -59,6 +59,10 @@ REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "tru
 # are answered as their own identity (see telegram_group.py).
 TELEGRAM_GROUPS_ENABLED = os.environ.get("TELEGRAM_GROUPS_ENABLED", "false").lower() == "true"
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
+# Test deployments only (router_log_reply_text): also log the Telegram reply
+# text, which the E2E log tailer reads. Off by default, so replies stay out of
+# the router logs.
+LOG_REPLY_TEXT = os.environ.get("LOG_REPLY_TEXT", "false").lower() == "true"
 
 # --- Clients (lazy init on cold start) ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
@@ -1782,7 +1786,9 @@ def handle_telegram(body):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
     response_text = _extract_text_from_content_blocks(response_text)
-    logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
+    logger.info("Telegram response ready (len=%d, streamed=%s)", len(response_text), bool(result.get("streamed")))
+    if LOG_REPLY_TEXT:
+        logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
 
     # If contract already streamed progressively to Telegram, skip duplicate send
     if result.get("streamed"):
