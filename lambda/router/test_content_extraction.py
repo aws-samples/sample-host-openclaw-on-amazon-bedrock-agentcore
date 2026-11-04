@@ -269,6 +269,33 @@ class TestExtractTextFromContentBlocks(unittest.TestCase):
             index._extract_text_from_content_blocks(text)
             self.assertLess(time.monotonic() - start, 15.0)
 
+    def test_whitespace_run_after_brace_finishes_quickly(self):
+        """A long space or newline run after '}' does not make the block-close search quadratic."""
+        import time
+        for run in (" " * 200000, "\n" * 200000):
+            with self.subTest(run=repr(run[0])):
+                start = time.monotonic()
+                index._extract_text_from_content_blocks('[{"type":}' + run + "x")
+                self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_block_close_still_allows_whitespace_and_one_comma(self):
+        """'}]' with optional whitespace around at most one comma still closes a block."""
+        for closer in ("}]", "},]", "} ]", "}, ]", "} ,]", "} , ]", "}\n,\n]", "}\n\n]"):
+            with self.subTest(closer=closer):
+                match = index._BLOCK_CLOSE_RE.search("x" + closer + "y")
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group(), closer)
+        for text in ("}", "} x]", "},,]", "}, ,]"):
+            with self.subTest(text=text):
+                self.assertIsNone(index._BLOCK_CLOSE_RE.search(text))
+
+    def test_malformed_block_with_spaced_close_is_extracted(self):
+        """Malformed blocks closed with whitespace, with or without a comma, still yield their text."""
+        for raw in ('prefix [{"type":"text","text":"x"} ,\n ] suffix',
+                    'prefix [{"type":"text","text","x"}\n] suffix'):
+            with self.subTest(raw=raw):
+                self.assertEqual(index._extract_text_from_content_blocks(raw), "prefix x suffix")
+
     def test_content_block_after_many_brackets_is_unwrapped(self):
         """'[{' that cannot start JSON does not use up the decode budget."""
         text = "[{" * 5000 + ' [{"type":"text","text":"kept"}]'

@@ -1031,7 +1031,10 @@ def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_tar
 # ---------------------------------------------------------------------------
 
 # End of a (possibly malformed) content-block array: '}]' or '},]'.
-_BLOCK_CLOSE_RE = re.compile(r'\}\s*,?\s*\]')
+# The comma and the whitespace after it are one optional group, so a long
+# whitespace run after '}' is scanned once rather than split between two
+# '\s*' runs, which backtracks in time quadratic in the run's length.
+_BLOCK_CLOSE_RE = re.compile(r'\}\s*(?:,\s*)?\]')
 # Text value of a '{"type":"text","text":"..."}' block, for regex fallback.
 # Accepts ',' as well as ':' before the value (seen from models in the wild).
 _MALFORMED_TEXT_BLOCK_RE = re.compile(
