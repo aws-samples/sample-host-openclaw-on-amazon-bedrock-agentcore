@@ -20,7 +20,7 @@ function harness(t, { holdSpawn = false, holdBind = false, onKill, onPrepare } =
     stdout: { resume() {} }, stderr: { resume() {} } });
   child.kill = () => { onKill?.(stateRoot); child.exitCode = 0; child.emit("exit", 0); };
   let binding;
-  const processStub = { execPath: "/usr/local/bin/node", version: "v24.21.0", arch: "arm64",
+  const processStub = { execPath: "/usr/local/bin/node", version: "v24.22.1", arch: "arm64",
     platform: "linux", getuid: () => process.getuid(), kill: () => child.kill() };
   const fsStub = {
     ...fs,

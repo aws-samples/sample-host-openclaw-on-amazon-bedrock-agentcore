@@ -31,7 +31,7 @@ export function createInvariantPrewarmer() {
       const backend = seed.OPENCLAW_AGENTCORE_SQLITE_BACKEND_PREPARE;
       if (receiver === undefined && backend === undefined) return;
       if (receiver !== "1" || backend !== "1") throw new Error("Invalid SQLite preparation controls");
-      if (process.platform !== "linux" || process.arch !== "arm64" || process.version !== "v24.21.0" ||
+      if (process.platform !== "linux" || process.arch !== "arm64" || process.version !== "v24.22.1" ||
           Object.hasOwn(seed, "USER_ID") || Object.hasOwn(seed, "INTERNAL_USER_ID")) {
         throw new Error("SQLite preparation requires the pinned unbound runtime");
       }

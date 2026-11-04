@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Builder — install all dependencies and tools
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.21.0-slim@sha256:ba6b7d0ee561d9d49deb99e2b93c98632cc287b6cca1a6b18d66127054efa4dc AS builder
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.22.1-slim@sha256:932a44adcdb8f5dfbf00f00eb38da8d22b450b2ad258b6d1b2319beca823bfbd AS builder
 
 # Install system dependencies. ca-certificates is listed explicitly: with
 # --no-install-recommends only python3-pip pulls it in (git and libcurl4 merely
@@ -22,9 +22,29 @@ COPY patch-openclaw-preinit.js patch-openclaw-preinit.test.js /tmp/openclaw-patc
 COPY patch-openclaw-snapshot.js patch-openclaw-snapshot.test.js /tmp/openclaw-patch/
 COPY patches/runtime-v2.json /tmp/openclaw-patch/patches/runtime-v2.json
 COPY openclaw-preinit.mjs gateway-invariant-prewarm.mjs scoped-credentials.js /tmp/openclaw-patch/
+COPY undici-floor-check.js /tmp/openclaw-patch/undici-floor-check.js
 # Omit the empty subagent status fact at its source; keep active/completed status.
-RUN npm install -g openclaw@2026.9.5 clawhub@0.23.3 --allow-scripts=openclaw && \
-    OPENCLAW_PACKAGE_DIR=/usr/local/lib/node_modules/openclaw \
+RUN npm install -g openclaw@2026.9.5 clawhub@0.25.1 --allow-scripts=openclaw
+
+# Patch the undici response-decompression DoS (GHSA-xjj6-f33q-929c). openclaw
+# 2026.9.5 pins undici 8.10.2, which is vulnerable (fixed in 8.12.2); its
+# web_fetch tool reaches this copy, so a crafted reply can crash the gateway.
+# Swap in 8.12.2 in place, leaving the rest of openclaw's pinned tree
+# byte-for-byte as the release shipped it, then gate the build on every undici
+# the image can load (Node's global-fetch copy, openclaw's and clawhub's).
+# openclaw 2026.10.10 ships 8.12.2 and will remove the need for the swap (PR B);
+# the floor check stays. undici lives under node_modules, not in openclaw's
+# dist/, so the SHA-256-pinned dist patches below are unaffected — the three
+# patch-script test suites pass with the forced undici in place.
+RUN set -eu; \
+    npm install --prefix /tmp/undici-pin --no-save --no-audit --no-fund --ignore-scripts undici@8.12.2; \
+    undici_dir="$(node -e 'process.stdout.write(require("path").dirname(require.resolve("undici/package.json",{paths:["/usr/local/lib/node_modules/openclaw"]})))')"; \
+    test -n "$undici_dir" && test -f "$undici_dir/package.json"; \
+    find "$undici_dir" -mindepth 1 -delete; \
+    cp -a /tmp/undici-pin/node_modules/undici/. "$undici_dir/"; \
+    node /tmp/openclaw-patch/undici-floor-check.js
+
+RUN OPENCLAW_PACKAGE_DIR=/usr/local/lib/node_modules/openclaw \
       node --test /tmp/openclaw-patch/patch-openclaw.test.js \
         /tmp/openclaw-patch/patch-openclaw-preinit.test.js \
         /tmp/openclaw-patch/patch-openclaw-snapshot.test.js && \
@@ -107,10 +127,10 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 # Stage 2: Runtime — minimal image with only needed artifacts
 # ============================================================
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.21.0-slim@sha256:ba6b7d0ee561d9d49deb99e2b93c98632cc287b6cca1a6b18d66127054efa4dc
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:24.22.1-slim@sha256:932a44adcdb8f5dfbf00f00eb38da8d22b450b2ad258b6d1b2319beca823bfbd
 
 # Install only runtime system dependencies (no git, no pip, no build tools).
-# node:24.21.0-slim ships no CA bundle and --no-install-recommends drops the one
+# node:24.22.1-slim ships no CA bundle and --no-install-recommends drops the one
 # curl would otherwise pull in, so ca-certificates must be listed explicitly or
 # every `curl https://` inside the container fails (rc=77, "error setting
 # certificate file: /etc/ssl/certs/ca-certificates.crt"). Node's fetch uses its
@@ -131,6 +151,11 @@ COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-package
 
 # Copy OpenClaw and ClawHub from builder (global npm modules + binaries)
 COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+# Re-assert the undici floor (GHSA-xjj6-f33q-929c) on the shipped image: the
+# runtime base image's global-fetch undici plus the openclaw and clawhub copies
+# carried from the builder. Fails the build if any is below the fixed version.
+COPY undici-floor-check.js /tmp/undici-floor-check.js
+RUN node /tmp/undici-floor-check.js
 # Re-create symlinks instead of COPY (which resolves symlinks and breaks
 # relative imports like ./dist/entry.js in the openclaw ESM binary)
 RUN ln -s /usr/local/lib/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw && \
