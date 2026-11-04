@@ -96,7 +96,7 @@ class TestValidateFeishuWebhook(unittest.TestCase):
     def test_valid_signature(self, _mock_secret):
         """Valid signature returns True."""
         body = b'{"test": "data"}'
-        ts = "1234567890"
+        ts = str(int(time.time()))
         nonce = "abc123"
         sig = _make_feishu_signature(ts, nonce, ENCRYPT_KEY, body)
         headers = {
@@ -107,10 +107,34 @@ class TestValidateFeishuWebhook(unittest.TestCase):
         self.assertTrue(index.validate_feishu_webhook(headers, body))
 
     @patch.object(index, "_get_secret", return_value=FEISHU_SECRET)
+    def test_stale_timestamp_rejected(self, _mock_secret):
+        """Timestamp older than 5 minutes returns False (replay prevention)."""
+        body = b'{"test": "data"}'
+        ts = str(int(time.time()) - 600)  # 10 minutes old
+        nonce = "abc123"
+        sig = _make_feishu_signature(ts, nonce, ENCRYPT_KEY, body)
+        headers = {
+            "x-lark-request-timestamp": ts,
+            "x-lark-request-nonce": nonce,
+            "x-lark-signature": sig,
+        }
+        self.assertFalse(index.validate_feishu_webhook(headers, body))
+
+    @patch.object(index, "_get_secret", return_value=FEISHU_SECRET)
+    def test_non_numeric_timestamp_rejected(self, _mock_secret):
+        """Non-numeric timestamp returns False."""
+        headers = {
+            "x-lark-request-timestamp": "notanumber",
+            "x-lark-request-nonce": "abc123",
+            "x-lark-signature": "sig",
+        }
+        self.assertFalse(index.validate_feishu_webhook(headers, b"test"))
+
+    @patch.object(index, "_get_secret", return_value=FEISHU_SECRET)
     def test_invalid_signature(self, _mock_secret):
         """Wrong signature returns False."""
         headers = {
-            "x-lark-request-timestamp": "1234567890",
+            "x-lark-request-timestamp": str(int(time.time())),
             "x-lark-request-nonce": "abc123",
             "x-lark-signature": "wrong_signature",
         }
@@ -389,16 +413,55 @@ class TestDownloadFeishuImage(unittest.TestCase):
 class TestHandlerFeishuRouting(unittest.TestCase):
     """Tests for Feishu path routing in the Lambda handler."""
 
-    def test_feishu_challenge_routed(self):
-        """Feishu url_verification is handled synchronously (not async dispatched)."""
+    @patch.object(index, "_self_invoke_async")
+    @patch.object(index, "_get_secret", return_value=FEISHU_SECRET)
+    def test_feishu_challenge_routed(self, _mock_secret, mock_dispatch):
+        """Feishu url_verification carrying the app's Verification Token is
+        answered synchronously (not async dispatched)."""
         event = {
             "requestContext": {"http": {"method": "POST", "path": "/webhook/feishu"}},
-            "body": json.dumps({"type": "url_verification", "challenge": "test123"}),
+            "body": json.dumps({"type": "url_verification", "challenge": "test123", "token": "vtoken123"}),
             "headers": {},
         }
         result = index.handler(event, None)
         self.assertEqual(result["statusCode"], 200)
-        self.assertIn("test123", result["body"])
+        self.assertEqual(json.loads(result["body"]), {"challenge": "test123"})
+        mock_dispatch.assert_not_called()
+
+    @patch.object(index, "_self_invoke_async")
+    @patch.object(index, "_get_secret", return_value=FEISHU_SECRET)
+    def test_feishu_challenge_without_verification_token_rejected(self, _mock_secret, mock_dispatch):
+        """url_verification without the right Verification Token returns 401,
+        not an echo of the caller's challenge."""
+        for extra in ({}, {"token": "wrong-token"}, {"token": None}, {"token": "\u00e9"}):
+            with self.subTest(extra=extra):
+                event = {
+                    "requestContext": {"http": {"method": "POST", "path": "/webhook/feishu"}},
+                    "body": json.dumps({"type": "url_verification", "challenge": "test123", **extra}),
+                    "headers": {},
+                }
+                result = index.handler(event, None)
+                self.assertEqual(result["statusCode"], 401)
+                self.assertNotIn("test123", result["body"])
+        mock_dispatch.assert_not_called()
+
+    @patch.object(index, "_self_invoke_async")
+    @patch.object(index, "_get_secret", return_value="placeholder-not-json")
+    def test_feishu_challenge_answered_before_credentials_are_stored(self, _mock_secret, mock_dispatch):
+        """First-time setup: setup-feishu.sh has the Request URL saved before the
+        credentials are stored, so with no Verification Token stored yet the
+        challenge is answered as before. Other requests still fail closed."""
+        event = {
+            "requestContext": {"http": {"method": "POST", "path": "/webhook/feishu"}},
+            "body": json.dumps({"type": "url_verification", "challenge": "test123", "token": "vtoken123"}),
+            "headers": {},
+        }
+        result = index.handler(event, None)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(json.loads(result["body"]), {"challenge": "test123"})
+        event["body"] = json.dumps(_make_feishu_text_event())
+        self.assertEqual(index.handler(event, None)["statusCode"], 401)
+        mock_dispatch.assert_not_called()
 
     @patch.object(index, "validate_feishu_webhook", return_value=False)
     def test_feishu_invalid_signature_rejected(self, _mock_validate):

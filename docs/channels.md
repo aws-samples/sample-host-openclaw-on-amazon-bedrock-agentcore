@@ -73,31 +73,11 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
 7. Under **Show Tabs**, enable **Messages Tab**
 8. Check **Allow users to send Slash commands and messages from the messages tab**
 
-**Configure Event Subscriptions:**
+**Store credentials in Secrets Manager** (before the Request URL: the Router answers Slack's URL check only when it is signed with this signing secret):
 
-9. Get your API Gateway URL (you'll need this for the Request URL):
-    ```bash
-    aws cloudformation describe-stacks \
-      --stack-name OpenClawRouter \
-      --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
-      --output text --region $CDK_DEFAULT_REGION
-    ```
-10. Go to **Features** > **Event Subscriptions** and toggle **Enable Events** on
-11. Set the **Request URL** to your API URL followed by `webhook/slack`, e.g.:
-    ```
-    https://<your-api-id>.execute-api.us-west-2.amazonaws.com/webhook/slack
-    ```
-    Slack sends a verification challenge — you should see a green checkmark confirming the URL is valid.
-12. Under **Subscribe to bot events**, add:
-    - `message.im` — receive direct messages
-    - `message.channels` — messages in channels the bot is in (optional)
-13. Click **Save Changes**
-
-**Store credentials in Secrets Manager:**
-
-14. From **Settings** > **Basic Information** > **App Credentials**, copy the **Signing Secret** (a hex string like `a1b2c3d4...` — this is NOT the app-level token that starts with `xapp-`)
-15. From **Features** > **OAuth & Permissions**, copy the **Bot User OAuth Token** (starts with `xoxb-`)
-16. Store both values:
+9. From **Settings** > **Basic Information** > **App Credentials**, copy the **Signing Secret** (a hex string like `a1b2c3d4...` — this is NOT the app-level token that starts with `xapp-`)
+10. From **Features** > **OAuth & Permissions**, copy the **Bot User OAuth Token** (starts with `xoxb-`)
+11. Store both values:
     ```bash
     aws secretsmanager update-secret \
       --secret-id openclaw/channels/slack \
@@ -105,12 +85,32 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
       --region $CDK_DEFAULT_REGION
     ```
 
-The signing secret is used by the Router Lambda to validate `X-Slack-Signature` HMAC on every incoming webhook request (with 5-minute replay attack prevention).
+The signing secret is used by the Router Lambda to validate `X-Slack-Signature` HMAC on every incoming webhook request, the URL verification challenge included (with 5-minute replay attack prevention).
+
+**Configure Event Subscriptions:**
+
+12. Get your API Gateway URL (you'll need this for the Request URL):
+    ```bash
+    aws cloudformation describe-stacks \
+      --stack-name OpenClawRouter \
+      --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+      --output text --region $CDK_DEFAULT_REGION
+    ```
+13. Go to **Features** > **Event Subscriptions** and toggle **Enable Events** on
+14. Set the **Request URL** to your API URL followed by `webhook/slack`, e.g.:
+    ```
+    https://<your-api-id>.execute-api.us-west-2.amazonaws.com/webhook/slack
+    ```
+    Slack sends a verification challenge — you should see a green checkmark confirming the URL is valid. If Slack reports the URL as invalid, check the signing secret from step 11; the Router caches secrets for up to 15 minutes, so retry after that if you just changed it.
+15. Under **Subscribe to bot events**, add:
+    - `message.im` — receive direct messages
+    - `message.channels` — messages in channels the bot is in (optional)
+16. Click **Save Changes**
 
 **Add yourself to the allowlist:**
 
 17. Find your Slack member ID: click your profile picture → **Profile** → **⋯** (more) → **Copy member ID**
-18. Run the setup script (handles steps 9–11 and the allowlist in one go):
+18. Run the setup script (handles steps 12–14 and the allowlist in one go):
     ```bash
     ./scripts/setup-slack.sh
     ```
@@ -121,7 +121,7 @@ The signing secret is used by the Router Lambda to validate `X-Slack-Signature` 
 
 ## Feishu
 
-Feishu (飞书 / Lark) uses the Events API with the Router Lambda as the webhook endpoint (`POST /webhook/feishu`). Requests are validated with the `X-Lark-Signature` SHA-256 check (fail-closed if `encryptKey` is not set). The Lambda calls `open.feishu.cn` by default (`FEISHU_API_DOMAIN`), downloads image messages via `im/v1/images`, and caches the tenant access token.
+Feishu (飞书 / Lark) uses the Events API with the Router Lambda as the webhook endpoint (`POST /webhook/feishu`). Requests are validated with the `X-Lark-Signature` SHA-256 check (fail-closed if `encryptKey` is not set) and must be less than 5 minutes old. The Request URL verification challenge carries no signature; once a `verificationToken` is stored, the Router answers it only when it carries that token. The Lambda calls `open.feishu.cn` by default (`FEISHU_API_DOMAIN`), downloads image messages via `im/v1/images`, and caches the tenant access token.
 
 1. Create an app with **Bot** capability at [open.feishu.cn/app](https://open.feishu.cn/app)
 2. Run `./scripts/setup-feishu.sh` — it prints the Request URL for **Event Subscriptions**, stores the app credentials, and adds you to the allowlist
