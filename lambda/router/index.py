@@ -443,7 +443,8 @@ def validate_slack_webhook(headers, body):
         if abs(time.time() - int(timestamp)) > 300:
             logger.warning("Slack webhook timestamp too old (replay attack prevention)")
             return False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large to subtract from a float.
         logger.warning("Slack webhook invalid timestamp: %s", timestamp)
         return False
 
@@ -486,7 +487,8 @@ def validate_feishu_webhook(headers, body_bytes):
         if abs(time.time() - int(timestamp)) > 300:
             logger.warning("Feishu webhook timestamp too old (replay attack prevention)")
             return False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large to subtract from a float.
         logger.warning("Feishu webhook invalid timestamp: %s", timestamp)
         return False
 
