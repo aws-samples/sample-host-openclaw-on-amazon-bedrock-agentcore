@@ -55,6 +55,9 @@ class RouterStack(Stack):
         # Telegram groups: off by default, so every group message is ignored.
         telegram_groups_enabled = str(
             self.node.try_get_context("telegram_groups_enabled") or "false").lower() == "true"
+        # Test deployments only: log reply text for the E2E log tailer.
+        log_reply_text = str(
+            self.node.try_get_context("router_log_reply_text") or "false").strip().lower() == "true"
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
@@ -111,6 +114,7 @@ class RouterStack(Stack):
                 "TELEGRAM_GROUPS_ENABLED": "true" if telegram_groups_enabled else "false",
                 "USER_FILES_BUCKET": user_files_bucket_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
+                **({"LOG_REPLY_TEXT": "true"} if log_reply_text else {}),
             },
             log_group=router_log_group,
         )
