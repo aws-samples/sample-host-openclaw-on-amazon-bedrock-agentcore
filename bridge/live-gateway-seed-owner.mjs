@@ -32,7 +32,7 @@ export function createLiveGatewaySeedOwner(options) {
     fs.statSync(cwd).isDirectory() && Number.isInteger(port) && port > 1024 && port < 65536 &&
     Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 180000, "owner_options");
   check(process.platform === "linux" && process.arch === "arm64" &&
-    process.version === "v24.21.0" && node === process.execPath &&
+    process.version === "v24.22.1" && node === process.execPath &&
     cli === "/usr/local/lib/node_modules/openclaw/openclaw.mjs", "owner_runtime");
   const seedId = randomUUID();
   const stateRoot = path.join(home, ".openclaw");

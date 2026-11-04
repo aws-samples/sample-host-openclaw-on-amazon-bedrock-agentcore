@@ -83,7 +83,7 @@ function staticEnv(env) {
   return value;
 }
 function launchIdentity(env) {
-  check(process.platform === "linux" && process.arch === "arm64" && process.version === "v24.21.0" &&
+  check(process.platform === "linux" && process.arch === "arm64" && process.version === "v24.22.1" &&
     process.cwd() === "/app" && process.getuid() === 0 && process.getgid() === 0, "selector");
   let executable = null;
   for (const path of env.PATH.split(":")) {
