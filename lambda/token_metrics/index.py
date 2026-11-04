@@ -7,11 +7,12 @@ For each invocation log entry:
      the requestMetadata the bridge proxy sets on every Converse/ConverseStream call
   3. Computes estimated cost using model pricing lookup
   4. Writes record to DynamoDB with composite keys for multi-access patterns
-  5. Publishes CloudWatch custom metrics with dimensions
+  5. Publishes CloudWatch custom metrics by channel and model (never by actor)
 """
 
 import base64
 import gzip
+import hashlib
 import json
 import logging
 import os
@@ -163,6 +164,29 @@ UNBOUND_ACTOR = "default-user"
 
 def _clean(value, pattern=_SAFE_VALUE):
     return value if isinstance(value, str) and pattern.match(value) else None
+
+
+# A channel prefix is logged only if it is letters alone, so no digit of the
+# platform user ID can reach a log line.
+_LOG_CHANNEL = re.compile(r"^[a-z]{1,32}$")
+
+
+def actor_log_id(actor_id: str) -> str:
+    """The actor as it appears in log lines: "<channel>:sha256:<12 hex digits>".
+
+    A WhatsApp actor ID is "whatsapp:<phone number>", so the ID itself is never
+    logged (the Router logs only the internal user ID for the same reason).
+    The digest is unkeyed, like the internal user ID (user_<sha256 prefix>).
+    It keeps the number out of the log, but it is a pseudonym: hashing a known
+    or guessed actor ID finds that actor's lines. The unbound default-user is
+    not personal and is logged as is.
+    """
+    if actor_id == UNBOUND_ACTOR:
+        return actor_id
+    digest = hashlib.sha256(actor_id.encode("utf-8")).hexdigest()[:12]
+    channel, sep, _ = actor_id.partition(":")
+    prefix = f"{channel}:" if sep and _LOG_CHANNEL.match(channel) else ""
+    return f"{prefix}sha256:{digest}"
 
 
 def _as_dict(value) -> dict:
@@ -321,9 +345,14 @@ def write_to_dynamodb(record: dict):
 
 
 def publish_metrics(record: dict):
-    """Publish CloudWatch custom metrics with dimensions."""
+    """Publish CloudWatch custom metrics by channel and model.
+
+    The actor ID is not a dimension: for WhatsApp it is the user's phone
+    number, CloudWatch keeps metric data for up to 15 months and cannot delete
+    it, and anyone allowed cloudwatch:ListMetrics can read dimension values.
+    Per-user totals are in DynamoDB.
+    """
     dimensions_base = [
-        {"Name": "ActorId", "Value": record["actor_id"]},
         {"Name": "Channel", "Value": record["channel"]},
         {"Name": "ModelId", "Value": record["model_id"]},
     ]
@@ -452,7 +481,7 @@ def process_log_entry(log_entry: dict):
         input_tokens,
         output_tokens,
         cost,
-        metadata["actor_id"],
+        actor_log_id(metadata["actor_id"]),
         metadata["channel"],
         metadata["agent_type"],
         metadata["attribution"],
