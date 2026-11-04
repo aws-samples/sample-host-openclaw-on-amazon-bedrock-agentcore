@@ -55,7 +55,7 @@ class RouterStack(Stack):
         # Telegram groups: off by default, so every group message is ignored.
         telegram_groups_enabled = str(
             self.node.try_get_context("telegram_groups_enabled") or "false").lower() == "true"
-        # Test deployments only: log the Telegram reply text for the E2E log tailer.
+        # Test deployments only: log reply text for the E2E log tailer.
         log_reply_text = str(
             self.node.try_get_context("router_log_reply_text") or "false").strip().lower() == "true"
 

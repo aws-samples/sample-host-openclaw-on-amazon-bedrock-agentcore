@@ -12,6 +12,8 @@ and values are placeholders.
 
 import ast
 import importlib.util
+import io
+import json
 import logging
 import os
 import sys
@@ -57,8 +59,13 @@ def test_router_logs_reply_text_only_when_opted_in(tmp_path, value):
     assert _router_env(tmp_path, router_log_reply_text=value)["LOG_REPLY_TEXT"] == "true"
 
 
-def test_reply_text_log_line_is_behind_the_flag():
-    """The only log call that formats the reply text sits under `if LOG_REPLY_TEXT:`."""
+# Log lines that format reply text: the Telegram reply, and the start of the
+# raw AgentCore response body (which holds the reply for every channel).
+REPLY_TEXT_LOG_LINES = ("Response to send", "AgentCore response (len=%d, first")
+
+
+def test_reply_text_log_lines_are_behind_the_flag():
+    """Every log call that formats reply text sits under `if LOG_REPLY_TEXT:`."""
     tree = ast.parse(ROUTER.read_text())
     guarded, unguarded = [], []
 
@@ -68,13 +75,15 @@ def test_reply_text_log_line_is_behind_the_flag():
                                   and node.test.id == "LOG_REPLY_TEXT" and child in node.body)
             if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
                     and isinstance(child.func.value, ast.Name) and child.func.value.id == "logger"
-                    and child.args and isinstance(child.args[0], ast.Constant)
-                    and "Response to send" in str(child.args[0].value)):
-                (guarded if flag else unguarded).append(child.lineno)
+                    and child.args and isinstance(child.args[0], ast.Constant)):
+                for marker in REPLY_TEXT_LOG_LINES:
+                    if marker in str(child.args[0].value):
+                        (guarded if flag else unguarded).append((marker, child.lineno))
             visit(child, flag)
 
     visit(tree, False)
-    assert guarded and not unguarded, (guarded, unguarded)
+    assert not unguarded, unguarded
+    assert {marker for marker, _ in guarded} == set(REPLY_TEXT_LOG_LINES), guarded
 
 
 def test_log_tailer_reads_length_without_text_and_text_when_logged():
@@ -104,15 +113,22 @@ def _load_router(log_reply_text=None):
 
 
 def _telegram_turn(module, caplog):
-    """One private-chat turn whose agent reply carries a key value and a presigned URL."""
+    """One private-chat turn whose agent reply carries a key value and a presigned URL.
+
+    Only the AgentCore client is faked, so invoke_agent_runtime() runs and logs
+    the response it reads, as it does in a deployed Router.
+    """
     sent = []
+    runtime = MagicMock()
+    runtime.invoke_agent_runtime.return_value = {
+        "statusCode": 200, "response": io.BytesIO(json.dumps({"response": REPLY}).encode())}
     with patch.object(module, "_get_telegram_token", return_value="900000001:test-token"), \
             patch.object(module, "resolve_user", return_value=("user_test", False)), \
             patch.object(module, "get_or_create_session", return_value="ses_test"), \
             patch.object(module, "send_telegram_typing"), \
             patch.object(module, "_periodic_typing"), \
             patch.object(module, "send_telegram_message"), \
-            patch.object(module, "invoke_agent_runtime", return_value={"response": REPLY}), \
+            patch.object(module, "agentcore_client", runtime), \
             patch.object(module, "_send_telegram_chunks",
                          side_effect=lambda chat_id, text, token, **kwargs: sent.append(text)), \
             caplog.at_level(logging.DEBUG):

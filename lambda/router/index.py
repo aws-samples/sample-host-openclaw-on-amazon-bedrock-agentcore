@@ -59,9 +59,9 @@ REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "tru
 # are answered as their own identity (see telegram_group.py).
 TELEGRAM_GROUPS_ENABLED = os.environ.get("TELEGRAM_GROUPS_ENABLED", "false").lower() == "true"
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
-# Test deployments only (router_log_reply_text): also log the Telegram reply
-# text, which the E2E log tailer reads. Off by default, so replies stay out of
-# the router logs.
+# Test deployments only (router_log_reply_text): also log reply text (the first
+# 200 characters of each AgentCore response and each Telegram reply), which the
+# E2E log tailer reads. Off by default, so replies stay out of the router logs.
 LOG_REPLY_TEXT = os.environ.get("LOG_REPLY_TEXT", "false").lower() == "true"
 
 # --- Clients (lazy init on cold start) ---
@@ -665,7 +665,9 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
                     body_text = body_text[:MAX_RESPONSE_BYTES]
             else:
                 body_text = str(body)[:MAX_RESPONSE_BYTES]
-            logger.info("AgentCore response (len=%d, first 200 chars): %s", len(body_text), body_text[:200])
+            logger.info("AgentCore response received (len=%d)", len(body_text))
+            if LOG_REPLY_TEXT:
+                logger.info("AgentCore response (len=%d, first 200 chars): %s", len(body_text), body_text[:200])
             try:
                 return json.loads(body_text)
             except json.JSONDecodeError:

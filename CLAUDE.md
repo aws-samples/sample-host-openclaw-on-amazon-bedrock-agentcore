@@ -430,7 +430,7 @@ cd tests/e2e && python -m pytest bot_test.py -v                    # simulated T
 cd tests/e2e && python -m pytest bot_test.py -v -k TestBrowserFeature  # browser E2E tests (requires enable_browser=true)
 ```
 
-The Router logs only the length of a Telegram reply. Tests that check reply text need a test deployment with `router_log_reply_text` set to `true`; without it `TailResult.response_text` stays empty.
+The Router logs only the length of each reply. Tests that check reply text need a test deployment with `router_log_reply_text` set to `true`; without it `TailResult.response_text` stays empty.
 
 ### Runtime Operations
 ```bash
@@ -516,7 +516,7 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agen
 | `router_lambda_timeout_seconds` | `300` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
 | `registration_open` | `false` | If true, any user can register. If false, only allowlisted users |
-| `router_log_reply_text` | `false` | Test deployments only: the Router also logs Telegram reply text, which `tests/e2e/log_tailer.py` needs to check replies |
+| `router_log_reply_text` | `false` | Test deployments only: the Router also logs reply text, which `tests/e2e/log_tailer.py` needs to check replies |
 | `cron_lambda_timeout_seconds` | `600` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
 | `enable_cloudtrail` | `false` | Deploy a dedicated CloudTrail trail (S3 bucket + trail). Off by default — most accounts already have one |

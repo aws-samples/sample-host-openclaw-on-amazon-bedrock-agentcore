@@ -23,6 +23,7 @@ PATTERNS = {
     "agentcore_invoked": re.compile(
         r"Invoking AgentCore: arn=(\S+) qualifier=(\S+) session=(\S+)"
     ),
+    # Logged only when the stack is deployed with router_log_reply_text=true.
     "agentcore_response": re.compile(
         r"AgentCore response \(len=\d+, first \d+ chars\): (.+)", re.DOTALL
     ),
