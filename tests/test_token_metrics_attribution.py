@@ -7,12 +7,17 @@ Records written before that, or by another caller, have none and must keep
 accumulating exactly as before: default-user / unknown / default-session, on
 the old sort key.
 
+The actor ID stays in the DynamoDB row only. A WhatsApp actor ID is the user's
+phone number, so it is neither a CloudWatch metric dimension nor in a log line.
+
     pytest tests/test_token_metrics_attribution.py -v
 """
 
 import base64
 import gzip
+import hashlib
 import json
+import logging
 from decimal import Decimal
 from unittest.mock import MagicMock
 
@@ -147,13 +152,62 @@ def test_legacy_fields_still_fill_when_there_is_no_request_metadata(tm):
         ("slack:U0XXXXXXX", "legacy-s", "unknown", "legacy")
 
 
-def test_metrics_dimensions_are_unchanged(tm):
+def test_metrics_are_dimensioned_by_channel_and_model_only(tm):
     tm.process_log_entry(_log(_meta(agent="subagent")))
     calls = tm.cloudwatch.put_metric_data.call_args_list
     dims = {tuple(d["Name"] for d in m["Dimensions"]) for c in calls for m in c.kwargs["MetricData"]}
-    assert dims == {("ActorId", "Channel", "ModelId"), ()}
-    actor_dims = [m["Dimensions"] for c in calls for m in c.kwargs["MetricData"] if m["Dimensions"]]
-    assert actor_dims[0][0] == {"Name": "ActorId", "Value": "telegram:1001"}
+    assert dims == {("Channel", "ModelId"), ()}
+    dimensioned = [m["Dimensions"] for c in calls for m in c.kwargs["MetricData"] if m["Dimensions"]]
+    assert dimensioned[0] == [{"Name": "Channel", "Value": "telegram"},
+                              {"Name": "ModelId", "Value": "global.anthropic.claude-opus-5-5"}]
+
+
+def _cwl_event(*entries):
+    """The CloudWatch Logs subscription event the handler receives."""
+    events = [{"id": str(i), "timestamp": 0, "message": json.dumps(e)} for i, e in enumerate(entries)]
+    payload = {"logGroup": "/aws/bedrock/invocation-logs", "logEvents": events}
+    return {"awslogs": {"data": base64.b64encode(gzip.compress(json.dumps(payload).encode())).decode()}}
+
+
+@pytest.mark.parametrize("actor, channel, platform_id", [
+    ("whatsapp:15551234567", "whatsapp", "15551234567"),  # the user's phone number
+    ("telegram:987654321", "telegram", "987654321"),
+], ids=["whatsapp", "telegram"])
+def test_actor_id_reaches_neither_metric_dimensions_nor_logs(tm, caplog, actor, channel, platform_id):
+    with caplog.at_level(logging.DEBUG):
+        result = tm.handler(_cwl_event(_log(_meta(actor=actor, channel=channel))), None)
+    assert result == {"processed": 1, "errors": 0, "total": 1}
+    # Per-user totals stay in DynamoDB, keyed by the actor as before.
+    (key,) = _rows(tm)
+    assert key[0] == f"USER#{actor}"
+
+    data = [m for c in tm.cloudwatch.put_metric_data.call_args_list for m in c.kwargs["MetricData"]]
+    dimension_values = {d["Value"] for m in data for d in m["Dimensions"]}
+    assert dimension_values == {channel, "global.anthropic.claude-opus-5-5"}
+    assert [m for m in data if platform_id in repr(m)] == []
+
+    messages = [r.getMessage() for r in caplog.records]
+    [line] = [m for m in messages if m.startswith("Processing invocation:")]
+    digest = hashlib.sha256(actor.encode()).hexdigest()[:12]
+    assert f" actor={channel}:sha256:{digest} channel={channel} " in line
+    assert [m for m in messages if platform_id in m] == []
+
+
+@pytest.mark.parametrize("actor, prefix", [
+    ("whatsapp:15551234567", "whatsapp:"),
+    ("slack:U0XXXXXXX", "slack:"),
+    ("15551234567:x", ""),            # no channel word before the colon
+    ("wa15551234567:x", ""),          # digits in the prefix: dropped
+    ("15551234567", ""),              # no colon at all
+    ("sha256:" + "ab" * 16, ""),      # actor the bridge sent as a hash
+])
+def test_log_id_is_a_digest_behind_a_plain_channel_word(tm, actor, prefix):
+    digest = hashlib.sha256(actor.encode()).hexdigest()[:12]
+    assert tm.actor_log_id(actor) == f"{prefix}sha256:{digest}"
+
+
+def test_unbound_actor_is_logged_as_is(tm):
+    assert tm.actor_log_id("default-user") == "default-user"
 
 
 def test_handler_mixes_old_and_new_records_in_one_batch(tm):
