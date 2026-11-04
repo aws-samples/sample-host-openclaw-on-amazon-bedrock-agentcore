@@ -160,7 +160,7 @@ cd ~/g-repo/openclaw-deploy/bridge
 sudo docker build --platform linux/arm64 -t openclaw-bridge:usw2 .
 
 # Test locally
-sudo docker run --rm -d --name test -p 8080:8080 -e AWS_REGION=us-west-2 openclaw-bridge:usw2
+sudo docker run --rm -d --name test -p 127.0.0.1:8080:8080 -e AWS_REGION=us-west-2 openclaw-bridge:usw2
 curl http://localhost:8080/ping
 sudo docker stop test
 
