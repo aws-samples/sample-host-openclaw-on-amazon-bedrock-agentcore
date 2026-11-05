@@ -174,7 +174,7 @@ function validateUserId(userId) {
   // Namespace must match channel_identifier pattern (e.g., telegram_123456789, slack_U0XXXXXXXX1).
   // This is a format gate only; assertOwnNamespace below proves ownership.
   const VALID_NAMESPACE =
-    /^(telegram|slack|discord|whatsapp|line)_[a-zA-Z0-9_-]{1,64}$/;
+    /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}$/;
   if (!VALID_NAMESPACE.test(userId)) {
     console.error(
       `Error: Invalid user_id "${userId}". Must match channel_identifier format (e.g., telegram_123456, slack_username).`,

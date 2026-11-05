@@ -203,10 +203,11 @@ function buildSessionPolicy({ bucket, namespace, internalUserId, eventbridgeRole
       Resource: `arn:aws:secretsmanager:${region}:${account}:secret:openclaw/user/${namespace}/*`,
     });
   }
-  // ListSecrets has no resource-level permissions. The api-keys skill uses it
-  // (prefix-filtered) for `list` and the per-user secret limit; it returns
-  // secret names and metadata, never values.
-  statements.push({ Effect: "Allow", Action: "secretsmanager:ListSecrets", Resource: "*" });
+  // No secretsmanager:ListSecrets: it has no resource-level permissions, so it
+  // cannot be scoped to one tenant. The api-keys skill tracks the user's own
+  // key names in a per-user index under the user's S3 prefix
+  // (skills/api-keys/secrets-index.js), so `list` and the per-user secret
+  // limit need no account-wide secret enumeration.
 
   if (identityTableArn && internalUserId) {
     // eventbridge-cron skill: CRON# items under the user's own partition only.

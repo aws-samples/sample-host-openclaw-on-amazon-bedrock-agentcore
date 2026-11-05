@@ -20,8 +20,11 @@ const USER_ID = "telegram_123456";
 const KEY_NAME = "demo_key";
 const SECRET_VALUE = "sk-test-value";
 
-// Preload stub: records every SecretsManager command to SM_STUB_LOG.
-// SM_STUB selects the GetSecretValue response: "string" (default), "binary", "empty".
+// Preload stub: records every SecretsManager command to SM_STUB_LOG, and fakes
+// @aws-sdk/client-s3 with an in-memory, conditional-write object store so the
+// api-keys name index (secrets-index.js) runs without AWS. SM_STUB selects the
+// GetSecretValue response: "string" (default), "binary", "empty". The S3 store
+// lives on globalThis because secrets-index re-requires the SDK per call.
 const STUB_SOURCE = `
 const Module = require("module");
 const fs = require("fs");
@@ -49,6 +52,34 @@ Module._load = function (req, ...rest) {
       DeleteSecretCommand: mk("DeleteSecretCommand"),
     };
   }
+  if (req === "@aws-sdk/client-s3") {
+    const mk = (name) => class { constructor(input) { this.name = name; this.input = input; } };
+    const s3 = globalThis.__S3_STUB__ || (globalThis.__S3_STUB__ = { map: new Map(), etag: 0 });
+    const precond = () => { const e = new Error("precondition failed"); e.name = "PreconditionFailed"; e.$metadata = { httpStatusCode: 412 }; return e; };
+    return {
+      S3Client: class {
+        async send(cmd) {
+          const input = cmd.input;
+          if (cmd.name === "GetObjectCommand") {
+            const obj = s3.map.get(input.Key);
+            if (!obj) { const e = new Error("NoSuchKey"); e.name = "NoSuchKey"; e.$metadata = { httpStatusCode: 404 }; throw e; }
+            return { ETag: obj.etag, Body: { transformToString: async () => obj.body } };
+          }
+          if (cmd.name === "PutObjectCommand") {
+            const existing = s3.map.get(input.Key);
+            if (input.IfNoneMatch === "*" && existing) throw precond();
+            if (input.IfMatch && (!existing || existing.etag !== input.IfMatch)) throw precond();
+            const etag = '"s3-' + (++s3.etag) + '"';
+            s3.map.set(input.Key, { body: input.Body, etag });
+            return { ETag: etag };
+          }
+          return {};
+        }
+      },
+      GetObjectCommand: mk("GetObjectCommand"),
+      PutObjectCommand: mk("PutObjectCommand"),
+    };
+  }
   return orig.call(this, req, ...rest);
 };
 `;
@@ -63,6 +94,7 @@ function run(script, args, extraEnv = {}) {
     PATH: process.env.PATH,
     HOME: tmp,
     AWS_REGION: "us-west-2",
+    S3_USER_FILES_BUCKET: "openclaw-user-files-test",
     // The session's own user ("channel:id"); scripts refuse any other user_id.
     USER_ID: USER_ID.replace("_", ":"),
     SM_STUB_LOG: logPath,

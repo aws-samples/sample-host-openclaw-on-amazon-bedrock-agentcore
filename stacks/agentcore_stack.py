@@ -203,14 +203,11 @@ class AgentCoreStack(Stack):
                 ],
             )
         )
-        # ListSecrets does not support resource-level restrictions (AWS API limitation).
-        # Results filtered by prefix in application code (executeManageSecret).
-        self.execution_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["secretsmanager:ListSecrets"],
-                resources=["*"],
-            )
-        )
+        # No secretsmanager:ListSecrets grant: it cannot be restricted to a
+        # single tenant's secrets. The api-keys skill lists a user's own key
+        # names from a per-user index kept in that user's S3 prefix
+        # (bridge/skills/api-keys/secrets-index.js) instead of enumerating
+        # Secrets Manager, so no caller the agent can reach needs it.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["kms:Decrypt"],

@@ -163,6 +163,10 @@ describe("validateUserId", () => {
     asUser("line:U0000000000000000000000000000001", () => assert.doesNotThrow(() => validateUserId("line_U0000000000000000000000000000001")));
   });
 
+  it("accepts valid feishu namespace", () => {
+    asUser("feishu:ou_abc123def456", () => assert.doesNotThrow(() => validateUserId("feishu_ou_abc123def456")));
+  });
+
   it("accepts valid slack namespace with uppercase ID", () => {
     asUser("slack:U0XXXXXXXX1", () => assert.doesNotThrow(() => validateUserId("slack_U0XXXXXXXX1")));
   });
