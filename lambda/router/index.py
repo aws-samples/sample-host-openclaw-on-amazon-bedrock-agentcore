@@ -50,6 +50,7 @@ import whatsapp
 import discord_channel
 import formatting
 import line_channel
+import telegram_album
 import telegram_group
 import channel_identity
 import usage_limits
@@ -2475,12 +2476,23 @@ def handle_telegram(body):
         if doc_kind is None:
             return
 
+    # The items of an album share one turn and one reply (telegram_album.py).
+    # An item's own failure reply is held: the album reports failures once.
+    album = None if has_document else telegram_album.join(
+        message, text, resolved_user_id, has_image, telegram_album.DynamoAlbumStore(identity_table), reply)
+    if album is not None:
+        if album.duplicate:
+            return
+        reply = album.hold_reply
+
     # Send typing indicator
     send_telegram_typing(chat_id, token)
 
     # Build message payload (structured if image, plain string if text-only)
     namespace = session_id.namespace if (doc_kind or has_image) else None
     agent_message = _telegram_agent_message(message, text, document, doc_kind, has_image, namespace, token, reply)
+    if album is not None:
+        agent_message = album.finish(agent_message)
     if agent_message is None:
         return
 
