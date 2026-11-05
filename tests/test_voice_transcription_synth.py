@@ -2,9 +2,10 @@
 
 - Off (the default) adds nothing: no VOICE_* variables, no Transcribe or
   voice_* S3 statements, so the templates are what they were before the setting.
-- On, the Router gets the VOICE_* variables and two statements: the three
-  Transcribe job actions on transcription-job/oc-*, and GetObject, DeleteObject
-  and DeleteObjectVersion on */_uploads/voice_*. Nothing else in any stack
+- On, the Router gets the VOICE_* variables and three statements:
+  StartTranscriptionJob on *, GetTranscriptionJob and DeleteTranscriptionJob
+  on transcription-job/oc-*, and GetObject, DeleteObject and
+  DeleteObjectVersion on */_uploads/voice_*. Nothing else in any stack
   changes, and cdk-nag reports no unsuppressed errors.
 - Values outside the documented ranges fail the synth.
 
@@ -22,8 +23,12 @@ from stacks.router_stack import voice_transcription
 from tests._app_synth import ACCOUNT, REGION, resources, synth_app, synth_errors
 
 ON = {"voice_transcription": "transcribe", "voice_language_options": ["en-US", "zh-CN"]}
-TRANSCRIBE_ACTIONS = {"transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob",
-                      "transcribe:DeleteTranscriptionJob"}
+# Resource types from the Service Authorization Reference (list_transcribe.html):
+# StartTranscriptionJob has none, so only a statement on "*" allows it; Get and
+# DeleteTranscriptionJob require transcriptionjob (transcription-job/${JobName}).
+START_ACTIONS = {"transcribe:StartTranscriptionJob"}
+JOB_ACTIONS = {"transcribe:GetTranscriptionJob", "transcribe:DeleteTranscriptionJob"}
+TRANSCRIBE_ACTIONS = START_ACTIONS | JOB_ACTIONS
 VOICE_OBJECT_ACTIONS = {"s3:GetObject", "s3:DeleteObject", "s3:DeleteObjectVersion"}
 JOBS_ARN = f"arn:aws:transcribe:{REGION}:{ACCOUNT}:transcription-job/oc-*"
 
@@ -62,7 +67,7 @@ def test_off_by_default_adds_nothing():
     assert "transcribe" not in str(templates).lower().replace("transcribed", "")
 
 
-def test_on_adds_the_variables_and_two_statements():
+def test_on_adds_the_variables_and_three_statements():
     stack, function_id, policies = _router(synth_app(**ON))
     variables = stack["Resources"][function_id]["Properties"]["Environment"]["Variables"]
     assert {name: value for name, value in variables.items() if name.startswith("VOICE_")} == {
@@ -71,15 +76,23 @@ def test_on_adds_the_variables_and_two_statements():
         "VOICE_TRANSCRIBE_TIMEOUT_SECONDS": "45",
         "VOICE_LANGUAGE_OPTIONS": '["en-US","zh-CN"]',
     }
-    statements = [s for policy in policies.values() for s in policy["Properties"]["PolicyDocument"]["Statement"]
-                  if _is_voice_statement(s)]
-    assert len(statements) == 2
-    jobs, objects = sorted(statements, key=lambda s: "s3:" in str(s["Action"]))
-    assert jobs["Effect"] == "Allow" and _actions(jobs) == TRANSCRIBE_ACTIONS and jobs["Resource"] == JOBS_ARN
+    role_statements = [s for policy in policies.values() for s in policy["Properties"]["PolicyDocument"]["Statement"]]
+    statements = [s for s in role_statements if _is_voice_statement(s)]
+    assert len(statements) == 3
+    start = [s for s in statements if _actions(s) & START_ACTIONS]
+    jobs = [s for s in statements if _actions(s) & JOB_ACTIONS]
+    objects = [s for s in statements if "s3:" in str(s["Action"])]
+    assert len(start) == len(jobs) == len(objects) == 1
+    (start,), (jobs,), (objects,) = start, jobs, objects
+    # A statement on a job ARN does not allow StartTranscriptionJob, which has no resource type.
+    assert start["Effect"] == "Allow" and _actions(start) == START_ACTIONS and start["Resource"] == "*"
+    assert jobs["Effect"] == "Allow" and _actions(jobs) == JOB_ACTIONS and jobs["Resource"] == JOBS_ARN
     assert objects["Effect"] == "Allow" and _actions(objects) == VOICE_OBJECT_ACTIONS
     join = objects["Resource"]["Fn::Join"][1]
     assert "Fn::ImportValue" in str(join[0]) and join[1:] == ["/*/_uploads/voice_*"]  # the user-files bucket
-    assert "Condition" not in jobs and "Condition" not in objects
+    assert not [s for s in statements if "Condition" in s]
+    # The Resource::* nag entry added when on covers this statement only.
+    assert [s for s in role_statements if s["Resource"] == "*"] == [start]
 
 
 def test_turning_it_on_changes_only_the_router_variables_and_role_policy():

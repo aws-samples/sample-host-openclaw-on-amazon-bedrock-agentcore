@@ -424,16 +424,23 @@ class RouterStack(Stack):
         )
 
         # Voice transcription, only when on (lambda/router/voice.py). The Router
-        # starts, polls and deletes its own jobs, named oc-<uuid4 hex>. Transcribe
-        # reads the stored audio with the Router's permissions (and its kms:Decrypt
-        # above), and the Router deletes that exact object version afterwards.
+        # starts, polls and deletes its own jobs, named oc-<uuid4 hex>. The Service
+        # Authorization Reference lists no resource type for StartTranscriptionJob,
+        # so only "*" allows it; Get and DeleteTranscriptionJob take the job ARN.
+        # Transcribe reads the stored audio with the Router's permissions (and its
+        # kms:Decrypt above), and the Router deletes that exact object version afterwards.
         transcribe_jobs_arn = f"arn:aws:transcribe:{region}:{account}:transcription-job/oc-*"
         voice_objects_arn = f"{user_files_bucket_arn}/*/_uploads/voice_*"
         if voice_env:
             self.router_fn.add_to_role_policy(
                 iam.PolicyStatement(
+                    actions=["transcribe:StartTranscriptionJob"],
+                    resources=["*"],
+                )
+            )
+            self.router_fn.add_to_role_policy(
+                iam.PolicyStatement(
                     actions=[
-                        "transcribe:StartTranscriptionJob",
                         "transcribe:GetTranscriptionJob",
                         "transcribe:DeleteTranscriptionJob",
                     ],
@@ -481,7 +488,9 @@ class RouterStack(Stack):
                     "DynamoDB grant_read_write_data adds index wildcards and KMS "
                     "wildcards for CMK-encrypted table. S3 PutObject scoped to "
                     "*/_uploads/* prefix for image uploads."
-                    + (" Voice transcription: Transcribe jobs named oc-* (the Router names each "
+                    + (" Voice transcription: transcribe:StartTranscriptionJob on * (the Service "
+                       "Authorization Reference lists no resource type for it), Get and "
+                       "DeleteTranscriptionJob on jobs named oc-* (the Router names each "
                        "oc-<uuid4 hex>), and the */_uploads/voice_* objects Transcribe reads and the "
                        "Router deletes." if voice_env else ""),
                     applies_to=[
@@ -493,7 +502,8 @@ class RouterStack(Stack):
                         ],
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
-                        *([f"Resource::{transcribe_jobs_arn}",
+                        *(["Resource::*",
+                           f"Resource::{transcribe_jobs_arn}",
                            "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/voice_*"] if voice_env else []),
                         "Action::kms:GenerateDataKey*",
                         "Action::kms:ReEncrypt*",
