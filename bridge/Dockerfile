@@ -263,6 +263,23 @@ COPY patches/runtime-v2.json /app/patches/runtime-v2.json
 # /skills/ — scanned via extraDirs config (skills also copied to home dir during user setup below)
 COPY skills/s3-user-files /skills/s3-user-files
 RUN chmod +x /skills/s3-user-files/*.js
+# read_pdf_text (read-pdf.js) imports clawpdf, a direct bridge dependency
+# (package.json), so it does not depend on openclaw's own copy. Fail the build
+# unless clawpdf 0.3.2 resolves from /app and, through /skills/node_modules,
+# from the skill directory.
+RUN for dir in /app /skills/s3-user-files; do \
+      (cd "$dir" && node --input-type=module -e " \
+        import { readFileSync } from 'node:fs'; \
+        import { fileURLToPath } from 'node:url'; \
+        const url = import.meta.resolve('clawpdf'); \
+        const entry = fileURLToPath(url); \
+        const { name, version } = JSON.parse(readFileSync(new URL('../package.json', url), 'utf8')); \
+        if (name !== 'clawpdf' || version !== '0.3.2' || !entry.startsWith('/app/node_modules/clawpdf/')) \
+          throw new Error('expected clawpdf 0.3.2 in /app/node_modules, found ' + name + ' ' + version + ' at ' + entry); \
+        if (typeof (await import('clawpdf')).openPdf !== 'function') throw new Error('clawpdf has no openPdf'); \
+        console.log('[build] clawpdf ' + version + ' resolves from ' + process.cwd()); \
+      ") || exit 1; \
+    done
 
 # Copy EventBridge cron scheduling skill
 COPY skills/eventbridge-cron /skills/eventbridge-cron
