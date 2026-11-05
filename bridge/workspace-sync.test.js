@@ -845,7 +845,8 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
       send: async (cmd) => {
         if (cmd.kind === "list") {
           return {
-            Contents: Object.entries(objects).map(([Key, body]) => ({ Key, Size: Buffer.byteLength(body) })),
+            Contents: Object.entries(objects).filter(([Key]) => Key.startsWith(cmd.input.Prefix || ""))
+              .map(([Key, body]) => ({ Key, Size: Buffer.byteLength(body) })),
             IsTruncated: false,
           };
         }
@@ -993,6 +994,30 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
     fs.writeFileSync(soul, "soul v2\n");
     await workspaceSync.saveWorkspace("telegram_1");
     assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/SOUL.md"]);
+  });
+
+  // A user moved to a stored namespace (scripts/namespace_cutover.py): the session
+  // storage mount still mirrors the state dir from before the move, and the
+  // objects under the new prefix are server-side copies that keep their metadata.
+  it("a state dir filled under one namespace restores under its copied new namespace without re-uploads", async () => {
+    const soul = path.join(tmpDir, ".openclaw", "workspace", "SOUL.md");
+    fs.mkdirSync(path.dirname(soul), { recursive: true });
+    fs.writeFileSync(soul, "soul v1\n");
+    fs.writeFileSync(path.join(tmpDir, ".openclaw", "runtime-skills.json"), '{"version":1,"skills":{}}\n');
+    fs.writeFileSync(path.join(tmpDir, ".openclaw", "workspace", "NOTES.md"), "written after the copy\n");
+    const moved = "ns_" + "p".repeat(26);
+    for (const key of Object.keys(objects)) {
+      objects[key.replace(/^telegram_1\//, `${moved}/`)] = objects[key];
+      metadata[key.replace(/^telegram_1\//, `${moved}/`)] = metadata[key];
+    }
+
+    const r = await workspaceSync.restoreWorkspace(moved, { overwrite: false });
+    assert.deepEqual(r, { restored: 0, kept: 2, keptUnchanged: 2, failed: 0, hadState: true });
+    assert.ok(heads.length === 2 && heads.every((h) => h.input.Key.startsWith(`${moved}/`)), "only the new prefix is read");
+    assert.equal(fs.readFileSync(soul, "utf8"), "soul v1\n", "local files are kept");
+    await workspaceSync.saveWorkspace(moved);
+    // Only the file S3 does not hold yet is uploaded, and only under the new prefix.
+    assert.deepEqual(puts.map((put) => put.input.Key), [`${moved}/.openclaw/workspace/NOTES.md`]);
   });
 
   it("uploads kept files that differ from S3, and seeds only the identical ones", async () => {

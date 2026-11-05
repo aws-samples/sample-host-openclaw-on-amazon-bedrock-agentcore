@@ -115,24 +115,30 @@ function downloadPath(userId, key, outDir) {
 }
 
 // The contract server writes the bound user's identity here and sets USER_ID
-// ("channel:id") before OpenClaw runs a skill.
+// ("channel:id") before OpenClaw runs a skill. The file also names the bound
+// storage namespace; in a file without one the namespace is the actor with
+// ":" replaced by "_" (bridge/user-namespace.js).
 const IDENTITY_FILE = "/tmp/current-identity.json";
 
 /**
- * Namespaces ("channel_id") of the user this AgentCore Runtime session is
- * bound to, from the identity file and USER_ID. Empty when neither is set.
+ * Namespaces of the user this AgentCore Runtime session is bound to, from the
+ * identity file and USER_ID. Empty when neither is set.
  */
 function boundNamespaces() {
   const namespaces = [];
+  let actor = null;
   try {
     const identity = JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8"));
     if (typeof identity?.actorId === "string" && identity.actorId) {
-      namespaces.push(identity.actorId.replace(/:/g, "_"));
+      actor = identity.actorId;
+      namespaces.push(typeof identity.namespace === "string" && identity.namespace
+        ? identity.namespace : actor.replace(/:/g, "_"));
     }
   } catch {
     // No readable identity file: fall back to USER_ID alone.
   }
-  if (process.env.USER_ID) namespaces.push(process.env.USER_ID.replace(/:/g, "_"));
+  const envActor = process.env.USER_ID;
+  if (envActor) namespaces.push(envActor === actor ? namespaces[0] : envActor.replace(/:/g, "_"));
   return namespaces;
 }
 
@@ -171,10 +177,11 @@ function validateUserId(userId) {
     );
     process.exit(1);
   }
-  // Namespace must match channel_identifier pattern (e.g., telegram_123456789, slack_U0XXXXXXXX1).
+  // Namespace must match the channel_identifier pattern (e.g., telegram_123456789,
+  // slack_U0XXXXXXXX1) or a stored namespace ("ns_" + 26 base32 characters).
   // This is a format gate only; assertOwnNamespace below proves ownership.
   const VALID_NAMESPACE =
-    /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}$/;
+    /^(?:(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}|ns_[a-z2-7]{26})$/;
   if (!VALID_NAMESPACE.test(userId)) {
     console.error(
       `Error: Invalid user_id "${userId}". Must match channel_identifier format (e.g., telegram_123456, slack_username).`,

@@ -5,7 +5,7 @@ const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 const { createProxyAuthChild } = require("./proxy-auth-prepare");
 
-function proxy(actor = "slack:owner", { onExit } = {}) {
+function proxy(actor = "slack:owner", { onExit, namespace } = {}) {
   let handler, identity = actor ? { actorId: actor, channel: "slack" } : null;
   const cognito = [], s3 = [], model = [];
   const tokens = {
@@ -36,6 +36,7 @@ function proxy(actor = "slack:owner", { onExit } = {}) {
   process.env = {
     AWS_REGION: "us-west-2", S3_USER_FILES_BUCKET: "fixture-bucket",
     ...(actor ? { USER_ID: actor, CHANNEL: "slack" } : {}),
+    ...(namespace ? { USER_NAMESPACE: namespace } : {}),
   };
   process.connected = false;
   process.exit = onExit || (() => assert.fail("Proxy must not exit"));
@@ -284,5 +285,61 @@ test("a Slack channel or Feishu group identity gets its own namespace, the group
     assert.match(text, /Scheduled tasks \(cron\) are not available in group chats/);
     assert.match(text, /## Shared Conversation/);
     assert.equal(text.includes(actor), false, "raw actor in the system prompt");
+  }
+});
+
+const STORED_NAMESPACE = "ns_" + "e".repeat(26);
+
+test("a bound stored namespace names the workspace files, the system prompt and the Cognito user", async () => {
+  const app = proxy("slack:owner", { namespace: STORED_NAMESPACE });
+  app.identity({ actorId: "slack:owner", channel: "slack", namespace: STORED_NAMESPACE });
+  assert.equal((await app.request()).status, 200);
+  assert.deepEqual(app.cognito, [STORED_NAMESPACE]);
+  assert.ok(app.s3.length > 0);
+  assert.ok(app.s3.every((request) => request.Key.startsWith(`${STORED_NAMESPACE}/`) ||
+    request.Key.startsWith(`_system/${STORED_NAMESPACE}/`)), JSON.stringify(app.s3.map((r) => r.Key)));
+  const text = JSON.stringify(app.model[0].system);
+  assert.ok(text.includes(`You are chatting with a user (namespace: ${STORED_NAMESPACE}) on channel: `));
+  assert.equal(text.includes("slack_owner"), false, "the legacy namespace is not in the prompt");
+});
+
+test("the identity file cannot move the proxy to another namespace", async () => {
+  const app = proxy("slack:owner", { namespace: STORED_NAMESPACE });
+  app.identity({ actorId: "slack:owner", channel: "slack", namespace: "ns_" + "f".repeat(26) });
+  assert.equal((await app.request()).status, 200);
+  assert.deepEqual(app.cognito, [STORED_NAMESPACE]);
+  assert.ok(app.s3.every((request) => request.Key.includes(STORED_NAMESPACE)));
+});
+
+test("a bound USER_NAMESPACE that is not a namespace of the bound actor stops the proxy at load", () => {
+  for (const namespace of ["slack_other", "telegram_owner", "ns_short"]) {
+    let exitCode = null;
+    assert.throws(() => proxy("slack:owner", {
+      namespace,
+      onExit: (code) => {
+        exitCode = code;
+        throw new Error(`process.exit(${code})`);
+      },
+    }), /process\.exit\(1\)/, namespace);
+    assert.equal(exitCode, 1);
+  }
+});
+
+test("a Slack channel or Feishu group identity with a stored namespace keeps the group rules", async () => {
+  for (const [actor, channel, target] of [
+    ["slack_channel:C0123CHAN", "slack_channel", "C0123CHAN"],
+    ["feishu_group:oc_0123abcdef", "feishu_group", "oc_0123abcdef"],
+  ]) {
+    const app = proxy(actor, { namespace: STORED_NAMESPACE });
+    app.identity({ actorId: actor, channel, channelActorId: actor, channelTarget: target, sharedChat: true,
+      namespace: STORED_NAMESPACE });
+    assert.equal((await app.request()).status, 200, actor);
+    assert.deepEqual(app.cognito, [STORED_NAMESPACE]);
+    assert.ok(app.s3.every((request) => request.Key.startsWith(`${STORED_NAMESPACE}/`) ||
+      request.Key.startsWith(`_system/${STORED_NAMESPACE}/`)));
+    const text = app.model[0].system.map((block) => block.text || "").join("");
+    assert.ok(text.includes(`You are chatting with a user (namespace: ${STORED_NAMESPACE}) on channel: ${channel}.`));
+    assert.match(text, /shared group chat/);
+    assert.equal(text.includes(actor.replace(/:/g, "_")), false, "the legacy namespace is not in the prompt");
   }
 });

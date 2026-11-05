@@ -41,7 +41,8 @@ BOT_ID = "U" + "f" * 32
 REPLY_TOKEN = "nHuyWiB7yP5Zw52FIkcQobQuGDXCTA"
 SECRET = json.dumps({"channelSecret": CHANNEL_SECRET, "channelAccessToken": ACCESS_TOKEN})
 CONFIG = line_channel.parse_config(SECRET)
-ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id=f"line:{USER_ID}")
+ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id=f"line:{USER_ID}",
+                        namespace=f"line_{USER_ID}")
 
 
 class FakeClientError(Exception):
@@ -260,6 +261,29 @@ class TestHandleLine(unittest.TestCase):
         mock_dl.assert_called_once_with(CONFIG, "100000000000000001", index.ALLOWED_IMAGE_TYPES, index.MAX_IMAGE_BYTES)
         mock_up.assert_called_once_with(b"jpeg", f"line_{USER_ID}", "image/jpeg")
         self.assertEqual(mock_invoke.call_args.args[4]["text"], "What is this image?")
+
+    @patch.object(index, "invoke_agent_runtime")
+    @patch.object(index, "get_or_create_session", side_effect=index.RouteMigrating("migrating"))
+    @patch.object(index, "resolve_user", return_value=("user_abc123", False))
+    def test_migrating_user_gets_the_maintenance_reply(self, _r, _sess, mock_invoke, mock_send, _l, _c, _s):
+        event = _event()
+        index.handle_line(json.dumps(_payload(event)))
+        mock_invoke.assert_not_called()
+        mock_send.assert_called_once_with(CONFIG, USER_ID, index.MIGRATION_REPLY, event["replyToken"])
+
+    @patch.object(index, "invoke_agent_runtime")
+    @patch.object(index, "get_or_create_session", return_value=SimpleNamespace(
+        platform_version="V2", user_id="user_abc123", actor_id=f"line:{USER_ID}", namespace="ns_" + "b" * 26))
+    @patch.object(index, "authorize_channel_actor")
+    @patch.object(index.line_channel, "download_image", return_value=(b"jpeg", "image/jpeg"))
+    @patch.object(index, "_upload_image_to_s3", return_value="ns_bbbb/_uploads/img.jpg")
+    @patch.object(index, "get_model_override", return_value=None)
+    @patch.object(index, "resolve_user", return_value=("user_abc123", False))
+    def test_image_of_a_user_with_a_stored_namespace_is_stored_under_it(
+            self, _r, _m, mock_up, _dl, _a, _sess, mock_invoke, _send, _l, _c, _s):
+        mock_invoke.return_value = {"response": "a cat"}
+        index.handle_line(json.dumps(_payload(_event(msg_type="image"))))
+        mock_up.assert_called_once_with(b"jpeg", "ns_" + "b" * 26, "image/jpeg")
 
     @patch.object(index, "invoke_agent_runtime")
     def test_unconfigured_drops(self, mock_invoke, mock_send, _l, _c, mock_secret):

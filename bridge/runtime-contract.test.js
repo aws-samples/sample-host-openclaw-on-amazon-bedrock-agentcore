@@ -40,6 +40,8 @@ function loadContract(t, {
   const intervals = [];
   const timeouts = [];
   const processHandlers = {};
+  const restoredNamespaces = [];
+  const cognitoUsers = [];
   let persistenceProvider;
   const remoteBrowserStatus = new Map();
   let browserStarts = 0;
@@ -277,7 +279,8 @@ function loadContract(t, {
     "./cognito-token": {
       createCognitoTokenProvider: () => ({
         isConfigured: () => true,
-        getAccessToken: async (_actor, options) => {
+        getAccessToken: async (username, options) => {
+          cognitoUsers.push(username);
           calls.push(options?.force ? "bearer:refresh" : "bearer:initial");
           return { token: options?.force ? "fresh-bearer" : "initial-bearer", expiresAt: Date.now() + 3600000 };
         },
@@ -297,7 +300,8 @@ function loadContract(t, {
       buildOpenClawEnv: require("./scoped-credentials").buildOpenClawEnv,
     },
     "./workspace-sync": {
-      restoreWorkspace(_namespace, options) {
+      restoreWorkspace(namespace, options) {
+        restoredNamespaces.push(namespace);
         calls.push("restore");
         return restore.then(() => { restored = true; });
       },
@@ -425,6 +429,7 @@ function loadContract(t, {
   }
   return {
     request, calls, files, children, errors, logs, warnings, streams, preparations, activations, remoteBrowserStatus,
+    restoredNamespaces, cognitoUsers,
     evaluate: (code) => vm.runInContext(code, context),
     gatewayEnv: () => vm.runInContext('openclawEnvFor("u1")', context),
     shutdown: () => processHandlers.SIGTERM(),
@@ -1532,8 +1537,8 @@ test("a linked Slack turn and its Cron retain delivery metadata separately from 
   assert.equal(app.activations[0].env.USER_ID, "telegram:123");
   assert.equal(app.activations[0].env.INTERNAL_USER_ID, "u1");
   const identity = JSON.parse(app.files.get("/tmp/current-identity.json"));
-  assert.deepEqual(identity, { actorId: "telegram:123", userId: "u1", channel: "slack", channelActorId: "slack:U456",
-    channelTarget, trigger: "chat", sessionId: "session-1" });
+  assert.deepEqual(identity, { actorId: "telegram:123", userId: "u1", namespace: "telegram_123", channel: "slack",
+    channelActorId: "slack:U456", channelTarget, trigger: "chat", sessionId: "session-1" });
   const { schedules, records } = await createCronForIdentity(identity);
   assert.equal(schedules.length, 1);
   assert.match(schedules[0].Name, /^openclaw-telegram_123-/);
@@ -1721,8 +1726,8 @@ test("a payload model override reaches the proxy identity file for that turn onl
   const plain = await app.request({ ...owner, action: "chat", message: "next" });
   assert.equal(plain.body.execution.phase, "completed");
   assert.deepEqual(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)),
-    { actorId: owner.actorId, userId: owner.userId, channel: owner.channel, channelActorId: null,
-      channelTarget: null, trigger: "chat", sessionId: "session-1" });
+    { actorId: owner.actorId, userId: owner.userId, namespace: owner.actorId.replace(/:/g, "_"),
+      channel: owner.channel, channelActorId: null, channelTarget: null, trigger: "chat", sessionId: "session-1" });
 
   const cron = await app.request({ ...owner, action: "cron", message: "scheduled" });
   assert.equal(cron.body.execution.phase, "completed");
@@ -2020,4 +2025,76 @@ test("Cron creation is refused for a Slack channel or Feishu group identity, bef
       }, args, actor.replace(/:/g, "_")), /not available in group chats/);
     }
   }
+});
+
+// --- Stored user namespace (user-namespace.js) ---------------------------------------
+
+const OPAQUE_NAMESPACE = "ns_" + "c".repeat(26);
+
+function namespaceRecordingManager(namespaces) {
+  return (namespace) => {
+    namespaces.push(namespace);
+    return { ensureFresh: async () => {}, getCredentials: () => ({}), stop() {}, beginDrain() {} };
+  };
+}
+
+test("a request without a namespace activates with the legacy namespace of its actor", async (t) => {
+  const scoped = [];
+  const app = loadContract(t, { managerFactory: namespaceRecordingManager(scoped) });
+  const result = await app.request({ ...owner, action: "chat", message: "hello" });
+  assert.equal(result.body.execution.phase, "completed", app.errors.join("\n"));
+  assert.deepEqual(scoped, ["telegram_1"]);
+  assert.deepEqual(app.restoredNamespaces, ["telegram_1"]);
+  assert.equal(app.children.find((child) => child.kind === "node").env.USER_NAMESPACE, "telegram_1");
+  assert.equal(app.evaluate("v2Lifecycle.snapshot().namespace"), "telegram_1");
+  // The legacy namespace named explicitly is the same binding.
+  const named = await app.request({ ...owner, namespace: "telegram_1", action: "chat", message: "again" });
+  assert.equal(named.body.execution.phase, "completed");
+});
+
+test("a stored opaque namespace drives the scoped credentials, restore, proxy, identity file and Cognito user", async (t) => {
+  const scoped = [];
+  const app = loadContract(t, { gatewayMcpEnabled: true, managerFactory: namespaceRecordingManager(scoped) });
+  const first = await app.request({ ...owner, namespace: OPAQUE_NAMESPACE, action: "chat", message: "hello" });
+  assert.equal(first.body.execution.phase, "completed", app.errors.join("\n"));
+  assert.deepEqual(scoped, [OPAQUE_NAMESPACE]);
+  assert.deepEqual(app.restoredNamespaces, [OPAQUE_NAMESPACE]);
+  const proxy = app.children.find((child) => child.kind === "node");
+  assert.equal(proxy.env.USER_NAMESPACE, OPAQUE_NAMESPACE);
+  assert.equal(proxy.env.USER_ID, owner.actorId, "the actor stays the bound actor");
+  const identity = JSON.parse(app.files.get("/tmp/current-identity.json"));
+  assert.equal(identity.namespace, OPAQUE_NAMESPACE);
+  assert.equal(identity.actorId, owner.actorId);
+  assert.deepEqual([...new Set(app.cognitoUsers)], [OPAQUE_NAMESPACE], "the Cognito user is named after the namespace");
+});
+
+test("a request for another namespace than the pinned one is refused without a turn", async (t) => {
+  const app = loadContract(t);
+  const first = await app.request({ ...owner, namespace: OPAQUE_NAMESPACE, action: "chat", message: "hello" });
+  assert.equal(first.body.execution.phase, "completed", app.errors.join("\n"));
+  const sent = app.calls.filter((entry) => entry === "chat.send").length;
+  for (const namespace of [undefined, "telegram_1", "ns_" + "d".repeat(26)]) {
+    for (const action of ["chat", "cron", "status", "cron_status"]) {
+      const other = await app.request({ ...owner, ...(namespace === undefined ? {} : { namespace }), action,
+        message: "next", jobId: "j1" });
+      assert.equal(other.body.status, "error", `${action} ${namespace}`);
+      assert.match(other.body.response, /cannot accept the requested user binding/);
+    }
+  }
+  assert.equal(app.calls.filter((entry) => entry === "chat.send").length, sent);
+  const again = await app.request({ ...owner, namespace: OPAQUE_NAMESPACE, action: "chat", message: "next" });
+  assert.equal(again.body.execution.phase, "completed");
+});
+
+test("a namespace that is not one of the actor's is refused before activation", async (t) => {
+  const app = loadContract(t);
+  for (const namespace of ["telegram_2", "slack_1", "ns_short", "NS_" + "C".repeat(26), "", 7, {}]) {
+    for (const action of ["chat", "warmup", "cron_start"]) {
+      const result = await app.request({ ...owner, namespace, action, message: "hello", jobId: "j1" });
+      assert.equal(result.code, 400, `${action} ${JSON.stringify(namespace)}`);
+      assert.equal(result.body.error, "Invalid user namespace");
+    }
+  }
+  assert.equal(app.evaluate("v2Lifecycle.snapshot().binding"), null);
+  assert.equal(app.calls.includes("credentials"), false);
 });

@@ -23,7 +23,8 @@ function fixture(t, changes = {}, extraEnv = { OPENCLAW_UNSAFE_SHARED_SEED: "1" 
   const abort = new AbortController();
   const scope = { generation: "test-generation", signal: abort.signal,
     checkpoint: () => abort.signal.throwIfAborted() };
-  const current = { state: "BINDING", generation: scope.generation, binding, resources: ["credentials"] };
+  const current = { state: "BINDING", generation: scope.generation, binding, namespace: "slack_test-user",
+    resources: ["credentials"] };
   const lifecycle = { snapshot: () => current, assertBinding: (value) => assert.equal(value, current.binding) };
   const calls = [];
   let wasBound = false;

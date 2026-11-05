@@ -17,27 +17,38 @@ const EVENTBRIDGE_ROLE_ARN = process.env.EVENTBRIDGE_ROLE_ARN;
 const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
 
 // The contract server writes the bound user's identity here and sets USER_ID
-// ("channel:id") before OpenClaw runs a skill.
+// ("channel:id") before OpenClaw runs a skill. The file also names the bound
+// storage namespace; in a file without one the namespace is the actor with
+// ":" replaced by "_" (bridge/user-namespace.js).
 const IDENTITY_FILE = "/tmp/current-identity.json";
 // Group conversations (one identity shared by a whole Telegram group, Slack
 // channel or Feishu group chat) cannot schedule tasks.
 const GROUP_CHANNELS = new Set(["telegram_group", "slack_channel", "feishu_group"]);
 
+/** The storage namespace an identity file record names. */
+function identityNamespace(identity) {
+  return typeof identity.namespace === "string" && identity.namespace
+    ? identity.namespace : identity.actorId.replace(/:/g, "_");
+}
+
 /**
- * Namespaces ("channel_id") of the user this AgentCore Runtime session is
- * bound to, from the identity file and USER_ID. Empty when neither is set.
+ * Namespaces of the user this AgentCore Runtime session is bound to, from the
+ * identity file and USER_ID. Empty when neither is set.
  */
 function boundNamespaces() {
   const namespaces = [];
+  let actor = null;
   try {
     const identity = JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8"));
     if (typeof identity?.actorId === "string" && identity.actorId) {
-      namespaces.push(identity.actorId.replace(/:/g, "_"));
+      actor = identity.actorId;
+      namespaces.push(identityNamespace(identity));
     }
   } catch {
     // No readable identity file: fall back to USER_ID alone.
   }
-  if (process.env.USER_ID) namespaces.push(process.env.USER_ID.replace(/:/g, "_"));
+  const envActor = process.env.USER_ID;
+  if (envActor) namespaces.push(envActor === actor ? namespaces[0] : envActor.replace(/:/g, "_"));
   return namespaces;
 }
 
@@ -82,8 +93,9 @@ function validateUserId(userId) {
     );
     process.exit(1);
   }
+  // A channel namespace ("telegram_123") or a stored one ("ns_" + 26 base32 characters).
   const VALID_NAMESPACE =
-    /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}$/;
+    /^(?:(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}|ns_[a-z2-7]{26})$/;
   if (!VALID_NAMESPACE.test(userId)) {
     console.error(
       `Error: Invalid user_id "${userId}". Must match channel_identifier format (e.g., telegram_123456, slack_username).`,
@@ -305,6 +317,8 @@ async function resolveScheduleName(schedulerClient, userId, scheduleId) {
   } catch {
     // Unreadable input: not provably this user's schedule.
   }
+  // Only legacy namespaces are long enough to have a pre-digest name, so the
+  // input's actor names its namespace here.
   return typeof actorId === "string" && actorId.replace(/:/g, "_") === userId ? legacy : name;
 }
 
@@ -328,7 +342,7 @@ function extractChannelInfo(userId) {
  */
 function resolveScheduleDelivery(userId, { channel, channelTarget } = {}) {
   const identity = JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8"));
-  if (typeof identity.actorId !== "string" || identity.actorId.replace(/:/g, "_") !== userId) {
+  if (typeof identity.actorId !== "string" || !identity.actorId || identityNamespace(identity) !== userId) {
     throw new Error("Schedule namespace does not match the AgentCore Runtime owner");
   }
   if (typeof identity.channel !== "string" || !identity.channel ||

@@ -25,7 +25,8 @@ sys.modules["botocore.exceptions"] = MagicMock()
 
 import importlib
 index = importlib.import_module("index")
-TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id="feishu:ou_test123")
+TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id="feishu:ou_test123",
+                             namespace="feishu_ou_test123")
 
 
 # --- Test helpers ---
@@ -276,6 +277,18 @@ class TestHandleFeishuTextMessage(unittest.TestCase):
         msg = mock_send.call_args[0][1]
         self.assertIn("feishu:ou_test123", msg)
         self.assertIn("private", msg)
+
+
+class TestHandleFeishuMigratingUser(unittest.TestCase):
+    @patch.object(index, "send_feishu_message")
+    @patch.object(index, "invoke_agent_runtime")
+    @patch.object(index, "get_or_create_session", side_effect=index.RouteMigrating("migrating"))
+    @patch.object(index, "resolve_user", return_value=("user_abc123", False))
+    def test_migrating_user_gets_the_maintenance_reply(self, _resolve, _session, mock_invoke, mock_send):
+        result = index.handle_feishu(json.dumps(_make_feishu_text_event("Hello bot")))
+        self.assertEqual(result["statusCode"], 200)
+        mock_invoke.assert_not_called()
+        mock_send.assert_called_once_with("oc_chat456", index.MIGRATION_REPLY)
 
 
 class TestHandleFeishuBindCommands(unittest.TestCase):

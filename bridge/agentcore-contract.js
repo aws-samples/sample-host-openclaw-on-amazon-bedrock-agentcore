@@ -39,6 +39,7 @@ const runtimeSkills = require("./runtime-skills");
 const { createCognitoTokenProvider } = require("./cognito-token");
 const { readBody } = require("./read-body");
 const { createRuntimeLifecycle, osRandomUUID } = require("./runtime-lifecycle");
+const userNamespace = require("./user-namespace");
 const {
   waitForGateway, gatewayTurn, dismissStaleSuspendedDeliveries, watchChatEvents,
 } = require("./gateway-lifecycle");
@@ -198,7 +199,7 @@ const v2Lifecycle = createRuntimeLifecycle({
   activate: (context, scope) => {
     activationScope = scope;
     return init(context.userId, context.actorId, context.channel || "unknown",
-      context.channelActorId, context.channelTarget);
+      context.channelActorId, context.channelTarget, context.namespace);
   },
   cleanup: cleanupV2Resources,
   activationTimeoutMs: ACTIVATION_TIMEOUT_MS,
@@ -477,7 +478,8 @@ async function verifyV2Resources(context) {
   await credentialManager.ensureFresh({ minValidityMs: turnValidityMs(context.deadline) });
   activationScope.checkpoint();
   if (AGENTCORE_GATEWAY_URL && gatewayBearer.expiresAt <= Date.now() + turnValidityMs(context.deadline)) {
-    gatewayBearer = await gatewayTokenProvider.getAccessToken(context.actorId, { force: true });
+    gatewayBearer = await gatewayTokenProvider.getAccessToken(
+      userNamespace.cognitoUsername(context.actorId, currentNamespace), { force: true });
     activationScope.checkpoint();
     if (gatewayBearer.expiresAt <= Date.now() + turnValidityMs(context.deadline)) {
       throw new Error("Gateway bearer validity is too short for a turn");
@@ -579,8 +581,15 @@ function stopGateway(waitMs) {
   });
 }
 
+/** True when the identity file names this actor and namespace. */
+function identityFileNames(actorId, namespace) {
+  const identity = JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8"));
+  return identity.actorId === actorId && identity.namespace === namespace;
+}
+
 function updateIdentityFile(actorId, channel, channelActorId = null, channelTarget = null,
-  modelOverride = null, { trigger = "chat", sessionId = null, userId = null, sharedChat = false } = {}) {
+  modelOverride = null, { trigger = "chat", sessionId = null, userId = null, sharedChat = false,
+    namespace = currentNamespace } = {}) {
   const tempFile = `${IDENTITY_FILE}.${osRandomUUID()}.tmp`;
   try {
     // modelOverride is per turn: a turn without one (Cron, or no /model choice)
@@ -590,11 +599,14 @@ function updateIdentityFile(actorId, channel, channelActorId = null, channelTarg
     // token_metrics Lambda can attribute usage. userId is the binding's
     // internal user ID, the user the proxy names in logs and request metadata.
     // sharedChat (Slack channel or Feishu group turns, set by the Router) adds
-    // the shared-conversation rules to the system prompt.
+    // the shared-conversation rules to the system prompt. namespace is the
+    // binding's storage namespace; the skills build their S3 keys and schedule
+    // names from it.
     fs.writeFileSync(
       tempFile,
       JSON.stringify({ actorId, channel, channelActorId, channelTarget,
         ...(typeof userId === "string" && userId ? { userId } : {}),
+        ...(typeof namespace === "string" && namespace ? { namespace } : {}),
         ...(modelOverride ? { modelOverride } : {}),
         trigger: trigger === "cron" ? "cron" : "chat",
         ...(typeof sessionId === "string" && sessionId ? { sessionId } : {}),
@@ -1207,7 +1219,8 @@ function assertBrowserStartBinding(owner) {
   if (shuttingDown || owner.scope !== activationScope || current.generation !== owner.scope.generation ||
       ["userId", "actorId", "runtimeSessionId", "routingGeneration"]
         .some((key) => (current.binding?.[key] ?? null) !== owner.binding[key]) ||
-      currentUserId !== owner.binding.userId || currentNamespace !== owner.binding.actorId.replace(/:/g, "_") ||
+      current.namespace !== owner.namespace ||
+      currentUserId !== owner.binding.userId || currentNamespace !== owner.namespace ||
       process.env.USER_ID !== owner.binding.actorId || process.env.INTERNAL_USER_ID !== owner.binding.userId ||
       process.env.BROWSER_IDENTIFIER !== owner.browserIdentifier ||
       (process.env.AWS_REGION || "us-east-1") !== owner.region) {
@@ -1257,6 +1270,7 @@ function startBrowserOverlap(userId) {
   const owner = {
     binding: Object.freeze(Object.fromEntries(["userId", "actorId", "runtimeSessionId", "routingGeneration"]
       .map((key) => [key, current.binding[key] ?? null]))),
+    namespace: current.namespace,
     scope: activationScope, generation: browserGeneration + 1,
     browserIdentifier: process.env.BROWSER_IDENTIFIER, region: process.env.AWS_REGION || "us-east-1",
     retired: false, promoted: false, settled: false, sessionId: null,
@@ -1534,8 +1548,9 @@ async function stopBrowserSessions() {
 /**
  * Mint the per-user Cognito access token for the AgentCore Gateway MCP server.
  * The readiness check refreshes it before a turn and verifies the restarted gateway.
+ * username is user-namespace.js cognitoUsername(): the actor, or an opaque namespace.
  */
-async function setupGatewayBearer(actorId) {
+async function setupGatewayBearer(username) {
   const provider = createCognitoTokenProvider({
     userPoolId: process.env.COGNITO_USER_POOL_ID || "",
     clientId: process.env.COGNITO_CLIENT_ID || "",
@@ -1545,7 +1560,7 @@ async function setupGatewayBearer(actorId) {
   if (!provider.isConfigured()) {
     throw new Error("Gateway MCP requires Cognito configuration");
   }
-  gatewayBearer = await provider.getAccessToken(actorId);
+  gatewayBearer = await provider.getAccessToken(username);
   console.log(
     `[contract] Gateway MCP bearer acquired (expires ${new Date(gatewayBearer.expiresAt).toISOString()})`,
   );
@@ -1558,7 +1573,7 @@ async function setupGatewayBearer(actorId) {
  *
  * Bind credentials and restore state before activating the prepared child.
  */
-async function init(userId, actorId, channel, channelActorId, channelTarget) {
+async function init(userId, actorId, channel, channelActorId, channelTarget, boundNamespace) {
   if (initInProgress) return initPromise;
   initInProgress = true;
 
@@ -1577,7 +1592,11 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
     };
     const checkpoint = () => { activationScope.checkpoint(); };
     checkpoint();
-    const namespace = actorId.replace(/:/g, "_");
+    // Pinned with the binding (requestNamespace() resolved it from the first request).
+    const namespace = boundNamespace;
+    if (!userNamespace.isNamespaceOf(namespace, actorId) || v2Lifecycle.snapshot().namespace !== namespace) {
+      throw new Error("Invalid user namespace binding");
+    }
     currentUserId = userId;
     currentNamespace = namespace;
     // The stream is named after the internal user ID, not the namespace (for
@@ -1594,7 +1613,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
     process.env.INTERNAL_USER_ID = userId;
 
     // Write initial identity file for the proxy to read
-    updateIdentityFile(actorId, channel, channelActorId, channelTarget, null, { userId });
+    updateIdentityFile(actorId, channel, channelActorId, channelTarget, null, { userId, namespace });
     startBrowserOverlap(userId);
 
     console.log(`[contract] Init for user=${userId}`);
@@ -1637,7 +1656,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
 
     // 1b'. Mint the required per-user access token when Gateway MCP is enabled.
     if (AGENTCORE_GATEWAY_URL) {
-      await setupGatewayBearer(actorId);
+      await setupGatewayBearer(userNamespace.cognitoUsername(actorId, namespace));
       checkpoint();
     }
 
@@ -1690,6 +1709,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
         BEDROCK_USER_SELECTABLE_MODEL_IDS: process.env.BEDROCK_USER_SELECTABLE_MODEL_IDS || "",
         USER_ID: actorId,
         INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
+        USER_NAMESPACE: namespace,  // S3 prefix and Cognito username source (user-namespace.js)
         CHANNEL: channel,
         OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
       };
@@ -1704,6 +1724,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
             scope !== activationScope || current.generation !== scope.generation ||
             ["userId", "actorId", "runtimeSessionId", "routingGeneration"].some(
               (key) => (current.binding?.[key] ?? null) !== (binding[key] ?? null)) ||
+            current.namespace !== namespace ||
             currentUserId !== userId || currentNamespace !== namespace ||
             process.env.USER_ID !== actorId || process.env.INTERNAL_USER_ID !== userId ||
             !secretsReady || !GATEWAY_TOKEN || credentialManager !== credentials ||
@@ -1713,7 +1734,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
               "S3_USER_FILES_BUCKET", "SUBAGENT_BEDROCK_MODEL_ID", "BEDROCK_GUARDRAIL_ID",
               "BEDROCK_GUARDRAIL_VERSION", "BEDROCK_TEMPERATURE", "BEDROCK_USER_SELECTABLE_MODEL_IDS"].some(
               (key) => (process.env[key] || "") !== proxyEnv[key]) ||
-            JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8")).actorId !== actorId) {
+            !identityFileNames(actorId, namespace)) {
           throw new Error("Prepared Proxy binding is unavailable");
         }
         workspaceSync.assertRestoreReady();
@@ -2372,8 +2393,10 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival,
   }
   const sharedChat = payload.sharedChat === true;
   const modelOverride = payloadModelOverride(payload.modelOverride);
+  const namespace = userNamespace.requestNamespace(actorId, payload.namespace);
+  if (!namespace) return reply({ error: "Invalid user namespace" }, 400);
   const context = Object.freeze({
-    userId, actorId, channel, channelActorId, channelTarget, modelOverride, sharedChat,
+    userId, actorId, channel, channelActorId, channelTarget, modelOverride, sharedChat, namespace,
     runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
     routingGeneration: payload.routingGeneration ?? null,
     // Bounds the queue wait; the turn itself is re-bounded at dispatch below.
@@ -2602,8 +2625,10 @@ async function handleCronAsync(payload, req, res) {
         (!Number.isSafeInteger(payload.routingGeneration) || payload.routingGeneration < 0))) {
     return reply({ error: "Invalid AgentCore Runtime session binding" }, 400);
   }
+  const namespace = userNamespace.requestNamespace(actorId, payload.namespace);
+  if (!namespace) return reply({ error: "Invalid user namespace" }, 400);
   const bindingContext = Object.freeze({
-    userId, actorId,
+    userId, actorId, namespace,
     runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
     routingGeneration: payload.routingGeneration ?? null,
   });
@@ -2725,6 +2750,7 @@ const server = http.createServer(async (req, res) => {
           const statusContext = Object.freeze({
             userId: payload.userId,
             actorId: payload.actorId,
+            namespace: userNamespace.requestNamespace(payload.actorId, payload.namespace),
             runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
             routingGeneration: payload.routingGeneration ?? null,
           });

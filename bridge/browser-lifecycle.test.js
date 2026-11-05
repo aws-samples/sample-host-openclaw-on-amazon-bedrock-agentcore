@@ -95,7 +95,7 @@ function createBrowserFunctions({
     BROWSER_SESSION_FILE: "/test/browser-session.json", BROWSER_SESSION_TIMEOUT_SECONDS: 3600,
     activationScope: { generation: "activation", signal: new AbortController().signal,
       checkpoint() { if (aborted) throw new Error("Activation aborted"); } },
-    v2Lifecycle: { snapshot: () => ({ binding, generation: "activation",
+    v2Lifecycle: { snapshot: () => ({ binding, namespace: "telegram_1", generation: "activation",
       resources: ["credentials", "restore", "skills"] }) },
     currentUserId: binding.userId, currentNamespace: "telegram_1", shuttingDown: false,
     workspaceSync: { assertRestoreReady() {} }, TURN_TIMEOUT_MS: 620000,

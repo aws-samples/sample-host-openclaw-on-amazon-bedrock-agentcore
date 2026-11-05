@@ -29,7 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
 
 index = importlib.import_module("index")
-TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_test", actor_id="telegram:123456")
+TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_test", actor_id="telegram:123456",
+                             namespace="telegram_123456")
 
 TELEGRAM_LIMIT = 4096
 

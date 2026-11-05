@@ -33,7 +33,8 @@ PROFILE_KEY = {"PK": f"USER#{USER}", "SK": "PROFILE"}
 
 
 def _route(actor_id):
-    return SimpleNamespace(platform_version="V2", user_id=USER, actor_id=actor_id)
+    return SimpleNamespace(platform_version="V2", user_id=USER, actor_id=actor_id,
+                           namespace=actor_id.replace(":", "_"))
 
 
 class ModelSwitchingCase(unittest.TestCase):
@@ -170,7 +171,8 @@ class TestPayloadForwarding(ModelSwitchingCase):
     def invoke(self, **kwargs):
         route = MagicMock(actor_id="telegram:123", runtime_arn="arn", endpoint_name="release_1",
                           session_id="ses_1", generation=1)
-        route.payload_context.return_value = {"runtimeSessionId": "ses_1", "routingGeneration": 1}
+        route.payload_context.return_value = {"runtimeSessionId": "ses_1", "routingGeneration": 1,
+                                              "namespace": "telegram_123"}
         route.invocation.return_value = {"agentRuntimeArn": "arn", "qualifier": "release_1",
                                          "runtimeSessionId": "ses_1"}
         client = MagicMock()
@@ -194,7 +196,8 @@ class TestPayloadForwarding(ModelSwitchingCase):
         payload = self.invoke()
         self.assertNotIn("modelOverride", payload)
         self.assertEqual(set(payload), {"action", "userId", "actorId", "channelActorId", "channel",
-                                        "channelTarget", "message", "runtimeSessionId", "routingGeneration"})
+                                        "channelTarget", "message", "runtimeSessionId", "routingGeneration",
+                                        "namespace"})
 
     def test_shared_chat_flag_is_sent_only_for_shared_conversations(self):
         self.assertIs(self.invoke(shared_chat=True)["sharedChat"], True)

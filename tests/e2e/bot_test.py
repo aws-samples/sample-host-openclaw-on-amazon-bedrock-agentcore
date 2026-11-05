@@ -528,7 +528,7 @@ class TestApiKeyManagement:
         """Wait for V2 readiness and clean up stale test entries."""
         # Force-delete any lingering test secret (e.g. stuck in 7-day recovery window)
         sm = boto3.client("secretsmanager", region_name=e2e_config.region)
-        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
+        namespace = get_session_route(e2e_config).namespace
         secret_name = f"openclaw/user/{namespace}/{self.SM_KEY_NAME}"
         try:
             sm.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
@@ -931,7 +931,7 @@ class TestCronSchedule:
     @classmethod
     def _cleanup_stale_schedules(cls, cfg):
         """Delete any leftover E2E test schedules from prior runs."""
-        namespace = get_session_route(cfg).actor_id.replace(":", "_")
+        namespace = get_session_route(cfg).namespace
         scheduler = boto3.client("scheduler", region_name=cfg.region)
         try:
             resp = scheduler.list_schedules(GroupName=cls.SCHEDULE_GROUP)
@@ -1043,7 +1043,7 @@ class TestCronSchedule:
     def test_eventbridge_schedule_exists(self, e2e_config):
         """Verify the EventBridge schedule was created."""
         assert TestCronSchedule._schedule_id, "No schedule ID from previous test"
-        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
+        namespace = get_session_route(e2e_config).namespace
         eb_name = f"openclaw-{namespace}-{TestCronSchedule._schedule_id}"
 
         scheduler = boto3.client("scheduler", region_name=e2e_config.region)
@@ -1064,7 +1064,7 @@ class TestCronSchedule:
     def test_list_schedules(self, e2e_config):
         """Verify the test schedule exists in EventBridge via boto3."""
         assert TestCronSchedule._schedule_id, "No schedule ID from previous test"
-        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
+        namespace = get_session_route(e2e_config).namespace
         eb_name = f"openclaw-{namespace}-{TestCronSchedule._schedule_id}"
 
         scheduler = boto3.client("scheduler", region_name=e2e_config.region)
@@ -1080,7 +1080,7 @@ class TestCronSchedule:
     def test_delete_schedule(self, e2e_config):
         """Delete the test schedule via boto3 directly (prevents wrong-schedule deletion)."""
         assert TestCronSchedule._schedule_id, "No schedule ID from previous test"
-        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
+        namespace = get_session_route(e2e_config).namespace
         eb_name = f"openclaw-{namespace}-{TestCronSchedule._schedule_id}"
 
         # Delete EventBridge schedule
@@ -1128,7 +1128,7 @@ class TestCronSchedule:
     def test_eventbridge_schedule_deleted(self, e2e_config):
         """Verify the EventBridge schedule was removed."""
         assert TestCronSchedule._schedule_id, "No schedule ID from previous test"
-        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
+        namespace = get_session_route(e2e_config).namespace
         eb_name = f"openclaw-{namespace}-{TestCronSchedule._schedule_id}"
 
         scheduler = boto3.client("scheduler", region_name=e2e_config.region)
@@ -1185,7 +1185,7 @@ class TestCronExecution:
     @classmethod
     def _cleanup_stale_schedules(cls, cfg):
         """Delete any leftover E2E execution test schedules from prior runs."""
-        namespace = get_session_route(cfg).actor_id.replace(":", "_")
+        namespace = get_session_route(cfg).namespace
         scheduler = boto3.client("scheduler", region_name=cfg.region)
         try:
             resp = scheduler.list_schedules(GroupName=cls.SCHEDULE_GROUP)
@@ -1371,7 +1371,7 @@ class TestCronExecution:
         if not schedule_id:
             pytest.skip("No schedule to clean up")
 
-        namespace = get_session_route(e2e_config).actor_id.replace(":", "_")
+        namespace = get_session_route(e2e_config).namespace
         eb_name = f"openclaw-{namespace}-{schedule_id}"
 
         # Delete EventBridge schedule

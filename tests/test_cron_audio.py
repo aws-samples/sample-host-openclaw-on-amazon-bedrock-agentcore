@@ -342,7 +342,7 @@ def test_audio_is_skipped_when_the_lambda_is_out_of_time():
     telegram = FakeTelegram()
     module = _cron_module(s3)
     with patch.object(module.urllib_request, "urlopen", telegram):
-        module.deliver_brief_audio("telegram", "123", KEY, "telegram:123", deadline=module.time.monotonic() + 1)
+        module.deliver_brief_audio("telegram", "123", KEY, NAMESPACE, deadline=module.time.monotonic() + 1)
     assert telegram.methods == []
     assert s3.calls == []
 
@@ -357,7 +357,7 @@ def test_non_telegram_channel_strips_marker_and_sends_no_audio(channel):
             patch.object(module, "_get_slack_tokens", lambda: ("token", "")):
         response, key = module.split_audio_marker(f"{BRIEF}\n{MARKER}: {KEY}")
         module.deliver_response(channel, "target", response)
-        module.deliver_brief_audio(channel, "target", key, "telegram:123", deadline=module.time.monotonic() + 600)
+        module.deliver_brief_audio(channel, "target", key, NAMESPACE, deadline=module.time.monotonic() + 600)
     assert sent and MARKER not in sent[0]
     assert s3.calls == []
 

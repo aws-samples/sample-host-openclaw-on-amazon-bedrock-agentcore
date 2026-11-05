@@ -22,7 +22,8 @@ sys.modules["botocore.exceptions"] = MagicMock()
 
 import importlib
 index = importlib.import_module("index")
-TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_test123", actor_id="telegram:456")
+TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_test123", actor_id="telegram:456",
+                             namespace="telegram_456")
 
 
 class TestUploadImageToS3(unittest.TestCase):

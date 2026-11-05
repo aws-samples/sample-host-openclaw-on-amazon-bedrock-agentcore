@@ -68,7 +68,8 @@ APP_ID = "400000000000000001"
 USER_ID = "500000000000000001"
 TOKEN = "aW50ZXJhY3Rpb246dGVzdA.synthetic-token"
 SECRET = json.dumps({"applicationId": APP_ID, "publicKey": SIGNER.public_hex, "botToken": "synthetic.bot.token"})
-ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id=f"discord:{USER_ID}")
+ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id=f"discord:{USER_ID}",
+                        namespace=f"discord_{USER_ID}")
 
 
 class FakeClientError(Exception):
@@ -285,6 +286,14 @@ class TestHandleDiscord(unittest.TestCase):
         mock_auth.assert_called_once()
         self.assertEqual(mock_invoke.call_args.args[3:5], ("discord", "What's up?"))
         mock_reply.assert_called_once_with(APP_ID, TOKEN, "Hi there", ephemeral=False)
+
+    @patch.object(index, "invoke_agent_runtime")
+    @patch.object(index, "get_or_create_session", side_effect=index.RouteMigrating("migrating"))
+    @patch.object(index, "resolve_user", return_value=("user_abc123", False))
+    def test_migrating_user_gets_the_maintenance_reply(self, _r, _sess, mock_invoke, mock_reply, _s):
+        index.handle_discord(json.dumps(_ask("hello", guild=True)))
+        mock_invoke.assert_not_called()
+        mock_reply.assert_called_once_with(APP_ID, TOKEN, index.MIGRATION_REPLY, ephemeral=True)
 
     @patch.object(index, "invoke_agent_runtime")
     @patch.object(index, "resolve_user", return_value=(None, False))

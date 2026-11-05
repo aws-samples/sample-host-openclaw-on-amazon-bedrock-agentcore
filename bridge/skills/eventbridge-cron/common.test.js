@@ -294,3 +294,35 @@ describe("resolveScheduleDelivery binds the target to the current conversation",
       /channel must match the current conversation/);
   });
 });
+
+describe("a session with a stored namespace in its identity file", () => {
+  const OPAQUE = "ns_" + "i".repeat(26);
+  const IDENTITY = JSON.stringify({ actorId: ACTOR_ID, namespace: OPAQUE, channel: "telegram",
+    channelActorId: ACTOR_ID, channelTarget: "123456" });
+
+  it("names its schedules after the stored namespace", () => {
+    assert.equal(run(UPDATE, [OPAQUE, "0a1b2c3d", "--message", "hi"], { IDENTITY_STUB: IDENTITY }).status, 0);
+    assert.equal(run(DELETE, [OPAQUE, "0a1b2c3d"], { IDENTITY_STUB: IDENTITY }).status, 0);
+    const scheduler = awsCalls().filter((c) => c.input.GroupName);
+    assert.ok(scheduler.length >= 2);
+    for (const call of scheduler) assert.equal(call.input.Name, `openclaw-${OPAQUE}-0a1b2c3d`);
+  });
+
+  it("refuses the legacy namespace taken from an older transcript before any AWS call", () => {
+    const r = run(LIST, [NAMESPACE], { IDENTITY_STUB: IDENTITY });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Use the user_id from your system prompt/);
+    assert.deepEqual(awsCalls(), []);
+  });
+
+  it("binds schedule delivery to the stored namespace", () => {
+    const realRead = fs.readFileSync;
+    fs.readFileSync = (file, ...rest) => (file === "/tmp/current-identity.json" ? IDENTITY : realRead(file, ...rest));
+    try {
+      assert.equal(common.resolveScheduleDelivery(OPAQUE).channelTarget, "123456");
+      assert.throws(() => common.resolveScheduleDelivery(NAMESPACE), /does not match the AgentCore Runtime owner/);
+    } finally {
+      fs.readFileSync = realRead;
+    }
+  });
+});

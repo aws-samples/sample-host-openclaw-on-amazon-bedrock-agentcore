@@ -25,7 +25,8 @@ sys.modules["botocore.exceptions"] = MagicMock()
 
 import importlib
 index = importlib.import_module("index")
-TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id="slack:U12345USER")
+TEST_ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id="slack:U12345USER",
+                             namespace="slack_U12345USER")
 REAL_RESOLVE_USER = index.resolve_user
 
 
@@ -453,6 +454,25 @@ class TestSlackChannelMessages(_SlackTurnCase):
                 self.assertEqual(index._slack_addresses_bot(envelope, event), addressed)
         self.assertTrue(index._slack_addresses_bot({}, {"type": "app_mention", "text": "hi"}))
         self.assertFalse(index._slack_addresses_bot(envelope, {"type": "message", "text": None}))
+
+
+class TestSlackMigratingUser(_SlackTurnCase):
+    """While the user's storage is migrated the turn is not run; the sender gets the maintenance reply."""
+
+    def setUp(self):
+        super().setUp()
+        self.get_or_create_session.side_effect = index.RouteMigrating("migrating")
+
+    def test_dm_gets_the_reply_top_level(self):
+        index.handle_slack(json.dumps(_make_slack_dm_event(text="hello")))
+        self.invoke_agent_runtime.assert_not_called()
+        self.send_slack_message.assert_called_once_with("D12345DM", index.MIGRATION_REPLY, SLACK_BOT_TOKEN)
+
+    def test_channel_mention_gets_the_reply_in_its_thread(self):
+        index.handle_slack(json.dumps(_make_slack_app_mention_event()))
+        self.invoke_agent_runtime.assert_not_called()
+        self.send_slack_message.assert_called_once_with(
+            "C12345CHAN", index.MIGRATION_REPLY, SLACK_BOT_TOKEN, thread_ts=MESSAGE_TS)
 
 
 class TestSlackRetryHandling(_SlackTurnCase):

@@ -42,7 +42,7 @@ _TOOL_END = re.compile(r"embedded run tool end: runId=\S+ tool=(\S+)")
 
 
 def namespace(cfg: E2EConfig) -> str:
-    return get_session_route(cfg).actor_id.replace(":", "_")
+    return get_session_route(cfg).namespace
 
 
 def stream_prefixes(cfg: E2EConfig) -> List[str]:

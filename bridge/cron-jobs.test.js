@@ -162,7 +162,7 @@ function cronHandler({ turn = async () => {}, lifecycle = {} } = {}) {
     fs: { existsSync: () => false }, stateStorage: { DEFAULT_MOUNT: "/mnt/workspace" },
     cronJobs: jobs, osRandomUUID: () => "boot-1", CRON_JOB_BUDGET_MS: 45 * 60 * 1000,
     cronJobStoreInstance: null, console: { log() {}, warn() {}, error() {} },
-    Date, Object, Number,
+    Date, Object, Number, userNamespace: require("./user-namespace"),
     v2Lifecycle: { assertBinding, checkpoint },
     handleV2Invocation(payload, req, res, callerGone, arrival, options) {
       turns.push({ payload, options, callerGone: callerGone() });
@@ -314,6 +314,7 @@ test("handleV2Invocation bounds an async job by its own deadline, not a caller b
     console: { log() {}, warn() {}, error() {} }, Date, Object, JSON, Math, Number, AbortSignal,
     MAX_CALLER_BUDGET_MS: 900000, CALLER_REPLY_MARGIN_MS: 20000, TURN_TIMEOUT_MS: 620000,
     proxyModelOutcomeUnknown: false, activeTaskCount: 0, lastActivityTime: 0, RUNTIME_PLATFORM: "V2",
+    userNamespace: require("./user-namespace"),
     OPENCLAW_PORT: 1, GATEWAY_TOKEN: "t", TELEGRAM_BOT_TOKEN: "", activationScope: { signal: undefined },
     lateAnnounces: null, payloadModelOverride: () => null, buildBridgeText: (m) => m, extractTextFromContent: (x) => x,
     knownDeliveryRoutes: new Set(), routeTripleKey: () => null,

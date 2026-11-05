@@ -229,6 +229,31 @@ describe("uploadScreenshotToS3 key format", () => {
     assert.ok(key.startsWith("slack_U0ABC123/"));
     assert.ok(key.includes("_screenshots/screenshot_"));
   });
+
+  it("screenshots go under the stored namespace the identity file names for USER_ID", () => {
+    const { boundNamespace } = require("./skills/agentcore-browser/common");
+    const opaque = "ns_" + "l".repeat(26);
+    const readFileSync = fs.readFileSync;
+    const savedUser = process.env.USER_ID;
+    let identity = null;
+    fs.readFileSync = (file, ...rest) => {
+      if (file !== "/tmp/current-identity.json") return readFileSync(file, ...rest);
+      if (!identity) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return JSON.stringify(identity);
+    };
+    try {
+      process.env.USER_ID = "telegram:123456";
+      assert.equal(boundNamespace(), "telegram_123456", "no identity file: the legacy namespace");
+      identity = { actorId: "telegram:123456", namespace: opaque };
+      assert.equal(boundNamespace(), opaque);
+      identity = { actorId: "telegram:999", namespace: opaque };
+      assert.equal(boundNamespace(), "telegram_123456", "a file for another actor is ignored");
+    } finally {
+      fs.readFileSync = readFileSync;
+      if (savedUser === undefined) delete process.env.USER_ID;
+      else process.env.USER_ID = savedUser;
+    }
+  });
 });
 
 // --- SSRF URL validation ---

@@ -64,7 +64,8 @@ function fixture(t) {
   }));
   const controller = new AbortController();
   const binding = Object.freeze({ actorId: env.USER_ID, userId: env.INTERNAL_USER_ID });
-  const current = { state: "BINDING", binding, generation: "generation", resources: ["credentials"] };
+  const current = { state: "BINDING", binding, namespace: "slack_test", generation: "generation",
+    resources: ["credentials"] };
   const scope = { generation: current.generation, signal: controller.signal,
     checkpoint: () => controller.signal.throwIfAborted() };
   const lifecycle = { snapshot: () => current, checkpoint: scope.checkpoint,

@@ -221,7 +221,7 @@ function contractHandler(telemetry) {
       assertBinding: () => {},
       checkpoint: () => {},
     },
-    console: { log() {}, error() {} },
+    console: { log() {}, error() {} }, userNamespace: require("./user-namespace"),
   });
   const start = source.indexOf("const server = http.createServer(");
   const end = source.indexOf("\n// --- SIGTERM handler", start);
@@ -377,10 +377,12 @@ function loggerFixture({ region = "test-region", failStream = false } = {}) {
   const telemetry = timing({ emit: (record) => output.log(JSON.stringify(record)) });
   Object.assign(context, {
     cwLogger, startupTiming: telemetry, checkpoint() {}, userId: "test-user", actorId: "test:actor",
-    v2Lifecycle: { snapshot: () => ({ binding: { userId: "test-user", actorId: "test:actor" } }) },
+    boundNamespace: "test_actor", userNamespace: require("./user-namespace"),
+    v2Lifecycle: { snapshot: () => ({ binding: { userId: "test-user", actorId: "test:actor" },
+      namespace: "test_actor" }) },
     activationScope: { generation: "test-generation", signal: new AbortController().signal },
   });
-  const start = source.indexOf('    const namespace = actorId.replace(/:/g, "_");');
+  const start = source.indexOf("    const namespace = boundNamespace;");
   const end = source.indexOf("\n    // Expose USER_ID", start);
   assert.ok(start >= 0 && end > start);
   const initialize = vm.compileFunction(

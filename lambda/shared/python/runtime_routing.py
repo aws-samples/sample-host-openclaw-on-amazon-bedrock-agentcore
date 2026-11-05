@@ -5,6 +5,12 @@ actor binding. Consistent reads and conditional updates reject missing or
 changed routes instead of silently choosing a replacement. Admission tokens
 track active callers and prevent freezing a route while work is outstanding;
 callers retain tokens for unknown outcomes until explicit reconciliation.
+
+The route also names the user's storage namespace (the S3 prefix and the
+secret, schedule and session names built from it). A SESSION without a
+`namespace` attribute uses the legacy namespace, the runtime actor with ':'
+replaced by '_'. A stored namespace is used only when the `NS#<namespace>` /
+OWNER record, which lives outside the user's partition, names the same user.
 """
 
 from contextlib import contextmanager
@@ -20,6 +26,20 @@ logger = logging.getLogger(__name__)
 
 class RouteUnavailable(RuntimeError):
     pass
+
+
+class RouteMigrating(RouteUnavailable):
+    """The user's storage is being moved to another namespace (scripts/namespace_cutover.py)."""
+
+
+# A stored namespace is either the legacy value or "ns_" + 26 base32 characters
+# (128 random bits, scripts/namespace_cutover.py).
+OPAQUE_NAMESPACE = re.compile(r"ns_[a-z2-7]{26}")
+
+
+def legacy_namespace(actor_id):
+    """The namespace of a route that stores none: the runtime actor with ':' as '_'."""
+    return actor_id.replace(":", "_")
 
 
 class RuntimeAdmission:
@@ -45,6 +65,7 @@ def is_unknown_outcome(response):
 _ROUTE_FIELDS = (
     "sessionId", "runtimeArn", "endpointName", "generation",
     "platformVersion", "routeStatus", "actorId", "runtimeVersion", "imageDigest", "configurationHash",
+    "namespace",
 )
 _TARGET_FIELDS = ("runtimeArn", "endpointName", "generation", "platformVersion")
 _RUNTIME_ARN = re.compile(r"arn:[a-z0-9-]+:bedrock-agentcore:[a-z0-9-]+:\d{12}:runtime/[A-Za-z0-9_-]+")
@@ -60,6 +81,7 @@ class RuntimeRoute:
     generation: int
     platform_version: str
     actor_id: str
+    namespace: str
     snapshot: dict = field(repr=False, compare=False)
 
     def __str__(self):
@@ -69,6 +91,11 @@ class RuntimeRoute:
     def key(self):
         return {"PK": f"USER#{self.user_id}", "SK": "SESSION"}
 
+    @property
+    def namespace_stored(self):
+        """True when SESSION carries the namespace instead of deriving it from the actor."""
+        return "namespace" in self.snapshot
+
     def invocation(self):
         return {
             "agentRuntimeArn": self.runtime_arn,
@@ -77,7 +104,8 @@ class RuntimeRoute:
         }
 
     def payload_context(self):
-        return {"runtimeSessionId": self.session_id, "routingGeneration": self.generation}
+        return {"runtimeSessionId": self.session_id, "routingGeneration": self.generation,
+                "namespace": self.namespace}
 
 
 def route_from_record(item, user_id):
@@ -87,6 +115,8 @@ def route_from_record(item, user_id):
     if (not isinstance(session_id, str) or not 33 <= len(session_id) <= 256
             or not re.fullmatch(r"[A-Za-z0-9_-]+", session_id)):
         raise RouteUnavailable("Invalid AgentCore Runtime session ID; reconciliation required")
+    if item.get("routeStatus") == "MIGRATING":
+        raise RouteMigrating("User storage is being migrated; try again shortly")
     if item.get("routeStatus") != "ACTIVE":
         raise RouteUnavailable("AgentCore Runtime route is not active; reconciliation required")
     if not all(key in item for key in _TARGET_FIELDS):
@@ -107,8 +137,12 @@ def route_from_record(item, user_id):
         raise RouteUnavailable("AgentCore Runtime platform must be V2; reconciliation required")
     if not isinstance(actor, str) or not actor:
         raise RouteUnavailable("V2 requires a bound actor; reconciliation required")
+    namespace = item.get("namespace", legacy_namespace(actor))
+    if (not isinstance(namespace, str)
+            or (namespace != legacy_namespace(actor) and not OPAQUE_NAMESPACE.fullmatch(namespace))):
+        raise RouteUnavailable("Invalid stored namespace; reconciliation required")
     return RuntimeRoute(user_id, arn, endpoint, session_id, int(generation), platform,
-                        actor, {key: item[key] for key in _ROUTE_FIELDS if key in item})
+                        actor, namespace, {key: item[key] for key in _ROUTE_FIELDS if key in item})
 
 
 def _conditional_failure(error):
@@ -120,7 +154,22 @@ def resolve_route(table, user_id):
     item = table.get_item(Key=key, ConsistentRead=True).get("Item")
     if not item:
         raise RouteUnavailable("Canonical AgentCore Runtime route is missing; reconciliation required")
-    return route_from_record(item, user_id)
+    route = route_from_record(item, user_id)
+    if route.namespace_stored:
+        verify_namespace_owner(table, route.namespace, user_id)
+    return route
+
+
+def verify_namespace_owner(table, namespace, user_id):
+    """Fail closed unless NS#<namespace>/OWNER names user_id.
+
+    The owner record is outside the user's USER#<id> partition and is written
+    only by the operator tools (scripts/namespace_backfill.py and
+    scripts/namespace_cutover.py), so it, not SESSION, decides the namespace.
+    """
+    owner = table.get_item(Key={"PK": f"NS#{namespace}", "SK": "OWNER"}, ConsistentRead=True).get("Item")
+    if not owner or owner.get("userId") != user_id:
+        raise RouteUnavailable("Stored namespace is not owned by this user; reconciliation required")
 
 
 def _condition(route):
