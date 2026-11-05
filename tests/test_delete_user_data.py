@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import io
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import botocore.session
@@ -411,6 +412,10 @@ def world(suffix=""):
     for actor, rows in ((RUNTIME, 3), (USER, 1), (OTHER, 2)):
         for n in range(rows):
             aws.tokens.put(PK=f"USER#{actor}", SK=f"DATE#2026-11-0{n + 1}#CHANNEL#telegram#SESSION#s", actorId=actor)
+    # Daily usage items and a limit override (per_user_daily_cost_usd), outside USER#<id>.
+    for uid in (USER, OTHER_USER):
+        t.put(PK=f"USAGE#{uid}", SK="DAY#2026-11-05", costUsd=Decimal("1.5"), calls=Decimal(3))
+    t.put(PK=f"USAGE#{USER}", SK="CAP", dailyCostUsd=Decimal(2), setAt="2026-11-01T00:00:00Z")
     return aws
 
 
@@ -478,6 +483,7 @@ def test_dry_run_makes_no_mutating_call_and_lists_every_step():
     assert "would delete 6 object versions (60 bytes) and 1 delete marker" in out
     # The 2 CRON# records belong to step 4, so step 10 lists the other 5 partition items.
     assert "would delete 5 items under USER#<id> and 5 CHANNEL#, ACTOR#, BIND# or NS# records" in out
+    assert "would delete 2 usage items under USAGE#<id>" in out
     assert "would schedule 2 secrets for deletion with a 7-day recovery window" in out
     assert "would delete 4 rows" in out and "would delete 3 log streams" in out
     assert "AUDIT" not in out
@@ -506,6 +512,18 @@ def test_apply_runs_the_steps_in_order_and_identity_last():
     assert aws.agentcore.stopped == [{"agentRuntimeArn": ARN, "qualifier": "release_1",
                                       "runtimeSessionId": "ses_" + hashlib.md5(USER.encode()).hexdigest()}]
     assert out.rstrip().endswith(f"AUDIT: {USER} data deleted 2026-11-05")
+
+
+def test_usage_items_are_deleted_in_the_identity_step_and_only_this_users():
+    aws = world()
+    code, out = run(aws, "--actor", RUNTIME, "--apply")
+    assert code == 0, out
+    assert "deleted 2 usage items under USAGE#<id>" in out
+    assert not [key for key in aws.identity.items if key[0] == f"USAGE#{USER}"]
+    assert (f"USAGE#{OTHER_USER}", "DAY#2026-11-05") in aws.identity.items
+    deletes = [call for call in aws.log.mutating() if call[3] and call[3][0] == f"USAGE#{USER}"]
+    assert sorted(call[3][1] for call in deletes) == ["CAP", "DAY#2026-11-05"]
+    assert {step_of(call) for call in deletes} == {10}
 
 
 def test_any_linked_actor_or_the_user_id_selects_the_same_user():

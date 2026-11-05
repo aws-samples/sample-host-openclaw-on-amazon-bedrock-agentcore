@@ -26,6 +26,7 @@ import discord_channel
 import formatting
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
 from runtime_invocation import RELEASE_RESERVE_SECONDS, InvocationTransportError, invoke_bounded
+import usage_limits
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -47,6 +48,9 @@ USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
 # so a brief is not limited by this Lambda's 900 s timeout. Empty = the original
 # synchronous path (the rollback: deploy with -c cron_async=false).
 CRON_ASYNC_STATE_MACHINE_ARN = os.environ.get("CRON_ASYNC_STATE_MACHINE_ARN", "")
+# Default daily cost limit per internal user in USD (per_user_daily_cost_usd).
+# 0 = off: no usage is read before a run. See lambda/shared/python/usage_limits.py.
+PER_USER_DAILY_COST_USD = usage_limits.parse_limit(os.environ.get("PER_USER_DAILY_COST_USD"))
 
 # --- Clients ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION,
@@ -78,6 +82,10 @@ INVOCATION_FAILED_RESPONSE = "Agent invocation failed."
 CRON_FAILED_MESSAGE = (
     "Your scheduled task did not return a result this time. "
     "It will run again at the next scheduled time."
+)
+USAGE_LIMIT_SKIPPED_MESSAGE = (
+    "Skipped: today's usage limit is reached. "
+    "It runs again at its next scheduled time after 00:00 UTC."
 )
 
 
@@ -1095,6 +1103,9 @@ def handler(event, context):
     job, error = verify_cron_event(event)
     if error:
         return error
+    skipped = skip_over_usage_limit(job)
+    if skipped:
+        return skipped
     channel, channel_target, message = job["channel"], job["channelTarget"], job["message"]
     schedule_id, schedule_name = job["scheduleId"], job["scheduleName"]
     current_user_id, actor_id, session_id = job["userId"], job["actorId"], job["route"]
@@ -1259,6 +1270,24 @@ def scheduled_message(job):
     return f"[Scheduled task: {job['scheduleName'] or job['scheduleId']}] {job['message']}"
 
 
+def skip_over_usage_limit(job):
+    """The Lambda response for a schedule whose user is at or over today's usage limit, else None.
+
+    Checked once per fire, before the warm-up: nothing is sent to AgentCore.
+    A run that has already started (the async poll and deliver phases) is not
+    checked again and finishes. The user gets the skip notice at most once per
+    UTC day. The log line avoids the terms of the scheduled-task failure alarm.
+    """
+    usage = usage_limits.over_limit(identity_table, job["userId"], PER_USER_DAILY_COST_USD)
+    if usage is None:
+        return None
+    logger.warning("Scheduled task %s skipped: daily usage limit reached", job["scheduleId"])
+    if not usage.cron_notice_sent and usage_limits.claim_cron_notice(identity_table, job["userId"], usage.day):
+        deliver_response(job["channel"], job["channelTarget"],
+                         f"[Scheduled: {job['scheduleName'] or job['scheduleId']}] {USAGE_LIMIT_SKIPPED_MESSAGE}")
+    return {"statusCode": 200, "body": "Skipped: daily usage limit reached"}
+
+
 def deliver_warmup_failure(job):
     # Matched by the openclaw-scheduled-task-failures alarm.
     logger.warning("Scheduled task %s did not complete: the agent failed to start", job["scheduleId"])
@@ -1366,6 +1395,9 @@ def launch_async(event):
     job, error = verify_cron_event(event)
     if error:
         return error
+    skipped = skip_over_usage_limit(job)
+    if skipped:
+        return skipped
     name = async_job_id(event, job["userId"])
     state = {key: event[key] for key in ASYNC_EVENT_FIELDS if event.get(key) is not None}
     # Carry the verified values (current owner, record-bound destination,

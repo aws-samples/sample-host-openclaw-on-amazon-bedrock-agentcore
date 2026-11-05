@@ -166,6 +166,9 @@ token_monitoring_stack = TokenMonitoringStack(
     owns_invocation_log_group=observability_stack.manages_invocation_logging,
     alarm_topic=observability_stack.alarm_topic,
     cmk_arn=security_stack.cmk.key_arn,
+    # Per-user daily usage items; string names, as for OpenClawCron.
+    identity_table_name=_identity_table_name,
+    identity_table_arn=_identity_table_arn,
     env=env,
 )
 # Its scheduled-task alarms filter /openclaw/lambda/cron, which OpenClawCron creates.

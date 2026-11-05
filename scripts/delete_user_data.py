@@ -17,7 +17,7 @@ re-run with the same arguments to finish the job:
    7  the Cognito user
    8  token-usage rows
    9  /openclaw/container log streams
-  10  identity records, last, so an interrupted run can still find everything
+  10  identity records (usage items under USAGE#<id> first), last, so an interrupted run can still find everything
   11  what this tool cannot delete
 
 Records outside the user's USER#<id> partition decide which actors and namespaces belong to
@@ -631,6 +631,9 @@ def step_identity(run):
     partition = user.partition if not run.apply else {item["SK"]: item for item in _query(table, f"USER#{uid}")}
     if not run.apply:
         partition = {sk: item for sk, item in partition.items() if not sk.startswith("CRON#")}
+    # USAGE#<id>: the daily usage items and the limit override (per_user_daily_cost_usd).
+    # Keyed by the user ID itself and never read to resolve the user, so they go first.
+    usage = [item["SK"] for item in _query(table, f"USAGE#{uid}")]
     present = []
     for pk, sk, outside in identity_plan(user, partition):
         if not outside:
@@ -640,6 +643,8 @@ def step_identity(run):
             present.append((pk, sk, outside))
     groups = _group_records(run)
     if run.apply:
+        for sk in usage:
+            table.delete_item(Key={"PK": f"USAGE#{uid}", "SK": sk})
         for pk, sk, outside in present:
             if outside:
                 # Only while the record still names this user.
@@ -656,6 +661,7 @@ def step_identity(run):
                         "(remove the group or the attribute separately if needed)")
     run.say(10, "identity", f"{run.did('delete', 'deleted')} {_count(inside, 'item')} under USER#<id> and "
                             f"{_count(len(present) - inside, 'CHANNEL#, ACTOR#, BIND# or NS# record')}, PROFILE last; "
+                            f"{run.did('delete', 'deleted')} {_count(len(usage), 'usage item')} under USAGE#<id>; "
                             f"kept {_count(len(groups), 'Telegram group allowlist record')} this user added")
 
 

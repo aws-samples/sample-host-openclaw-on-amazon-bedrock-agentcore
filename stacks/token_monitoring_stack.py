@@ -20,7 +20,7 @@ import cdk_nag
 from constructs import Construct
 
 from stacks import DeploymentNamer, apply_table_tags, retention_days
-from stacks.health_alarms import add_health_alarms
+from stacks.health_alarms import NAMESPACE as HEALTH_NAMESPACE, add_health_alarms
 from stacks.context_limits import reserved_concurrency
 
 
@@ -73,11 +73,14 @@ class TokenMonitoringStack(Stack):
         owns_invocation_log_group: bool = True,
         alarm_topic: sns.ITopic,
         cmk_arn: str,
+        identity_table_name: str,
+        identity_table_arn: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         namer = DeploymentNamer.from_scope(self)
+        region = Stack.of(self).region
         # Metrics, their IAM condition, dashboard and alarms share one namespace,
         # suffixed per environment so two environments never sum each other's
         # datapoints. Unsuffixed it stays OpenClaw/TokenUsage.
@@ -199,6 +202,8 @@ class TokenMonitoringStack(Stack):
                 "TABLE_NAME": self.table.table_name,
                 "TTL_DAYS": str(ttl_days),
                 "METRICS_NAMESPACE": ns,
+                # Per-user daily usage items (per_user_daily_cost_usd and /usage).
+                "IDENTITY_TABLE_NAME": identity_table_name,
             },
             log_group=lambda_log_group,
         )
@@ -214,6 +219,35 @@ class TokenMonitoringStack(Stack):
                         "cloudwatch:namespace": ns
                     }
                 },
+            )
+        )
+
+        # Per-user daily usage items in the identity table (OpenClawRouter's, passed
+        # by name like OpenClawCron's): UpdateItem only under USAGE#<user ID>, and
+        # GetItem only on CHANNEL#<actor> records, to find the user of a record from
+        # a bridge image older than the user ID change.
+        self.token_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:UpdateItem"],
+                resources=[identity_table_arn],
+                conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["USAGE#*"]}},
+            )
+        )
+        self.token_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:GetItem"],
+                resources=[identity_table_arn],
+                conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": ["CHANNEL#*"]}},
+            )
+        )
+        # The identity table is encrypted with the CMK: the KMS actions CDK grants
+        # for a CMK-encrypted table, only through DynamoDB.
+        self.token_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["kms:Decrypt", "kms:DescribeKey", "kms:Encrypt", "kms:ReEncrypt*",
+                         "kms:GenerateDataKey*"],
+                resources=[cmk_arn],
+                conditions={"StringEquals": {"kms:ViaService": f"dynamodb.{region}.amazonaws.com"}},
             )
         )
 
@@ -377,6 +411,45 @@ class TokenMonitoringStack(Stack):
             stat="Sum",
         )
 
+        # --- Token metrics failures -----------------------------------------
+        # A failed invocation, a record the Lambda could not process, or a daily
+        # usage item it could not write each leave usage uncounted, and the
+        # per-user daily cost limit (per_user_daily_cost_usd) then counts less
+        # than was spent. The Lambda logs a failed record or usage item without
+        # failing the invocation, so the Errors metric alone misses them.
+        write_failures = logs.MetricFilter(
+            self,
+            "TokenMetricsWriteFailuresFilter",
+            log_group=lambda_log_group,
+            filter_pattern=logs.FilterPattern.any_term(
+                "Failed to process log event", "Usage aggregate not written"),
+            metric_namespace=HEALTH_NAMESPACE,
+            metric_name=namer.name("TokenMetricsWriteFailures"),
+            metric_value="1",
+        )
+        cw.MathExpression(
+            expression="FILL(errors, 0) + FILL(failures, 0)",
+            using_metrics={
+                "errors": self.token_lambda.metric_errors(statistic="Sum"),
+                "failures": write_failures.metric(statistic="Sum"),
+            },
+            period=Duration.hours(1),
+            label="Token metrics errors and unwritten records",
+        ).create_alarm(
+            self,
+            "TokenMetricsErrorsAlarm",
+            alarm_name=namer.name("openclaw-token-metrics-errors"),
+            alarm_description=(
+                "The token-metrics Lambda failed, or could not write a token-usage record or a per-user "
+                "daily usage item, in the last hour (3600 s). The usage of those calls is not fully "
+                "counted, also by the per-user daily cost limit (per_user_daily_cost_usd)."
+            ),
+            threshold=0,
+            evaluation_periods=1,
+            comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+        ).add_alarm_action(alarm_action)
+
         CfnOutput(
             self,
             "TokenUsageTableName",
@@ -403,7 +476,11 @@ class TokenMonitoringStack(Stack):
                     "and is scoped to the specific table's GSIs. KMS wildcards "
                     "(GenerateDataKey*, ReEncrypt*) are added by CDK for CMK-encrypted "
                     "DynamoDB table. cloudwatch:PutMetricData wildcard is constrained "
-                    f"by the cloudwatch:namespace condition to {ns} only.",
+                    f"by the cloudwatch:namespace condition to {ns} only. The same KMS "
+                    "wildcards on the CMK for the CMK-encrypted identity table are limited "
+                    "by kms:ViaService to DynamoDB in this region; the identity-table "
+                    "actions are limited by dynamodb:LeadingKeys to USAGE#* (UpdateItem) "
+                    "and CHANNEL#* (GetItem).",
                 ),
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-L1",

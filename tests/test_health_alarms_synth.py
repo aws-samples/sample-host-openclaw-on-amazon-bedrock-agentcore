@@ -28,7 +28,10 @@ def _synth():
     observability = ObservabilityStack(app, "OpenClawObservability", cmk_arn=security.cmk.key_arn, env=env)
     token = TokenMonitoringStack(app, "OpenClawTokenMonitoring",
                                  invocation_log_group=observability.invocation_log_group,
-                                 alarm_topic=observability.alarm_topic, cmk_arn=security.cmk.key_arn, env=env)
+                                 alarm_topic=observability.alarm_topic, cmk_arn=security.cmk.key_arn,
+                                 identity_table_name="openclaw-identity",
+                                 identity_table_arn=f"arn:aws:dynamodb:{_REGION}:{_ACCOUNT}:table/openclaw-identity",
+                                 env=env)
     return Template.from_stack(observability).to_json(), Template.from_stack(token).to_json()
 
 
@@ -62,7 +65,8 @@ def test_session_storage_alarms_are_in_observability():
 def test_scheduled_task_alarms_are_in_token_monitoring():
     obs, token = _synth()
     f = _filters(token)
-    assert set(f) == {"ScheduledTaskFailures", "RuntimeSessionUnstartable"}
+    # TokenMetricsWriteFailures (the token-metrics Lambda's own log group) is in tests/test_usage_limits_synth.py.
+    assert set(f) == {"ScheduledTaskFailures", "RuntimeSessionUnstartable", "TokenMetricsWriteFailures"}
     assert f["ScheduledTaskFailures"]["LogGroupName"] == "/openclaw/lambda/cron"
     assert f["ScheduledTaskFailures"]["FilterPattern"] == '?"did not complete" ?"Warmup timed out" ?"Status: timeout"'
     assert f["RuntimeSessionUnstartable"]["FilterPattern"] == '"could not start runtime session"'

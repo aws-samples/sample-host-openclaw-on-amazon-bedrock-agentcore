@@ -15,6 +15,7 @@ The bot can answer in Telegram groups and supergroups. This is **off by default*
 - **Only addressed messages.** In an allowlisted group the bot answers a message only if it @mentions the bot (the mention is removed), replies to one of the bot's own messages, or is `/command@YourBot` (sent to the agent as `/command`). A bare `/command`, a command for another bot, and all other messages are ignored without a reply. The bot's answer is a reply to the message that triggered it.
 - **Files and images** follow the same rules and limits as private chats and are stored under the group's namespace.
 - **Not available in groups:** `/model` (a group uses the default model), account linking (`link`, `link <code>`), and scheduled tasks (the agent's cron tools refuse to create a schedule for a group).
+- **`/usage@YourBot`** reports the group's own usage today. With `per_user_daily_cost_usd` set, the group has its own daily limit, shared by its members ([Per-user daily cost limit](../README.md#per-user-daily-cost-limit)).
 - **Token usage** for a group's turns is recorded under the group's actor, `telegram_group:<chat_id>`.
 
 ### Turn it on
@@ -160,6 +161,7 @@ A conversation here is any Slack conversation except a 1:1 DM (public channels, 
 - **Display names.** Slack includes the sender's profile with some events; otherwise the router reads it with `users.info`, which needs the `users:read` bot token scope. Feishu needs the `contact:user.base:readonly` permission, with the sender inside the app's contact range. Without them every sender appears as `a member`. Names are cached for an hour in each Router Lambda container.
 - **The shared-conversation rules apply.** The system prompt tells the agent that the conversation is shared and that its memory and files belong to the conversation, and not to reveal user IDs, the namespace or storage paths, or saved memory, notes and files, unless the sender explicitly asks.
 - **Not available in conversations:** `/model` (a conversation always uses the default model), account linking (`link`, `link <code>`: the bot asks for a 1:1 chat instead), and scheduled tasks (the agent's cron tools refuse to create one).
+- **`/usage`**, addressed to the bot like any other message there, reports the conversation's own usage today. With `per_user_daily_cost_usd` set, the conversation has its own daily limit, shared by its members ([Per-user daily cost limit](../README.md#per-user-daily-cost-limit)).
 - **Replies** go where they went before: in Slack to the message's thread, in Feishu to the group chat.
 - **Token usage** for a conversation's turns is recorded under the conversation's internal user ID.
 

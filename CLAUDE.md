@@ -349,6 +349,7 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bri
 | `hourly_cost_alarm_usd` | `30` | `openclaw-hourly-cost-spike` threshold (EstimatedCostUSD Sum over 1 h) |
 | `daily_cost_budget_usd` | `100` | `openclaw-daily-cost-budget` threshold (EstimatedCostUSD Sum over 1 day). Was compared per hour before the alarm split; move an hourly value to `hourly_cost_alarm_usd` |
 | `alarm_email` | `""` | Optional email subscription on `openclaw-alarms`; unset, alarms notify nobody |
+| `per_user_daily_cost_usd` | `0` (off) | Daily estimated-cost limit (USD, 0 to 10000) per internal user, checked by the Router before each turn and by the Cron Lambda before each scheduled run; resets at 00:00 UTC. See [README](README.md#per-user-daily-cost-limit) |
 | `token_ttl_days` | `90` | DynamoDB TTL |
 | `user_files_ttl_days` | `365` | S3 per-user file expiration |
 | `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |
@@ -389,6 +390,8 @@ See the [AgentCore Runtime V2 lifecycle](docs/runtime-v2.md#lifecycle-and-compat
 | `BIND#ABC123` | `BIND` | Cross-channel bind code (10 min TTL) |
 | `ALLOW#telegram:123456789` | `ALLOW` | User allowlist entry |
 | `USER#user_abc123` | `CRON#schedule-name` | User's cron schedule metadata (expression, message, timezone, channel) |
+| `USAGE#user_abc123` | `DAY#2026-11-05` | The user's estimated cost, model calls and tokens on that UTC day, added to by the token-metrics Lambda (TTL two days after the day); read by `per_user_daily_cost_usd` and `/usage` |
+| `USAGE#user_abc123` | `CAP` | The user's daily cost limit override (`manage-allowlist.sh set-cap`; 0 = no limit) |
 
 **Cross-channel binding**: User says "link accounts" on Telegram → gets 6-char code → enters code on Slack → both channels route to same user/session.
 
