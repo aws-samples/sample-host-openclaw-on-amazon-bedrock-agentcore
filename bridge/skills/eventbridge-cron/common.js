@@ -342,9 +342,19 @@ function resolveScheduleDelivery(userId, { channel, channelTarget } = {}) {
   if (channel && channel !== identity.channel) {
     throw new Error("Schedule channel must match the current conversation");
   }
-  const target = channelTarget === "" ? identity.channelTarget : (channelTarget ?? identity.channelTarget);
+  // The delivery target is always the current conversation's target (written
+  // to the identity file by the contract server and already authorized there).
+  // An explicit channel_target is accepted only when it equals that target —
+  // an empty string or an omitted argument means "use the current target" — so
+  // a schedule cannot be pointed at another chat on the same channel.
+  const requested = (channelTarget === "" || channelTarget === undefined || channelTarget === null)
+    ? null : channelTarget;
+  const target = identity.channelTarget;
   if (typeof target !== "string" || !target) {
     throw new Error("Schedule delivery target is unavailable");
+  }
+  if (requested !== null && requested !== target) {
+    throw new Error("Schedule delivery target must be the current conversation's target");
   }
   return {
     actorId: identity.actorId,

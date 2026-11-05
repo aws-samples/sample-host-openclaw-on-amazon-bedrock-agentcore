@@ -257,3 +257,40 @@ describe("eventbridge-cron owner checks", () => {
     assert.equal(awsCalls()[0].input.ExpressionAttributeValues[":pk"], `USER#${NAMESPACE}`);
   });
 });
+
+describe("resolveScheduleDelivery binds the target to the current conversation", () => {
+  const NS = "telegram_123456";
+  const IDENTITY = {
+    actorId: "telegram:123456", channel: "telegram",
+    channelActorId: "telegram:123456", channelTarget: "123456",
+  };
+  let realRead;
+  beforeEach(() => {
+    realRead = fs.readFileSync;
+    fs.readFileSync = (file, ...rest) =>
+      (file === "/tmp/current-identity.json" ? JSON.stringify(IDENTITY) : realRead(file, ...rest));
+  });
+  afterEach(() => { fs.readFileSync = realRead; });
+
+  it("uses the current conversation's target when channel_target is omitted", () => {
+    assert.equal(common.resolveScheduleDelivery(NS).channelTarget, "123456");
+  });
+
+  it("uses the current target when channel_target is an empty string", () => {
+    assert.equal(common.resolveScheduleDelivery(NS, { channelTarget: "" }).channelTarget, "123456");
+  });
+
+  it("accepts an explicit channel_target that equals the current target", () => {
+    assert.equal(common.resolveScheduleDelivery(NS, { channelTarget: "123456" }).channelTarget, "123456");
+  });
+
+  it("rejects an explicit channel_target that points at another chat", () => {
+    assert.throws(() => common.resolveScheduleDelivery(NS, { channelTarget: "999999" }),
+      /must be the current conversation's target/);
+  });
+
+  it("still requires the channel to match the current conversation", () => {
+    assert.throws(() => common.resolveScheduleDelivery(NS, { channel: "slack", channelTarget: "123456" }),
+      /channel must match the current conversation/);
+  });
+});
