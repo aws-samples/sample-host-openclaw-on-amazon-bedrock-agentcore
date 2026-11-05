@@ -52,6 +52,8 @@ elif args[:2] == ["secretsmanager", "update-secret"]:
         shutil.copy(value[len("file://"):], os.environ["CAPTURED_SECRET"])
 elif args[:2] == ["dynamodb", "get-item"] and os.environ.get("FAKE_USER_ID"):
     print(os.environ["FAKE_USER_ID"])
+elif args[:2] == ["dynamodb", "query"] and os.environ.get("FAKE_QUERY_ITEMS"):
+    print(os.environ["FAKE_QUERY_ITEMS"])
 '''
 
 
@@ -241,3 +243,31 @@ def test_allowlist_list_still_works_without_a_profile(env):
     result = _run("manage-allowlist.sh", environment, "list")
     assert result.returncode == 0, result.stderr
     assert [c["args"][:2] for c in _calls(root)] == [["dynamodb", "scan"]]
+
+
+def test_allowlist_whois_lists_channel_actors_for_a_user(env):
+    root, environment = env
+    environment["FAKE_QUERY_ITEMS"] = json.dumps({"Items": [
+        {"PK": {"S": "USER#user_0123abcd"}, "SK": {"S": "PROFILE"},
+         "enrollmentActorId": {"S": "telegram:123"}},
+        {"PK": {"S": "USER#user_0123abcd"}, "SK": {"S": "CHANNEL#telegram:123"}},
+        {"PK": {"S": "USER#user_0123abcd"}, "SK": {"S": "CHANNEL#slack:U456"}},
+        {"PK": {"S": "USER#user_0123abcd"}, "SK": {"S": "SESSION"}},
+    ]})
+    result = _run("manage-allowlist.sh", environment, "whois", "user_0123abcd")
+    assert result.returncode == 0, result.stderr
+    query = next(c["args"] for c in _calls(root) if c["tool"] == "aws")
+    assert query[:2] == ["dynamodb", "query"]
+    values = json.loads(query[query.index("--expression-attribute-values") + 1])
+    assert values[":pk"] == {"S": "USER#user_0123abcd"}
+    assert "telegram:123" in result.stdout
+    assert "slack:U456" in result.stdout
+    assert "SESSION" not in result.stdout
+
+
+def test_allowlist_whois_rejects_a_non_user_id_before_any_aws_call(env):
+    root, environment = env
+    result = _run("manage-allowlist.sh", environment, "whois", "telegram:123")
+    assert result.returncode != 0
+    assert "ERROR" in result.stderr
+    assert not any(c["tool"] == "aws" for c in _calls(root))

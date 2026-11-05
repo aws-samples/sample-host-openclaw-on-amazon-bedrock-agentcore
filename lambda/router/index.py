@@ -667,7 +667,7 @@ def _allow_record_exists(channel_key):
     except ClientError as e:
         # Fail closed on allowlist read errors so revocation is never silently
         # bypassed by a transient DynamoDB fault.
-        logger.error("Allowlist check failed for %s: %s", channel_key, e)
+        logger.error("Allowlist check failed for channel=%s: %s", channel_key.split(":", 1)[0], e)
         return False
     return "Item" in resp
 
@@ -714,7 +714,7 @@ def _is_currently_authorized(channel, channel_user_id, user_id):
     try:
         owner = read_actor_owner(identity_table, channel_key)
     except (ClientError, RouteUnavailable) as e:
-        logger.error("Authorization owner read failed for %s: %s", channel_key, e)
+        logger.error("Authorization owner read failed for channel=%s: %s", channel_key.split(":", 1)[0], e)
         return False
     if not owner or owner.get("userId") != user_id:
         return False
@@ -767,17 +767,17 @@ def resolve_user(channel, channel_user_id, display_name=""):
             if owner and owner["userId"] != existing_user_id:
                 raise RouteUnavailable("Channel mapping conflicts with durable actor ownership")
             # Re-evaluate authorization on every turn so that an operator
-            # removing the ALLOW# record (the documented revocation step)
+            # removing the ALLOW# record (scripts/manage-allowlist.sh remove)
             # actually revokes service, instead of only blocking first-time
-            # enrollment. See docs/security.md "Revoking access".
+            # enrollment.
             if not _is_currently_authorized(channel, channel_user_id, existing_user_id):
                 logger.warning(
-                    "Enrolled identity %s is no longer on the allowlist; rejecting turn",
-                    channel_key,
+                    "Rejecting turn: channel=%s reason=revoked user=%s",
+                    channel, existing_user_id,
                 )
                 return None, False
             if _is_user_disabled(existing_user_id):
-                logger.warning("User for %s is disabled; rejecting turn", channel_key)
+                logger.warning("Rejecting turn: channel=%s reason=disabled user=%s", channel, existing_user_id)
                 return None, False
             return existing_user_id, False
     except ClientError as e:
@@ -786,7 +786,7 @@ def resolve_user(channel, channel_user_id, display_name=""):
 
     # 2. Check allowlist before creating a new user
     if not is_user_allowed(channel, channel_user_id):
-        logger.warning("User %s not on allowlist — rejecting registration", channel_key)
+        logger.warning("Rejecting registration: channel=%s reason=not-allowlisted", channel)
         return None, False
 
     if RUNTIME_TARGET is None:
@@ -963,7 +963,7 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
             if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 logger.warning("redeem_bind_code: pointer cleanup failed for %s: %s", user_id, e)
 
-        logger.info("Bind code %s redeemed: %s -> %s", code, channel_key, user_id)
+        logger.info("Bind code redeemed for user %s", user_id)
         return user_id, True
     except (ClientError, RouteUnavailable) as e:
         logger.error("Bind code redemption failed: %s", e)
@@ -1365,7 +1365,7 @@ def send_telegram_message(chat_id, text, token, reply_to=None):
         urllib_request.urlopen(req, timeout=10)
         return True
     except Exception as e:
-        logger.error("Failed to send Telegram message to %s: %s", chat_id, e)
+        logger.error("Failed to send Telegram message: %s", e)
         return False
 
 
@@ -1539,7 +1539,7 @@ def send_slack_message(channel_id, text, bot_token, thread_ts=None):
     try:
         body = _read_response(req)
     except Exception as e:
-        logger.error("Failed to send Slack message to %s: %s", channel_id, e)
+        logger.error("Failed to send Slack message: %s", e)
         return False
     error = formatting.slack_error(body)
     if error:
@@ -1594,7 +1594,7 @@ def send_feishu_message(chat_id, text):
         try:
             body = _read_response(req)
         except Exception as e:
-            logger.error("Failed to send Feishu message to %s: %s", chat_id, e)
+            logger.error("Failed to send Feishu message: %s", e)
             delivered = False
             continue
         code = formatting.feishu_error(body)
@@ -1665,23 +1665,28 @@ def _extract_screenshots(text: str) -> tuple:
 
 
 
+def _key_without_namespace(s3_key):
+    """A rejected S3 key for logging, with its first path segment (the user namespace) dropped."""
+    return s3_key.split("/", 1)[1] if "/" in s3_key else "<no-prefix>"
+
+
 def _fetch_s3_image(s3_key: str, namespace: str):
     """Fetch image bytes from S3. Returns None on error or invalid key."""
     # Validate: reject path traversal
     if ".." in s3_key:
-        logger.error("Rejected S3 screenshot key with path traversal: %s", s3_key)
+        logger.error("Rejected S3 screenshot key with path traversal: %s", _key_without_namespace(s3_key))
         return None
     # Validate: key must be within user namespace _screenshots/ prefix
     expected_prefix = f"{namespace}/_screenshots/"
     if not s3_key.startswith(expected_prefix):
-        logger.error("Rejected S3 screenshot key outside user namespace: %s (expected prefix: %s)", s3_key, expected_prefix)
+        logger.error("Rejected S3 screenshot key outside user namespace: %s", _key_without_namespace(s3_key))
         return None
     try:
         bucket = os.environ["S3_USER_FILES_BUCKET"]
         resp = s3_client.get_object(Bucket=bucket, Key=s3_key)
         return resp["Body"].read()
     except Exception as e:
-        logger.error("Failed to fetch screenshot from S3 key %s: %s", s3_key, e)
+        logger.error("Failed to fetch screenshot from S3 key %s: %s", _key_without_namespace(s3_key), e)
         return None
 
 
@@ -1856,7 +1861,7 @@ def _upload_image_to_s3(image_bytes, namespace, content_type):
             Body=image_bytes,
             ContentType=content_type,
         )
-        logger.info("Uploaded image to s3://%s/%s (%d bytes)", USER_FILES_BUCKET, s3_key, len(image_bytes))
+        logger.info("Uploaded image size=%d bytes", len(image_bytes))
         return s3_key
     except Exception as e:
         logger.error("S3 image upload failed: %s", e)
@@ -2401,8 +2406,8 @@ def handle_telegram(body):
 
     image_count = 0 if isinstance(agent_message, str) else len(agent_message.get("images", []))
     logger.info(
-        "Telegram: user=%s actor=%s session=%s text_len=%d images=%d document=%s",
-        resolved_user_id, actor_id, session_id, len(text), image_count, doc_kind or "none",
+        "Telegram: user=%s session=%s text_len=%d images=%d document=%s",
+        resolved_user_id, session_id, len(text), image_count, doc_kind or "none",
     )
 
     # Invoke AgentCore with periodic typing indicator
@@ -2419,12 +2424,12 @@ def handle_telegram(body):
 
     # If contract already streamed progressively to Telegram, skip duplicate send
     if result.get("streamed"):
-        logger.info("Telegram response already streamed by contract — skipping send to chat_id=%s", chat_id)
+        logger.info("Telegram response already streamed by contract — skipping send")
         return
 
     # Send response, split to Telegram's 4096 UTF-16-unit limit
     _send_telegram_chunks(chat_id, response_text, token)
-    logger.info("Telegram response sent to chat_id=%s", chat_id)
+    logger.info("Telegram response sent")
 
 
 # ---------------------------------------------------------------------------
@@ -2842,8 +2847,8 @@ def handle_slack(body, headers=None):
             return {"statusCode": 200, "body": "ok"}
 
     logger.info(
-        "Slack: user=%s actor=%s session=%s msg_len=%d has_image=%s",
-        resolved_user_id, actor_id, session_id, len(text), has_image,
+        "Slack: user=%s session=%s msg_len=%d has_image=%s",
+        resolved_user_id, session_id, len(text), has_image,
     )
 
     # Invoke AgentCore with progress notification for long requests
@@ -3042,8 +3047,8 @@ def handle_feishu(body, headers=None):
             return {"statusCode": 200, "body": "ok"}
 
     logger.info(
-        "Feishu: user=%s actor=%s session=%s msg_len=%d has_image=%s chat_type=%s",
-        resolved_user_id, actor_id, session_id, len(text), has_image, chat_type,
+        "Feishu: user=%s session=%s msg_len=%d has_image=%s chat_type=%s",
+        resolved_user_id, session_id, len(text), has_image, chat_type,
     )
 
     # Invoke AgentCore with progress notification
@@ -3309,8 +3314,8 @@ def _handle_line_event(config, event):
             return
         agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
 
-    logger.info("LINE: user=%s actor=%s msg_len=%d has_image=%s redelivery=%s",
-                resolved_user_id, actor_id, len(text), has_image, event["redelivery"])
+    logger.info("LINE: user=%s msg_len=%d has_image=%s redelivery=%s",
+                resolved_user_id, len(text), has_image, event["redelivery"])
     result = invoke_agent_runtime(route, resolved_user_id, actor_id, "line", agent_message,
                                   channel_target=line_user_id,
                                   model_override=get_model_override(resolved_user_id))
@@ -3450,8 +3455,8 @@ def _handle_discord_command(command, reply):
             return
         agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
 
-    logger.info("Discord: user=%s actor=%s msg_len=%d has_image=%s",
-                resolved_user_id, actor_id, len(text), bool(attachment))
+    logger.info("Discord: user=%s msg_len=%d has_image=%s",
+                resolved_user_id, len(text), bool(attachment))
     result = invoke_agent_runtime(route, resolved_user_id, actor_id, "discord", agent_message,
                                   channel_target=discord_user_id,
                                   model_override=get_model_override(resolved_user_id))
