@@ -216,10 +216,10 @@ def resolve_current_user_id(actor_id):
             owner = read_actor_owner(identity_table, actor_id)
             if owner and owner["userId"] != resolved:
                 return None
-            logger.info("Resolved current userId=%s from actorId=%s", resolved, actor_id)
+            logger.info("Resolved current userId=%s", resolved)
             return resolved
     except Exception as e:
-        logger.warning("Failed to resolve userId from actorId %s: %s", actor_id, e)
+        logger.warning("Failed to resolve userId from actor: %s", e)
     return None
 
 
@@ -616,7 +616,7 @@ def send_telegram_message(chat_id, text, token):
         urllib_request.urlopen(req, timeout=10)
         return True
     except Exception as e:
-        logger.error("Failed to send Telegram message to %s: %s", chat_id, e)
+        logger.error("Failed to send Telegram message: %s", e)
         return False
 
 
@@ -740,7 +740,7 @@ def send_slack_message(channel_id, text, bot_token):
     try:
         body = _read_response(req)
     except Exception as e:
-        logger.error("Failed to send Slack message to %s: %s", channel_id, e)
+        logger.error("Failed to send Slack message: %s", e)
         return False
     error = formatting.slack_error(body)
     if error:
@@ -787,7 +787,7 @@ def send_feishu_message(receiver_id, text):
         try:
             body = _read_response(req)
         except Exception as e:
-            logger.error("Failed to send Feishu message to %s: %s", receiver_id, e)
+            logger.error("Failed to send Feishu message: %s", e)
             delivered = False
             continue
         code = formatting.feishu_error(body)
@@ -1027,7 +1027,7 @@ def deliver_response(channel, channel_target, response_text):
             logger.error("No Telegram token available; cron response not delivered")
             return
         if not _send_telegram_chunks(channel_target, response_text, token):
-            logger.error("Cron response to Telegram %s was not fully delivered", channel_target)
+            logger.error("Cron response to Telegram was not fully delivered")
     elif channel == "slack":
         bot_token, _ = _get_slack_tokens()
         if not send_slack_message(channel_target, response_text, bot_token):
@@ -1149,14 +1149,14 @@ def verify_cron_event(event):
 
     if not all([user_id, actor_id, channel, channel_target, message]):
         logger.error(
-            "Missing required fields. userId=%s actorId=%s channel=%s target=%s msg=%s",
-            user_id, actor_id, channel, channel_target, bool(message),
+            "Missing required fields. userId=%s channel=%s msg=%s",
+            user_id, channel, bool(message),
         )
         return None, {"statusCode": 400, "body": "Missing required fields"}
 
     logger.info(
-        "Processing cron: schedule=%s user=%s channel=%s:%s",
-        schedule_id, user_id, channel, channel_target,
+        "Processing cron: schedule=%s user=%s channel=%s",
+        schedule_id, user_id, channel,
     )
 
     # Resolve current userId from actorId BEFORE ownership check.
@@ -1241,9 +1241,9 @@ def verify_cron_event(event):
     actor_channel_user_id = actor_id.split(":", 1)[1] if ":" in actor_id else ""
     if channel_target != actor_channel_user_id:
         logger.warning(
-            "Scheduled task %s delivers to %s:%s, not the actor's own chat id; "
-            "verify the target was set by the owning conversation",
-            schedule_id, channel, channel_target,
+            "Scheduled task %s on channel %s delivers to a target that is not the "
+            "actor's own chat id; verify the target was set by the owning conversation",
+            schedule_id, channel,
         )
 
     # Phase 1: Get or create session
@@ -1285,7 +1285,7 @@ def deliver_result(job, response_text, run_started, run_finished, deadline):
     """Phase 4: deliver the reply, then the brief's audio (if any)."""
     channel, channel_target = job["channel"], job["channelTarget"]
     response_text, audio_key = split_audio_marker(_extract_text_from_content_blocks(response_text))
-    logger.info("Delivering response (len=%d) to %s:%s", len(response_text), channel, channel_target)
+    logger.info("Delivering response (len=%d) on channel %s", len(response_text), channel)
     deliver_response(channel, channel_target, response_text)
     if not audio_key and channel == "telegram":
         audio_key = find_run_audio_key(job["route"].actor_id, run_started, run_finished, deadline, job["message"])

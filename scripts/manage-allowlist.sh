@@ -9,6 +9,7 @@
 #   ./scripts/manage-allowlist.sh disable telegram:123456
 #   ./scripts/manage-allowlist.sh enable telegram:123456
 #   ./scripts/manage-allowlist.sh list
+#   ./scripts/manage-allowlist.sh whois user_0123456789abcdef
 #
 # Uses the openclaw-identity DynamoDB table.
 # Requires: aws cli, jq, appropriate IAM permissions.
@@ -65,6 +66,7 @@ usage() {
     echo "  disable <channel:user_id>  — Block a registered user on all linked channels and cron"
     echo "  enable  <channel:user_id>  — Undo disable"
     echo "  list                       — List all allowed users"
+    echo "  whois   <user_id>          — List the channel actors linked to an internal user ID"
     echo ""
     echo "  A Telegram group is allowed with telegram_group:<chat_id> (e.g. telegram_group:-1001234567890)."
     echo ""
@@ -161,6 +163,35 @@ cmd_list() {
         --output table
 }
 
+# Map an internal user ID back to the channel actors linked to it, so an
+# operator can still identify a person from a user ID that now stands in for
+# the raw actor in the logs. Reads the USER#<id> partition: the CHANNEL#<actor>
+# back-reference of every linked channel, plus the primary enrollmentActorId.
+cmd_whois() {
+    local user_id="$1"
+    if ! [[ "$user_id" =~ ^user_[A-Za-z0-9_-]{1,128}$ ]]; then
+        echo "ERROR: expected an internal user ID, e.g. user_0123456789abcdef" >&2
+        exit 1
+    fi
+    require_jq
+    local values items actors
+    values=$(jq -cn --arg pk "USER#${user_id}" '{":pk":{S:$pk}}')
+    items=$(aws_ddb query \
+        --key-condition-expression "PK = :pk" \
+        --expression-attribute-values "$values" \
+        --output json)
+    actors=$(printf '%s' "$items" | jq -r '
+        [ (.Items[] | select(.SK.S | startswith("CHANNEL#")) | .SK.S[8:]),
+          (.Items[] | select(.SK.S == "PROFILE") | .enrollmentActorId.S // empty) ]
+        | unique | .[]')
+    if [ -z "$actors" ]; then
+        echo "No channels found for ${user_id} (unknown or not registered)."
+        exit 0
+    fi
+    echo "Channel actors linked to ${user_id} in $TABLE_NAME ($REGION):"
+    printf '%s\n' "$actors"
+}
+
 # channel_key is written into DynamoDB keys, so it must not contain quotes,
 # backslashes, braces or whitespace (jq also escapes it, as a second layer).
 # The ID part covers every channel's user IDs (numeric, Slack/LINE IDs,
@@ -196,6 +227,10 @@ case "$1" in
         ;;
     list)
         cmd_list
+        ;;
+    whois)
+        [ $# -lt 2 ] && usage
+        cmd_whois "$2"
         ;;
     *)
         usage
