@@ -18,6 +18,7 @@ const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const { createHash, randomUUID } = require("node:crypto");
 const { createRequire } = require("node:module");
+const { isNamespaceOf } = require("./user-namespace");
 
 const TYPE = "openclaw.proxy-sdk-snapshot-control.v1";
 const SCHEMA = "openclaw.proxy-sdk-snapshot.v1";
@@ -37,7 +38,7 @@ const ENV_KEYS = ["PATH", "HOME", "NODE_PATH", "NODE_OPTIONS", "AWS_REGION",
   "S3_USER_FILES_BUCKET", "SUBAGENT_MODEL_NAME", "SUBAGENT_BEDROCK_MODEL_ID",
   "BEDROCK_GUARDRAIL_ID", "BEDROCK_GUARDRAIL_VERSION", "BEDROCK_TEMPERATURE",
   "BEDROCK_USER_SELECTABLE_MODEL_IDS",
-  "USER_ID", "INTERNAL_USER_ID", "CHANNEL", "OPENCLAW_SKIP_CRON"];
+  "USER_ID", "INTERNAL_USER_ID", "USER_NAMESPACE", "CHANNEL", "OPENCLAW_SKIP_CRON"];
 const OPTIONAL_ENV = ["NODE_COMPILE_CACHE"];
 const REASONS = new Set(["selector", "lineage", "protocol", "environment", "binding", "sdk",
   "prepare_timeout", "activate_timeout", "attest_timeout", "ipc", "child_exit",
@@ -113,6 +114,7 @@ function boundEnv(input, neutral, binding) {
     Object.values(env).every((v) => typeof v === "string" && !v.includes("\0")) &&
     JSON.stringify(env).length <= 65536 && env.OPENCLAW_SKIP_CRON === "1" &&
     env.USER_ID === binding.actorId && env.INTERNAL_USER_ID === binding.userId &&
+    isNamespaceOf(env.USER_NAMESPACE, binding.actorId) &&
     equal(entries(staticEnv(env)), entries(neutral)), "environment");
   return Object.freeze(env);
 }

@@ -18,9 +18,12 @@
  *   - aud (ID token) or client_id (access token) === COGNITO_CLIENT_ID
  *   - exp in the future
  * and derives the OpenClaw namespace from the token's `cognito:username`
- * (ID token) / `username` (access token), which the proxy sets to the actorId
- * ("telegram:123"), so namespace = username with ":" -> "_" — identical to
- * `actorId.replace(/:/g, "_")` in bridge/agentcore-proxy.js.
+ * (ID token) / `username` (access token). The bridge names the Cognito user
+ * after the actor ("telegram:123") while the user's namespace is the legacy
+ * one, so namespace = username with ":" -> "_". A user with a stored opaque
+ * namespace ("ns_" + 26 base32 characters) is named after that namespace
+ * (bridge/user-namespace.js cognitoUsername); its identity carries no actor,
+ * and a tool that needs one resolves it from the NS#<namespace> owner record.
  *
  * Which token type the Gateway accepts (ID vs access) is unverified — see
  * docs/gateway-mcp-tools.md. Both are handled here so the Lambda side is not
@@ -34,7 +37,8 @@ const https = require("node:https");
 const RESERVED_ARG = "__caller_token";
 
 // Same namespace pattern the exec skills enforce (bridge/skills/*/common.js).
-const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}$/;
+const VALID_NAMESPACE = /^(?:(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}|ns_[a-z2-7]{26})$/;
+const OPAQUE_NAMESPACE = /^ns_[a-z2-7]{26}$/;
 
 class IdentityError extends Error {
   constructor(message) {
@@ -144,8 +148,11 @@ function createVerifier(options = {}) {
     if (!username || typeof username !== "string") {
       throw new IdentityError("caller token: no username claim");
     }
+    if (OPAQUE_NAMESPACE.test(username)) {
+      return { actorId: null, namespace: username, opaque: true, sub: payload.sub, tokenUse: payload.token_use };
+    }
     const namespace = username.replace(/:/g, "_");
-    if (!VALID_NAMESPACE.test(namespace)) {
+    if (!VALID_NAMESPACE.test(namespace) || OPAQUE_NAMESPACE.test(namespace)) {
       throw new IdentityError("caller token: username is not a channel identity");
     }
     return { actorId: username, namespace, sub: payload.sub, tokenUse: payload.token_use };
@@ -175,6 +182,7 @@ async function resolveCaller(event, verifier) {
 module.exports = {
   RESERVED_ARG,
   VALID_NAMESPACE,
+  OPAQUE_NAMESPACE,
   IdentityError,
   decodeJwt,
   createVerifier,

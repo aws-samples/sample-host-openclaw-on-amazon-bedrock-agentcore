@@ -4,6 +4,7 @@
  */
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const { sanitize, buildKey, validateUserId } = require("./common");
 
 describe("sanitize", () => {
@@ -227,3 +228,53 @@ describe("validateUserId for Slack channel and Feishu group identities", () => {
     asUser("slack_channel:C0123CHAN", () => assert.equal(exitCodeOf(() => validateUserId("slack_U0123USER")), 1));
   });
 });
+
+// The contract writes the bound actor and storage namespace to /tmp/current-identity.json.
+function withIdentity(identity, fn) {
+  const readFileSync = fs.readFileSync;
+  fs.readFileSync = (file, ...rest) => (file === "/tmp/current-identity.json"
+    ? JSON.stringify(identity) : readFileSync(file, ...rest));
+  try {
+    return fn();
+  } finally {
+    fs.readFileSync = readFileSync;
+  }
+}
+
+describe("validateUserId with a stored namespace", () => {
+  const OPAQUE = "ns_" + "j".repeat(26);
+  const identity = { actorId: "telegram:123456789", namespace: OPAQUE };
+
+  it("accepts the namespace the identity file names", () => {
+    withIdentity(identity, () => asUser("telegram:123456789", () => assert.doesNotThrow(() => validateUserId(OPAQUE))));
+  });
+
+  it("refuses the legacy namespace taken from an older transcript", () => {
+    withIdentity(identity, () => asUser("telegram:123456789",
+      () => assert.equal(exitCodeOf(() => validateUserId("telegram_123456789")), 1)));
+  });
+
+  it("refuses another stored namespace, and the stored one when USER_ID names another actor", () => {
+    withIdentity(identity, () => asUser("telegram:123456789",
+      () => assert.equal(exitCodeOf(() => validateUserId("ns_" + "k".repeat(26))), 1)));
+    withIdentity(identity, () => asUser("telegram:5", () => assert.equal(exitCodeOf(() => validateUserId(OPAQUE)), 1)));
+  });
+
+  it("builds keys under the stored namespace", () => {
+    assert.equal(buildKey(OPAQUE, "notes.md"), `${OPAQUE}/notes.md`);
+  });
+});
+
+describe("validateUserId for a Slack channel or Feishu group with a stored namespace", () => {
+  const OPAQUE = "ns_" + "q".repeat(26);
+
+  it("accepts the stored namespace and refuses the conversation's legacy one", () => {
+    for (const actor of ["slack_channel:C0123CHAN", "feishu_group:oc_0123abcdef"]) {
+      withIdentity({ actorId: actor, namespace: OPAQUE }, () => asUser(actor, () => {
+        assert.doesNotThrow(() => validateUserId(OPAQUE));
+        assert.equal(exitCodeOf(() => validateUserId(actor.replace(/:/g, "_"))), 1);
+      }));
+    }
+  });
+});
+

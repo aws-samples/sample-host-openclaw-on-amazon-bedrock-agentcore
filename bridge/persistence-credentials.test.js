@@ -185,7 +185,7 @@ function failureRuntime(t, p) {
       dispatchCalls.push("chat.send");
       return { phase: "unknown_outcome", response: "unfinished" };
     },
-    activeTaskCount: 0, lastActivityTime: 0,
+    activeTaskCount: 0, lastActivityTime: 0, userNamespace: require("./user-namespace"),
   });
   const source = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf8");
   const cleanupStart = source.indexOf("async function cleanupV2Resources()");
@@ -203,7 +203,8 @@ function failureRuntime(t, p) {
   const shutdownStart = source.indexOf('process.on("SIGTERM", async () => {');
   vm.runInContext(source.slice(shutdownStart, source.indexOf("\nserver.listen(", shutdownStart)), box);
   t.after(() => { for (const { timer } of timers) clearTimeout(timer); });
-  const owner = { userId: "u1", actorId: "telegram:1", runtimeSessionId: "session-1", routingGeneration: 1 };
+  const owner = { userId: "u1", actorId: "telegram:1", namespace: "telegram_1", runtimeSessionId: "session-1",
+    routingGeneration: 1 };
   return {
     lifecycle, owner,
     async start() {

@@ -234,3 +234,23 @@ describe("interceptor", () => {
     assert.deepEqual(out.mcp.transformedGatewayRequest.body.params.arguments, { k: "v" });
   });
 });
+
+describe("identity of a user with a stored opaque namespace", () => {
+  const OPAQUE = "ns_" + "m".repeat(26);
+
+  it("is the namespace, with no actor (the tools resolve it from the NS# owner record)", async () => {
+    for (const token of [h.idToken(OPAQUE), h.accessToken(OPAQUE)]) {
+      const id = await verifier().verify(token);
+      assert.equal(id.namespace, OPAQUE);
+      assert.equal(id.actorId, null);
+      assert.equal(id.opaque, true);
+    }
+  });
+
+  it("rejects a malformed opaque-looking username and an actor that maps onto one", async () => {
+    const v = verifier();
+    for (const username of ["ns_" + "m".repeat(25), "ns_" + "M".repeat(26), "ns_" + "1".repeat(26), "ns:" + "m".repeat(26)]) {
+      await assert.rejects(v.verify(h.idToken(username)), /not a channel identity/, username);
+    }
+  });
+});

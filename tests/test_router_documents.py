@@ -41,7 +41,8 @@ except ImportError:  # pragma: no cover
 CHAT_ID = 1000001
 TG_USER = 2000002
 NAMESPACE = f"telegram_{TG_USER}"
-ROUTE = SimpleNamespace(platform_version="V2", user_id="user_test123", actor_id=f"telegram:{TG_USER}")
+ROUTE = SimpleNamespace(platform_version="V2", user_id="user_test123", actor_id=f"telegram:{TG_USER}",
+                        namespace=f"telegram_{TG_USER}")
 SECRET_NAME = "quarterly-plan-secret-name"
 
 

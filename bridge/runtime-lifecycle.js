@@ -37,6 +37,10 @@ const REQUIRED_RESOURCES = Object.freeze([
   "restore", "credentials", "proxy", "gateway", "browser", "skills", "persistence",
 ]);
 const BINDING_KEYS = ["userId", "actorId", "routingGeneration", "runtimeSessionId"];
+// The user's storage namespace (user-namespace.js) is pinned at activation with
+// the binding but kept out of the binding object, whose exact keys several
+// owners check. A context that carries a namespace must match the pinned one;
+// owners that re-check with the binding object itself carry none.
 
 function createRuntimeLifecycle({
   bootstrap = async () => {},
@@ -48,6 +52,7 @@ function createRuntimeLifecycle({
 } = {}) {
   let state = "BOOTSTRAPPING";
   let binding = null;
+  let namespace = null;
   let bootstrapPromise;
   let activationPromise;
   let recoveryPromise;
@@ -99,7 +104,8 @@ function createRuntimeLifecycle({
         typeof context.actorId !== "string" || !context.actorId) {
       throw new Error("Missing user binding");
     }
-    if (binding && BINDING_KEYS.some((key) => (binding[key] ?? null) !== (context[key] ?? null))) {
+    if (binding && (BINDING_KEYS.some((key) => (binding[key] ?? null) !== (context[key] ?? null)) ||
+        (Object.hasOwn(context, "namespace") && (context.namespace ?? null) !== namespace))) {
       throw new Error("Request does not match the active user binding");
     }
   }
@@ -113,6 +119,7 @@ function createRuntimeLifecycle({
     if (state === "RECOVERING") return recoveryPromise;
     if (activationPromise) return activationPromise;
     binding = Object.freeze(Object.fromEntries(BINDING_KEYS.map((key) => [key, context[key] ?? null])));
+    namespace = context.namespace ?? null;
     generation = osRandomUUID(); // Session-scoped; correlate with runtimeSessionId.
     controller = new AbortController();
     state = "BINDING";
@@ -218,7 +225,7 @@ function createRuntimeLifecycle({
 
   return {
     start, ensureReady, run, recover, fail, health, assertBinding, checkpoint,
-    snapshot: () => ({ state, binding, generation, resources: [...ready] }),
+    snapshot: () => ({ state, binding, namespace, generation, resources: [...ready] }),
     drain() {
       state = "DRAINING";
       controller?.abort(new Error("AgentCore Runtime is draining"));

@@ -175,6 +175,39 @@ function createHandler(deps = {}) {
     return { scheduler, schedulerCmds, ddb, ddbCmds };
   }
 
+  async function getItem(PK, SK) {
+    const { ddb, ddbCmds } = clients();
+    const resp = await ddb.send(
+      new ddbCmds.GetCommand({ TableName: env.tableName, Key: { PK, SK }, ConsistentRead: true }),
+    );
+    return resp.Item || null;
+  }
+
+  /**
+   * The runtime actor of a caller whose Cognito username is its stored opaque
+   * namespace. NS#<namespace>/OWNER names the user; the user's SESSION must
+   * still use that namespace; and the SESSION actor must be the user's own
+   * runtime actor by its ACTOR# owner record. The NS# and ACTOR# records are
+   * outside the user's USER#<id> partition.
+   */
+  async function resolveOpaqueCaller(identity) {
+    const owner = await getItem(`NS#${identity.namespace}`, "OWNER");
+    const userId = owner && owner.userId;
+    if (typeof userId !== "string" || !userId) throw new Error("no OpenClaw user owns this namespace");
+    const session = await getItem(`USER#${userId}`, "SESSION");
+    const actorId = session && session.actorId;
+    if (!session || session.namespace !== identity.namespace || typeof actorId !== "string" ||
+        !/^[a-z][a-z0-9_]{0,31}:[^\s:]{1,128}$/.test(actorId)) {
+      throw new Error("the namespace is not this user's current namespace");
+    }
+    const actorOwner = await getItem(`ACTOR#${actorId}`, "OWNER");
+    if (!actorOwner || actorOwner.userId !== userId ||
+        (actorOwner.runtimeActorId !== undefined && actorOwner.runtimeActorId !== actorId)) {
+      throw new Error("the namespace is not this user's current namespace");
+    }
+    return { ...identity, actorId };
+  }
+
   /** CHANNEL#<actorId> PROFILE -> internal userId (same lookup as the skill and cron executor). */
   async function resolveInternalUserId(actorId) {
     const { ddb, ddbCmds } = clients();
@@ -460,12 +493,13 @@ function createHandler(deps = {}) {
   };
 
   return withErrorEnvelope(async (event, context) => {
-    const { identity, args } = await resolveCaller(event, verifier);
+    const resolved = await resolveCaller(event, verifier);
+    const identity = resolved.identity.opaque ? await resolveOpaqueCaller(resolved.identity) : resolved.identity;
     const tool = toolNameFromContext(context);
     logToolCall(tool, identity, deps.log);
     const fn = tools[tool];
     if (!fn) return { error: "unknown_tool", message: `Unknown tool "${tool}"` };
-    return fn(identity, args);
+    return fn(identity, resolved.args);
   }, deps.log);
 }
 

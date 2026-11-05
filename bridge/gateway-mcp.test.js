@@ -235,6 +235,9 @@ describe("cognito-token.createCognitoTokenProvider", () => {
   it("keeps the secret out of the agent's openclaw/user/<namespace>/ prefix", () => {
     assert.equal(defaultSecretId("telegram:42", POOL), secretName("telegram_42"));
     assert.ok(!defaultSecretId("telegram:42", POOL).startsWith("openclaw/user/"));
+    // A user with a stored opaque namespace is its own Cognito username and secret stem.
+    const opaque = "ns_" + "o".repeat(26);
+    assert.equal(defaultSecretId(opaque, POOL), secretName(opaque));
   });
 
   it("migrates an existing user that has no secret without re-enrolment", async () => {

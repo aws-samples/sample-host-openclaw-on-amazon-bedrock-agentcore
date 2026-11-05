@@ -10,27 +10,34 @@ if (!REGION) {
 }
 
 const VALID_KEY_NAME = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
-const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}$/;
+// A channel namespace ("telegram_123") or a stored one ("ns_" + 26 base32 characters).
+const VALID_NAMESPACE = /^(?:(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}|ns_[a-z2-7]{26})$/;
 
 // The contract server writes the bound user's identity here and sets USER_ID
-// ("channel:id") before OpenClaw runs a skill.
+// ("channel:id") before OpenClaw runs a skill. The file also names the bound
+// storage namespace; in a file without one the namespace is the actor with
+// ":" replaced by "_" (bridge/user-namespace.js).
 const IDENTITY_FILE = "/tmp/current-identity.json";
 
 /**
- * Namespaces ("channel_id") of the user this AgentCore Runtime session is
- * bound to, from the identity file and USER_ID. Empty when neither is set.
+ * Namespaces of the user this AgentCore Runtime session is bound to, from the
+ * identity file and USER_ID. Empty when neither is set.
  */
 function boundNamespaces() {
   const namespaces = [];
+  let actor = null;
   try {
     const identity = JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8"));
     if (typeof identity?.actorId === "string" && identity.actorId) {
-      namespaces.push(identity.actorId.replace(/:/g, "_"));
+      actor = identity.actorId;
+      namespaces.push(typeof identity.namespace === "string" && identity.namespace
+        ? identity.namespace : actor.replace(/:/g, "_"));
     }
   } catch {
     // No readable identity file: fall back to USER_ID alone.
   }
-  if (process.env.USER_ID) namespaces.push(process.env.USER_ID.replace(/:/g, "_"));
+  const envActor = process.env.USER_ID;
+  if (envActor) namespaces.push(envActor === actor ? namespaces[0] : envActor.replace(/:/g, "_"));
   return namespaces;
 }
 

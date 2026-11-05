@@ -43,7 +43,8 @@ SECRET = json.dumps({
     "phoneNumberId": PHONE_NUMBER_ID,
 })
 CONFIG = whatsapp.parse_config(SECRET)
-ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id=f"whatsapp:{WA_ID}")
+ROUTE = SimpleNamespace(platform_version="V2", user_id="user_abc123", actor_id=f"whatsapp:{WA_ID}",
+                        namespace=f"whatsapp_{WA_ID}")
 
 
 class FakeClientError(Exception):
@@ -317,6 +318,14 @@ class TestHandleWhatsapp(unittest.TestCase):
         index.handle_whatsapp(json.dumps(_payload()))
         mock_invoke.assert_not_called()
         mock_send.assert_not_called()
+
+    @patch.object(index, "invoke_agent_runtime")
+    @patch.object(index, "get_or_create_session", side_effect=index.RouteMigrating("migrating"))
+    @patch.object(index, "resolve_user", return_value=("user_abc123", False))
+    def test_migrating_user_gets_the_maintenance_reply(self, _r, _sess, mock_invoke, mock_send, _claim, _secret):
+        index.handle_whatsapp(json.dumps(_payload("hello")))
+        mock_invoke.assert_not_called()
+        mock_send.assert_called_once_with(CONFIG, WA_ID, index.MIGRATION_REPLY)
 
 
 class TestSendFormatting(unittest.TestCase):

@@ -302,3 +302,61 @@ it("withErrorEnvelope logs a gateway_tool_error line and returns the envelope", 
   assert.equal(lines[0].tool, "create_schedule");
   assert.equal(lines[0].name, "AccessDeniedException");
 });
+
+describe("schedules target for a user with a stored opaque namespace", () => {
+  const OPAQUE = "ns_" + "n".repeat(26);
+  const OPAQUE_TOKEN = h.accessToken(OPAQUE);
+  const records = (overrides = {}) => ({
+    [`NS#${OPAQUE}|OWNER`]: { userId: "user_abc" },
+    "USER#user_abc|SESSION": { actorId: "telegram:123456", namespace: OPAQUE },
+    "ACTOR#telegram:123456|OWNER": { userId: "user_abc", actorId: "telegram:123456" },
+    "CHANNEL#telegram:123456|PROFILE": { userId: "user_abc" },
+    ...overrides,
+  });
+  const answer = (items) => (cmd) => {
+    if (cmd.kind !== "GetCommand") return cmd.kind === "QueryCommand" ? { Count: 0, Items: [] } : {};
+    const item = items[`${cmd.input.Key.PK}|${cmd.input.Key.SK}`];
+    return item ? { Item: item } : {};
+  };
+
+  it("resolves the actor from NS#, SESSION and ACTOR# and names the schedule after the namespace", async () => {
+    const { scheduler, ddb, handler } = cronHandler({ ddbAnswer: answer(records()) });
+    const out = await handler(
+      { expression: "cron(0 9 * * ? *)", timezone: "UTC", message: "stand up", [RESERVED_ARG]: OPAQUE_TOKEN },
+      h.gatewayContext("schedules", "create_schedule"),
+    );
+    assert.equal(out.schedule_id, "deadbeef", JSON.stringify(out));
+    const create = scheduler.sent.find((c) => c.kind === "CreateScheduleCommand").input;
+    assert.equal(create.Name, `openclaw-${OPAQUE}-deadbeef`);
+    const input = JSON.parse(create.Target.Input);
+    assert.equal(input.actorId, "telegram:123456");
+    assert.equal(input.channelTarget, "123456");
+    const reads = ddb.sent.filter((c) => c.kind === "GetCommand").map((c) => c.input);
+    assert.ok(reads.slice(0, 3).every((read) => read.ConsistentRead === true));
+    assert.deepEqual(reads.slice(0, 3).map((read) => read.Key.PK), [`NS#${OPAQUE}`, "USER#user_abc", "ACTOR#telegram:123456"]);
+  });
+
+  for (const [name, overrides] of [
+    ["no NS# owner record", { [`NS#${OPAQUE}|OWNER`]: undefined }],
+    ["a SESSION that moved to another namespace", { "USER#user_abc|SESSION": { actorId: "telegram:123456", namespace: "telegram_123456" } }],
+    ["a SESSION actor owned by another user", { "ACTOR#telegram:123456|OWNER": { userId: "user_other" } }],
+    ["a SESSION actor that is a linked channel, not the runtime actor",
+      { "ACTOR#telegram:123456|OWNER": { userId: "user_abc", runtimeActorId: "slack:U1" } }],
+  ]) {
+    it(`refuses the call for ${name}`, async () => {
+      const { scheduler, handler } = cronHandler({ ddbAnswer: answer(records(overrides)) });
+      const out = await handler(
+        { expression: "cron(0 9 * * ? *)", timezone: "UTC", message: "m", [RESERVED_ARG]: OPAQUE_TOKEN },
+        h.gatewayContext("schedules", "create_schedule"),
+      );
+      assert.equal(out.error, "error", JSON.stringify(out));
+      assert.equal(scheduler.sent.length, 0);
+    });
+  }
+
+  it("the user_files target uses the opaque namespace as the prefix", async () => {
+    const { s3, handler } = filesHandler({ Contents: [] });
+    await handler({ [RESERVED_ARG]: OPAQUE_TOKEN }, h.gatewayContext("user-files", "list_files"));
+    assert.equal(s3.sent[0].input.Prefix, `${OPAQUE}/`);
+  });
+});

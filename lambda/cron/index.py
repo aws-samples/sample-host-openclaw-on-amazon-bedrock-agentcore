@@ -858,11 +858,6 @@ def split_audio_marker(text):
     return "\n".join(kept).rstrip(), key
 
 
-def _audio_namespace(actor_id):
-    """User-files namespace for an actor, as the router and contract derive it."""
-    return (actor_id or "").replace(":", "_")
-
-
 def _valid_audio_key(key, namespace):
     if not isinstance(key, str) or not namespace or len(key) > 1024:
         return False
@@ -899,16 +894,16 @@ def audio_name_patterns(message):
     return patterns
 
 
-def find_run_audio_key(actor_id, run_started, run_finished, deadline, message=""):
+def find_run_audio_key(namespace, run_started, run_finished, deadline, message=""):
     """Key of the newest mp3 this run uploaded to the user's namespace, or None.
 
-    A brief that does not end with a BRIEF_AUDIO line (the prompt was edited,
-    or the model skipped the step) still uploads its mp3 in the same run. Only
+    namespace is the run's route namespace (RuntimeRoute.namespace). A brief
+    that does not end with a BRIEF_AUDIO line (the prompt was edited, or the
+    model skipped the step) still uploads its mp3 in the same run. Only
     top-level objects of the run's own namespace, written between the cron call
     and its reply, whose name matches an mp3 name in the schedule message
     count. Never raises; logs carry fixed messages only.
     """
-    namespace = _audio_namespace(actor_id)
     patterns = audio_name_patterns(message)
     if not patterns or not USER_FILES_BUCKET or not namespace or not isinstance(run_started, (int, float)):
         return None
@@ -971,11 +966,12 @@ def send_telegram_audio(chat_id, filename, data, token, timeout):
     urllib_request.urlopen(req, timeout=timeout)
 
 
-def deliver_brief_audio(channel, channel_target, key, actor_id, deadline):
+def deliver_brief_audio(channel, channel_target, key, namespace, deadline):
     """Send the brief's mp3 from S3 after its text. Never raises.
 
-    Only Telegram is supported. Logs carry a fixed message and the error type
-    only: the key and target are not logged.
+    Only Telegram is supported, and only a key under the run's route namespace.
+    Logs carry a fixed message and the error type only: the key and target are
+    not logged.
     """
     if not key:
         return False
@@ -985,7 +981,7 @@ def deliver_brief_audio(channel, channel_target, key, actor_id, deadline):
     if not USER_FILES_BUCKET:
         logger.warning("Brief audio skipped: user files bucket not configured")
         return False
-    if not _valid_audio_key(key, _audio_namespace(actor_id)):
+    if not _valid_audio_key(key, namespace):
         logger.warning("Brief audio skipped: key rejected (outside namespace, not .mp3, or unsafe)")
         return False
     remaining = deadline - time.monotonic()
@@ -1288,9 +1284,9 @@ def deliver_result(job, response_text, run_started, run_finished, deadline):
     logger.info("Delivering response (len=%d) on channel %s", len(response_text), channel)
     deliver_response(channel, channel_target, response_text)
     if not audio_key and channel == "telegram":
-        audio_key = find_run_audio_key(job["route"].actor_id, run_started, run_finished, deadline, job["message"])
+        audio_key = find_run_audio_key(job["route"].namespace, run_started, run_finished, deadline, job["message"])
     if audio_key:
-        deliver_brief_audio(channel, channel_target, audio_key, job["route"].actor_id, deadline)
+        deliver_brief_audio(channel, channel_target, audio_key, job["route"].namespace, deadline)
     logger.info("Cron execution complete: schedule=%s", job["scheduleId"])
 
 

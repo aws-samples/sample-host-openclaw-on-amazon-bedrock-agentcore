@@ -32,7 +32,7 @@ from urllib.parse import quote, urlparse
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from runtime_routing import RouteUnavailable, admit_route, is_unknown_outcome, resolve_route
+from runtime_routing import RouteMigrating, RouteUnavailable, admit_route, is_unknown_outcome, resolve_route
 from runtime_enrollment import authorize_channel_actor, enroll_new_user, link_actor, read_actor_owner, reconcile_actor_owner
 from runtime_invocation import InvocationTransportError
 from documents import (
@@ -812,6 +812,21 @@ def get_or_create_session(user_id):
     if _is_user_disabled(user_id):
         raise RouteUnavailable("User is administratively disabled")
     return resolve_route(identity_table, user_id)
+
+
+# Sent while scripts/namespace_cutover.py moves the user's storage (the route is
+# MIGRATING); the message itself is not processed.
+MIGRATION_REPLY = "Maintenance in progress, please send that again in a minute."
+
+
+def _route_or_reply(user_id, reply):
+    """The user's route, or None after sending MIGRATION_REPLY while the user is MIGRATING."""
+    try:
+        return get_or_create_session(user_id)
+    except RouteMigrating:
+        logger.info("Rejecting turn: user=%s reason=migrating", user_id)
+        reply(MIGRATION_REPLY)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -2371,7 +2386,9 @@ def handle_telegram(body):
         )
         return
 
-    session_id = get_or_create_session(resolved_user_id)
+    session_id = _route_or_reply(resolved_user_id, reply)
+    if session_id is None:
+        return
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "telegram")
 
     # Handle link-accounts command (generate bind code for existing users).
@@ -2408,7 +2425,7 @@ def handle_telegram(body):
     send_telegram_typing(chat_id, token)
 
     # Build message payload (structured if image, plain string if text-only)
-    namespace = session_id.actor_id.replace(":", "_") if (doc_kind or has_image) else None
+    namespace = session_id.namespace if (doc_kind or has_image) else None
     agent_message = _telegram_agent_message(message, text, document, doc_kind, has_image, namespace, token, reply)
     if agent_message is None:
         return
@@ -2633,7 +2650,9 @@ def _handle_telegram_group(message, text, document, doc_mime, has_image, has_doc
     if group_user_id is None:
         logger.warning("Telegram: group %s has no usable identity (disabled or not enrolled)", group_id)
         return
-    route = get_or_create_session(group_user_id)
+    route = _route_or_reply(group_user_id, reply)
+    if route is None:
+        return
     actor_id = f"{telegram_group.CHANNEL}:{group_id}"
 
     doc_kind = None
@@ -2643,7 +2662,7 @@ def _handle_telegram_group(message, text, document, doc_mime, has_image, has_doc
             return
 
     send_telegram_typing(group_id, token)
-    namespace = route.actor_id.replace(":", "_")
+    namespace = route.namespace
     agent_message = _telegram_agent_message(
         message, telegram_group.agent_text(user, text or "hi"), document, doc_kind, has_image,
         namespace, token, reply,
@@ -2937,7 +2956,9 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
     if channel_user_id is None:
         logger.warning("Slack: channel %s has no usable identity (disabled or not enrolled)", channel_id)
         return
-    route = get_or_create_session(channel_user_id)
+    route = _route_or_reply(channel_user_id, reply)
+    if route is None:
+        return
 
     message_text = channel_identity.agent_text(
         "Slack channel", _slack_member_name(event, slack_user_id, bot_token), text)
@@ -2947,7 +2968,7 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
         if not image_bytes:
             reply("Sorry, I couldn't download that image. Please try again.")
             return
-        s3_key = _upload_image_to_s3(image_bytes, route.actor_id.replace(":", "_"), content_type)
+        s3_key = _upload_image_to_s3(image_bytes, route.namespace, content_type)
         if not s3_key:
             reply("Sorry, I couldn't process that image. Please try again.")
             return
@@ -3004,7 +3025,9 @@ def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_im
     if group_user_id is None:
         logger.warning("Feishu: group %s has no usable identity (disabled or not enrolled)", chat_id)
         return
-    route = get_or_create_session(group_user_id)
+    route = _route_or_reply(group_user_id, lambda reply_text: send_feishu_message(chat_id, reply_text))
+    if route is None:
+        return
 
     name = _feishu_member_name(sender_id)
     agent_message = channel_identity.agent_text("Feishu group", name, text or "hi")
@@ -3013,7 +3036,7 @@ def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_im
         if not image_bytes:
             send_feishu_message(chat_id, "Sorry, I couldn't download that image. Please try again.")
             return
-        s3_key = _upload_image_to_s3(image_bytes, route.actor_id.replace(":", "_"), content_type)
+        s3_key = _upload_image_to_s3(image_bytes, route.namespace, content_type)
         if not s3_key:
             send_feishu_message(chat_id, "Sorry, I couldn't process that image. Please try again.")
             return
@@ -3182,7 +3205,10 @@ def handle_slack(body, headers=None):
             )
         return {"statusCode": 200, "body": "ok"}
 
-    session_id = get_or_create_session(resolved_user_id)
+    session_id = _route_or_reply(
+        resolved_user_id, lambda reply_text: send_slack_message(channel_id, reply_text, bot_token, **in_thread))
+    if session_id is None:
+        return {"statusCode": 200, "body": "ok"}
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "slack")
 
     # Handle link-accounts command (generate bind code for existing users).
@@ -3213,7 +3239,7 @@ def handle_slack(body, headers=None):
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text
     if has_image:
-        namespace = session_id.actor_id.replace(":", "_")
+        namespace = session_id.namespace
         # Use first image file
         file_info = image_files[0]
         image_bytes, content_type, _ = _download_slack_file(file_info, bot_token)
@@ -3396,7 +3422,9 @@ def handle_feishu(body, headers=None):
         )
         return {"statusCode": 200, "body": "ok"}
 
-    session_id = get_or_create_session(resolved_user_id)
+    session_id = _route_or_reply(resolved_user_id, lambda reply_text: send_feishu_message(chat_id, reply_text))
+    if session_id is None:
+        return {"statusCode": 200, "body": "ok"}
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "feishu")
 
     # Handle link-accounts command. A bind code links whoever redeems it
@@ -3425,7 +3453,7 @@ def handle_feishu(body, headers=None):
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text or "hi"
     if has_image:
-        namespace = session_id.actor_id.replace(":", "_")
+        namespace = session_id.namespace
         image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
         if image_bytes:
             s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
@@ -3526,6 +3554,9 @@ def handle_whatsapp(body):
             continue
         try:
             _handle_whatsapp_message(config, msg)
+        except RouteMigrating:
+            logger.info("WhatsApp: turn refused while the user's storage is migrated")
+            whatsapp.send_text(config, msg["from"], MIGRATION_REPLY)
         except RouteUnavailable as e:
             logger.error("WhatsApp: route unavailable: %s", type(e).__name__)
             whatsapp.send_text(config, msg["from"], "Sorry, your account needs attention. Please contact the bot admin.")
@@ -3579,7 +3610,7 @@ def _handle_whatsapp_message(config, msg):
 
     agent_message = text
     if has_image:
-        namespace = route.actor_id.replace(":", "_")
+        namespace = route.namespace
         image_bytes, content_type = whatsapp.download_media(
             config, msg["image_id"], ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES)
         s3_key = _upload_image_to_s3(image_bytes, namespace, content_type) if image_bytes else None
@@ -3644,6 +3675,9 @@ def handle_line(body):
             continue
         try:
             _handle_line_event(config, event)
+        except RouteMigrating:
+            logger.info("LINE: turn refused while the user's storage is migrated")
+            line_channel.send_text(config, event["user_id"], MIGRATION_REPLY, event["reply_token"])
         except RouteUnavailable as e:
             logger.error("LINE: route unavailable: %s", type(e).__name__)
             line_channel.send_text(config, event["user_id"],
@@ -3699,7 +3733,7 @@ def _handle_line_event(config, event):
     line_channel.show_loading(config, line_user_id)
     agent_message = text
     if has_image:
-        namespace = route.actor_id.replace(":", "_")
+        namespace = route.namespace
         image_bytes, content_type = line_channel.download_image(
             config, event["message_id"], ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES)
         s3_key = _upload_image_to_s3(image_bytes, namespace, content_type) if image_bytes else None
@@ -3792,6 +3826,9 @@ def handle_discord(body):
 
     try:
         _handle_discord_command(command, reply)
+    except RouteMigrating:
+        logger.info("Discord: turn refused while the user's storage is migrated")
+        reply(MIGRATION_REPLY)
     except RouteUnavailable as e:
         logger.error("Discord: route unavailable: %s", type(e).__name__)
         reply("Sorry, your account needs attention. Please contact the bot admin.")
@@ -3840,7 +3877,7 @@ def _handle_discord_command(command, reply):
 
     agent_message = text
     if attachment:
-        namespace = route.actor_id.replace(":", "_")
+        namespace = route.namespace
         image_bytes, content_type = discord_channel.download_attachment(
             attachment, ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES)
         s3_key = _upload_image_to_s3(image_bytes, namespace, content_type) if image_bytes else None

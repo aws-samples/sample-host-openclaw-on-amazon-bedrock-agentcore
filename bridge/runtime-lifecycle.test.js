@@ -218,3 +218,22 @@ test("a turn that starts before its deadline is not cut off by the queue timer",
   });
   assert.equal(result, "ran past the queue deadline");
 });
+
+test("the storage namespace is pinned with the binding but kept out of the binding object", async () => {
+  const runtime = createRuntimeLifecycle({ activate: async (_context, scope) => markReady(scope) });
+  const bound = { ...owner, namespace: "ns_" + "a".repeat(26) };
+  await runtime.ensureReady(bound);
+  assert.equal(runtime.snapshot().namespace, bound.namespace);
+  assert.deepEqual(Object.keys(runtime.snapshot().binding).sort(),
+    ["actorId", "routingGeneration", "runtimeSessionId", "userId"]);
+  runtime.assertBinding(bound);
+  // Owners that re-check with the binding object itself carry no namespace.
+  runtime.assertBinding(runtime.snapshot().binding);
+  for (const namespace of ["telegram_1", "ns_" + "b".repeat(26), null, undefined]) {
+    assert.throws(() => runtime.assertBinding({ ...owner, namespace }), /does not match the active user binding/);
+  }
+  let ran = false;
+  await assert.rejects(runtime.run({ ...owner, namespace: "telegram_1", deadline: Date.now() + 1000 },
+    async () => { ran = true; }), /does not match the active user binding/);
+  assert.equal(ran, false);
+});

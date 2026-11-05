@@ -192,7 +192,7 @@ function createLiveSeedBridge({
       const now = lifecycle.snapshot();
       if (now.state !== "BINDING" || now.binding !== binding ||
           now.generation !== scope.generation || !now.resources.includes("credentials") ||
-          namespace !== binding.actorId.replace(/:/g, "_") ||
+          namespace !== now.namespace ||
           env.USER_ID !== binding.actorId || env.INTERNAL_USER_ID !== binding.userId) {
         throw new Error("Live seed binding changed");
       }

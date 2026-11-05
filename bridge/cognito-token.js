@@ -8,7 +8,9 @@
  * token is refused with 403 "insufficient_scope". One ADMIN_USER_PASSWORD_AUTH
  * call returns both, so they are cached together.
  *
- * One Cognito user per actorId ("telegram:123"). Each user's password is
+ * One Cognito user per user, named by user-namespace.js cognitoUsername(): the
+ * actor ("telegram:123") while the user's namespace is the legacy one, the
+ * namespace once it is a stored opaque one. Each user's password is
  * generated with crypto.randomBytes and stored in its own Secrets Manager
  * secret, `openclaw/cognito-user/<userPoolId>/<namespace>`. Nothing derives a
  * password from a shared key.
@@ -33,15 +35,18 @@
 "use strict";
 
 const crypto = require("crypto");
+const { legacyNamespace } = require("./user-namespace");
 
 const SECRET_PREFIX = "openclaw/cognito-user/";
 
-function actorToNamespace(actorId) {
-  return String(actorId || "").replace(/:/g, "_");
+// The namespace a Cognito username belongs to. An actor username maps to its
+// legacy namespace; an opaque namespace has no ":" and maps to itself.
+function usernameToNamespace(username) {
+  return legacyNamespace(String(username || ""));
 }
 
-function defaultSecretId(actorId, userPoolId) {
-  return SECRET_PREFIX + userPoolId + "/" + actorToNamespace(actorId);
+function defaultSecretId(username, userPoolId) {
+  return SECRET_PREFIX + userPoolId + "/" + usernameToNamespace(username);
 }
 
 function generateRandomPassword() {

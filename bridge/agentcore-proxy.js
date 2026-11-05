@@ -44,6 +44,18 @@ if (BOUND_ACTOR_ID && !VALID_ACTOR_ID.test(BOUND_ACTOR_ID)) {
 // against the activation before this module loads). Logs and Bedrock request
 // metadata name the user by this ID, never by the actor.
 const BOUND_USER_ID = process.env.INTERNAL_USER_ID || "";
+// The binding's storage namespace (user-namespace.js): where the workspace
+// files and image uploads live, and the source of the Cognito username. A
+// contract from before stored namespaces sets no USER_NAMESPACE; the legacy
+// namespace of the bound actor applies then.
+const userNamespace = require("./user-namespace");
+const BOUND_NAMESPACE = process.env.USER_NAMESPACE ||
+  (BOUND_ACTOR_ID ? userNamespace.legacyNamespace(BOUND_ACTOR_ID) : "");
+if (BOUND_ACTOR_ID && !userNamespace.isNamespaceOf(BOUND_NAMESPACE, BOUND_ACTOR_ID)) {
+  console.error("[proxy] FATAL: bound USER_NAMESPACE is not a namespace of the bound actor.");
+  process.exit(1);
+}
+const COGNITO_USERNAME = BOUND_ACTOR_ID ? userNamespace.cognitoUsername(BOUND_ACTOR_ID, BOUND_NAMESPACE) : "";
 const AWS_REGION = process.env.AWS_REGION;
 if (!AWS_REGION) {
   console.error("[proxy] FATAL: AWS_REGION environment variable is not set.");
@@ -295,7 +307,7 @@ const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
   log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[proxy] Cognito")),
 });
 const proxyAuthPrepare = createProxyAuthChild({
-  channel: process, tokenProvider: cognitoTokens, boundActor: BOUND_ACTOR_ID,
+  channel: process, tokenProvider: cognitoTokens, boundActor: COGNITO_USERNAME,
 });
 
 // Lazily initialized S3 client
@@ -743,7 +755,8 @@ async function retrieveMemoryContext(_actorId, _lastUserText) {
 
 async function buildUserIdentityContext(actorId, channel, { sharedChat = false } = {}) {
   const safeChannel = VALID_CHANNELS.has(channel) ? channel : "unknown";
-  const namespace = actorId.replace(/:/g, "_");
+  if (actorId !== BOUND_ACTOR_ID) throw new Error("Proxy canonical actor changed");
+  const namespace = BOUND_NAMESPACE;
 
   // Pre-load all workspace files in parallel
   const rawContents = await Promise.all(
@@ -825,8 +838,9 @@ async function buildUserIdentityContext(actorId, channel, { sharedChat = false }
   // user-writable path (or stale data from before the reserved-name denylist)
   // cannot precede or imitate the trusted rules. The workspace blocks that
   // follow are explicitly labelled as untrusted reference data.
-  // The raw actor is not in the prompt; the namespace stays until it is no
-  // longer derived from the actor.
+  // The raw actor is not in the prompt. The namespace is, as the user_id the
+  // skills take; it no longer names the actor once the user has a stored
+  // opaque namespace (user-namespace.js).
   const trustedRules =
     "\n## Current User\n" +
     `You are chatting with a user (namespace: ${namespace}) on channel: ${safeChannel}.\n` +
@@ -875,11 +889,13 @@ async function buildUserIdentityContext(actorId, channel, { sharedChat = false }
 }
 
 /**
- * Get a JWT (ID token) for the given actorId (cached, auto-refreshes).
+ * Get a JWT (ID token) for the bound actor (cached, auto-refreshes). The
+ * Cognito user is COGNITO_USERNAME: the actor, or the opaque namespace.
  * Returns null if Cognito is not configured.
  */
 async function getCognitoToken(actorId) {
-  const entry = await proxyAuthPrepare.getIdToken(actorId);
+  if (actorId !== BOUND_ACTOR_ID) throw new Error("Proxy canonical actor changed");
+  const entry = await proxyAuthPrepare.getIdToken(COGNITO_USERNAME);
   return entry ? entry.token : null;
 }
 
@@ -1601,7 +1617,6 @@ const server = http.createServer(async (req, res) => {
 
         // --- Preprocess images: extract markers from last user message ---
         let processedMessages = messages;
-        const namespace = actorId.replace(/:/g, "_");
         const lastUserIdx = messages.reduce(
           (acc, m, i) => (m.role === "user" ? i : acc),
           -1,
@@ -1627,7 +1642,8 @@ const server = http.createServer(async (req, res) => {
               contentParts.push({ type: "text", text: cleanText });
             }
             for (const img of images) {
-              const fetched = await fetchImageFromS3(img.s3Key, namespace);
+              // Only keys under the bound namespace's _uploads/ are fetched.
+              const fetched = await fetchImageFromS3(img.s3Key, BOUND_NAMESPACE);
               if (fetched) {
                 contentParts.push({
                   type: "image_bedrock",

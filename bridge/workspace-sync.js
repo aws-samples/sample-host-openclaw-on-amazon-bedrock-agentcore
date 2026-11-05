@@ -12,7 +12,8 @@
  * container whose restore failed: a partially restored state dir must never
  * overwrite the good copy in S3 (see the upload gate below).
  *
- * Namespace format: {actorId.replace(/:/g, "_")} (e.g., "telegram_123456789")
+ * Namespace: the binding's storage namespace (user-namespace.js), e.g.
+ * "telegram_123456789" or a stored "ns_..." value
  * S3 prefix: {namespace}/.openclaw/
  * Local path: $HOME/.openclaw/ (defaults to /root/.openclaw/). On AgentCore Runtime,
  * this and `workspace/` are local directories. state-storage.js mirrors them
@@ -516,8 +517,7 @@ async function restoreAbsentSeed(namespace, { lifecycle, scope, bindSeed } = {})
     if (_restoreAttempt !== attempt || _restoreState !== "pending" ||
         current.state !== "BINDING" || current.binding !== binding ||
         current.generation !== scope.generation || !current.resources.includes("credentials") ||
-        provider !== _credentialProvider || !binding ||
-        binding.actorId.replace(/:/g, "_") !== namespace ||
+        provider !== _credentialProvider || !binding || current.namespace !== namespace ||
         process.env.USER_ID !== binding.actorId || process.env.INTERNAL_USER_ID !== binding.userId) {
       throw new Error("Live seed restore owner changed");
     }

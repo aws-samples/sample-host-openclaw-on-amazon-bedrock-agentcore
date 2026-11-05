@@ -151,13 +151,32 @@ async function connectBrowser({ policy = defaultPolicy } = {}) {
   }
 }
 
+// The contract server writes the bound user's actor and storage namespace here.
+const IDENTITY_FILE = "/tmp/current-identity.json";
+
+/**
+ * The bound user's storage namespace: the one the identity file names for the
+ * USER_ID actor, else the actor with ":" replaced by "_" (bridge/user-namespace.js).
+ */
+function boundNamespace() {
+  const actor = process.env.USER_ID || "default-user";
+  try {
+    const identity = JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf8"));
+    if (identity?.actorId === actor && typeof identity.namespace === "string" && identity.namespace) {
+      return identity.namespace;
+    }
+  } catch {
+    // No readable identity file: the namespace follows from USER_ID.
+  }
+  return actor.replace(/:/g, "_");
+}
+
 async function uploadScreenshotToS3(imageBuffer) {
   const bucket = process.env.S3_USER_FILES_BUCKET;
   if (!bucket) {
     throw new Error("S3_USER_FILES_BUCKET environment variable is not set — cannot upload screenshot");
   }
-  const userId = process.env.USER_ID || "default-user";
-  const namespace = userId.replace(/:/g, "_");
+  const namespace = boundNamespace();
   const timestamp = Date.now();
   const key = `${namespace}/_screenshots/screenshot_${timestamp}.png`;
 
@@ -198,6 +217,7 @@ module.exports = {
   getBrowserSession,
   connectBrowser,
   applyStealthHeaders,
+  boundNamespace,
   uploadScreenshotToS3,
   truncateContent,
   defaultPolicy,

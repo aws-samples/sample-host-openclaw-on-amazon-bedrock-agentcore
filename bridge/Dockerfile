@@ -244,6 +244,7 @@ COPY late-announce.js /app/late-announce.js
 COPY gateway-mcp.js /app/gateway-mcp.js
 COPY runtime-skills.js /app/runtime-skills.js
 COPY runtime-lifecycle.js /app/runtime-lifecycle.js
+COPY user-namespace.js /app/user-namespace.js
 COPY gateway-lifecycle.js /app/gateway-lifecycle.js
 COPY gateway-config.js live-seed-bridge.js model-policy.js invocation-stream.js cron-jobs.js /app/
 COPY proxy-sdk-snapshot.js proxy-auth-prepare.js system-prefix-cache.js /app/

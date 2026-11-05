@@ -13,6 +13,12 @@ const { spawnSync } = require("child_process");
 const COMMON = path.join(__dirname, "common.js");
 
 const HARNESS = [
+  // TEST_IDENTITY_FILE stands in for the contract's /tmp/current-identity.json.
+  'const fs = require("node:fs");',
+  'const readFileSync = fs.readFileSync;',
+  'fs.readFileSync = (file, ...rest) => readFileSync(',
+  '  file === "/tmp/current-identity.json" && process.env.TEST_IDENTITY_FILE ? process.env.TEST_IDENTITY_FILE : file,',
+  '  ...rest);',
   'const { validateUserId } = require(' + JSON.stringify(COMMON) + ');',
   'validateUserId(process.argv[2]);',
   'console.log("ok");',
@@ -106,3 +112,56 @@ describe("validateUserId for Slack channel and Feishu group identities", () => {
     assert.match(r.stderr, /does not match the user this session belongs to/);
   });
 });
+
+describe("validateUserId with a stored namespace in the identity file", () => {
+  const OPAQUE = "ns_" + "g".repeat(26);
+
+  function withIdentity(identity, args, extraEnv) {
+    const file = path.join(tmp, "identity.json");
+    fs.writeFileSync(file, JSON.stringify(identity));
+    return run(args, Object.assign({ TEST_IDENTITY_FILE: file }, extraEnv || {}));
+  }
+
+  it("accepts the namespace the identity file names for the bound actor", () => {
+    const r = withIdentity({ actorId: "telegram:123456", namespace: OPAQUE }, [OPAQUE], { USER_ID: "telegram:123456" });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /ok/);
+  });
+
+  it("refuses the old legacy namespace, as taken from an older transcript, with the system-prompt hint", () => {
+    const r = withIdentity({ actorId: "telegram:123456", namespace: OPAQUE }, ["telegram_123456"],
+      { USER_ID: "telegram:123456" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /Use the user_id from your system prompt/);
+  });
+
+  it("refuses another stored namespace and a USER_ID that names another actor", () => {
+    let r = withIdentity({ actorId: "telegram:123456", namespace: OPAQUE }, ["ns_" + "h".repeat(26)],
+      { USER_ID: "telegram:123456" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /does not match the user this session belongs to/);
+    r = withIdentity({ actorId: "telegram:123456", namespace: OPAQUE }, [OPAQUE], { USER_ID: "telegram:999999" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /does not match the user this session belongs to/);
+  });
+
+  it("uses the legacy namespace when the identity file names none", () => {
+    const r = withIdentity({ actorId: "telegram:123456" }, ["telegram_123456"], { USER_ID: "telegram:123456" });
+    assert.equal(r.status, 0, r.stderr);
+  });
+});
+
+describe("validateUserId for a Feishu group with a stored namespace", () => {
+  it("accepts the stored namespace the identity file names for the group", () => {
+    const file = path.join(tmp, "identity.json");
+    const opaque = "ns_" + "r".repeat(26);
+    fs.writeFileSync(file, JSON.stringify({ actorId: "feishu_group:oc_0123abcdef", namespace: opaque }));
+    const env = { TEST_IDENTITY_FILE: file, USER_ID: "feishu_group:oc_0123abcdef" };
+    const ok = run([opaque], env);
+    assert.equal(ok.status, 0, ok.stderr);
+    const legacy = run(["feishu_group_oc_0123abcdef"], env);
+    assert.notEqual(legacy.status, 0);
+    assert.match(legacy.stderr, /Use the user_id from your system prompt/);
+  });
+});
+
