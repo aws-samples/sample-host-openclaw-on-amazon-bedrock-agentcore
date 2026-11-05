@@ -74,10 +74,11 @@ describe("buildSessionPolicy", () => {
     assert.ok(!stmt.Action.includes("secretsmanager:ListSecrets"));
   });
 
-  it("keeps ListSecrets alone in its own statement (no resource-level support)", () => {
-    const stmt = statementFor(fullPolicy(), "secretsmanager:ListSecrets");
-    assert.equal(stmt.Action, "secretsmanager:ListSecrets");
-    assert.equal(stmt.Resource, "*");
+  it("does not grant secretsmanager:ListSecrets (it cannot be scoped to one tenant)", () => {
+    const parsed = fullPolicy();
+    for (const s of parsed.Statement) {
+      assert.ok(![].concat(s.Action).includes("secretsmanager:ListSecrets"), JSON.stringify(s));
+    }
   });
 
   it("limits DynamoDB to the identity table and the user's USER# partition", () => {
@@ -160,13 +161,12 @@ describe("buildSessionPolicy", () => {
     ] } });
   });
 
-  it("grants no wildcard action and Resource * only to ListSecrets and via-service KMS", () => {
+  it("grants no wildcard action and Resource * only to via-service KMS", () => {
     const parsed = fullPolicy();
     for (const s of parsed.Statement) {
       for (const action of [].concat(s.Action)) assert.ok(!action.includes("*"), action);
       if (s.Resource === "*") {
-        assert.ok(s.Action === "secretsmanager:ListSecrets" || s.Condition?.StringLike?.["kms:ViaService"],
-          JSON.stringify(s));
+        assert.ok(s.Condition?.StringLike?.["kms:ViaService"], JSON.stringify(s));
       }
     }
   });
@@ -275,7 +275,7 @@ describe("buildSessionPolicy", () => {
       (part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(arn);
     for (const stmt of fullPolicy().Statement) {
       const actions = [].concat(stmt.Action);
-      if (!actions.some((a) => a.startsWith("secretsmanager:") && a !== "secretsmanager:ListSecrets")) continue;
+      if (!actions.some((a) => a.startsWith("secretsmanager:"))) continue;
       assert.ok(![].concat(stmt.Resource).some(matches), "session policy must not reach " + name);
     }
   });

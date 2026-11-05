@@ -96,7 +96,7 @@ During user activation, the contract server calls `STS:AssumeRole` on the execut
 |---|---|
 | S3 objects | `arn:aws:s3:::{bucket}/{namespace}/*` only |
 | S3 list | `s3:ListBucket` with an `s3:prefix` condition of `{namespace}/*` |
-| Secrets Manager | `openclaw/user/{namespace}/*` (get, put, create, delete, tag). `ListSecrets` has no resource-level permissions, so it stays on `*`; the skill filters by the user's prefix and the call returns names, not values |
+| Secrets Manager | `openclaw/user/{namespace}/*` (get, put, create, delete, tag) only. No `ListSecrets`: it has no resource-level permissions, so the skill lists a user's own key names from a per-user index under that user's S3 prefix instead of enumerating Secrets Manager |
 | DynamoDB | Identity table only, with `ForAllValues:StringEquals` on `dynamodb:LeadingKeys` = `USER#{internalUserId}` (the partition that holds the user's `CRON#` records) |
 | EventBridge Scheduler | Create, get, update and delete on `schedule/{group}/openclaw-{namespace}-*` only. A namespace longer than 46 characters uses the same digest prefix as its schedule names; the older truncated names are not granted |
 | IAM PassRole | Only the EventBridge scheduler role, only to `scheduler.amazonaws.com` |
