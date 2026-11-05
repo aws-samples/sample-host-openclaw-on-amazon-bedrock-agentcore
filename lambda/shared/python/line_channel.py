@@ -22,6 +22,8 @@ import uuid
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+import formatting
+
 logger = logging.getLogger()
 
 API_BASE = "https://api.line.me/v2/bot"
@@ -179,7 +181,8 @@ def send_text(config, user_id, text, reply_token="", timeout=10):
     if not config or not isinstance(user_id, str) or not _USER_ID_RE.match(user_id):
         logger.error("LINE send skipped: channel not configured or bad recipient")
         return False
-    messages = [{"type": "text", "text": c} for c in split_text(text)]
+    # LINE text messages show Markdown markers literally, so they are removed.
+    messages = [{"type": "text", "text": c} for c in split_text(formatting.plain_text(text))]
     batches = [messages[i:i + MAX_MESSAGES_PER_REQUEST] for i in range(0, len(messages), MAX_MESSAGES_PER_REQUEST)]
     for index, batch in enumerate(batches):
         if index == 0 and reply_token:

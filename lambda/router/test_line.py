@@ -302,6 +302,14 @@ class TestSend(unittest.TestCase):
             self.assertTrue(line_channel.send_text(CONFIG, USER_ID, "cron result"))
         self.assertTrue(mock_open.call_args.args[0].full_url.endswith("/message/push"))
 
+    def test_markdown_is_sent_as_plain_text(self):
+        with patch.object(line_channel.urllib_request, "urlopen") as mock_open:
+            self.assertTrue(line_channel.send_text(
+                CONFIG, USER_ID, "## Brief\n**Rain** after 3 pm. See [map](https://example.com/m)."))
+        messages = json.loads(mock_open.call_args.args[0].data)["messages"]
+        self.assertEqual(messages, [{"type": "text",
+                                     "text": "Brief\nRain after 3 pm. See map (https://example.com/m)."}])
+
     def test_bad_recipient(self):
         with patch.object(line_channel.urllib_request, "urlopen") as mock_open:
             self.assertFalse(line_channel.send_text(CONFIG, "../x", "x"))

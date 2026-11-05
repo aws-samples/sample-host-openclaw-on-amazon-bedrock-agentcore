@@ -312,7 +312,7 @@ The [AgentCore Runtime V2 lifecycle contract](runtime-v2.md#lifecycle-and-compat
 4. Lambda conditionally admits the invocation on the resolved AgentCore Runtime ARN, endpoint name, per-user session ID and generation
 5. Contract server activates the user when needed. V2 waits for `USER_READY` and uses full OpenClaw
 6. Proxy converts to Bedrock ConverseStream API call (multimodal if images present)
-7. Response streams back → Lambda recursively unwraps nested content blocks (from subagent responses), converts markdown to Telegram HTML, sends to channel API (long Telegram replies split into chunks under the 4,096-unit limit)
+7. Response streams back → Lambda recursively unwraps nested content blocks (from subagent responses), converts the Markdown for the channel, and sends it to the channel API (long Telegram replies split into chunks under the 4,096-unit limit). Telegram gets HTML; Slack gets mrkdwn; WhatsApp gets its own `*bold*`/`_italic_` formatting; LINE and Feishu get plain text; Discord renders Markdown itself. Headings become bold lines, tables become bullet lists, and only http(s) links are kept. Slack mentions (`<!channel>`, `<!here>`, `<@U…>`) and Feishu `<at>` tags in the model's text are neutralised, so a reply cannot ping anyone (`lambda/shared/python/formatting.py`). A Slack (`ok: false`) or Feishu (non-zero `code`) refusal is logged with its error code.
 
 ## Tools & Skills
 

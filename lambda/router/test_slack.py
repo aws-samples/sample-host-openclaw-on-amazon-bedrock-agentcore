@@ -498,13 +498,48 @@ class TestSlackRetryHandling(_SlackTurnCase):
 
 
 class TestSlackSend(unittest.TestCase):
-    """thread_ts reaches chat.postMessage only when given."""
+    """chat.postMessage gets mrkdwn, thread_ts only when given, and ok:false is logged by code."""
 
-    def _payloads(self, *calls):
+    def _payloads(self, *calls, response=b'{"ok": true}'):
         with patch.object(index.urllib_request, "urlopen") as urlopen:
+            urlopen.return_value.read.return_value = response
             for call in calls:
                 call()
         return [json.loads(c.args[0].data) for c in urlopen.call_args_list]
+
+    def test_text_is_sent_as_mrkdwn_with_model_mentions_escaped(self):
+        payload, = self._payloads(lambda: index.send_slack_message(
+            "D12345DM", "## Brief\n**Rain** <!channel> [map](https://example.com/m)", SLACK_BOT_TOKEN))
+        self.assertEqual(payload["text"], "*Brief*\n*Rain* &lt;!channel&gt; <https://example.com/m|map>")
+
+    def test_accepted_message_returns_true_without_logging(self):
+        with self.assertNoLogs(index.logger, level="WARNING"):
+            results = []
+            self._payloads(lambda: results.append(index.send_slack_message("D12345DM", "hi", SLACK_BOT_TOKEN)))
+        self.assertEqual(results, [True])
+
+    def test_ok_false_is_logged_with_slack_error_code_only(self):
+        response = b'{"ok": false, "error": "not_in_channel", "warning": "detail-from-body"}'
+        results = []
+        with self.assertLogs(index.logger, level="ERROR") as logs:
+            self._payloads(lambda: results.append(
+                index.send_slack_message("C12345CHAN", "secret brief", SLACK_BOT_TOKEN)), response=response)
+        self.assertEqual(results, [False])
+        output = "\n".join(logs.output)
+        self.assertIn("error=not_in_channel", output)
+        for leaked in ("detail-from-body", "secret brief", SLACK_BOT_TOKEN):
+            self.assertNotIn(leaked, output)
+
+    def test_unreadable_response_and_network_error_return_false(self):
+        results = []
+        with self.assertLogs(index.logger, level="ERROR") as logs:
+            self._payloads(lambda: results.append(index.send_slack_message("D12345DM", "hi", SLACK_BOT_TOKEN)),
+                           response=b"<html>502 Bad Gateway</html>")
+        self.assertIn("error=unreadable_response", "\n".join(logs.output))
+        with patch.object(index.urllib_request, "urlopen", side_effect=TimeoutError("timed out")), \
+                self.assertLogs(index.logger, level="ERROR"):
+            results.append(index.send_slack_message("D12345DM", "hi", SLACK_BOT_TOKEN))
+        self.assertEqual(results, [False, False])
 
     def test_thread_ts_is_sent_only_when_given(self):
         top_level, threaded = self._payloads(

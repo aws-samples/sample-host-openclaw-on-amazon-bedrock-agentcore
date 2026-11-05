@@ -319,6 +319,15 @@ class TestHandleWhatsapp(unittest.TestCase):
         mock_send.assert_not_called()
 
 
+class TestSendFormatting(unittest.TestCase):
+    def test_markdown_is_sent_in_whatsapp_formatting(self):
+        with patch.object(whatsapp.urllib_request, "urlopen") as mock_open:
+            self.assertTrue(whatsapp.send_text(
+                CONFIG, WA_ID, "## Brief\n**Rain** after *3 pm*. See [map](https://example.com/m)."))
+        body = json.loads(mock_open.call_args.args[0].data)["text"]["body"]
+        self.assertEqual(body, "*Brief*\n*Rain* after _3 pm_. See map (https://example.com/m).")
+
+
 class TestDedupe(unittest.TestCase):
     def test_claim(self):
         with patch.object(index, "ClientError", FakeClientError), \

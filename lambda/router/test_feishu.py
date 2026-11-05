@@ -369,6 +369,28 @@ class TestSendFeishuMessage(unittest.TestCase):
         index.send_feishu_message("oc_chat123", "Hello!")
         mock_urlopen.assert_not_called()
 
+    @patch.object(index, "_get_feishu_tenant_token", return_value="t-test")
+    @patch("urllib.request.urlopen")
+    def test_text_is_sent_as_plain_text_without_at_tags(self, mock_urlopen, _mock_token):
+        mock_urlopen.return_value.read.return_value = b'{"code": 0, "msg": "success"}'
+        with self.assertNoLogs(index.logger, level="WARNING"):
+            self.assertTrue(index.send_feishu_message(
+                "oc_chat123", '## Brief\n**Rain** <at user_id="all">all</at> [map](https://example.com/m)'))
+        body = json.loads(mock_urlopen.call_args.args[0].data)
+        self.assertEqual(body["msg_type"], "text")
+        self.assertEqual(json.loads(body["content"]), {"text": "Brief\nRain all map (https://example.com/m)"})
+
+    @patch.object(index, "_get_feishu_tenant_token", return_value="t-test")
+    @patch("urllib.request.urlopen")
+    def test_non_zero_code_is_logged_with_its_code_only(self, mock_urlopen, _mock_token):
+        mock_urlopen.return_value.read.return_value = b'{"code": 230002, "msg": "Bot is not in the chat"}'
+        with self.assertLogs(index.logger, level="ERROR") as logs:
+            self.assertFalse(index.send_feishu_message("oc_chat123", "secret brief"))
+        output = "\n".join(logs.output)
+        self.assertIn("code=230002", output)
+        self.assertNotIn("Bot is not in the chat", output)
+        self.assertNotIn("secret brief", output)
+
 
 class TestDownloadFeishuImage(unittest.TestCase):
     """Tests for _download_feishu_image."""
