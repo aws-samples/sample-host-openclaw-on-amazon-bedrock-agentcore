@@ -50,6 +50,12 @@ describe("validateUserId cross-tenant check", () => {
     assert.match(r.stdout, /ok/);
   });
 
+  it("accepts a feishu namespace matching USER_ID", () => {
+    const r = run(["feishu_ou_abc123"], { USER_ID: "feishu:ou_abc123" });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /ok/);
+  });
+
   it("rejects every call when no bound identity is available", () => {
     const r = run(["telegram_123456"], {});
     assert.notEqual(r.status, 0);

@@ -10,7 +10,7 @@ if (!REGION) {
 }
 
 const VALID_KEY_NAME = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
-const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp|line)_[a-zA-Z0-9_-]{1,64}$/;
+const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}$/;
 
 // The contract server writes the bound user's identity here and sets USER_ID
 // ("channel:id") before OpenClaw runs a skill.

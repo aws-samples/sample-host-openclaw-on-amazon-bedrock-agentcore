@@ -692,28 +692,35 @@ def _is_currently_authorized(channel, channel_user_id, user_id):
     """Re-evaluate per-turn authorization for an already-enrolled identity.
 
     An enrolled identity remains authorized only while REGISTRATION_OPEN is
-    on, an ALLOW# record exists for its own channel key, OR — for linked
-    secondary channels — an ALLOW# record exists for the owning user's
-    original enrollment actor. Fails closed on missing / unreadable records
-    so operator revocation via scripts/manage-allowlist.sh takes effect on
-    the next webhook turn.
+    on, an ALLOW# record exists for its own channel key, OR — for a linked
+    secondary channel — an ALLOW# record exists for the owning user's primary
+    (runtime) actor. That primary actor is read from the durable owner record
+    ``ACTOR#<channel actor>/OWNER`` (PK ``ACTOR#…``, outside the ``USER#<id>``
+    partition the in-microVM agent can write), never from an attribute the
+    agent could set on its own ``USER#<id>/PROFILE``. Fails closed on missing,
+    unreadable or invalid records so operator revocation via
+    scripts/manage-allowlist.sh takes effect on the next webhook turn.
     """
     if REGISTRATION_OPEN:
         return True
     channel_key = f"{channel}:{channel_user_id}"
     if _allow_record_exists(channel_key):
         return True
-    # Linked secondary channel: honour the primary enrollment actor's ALLOW#.
+    # Linked secondary channel: authorize only via the owning user's primary
+    # (runtime) actor, taken from the agent-unwritable ACTOR#<actor>/OWNER
+    # record. The scoped credentials let the agent write its own
+    # USER#<id>/PROFILE, so a stored enrollmentActorId there must not drive
+    # this decision (it could point at another still-allowlisted actor).
     try:
-        profile = identity_table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
-        ).get("Item") or {}
-    except ClientError as e:
-        logger.error("Authorization profile read failed for %s: %s", user_id, e)
+        owner = read_actor_owner(identity_table, channel_key)
+    except (ClientError, RouteUnavailable) as e:
+        logger.error("Authorization owner read failed for %s: %s", channel_key, e)
         return False
-    enrollment_actor = profile.get("enrollmentActorId")
-    if isinstance(enrollment_actor, str) and enrollment_actor and enrollment_actor != channel_key:
-        if _allow_record_exists(enrollment_actor):
+    if not owner or owner.get("userId") != user_id:
+        return False
+    primary_actor = owner.get("runtimeActorId")
+    if isinstance(primary_actor, str) and primary_actor and primary_actor != channel_key:
+        if _allow_record_exists(primary_actor):
             return True
     return False
 

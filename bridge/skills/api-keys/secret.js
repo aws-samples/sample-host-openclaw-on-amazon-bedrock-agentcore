@@ -2,14 +2,38 @@
 /**
  * AWS Secrets Manager API key management.
  * Usage: node secret.js <user_id> <action> [key_name] [key_value]
+ *
+ * `list` and the per-user secret limit read a per-user name index kept in the
+ * user's own S3 prefix (see secrets-index.js) instead of calling
+ * secretsmanager:ListSecrets, which cannot be scoped to one tenant.
  */
 const { REGION, validateUserId, validateKeyName, SM_REQUEST_TIMEOUT_MS } = require("./common");
+const secretsIndex = require("./secrets-index");
 
 const SECRET_PREFIX = "openclaw/user/";
 const MAX_SECRETS_PER_USER = 10;
+const BUCKET = process.env.S3_USER_FILES_BUCKET;
 
 function buildSecretName(namespace, keyName) {
   return `${SECRET_PREFIX}${namespace}/${keyName}`;
+}
+
+function requireBucket() {
+  if (!BUCKET) {
+    console.error("Error: S3_USER_FILES_BUCKET environment variable is not set.");
+    process.exit(1);
+  }
+}
+
+// Index maintenance is secondary to the Secrets Manager write that just
+// succeeded: never fail the user's operation because the name index could not
+// be updated. A stale index self-heals on the next list/get of that name.
+async function tryIndex(op, keyName) {
+  try {
+    await op();
+  } catch (err) {
+    console.error(`Warning: API-key index not updated for '${keyName}': ${err.message}`);
+  }
 }
 
 async function main() {
@@ -30,9 +54,11 @@ async function main() {
     }
   }
 
+  requireBucket();
+  const s3 = secretsIndex.makeClient(REGION);
+
   const {
     SecretsManagerClient,
-    ListSecretsCommand,
     GetSecretValueCommand,
     PutSecretValueCommand,
     CreateSecretCommand,
@@ -45,12 +71,7 @@ async function main() {
   });
 
   if (action === "list") {
-    const prefix = `${SECRET_PREFIX}${userId}/`;
-    const resp = await client.send(new ListSecretsCommand({
-      Filters: [{ Key: "name", Values: [prefix] }],
-      MaxResults: 100,
-    }));
-    const secrets = (resp.SecretList || []).map((s) => s.Name.slice(prefix.length));
+    const secrets = await secretsIndex.listKeys(s3, BUCKET, userId);
     if (secrets.length === 0) {
       console.log("No secrets stored (Secrets Manager).");
     } else {
@@ -67,16 +88,15 @@ async function main() {
         SecretId: secretName,
         SecretString: keyValue,
       }));
+      // Existing secret updated — make sure it is in the index (self-heals a
+      // key created before the index existed).
+      await tryIndex(() => secretsIndex.addKey(s3, BUCKET, userId, keyName), keyName);
       console.log(`Secret '${keyName}' updated (Secrets Manager, KMS-encrypted).`);
     } catch (err) {
       if (err.name === "ResourceNotFoundException") {
-        // Check limit
-        const prefix = `${SECRET_PREFIX}${userId}/`;
-        const listResp = await client.send(new ListSecretsCommand({
-          Filters: [{ Key: "name", Values: [prefix] }],
-          MaxResults: 100,
-        }));
-        if ((listResp.SecretList || []).length >= MAX_SECRETS_PER_USER) {
+        // Check the per-user limit from the index.
+        const names = await secretsIndex.listKeys(s3, BUCKET, userId);
+        if (names.length >= MAX_SECRETS_PER_USER) {
           console.error(`Error: Maximum ${MAX_SECRETS_PER_USER} secrets per user reached.`);
           process.exit(1);
         }
@@ -88,6 +108,7 @@ async function main() {
             { Key: "openclaw:managed", Value: "true" },
           ],
         }));
+        await tryIndex(() => secretsIndex.addKey(s3, BUCKET, userId, keyName), keyName);
         console.log(`Secret '${keyName}' saved (Secrets Manager, KMS-encrypted, auditable via CloudTrail).`);
       } else {
         console.error(`Error updating secret: ${err.message}`);
@@ -97,9 +118,13 @@ async function main() {
   } else if (action === "get") {
     try {
       const resp = await client.send(new GetSecretValueCommand({ SecretId: secretName }));
+      // Self-heal: a readable key belongs in the index.
+      await tryIndex(() => secretsIndex.addKey(s3, BUCKET, userId, keyName), keyName);
       console.log(resp.SecretString);
     } catch (err) {
       if (err.name === "ResourceNotFoundException") {
+        // The key is gone — drop any stale index entry.
+        await tryIndex(() => secretsIndex.removeKey(s3, BUCKET, userId, keyName), keyName);
         console.error(`Error: No secret found with name '${keyName}'.`);
       } else {
         console.error(`Error retrieving secret: ${err.message}`);
@@ -112,9 +137,11 @@ async function main() {
         SecretId: secretName,
         RecoveryWindowInDays: 7,
       }));
+      await tryIndex(() => secretsIndex.removeKey(s3, BUCKET, userId, keyName), keyName);
       console.log(`Secret '${keyName}' scheduled for deletion (7-day recovery window).`);
     } catch (err) {
       if (err.name === "ResourceNotFoundException") {
+        await tryIndex(() => secretsIndex.removeKey(s3, BUCKET, userId, keyName), keyName);
         console.error(`Error: No secret found with name '${keyName}'.`);
       } else {
         console.error(`Error deleting secret: ${err.message}`);
