@@ -3,30 +3,31 @@
 Pure helpers with no AWS or network calls, so they are easy to test and to
 share between channels:
 
-- ``classify_document`` decides whether a file is Markdown, a ZIP archive, or
-  unsupported, from its MIME type and file name.
+- ``classify_document`` decides whether a file is Markdown, a text file, a
+  PDF, a ZIP archive, or unsupported, from its MIME type and file name.
 - ``zip_listing`` reads a ZIP archive's central directory (names, declared
   sizes, flags) without decompressing anything.
 - ``build_document_message`` turns a stored file into the text the agent sees:
-  the S3 file reference, plus inlined Markdown text or the ZIP listing.
+  the S3 file reference, plus inlined Markdown or text, the ZIP listing, or
+  for a PDF a pointer to the agent's read_pdf_text tool.
 
-The router never extracts archives. If the agent needs the contents it
-downloads the stored file into its own sandbox and extracts it there.
+The router never extracts archives or parses PDFs. If the agent needs the
+contents it reads the stored file in its own microVM.
 """
 
 import secrets
 import struct
 import unicodedata
 
-# Telegram Bot API getFile only serves files up to 20 MB, so that is the
-# effective limit for anything a Telegram user sends.
+# The limit for a document on every channel. Telegram Bot API getFile only
+# serves files up to 20 MB, and the other channels use the same limit.
 MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
 MAX_DOCUMENT_LABEL = "20 MB"
 
-# Inline at most 32 KB of Markdown into the turn (about 8k tokens). That covers
-# typical notes, READMEs and specs whole, while a large file cannot crowd out the
-# conversation or system prompt; the agent can read the full stored file with
-# the s3-user-files skill when it needs the rest.
+# Inline at most 32 KB of Markdown or text into the turn (about 8k tokens).
+# That covers typical notes, READMEs, specs and small data files whole, while a
+# large file cannot crowd out the conversation or system prompt; the agent can
+# read the full stored file with the s3-user-files skill when it needs the rest.
 MARKDOWN_INLINE_MAX_BYTES = 32 * 1024
 
 ZIP_LIST_MAX_ENTRIES = 50
@@ -39,43 +40,65 @@ ZIP_MAX_NAME_CHARS = 200
 
 MARKDOWN_MIME_TYPES = {"text/markdown", "text/x-markdown"}
 ZIP_MIME_TYPES = {"application/zip", "application/x-zip-compressed"}
+PDF_MIME_TYPES = {"application/pdf", "application/x-pdf"}
+# text/plain is generic too (below): a text/plain file named .md is Markdown.
+TEXT_MIME_TYPES = {"text/csv", "text/tab-separated-values", "application/json"}
 # Clients often send these generic types; the file extension then decides.
 GENERIC_MIME_TYPES = {"", "application/octet-stream", "text/plain"}
 MARKDOWN_EXTENSIONS = (".md", ".markdown")
 ZIP_EXTENSIONS = (".zip",)
+PDF_EXTENSIONS = (".pdf",)
+TEXT_EXTENSIONS = (".txt", ".csv", ".tsv", ".log", ".json")
 
 KIND_MARKDOWN = "markdown"
 KIND_ZIP = "zip"
+KIND_PDF = "pdf"
+KIND_TEXT = "text"
 KIND_INFO = {
     KIND_MARKDOWN: {"ext": "md", "content_type": "text/markdown", "label": "Markdown"},
     KIND_ZIP: {"ext": "zip", "content_type": "application/zip", "label": "ZIP archive"},
+    KIND_PDF: {"ext": "pdf", "content_type": "application/pdf", "label": "PDF"},
+    KIND_TEXT: {"ext": "txt", "content_type": "text/plain", "label": "Text file"},
 }
+_EXTENSION_KINDS = (
+    (MARKDOWN_EXTENSIONS, KIND_MARKDOWN),
+    (ZIP_EXTENSIONS, KIND_ZIP),
+    (PDF_EXTENSIONS, KIND_PDF),
+    (TEXT_EXTENSIONS, KIND_TEXT),
+)
 
-ACCEPTED_FILES_TEXT = "images (JPEG, PNG, GIF, WebP), Markdown (.md) files and ZIP (.zip) archives"
-# Telegram private chats and groups ("telegram_group") also take documents.
-_DOCUMENT_CHANNELS = frozenset({"telegram", "telegram_group"})
+ACCEPTED_FILES_TEXT = (
+    "images (JPEG, PNG, GIF, WebP), PDFs, text files (.txt, .csv, .tsv, .log, .json), "
+    "Markdown (.md) files and ZIP (.zip) archives"
+)
 
 
 def accepted_text(channel):
-    """What a channel can read, for the notice sent when a message cannot be read."""
-    if channel in _DOCUMENT_CHANNELS:
-        return f"text, {ACCEPTED_FILES_TEXT}"
-    return "text and images (JPEG, PNG, GIF, WebP)"
+    """What the bot can read, for the notice sent when a message cannot be read.
+
+    Every channel takes the same files, so the channel only names the caller.
+    """
+    return f"text, {ACCEPTED_FILES_TEXT}"
 
 
 def classify_document(mime_type, file_name):
-    """Return KIND_MARKDOWN, KIND_ZIP, or None for an unsupported file."""
+    """Return KIND_MARKDOWN, KIND_ZIP, KIND_PDF, KIND_TEXT, or None for an unsupported file."""
     mime = (mime_type or "").split(";", 1)[0].strip().lower()
     name = (file_name or "").strip().lower()
     if mime in MARKDOWN_MIME_TYPES:
         return KIND_MARKDOWN
     if mime in ZIP_MIME_TYPES:
         return KIND_ZIP
+    if mime in PDF_MIME_TYPES:
+        return KIND_PDF
+    if mime in TEXT_MIME_TYPES:
+        return KIND_TEXT
     if mime in GENERIC_MIME_TYPES:
-        if name.endswith(MARKDOWN_EXTENSIONS):
-            return KIND_MARKDOWN
-        if name.endswith(ZIP_EXTENSIONS):
-            return KIND_ZIP
+        for extensions, kind in _EXTENSION_KINDS:
+            if name.endswith(extensions):
+                return kind
+        if mime == "text/plain":
+            return KIND_TEXT
     return None
 
 
@@ -235,18 +258,30 @@ def zip_listing(data, max_listed=ZIP_LIST_MAX_ENTRIES):
 
 def _file_header(kind, display_name, size, stored_name):
     info = KIND_INFO[kind]
+    # read_user_file would print a PDF's raw bytes; read_pdf_text extracts its text.
+    reader = "read_pdf_text" if kind == KIND_PDF else "read_user_file"
     return [
         "[Attached file from the user]",
         f"- Name: {safe_display_name(display_name) or '(no name)'}",
         f"- Type: {info['label']}",
         f"- Size: {size} bytes",
         f"- Stored in the user's file storage as: {stored_name}",
-        f"  (s3-user-files skill: read_user_file / presign_user_file / download_user_file "
+        f"  (s3-user-files skill: {reader} / presign_user_file / download_user_file "
         f"with filename \"{stored_name}\")",
     ]
 
 
-def _markdown_section(data):
+def _pdf_section(stored_name):
+    return [
+        f"The router did not open the PDF. Read its text with read_pdf_text (s3-user-files skill) and "
+        f"filename \"{stored_name}\": it returns 20 pages at a time, and the first line of its output "
+        f"says how to continue. If you have no read_pdf_text tool, tell the user that PDFs cannot be "
+        f"read here yet.",
+    ]
+
+
+def _inline_text_section(data):
+    """Markdown and text files: the content inlined between random markers, up to the cap."""
     try:
         text = bytes(data).decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -269,7 +304,8 @@ def _markdown_section(data):
     if truncated:
         lines.append(
             f"[Truncated: the file is {len(raw)} bytes; only the first {MARKDOWN_INLINE_MAX_BYTES} "
-            f"bytes are shown above. Read the full file with read_user_file.]"
+            f"bytes are shown above. Read the full file with read_user_file, or for a file over "
+            f"1 MB, download it with download_user_file and process it in the sandbox.]"
         )
     return lines
 
@@ -318,8 +354,10 @@ def build_document_message(text, kind, data, stored_name, display_name, listing=
     """Build the agent's turn text for an accepted document."""
     request = (text or "").strip() or "The user sent a file without a message."
     lines = [request, ""] + _file_header(kind, display_name, len(data), stored_name)
-    if kind == KIND_MARKDOWN:
-        lines += _markdown_section(data)
+    if kind in (KIND_MARKDOWN, KIND_TEXT):
+        lines += _inline_text_section(data)
     elif kind == KIND_ZIP:
         lines += _zip_section(listing if listing is not None else zip_listing(data))
+    elif kind == KIND_PDF:
+        lines += _pdf_section(stored_name)
     return "\n".join(lines)

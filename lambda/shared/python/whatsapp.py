@@ -28,9 +28,11 @@ GRAPH_API_BASE = "https://graph.facebook.com"
 _GRAPH_VERSION_RE = re.compile(r"^v\d{1,3}\.\d{1,2}$")
 _PHONE_NUMBER_ID_RE = re.compile(r"^\d{1,32}$")
 _WA_ID_RE = re.compile(r"^\d{1,32}$")
-# Message types the bot cannot read yet: kept so the Router can say so.
-UNSUPPORTED_TYPES = frozenset({"audio", "video", "document", "sticker", "location", "contacts"})
-_CAPTIONED_TYPES = frozenset({"video", "document"})
+# Message types the bot cannot read yet: kept so the Router can say so. A
+# document is passed on with its media ID, MIME type and file name, and the
+# Router decides from those whether it can read it.
+UNSUPPORTED_TYPES = frozenset({"audio", "video", "sticker", "location", "contacts"})
+_CAPTIONED_TYPES = frozenset({"video"})
 _MEDIA_ID_RE = re.compile(r"^\d{1,64}$")
 _CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 
@@ -112,9 +114,11 @@ def extract_messages(payload, phone_number_id, now=None):
     """Yield normalized inbound user messages from a webhook payload.
 
     Each item: {"id", "from", "name", "type", "text", "image_id", "image_mime",
-    "timestamp", "unsupported"}. A message of one of UNSUPPORTED_TYPES is kept
-    with unsupported=True (and the caption of a video or document as its text),
-    so the Router can say it cannot read it. Messages for another phone number,
+    "document_id", "document_mime", "document_name", "timestamp", "unsupported"}.
+    A document keeps its caption as the text. A message of one of
+    UNSUPPORTED_TYPES, or a document without a usable media ID, is kept with
+    unsupported=True (and the caption of a video or document as its text), so
+    the Router can say it cannot read it. Messages for another phone number,
     status updates, other types (reactions, buttons, system messages, Meta's own
     "unsupported" type) and messages older than MAX_MESSAGE_AGE_SECONDS are
     dropped.
@@ -166,7 +170,8 @@ def _normalize_message(msg, now):
         return None
     msg_type = msg.get("type")
     item = {"id": msg_id, "from": sender, "type": msg_type, "text": "",
-            "image_id": "", "image_mime": "", "timestamp": ts, "unsupported": False}
+            "image_id": "", "image_mime": "", "document_id": "", "document_mime": "", "document_name": "",
+            "timestamp": ts, "unsupported": False}
     if msg_type == "text":
         item["text"] = str((msg.get("text") or {}).get("body", ""))
     elif msg_type == "image":
@@ -177,6 +182,16 @@ def _normalize_message(msg, now):
         item["image_id"] = media_id
         item["image_mime"] = str(image.get("mime_type", "")).split(";")[0].strip()
         item["text"] = str(image.get("caption", "") or "")
+    elif msg_type == "document":
+        document = msg.get("document") if isinstance(msg.get("document"), dict) else {}
+        item["text"] = str(document.get("caption", "") or "")
+        media_id = str(document.get("id", ""))
+        if _MEDIA_ID_RE.match(media_id):
+            item["document_id"] = media_id
+            item["document_mime"] = str(document.get("mime_type", "")).split(";")[0].strip()[:128]
+            item["document_name"] = str(document.get("filename", "") or "")[:256]
+        else:
+            item["unsupported"] = True
     elif msg_type in UNSUPPORTED_TYPES:
         item["unsupported"] = True
         media = msg.get(msg_type)
@@ -238,10 +253,14 @@ def send_text(config, to, text, timeout=10):
     return ok
 
 
-def download_media(config, media_id, allowed_types, max_bytes, timeout=15):
-    """Download an inbound media object. Returns (bytes, content_type) or (None, None)."""
+def _fetch_media(config, media_id, allowed_types, max_bytes, timeout):
+    """Download an inbound media object: (bytes, content_type, None) or (None, None, reason).
+
+    allowed_types None accepts any type (the caller has classified the file).
+    reason is "too_large" (declared by Meta, or seen while downloading) or "failed".
+    """
     if not config or not _MEDIA_ID_RE.match(str(media_id)):
-        return None, None
+        return None, None, "failed"
     auth = {"Authorization": f"Bearer {config['accessToken']}"}
     try:
         meta_req = urllib_request.Request(_graph_url(config, quote(str(media_id), safe="")), headers=auth)
@@ -250,25 +269,40 @@ def download_media(config, media_id, allowed_types, max_bytes, timeout=15):
         mime = str(meta.get("mime_type", "")).split(";")[0].strip()
         size = int(meta.get("file_size", 0) or 0)
         media_url = meta.get("url", "")
-        if mime not in allowed_types:
+        if allowed_types is not None and mime not in allowed_types:
             logger.warning("WhatsApp media rejected: unsupported type %s", mime)
-            return None, None
+            return None, None, "failed"
         if size > max_bytes:
             logger.warning("WhatsApp media rejected: %s bytes over limit", size)
-            return None, None
+            return None, None, "too_large"
         # Only follow Meta-hosted HTTPS URLs so the bearer token is never sent elsewhere.
         if not _is_meta_media_url(media_url):
             logger.warning("WhatsApp media rejected: unexpected download host")
-            return None, None
+            return None, None, "failed"
         with _NO_REDIRECT_OPENER.open(urllib_request.Request(media_url, headers=auth), timeout=timeout) as resp:
             data = resp.read(max_bytes + 1)
         if len(data) > max_bytes:
             logger.warning("WhatsApp media rejected: download over limit")
-            return None, None
-        return data, mime
+            return None, None, "too_large"
+        return data, mime, None
     except Exception as e:
         logger.error("WhatsApp media download failed: %s", type(e).__name__)
-        return None, None
+        return None, None, "failed"
+
+
+def download_media(config, media_id, allowed_types, max_bytes, timeout=15):
+    """Download an inbound media object. Returns (bytes, content_type) or (None, None)."""
+    data, mime, _ = _fetch_media(config, media_id, allowed_types, max_bytes, timeout)
+    return data, mime
+
+
+def download_document(config, media_id, max_bytes, timeout=15):
+    """Download an inbound document of any type. Returns (bytes, None) or (None, reason).
+
+    reason is "too_large" or "failed". The caller classifies the document.
+    """
+    data, _, reason = _fetch_media(config, media_id, None, max_bytes, timeout)
+    return data, reason
 
 
 class _NoRedirect(urllib_request.HTTPRedirectHandler):

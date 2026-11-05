@@ -34,8 +34,10 @@ _MESSAGE_ID_RE = re.compile(r"^\d{1,32}$")
 _EVENT_ID_RE = re.compile(r"^[0-9A-Za-z]{1,64}$")
 _REPLY_TOKEN_RE = re.compile(r"^[0-9A-Za-z_\-]{1,256}$")
 _SIGNATURE_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
-# Message types the bot cannot read yet: kept so the Router can say so.
-UNSUPPORTED_TYPES = frozenset({"audio", "video", "file", "sticker", "location"})
+# Message types the bot cannot read yet: kept so the Router can say so. A file
+# is passed on with its message ID, name and size, and the Router decides from
+# those whether it can read it.
+UNSUPPORTED_TYPES = frozenset({"audio", "video", "sticker", "location"})
 
 MAX_BODY_BYTES = 1_000_000
 # LINE text messages are limited to 5000 characters; one request carries at most 5 messages.
@@ -88,8 +90,11 @@ def extract_events(payload, bot_user_id="", now=None):
     """Return normalized 1:1 user message events from a verified webhook payload.
 
     Each item: {"event_id", "user_id", "reply_token", "type", "text", "message_id",
-    "redelivery", "unsupported"}. A message of one of UNSUPPORTED_TYPES is kept
-    with unsupported=True, so the Router can say it cannot read it.
+    "file_message_id", "file_name", "file_size", "redelivery", "unsupported"}.
+    message_id is set for an image, file_message_id (with the file's name and
+    declared size) for a file. A message of one of UNSUPPORTED_TYPES, or a file
+    without a usable message ID, is kept with unsupported=True, so the Router
+    can say it cannot read it.
     Group/room messages, standby-mode events, non-message events, other message
     types and events outside the replay window are dropped. An empty event list
     (LINE's console "Verify" request) yields [].
@@ -138,7 +143,8 @@ def _normalize_event(event, now):
     message = event.get("message") or {}
     msg_type = message.get("type")
     item = {"event_id": event_id, "user_id": user_id, "reply_token": reply_token, "type": msg_type,
-            "text": "", "message_id": "", "redelivery": redelivery, "unsupported": False}
+            "text": "", "message_id": "", "file_message_id": "", "file_name": "", "file_size": None,
+            "redelivery": redelivery, "unsupported": False}
     if msg_type == "text":
         item["text"] = str(message.get("text", ""))
     elif msg_type == "image":
@@ -147,6 +153,15 @@ def _normalize_event(event, now):
         if provider != "line" or not _MESSAGE_ID_RE.match(message_id):
             return None
         item["message_id"] = message_id
+    elif msg_type == "file":
+        message_id = str(message.get("id", ""))
+        if _MESSAGE_ID_RE.match(message_id):
+            item["file_message_id"] = message_id
+            item["file_name"] = str(message.get("fileName", "") or "")[:256]
+            size = message.get("fileSize")
+            item["file_size"] = size if isinstance(size, int) and not isinstance(size, bool) else None
+        else:
+            item["unsupported"] = True
     elif msg_type in UNSUPPORTED_TYPES:
         item["unsupported"] = True
     else:
@@ -228,8 +243,12 @@ def show_loading(config, user_id, seconds=60, timeout=5):
         logger.info("LINE loading animation failed: %s", type(e).__name__)
 
 
-def download_image(config, message_id, allowed_types, max_bytes, timeout=15):
-    """Download an inbound image's content. Returns (bytes, content_type) or (None, None)."""
+def download_content(config, message_id, allowed_types, max_bytes, timeout=15):
+    """Download an inbound message's content. Returns (bytes, content_type) or (None, None).
+
+    allowed_types None accepts any content type: LINE may serve a file with a
+    generic one, so the Router classifies files by name before downloading.
+    """
     if not config or not _MESSAGE_ID_RE.match(str(message_id)):
         return None, None
     req = urllib_request.Request(
@@ -239,14 +258,19 @@ def download_image(config, message_id, allowed_types, max_bytes, timeout=15):
     try:
         with urllib_request.urlopen(req, timeout=timeout) as resp:
             content_type = str(resp.headers.get("Content-Type", "")).split(";")[0].strip()
-            if content_type not in allowed_types:
-                logger.warning("LINE image rejected: unsupported type %s", content_type)
+            if allowed_types is not None and content_type not in allowed_types:
+                logger.warning("LINE content rejected: unsupported type %s", content_type)
                 return None, None
             data = resp.read(max_bytes + 1)
         if len(data) > max_bytes:
-            logger.warning("LINE image rejected: over size limit")
+            logger.warning("LINE content rejected: over size limit")
             return None, None
         return data, content_type
     except Exception as e:
-        logger.error("LINE image download failed: %s", type(e).__name__)
+        logger.error("LINE content download failed: %s", type(e).__name__)
         return None, None
+
+
+def download_image(config, message_id, allowed_types, max_bytes, timeout=15):
+    """Download an inbound image's content. Returns (bytes, content_type) or (None, None)."""
+    return download_content(config, message_id, allowed_types, max_bytes, timeout)

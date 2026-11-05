@@ -47,10 +47,16 @@ def label(kind):
 def note(what, text_only=True):
     """The line appended to the agent's text, naming what else was sent.
 
-    text_only=False when an image was received as well as the text.
+    text_only=False when an image or a document was received as well as the text.
     """
     tail = " Only the text above was received." if text_only else ""
     return f"\n\n[The user also sent {what}, which cannot be read yet.{tail}]"
+
+
+def skipped_note(what):
+    """The line for files of a readable type that were not read: one file is read per message."""
+    return (f"\n\n[The user also sent {what}, which was not read: only one file per message is read. "
+            "The user can send the others in separate messages.]")
 
 
 def telegram_kind(message):

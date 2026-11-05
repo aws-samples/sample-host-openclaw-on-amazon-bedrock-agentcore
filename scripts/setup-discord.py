@@ -33,7 +33,9 @@ COMMANDS = [
         "contexts": [0, 1, 2],
         "options": [
             {"type": 3, "name": "prompt", "description": "Your message", "required": False, "max_length": 6000},
-            {"type": 11, "name": "image", "description": "An image to include (JPEG, PNG, GIF, WebP)", "required": False},
+            # The option keeps the name "image" so commands registered before files were accepted still work.
+            {"type": 11, "name": "image", "description": "A file to include: an image, PDF, text, Markdown or ZIP file",
+             "required": False},
         ],
     },
     {
