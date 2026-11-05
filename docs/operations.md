@@ -74,14 +74,21 @@ It has three stages. Each one can stop safely at its end:
 Both tools are dry runs unless `--apply` is given. Run the dry run first, and read what it reports:
 
 ```bash
-PY="uv run --no-project --python .venv-deploy/bin/python python"
-$PY scripts/namespace_backfill.py --region "$CDK_DEFAULT_REGION"           # dry run
-$PY scripts/namespace_backfill.py --region "$CDK_DEFAULT_REGION" --apply   # every route; --user-id or --limit N for fewer
-$PY scripts/namespace_cutover.py --region "$CDK_DEFAULT_REGION" --user-id user_<16 hex> --endpoint release_3           # dry run
-$PY scripts/namespace_cutover.py --region "$CDK_DEFAULT_REGION" --user-id user_<16 hex> --endpoint release_3 --apply
-$PY scripts/namespace_cutover.py --region "$CDK_DEFAULT_REGION" --user-id user_<16 hex> --rollback --apply   # within the hold
-$PY scripts/namespace_cutover.py --region "$CDK_DEFAULT_REGION" --user-id user_<16 hex> --cleanup --apply    # after the hold
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_backfill.py \
+  --region "$CDK_DEFAULT_REGION"           # dry run
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_backfill.py \
+  --region "$CDK_DEFAULT_REGION" --apply   # every route; --user-id or --limit N for fewer
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_cutover.py \
+  --region "$CDK_DEFAULT_REGION" --user-id user_0123456789abcdef --endpoint release_3           # dry run
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_cutover.py \
+  --region "$CDK_DEFAULT_REGION" --user-id user_0123456789abcdef --endpoint release_3 --apply
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_cutover.py \
+  --region "$CDK_DEFAULT_REGION" --user-id user_0123456789abcdef --rollback --apply   # within the hold
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_cutover.py \
+  --region "$CDK_DEFAULT_REGION" --user-id user_0123456789abcdef --cleanup --apply    # after the hold
 ```
+
+`--endpoint` takes the name you gave the release with `--endpoint-name` (for example `release_3`).
 
 - **Backfill results:** `stored` and `already stored` are done. `busy` means a turn was running or the route changed; re-run later (exit 1). `inactive` (the route is not `ACTIVE`), `unconfirmed` (no `ACTOR#` owner record confirms the route's actor) and `conflict` (the `NS#` record is missing or names another user) need reconciling first (exit 3).
 - **Endpoints:** `--endpoint` names the endpoints whose bridge image reads the namespace from the route: the endpoint of the dual-read release and any later one. A user on another endpoint is refused, because an older bridge derives the namespace from the actor whatever the route stores.
