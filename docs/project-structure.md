@@ -98,10 +98,12 @@ openclaw-on-agentcore/
     runtime_manifest.py            # Pure deployment/CDK enrollment evidence validation
     e2e-deploy-and-test.sh          # V2 manifest verification + smoke/lifecycle; no route resets
     manage-allowlist.sh           # Add/remove/list users in the allowlist
+    delete_user_data.py           # Delete one user's data, dry run by default (see docs/operations.md)
     agentcore-exec.py             # Operator CLI: run a shell command in a live session (InvokeAgentRuntimeCommand)
     guardrail-eval.py             # Operator CLI: run fixture prompts through ApplyGuardrail, exit 1 on unexpected verdicts
   tests/
     test_agentcore_exec.py        # Unit tests for scripts/agentcore-exec.py (mocked boto3, no AWS)
+    test_delete_user_data.py      # Unit tests for scripts/delete_user_data.py (stubbed AWS clients, no AWS)
     test_guardrail_eval.py        # Unit tests for scripts/guardrail-eval.py (stubbed ApplyGuardrail, no AWS)
     test_state_bucket_lifecycle_synth.py # User-files bucket lifecycle rules synth test (no AWS)
     test_gateway_stack_synth.py   # OpenClawGateway synth tests: flag off = unchanged templates, flag on = stack + IAM + cdk-nag (10 tests, no AWS)
