@@ -36,6 +36,10 @@ jobs:
         # Same flags as the image build (bridge/Dockerfile): no install scripts.
         run: npm ci --prefix bridge --ignore-scripts --no-audit --no-fund
       - name: Bridge
+        env:
+          # The runner's preinstalled Chrome, so the real-browser url-policy
+          # tests run instead of skipping (loopback server, no network).
+          PLAYWRIGHT_CHROMIUM_PATH: /usr/bin/google-chrome
         run: scripts/run-unit-tests.sh bridge
       - name: Skills
         run: scripts/run-unit-tests.sh skills
