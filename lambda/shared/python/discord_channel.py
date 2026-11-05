@@ -394,7 +394,10 @@ def send_dm(bot_token, user_id, text, timeout=10):
 
 
 def download_attachment(attachment, allowed_types, max_bytes, timeout=15):
-    """Download a slash-command attachment from Discord's CDN. Returns (bytes, type) or (None, None)."""
+    """Download a slash-command attachment from Discord's CDN. Returns (bytes, type) or (None, None).
+
+    allowed_types None accepts any content type (the caller has classified the file).
+    """
     if not isinstance(attachment, dict):
         return None, None
     content_type = str(attachment.get("content_type", "")).split(";")[0].strip()
@@ -403,7 +406,7 @@ def download_attachment(attachment, allowed_types, max_bytes, timeout=15):
         size = int(attachment.get("size", 0) or 0)
     except (TypeError, ValueError):
         return None, None
-    if content_type not in allowed_types:
+    if allowed_types is not None and content_type not in allowed_types:
         logger.warning("Discord attachment rejected: unsupported type %s", content_type)
         return None, None
     if size > max_bytes:

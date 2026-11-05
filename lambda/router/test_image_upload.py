@@ -171,9 +171,8 @@ class TestDownloadTelegramImage(unittest.TestCase):
 class TestDownloadSlackFile(unittest.TestCase):
     """Tests for _download_slack_file."""
 
-    @patch("index.urllib_request")
-    def test_valid_image_download(self, mock_urllib):
-        """Downloads a valid image file from Slack."""
+    def test_valid_image_download(self):
+        """Downloads a valid image file from Slack, sending the bot token to the Slack URL."""
         file_info = {
             "mimetype": "image/jpeg",
             "size": 50000,
@@ -182,15 +181,18 @@ class TestDownloadSlackFile(unittest.TestCase):
         }
 
         download_resp = MagicMock()
+        download_resp.__enter__.return_value = download_resp
         download_resp.read.return_value = b"\xff\xd8" + b"\x00" * 100
-        mock_urllib.urlopen.return_value = download_resp
-        mock_urllib.Request = MagicMock(return_value=MagicMock())
+        with patch.object(index, "_SLACK_FILE_OPENER") as opener:
+            opener.open.return_value = download_resp
+            image_bytes, content_type, filename = index._download_slack_file(file_info, "xoxb-token")
 
-        image_bytes, content_type, filename = index._download_slack_file(file_info, "xoxb-token")
-
-        self.assertIsNotNone(image_bytes)
+        self.assertEqual(image_bytes, b"\xff\xd8" + b"\x00" * 100)
         self.assertEqual(content_type, "image/jpeg")
         self.assertEqual(filename, "photo.jpg")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, file_info["url_private_download"])
+        self.assertEqual(request.get_header("Authorization"), "Bearer xoxb-token")
 
     def test_non_image_rejected(self):
         """Rejects non-image MIME types."""

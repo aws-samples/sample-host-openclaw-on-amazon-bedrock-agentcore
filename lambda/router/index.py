@@ -47,6 +47,7 @@ from documents import (
     classify_document,
     zip_listing,
 )
+from urllib.error import HTTPError
 import whatsapp
 import discord_channel
 import formatting
@@ -1701,6 +1702,62 @@ def _download_feishu_image(content_str, msg_type):
         return None, None, None
 
 
+# A file message's IDs go into the message-resource URL path.
+FEISHU_MESSAGE_ID_RE = re.compile(r"om_[A-Za-z0-9_-]{1,128}")
+FEISHU_FILE_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,256}")
+
+
+def _download_feishu_file(message_id, file_key, max_bytes=MAX_DOCUMENT_BYTES):
+    """Download the file of a Feishu file message with the message-resource API.
+
+    GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file
+    (app permissions im:message and im:resource). Returns (bytes, None), or
+    (None, reason) where reason is "too_large" or "failed".
+    """
+    message_id, file_key = str(message_id or ""), str(file_key or "")
+    if not FEISHU_MESSAGE_ID_RE.fullmatch(message_id) or not FEISHU_FILE_KEY_RE.fullmatch(file_key):
+        logger.warning("Feishu file rejected: malformed message ID or file key")
+        return None, "failed"
+    token = _get_feishu_tenant_token()
+    if not token:
+        return None, "failed"
+    url = f"{FEISHU_API_DOMAIN}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
+    req = urllib_request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib_request.urlopen(req, timeout=30) as resp:
+            declared = str(resp.headers.get("Content-Length") or "")
+            if declared.isdigit() and int(declared) > max_bytes:
+                return None, "too_large"
+            data = resp.read(max_bytes + 1)
+    except HTTPError as e:
+        # The status and Feishu's error code tell a missing permission apart; never the body text.
+        try:
+            code = json.loads(e.read(4096) or b"{}").get("code")
+        except Exception:  # noqa: BLE001 -- the code is a diagnostic only
+            code = None
+        logger.warning("Feishu file download failed: status=%s code=%s", e.code, code)
+        return None, "failed"
+    except Exception as e:  # noqa: BLE001 -- the user gets a retry message
+        logger.warning("Feishu file download failed: %s", type(e).__name__)
+        return None, "failed"
+    if len(data) > max_bytes:
+        return None, "too_large"
+    return data, None
+
+
+def _feishu_document_message(document, text, namespace, reply):
+    """Download and store a Feishu file message: the agent's turn text, or None after replying."""
+    data, reason = _download_feishu_file(document["message_id"], document["file_key"])
+    if reason == "too_large":
+        logger.info("Feishu: rejected document kind=%s reason=too_large", document["kind"])
+        reply(DOCUMENT_TOO_LARGE_REPLY)
+        return None
+    if data is None:
+        reply(DOCUMENT_DOWNLOAD_FAILED_REPLY)
+        return None
+    return _document_agent_message("Feishu", data, document["kind"], namespace, text, document["file_name"], reply)
+
+
 
 # --- Screenshot marker detection ---
 SCREENSHOT_MARKER_RE = re.compile(r"\[SCREENSHOT:([^\]]+)\]")
@@ -1985,13 +2042,39 @@ def _download_telegram_image(message, token):
         return None, None, None
 
 
-def _download_slack_file(file_info, bot_token):
-    """Download an image file from Slack.
+def _is_slack_file_url(url):
+    """True for an https URL on slack.com or a subdomain: the only hosts that get the bot token."""
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (host == "slack.com" or host.endswith(".slack.com"))
 
-    Returns (bytes, content_type, filename) or (None, None, None).
+
+class _SlackRedirect(urllib_request.HTTPRedirectHandler):
+    """Follow a redirect only to another Slack URL: urllib would resend the bot token to any host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_slack_file_url(newurl):
+            logger.warning("Slack file download refused a redirect off Slack")
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SLACK_FILE_OPENER = urllib_request.build_opener(_SlackRedirect)
+
+
+def _download_slack_file(file_info, bot_token, allowed_types=ALLOWED_IMAGE_TYPES, max_bytes=MAX_IMAGE_BYTES):
+    """Download a file attached to a Slack message.
+
+    allowed_types: the accepted MIME types, or None when the caller has
+    already classified the file (documents). The declared size and the
+    transfer are both capped at max_bytes, and the bot token is sent only to
+    an https Slack host. Returns (bytes, content_type, filename) or
+    (None, None, None).
     """
     mimetype = file_info.get("mimetype", "")
-    if mimetype not in ALLOWED_IMAGE_TYPES:
+    if allowed_types is not None and mimetype not in allowed_types:
         return None, None, None
 
     # Treat a missing size as a rejection rather than defaulting to 0; Slack
@@ -2000,7 +2083,7 @@ def _download_slack_file(file_info, bot_token):
     if not isinstance(file_size, int) or file_size <= 0:
         logger.warning("Slack file missing or invalid size; rejecting")
         return None, None, None
-    if file_size > MAX_IMAGE_BYTES:
+    if file_size > max_bytes:
         logger.warning("Slack file too large: %d bytes", file_size)
         return None, None, None
 
@@ -2008,23 +2091,26 @@ def _download_slack_file(file_info, bot_token):
     if not download_url:
         logger.warning("Slack file has no download URL")
         return None, None, None
+    if not _is_slack_file_url(download_url):
+        logger.warning("Slack file rejected: download URL is not an https Slack URL")
+        return None, None, None
 
     try:
         req = urllib_request.Request(
             download_url,
             headers={"Authorization": f"Bearer {bot_token}"},
         )
-        resp = urllib_request.urlopen(req, timeout=15)
-        # Bound the transfer itself so an understated or absent declared size
-        # cannot cause an unbounded read into Lambda memory.
-        image_bytes = resp.read(MAX_IMAGE_BYTES + 1)
-        if len(image_bytes) > MAX_IMAGE_BYTES:
-            logger.warning("Slack image exceeded %d bytes during download", MAX_IMAGE_BYTES)
+        with _SLACK_FILE_OPENER.open(req, timeout=15) as resp:
+            # Bound the transfer itself so an understated or absent declared size
+            # cannot cause an unbounded read into Lambda memory.
+            data = resp.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            logger.warning("Slack file exceeded %d bytes during download", max_bytes)
             return None, None, None
         filename = file_info.get("name", "image")
-        return image_bytes, mimetype, filename
+        return data, mimetype, filename
     except Exception as e:
-        logger.error("Slack file download failed: %s", e)
+        logger.error("Slack file download failed: %s", type(e).__name__)
         return None, None, None
 
 
@@ -2051,6 +2137,8 @@ DOCUMENT_TOO_LARGE_REPLY = (
 BAD_ZIP_REPLY = (
     "Sorry, I couldn't read that file as a ZIP archive. It may be damaged or not a real .zip file."
 )
+DOCUMENT_DOWNLOAD_FAILED_REPLY = "Sorry, I couldn't download that file. Please try again."
+DOCUMENT_STORE_FAILED_REPLY = "Sorry, I couldn't store that file. Please try again."
 
 
 def unsupported_reply(channel):
@@ -2116,6 +2204,39 @@ def _upload_document_to_s3(data, namespace, kind):
         return None
 
 
+def _document_too_large(channel, kind, declared_size, reply):
+    """Reply with the limit and return True when a platform-declared size is over it."""
+    if isinstance(declared_size, int) and not isinstance(declared_size, bool) \
+            and declared_size > MAX_DOCUMENT_BYTES:
+        logger.info("%s: rejected document kind=%s size=%d reason=too_large", channel, kind, declared_size)
+        reply(DOCUMENT_TOO_LARGE_REPLY)
+        return True
+    return False
+
+
+def _document_agent_message(channel, data, kind, namespace, text, display_name, reply):
+    """Store a downloaded document under namespace and build the agent's turn text.
+
+    channel names the channel in logs. Returns the text, or None after
+    replying with the reason the file could not be used. The router reads a
+    ZIP's central directory only and never opens a PDF.
+    """
+    listing = None
+    if kind == KIND_ZIP:
+        try:
+            listing = zip_listing(data)
+        except ZipListingError:
+            logger.info("%s: rejected document kind=zip size=%d reason=malformed", channel, len(data))
+            reply(BAD_ZIP_REPLY)
+            return None
+    s3_key = _upload_document_to_s3(data, namespace, kind)
+    if not s3_key:
+        reply(DOCUMENT_STORE_FAILED_REPLY)
+        return None
+    logger.info("%s: document accepted kind=%s size=%d", channel, kind, len(data))
+    return build_document_message(text, kind, data, s3_key[len(namespace) + 1:], display_name, listing)
+
+
 # ---------------------------------------------------------------------------
 # Webhook handlers
 # ---------------------------------------------------------------------------
@@ -2165,12 +2286,62 @@ def _slack_file_kinds(files):
 
 
 def _with_files_note(text, other_files, has_image):
-    """text, plus a note for the agent naming the files the bot cannot read yet."""
+    """text, plus a note for the agent naming the files the bot cannot read yet.
+
+    has_image: an image or a document was received as well as the text.
+    """
     if not other_files:
         return text
     note = unsupported_media.note(
         unsupported_media.files_label([f.get("mimetype") for f in other_files]), text_only=not has_image)
     return text + note if text else note.lstrip("\n")
+
+
+def _with_skipped_note(text, skipped_files):
+    """text, plus a note naming readable files that were not read (one file is read per message)."""
+    if not skipped_files:
+        return text
+    note = unsupported_media.skipped_note(
+        unsupported_media.files_label([f.get("mimetype") for f in skipped_files]))
+    return text + note if text else note.lstrip("\n")
+
+
+def _slack_files(files):
+    """Sort a Slack message's files into (image, document, skipped, unreadable).
+
+    One file is read per message: the first image, else the first document of
+    an accepted type (documents.classify_document), as (file, kind). skipped
+    holds the other files of accepted types, which the agent is told were not
+    read; unreadable holds files of other types.
+    """
+    images, document_files, unreadable = [], [], []
+    for file_info in files:
+        mimetype = file_info.get("mimetype", "")
+        if mimetype in ALLOWED_IMAGE_TYPES:
+            images.append(file_info)
+            continue
+        kind = classify_document(mimetype, file_info.get("name", ""))
+        if kind:
+            document_files.append((file_info, kind))
+        else:
+            unreadable.append(file_info)
+    if images:
+        return images[0], None, images[1:] + [f for f, _ in document_files], unreadable
+    if document_files:
+        return None, document_files[0], [f for f, _ in document_files[1:]], unreadable
+    return None, None, [], unreadable
+
+
+def _slack_document_message(document, text, namespace, bot_token, reply):
+    """Download and store a Slack document: the agent's turn text, or None after replying."""
+    file_info, kind = document
+    if _document_too_large("Slack", kind, file_info.get("size"), reply):
+        return None
+    data, _, _ = _download_slack_file(file_info, bot_token, allowed_types=None, max_bytes=MAX_DOCUMENT_BYTES)
+    if data is None:
+        reply(DOCUMENT_DOWNLOAD_FAILED_REPLY)
+        return None
+    return _document_agent_message("Slack", data, kind, namespace, text, file_info.get("name", ""), reply)
 
 
 def _is_bind_command(text):
@@ -2352,25 +2523,10 @@ def _telegram_agent_message(message, text, document, doc_kind, has_image, namesp
             reply(DOCUMENT_TOO_LARGE_REPLY)
             return None
         if doc_bytes is None:
-            reply("Sorry, I couldn't download that file. Please try again.")
+            reply(DOCUMENT_DOWNLOAD_FAILED_REPLY)
             return None
-        listing = None
-        if doc_kind == KIND_ZIP:
-            try:
-                listing = zip_listing(doc_bytes)
-            except ZipListingError:
-                logger.info("Telegram: rejected document kind=zip size=%d reason=malformed", len(doc_bytes))
-                reply(BAD_ZIP_REPLY)
-                return None
-        s3_key = _upload_document_to_s3(doc_bytes, namespace, doc_kind)
-        if not s3_key:
-            reply("Sorry, I couldn't store that file. Please try again.")
-            return None
-        stored_name = s3_key[len(namespace) + 1:]
-        logger.info("Telegram: document accepted kind=%s size=%d", doc_kind, len(doc_bytes))
-        return build_document_message(
-            text, doc_kind, doc_bytes, stored_name, document.get("file_name", ""), listing,
-        )
+        return _document_agent_message(
+            "Telegram", doc_bytes, doc_kind, namespace, text, document.get("file_name", ""), reply)
     if has_image:
         image_bytes, content_type, _ = _download_telegram_image(message, token)
         if not image_bytes:
@@ -3047,13 +3203,14 @@ def _is_disabled_sender(channel_key):
         return True
 
 
-def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, image_files, in_thread, bot_token,
-                          other_files=()):
+def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, slack_files, in_thread, bot_token):
     """Answer a Slack channel, private channel or group DM as its own identity, never the sender's.
 
-    other_files: attached files the bot cannot read yet. Alone they get the
-    notice; with text, the agent is told about them.
+    slack_files: the message's files sorted by _slack_files. Files the bot
+    cannot read yet get the notice when they come alone; with text or a file
+    that is read, the agent is told about them.
     """
+    image_file, document, skipped_files, other_files = slack_files
     if not channel_identity.SLACK_CONVERSATION_ID_RE.fullmatch(channel_id):
         logger.info("Slack: channel message ignored (malformed conversation ID)")
         return
@@ -3074,8 +3231,9 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
     if _is_disabled_sender(f"slack:{slack_user_id}"):
         logger.info("Slack: channel %s message ignored (sender is disabled)", channel_id)
         return
-    has_image = bool(image_files)
-    if not has_image and _parse_model_command(text) is not None:
+    has_image = image_file is not None
+    has_file = has_image or document is not None
+    if not has_file and _parse_model_command(text) is not None:
         reply(SLACK_CHANNEL_MODEL_MESSAGE)
         return
     if _is_bind_command(text)[0] or _is_link_command(text):
@@ -3086,7 +3244,7 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
     if channel_user_id is None:
         logger.warning("Slack: channel %s has no usable identity (disabled or not enrolled)", channel_id)
         return
-    if other_files and not text and not has_image:
+    if other_files and not text and not has_file:
         logger.info("Slack channel: unsupported message kinds=%s", _slack_file_kinds(other_files))
         reply(unsupported_reply(channel_identity.SLACK))
         return
@@ -3095,16 +3253,16 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
         return
 
     # Unlike /model, /usage works here: it reports the channel's own usage.
-    if not has_image and _is_usage_command(text):
+    if not has_file and _is_usage_command(text):
         reply(handle_usage_command(channel_user_id, conversation=True))
         return
 
     message_text = channel_identity.agent_text(
         "Slack channel", _slack_member_name(event, slack_user_id, bot_token),
-        _with_files_note(text, other_files, has_image))
+        _with_skipped_note(_with_files_note(text, other_files, has_file), skipped_files))
     agent_message = message_text
     if has_image:
-        image_bytes, content_type, _ = _download_slack_file(image_files[0], bot_token)
+        image_bytes, content_type, _ = _download_slack_file(image_file, bot_token)
         if not image_bytes:
             reply("Sorry, I couldn't download that image. Please try again.")
             return
@@ -3113,10 +3271,14 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
             reply("Sorry, I couldn't process that image. Please try again.")
             return
         agent_message = _build_structured_message(message_text, s3_key, content_type)
+    elif document is not None:
+        agent_message = _slack_document_message(document, message_text, route.namespace, bot_token, reply)
+        if agent_message is None:
+            return
 
     logger.info(
-        "Slack channel: user=%s actor=%s session=%s msg_len=%d has_image=%s",
-        channel_user_id, actor_id, route, len(text), has_image,
+        "Slack channel: user=%s actor=%s session=%s msg_len=%d has_image=%s document=%s",
+        channel_user_id, actor_id, route, len(text), has_image, document[1] if document else "none",
     )
     stop_notify = threading.Event()
     notify_thread = threading.Thread(
@@ -3133,13 +3295,16 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
     reply(_extract_text_from_content_blocks(result.get("response", "Sorry, I couldn't process your message.")))
 
 
-def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image, unsupported=None, note=""):
+def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image, unsupported=None, note="",
+                         document=None):
     """Answer a Feishu group chat as its own identity, never the sender's.
 
     unsupported: the kind of a message the bot cannot read (then there is no
     text), answered with the notice. note: the line for the agent naming what
-    a rich-text post left out.
+    a rich-text post left out. document: a file message of an accepted type
+    (kind, message_id, file_key, file_name), as handle_feishu found it.
     """
+    has_file = has_image or document is not None
     if not channel_identity.FEISHU_CHAT_ID_RE.fullmatch(chat_id):
         logger.info("Feishu: group message ignored (malformed chat ID)")
         return
@@ -3159,7 +3324,7 @@ def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_im
     if _is_disabled_sender(f"feishu:{sender_id}"):
         logger.info("Feishu: group %s message ignored (sender is disabled)", chat_id)
         return
-    if not has_image and _parse_model_command(text) is not None:
+    if not has_file and _parse_model_command(text) is not None:
         send_feishu_message(chat_id, FEISHU_GROUP_MODEL_MESSAGE)
         return
     if _is_bind_command(text)[0] or _is_link_command(text):
@@ -3179,12 +3344,18 @@ def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_im
         return
 
     # Unlike /model, /usage works here: it reports the group's own usage.
-    if not has_image and _is_usage_command(text):
+    if not has_file and _is_usage_command(text):
         send_feishu_message(chat_id, handle_usage_command(group_user_id, conversation=True))
         return
 
     name = _feishu_member_name(sender_id)
     agent_message = channel_identity.agent_text("Feishu group", name, (text or "hi") + note)
+    if document is not None:
+        agent_message = _feishu_document_message(
+            document, channel_identity.agent_text("Feishu group", name, text), route.namespace,
+            lambda reply_text: send_feishu_message(chat_id, reply_text))
+        if agent_message is None:
+            return
     if has_image:
         image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
         if not image_bytes:
@@ -3198,8 +3369,8 @@ def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_im
             channel_identity.agent_text("Feishu group", name, text or "What is this image?"), s3_key, content_type)
 
     logger.info(
-        "Feishu group: user=%s actor=%s session=%s msg_len=%d has_image=%s",
-        group_user_id, actor_id, route, len(text), has_image,
+        "Feishu group: user=%s actor=%s session=%s msg_len=%d has_image=%s document=%s",
+        group_user_id, actor_id, route, len(text), has_image, document["kind"] if document else "none",
     )
     stop_notify = threading.Event()
     notify_thread = threading.Thread(target=_feishu_progress_notify, args=(chat_id, stop_notify), daemon=True)
@@ -3295,14 +3466,16 @@ def handle_slack(body, headers=None):
     slack_user_id = event.get("user", "")
     channel_id = event.get("channel", "")
 
-    # Detect image files attached to the message (strict allowed-type check).
-    # Any other file is one the bot cannot read yet.
+    # One attached file is read: the first image (strict allowed-type check),
+    # else the first document of an accepted type. Files of other types are
+    # ones the bot cannot read yet.
     files = [f for f in (event.get("files") or []) if isinstance(f, dict)]
-    image_files = [f for f in files if f.get("mimetype", "") in ALLOWED_IMAGE_TYPES]
-    other_files = [f for f in files if f.get("mimetype", "") not in ALLOWED_IMAGE_TYPES]
-    has_image = bool(image_files)
+    slack_files = _slack_files(files)
+    image_file, document, skipped_files, other_files = slack_files
+    has_image = image_file is not None
+    has_file = has_image or document is not None
 
-    if not slack_user_id or not channel_id or (not text and not has_image and not other_files):
+    if not slack_user_id or not channel_id or (not text and not has_file and not other_files):
         return {"statusCode": 200, "body": "ok"}
 
     if len(slack_user_id) > 128:
@@ -3327,8 +3500,7 @@ def handle_slack(body, headers=None):
     # channel_identity_mode "channel": a channel, private channel or group DM is
     # answered as its own identity (channel_identity.py). 1:1 DMs (D...) stay personal.
     if not is_dm and _channel_identity_on() and not channel_id.startswith("D"):
-        _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, image_files, in_thread, bot_token,
-                              other_files)
+        _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, slack_files, in_thread, bot_token)
         return {"statusCode": 200, "body": "ok"}
 
     # Handle bind commands BEFORE allowlist check — cross-channel binding
@@ -3361,7 +3533,7 @@ def handle_slack(body, headers=None):
         return {"statusCode": 200, "body": "ok"}
 
     # Only files the bot cannot read: the notice, no turn.
-    if other_files and not text and not has_image:
+    if other_files and not text and not has_file:
         logger.info("Slack: unsupported message kinds=%s", _slack_file_kinds(other_files))
         send_slack_message(channel_id, unsupported_reply("slack"), bot_token, **in_thread)
         return {"statusCode": 200, "body": "ok"}
@@ -3392,24 +3564,28 @@ def handle_slack(body, headers=None):
 
     # Handle /model (Slack users type " /model" with a leading space so the
     # Slack client sends it as a message instead of a slash command).
-    model_argument = None if has_image else _parse_model_command(text)
+    model_argument = None if has_file else _parse_model_command(text)
     if model_argument is not None:
         send_slack_message(channel_id, handle_model_command(resolved_user_id, model_argument), bot_token, **in_thread)
         return {"statusCode": 200, "body": "ok"}
 
     # Handle /usage (typed " /usage", like /model); the reply is not forwarded to the agent.
-    if not has_image and _is_usage_command(text):
+    if not has_file and _is_usage_command(text):
         send_slack_message(channel_id, handle_usage_command(resolved_user_id), bot_token, **in_thread)
         return {"statusCode": 200, "body": "ok"}
 
-    # Build message payload (structured if image, plain string if text-only)
-    message_text = _with_files_note(text, other_files, has_image)
+    # Build message payload (structured if image, document text, or plain string if text-only)
+    message_text = _with_skipped_note(_with_files_note(text, other_files, has_file), skipped_files)
     agent_message = message_text
+    if document is not None:
+        agent_message = _slack_document_message(
+            document, message_text, session_id.namespace, bot_token,
+            lambda reply_text: send_slack_message(channel_id, reply_text, bot_token, **in_thread))
+        if agent_message is None:
+            return {"statusCode": 200, "body": "ok"}
     if has_image:
         namespace = session_id.namespace
-        # Use first image file
-        file_info = image_files[0]
-        image_bytes, content_type, _ = _download_slack_file(file_info, bot_token)
+        image_bytes, content_type, _ = _download_slack_file(image_file, bot_token)
         if image_bytes:
             s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
             if s3_key:
@@ -3424,8 +3600,8 @@ def handle_slack(body, headers=None):
             return {"statusCode": 200, "body": "ok"}
 
     logger.info(
-        "Slack: user=%s session=%s msg_len=%d has_image=%s",
-        resolved_user_id, session_id, len(text), has_image,
+        "Slack: user=%s session=%s msg_len=%d has_image=%s document=%s",
+        resolved_user_id, session_id, len(text), has_image, document[1] if document else "none",
     )
 
     # Invoke AgentCore with progress notification for long requests
@@ -3538,16 +3714,22 @@ def handle_feishu(body, headers=None):
     if not isinstance(content, dict):
         content = {}
 
-    # Text, an image, or rich text (post) read as plain text. Any other type is
-    # one the bot cannot read yet (unsupported), and its content never reaches
-    # the agent. left_out names images and videos inside a post.
-    left_out, unsupported = "", None
+    # Text, an image, rich text (post) read as plain text, or a file of an
+    # accepted type (classified by its name: the event carries no MIME type).
+    # Any other type is one the bot cannot read yet (unsupported), and its
+    # content never reaches the agent. left_out names images and videos inside a post.
+    left_out, unsupported, document = "", None, None
+    file_kind = classify_document("", str(content.get("file_name", ""))) if msg_type == "file" else None
     if msg_type == "text":
         text = str(content.get("text", ""))
     elif msg_type == "image":
         text = ""  # Image-only — text may be empty
     elif msg_type == "post":
         text, left_out = unsupported_media.flatten_feishu_post(content)
+    elif file_kind:
+        text = ""  # a file message carries no text
+        document = {"kind": file_kind, "message_id": str(message.get("message_id", "")),
+                    "file_key": str(content.get("file_key", "")), "file_name": str(content.get("file_name", ""))}
     else:
         text = ""
         if msg_type not in unsupported_media.FEISHU_SILENT_TYPES:
@@ -3567,7 +3749,8 @@ def handle_feishu(body, headers=None):
     # The agent is told about what a post left out. Set only when there is text.
     note = unsupported_media.note(left_out) if left_out and text else ""
     has_image = msg_type == "image"
-    if not sender_id or not chat_id or (not text and not has_image and not unsupported):
+    has_file = has_image or document is not None
+    if not sender_id or not chat_id or (not text and not has_file and not unsupported):
         return {"statusCode": 200, "body": "ok"}
 
     if len(sender_id) > 128:
@@ -3577,7 +3760,7 @@ def handle_feishu(body, headers=None):
     # channel_identity_mode "channel": a group chat is answered as its own
     # identity (channel_identity.py). 1:1 (p2p) chats stay personal.
     if message.get("chat_type") != "p2p" and _channel_identity_on():
-        _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image, unsupported, note)
+        _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image, unsupported, note, document)
         return {"statusCode": 200, "body": "ok"}
 
     # Handle bind commands BEFORE allowlist check
@@ -3632,18 +3815,23 @@ def handle_feishu(body, headers=None):
         return {"statusCode": 200, "body": "ok"}
 
     # Handle /model (per-user model switching); the reply is not forwarded to the agent.
-    model_argument = None if has_image else _parse_model_command(text)
+    model_argument = None if has_file else _parse_model_command(text)
     if model_argument is not None:
         send_feishu_message(chat_id, handle_model_command(resolved_user_id, model_argument, code=False))
         return {"statusCode": 200, "body": "ok"}
 
     # Handle /usage (today's usage and limit); the reply is not forwarded to the agent.
-    if not has_image and _is_usage_command(text):
+    if not has_file and _is_usage_command(text):
         send_feishu_message(chat_id, handle_usage_command(resolved_user_id))
         return {"statusCode": 200, "body": "ok"}
 
-    # Build message payload (structured if image, plain string if text-only)
+    # Build message payload (structured if image, document text, or plain string if text-only)
     agent_message = (text or "hi") + note
+    if document is not None:
+        agent_message = _feishu_document_message(
+            document, text, session_id.namespace, lambda reply_text: send_feishu_message(chat_id, reply_text))
+        if agent_message is None:
+            return {"statusCode": 200, "body": "ok"}
     if has_image:
         namespace = session_id.namespace
         image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
@@ -3659,8 +3847,8 @@ def handle_feishu(body, headers=None):
             return {"statusCode": 200, "body": "ok"}
 
     logger.info(
-        "Feishu: user=%s session=%s msg_len=%d has_image=%s chat_type=%s",
-        resolved_user_id, session_id, len(text), has_image, chat_type,
+        "Feishu: user=%s session=%s msg_len=%d has_image=%s document=%s chat_type=%s",
+        resolved_user_id, session_id, len(text), has_image, document["kind"] if document else "none", chat_type,
     )
 
     # Invoke AgentCore with progress notification
@@ -3758,9 +3946,12 @@ def _handle_whatsapp_message(config, msg):
     wa_id = msg["from"]
     text = msg["text"].strip()
     has_image = bool(msg["image_id"])
-    # Audio, video, a document, ... the bot cannot read yet (whatsapp.UNSUPPORTED_TYPES).
-    unsupported = msg.get("unsupported") and msg.get("type")
-    if not text and not has_image and not unsupported:
+    document_id = msg.get("document_id") or ""
+    doc_kind = classify_document(msg.get("document_mime"), msg.get("document_name")) if document_id else None
+    # Audio, video, a document of another type, ... the bot cannot read yet (whatsapp.UNSUPPORTED_TYPES).
+    unsupported = (msg.get("unsupported") and msg.get("type")) or ("document" if document_id and not doc_kind else None)
+    has_file = has_image or doc_kind is not None
+    if not text and not has_file and not unsupported:
         return
 
     actor_id = f"whatsapp:{wa_id}"
@@ -3802,18 +3993,33 @@ def _handle_whatsapp_message(config, msg):
         return
 
     # Handle /model (per-user model switching); the reply is not forwarded to the agent.
-    model_argument = None if has_image else _parse_model_command(text)
+    model_argument = None if has_file else _parse_model_command(text)
     if model_argument is not None:
         whatsapp.send_text(config, wa_id, handle_model_command(resolved_user_id, model_argument, code=False))
         return
 
     # Handle /usage (today's usage and limit); the reply is not forwarded to the agent.
-    if not has_image and _is_usage_command(text):
+    if not has_file and _is_usage_command(text):
         whatsapp.send_text(config, wa_id, handle_usage_command(resolved_user_id))
         return
 
-    # A caption on a video or document: the caption turn, and the agent is told about the file.
+    # A caption on a video or a document it cannot read: the caption turn, and the agent is told about the file.
     agent_message = (text + unsupported_media.note(unsupported_media.label(unsupported))) if unsupported else text
+    if doc_kind:
+        # Meta declares the size in the media metadata; download_document checks it before downloading.
+        data, reason = whatsapp.download_document(config, document_id, MAX_DOCUMENT_BYTES)
+        if reason == "too_large":
+            logger.info("WhatsApp: rejected document kind=%s reason=too_large", doc_kind)
+            whatsapp.send_text(config, wa_id, DOCUMENT_TOO_LARGE_REPLY)
+            return
+        if data is None:
+            whatsapp.send_text(config, wa_id, DOCUMENT_DOWNLOAD_FAILED_REPLY)
+            return
+        agent_message = _document_agent_message(
+            "WhatsApp", data, doc_kind, route.namespace, text, msg.get("document_name", ""),
+            lambda reply_text: whatsapp.send_text(config, wa_id, reply_text))
+        if agent_message is None:
+            return
     if has_image:
         namespace = route.namespace
         image_bytes, content_type = whatsapp.download_media(
@@ -3825,7 +4031,8 @@ def _handle_whatsapp_message(config, msg):
         agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
 
     # The actor ID is a phone number, so only the internal user ID is logged.
-    logger.info("WhatsApp: user=%s msg_len=%d has_image=%s", resolved_user_id, len(text), has_image)
+    logger.info("WhatsApp: user=%s msg_len=%d has_image=%s document=%s",
+                resolved_user_id, len(text), has_image, doc_kind or "none")
 
     stop_notify = threading.Event()
     notify_thread = threading.Thread(
@@ -3894,9 +4101,14 @@ def _handle_line_event(config, event):
     line_user_id = event["user_id"]
     text = event["text"].strip()
     has_image = bool(event["message_id"])
-    # Audio, video, a file, ... the bot cannot read yet (line_channel.UNSUPPORTED_TYPES).
-    unsupported = event.get("unsupported") and event.get("type")
-    if not text and not has_image and not unsupported:
+    file_message_id = event.get("file_message_id") or ""
+    # LINE may serve a file with a generic content type, so the file name decides.
+    file_kind = classify_document("", event.get("file_name")) if file_message_id else None
+    # Audio, video, a file of another type, ... the bot cannot read yet (line_channel.UNSUPPORTED_TYPES).
+    unsupported = (event.get("unsupported") and event.get("type")) or ("file" if file_message_id and not file_kind
+                                                                       else None)
+    has_file = has_image or file_kind is not None
+    if not text and not has_file and not unsupported:
         return
 
     def reply(message):
@@ -3938,18 +4150,29 @@ def _handle_line_event(config, event):
         return
 
     # Handle /model (per-user model switching); the reply is not forwarded to the agent.
-    model_argument = None if has_image else _parse_model_command(text)
+    model_argument = None if has_file else _parse_model_command(text)
     if model_argument is not None:
         reply(handle_model_command(resolved_user_id, model_argument, code=False))
         return
 
     # Handle /usage (today's usage and limit); the reply is not forwarded to the agent.
-    if not has_image and _is_usage_command(text):
+    if not has_file and _is_usage_command(text):
         reply(handle_usage_command(resolved_user_id))
         return
 
+    if file_kind and _document_too_large("LINE", file_kind, event.get("file_size"), reply):
+        return
     line_channel.show_loading(config, line_user_id)
     agent_message = text
+    if file_kind:
+        data, _ = line_channel.download_content(config, file_message_id, None, MAX_DOCUMENT_BYTES)
+        if data is None:
+            reply(DOCUMENT_DOWNLOAD_FAILED_REPLY)
+            return
+        agent_message = _document_agent_message(
+            "LINE", data, file_kind, route.namespace, text, event.get("file_name", ""), reply)
+        if agent_message is None:
+            return
     if has_image:
         namespace = route.namespace
         image_bytes, content_type = line_channel.download_image(
@@ -3960,8 +4183,8 @@ def _handle_line_event(config, event):
             return
         agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
 
-    logger.info("LINE: user=%s msg_len=%d has_image=%s redelivery=%s",
-                resolved_user_id, len(text), has_image, event["redelivery"])
+    logger.info("LINE: user=%s msg_len=%d has_image=%s document=%s redelivery=%s",
+                resolved_user_id, len(text), has_image, file_kind or "none", event["redelivery"])
     result = invoke_agent_runtime(route, resolved_user_id, actor_id, "line", agent_message,
                                   channel_target=line_user_id,
                                   model_override=get_model_override(resolved_user_id))
@@ -4052,6 +4275,14 @@ def handle_discord(body):
         reply("Sorry, your account needs attention. Please contact the bot admin.")
 
 
+def _discord_attachment_size(attachment):
+    """The size Discord declares for an attachment, or None when it is not a number."""
+    try:
+        return int(attachment.get("size"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _handle_discord_command(command, reply):
     discord_user_id = command["user_id"]
     text = command["text"]
@@ -4075,10 +4306,14 @@ def _handle_discord_command(command, reply):
               f"Send this ID to the bot admin to request access.")
         return
 
-    # An attachment that is not an accepted image: the notice, no download and no turn.
+    # An image, or a document of an accepted type, through the /ask "image" option.
+    # Any other attachment: the notice, no download and no turn.
     attachment_type = (unsupported_media.mime_type(attachment.get("content_type"))
                        if isinstance(attachment, dict) else "")
-    if attachment and attachment_type not in ALLOWED_IMAGE_TYPES:
+    is_image = attachment_type in ALLOWED_IMAGE_TYPES
+    doc_kind = (classify_document(attachment_type, attachment.get("filename"))
+                if isinstance(attachment, dict) and not is_image else None)
+    if attachment and not is_image and not doc_kind:
         logger.info("Discord: unsupported attachment kind=%s", attachment_type or "unknown")
         reply(unsupported_reply("discord"))
         return
@@ -4107,7 +4342,18 @@ def _handle_discord_command(command, reply):
         return
 
     agent_message = text
-    if attachment:
+    if doc_kind:
+        if _document_too_large("Discord", doc_kind, _discord_attachment_size(attachment), reply):
+            return
+        data, _ = discord_channel.download_attachment(attachment, None, MAX_DOCUMENT_BYTES)
+        if data is None:
+            reply(DOCUMENT_DOWNLOAD_FAILED_REPLY)
+            return
+        agent_message = _document_agent_message(
+            "Discord", data, doc_kind, route.namespace, text, attachment.get("filename", ""), reply)
+        if agent_message is None:
+            return
+    elif attachment:
         namespace = route.namespace
         image_bytes, content_type = discord_channel.download_attachment(
             attachment, ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES)
@@ -4117,8 +4363,8 @@ def _handle_discord_command(command, reply):
             return
         agent_message = _build_structured_message(text or "What is this image?", s3_key, content_type)
 
-    logger.info("Discord: user=%s msg_len=%d has_image=%s",
-                resolved_user_id, len(text), bool(attachment))
+    logger.info("Discord: user=%s msg_len=%d has_image=%s document=%s",
+                resolved_user_id, len(text), bool(attachment) and is_image, doc_kind or "none")
     result = invoke_agent_runtime(route, resolved_user_id, actor_id, "discord", agent_message,
                                   channel_target=discord_user_id,
                                   model_override=get_model_override(resolved_user_id))

@@ -149,13 +149,13 @@ class TelegramPrivate(TelegramTest):
         self.chunks.assert_not_called()
         self.route.assert_not_called()  # a notice needs no route
 
-    def test_the_notice_names_what_telegram_accepts(self):
-        self.assertEqual(index.unsupported_reply("telegram"),
-                         "Sorry, I can only read text, images (JPEG, PNG, GIF, WebP), Markdown (.md) files "
-                         "and ZIP (.zip) archives for now.")
-        for channel in ("slack", "slack_channel", "feishu", "feishu_group", "whatsapp", "line", "discord"):
+    def test_the_notice_names_what_every_channel_accepts(self):
+        for channel in ("telegram", "telegram_group", "slack", "slack_channel", "feishu", "feishu_group",
+                        "whatsapp", "line", "discord"):
             self.assertEqual(index.unsupported_reply(channel),
-                             "Sorry, I can only read text and images (JPEG, PNG, GIF, WebP) for now.")
+                             "Sorry, I can only read text, images (JPEG, PNG, GIF, WebP), PDFs, text files "
+                             "(.txt, .csv, .tsv, .log, .json), Markdown (.md) files and ZIP (.zip) archives "
+                             "for now.")
 
     def test_service_and_empty_messages_get_nothing(self):
         for extra in ({"pinned_message": {"message_id": 4}}, {"new_chat_members": [{"id": 7}]},
@@ -275,8 +275,9 @@ class TelegramAlbum(TelegramTest):
 
 BOT_USER_ID = "UBOT123"
 AUTHORIZATIONS = [{"team_id": "T1", "user_id": BOT_USER_ID, "is_bot": True}]
-PDF = {"mimetype": "application/pdf", "name": "q3-report.pdf", "size": 9000,
-       "url_private_download": "https://files.slack.com/x/q3-report.pdf"}
+# A Word file: a document type the bot cannot read (PDFs and text files it can).
+DOC = {"mimetype": "application/msword", "name": "q3-report.doc", "size": 9000,
+       "url_private_download": "https://files.slack.com/x/q3-report.doc"}
 AUDIO_CLIP = {"mimetype": "audio/webm", "name": "audio_message.webm", "size": 9000,
               "url_private_download": "https://files.slack.com/x/audio.webm"}
 PNG = {"mimetype": "image/png", "name": "chart.png", "size": 9000,
@@ -315,21 +316,21 @@ class SlackDirectMessages(SlackTest):
         self.invoke.assert_not_called()
         self.route.assert_not_called()
 
-    def test_a_pdf_with_text_runs_one_turn_with_the_note(self):
-        index.handle_slack(slack_event("summarize this", [PDF]))
-        self.assertEqual(self.agent_messages(), ["summarize this" + caption_note("a file (application/pdf)")])
+    def test_an_unreadable_file_with_text_runs_one_turn_with_the_note(self):
+        index.handle_slack(slack_event("summarize this", [DOC]))
+        self.assertEqual(self.agent_messages(), ["summarize this" + caption_note("a file (application/msword)")])
         self.download.assert_not_called()
 
-    def test_an_image_and_a_pdf_without_text(self):
-        index.handle_slack(slack_event("", [PNG, PDF]))
+    def test_an_image_and_an_unreadable_file_without_text(self):
+        index.handle_slack(slack_event("", [PNG, DOC]))
         self.assertEqual(self.agent_messages(), [{
-            "text": "[The user also sent a file (application/pdf), which cannot be read yet.]",
+            "text": "[The user also sent a file (application/msword), which cannot be read yet.]",
             "images": [{"s3Key": "slack_U12345USER/_uploads/img_1.png", "contentType": "image/png"}],
         }])
 
     def test_an_unaddressed_channel_message_with_a_file_gets_nothing(self):
-        index.handle_slack(slack_event("", [PDF], channel="C12345CHAN", channel_type="channel"))
-        index.handle_slack(slack_event("look at this", [PDF], channel="C12345CHAN", channel_type="channel"))
+        index.handle_slack(slack_event("", [DOC], channel="C12345CHAN", channel_type="channel"))
+        index.handle_slack(slack_event("look at this", [DOC], channel="C12345CHAN", channel_type="channel"))
         self.send.assert_not_called()
         self.invoke.assert_not_called()
         self.claim.assert_not_called()
@@ -364,9 +365,9 @@ class SlackChannelMode(SlackTest):
         self.route.assert_not_called()
 
     def test_a_file_with_text_runs_the_channel_turn_with_the_note(self):
-        index.handle_slack(self.channel_event("summarize this", [PDF]))
+        index.handle_slack(self.channel_event("summarize this", [DOC]))
         self.assertEqual(self.agent_messages(), [
-            "Slack channel message from Alex:\nsummarize this" + caption_note("a file (application/pdf)")])
+            "Slack channel message from Alex:\nsummarize this" + caption_note("a file (application/msword)")])
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +385,7 @@ def feishu_event(msg_type, content, chat_type="p2p", event_id="evt1", mentions=N
 
 
 FEISHU_UNREADABLE = {
-    "file": {"file_key": "file_v3_00cd", "file_name": "q3-report.pdf"},
+    "file": {"file_key": "file_v3_00cd", "file_name": "q3-report.doc"},
     "audio": {"file_key": "file_v3_00ab", "duration": 3000},
     "media": {"file_key": "file_v3_00ef", "image_key": "img_v3_01", "file_name": "clip.mp4", "duration": 4000},
     "sticker": {"file_key": "file_v3_00gh"},
@@ -543,10 +544,10 @@ def wa_message(msg_type, body, msg_id=None):
             msg_type: body}
 
 
+# A document is passed on with its media ID, type and name (test_documents_channels.py).
 WA_UNREADABLE = {
     "audio": {"id": "123", "mime_type": "audio/ogg; codecs=opus", "voice": True},
     "video": {"id": "789", "mime_type": "video/mp4"},
-    "document": {"id": "456", "mime_type": "application/pdf", "filename": "passport.pdf"},
     "sticker": {"id": "321", "mime_type": "image/webp"},
     "location": {"latitude": 1.0, "longitude": 2.0, "name": "Cafe"},
     "contacts": [{"name": {"formatted_name": "B"}, "phones": [{"phone": "+15550000002"}]}],
@@ -616,10 +617,10 @@ def line_event(msg_type, extra=None, event_id="01HSYNTHETICEVENT0000000001", eve
             "deliveryContext": {"isRedelivery": False}, "replyToken": REPLY_TOKEN, "message": message}
 
 
+# A file is passed on with its message ID, name and size (test_documents_channels.py).
 LINE_UNREADABLE = {
     "audio": {"duration": 4000},
     "video": {"duration": 4000},
-    "file": {"fileName": "contract.pdf", "fileSize": 9},
     "sticker": {"packageId": "1", "stickerId": "2"},
     "location": {"title": "Cafe", "latitude": 1.0, "longitude": 2.0},
 }
@@ -679,10 +680,10 @@ class DiscordCommands(ChannelTest):
         patch.object(index, "_upload_image_to_s3", return_value="discord_500000000000000001/_uploads/img.png").start()
         self.replies = []
 
-    def test_a_pdf_attachment_gets_the_notice_without_a_download(self):
-        pdf = {"content_type": "application/pdf", "filename": "a.pdf", "size": 1000,
-               "url": "https://cdn.discordapp.com/attachments/1/2/a.pdf"}
-        index._handle_discord_command(discord_command("summarize", pdf), self.replies.append)
+    def test_an_unreadable_attachment_gets_the_notice_without_a_download(self):
+        doc = {"content_type": "application/msword", "filename": "a.doc", "size": 1000,
+               "url": "https://cdn.discordapp.com/attachments/1/2/a.doc"}
+        index._handle_discord_command(discord_command("summarize", doc), self.replies.append)
         self.assertEqual(self.replies, [index.unsupported_reply("discord")])
         self.download.assert_not_called()
         self.invoke.assert_not_called()
@@ -704,8 +705,10 @@ class DiscordCommands(ChannelTest):
 class LogPrivacy(unittest.TestCase):
     """File names, captions and message text never reach the logs; the kind does."""
 
-    SECRETS = ("caption-secret-tg", "slack-secret.pdf", "text-secret-slack", "feishu-secret.pdf",
-               "wa-secret.pdf", "caption-secret-wa", "line-secret.pdf", "discord-secret.pdf")
+    # Word files: types the bot cannot read, so every channel takes the notice path and
+    # nothing is downloaded (accepted documents: test_documents_channels.py).
+    SECRETS = ("caption-secret-tg", "slack-secret.doc", "text-secret-slack", "feishu-secret.doc",
+               "wa-secret.doc", "caption-secret-wa", "line-secret.doc", "discord-secret.doc")
 
     def test_no_file_names_or_captions_in_log_records(self):
         records = []
@@ -753,19 +756,20 @@ class LogPrivacy(unittest.TestCase):
                 stack.enter_context(active)
             index.handle_telegram(tg_update({**tg_media("video"), "caption": "caption-secret-tg"}))
             index.handle_telegram(tg_update(tg_media("voice"), message_id=6))
-            secret_pdf = {**PDF, "name": "slack-secret.pdf"}
-            index.handle_slack(slack_event("", [secret_pdf], event_id="Ev2"))
-            index.handle_slack(slack_event("text-secret-slack", [secret_pdf], event_id="Ev3"))
-            index.handle_feishu(feishu_event("file", {"file_key": "file_v3", "file_name": "feishu-secret.pdf"}))
+            secret_doc = {**DOC, "name": "slack-secret.doc"}
+            index.handle_slack(slack_event("", [secret_doc], event_id="Ev2"))
+            index.handle_slack(slack_event("text-secret-slack", [secret_doc], event_id="Ev3"))
+            index.handle_feishu(feishu_event("file", {"file_key": "file_v3", "file_name": "feishu-secret.doc"}))
             index.handle_whatsapp(json.dumps(wa_payload(
-                wa_message("document", {"id": "1", "filename": "wa-secret.pdf"}, msg_id="wamid.d1"),
-                wa_message("document", {"id": "2", "filename": "wa-secret.pdf", "caption": "caption-secret-wa"},
-                           msg_id="wamid.d2"))))
+                wa_message("document", {"id": "1", "mime_type": "application/msword", "filename": "wa-secret.doc"},
+                           msg_id="wamid.d1"),
+                wa_message("document", {"id": "2", "mime_type": "application/msword", "filename": "wa-secret.doc",
+                                        "caption": "caption-secret-wa"}, msg_id="wamid.d2"))))
             index.handle_line(json.dumps({"destination": "", "events": [
-                line_event("file", {"fileName": "line-secret.pdf", "fileSize": 9})]}))
+                line_event("file", {"fileName": "line-secret.doc", "fileSize": 9})]}))
             index._handle_discord_command(
-                discord_command("", {"content_type": "application/pdf", "filename": "discord-secret.pdf",
-                                     "url": "https://cdn.discordapp.com/attachments/1/2/discord-secret.pdf"}),
+                discord_command("", {"content_type": "application/msword", "filename": "discord-secret.doc",
+                                     "url": "https://cdn.discordapp.com/attachments/1/2/discord-secret.doc"}),
                 lambda text: None)
 
 
