@@ -28,7 +28,9 @@ USER_AGENT = "DiscordBot (https://github.com/aws-samples/sample-host-openclaw-on
 _SNOWFLAKE_RE = re.compile(r"^\d{1,25}$")
 _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _HEX128_RE = re.compile(r"^[0-9a-fA-F]{128}$")
-_TIMESTAMP_RE = re.compile(r"^\d{1,12}$")
+# ASCII digits only: '\d' also matches other scripts' digits, which int()
+# accepts but the signed message (timestamp + body) cannot encode as ASCII.
+_TIMESTAMP_RE = re.compile(r"^[0-9]{1,12}$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9._\-]{1,1000}$")
 
 MAX_TIMESTAMP_SKEW_SECONDS = 300

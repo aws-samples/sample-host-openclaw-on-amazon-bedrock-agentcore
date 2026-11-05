@@ -153,6 +153,32 @@ class TestMalformedHeaders(_ChannelsConfigured):
         self.mock_async.assert_not_called()
 
 
+class TestOutOfRangeTimestamps(_ChannelsConfigured):
+    """Timestamps that int() accepts but the checks cannot use still get a 401."""
+
+    def test_huge_timestamp_is_401(self):
+        # Over 308 digits: subtracting it from time.time() overflows a float.
+        huge = "9" * 400
+        for ts in (huge, "-" + huge):
+            for ch, headers in (
+                ("slack", {"x-slack-request-timestamp": ts, "x-slack-signature": "v0=" + "0" * 64}),
+                ("feishu", {"x-lark-request-timestamp": ts, "x-lark-request-nonce": "n",
+                            "x-lark-signature": "0" * 64}),
+            ):
+                with self.subTest(channel=ch, negative=ts.startswith("-")):
+                    resp = self.call(_event(ch, "{}", headers))
+                    self.assertEqual(resp["statusCode"], 401)
+        self.mock_async.assert_not_called()
+
+    def test_discord_non_ascii_digit_timestamp_is_401(self):
+        # The current time in Arabic-Indic digits, so the replay window passes.
+        now = "".join(chr(0x0660 + int(d)) for d in str(int(time.time())))
+        headers = {"x-signature-ed25519": "0" * 128, "x-signature-timestamp": now}
+        resp = self.call(_event("discord", "{}", headers))
+        self.assertEqual(resp["statusCode"], 401)
+        self.mock_async.assert_not_called()
+
+
 class TestMalformedBodies(_ChannelsConfigured):
     def test_invalid_base64_is_400(self):
         for ch in ALL_CHANNELS:
