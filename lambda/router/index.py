@@ -52,6 +52,7 @@ import formatting
 import line_channel
 import telegram_group
 import channel_identity
+import usage_limits
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -83,6 +84,11 @@ DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "")
 # text, which the E2E log tailer reads. Off by default, so replies stay out of
 # the router logs.
 LOG_REPLY_TEXT = os.environ.get("LOG_REPLY_TEXT", "false").lower() == "true"
+# Default daily cost limit per internal user in USD (per_user_daily_cost_usd).
+# 0 = off: no usage is read before a turn. See lambda/shared/python/usage_limits.py.
+PER_USER_DAILY_COST_USD = usage_limits.parse_limit(os.environ.get("PER_USER_DAILY_COST_USD"))
+# Identities that are a conversation (a group or channel) rather than a person.
+CONVERSATION_CHANNELS = frozenset({telegram_group.CHANNEL, channel_identity.SLACK, channel_identity.FEISHU})
 
 # Maximum accepted webhook body size (bytes). Matches the 1 MB cap enforced by
 # the WhatsApp/LINE/Discord verifiers (lambda/shared/python/*.py). Oversized
@@ -994,6 +1000,19 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 # AgentCore invocation
 # ---------------------------------------------------------------------------
 
+def _usage_limit_reply(user_id, channel):
+    """The reply for a user at or over today's usage limit, or None to run the turn.
+
+    Reads nothing while per_user_daily_cost_usd is 0, and runs the turn when
+    the usage cannot be read (usage_limits.over_limit fails open).
+    """
+    usage = usage_limits.over_limit(identity_table, user_id, PER_USER_DAILY_COST_USD)
+    if usage is None:
+        return None
+    logger.warning("Rejecting turn: channel=%s reason=usage-limit user=%s", channel, user_id)
+    return usage_limits.limit_reached_text(usage, conversation=channel in CONVERSATION_CHANNELS)
+
+
 def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_target=None,
                          model_override=None, shared_chat=False):
     """Invoke the AgentCore Runtime with a per-user session.
@@ -1004,7 +1023,14 @@ def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_tar
     shared_chat marks a turn from a Slack channel or a Feishu group chat, where
     everyone in the conversation sees the reply; the bridge then tells the
     agent not to reveal user IDs, the namespace or the user's files there.
+
+    A user at or over today's usage limit (per_user_daily_cost_usd) gets
+    {"response": <limit notice>, "status": "capped"} instead, and AgentCore is
+    not called. Every channel handler sends that response as it is.
     """
+    limit_reply = _usage_limit_reply(user_id, channel)
+    if limit_reply:
+        return {"response": limit_reply, "status": "capped"}
     payload = json.dumps({
         "action": "chat",
         "userId": user_id,
@@ -2242,6 +2268,29 @@ def handle_model_command(user_id, argument, code=True):
     return f"Model switched to {fmt(choice)} ({fmt(models[choice])}) for your next messages."
 
 
+# ---------------------------------------------------------------------------
+# Today's usage (/usage)
+# ---------------------------------------------------------------------------
+
+# "/usage", "/usage@MyBot" (Telegram group form). Like /model, only a leading
+# "/usage" counts; anything after it is ignored.
+_USAGE_COMMAND_RE = re.compile(r"^/usage(?:@[A-Za-z0-9_]{1,64})?(?:\s.*)?$", re.IGNORECASE | re.DOTALL)
+
+
+def _is_usage_command(text):
+    return isinstance(text, str) and _USAGE_COMMAND_RE.match(text.strip()) is not None
+
+
+def handle_usage_command(user_id, conversation=False):
+    """The /usage reply (never forwarded to the agent): today's usage of this identity.
+
+    Answered whether or not a limit is configured, and also once the limit is
+    reached. conversation: the identity is a group or channel.
+    """
+    return usage_limits.usage_report(identity_table, user_id, PER_USER_DAILY_COST_USD,
+                                     conversation=conversation)
+
+
 def _telegram_document_kind(document, doc_mime, reply):
     """Classify a Telegram document, or reply with the reason and return None."""
     doc_kind = classify_document(doc_mime, document.get("file_name", ""))
@@ -2413,6 +2462,11 @@ def handle_telegram(body):
     model_argument = None if (has_image or has_document) else _parse_model_command(text)
     if model_argument is not None:
         send_telegram_message(chat_id, handle_model_command(resolved_user_id, model_argument), token)
+        return
+
+    # Handle /usage (today's usage and limit); the reply is not forwarded to the agent.
+    if not (has_image or has_document) and _is_usage_command(text):
+        send_telegram_message(chat_id, handle_usage_command(resolved_user_id), token)
         return
 
     doc_kind = None
@@ -2654,6 +2708,11 @@ def _handle_telegram_group(message, text, document, doc_mime, has_image, has_doc
     if route is None:
         return
     actor_id = f"{telegram_group.CHANNEL}:{group_id}"
+
+    # Unlike /model, /usage works in groups: it reports the group's own usage.
+    if command == "usage":
+        reply(handle_usage_command(group_user_id, conversation=True))
+        return
 
     doc_kind = None
     if has_document:
@@ -2960,6 +3019,11 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
     if route is None:
         return
 
+    # Unlike /model, /usage works here: it reports the channel's own usage.
+    if not has_image and _is_usage_command(text):
+        reply(handle_usage_command(channel_user_id, conversation=True))
+        return
+
     message_text = channel_identity.agent_text(
         "Slack channel", _slack_member_name(event, slack_user_id, bot_token), text)
     agent_message = message_text
@@ -3027,6 +3091,11 @@ def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_im
         return
     route = _route_or_reply(group_user_id, lambda reply_text: send_feishu_message(chat_id, reply_text))
     if route is None:
+        return
+
+    # Unlike /model, /usage works here: it reports the group's own usage.
+    if not has_image and _is_usage_command(text):
+        send_feishu_message(chat_id, handle_usage_command(group_user_id, conversation=True))
         return
 
     name = _feishu_member_name(sender_id)
@@ -3234,6 +3303,11 @@ def handle_slack(body, headers=None):
     model_argument = None if has_image else _parse_model_command(text)
     if model_argument is not None:
         send_slack_message(channel_id, handle_model_command(resolved_user_id, model_argument), bot_token, **in_thread)
+        return {"statusCode": 200, "body": "ok"}
+
+    # Handle /usage (typed " /usage", like /model); the reply is not forwarded to the agent.
+    if not has_image and _is_usage_command(text):
+        send_slack_message(channel_id, handle_usage_command(resolved_user_id), bot_token, **in_thread)
         return {"statusCode": 200, "body": "ok"}
 
     # Build message payload (structured if image, plain string if text-only)
@@ -3450,6 +3524,11 @@ def handle_feishu(body, headers=None):
         send_feishu_message(chat_id, handle_model_command(resolved_user_id, model_argument, code=False))
         return {"statusCode": 200, "body": "ok"}
 
+    # Handle /usage (today's usage and limit); the reply is not forwarded to the agent.
+    if not has_image and _is_usage_command(text):
+        send_feishu_message(chat_id, handle_usage_command(resolved_user_id))
+        return {"statusCode": 200, "body": "ok"}
+
     # Build message payload (structured if image, plain string if text-only)
     agent_message = text or "hi"
     if has_image:
@@ -3608,6 +3687,11 @@ def _handle_whatsapp_message(config, msg):
         whatsapp.send_text(config, wa_id, handle_model_command(resolved_user_id, model_argument, code=False))
         return
 
+    # Handle /usage (today's usage and limit); the reply is not forwarded to the agent.
+    if not has_image and _is_usage_command(text):
+        whatsapp.send_text(config, wa_id, handle_usage_command(resolved_user_id))
+        return
+
     agent_message = text
     if has_image:
         namespace = route.namespace
@@ -3728,6 +3812,11 @@ def _handle_line_event(config, event):
     model_argument = None if has_image else _parse_model_command(text)
     if model_argument is not None:
         reply(handle_model_command(resolved_user_id, model_argument, code=False))
+        return
+
+    # Handle /usage (today's usage and limit); the reply is not forwarded to the agent.
+    if not has_image and _is_usage_command(text):
+        reply(handle_usage_command(resolved_user_id))
         return
 
     line_channel.show_loading(config, line_user_id)
@@ -3873,6 +3962,11 @@ def _handle_discord_command(command, reply):
     model_argument = None if attachment else _parse_model_command(text)
     if model_argument is not None:
         reply(handle_model_command(resolved_user_id, model_argument))
+        return
+
+    # Handle /usage (in the /ask prompt, like /model); the reply is not forwarded to the agent.
+    if not attachment and _is_usage_command(text):
+        reply(handle_usage_command(resolved_user_id))
         return
 
     agent_message = text

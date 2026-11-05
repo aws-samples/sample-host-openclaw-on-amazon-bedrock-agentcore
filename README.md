@@ -19,6 +19,7 @@ AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Per-user model switching](#per-user-model-switching)
+- [Per-user daily cost limit](#per-user-daily-cost-limit)
 - [Channel Setup](#channel-setup)
 - [Operations](#operations)
 - [Upgrading: budget alarms are now hourly and daily](#upgrading-budget-alarms-are-now-hourly-and-daily)
@@ -38,6 +39,7 @@ AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-
 - Slack channels and Feishu group chats as their own identity (off by default, `channel_identity_mode`): an allowlisted conversation gets its own shared session, memory and files instead of the sender's ([Slack channels and Feishu groups](docs/channels.md#slack-channels-and-feishu-groups))
 - Multimodal: text + image messages via Bedrock ConverseStream
 - Per-user model switching with a `/model` chat command, limited to an operator allowlist
+- Per-user daily cost limit (off by default, `per_user_daily_cost_usd`), and a `/usage` chat command that shows today's estimated usage ([Per-user daily cost limit](#per-user-daily-cost-limit))
 - STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
 - Custom skills: S3 file storage, EventBridge cron scheduling, API key management, ClawHub skill installer
 - Scheduled briefs that deliver only the final answer, send a fixed notice instead of raw errors, and can attach an MP3 on Telegram ([brief audio](docs/how-it-works.md#brief-audio))
@@ -302,6 +304,7 @@ All tunable parameters are in `cdk.json`:
 | `daily_token_budget` | `18000000` | Threshold of the `openclaw-daily-token-budget` alarm: `TotalTokens` summed over **1 day** (86400 s) |
 | `hourly_cost_alarm_usd` | `30` | Threshold (USD) of the `openclaw-hourly-cost-spike` alarm: estimated cost summed over **1 hour** |
 | `daily_cost_budget_usd` | `100` | Threshold (USD) of the `openclaw-daily-cost-budget` alarm: estimated cost summed over **1 day** (86400 s). Before this release it was compared per hour; see [Upgrading: budget alarms](#upgrading-budget-alarms-are-now-hourly-and-daily) |
+| `per_user_daily_cost_usd` | `0` (off) | Daily limit (USD, 0 to 10000) on each internal user's estimated cost, reset at 00:00 UTC. A user at the limit gets a notice instead of a turn, and their scheduled tasks are skipped. `0` turns it off: no usage is read before a turn. Per-user overrides: `manage-allowlist.sh set-cap`. See [Per-user daily cost limit](#per-user-daily-cost-limit) |
 | `alarm_email` | `""` (unset) | Optional email address subscribed to the `openclaw-alarms` SNS topic. SNS sends a confirmation email that must be accepted. **Unset, every alarm notifies nobody** until someone subscribes to the topic |
 | `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |
 | `session_max_lifetime` | `28800` | Per-user session max lifetime (seconds) |
@@ -372,8 +375,29 @@ The operator controls which models are offered with `user_selectable_models` in 
 - To disable the feature, set `"user_selectable_models": {}` and redeploy both the runtime configuration and the Router (see [Deploy and verify V2](docs/runtime-v2.md#deploy-and-verify-v2)). `/model` then replies that switching is not enabled, and stored choices are ignored.
 - Removing a model from the map takes effect at the next deployment: users who picked it go back to `default_model_id` without being told, and `/model` shows them the default.
 - Rules that still apply with an override: sub-agents keep `subagent_model_id`; if the chosen model fails before any output, the bridge falls back once to `fallback_model_id` (no fallback when they are the same model); scheduled (Cron) tasks use `default_model_id`. Request settings follow the model actually sent (Haiku 5.5 runs with thinking disabled; Haiku 5.5, Sonnet 5.5 and Opus 5.5 omit temperature).
-- Cost: larger models cost more per token. Token monitoring prices Haiku, Sonnet and Opus 5.5, and the daily budget alarms cover all users together.
+- Cost: larger models cost more per token. Token monitoring prices Haiku, Sonnet and Opus 5.5. The daily budget alarms cover all users together; `per_user_daily_cost_usd` limits each user (see [Per-user daily cost limit](#per-user-daily-cost-limit)).
 - The runtime execution role already allows every model through `inference-profile/*` and `foundation-model/*`. If you narrow that policy, keep every allowlisted model's inference profile and its foundation models.
+
+## Per-user daily cost limit
+
+The budget alarms only notify, and they cover all users together. `per_user_daily_cost_usd` in `cdk.json` (USD, 0 to 10000; `0`, the default, is off) stops answering a user for the rest of the UTC day once their estimated cost for the day reaches it:
+
+- **Who:** each internal user, so a linked user has one limit across their channels. A [Telegram group](docs/channels.md#telegram-groups), and a Slack channel or Feishu group chat with `channel_identity_mode` `channel`, is its own identity with its own limit, shared by its members. Scheduled tasks count toward their owner's limit.
+- **At the limit:** the Router replies, without calling AgentCore or a model: "You have reached today's usage limit (about $5.03 of $5.00). It resets at 00:00 UTC, in 6 h 12 min. Send /usage to see today's usage." A scheduled task is skipped before its warm-up, and its owner is told once per day: "[Scheduled: *name*] Skipped: today's usage limit is reached. It runs again at its next scheduled time after 00:00 UTC." A scheduled run that has already started finishes.
+- **`/usage`:** shows today's estimated cost and limit, model calls (and how many came from scheduled tasks) and tokens. The Router answers it directly, like `/model`: also when the limit is off (the cost line then says "no daily limit") or reached, and on every channel. In a Telegram group send `/usage@YourBot`; in a group or channel it reports that conversation's usage. In Slack, type a space before the slash (` /usage`); in Discord, use `/ask prompt: /usage`. Token counts do not include prompt-cache tokens; the cost does.
+- **Overrides:** `scripts/manage-allowlist.sh` sets a limit for one user, which replaces the default for them while `per_user_daily_cost_usd` is above 0. Any of the user's channel identities works, as do `telegram_group:`, `slack_channel:` and `feishu_group:` keys. To limit only some users (for example strangers with `registration_open`), set the default to their limit and exempt trusted users with `set-cap ... 0`.
+
+  ```bash
+  ./scripts/manage-allowlist.sh set-cap telegram:123456 20   # $20 per UTC day for this user
+  ./scripts/manage-allowlist.sh set-cap telegram:123456 0    # no limit for this user
+  ./scripts/manage-allowlist.sh clear-cap telegram:123456    # back to per_user_daily_cost_usd
+  ./scripts/manage-allowlist.sh usage telegram:123456        # today's usage and the override
+  ```
+
+- **A soft limit:** costs are the token-metrics Lambda's estimates from the Bedrock invocation logs, the same as the budget alarms', and a call is counted a few minutes after it is made. A turn that is already running is not stopped. A user can therefore go over the limit by the turns in flight plus a few minutes of usage; one long Opus turn with sub-agents can cost several dollars.
+- **Fails open:** if the usage cannot be read (a DynamoDB error), the turn runs and the Router or Cron Lambda logs a warning. This is a cost guard; the allowlist and `disable` still fail closed. The `openclaw-token-metrics-errors` alarm reports usage that was not counted.
+- **Storage:** one item per user and UTC day, `USAGE#<user ID>` / `DAY#<yyyy-mm-dd>`, in the identity table, added to by the token-metrics Lambda and expiring two days after its day; the override is `USAGE#<user ID>` / `CAP`. The agent's scoped credentials cannot write them. The runtime execution role can, as it can write `ALLOW#` records, so the limit is a cost control for ordinary use, not an isolation boundary.
+- **Turning it on:** set the value and run Phase 3 (`./scripts/deploy.sh --phase3`), which deploys the Router, Cron and token-metrics Lambdas. The order does not matter (see [operations](docs/operations.md#turn-on-the-per-user-daily-cost-limit)).
 
 ## Channel Setup
 

@@ -338,3 +338,137 @@ def test_allowlist_usage_names_the_conversation_keys(env):
     assert result.returncode != 0
     assert "slack_channel:<channel_id>" in result.stdout
     assert "feishu_group:<chat_id>" in result.stdout
+
+
+# ------------------------------------- manage-allowlist: daily cost limit (per_user_daily_cost_usd)
+
+
+def _aws_calls(root):
+    return [c["args"] for c in _calls(root) if c["tool"] == "aws"]
+
+
+@pytest.mark.parametrize("key", [
+    "telegram:123456", "slack:U0XXXXXXXX2", "telegram_group:-1001234567890", "slack_channel:C0123ABCDEF",
+    "feishu_group:oc_0123abcd",
+])
+@pytest.mark.parametrize("usd, stored", [("5", "5"), ("2.50", "2.50"), ("0", "0"), ("10000", "10000"),
+                                         ("0.000001", "0.000001")])
+def test_set_cap_writes_the_override_of_the_bound_user(env, key, usd, stored):
+    root, environment = env
+    environment["FAKE_USER_ID"] = "user_0123abcd"
+    result = _run("manage-allowlist.sh", environment, "set-cap", key, usd)
+    assert result.returncode == 0, result.stderr
+    lookup, put = _aws_calls(root)
+    assert json.loads(lookup[lookup.index("--key") + 1]) == {"PK": {"S": f"CHANNEL#{key}"}, "SK": {"S": "PROFILE"}}
+    assert put[:2] == ["dynamodb", "put-item"]
+    item = json.loads(put[put.index("--item") + 1])
+    assert set(item) == {"PK", "SK", "dailyCostUsd", "setAt"}
+    assert item["PK"] == {"S": "USAGE#user_0123abcd"} and item["SK"] == {"S": "CAP"}
+    assert item["dailyCostUsd"] == {"N": stored}
+    assert "per_user_daily_cost_usd" in result.stdout
+    if usd == "0":
+        assert "has no daily cost limit" in result.stdout
+
+
+@pytest.mark.parametrize("usd", ["-1", "abc", "1e3", "10000.01", "10001", "5 USD", "", '5"}', ".5", "5.",
+                                 "0x10", "5.0000001", " 5"])
+def test_set_cap_rejects_an_amount_that_is_not_plain_usd_before_any_aws_call(env, usd):
+    root, environment = env
+    environment["FAKE_USER_ID"] = "user_0123abcd"
+    result = _run("manage-allowlist.sh", environment, "set-cap", "telegram:123456", usd)
+    assert result.returncode != 0
+    assert "ERROR" in result.stderr
+    assert _aws_calls(root) == []
+
+
+@pytest.mark.parametrize("key", ['telegram:1", "PK": {"S": "USER#x', "telegram:", "slack_channel:general",
+                                 "feishu_group:ou_0123abcd"])
+@pytest.mark.parametrize("args", [("set-cap", "5"), ("clear-cap",), ("usage",)])
+def test_cap_commands_reject_malformed_keys_before_any_aws_call(env, key, args):
+    root, environment = env
+    command, *rest = args
+    result = _run("manage-allowlist.sh", environment, command, key, *rest)
+    assert result.returncode != 0
+    assert "ERROR" in result.stderr
+    assert _aws_calls(root) == []
+
+
+@pytest.mark.parametrize("args", [("set-cap", "telegram:123456", "5"), ("clear-cap", "telegram:123456"),
+                                  ("usage", "telegram:123456")])
+def test_cap_commands_refuse_an_unregistered_identity(env, args):
+    root, environment = env
+    result = _run("manage-allowlist.sh", environment, *args)
+    assert result.returncode != 0
+    assert "is not registered" in result.stderr
+    assert [call[:2] for call in _aws_calls(root)] == [["dynamodb", "get-item"]]
+
+
+def test_set_cap_without_an_amount_prints_the_usage(env):
+    root, environment = env
+    result = _run("manage-allowlist.sh", environment, "set-cap", "telegram:123456")
+    assert result.returncode != 0
+    assert "set-cap <channel:user_id> <usd>" in result.stdout
+    assert _aws_calls(root) == []
+
+
+def test_clear_cap_deletes_the_override(env):
+    root, environment = env
+    environment["FAKE_USER_ID"] = "user_0123abcd"
+    result = _run("manage-allowlist.sh", environment, "clear-cap", "slack_channel:C0123ABCDEF")
+    assert result.returncode == 0, result.stderr
+    lookup, delete = _aws_calls(root)
+    assert json.loads(lookup[lookup.index("--key") + 1])["PK"] == {"S": "CHANNEL#slack_channel:C0123ABCDEF"}
+    assert delete[:2] == ["dynamodb", "delete-item"]
+    assert json.loads(delete[delete.index("--key") + 1]) == {"PK": {"S": "USAGE#user_0123abcd"}, "SK": {"S": "CAP"}}
+
+
+def test_usage_prints_todays_item_and_the_override(env):
+    root, environment = env
+    environment["FAKE_USER_ID"] = "user_0123abcd"
+    today = subprocess.run(["date", "-u", "+%Y-%m-%d"], capture_output=True, text=True).stdout.strip()
+    environment["FAKE_QUERY_ITEMS"] = json.dumps({"Items": [
+        {"PK": {"S": "USAGE#user_0123abcd"}, "SK": {"S": "CAP"}, "dailyCostUsd": {"N": "2.5"},
+         "setAt": {"S": "2026-11-01T00:00:00Z"}},
+        {"PK": {"S": "USAGE#user_0123abcd"}, "SK": {"S": "DAY#2000-01-01"}, "costUsd": {"N": "99"}},
+        {"PK": {"S": "USAGE#user_0123abcd"}, "SK": {"S": f"DAY#{today}"}, "costUsd": {"N": "1.24"},
+         "cronCostUsd": {"N": "0.1"}, "calls": {"N": "37"}, "cronCalls": {"N": "4"},
+         "inputTokens": {"N": "400100"}, "outputTokens": {"N": "12245"}},
+    ]})
+    result = _run("manage-allowlist.sh", environment, "usage", "telegram:123456")
+    assert result.returncode == 0, result.stderr
+    lookup, query = _aws_calls(root)
+    assert query[:2] == ["dynamodb", "query"]
+    assert query[query.index("--key-condition-expression") + 1] == "PK = :pk AND SK BETWEEN :cap AND :day"
+    assert json.loads(query[query.index("--expression-attribute-values") + 1]) == {
+        ":pk": {"S": "USAGE#user_0123abcd"}, ":cap": {"S": "CAP"}, ":day": {"S": f"DAY#{today}"}}
+    assert result.stdout.splitlines() == [
+        f"Usage of user_0123abcd on {today} (UTC), estimated:",
+        "  cost:        $1.24 (scheduled tasks: $0.1)",
+        "  model calls: 37 (scheduled tasks: 4)",
+        "  tokens:      400100 in, 12245 out",
+        "  limit:       $2.5 (override, set 2026-11-01T00:00:00Z)",
+    ]
+
+
+@pytest.mark.parametrize("items, limit", [
+    ([], "  limit:       per_user_daily_cost_usd from cdk.json (no override)"),
+    ([{"PK": {"S": "USAGE#user_0123abcd"}, "SK": {"S": "CAP"}, "dailyCostUsd": {"N": "0"},
+       "setAt": {"S": "2026-11-01T00:00:00Z"}}], "  limit:       none (override 0, set 2026-11-01T00:00:00Z)"),
+])
+def test_usage_of_a_day_without_calls(env, items, limit):
+    root, environment = env
+    environment["FAKE_USER_ID"] = "user_0123abcd"
+    environment["FAKE_QUERY_ITEMS"] = json.dumps({"Items": items})
+    result = _run("manage-allowlist.sh", environment, "usage", "telegram_group:-1001234567890")
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[1:] == ["  cost:        $0 (scheduled tasks: $0)", "  model calls: 0 (scheduled tasks: 0)",
+                         "  tokens:      0 in, 0 out", limit]
+
+
+def test_allowlist_usage_names_the_cap_commands(env):
+    _, environment = env
+    result = _run("manage-allowlist.sh", environment)
+    assert result.returncode != 0
+    for command in ("set-cap <channel:user_id> <usd>", "clear-cap <channel:user_id>", "usage   <channel:user_id>"):
+        assert command in result.stdout

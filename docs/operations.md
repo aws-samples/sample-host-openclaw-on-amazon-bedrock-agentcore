@@ -19,7 +19,7 @@ Unknown invocation outcomes retain `activeAdmissions` and `inFlight`. Reconcile 
 
 ## Deleting a user's data
 
-`scripts/delete_user_data.py` erases one user: every linked channel, the session, schedules, files, secrets, the Cognito user, token-usage rows, container log streams and identity records. This is a deliberate end-of-life action, not a reset; to block a user without deleting anything, use `manage-allowlist.sh disable`. The tool is a dry run unless `--apply` is given:
+`scripts/delete_user_data.py` erases one user: every linked channel, the session, schedules, files, secrets, the Cognito user, token-usage rows, container log streams, daily usage items and identity records. This is a deliberate end-of-life action, not a reset; to block a user without deleting anything, use `manage-allowlist.sh disable`. The tool is a dry run unless `--apply` is given:
 
 ```bash
 uv run --no-project --python .venv-deploy/bin/python python scripts/delete_user_data.py \
@@ -33,7 +33,7 @@ uv run --no-project --python .venv-deploy/bin/python python scripts/delete_user_
   1. Revoke: `ALLOW#` records are deleted, and PROFILE gets `accessStatus = DISABLED`, as `disable` does.
   2. Stop: the route is frozen and the AgentCore session is stopped.
   3. Delete: schedules and `CRON#` records; every S3 object version and delete marker under `<namespace>/` and `_system/<namespace>/`, checked empty afterwards; `openclaw/user/<namespace>/*` and the Cognito password secret; the Cognito user; token-usage rows (`USER#<user ID>` and the older `USER#<runtime actor>` form); and `/openclaw/container` log streams (`<user ID>-*` and the older `<namespace>-*` form).
-  4. Identity records go last.
+  4. Identity records go last. The step starts with the user's daily usage items and limit override (`USAGE#<user ID>`), which are not needed to find the user again.
 - **Secrets:** they are deleted with a 7-day recovery window. `--force-delete-secrets` deletes them at once.
 - **Refusals:** the tool refuses (exit 3) while the route holds invocation admissions, which means a turn is running or an unknown outcome needs reconciling (see Inspect sessions). It also refuses when the identity records disagree. When it refuses or a call fails (exit 1), re-run the same command: every step lists before it deletes, so a re-run finishes the job.
 - **Ownership checks:** records outside the user's `USER#<id>` partition (`CHANNEL#`, `ACTOR#` and `NS#`) decide which actors and namespaces belong to the user. A `CRON#` record or back-reference in the partition that points elsewhere is reported and left alone.
@@ -171,6 +171,20 @@ A fresh deployment (`./scripts/deploy.sh` without a mode) needs no extra step: t
 ```
 
 Phase 1 needs no manifest. Phase 3 requires successful warmup and live V2 readback; it grants invocation permissions and configures new registrations. Preserve older endpoints and dependencies used by existing routes. Platform selectors, V1 maintenance, fallback and enrollment opt-in flags are removed.
+
+## Turn on the per-user daily cost limit
+
+Set `per_user_daily_cost_usd` in `cdk.json` (USD; see the [README](../README.md#per-user-daily-cost-limit)) and run Phase 3:
+
+```bash
+./scripts/deploy.sh --phase3 --manifest .runtime/runtime-v2.json
+```
+
+- **No deploy order is needed.** Phase 3 deploys the token-metrics Lambda, which writes the daily usage items (`USAGE#<user ID>` / `DAY#<day>` in the identity table), and the Router and Cron Lambdas, which read them. A user without an item for today has no usage, so nothing is refused before the new token-metrics Lambda runs, and its items change nothing while nobody reads them. No bridge image change is involved.
+- **The first day is counted from the upgrade.** The items start with the first call the new token-metrics Lambda processes, so on the day it is deployed earlier calls are not in the count.
+- **Turning it off:** set it to `0` and run Phase 3 again. The Router and Cron then read no usage before a turn; `/usage` keeps working, and the items keep being written.
+- **Overrides and inspection:** `scripts/manage-allowlist.sh set-cap`, `clear-cap` and `usage`. They need DynamoDB `GetItem`, `PutItem`, `DeleteItem` and `Query` on the identity table.
+- **Alarm:** `openclaw-token-metrics-errors` fires when the token-metrics Lambda fails or logs a record or usage item it could not write (`Failed to process log event`, `Usage aggregate not written`) within an hour. That usage is missing from the count.
 
 ## Run tests
 

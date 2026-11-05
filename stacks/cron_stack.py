@@ -25,7 +25,7 @@ import cdk_nag
 from constructs import Construct
 
 from stacks import DeploymentNamer, retention_days
-from stacks.context_limits import reserved_concurrency
+from stacks.context_limits import per_user_daily_cost_usd, reserved_concurrency
 
 
 class CronStack(Stack):
@@ -64,6 +64,8 @@ class CronStack(Stack):
         # either way, so no schedule changes in either direction.
         cron_async = str(self.node.try_get_context("cron_async") if self.node.try_get_context("cron_async")
                          is not None else "true").lower() not in ("false", "0", "no", "off")
+        # Per-user daily cost limit (USD), validated at synth; None = off.
+        daily_cost_limit = per_user_daily_cost_usd(self)
         namer = DeploymentNamer.from_scope(self)
         schedule_group_name = namer.name("openclaw-cron")
         scheduler_role_name = namer.name(f"openclaw-cron-scheduler-role-{region}")
@@ -143,6 +145,8 @@ class CronStack(Stack):
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
                 "USER_FILES_BUCKET": user_files_bucket_name,
                 "CRON_ASYNC_STATE_MACHINE_ARN": state_machine_arn if cron_async else "",
+                # Set only when the limit is on, so the default (0) leaves the function unchanged.
+                **({"PER_USER_DAILY_COST_USD": daily_cost_limit} if daily_cost_limit else {}),
             },
             log_group=cron_log_group,
         )

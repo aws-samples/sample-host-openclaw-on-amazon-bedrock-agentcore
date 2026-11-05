@@ -12,6 +12,9 @@
 #   ./scripts/manage-allowlist.sh enable telegram:123456
 #   ./scripts/manage-allowlist.sh list
 #   ./scripts/manage-allowlist.sh whois user_0123456789abcdef
+#   ./scripts/manage-allowlist.sh set-cap telegram:123456 5           (daily cost limit in USD; see README)
+#   ./scripts/manage-allowlist.sh clear-cap telegram:123456
+#   ./scripts/manage-allowlist.sh usage telegram:123456
 #
 # Uses the openclaw-identity DynamoDB table.
 # Requires: aws cli, jq, appropriate IAM permissions.
@@ -24,6 +27,14 @@
 #     every linked channel and every scheduled task is refused from the next
 #     turn.
 #   * `enable <channel:user_id>` clears it.
+#   * `set-cap <channel:user_id> <usd>` sets the daily cost limit of the internal
+#     user the channel identity is bound to (USAGE#<id>/CAP), replacing
+#     per_user_daily_cost_usd for that user; 0 exempts the user. A linked user has
+#     one limit across channels; a Telegram group, Slack channel or Feishu group
+#     chat identity has its own. It applies only while per_user_daily_cost_usd in
+#     cdk.json is above 0.
+#   * `clear-cap <channel:user_id>` removes it (back to per_user_daily_cost_usd).
+#   * `usage <channel:user_id>` prints today's (UTC) estimated usage and the override.
 
 set -euo pipefail
 
@@ -60,7 +71,7 @@ ddb_key() {
 }
 
 usage() {
-    echo "Usage: $0 {add|remove|disable|enable|list} [channel:user_id]"
+    echo "Usage: $0 {add|remove|disable|enable|list|whois|set-cap|clear-cap|usage} [channel:user_id] [usd]"
     echo ""
     echo "Commands:"
     echo "  add     <channel:user_id>  — Allow a user to register (e.g. telegram:123456)"
@@ -69,6 +80,11 @@ usage() {
     echo "  enable  <channel:user_id>  — Undo disable"
     echo "  list                       — List all allowed users"
     echo "  whois   <user_id>          — List the channel actors linked to an internal user ID"
+    echo "  set-cap <channel:user_id> <usd>"
+    echo "                             — Daily cost limit for a registered user (0 = no limit); applies"
+    echo "                               while per_user_daily_cost_usd in cdk.json is above 0"
+    echo "  clear-cap <channel:user_id> — Back to the per_user_daily_cost_usd default"
+    echo "  usage   <channel:user_id>  — Today's (UTC) estimated usage and the user's limit override"
     echo ""
     echo "  A Telegram group is allowed with telegram_group:<chat_id> (e.g. telegram_group:-1001234567890)."
     echo "  With channel_identity_mode \"channel\", a Slack channel is allowed with slack_channel:<channel_id>"
@@ -210,6 +226,78 @@ cmd_whois() {
     printf '%s\n' "$actors"
 }
 
+# A USD amount from 0 to 10000, the range per_user_daily_cost_usd accepts. It is
+# written as a DynamoDB number with jq, so it must be a plain decimal number.
+validate_usd() {
+    if ! [[ "$1" =~ ^([0-9]{1,4}(\.[0-9]{1,6})?|10000(\.0{1,6})?)$ ]]; then
+        echo "ERROR: expected an amount in USD from 0 to 10000 (e.g. 5 or 2.50)" >&2
+        exit 1
+    fi
+}
+
+# Per-user daily cost limit (per_user_daily_cost_usd). The override lives on
+# USAGE#<id>/CAP, outside the USER#<id> partition the agent can write; the
+# Router and the cron Lambda read it before every turn while the limit is on.
+cmd_set_cap() {
+    local channel_key="$1" usd="$2"
+    validate_channel_key "$channel_key"
+    validate_usd "$usd"
+    require_jq
+    local user_id now_iso item
+    user_id=$(resolve_user_id "$channel_key")
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    item=$(jq -cn --arg pk "USAGE#${user_id}" --arg usd "$usd" --arg t "$now_iso" \
+        '{PK:{S:$pk},SK:{S:"CAP"},dailyCostUsd:{N:$usd},setAt:{S:$t}}')
+
+    echo "Setting the daily cost limit of $user_id (bound to $channel_key) to \$$usd..."
+    aws_ddb put-item --item "$item"
+    if [[ "$usd" =~ ^0+(\.0+)?$ ]]; then
+        echo "Done. $user_id has no daily cost limit."
+    else
+        echo "Done. $user_id is limited to \$$usd of estimated cost per UTC day."
+    fi
+    echo "Note: the override applies only while per_user_daily_cost_usd in cdk.json is above 0."
+}
+
+cmd_clear_cap() {
+    local channel_key="$1"
+    validate_channel_key "$channel_key"
+    require_jq
+    local user_id
+    user_id=$(resolve_user_id "$channel_key")
+
+    echo "Removing the daily cost limit override of $user_id (bound to $channel_key)..."
+    aws_ddb delete-item --key "$(ddb_key "USAGE#${user_id}" CAP)"
+    echo "Done. $user_id has the per_user_daily_cost_usd default from cdk.json."
+}
+
+cmd_usage() {
+    local channel_key="$1"
+    validate_channel_key "$channel_key"
+    require_jq
+    local user_id today values items
+    user_id=$(resolve_user_id "$channel_key")
+    today=$(date -u +"%Y-%m-%d")
+    values=$(jq -cn --arg pk "USAGE#${user_id}" --arg day "DAY#${today}" \
+        '{":pk":{S:$pk},":cap":{S:"CAP"},":day":{S:$day}}')
+    items=$(aws_ddb query \
+        --key-condition-expression "PK = :pk AND SK BETWEEN :cap AND :day" \
+        --expression-attribute-values "$values" \
+        --output json)
+    [ -n "$items" ] || items='{"Items":[]}'
+    printf '%s' "$items" | jq -r --arg user "$user_id" --arg today "$today" '
+        (.Items // []) as $items
+        | (first($items[] | select(.SK.S == ("DAY#" + $today))) // {}) as $day
+        | (first($items[] | select(.SK.S == "CAP")) // null) as $cap
+        | "Usage of \($user) on \($today) (UTC), estimated:",
+          "  cost:        $\($day.costUsd.N // "0") (scheduled tasks: $\($day.cronCostUsd.N // "0"))",
+          "  model calls: \($day.calls.N // "0") (scheduled tasks: \($day.cronCalls.N // "0"))",
+          "  tokens:      \($day.inputTokens.N // "0") in, \($day.outputTokens.N // "0") out",
+          "  limit:       " + (if $cap == null then "per_user_daily_cost_usd from cdk.json (no override)"
+                             elif ($cap.dailyCostUsd.N | tonumber) == 0 then "none (override 0, set \($cap.setAt.S // "?"))"
+                             else "$\($cap.dailyCostUsd.N) (override, set \($cap.setAt.S // "?"))" end)'
+}
+
 # channel_key is written into DynamoDB keys, so it must not contain quotes,
 # backslashes, braces or whitespace (jq also escapes it, as a second layer).
 # The ID part covers every channel's user IDs (numeric, Slack/LINE IDs,
@@ -266,6 +354,18 @@ case "$1" in
     whois)
         [ $# -lt 2 ] && usage
         cmd_whois "$2"
+        ;;
+    set-cap)
+        [ $# -lt 3 ] && usage
+        cmd_set_cap "$2" "$3"
+        ;;
+    clear-cap)
+        [ $# -lt 2 ] && usage
+        cmd_clear_cap "$2"
+        ;;
+    usage)
+        [ $# -lt 2 ] && usage
+        cmd_usage "$2"
         ;;
     *)
         usage

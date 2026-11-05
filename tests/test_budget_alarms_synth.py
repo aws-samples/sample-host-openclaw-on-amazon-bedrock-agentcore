@@ -53,6 +53,8 @@ def _synth(**context):
         invocation_log_group=observability.invocation_log_group,
         alarm_topic=observability.alarm_topic,
         cmk_arn=security.cmk.key_arn,
+        identity_table_name="openclaw-identity",
+        identity_table_arn=f"arn:aws:dynamodb:{_REGION}:{_ACCOUNT}:table/openclaw-identity",
         env=env,
     )
     return Template.from_stack(token), Template.from_stack(observability)
