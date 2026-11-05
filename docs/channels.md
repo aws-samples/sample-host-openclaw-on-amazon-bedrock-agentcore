@@ -181,12 +181,13 @@ Discord delivers ordinary chat messages only over its Gateway websocket, which a
 Security model:
 - Every request must carry `X-Signature-Ed25519` over `X-Signature-Timestamp` + raw body, verified with the application's public key (OpenSSL Ed25519 via the system `libcrypto`, no extra packages) before the body is parsed. Missing or invalid signatures get 401, which Discord also tests when you save the endpoint URL.
 - Timestamps more than 5 minutes off are rejected, and interaction IDs are recorded for an hour so a replayed request runs once.
-- Interactions for another application ID, from bot users, or for unknown commands are refused. Replies go back through the interaction's webhook (no bot token needed at runtime), with mentions disabled so model output can't ping `@everyone`. In servers, replies are visible only to the person who ran the command.
+- Interactions for another application ID, from bot users, or for unknown commands are refused. Replies go back through the interaction's webhook (the Router needs no bot token), with mentions disabled so model output can't ping `@everyone`. In servers, replies are visible only to the person who ran the command.
+- Scheduled-task results have no interaction to reply to, so the Cron Lambda sends them as a DM from the bot, using the `botToken` in the secret, with mentions disabled. The Cron Lambda's IAM policy reads this one secret, and its Discord requests refuse HTTP redirects, so the token is only sent to `discord.com`.
 - Same allowlist and `link` account binding as other channels. User IDs are `discord:<user ID>`.
 
 1. Create an application at the [Discord Developer Portal](https://discord.com/developers/applications).
 2. On **General Information**, copy the **Application ID** and **Public Key**.
-3. On **Bot**, reset and copy the **token** (only `scripts/setup-discord.py` uses it, to register commands). Privileged intents are not needed.
+3. On **Bot**, reset and copy the **token**. `scripts/setup-discord.py` uses it to register commands, and the Cron Lambda uses it to DM scheduled-task results. Privileged intents are not needed.
 4. Store the config:
    ```bash
    aws secretsmanager update-secret \
@@ -205,7 +206,9 @@ Security model:
    ./scripts/manage-allowlist.sh add discord:YOUR_USER_ID
    ```
 
-Limits: one `/ask` is one turn; the reply must arrive within Discord's 15-minute interaction window and is split into 1,900-character messages. Images can be attached with the `image` option (JPEG, PNG, GIF, WebP, up to 3.75 MB). Scheduled-task (cron) results are not delivered to Discord yet, because delivery outside an interaction needs the bot to DM the user with its bot token.
+Limits: one `/ask` is one turn; the reply must arrive within Discord's 15-minute interaction window and is split into 1,900-character messages. Images can be attached with the `image` option (JPEG, PNG, GIF, WebP, up to 3.75 MB).
+
+Scheduled-task (cron) results, and the notice sent when a scheduled task fails, arrive as a DM from the bot, split into 1,900-character messages. Discord only lets a bot DM users it can reach, which normally means the user shares a server with the bot (install it with **Guild Install** in a server you are in) and allows DMs from that server's members. Otherwise Discord answers 403, and the result is not delivered; the Cron Lambda logs the HTTP status and Discord's error code (for example `50007`), not the message. Without `botToken` in the secret, scheduled tasks still run but their results are not delivered.
 
 ## LINE
 

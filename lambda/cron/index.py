@@ -2,7 +2,7 @@
 
 Receives a scheduled event payload, warms up the user's AgentCore session
 if cold, sends the cron message, and delivers the response to the user's
-channel (Telegram, Slack or Feishu).
+channel (Telegram, Slack, Feishu, WhatsApp, LINE or Discord).
 """
 
 import hashlib
@@ -22,6 +22,7 @@ from botocore.exceptions import ClientError
 from runtime_routing import RouteUnavailable, admit_route, is_unknown_outcome, resolve_route
 import whatsapp
 import line_channel
+import discord_channel
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
 from runtime_invocation import RELEASE_RESERVE_SECONDS, InvocationTransportError, invoke_bounded
 
@@ -35,6 +36,7 @@ SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 FEISHU_TOKEN_SECRET_ID = os.environ.get("FEISHU_TOKEN_SECRET_ID", "")
 WHATSAPP_TOKEN_SECRET_ID = os.environ.get("WHATSAPP_TOKEN_SECRET_ID", "")
 LINE_TOKEN_SECRET_ID = os.environ.get("LINE_TOKEN_SECRET_ID", "")
+DISCORD_TOKEN_SECRET_ID = os.environ.get("DISCORD_TOKEN_SECRET_ID", "")
 FEISHU_API_DOMAIN = os.environ.get("FEISHU_API_DOMAIN", "https://open.feishu.cn")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
@@ -1026,6 +1028,15 @@ def deliver_response(channel, channel_target, response_text):
             return
         if not line_channel.send_text(config, channel_target, response_text):
             logger.error("Cron response to LINE was not delivered")
+    elif channel == "discord":
+        # No interaction to answer, so the bot DMs the user (channel_target is their user ID).
+        raw = _get_secret(DISCORD_TOKEN_SECRET_ID) if DISCORD_TOKEN_SECRET_ID else ""
+        bot_token = discord_channel.parse_bot_token(raw)
+        if not bot_token:
+            logger.error("Discord bot token not configured; cron response not delivered")
+            return
+        if not discord_channel.send_dm(bot_token, channel_target, response_text):
+            logger.error("Cron response to Discord was not delivered")
     else:
         logger.warning("Unknown channel type: %s", channel)
 

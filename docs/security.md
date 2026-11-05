@@ -170,7 +170,7 @@ Seven system secrets are stored in AWS Secrets Manager, all encrypted with the p
 | `openclaw/cognito-user/<poolId>/<namespace>` | Per-user random Cognito password (execution role only) |
 | `openclaw/channels/telegram` | Telegram Bot API token |
 | `openclaw/channels/slack` | Slack bot token + signing secret (JSON) |
-| `openclaw/channels/discord` | Discord bot token (placeholder) |
+| `openclaw/channels/discord` | Discord application ID, public key and bot token (JSON; placeholder until set). The Router verifies interactions with the public key; the Cron Lambda DMs scheduled-task results with the bot token |
 | `openclaw/channels/whatsapp` | WhatsApp bot token (placeholder) |
 
 #### Per-User API Key Storage (Secrets Manager)
