@@ -17,6 +17,50 @@ Use the identity table's saved V2 route when inspecting or stopping a test sessi
 
 Unknown invocation outcomes retain `activeAdmissions` and `inFlight`. Reconcile the exact invocation before changing state; do not clear ownership records or admission tokens to force a new registration.
 
+## Deleting a user's data
+
+`scripts/delete_user_data.py` erases one user: every linked channel, the session, schedules, files, secrets, the Cognito user, token-usage rows, container log streams and identity records. This is a deliberate end-of-life action, not a reset; to block a user without deleting anything, use `manage-allowlist.sh disable`. The tool is a dry run unless `--apply` is given:
+
+```bash
+uv run --no-project --python .venv-deploy/bin/python python scripts/delete_user_data.py \
+  --actor telegram:123456789 --region "$CDK_DEFAULT_REGION"          # dry run: lists what it would delete
+uv run --no-project --python .venv-deploy/bin/python python scripts/delete_user_data.py \
+  --actor telegram:123456789 --region "$CDK_DEFAULT_REGION" --apply  # deletes
+```
+
+- **Who:** `--actor` takes any of the user's channel identities, and `--user-id user_<16 hex>` the internal user ID. Add `--env-suffix S`, or set `OPENCLAW_ENV_SUFFIX`, for a suffixed deployment. Table, bucket and pool names come from the stacks' CloudFormation outputs, and the schedule group from the suffix.
+- **Order:**
+  1. Revoke: `ALLOW#` records are deleted, and PROFILE gets `accessStatus = DISABLED`, as `disable` does.
+  2. Stop: the route is frozen and the AgentCore session is stopped.
+  3. Delete: schedules and `CRON#` records; every S3 object version and delete marker under `<namespace>/` and `_system/<namespace>/`, checked empty afterwards; `openclaw/user/<namespace>/*` and the Cognito password secret; the Cognito user; token-usage rows; and `/openclaw/container` log streams.
+  4. Identity records go last.
+- **Secrets:** they are deleted with a 7-day recovery window. `--force-delete-secrets` deletes them at once.
+- **Refusals:** the tool refuses (exit 3) while the route holds invocation admissions, which means a turn is running or an unknown outcome needs reconciling (see Inspect sessions). It also refuses when the identity records disagree. When it refuses or a call fails (exit 1), re-run the same command: every step lists before it deletes, so a re-run finishes the job.
+- **Ownership checks:** records outside the user's `USER#<id>` partition (`CHANNEL#`, `ACTOR#` and `NS#`) decide which actors and namespaces belong to the user. A `CRON#` record or back-reference in the partition that points elsewhere is reported and left alone.
+- **Output:** the user appears by internal user ID only. A successful `--apply` ends with `AUDIT: user_<id> data deleted <date>`; keep that line.
+- **Shared resources:** api-key secrets (`openclaw/user/<namespace>/*`) and the `/openclaw/container` log group are shared by every deployment in the account and region. Deleting the user in one deployment removes these copies for the others too.
+- **Not deleted:** a Telegram group the user allowlisted stays allowlisted; its `addedBy` is reported. Also not deleted:
+  - CloudTrail history;
+  - Step Functions history of async scheduled runs;
+  - events in shared log groups, until their retention ends;
+  - ActorId metrics from before #230;
+  - point-in-time recovery copies, for 35 days;
+  - secrets inside their recovery window;
+  - AgentCore session storage, until it expires;
+  - mentions in other identities' data.
+
+  The tool prints this list at the end of every run.
+- **Re-registration:** with the ownership record gone, the same actor can register again (for example, when allowlisted). It gets the same internal user ID and an empty namespace.
+- **Permissions:** the operator needs:
+  - `cloudformation:DescribeStacks`;
+  - DynamoDB `GetItem`, `Query`, `Scan`, `UpdateItem` and `DeleteItem` on the identity and token tables;
+  - `s3:ListBucketVersions` and `s3:DeleteObjectVersion` on the user-files bucket;
+  - `scheduler:ListSchedules`, `GetSchedule` and `DeleteSchedule`;
+  - `secretsmanager:ListSecrets`, `DescribeSecret` and `DeleteSecret`;
+  - `cognito-idp:AdminDeleteUser`;
+  - `logs:DescribeLogStreams` and `DeleteLogStream`;
+  - `bedrock-agentcore:StopRuntimeSession`.
+
 ## Deploy a new bridge version
 
 Install the `uv` environments described in [Quick Start](../README.md#quick-start). Set `image_version` or supply a reviewed ARM64 image. Preserve the previous release manifest, choose an unused endpoint name, then run:
@@ -67,6 +111,7 @@ cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test com
 PYTHONPATH=lambda/shared/python:lambda/router uv run --no-project --python .venv/bin/python python -m pytest lambda/router -q
 PYTHONPATH=lambda/shared/python:lambda/cron uv run --no-project --python .venv/bin/python python -m pytest lambda/cron -q
 uv run --no-project --python .venv/bin/python python -m pytest tests/test_agentcore_exec.py -v                     # operator CLI tests (mocked boto3)
+uv run --no-project --python .venv/bin/python python -m pytest tests/test_delete_user_data.py -v                  # user data deletion tool (stubbed AWS clients)
 uv run --no-project --python .venv/bin/python python -m pytest tests/test_guardrail_eval.py -v                     # guardrail eval script tests (stubbed ApplyGuardrail)
 uv run --no-project --python .venv/bin/python python -m pytest tests/test_state_bucket_lifecycle_synth.py -v       # user-files bucket lifecycle rules (synth, no AWS)
 uv run --no-project --python .venv/bin/python python -m pytest tests/test_gateway_stack_synth.py -v                # OpenClawGateway synth: flag off leaves the 8 templates unchanged, flag on adds the stack (10 tests, no AWS)
