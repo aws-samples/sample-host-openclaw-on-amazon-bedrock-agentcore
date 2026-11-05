@@ -190,9 +190,11 @@ class TestExtract(unittest.TestCase):
         self.assertTrue(events[0]["redelivery"])
         self.assertEqual(line_channel.extract_events(_payload(_event(ts=time.time() - 7200, redelivery=True))), [])
 
-    def test_groups_standby_and_unsupported_dropped(self):
+    def test_groups_standby_and_non_message_events_dropped(self):
+        # Stickers and other media are kept as unsupported items (test_unsupported_messages.py).
         for ev in (_event(source={"type": "group", "groupId": "C" + "0" * 32, "userId": USER_ID}),
-                   _event(mode="standby"), _event(msg_type="sticker"),
+                   _event(mode="standby"), _event(source={"type": "group", "groupId": "C" + "0" * 32,
+                                                          "userId": USER_ID}, msg_type="sticker"),
                    _event(source={"type": "user", "userId": "not-a-line-id"}),
                    {**_event(), "type": "follow"}):
             self.assertEqual(line_channel.extract_events(_payload(ev)), [], ev)

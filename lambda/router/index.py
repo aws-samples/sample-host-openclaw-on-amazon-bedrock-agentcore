@@ -42,6 +42,7 @@ from documents import (
     MAX_DOCUMENT_BYTES,
     MAX_DOCUMENT_LABEL,
     ZipListingError,
+    accepted_text,
     build_document_message,
     classify_document,
     zip_listing,
@@ -53,6 +54,7 @@ import line_channel
 import telegram_album
 import telegram_group
 import channel_identity
+import unsupported_media
 import usage_limits
 
 logger = logging.getLogger()
@@ -2051,6 +2053,12 @@ BAD_ZIP_REPLY = (
 )
 
 
+def unsupported_reply(channel):
+    """The notice for a message the bot cannot read yet (a voice note, a video, a
+    sticker, a file of another type, ...). Plain text, so no channel reformats it."""
+    return f"Sorry, I can only read {accepted_text(channel)} for now."
+
+
 def _download_telegram_document(file_id, token, max_bytes=MAX_DOCUMENT_BYTES):
     """Download a Telegram document of at most ``max_bytes``.
 
@@ -2149,6 +2157,20 @@ def _slack_addresses_bot(event_data, event):
     if not bot_user_id or not isinstance(text, str):
         return False
     return f"<@{bot_user_id}>" in text or f"<@{bot_user_id}|" in text
+
+
+def _slack_file_kinds(files):
+    """The MIME types of Slack files, for logs (never their names)."""
+    return ",".join(unsupported_media.mime_type(f.get("mimetype")) or "unknown" for f in files)
+
+
+def _with_files_note(text, other_files, has_image):
+    """text, plus a note for the agent naming the files the bot cannot read yet."""
+    if not other_files:
+        return text
+    note = unsupported_media.note(
+        unsupported_media.files_label([f.get("mimetype") for f in other_files]), text_only=not has_image)
+    return text + note if text else note.lstrip("\n")
 
 
 def _is_bind_command(text):
@@ -2308,12 +2330,21 @@ def _telegram_document_kind(document, doc_mime, reply):
     return doc_kind
 
 
-def _telegram_agent_message(message, text, document, doc_kind, has_image, namespace, token, reply):
+def _telegram_agent_message(message, text, document, doc_kind, has_image, namespace, token, reply,
+                            unsupported=None):
     """Build the agent payload, storing any file or image under namespace.
 
     Returns the plain text, or a structured message for a file or image, or
     None after replying with the reason a file or image could not be used.
+    unsupported is the kind of media the bot cannot read (unsupported_media):
+    with text, the text gets a note naming it; without, the reply is the notice.
     """
+    if unsupported:
+        if not text:
+            logger.info("Telegram: unsupported message kind=%s", unsupported)
+            reply(unsupported_reply("telegram"))
+            return None
+        return text + unsupported_media.note(unsupported_media.label(unsupported))
     if doc_kind:
         doc_bytes, reason = _download_telegram_document(document.get("file_id"), token)
         if reason == "too_large":
@@ -2388,8 +2419,10 @@ def handle_telegram(body):
     has_image = bool(message.get("photo") or doc_mime in ALLOWED_IMAGE_TYPES)
     # Any other document is handled as a file (accepted or rejected with a reply).
     has_document = bool(document) and not has_image
+    # A voice note, video, sticker, location, ... the bot cannot read yet.
+    unsupported = None if (has_image or has_document) else unsupported_media.telegram_kind(message)
 
-    if not chat_id or not user_id_tg or (not text and not has_image and not has_document):
+    if not chat_id or not user_id_tg or (not text and not has_image and not has_document and not unsupported):
         logger.info("Telegram: ignoring non-text/non-image or missing-user message")
         return
 
@@ -2400,7 +2433,7 @@ def handle_telegram(body):
     # A group is never answered as the sender's personal session.
     kind = telegram_group.chat_kind(message)
     if kind == "group":
-        _handle_telegram_group(message, text, document, doc_mime, has_image, has_document)
+        _handle_telegram_group(message, text, document, doc_mime, has_image, has_document, unsupported)
         return
     if kind != "private":
         logger.info("Telegram: ignoring message from an unsupported chat type")
@@ -2434,6 +2467,13 @@ def handle_telegram(body):
             f"Send this ID to the bot admin to request access.",
             token,
         )
+        return
+
+    # Media the bot cannot read and no text: the notice, no turn. An album item
+    # goes on to the album, which answers once for all its items.
+    if unsupported and not text and not message.get("media_group_id"):
+        logger.info("Telegram: unsupported message kind=%s", unsupported)
+        reply(unsupported_reply("telegram"))
         return
 
     session_id = _route_or_reply(resolved_user_id, reply)
@@ -2477,9 +2517,10 @@ def handle_telegram(body):
             return
 
     # The items of an album share one turn and one reply (telegram_album.py).
-    # An item's own failure reply is held: the album reports failures once.
+    # An item's own failure reply or notice is held: the album answers once.
     album = None if has_document else telegram_album.join(
-        message, text, resolved_user_id, has_image, telegram_album.DynamoAlbumStore(identity_table), reply)
+        message, text, resolved_user_id, has_image, telegram_album.DynamoAlbumStore(identity_table), reply,
+        notice=unsupported_reply("telegram"))
     if album is not None:
         if album.duplicate:
             return
@@ -2490,7 +2531,8 @@ def handle_telegram(body):
 
     # Build message payload (structured if image, plain string if text-only)
     namespace = session_id.namespace if (doc_kind or has_image) else None
-    agent_message = _telegram_agent_message(message, text, document, doc_kind, has_image, namespace, token, reply)
+    agent_message = _telegram_agent_message(
+        message, text, document, doc_kind, has_image, namespace, token, reply, unsupported)
     if album is not None:
         agent_message = album.finish(agent_message)
     if agent_message is None:
@@ -2667,10 +2709,18 @@ def _is_disabled_telegram_sender(user_id_tg):
         return True
 
 
-def _handle_telegram_group(message, text, document, doc_mime, has_image, has_document):
-    """Answer a group message as the group's own identity, never the sender's."""
+def _handle_telegram_group(message, text, document, doc_mime, has_image, has_document, unsupported=None):
+    """Answer a group message as the group's own identity, never the sender's.
+
+    unsupported: the kind of media the bot cannot read (unsupported_media). An
+    addressed message without text gets the notice; stickers and dice are
+    ignored, as reactions rather than requests.
+    """
     if not TELEGRAM_GROUPS_ENABLED:
         logger.info("Telegram: group message ignored (telegram_groups_enabled is off)")
+        return
+    if unsupported in unsupported_media.TELEGRAM_GROUP_SILENT_KINDS:
+        logger.info("Telegram: group message ignored (kind=%s)", unsupported)
         return
     group_id = str((message.get("chat") or {}).get("id", ""))
     user = message.get("from") or {}
@@ -2716,6 +2766,10 @@ def _handle_telegram_group(message, text, document, doc_mime, has_image, has_doc
     if group_user_id is None:
         logger.warning("Telegram: group %s has no usable identity (disabled or not enrolled)", group_id)
         return
+    if unsupported and not text:
+        logger.info("Telegram group: unsupported message kind=%s", unsupported)
+        reply(unsupported_reply(telegram_group.CHANNEL))
+        return
     route = _route_or_reply(group_user_id, reply)
     if route is None:
         return
@@ -2736,7 +2790,7 @@ def _handle_telegram_group(message, text, document, doc_mime, has_image, has_doc
     namespace = route.namespace
     agent_message = _telegram_agent_message(
         message, telegram_group.agent_text(user, text or "hi"), document, doc_kind, has_image,
-        namespace, token, reply,
+        namespace, token, reply, unsupported,
     )
     if agent_message is None:
         return
@@ -2993,8 +3047,13 @@ def _is_disabled_sender(channel_key):
         return True
 
 
-def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, image_files, in_thread, bot_token):
-    """Answer a Slack channel, private channel or group DM as its own identity, never the sender's."""
+def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, image_files, in_thread, bot_token,
+                          other_files=()):
+    """Answer a Slack channel, private channel or group DM as its own identity, never the sender's.
+
+    other_files: attached files the bot cannot read yet. Alone they get the
+    notice; with text, the agent is told about them.
+    """
     if not channel_identity.SLACK_CONVERSATION_ID_RE.fullmatch(channel_id):
         logger.info("Slack: channel message ignored (malformed conversation ID)")
         return
@@ -3027,6 +3086,10 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
     if channel_user_id is None:
         logger.warning("Slack: channel %s has no usable identity (disabled or not enrolled)", channel_id)
         return
+    if other_files and not text and not has_image:
+        logger.info("Slack channel: unsupported message kinds=%s", _slack_file_kinds(other_files))
+        reply(unsupported_reply(channel_identity.SLACK))
+        return
     route = _route_or_reply(channel_user_id, reply)
     if route is None:
         return
@@ -3037,7 +3100,8 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
         return
 
     message_text = channel_identity.agent_text(
-        "Slack channel", _slack_member_name(event, slack_user_id, bot_token), text)
+        "Slack channel", _slack_member_name(event, slack_user_id, bot_token),
+        _with_files_note(text, other_files, has_image))
     agent_message = message_text
     if has_image:
         image_bytes, content_type, _ = _download_slack_file(image_files[0], bot_token)
@@ -3069,8 +3133,13 @@ def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, im
     reply(_extract_text_from_content_blocks(result.get("response", "Sorry, I couldn't process your message.")))
 
 
-def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image):
-    """Answer a Feishu group chat as its own identity, never the sender's."""
+def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image, unsupported=None, note=""):
+    """Answer a Feishu group chat as its own identity, never the sender's.
+
+    unsupported: the kind of a message the bot cannot read (then there is no
+    text), answered with the notice. note: the line for the agent naming what
+    a rich-text post left out.
+    """
     if not channel_identity.FEISHU_CHAT_ID_RE.fullmatch(chat_id):
         logger.info("Feishu: group message ignored (malformed chat ID)")
         return
@@ -3101,6 +3170,10 @@ def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_im
     if group_user_id is None:
         logger.warning("Feishu: group %s has no usable identity (disabled or not enrolled)", chat_id)
         return
+    if unsupported:
+        logger.info("Feishu group: unsupported message kind=%s", unsupported)
+        send_feishu_message(chat_id, unsupported_reply(channel_identity.FEISHU))
+        return
     route = _route_or_reply(group_user_id, lambda reply_text: send_feishu_message(chat_id, reply_text))
     if route is None:
         return
@@ -3111,7 +3184,7 @@ def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_im
         return
 
     name = _feishu_member_name(sender_id)
-    agent_message = channel_identity.agent_text("Feishu group", name, text or "hi")
+    agent_message = channel_identity.agent_text("Feishu group", name, (text or "hi") + note)
     if has_image:
         image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
         if not image_bytes:
@@ -3222,14 +3295,14 @@ def handle_slack(body, headers=None):
     slack_user_id = event.get("user", "")
     channel_id = event.get("channel", "")
 
-    # Detect image files attached to the message (strict allowed-type check)
-    image_files = [
-        f for f in (event.get("files") or [])
-        if f.get("mimetype", "") in ALLOWED_IMAGE_TYPES
-    ]
+    # Detect image files attached to the message (strict allowed-type check).
+    # Any other file is one the bot cannot read yet.
+    files = [f for f in (event.get("files") or []) if isinstance(f, dict)]
+    image_files = [f for f in files if f.get("mimetype", "") in ALLOWED_IMAGE_TYPES]
+    other_files = [f for f in files if f.get("mimetype", "") not in ALLOWED_IMAGE_TYPES]
     has_image = bool(image_files)
 
-    if not slack_user_id or not channel_id or (not text and not has_image):
+    if not slack_user_id or not channel_id or (not text and not has_image and not other_files):
         return {"statusCode": 200, "body": "ok"}
 
     if len(slack_user_id) > 128:
@@ -3254,7 +3327,8 @@ def handle_slack(body, headers=None):
     # channel_identity_mode "channel": a channel, private channel or group DM is
     # answered as its own identity (channel_identity.py). 1:1 DMs (D...) stay personal.
     if not is_dm and _channel_identity_on() and not channel_id.startswith("D"):
-        _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, image_files, in_thread, bot_token)
+        _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, image_files, in_thread, bot_token,
+                              other_files)
         return {"statusCode": 200, "body": "ok"}
 
     # Handle bind commands BEFORE allowlist check — cross-channel binding
@@ -3284,6 +3358,12 @@ def handle_slack(body, headers=None):
                 f"Send this ID to the bot admin to request access.",
                 bot_token,
             )
+        return {"statusCode": 200, "body": "ok"}
+
+    # Only files the bot cannot read: the notice, no turn.
+    if other_files and not text and not has_image:
+        logger.info("Slack: unsupported message kinds=%s", _slack_file_kinds(other_files))
+        send_slack_message(channel_id, unsupported_reply("slack"), bot_token, **in_thread)
         return {"statusCode": 200, "body": "ok"}
 
     session_id = _route_or_reply(
@@ -3323,7 +3403,8 @@ def handle_slack(body, headers=None):
         return {"statusCode": 200, "body": "ok"}
 
     # Build message payload (structured if image, plain string if text-only)
-    agent_message = text
+    message_text = _with_files_note(text, other_files, has_image)
+    agent_message = message_text
     if has_image:
         namespace = session_id.namespace
         # Use first image file
@@ -3332,7 +3413,7 @@ def handle_slack(body, headers=None):
         if image_bytes:
             s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
             if s3_key:
-                agent_message = _build_structured_message(text, s3_key, content_type)
+                agent_message = _build_structured_message(message_text, s3_key, content_type)
             else:
                 send_slack_message(channel_id, "Sorry, I couldn't process that image. Please try again.", bot_token,
                                    **in_thread)
@@ -3452,15 +3533,25 @@ def handle_feishu(body, headers=None):
     # Parse message content (Feishu wraps content as JSON string)
     try:
         content = json.loads(content_str)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        content = {}
+    if not isinstance(content, dict):
         content = {}
 
+    # Text, an image, or rich text (post) read as plain text. Any other type is
+    # one the bot cannot read yet (unsupported), and its content never reaches
+    # the agent. left_out names images and videos inside a post.
+    left_out, unsupported = "", None
     if msg_type == "text":
-        text = content.get("text", "")
+        text = str(content.get("text", ""))
     elif msg_type == "image":
         text = ""  # Image-only — text may be empty
+    elif msg_type == "post":
+        text, left_out = unsupported_media.flatten_feishu_post(content)
     else:
-        text = content.get("text", str(content))
+        text = ""
+        if msg_type not in unsupported_media.FEISHU_SILENT_TYPES:
+            unsupported = unsupported_media.log_kind(msg_type)
 
     # Group chat: strip @bot mention tags
     chat_type = message.get("chat_type", "p2p")
@@ -3471,8 +3562,12 @@ def handle_feishu(body, headers=None):
             if mention_key:
                 text = text.replace(mention_key, "").strip()
 
+    if left_out and not text:
+        unsupported = "post"  # nothing but images or videos
+    # The agent is told about what a post left out. Set only when there is text.
+    note = unsupported_media.note(left_out) if left_out and text else ""
     has_image = msg_type == "image"
-    if not sender_id or not chat_id or (not text and not has_image):
+    if not sender_id or not chat_id or (not text and not has_image and not unsupported):
         return {"statusCode": 200, "body": "ok"}
 
     if len(sender_id) > 128:
@@ -3482,7 +3577,7 @@ def handle_feishu(body, headers=None):
     # channel_identity_mode "channel": a group chat is answered as its own
     # identity (channel_identity.py). 1:1 (p2p) chats stay personal.
     if message.get("chat_type") != "p2p" and _channel_identity_on():
-        _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image)
+        _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image, unsupported, note)
         return {"statusCode": 200, "body": "ok"}
 
     # Handle bind commands BEFORE allowlist check
@@ -3506,6 +3601,12 @@ def handle_feishu(body, headers=None):
             f"Your ID: feishu:{sender_id}\n\n"
             f"Send this ID to the bot admin to request access.",
         )
+        return {"statusCode": 200, "body": "ok"}
+
+    # A message the bot cannot read (unsupported is set only without text): the notice, no turn.
+    if unsupported:
+        logger.info("Feishu: unsupported message kind=%s", unsupported)
+        send_feishu_message(chat_id, unsupported_reply("feishu"))
         return {"statusCode": 200, "body": "ok"}
 
     session_id = _route_or_reply(resolved_user_id, lambda reply_text: send_feishu_message(chat_id, reply_text))
@@ -3542,7 +3643,7 @@ def handle_feishu(body, headers=None):
         return {"statusCode": 200, "body": "ok"}
 
     # Build message payload (structured if image, plain string if text-only)
-    agent_message = text or "hi"
+    agent_message = (text or "hi") + note
     if has_image:
         namespace = session_id.namespace
         image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
@@ -3657,7 +3758,9 @@ def _handle_whatsapp_message(config, msg):
     wa_id = msg["from"]
     text = msg["text"].strip()
     has_image = bool(msg["image_id"])
-    if not text and not has_image:
+    # Audio, video, a document, ... the bot cannot read yet (whatsapp.UNSUPPORTED_TYPES).
+    unsupported = msg.get("unsupported") and msg.get("type")
+    if not text and not has_image and not unsupported:
         return
 
     actor_id = f"whatsapp:{wa_id}"
@@ -3676,6 +3779,11 @@ def _handle_whatsapp_message(config, msg):
             f"Your ID: whatsapp:{wa_id}\n\n"
             f"Send this ID to the bot admin to request access.",
         )
+        return
+
+    if unsupported and not text:
+        logger.info("WhatsApp: unsupported message kind=%s", unsupported)
+        whatsapp.send_text(config, wa_id, unsupported_reply("whatsapp"))
         return
 
     route = get_or_create_session(resolved_user_id)
@@ -3704,7 +3812,8 @@ def _handle_whatsapp_message(config, msg):
         whatsapp.send_text(config, wa_id, handle_usage_command(resolved_user_id))
         return
 
-    agent_message = text
+    # A caption on a video or document: the caption turn, and the agent is told about the file.
+    agent_message = (text + unsupported_media.note(unsupported_media.label(unsupported))) if unsupported else text
     if has_image:
         namespace = route.namespace
         image_bytes, content_type = whatsapp.download_media(
@@ -3785,7 +3894,9 @@ def _handle_line_event(config, event):
     line_user_id = event["user_id"]
     text = event["text"].strip()
     has_image = bool(event["message_id"])
-    if not text and not has_image:
+    # Audio, video, a file, ... the bot cannot read yet (line_channel.UNSUPPORTED_TYPES).
+    unsupported = event.get("unsupported") and event.get("type")
+    if not text and not has_image and not unsupported:
         return
 
     def reply(message):
@@ -3806,6 +3917,12 @@ def _handle_line_event(config, event):
         reply(f"Sorry, this bot is private and requires an invitation.\n\n"
               f"Your ID: line:{line_user_id}\n\n"
               f"Send this ID to the bot admin to request access.")
+        return
+
+    # These LINE message types carry no text: the notice, with the reply token.
+    if unsupported:
+        logger.info("LINE: unsupported message kind=%s", unsupported)
+        reply(unsupported_reply("line"))
         return
 
     route = get_or_create_session(resolved_user_id)
@@ -3956,6 +4073,14 @@ def _handle_discord_command(command, reply):
         reply(f"Sorry, this bot is private and requires an invitation.\n\n"
               f"Your ID: `discord:{discord_user_id}`\n\n"
               f"Send this ID to the bot admin to request access.")
+        return
+
+    # An attachment that is not an accepted image: the notice, no download and no turn.
+    attachment_type = (unsupported_media.mime_type(attachment.get("content_type"))
+                       if isinstance(attachment, dict) else "")
+    if attachment and attachment_type not in ALLOWED_IMAGE_TYPES:
+        logger.info("Discord: unsupported attachment kind=%s", attachment_type or "unknown")
+        reply(unsupported_reply("discord"))
         return
 
     route = get_or_create_session(resolved_user_id)

@@ -28,6 +28,9 @@ GRAPH_API_BASE = "https://graph.facebook.com"
 _GRAPH_VERSION_RE = re.compile(r"^v\d{1,3}\.\d{1,2}$")
 _PHONE_NUMBER_ID_RE = re.compile(r"^\d{1,32}$")
 _WA_ID_RE = re.compile(r"^\d{1,32}$")
+# Message types the bot cannot read yet: kept so the Router can say so.
+UNSUPPORTED_TYPES = frozenset({"audio", "video", "document", "sticker", "location", "contacts"})
+_CAPTIONED_TYPES = frozenset({"video", "document"})
 _MEDIA_ID_RE = re.compile(r"^\d{1,64}$")
 _CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 
@@ -108,9 +111,13 @@ def verify_subscription(query, verify_token):
 def extract_messages(payload, phone_number_id, now=None):
     """Yield normalized inbound user messages from a webhook payload.
 
-    Each item: {"id", "from", "name", "type", "text", "image_id", "image_mime", "timestamp"}.
-    Messages for another phone number, status updates, unsupported types and
-    messages older than MAX_MESSAGE_AGE_SECONDS are dropped.
+    Each item: {"id", "from", "name", "type", "text", "image_id", "image_mime",
+    "timestamp", "unsupported"}. A message of one of UNSUPPORTED_TYPES is kept
+    with unsupported=True (and the caption of a video or document as its text),
+    so the Router can say it cannot read it. Messages for another phone number,
+    status updates, other types (reactions, buttons, system messages, Meta's own
+    "unsupported" type) and messages older than MAX_MESSAGE_AGE_SECONDS are
+    dropped.
     """
     now = time.time() if now is None else now
     out = []
@@ -159,7 +166,7 @@ def _normalize_message(msg, now):
         return None
     msg_type = msg.get("type")
     item = {"id": msg_id, "from": sender, "type": msg_type, "text": "",
-            "image_id": "", "image_mime": "", "timestamp": ts}
+            "image_id": "", "image_mime": "", "timestamp": ts, "unsupported": False}
     if msg_type == "text":
         item["text"] = str((msg.get("text") or {}).get("body", ""))
     elif msg_type == "image":
@@ -170,6 +177,11 @@ def _normalize_message(msg, now):
         item["image_id"] = media_id
         item["image_mime"] = str(image.get("mime_type", "")).split(";")[0].strip()
         item["text"] = str(image.get("caption", "") or "")
+    elif msg_type in UNSUPPORTED_TYPES:
+        item["unsupported"] = True
+        media = msg.get(msg_type)
+        if msg_type in _CAPTIONED_TYPES and isinstance(media, dict):
+            item["text"] = str(media.get("caption", "") or "")
     else:
         return None
     return item

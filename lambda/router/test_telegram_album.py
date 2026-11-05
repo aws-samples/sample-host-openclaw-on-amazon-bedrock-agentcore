@@ -470,7 +470,7 @@ class TelegramAlbumTurns(AlbumTestCase):
         video = {"video": {"file_id": "video10", "duration": 9, "mime_type": "video/mp4"}}
         self.deliver(update(10, "what do you see?", media=video), (0.1, update(11)), (0.2, update(12)))
         self.assertEqual(self.agent_messages(), [{
-            "text": "what do you see?\n\n[The user also sent video, which cannot be read yet.]",
+            "text": "what do you see?\n\n[The user also sent a video, which cannot be read yet.]",
             "images": [image(11), image(12)],
         }])
         self.assertEqual(self.replies(), 1)
@@ -648,10 +648,14 @@ class AlbumMessage(unittest.TestCase):
              {"text": "one\n\ntwo\n\n[2 photos could not be downloaded.]", "images": [image_of(ready)]}),
             ([ready, {"s": "unsupported", "kind": "video"}, {"s": "unsupported", "kind": "audio"}],
              {"text": "The user sent 1 photo without a message.\n\n"
-                      "[The user also sent video and audio, which cannot be read yet.]",
+                      "[The user also sent a video and an audio file, which cannot be read yet.]",
               "images": [image_of(ready)]}),
             ([{"s": "unsupported", "kind": "video", "c": "look"}],
-             "look\n\n[The user also sent video, which cannot be read yet.]"),
+             "look\n\n[The user also sent a video, which cannot be read yet. Only the text above was received.]"),
+            ([ready, {"s": "unsupported", "kind": "video"}, {"s": "unsupported", "kind": "video"}],
+             {"text": "The user sent 1 photo without a message.\n\n"
+                      "[The user also sent 2 videos, which cannot be read yet.]",
+              "images": [image_of(ready)]}),
             ([{**ready, "c": "  "}], {"text": "The user sent 1 photo without a message.", "images": [image_of(ready)]}),
         ]
         for items, expected in cases:
@@ -662,6 +666,10 @@ class AlbumMessage(unittest.TestCase):
         self.assertEqual(telegram_album.album_message([{"s": "failed"}, {"s": "failed", "c": "hi"}]),
                          (None, telegram_album.ALL_FAILED_REPLY))
         self.assertEqual(telegram_album.album_message([{"s": "unsupported", "kind": "video"}]), (None, None))
+        # Only items the bot cannot read and no caption: the notice instead of a turn.
+        self.assertEqual(telegram_album.album_message([{"s": "unsupported", "kind": "video"}] * 2, notice="N"),
+                         (None, "N"))
+        self.assertEqual(telegram_album.album_message([], notice="N"), (None, None))
 
     def test_join_ignores_updates_that_are_not_album_items(self):
         store = MagicMock()
