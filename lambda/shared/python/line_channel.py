@@ -90,9 +90,11 @@ def extract_events(payload, bot_user_id="", now=None):
     """Return normalized 1:1 user message events from a verified webhook payload.
 
     Each item: {"event_id", "user_id", "reply_token", "type", "text", "message_id",
-    "file_message_id", "file_name", "file_size", "redelivery", "unsupported"}.
-    message_id is set for an image, file_message_id (with the file's name and
-    declared size) for a file. A message of one of UNSUPPORTED_TYPES, or a file
+    "file_message_id", "file_name", "file_size", "audio_message_id",
+    "audio_duration_ms", "redelivery", "unsupported"}. message_id is set for an
+    image, file_message_id (with the file's name and declared size) for a file,
+    and audio_message_id (with the declared duration) for audio stored by LINE,
+    for voice transcription. A message of one of UNSUPPORTED_TYPES, or a file
     without a usable message ID, is kept with unsupported=True, so the Router
     can say it cannot read it.
     Group/room messages, standby-mode events, non-message events, other message
@@ -144,7 +146,7 @@ def _normalize_event(event, now):
     msg_type = message.get("type")
     item = {"event_id": event_id, "user_id": user_id, "reply_token": reply_token, "type": msg_type,
             "text": "", "message_id": "", "file_message_id": "", "file_name": "", "file_size": None,
-            "redelivery": redelivery, "unsupported": False}
+            "audio_message_id": "", "audio_duration_ms": None, "redelivery": redelivery, "unsupported": False}
     if msg_type == "text":
         item["text"] = str(message.get("text", ""))
     elif msg_type == "image":
@@ -162,6 +164,17 @@ def _normalize_event(event, now):
             item["file_size"] = size if isinstance(size, int) and not isinstance(size, bool) else None
         else:
             item["unsupported"] = True
+    elif msg_type == "audio":
+        # Unsupported unless the Router transcribes voice messages; content LINE
+        # stores (not an external provider's) is kept for that.
+        item["unsupported"] = True
+        message_id = str(message.get("id", ""))
+        provider = (message.get("contentProvider") or {}).get("type", "line")
+        if provider == "line" and _MESSAGE_ID_RE.match(message_id):
+            item["audio_message_id"] = message_id
+            duration = message.get("duration")
+            item["audio_duration_ms"] = duration if isinstance(duration, int) and not isinstance(duration, bool) \
+                else None
     elif msg_type in UNSUPPORTED_TYPES:
         item["unsupported"] = True
     else:

@@ -57,6 +57,7 @@ import telegram_group
 import channel_identity
 import unsupported_media
 import usage_limits
+import voice
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -91,6 +92,9 @@ LOG_REPLY_TEXT = os.environ.get("LOG_REPLY_TEXT", "false").lower() == "true"
 # Default daily cost limit per internal user in USD (per_user_daily_cost_usd).
 # 0 = off: no usage is read before a turn. See lambda/shared/python/usage_limits.py.
 PER_USER_DAILY_COST_USD = usage_limits.parse_limit(os.environ.get("PER_USER_DAILY_COST_USD"))
+# Voice transcription with Amazon Transcribe (voice_transcription): off unless
+# the stack sets VOICE_TRANSCRIPTION=transcribe. See voice.py.
+VOICE = voice.Settings.from_env(os.environ)
 # Identities that are a conversation (a group or channel) rather than a person.
 CONVERSATION_CHANNELS = frozenset({telegram_group.CHANNEL, channel_identity.SLACK, channel_identity.FEISHU})
 
@@ -143,6 +147,25 @@ secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 
 USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
+_transcribe_client = None  # created on first use, only when voice transcription is on
+
+
+def _voice_client(service):
+    """The boto3 client voice.py asks for: the Router's S3 client, or Transcribe."""
+    global _transcribe_client
+    if service == "s3":
+        return s3_client
+    if _transcribe_client is None:
+        _transcribe_client = boto3.client(
+            "transcribe", region_name=AWS_REGION,
+            config=Config(connect_timeout=5, read_timeout=10, retries={"max_attempts": 2, "mode": "standard"}))
+    return _transcribe_client
+
+
+def _transcribe_voice(audio, content_type, namespace, duration):
+    """Transcribe one audio message stored under namespace (voice.Result)."""
+    return voice.Transcriber(USER_FILES_BUCKET, VOICE, _voice_client).transcribe(
+        audio, content_type, namespace, duration)
 
 # --- Token cache (survives across warm invocations, 15-min TTL) ---
 _SECRET_CACHE_TTL_SECONDS = 900  # 15 minutes
@@ -2144,7 +2167,7 @@ DOCUMENT_STORE_FAILED_REPLY = "Sorry, I couldn't store that file. Please try aga
 def unsupported_reply(channel):
     """The notice for a message the bot cannot read yet (a voice note, a video, a
     sticker, a file of another type, ...). Plain text, so no channel reformats it."""
-    return f"Sorry, I can only read {accepted_text(channel)} for now."
+    return f"Sorry, I can only read {accepted_text(channel, VOICE.enabled and channel in voice.CHANNELS)} for now."
 
 
 def _download_telegram_document(file_id, token, max_bytes=MAX_DOCUMENT_BYTES):
@@ -2557,6 +2580,46 @@ def _invoke_with_typing(chat_id, token, invoke, reply_to=None):
         typing_thread.join(timeout=2)
 
 
+def _telegram_voice_kind(message, unsupported):
+    """The kind to transcribe (voice, audio, video_note) when transcription is on, else None.
+
+    An album item stays with the album (telegram_album.py), which answers it with the notice.
+    """
+    if VOICE.enabled and unsupported in voice.TELEGRAM_LABELS and not message.get("media_group_id"):
+        return unsupported
+    return None
+
+
+def _telegram_voice_text(message, kind, caption, namespace, chat_id, token, reply, reply_to=None):
+    """Transcribe a Telegram voice note, audio file or video note (voice.py).
+
+    Returns the agent text (the caption, a line naming the transcript, the
+    transcript), or None after replying with the reason it could not be used.
+    """
+    media = message.get(kind) if isinstance(message.get(kind), dict) else {}
+    duration = voice.seconds(media.get("duration"))
+    content_type = "video/mp4" if kind == "video_note" else str(media.get("mime_type") or "")
+    if voice.media_format(content_type) is None:
+        logger.info("Telegram: unsupported message kind=%s (format not transcribed)", kind)
+        reply(unsupported_reply("telegram"))
+        return None
+    refusal = voice.refusal(VOICE, duration, media.get("file_size"))
+    if refusal:
+        logger.info("Telegram: voice refused kind=%s seconds=%s", kind, duration)
+        reply(refusal)
+        return None
+    data, reason = _download_telegram_document(media.get("file_id"), token, voice.MAX_BYTES)
+    if data is None:
+        reply(voice.TOO_LARGE_REPLY if reason == "too_large" else voice.FAILED_REPLY)
+        return None
+    result = _invoke_with_typing(
+        chat_id, token, lambda: _transcribe_voice(data, content_type, namespace, duration), reply_to=reply_to)
+    if result.reply:
+        reply(result.reply)
+        return None
+    return voice.agent_text(caption, voice.TELEGRAM_LABELS[kind], duration, result.text)
+
+
 def handle_telegram(body):
     """Process a Telegram webhook update."""
     update = json.loads(body) if isinstance(body, str) else body
@@ -2577,6 +2640,7 @@ def handle_telegram(body):
     has_document = bool(document) and not has_image
     # A voice note, video, sticker, location, ... the bot cannot read yet.
     unsupported = None if (has_image or has_document) else unsupported_media.telegram_kind(message)
+    voice_kind = _telegram_voice_kind(message, unsupported)
 
     if not chat_id or not user_id_tg or (not text and not has_image and not has_document and not unsupported):
         logger.info("Telegram: ignoring non-text/non-image or missing-user message")
@@ -2626,8 +2690,9 @@ def handle_telegram(body):
         return
 
     # Media the bot cannot read and no text: the notice, no turn. An album item
-    # goes on to the album, which answers once for all its items.
-    if unsupported and not text and not message.get("media_group_id"):
+    # goes on to the album, which answers once for all its items, and a voice
+    # message to transcription.
+    if unsupported and not text and not message.get("media_group_id") and not voice_kind:
         logger.info("Telegram: unsupported message kind=%s", unsupported)
         reply(unsupported_reply("telegram"))
         return
@@ -2671,6 +2736,13 @@ def handle_telegram(body):
         doc_kind = _telegram_document_kind(document, doc_mime, reply)
         if doc_kind is None:
             return
+
+    # Voice transcription on: the transcript (with any caption) becomes the turn's text.
+    if voice_kind:
+        text = _telegram_voice_text(message, voice_kind, text, session_id.namespace, chat_id, token, reply)
+        if text is None:
+            return
+        unsupported = None
 
     # The items of an album share one turn and one reply (telegram_album.py).
     # An item's own failure reply or notice is held: the album answers once.
@@ -2922,7 +2994,8 @@ def _handle_telegram_group(message, text, document, doc_mime, has_image, has_doc
     if group_user_id is None:
         logger.warning("Telegram: group %s has no usable identity (disabled or not enrolled)", group_id)
         return
-    if unsupported and not text:
+    voice_kind = _telegram_voice_kind(message, unsupported)
+    if unsupported and not text and not voice_kind:
         logger.info("Telegram group: unsupported message kind=%s", unsupported)
         reply(unsupported_reply(telegram_group.CHANNEL))
         return
@@ -2941,6 +3014,13 @@ def _handle_telegram_group(message, text, document, doc_mime, has_image, has_doc
         doc_kind = _telegram_document_kind(document, doc_mime, reply)
         if doc_kind is None:
             return
+
+    # Voice transcription on: the transcript (with any caption) becomes the turn's text.
+    if voice_kind:
+        text = _telegram_voice_text(message, voice_kind, text, route.namespace, group_id, token, reply, reply_to)
+        if text is None:
+            return
+        unsupported = None
 
     send_telegram_typing(group_id, token)
     namespace = route.namespace
@@ -3942,6 +4022,37 @@ def handle_whatsapp(body):
             whatsapp.send_text(config, msg["from"], "Sorry, your account needs attention. Please contact the bot admin.")
 
 
+def _whatsapp_voice_text(config, msg, namespace):
+    """Transcribe a WhatsApp audio message (voice.py). Returns the agent text, or None after replying.
+
+    WhatsApp reports no duration, so an Ogg Opus voice note is measured after the download.
+    """
+    def send(reply_text):
+        whatsapp.send_text(config, msg["from"], reply_text)
+
+    if voice.media_format(msg.get("audio_mime")) is None:
+        logger.info("WhatsApp: unsupported message kind=audio (format not transcribed)")
+        send(unsupported_reply("whatsapp"))
+        return None
+    data, content_type, reason = whatsapp.download_audio(
+        config, msg["audio_id"], voice.CONTENT_TYPES, voice.MAX_BYTES)
+    if data is None:
+        send(voice.TOO_LARGE_REPLY if reason == "too_large" else voice.FAILED_REPLY)
+        return None
+    media = voice.media_format(content_type)
+    duration = voice.ogg_seconds(data) if media and media[0] == "ogg" else None
+    refusal = voice.refusal(VOICE, duration)
+    if refusal:
+        logger.info("WhatsApp: voice refused seconds=%s", duration)
+        send(refusal)
+        return None
+    result = _transcribe_voice(data, content_type, namespace, duration)
+    if result.reply:
+        send(result.reply)
+        return None
+    return voice.agent_text("", voice.VOICE_LABEL, duration, result.text)
+
+
 def _handle_whatsapp_message(config, msg):
     wa_id = msg["from"]
     text = msg["text"].strip()
@@ -3950,6 +4061,8 @@ def _handle_whatsapp_message(config, msg):
     doc_kind = classify_document(msg.get("document_mime"), msg.get("document_name")) if document_id else None
     # Audio, video, a document of another type, ... the bot cannot read yet (whatsapp.UNSUPPORTED_TYPES).
     unsupported = (msg.get("unsupported") and msg.get("type")) or ("document" if document_id and not doc_kind else None)
+    # An audio message is transcribed when voice transcription is on (voice.py).
+    voice_audio = VOICE.enabled and msg.get("type") == "audio" and bool(msg.get("audio_id"))
     has_file = has_image or doc_kind is not None
     if not text and not has_file and not unsupported:
         return
@@ -3972,7 +4085,7 @@ def _handle_whatsapp_message(config, msg):
         )
         return
 
-    if unsupported and not text:
+    if unsupported and not text and not voice_audio:
         logger.info("WhatsApp: unsupported message kind=%s", unsupported)
         whatsapp.send_text(config, wa_id, unsupported_reply("whatsapp"))
         return
@@ -4003,6 +4116,11 @@ def _handle_whatsapp_message(config, msg):
         whatsapp.send_text(config, wa_id, handle_usage_command(resolved_user_id))
         return
 
+    if voice_audio:
+        text = _whatsapp_voice_text(config, msg, route.namespace)
+        if text is None:
+            return
+        unsupported = None
     # A caption on a video or a document it cannot read: the caption turn, and the agent is told about the file.
     agent_message = (text + unsupported_media.note(unsupported_media.label(unsupported))) if unsupported else text
     if doc_kind:
@@ -4097,6 +4215,29 @@ def handle_line(body):
                                    event["reply_token"])
 
 
+def _line_voice_text(config, event, namespace, reply):
+    """Transcribe a LINE audio message (voice.py). Returns the agent text, or None after replying.
+
+    LINE reports the duration, so a message over the limit is refused before the download.
+    """
+    duration = voice.seconds(event.get("audio_duration_ms"), per_second=1000)
+    refusal = voice.refusal(VOICE, duration)
+    if refusal:
+        logger.info("LINE: voice refused seconds=%s", duration)
+        reply(refusal)
+        return None
+    data, content_type = line_channel.download_content(
+        config, event["audio_message_id"], voice.CONTENT_TYPES, voice.MAX_BYTES)
+    if data is None:
+        reply(voice.FAILED_REPLY)
+        return None
+    result = _transcribe_voice(data, content_type, namespace, duration)
+    if result.reply:
+        reply(result.reply)
+        return None
+    return voice.agent_text("", voice.VOICE_LABEL, duration, result.text)
+
+
 def _handle_line_event(config, event):
     line_user_id = event["user_id"]
     text = event["text"].strip()
@@ -4107,6 +4248,8 @@ def _handle_line_event(config, event):
     # Audio, video, a file of another type, ... the bot cannot read yet (line_channel.UNSUPPORTED_TYPES).
     unsupported = (event.get("unsupported") and event.get("type")) or ("file" if file_message_id and not file_kind
                                                                        else None)
+    # An audio message is transcribed when voice transcription is on (voice.py).
+    voice_audio = VOICE.enabled and event.get("type") == "audio" and bool(event.get("audio_message_id"))
     has_file = has_image or file_kind is not None
     if not text and not has_file and not unsupported:
         return
@@ -4132,7 +4275,7 @@ def _handle_line_event(config, event):
         return
 
     # These LINE message types carry no text: the notice, with the reply token.
-    if unsupported:
+    if unsupported and not voice_audio:
         logger.info("LINE: unsupported message kind=%s", unsupported)
         reply(unsupported_reply("line"))
         return
@@ -4163,6 +4306,10 @@ def _handle_line_event(config, event):
     if file_kind and _document_too_large("LINE", file_kind, event.get("file_size"), reply):
         return
     line_channel.show_loading(config, line_user_id)
+    if voice_audio:
+        text = _line_voice_text(config, event, route.namespace, reply)
+        if text is None:
+            return
     agent_message = text
     if file_kind:
         data, _ = line_channel.download_content(config, file_message_id, None, MAX_DOCUMENT_BYTES)
