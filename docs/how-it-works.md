@@ -152,8 +152,9 @@ The agent gets the caption (if any), then a line such as `[Voice message, 0:14, 
 
 Logs carry the duration, size, job status and `elapsed_ms` only, never the transcript, the S3 key or the job name.
 
-The Router role gets two statements only when the setting is on:
-- `transcribe:StartTranscriptionJob`, `GetTranscriptionJob` and `DeleteTranscriptionJob` on `transcription-job/oc-*`;
+The Router role gets three statements only when the setting is on:
+- `transcribe:StartTranscriptionJob` on `*`. The [Service Authorization Reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_transcribe.html) lists no resource type for it, so it cannot be limited to the Router's jobs;
+- `transcribe:GetTranscriptionJob` and `DeleteTranscriptionJob` on `transcription-job/oc-*`;
 - `s3:GetObject`, `s3:DeleteObject` and `s3:DeleteObjectVersion` on `*/_uploads/voice_*`. Transcribe reads the audio with the Router's permissions, including its existing `kms:Decrypt` on the CMK.
 
 Before turning it on:
