@@ -196,11 +196,15 @@ def resolve_namespaces(table, user, session):
 
     Today a namespace is the runtime actor with ':' as '_'. A stored opaque namespace
     (SESSION.namespace or NS_MIGRATION, with an NS#<ns>/OWNER record naming the user) is
-    handled too. A stored value counts only when its NS#<ns>/OWNER record agrees.
+    handled too. A stored value counts only when its NS#<ns>/OWNER record agrees. The side
+    a finished migration left (`to` after a rollback, `from` after the cleanup) is ignored:
+    scripts/namespace_cutover.py deleted its data, and its NS# record last.
     """
     namespaces = [legacy_namespace(user.runtime_actor)] if user.runtime_actor else []
     migration = user.partition.get("NS_MIGRATION") or {}
-    stored = {(session or {}).get("namespace"), migration.get("from"), migration.get("to")}
+    # A finished migration (scripts/namespace_cutover.py) deleted the side it left, NS# record last.
+    finished = {"ROLLED_BACK": "to", "CLEANED": "from"}.get(migration.get("state"))
+    stored = {(session or {}).get("namespace"), *(migration.get(side) for side in ("from", "to") if side != finished)}
     for namespace in sorted(value for value in stored if isinstance(value, str) and value):
         if namespace in namespaces:
             continue
@@ -607,7 +611,8 @@ def identity_plan(user, partition):
     code = (partition.get("BIND_POINTER") or {}).get("code")
     if isinstance(code, str) and BIND_CODE_RE.fullmatch(code):
         plan.append((f"BIND#{code}", "BIND", True))
-    plan += [(f"NS#{n}", "OWNER", True) for n in user.namespaces if OPAQUE_NAMESPACE_RE.fullmatch(n)]
+    # Opaque namespaces, and the legacy one once scripts/namespace_backfill.py stored it.
+    plan += [(f"NS#{n}", "OWNER", True) for n in user.namespaces]
     runtime_backref = f"CHANNEL#{user.runtime_actor}" if user.runtime_actor else None
     planned = {(pk, sk) for pk, sk, _ in plan}
     plan += [(f"USER#{uid}", sk, False) for sk in sorted(partition)

@@ -61,6 +61,87 @@ uv run --no-project --python .venv-deploy/bin/python python scripts/delete_user_
   - `logs:DescribeLogStreams` and `DeleteLogStream`;
   - `bedrock-agentcore:StopRuntimeSession`.
 
+## Namespace migration
+
+A user's files, api-key secrets, schedules and Cognito username are named after the user's storage namespace. Until a user is migrated, that is the runtime actor with `:` replaced by `_` (for example `telegram_123456789`), so the channel user ID appears in S3 keys, secret and schedule names, and in the CloudTrail records of calls on them. The migration moves one user at a time to a random namespace, `ns_` followed by 26 base32 characters. The route stores it (`USER#<id>` / `SESSION.namespace`), and an owner record outside the user's partition, `NS#<namespace>` / `OWNER`, names the user it belongs to.
+
+It has three stages. Each one can stop safely at its end:
+
+1. **Dual-read release.** The Router, the Cron Lambda, the gateway tools and the bridge read the namespace from the route; a route without one uses the actor-derived namespace. Nothing moves. While a route is `MIGRATING`, the Router answers every message with "Maintenance in progress, please send that again in a minute." Deploy this release everywhere first: Phase 3 for the Lambdas, and a bridge image on a new endpoint (see [Deploy a new bridge version](#deploy-a-new-bridge-version)). A route keeps the endpoint it enrolled on ([runtime-v2.md](runtime-v2.md#existing-user-migration-and-cutover)), so only users enrolled on that endpoint or a later one can move in stage 3.
+2. **Backfill.** `scripts/namespace_backfill.py` stores each route's current namespace and writes its `NS#` owner record. No data moves and no turn changes, because the stored value is the one every component derives today. This is safe for every user, whatever their endpoint.
+3. **Cut-over.** `scripts/namespace_cutover.py` moves one user's data to a new namespace.
+
+Both tools are dry runs unless `--apply` is given. Run the dry run first, and read what it reports:
+
+```bash
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_backfill.py \
+  --region "$CDK_DEFAULT_REGION"           # dry run
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_backfill.py \
+  --region "$CDK_DEFAULT_REGION" --apply   # every route; --user-id or --limit N for fewer
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_cutover.py \
+  --region "$CDK_DEFAULT_REGION" --user-id user_0123456789abcdef --endpoint release_3           # dry run
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_cutover.py \
+  --region "$CDK_DEFAULT_REGION" --user-id user_0123456789abcdef --endpoint release_3 --apply
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_cutover.py \
+  --region "$CDK_DEFAULT_REGION" --user-id user_0123456789abcdef --rollback --apply   # within the hold
+uv run --no-project --python .venv-deploy/bin/python python scripts/namespace_cutover.py \
+  --region "$CDK_DEFAULT_REGION" --user-id user_0123456789abcdef --cleanup --apply    # after the hold
+```
+
+`--endpoint` takes the name you gave the release with `--endpoint-name` (for example `release_3`).
+
+- **Backfill results:** `stored` and `already stored` are done. `busy` means a turn was running or the route changed; re-run later (exit 1). `inactive` (the route is not `ACTIVE`), `unconfirmed` (no `ACTOR#` owner record confirms the route's actor) and `conflict` (the `NS#` record is missing or names another user) need reconciling first (exit 3).
+- **Endpoints:** `--endpoint` names the endpoints whose bridge image reads the namespace from the route: the endpoint of the dual-read release and any later one. A user on another endpoint is refused, because an older bridge derives the namespace from the actor whatever the route stores.
+- **Cut-over steps:**
+  1. Plan: allocate the namespace and write its `NS#` owner record.
+  2. Freeze: the route becomes `MIGRATING`, and the Router sends the maintenance reply.
+  3. Stop: stop the AgentCore session, then wait until the old prefixes have not changed for `--quiesce-minutes` (default 10).
+  4. Copy: the current version of every object under `<old>/` and `_system/<old>/`.
+  5. Secrets: copy `openclaw/user/<old>/*`.
+  6. Schedules: recreate each one under its new name and update `CRON#.ebName`.
+  7. Flip: store the new namespace and bump the route's generation.
+  8. Verify: copy again whatever changed under the old prefixes, then check the secrets and schedules.
+  9. Unfreeze: the route becomes `ACTIVE` again.
+
+  Progress is kept in `USER#<id>` / `NS_MIGRATION`, and the same command continues an interrupted run where it stopped (exit 1 means re-run). The tool refuses (exit 3) while the route holds invocation admissions, as `delete_user_data.py` does, and whenever the `NS#` and `ACTOR#` records disagree with the route or the migration record.
+- **During the cut-over:** messages get the maintenance reply. A scheduled task that fires in that window fails once. The window is the quiet wait plus the copy time.
+- **What is copied, and how:**
+  - Objects: only current versions are copied; older versions stay under the old prefix until cleanup. Copies are new objects, so the user-files expiry (`user_files_ttl_days`) starts again for them. One copy call takes at most 5 GiB, so the plan refuses a user with a larger object.
+  - Secrets: they keep their value, KMS key and tags; a tag whose value was the old namespace names the new one.
+  - Schedules: they keep their expression and target input. A one-time schedule whose time has passed is moved disabled, so that it cannot run again.
+  - Cognito: the user is not copied. The bridge creates the user under the new namespace at the next turn, and the old one stays until cleanup.
+- **Rollback window:** the old data is kept for `--hold-days` (default 14) after the cut-over, and `--rollback` returns the user to it. Before the flip, it moves the schedules back and unfreezes. After the flip, it freezes and stops the route again, copies back the objects written under the new namespace since the cut-over and the secrets that differ, moves the schedules back, flips back and unfreezes. Either way it then deletes the new namespace's objects, secrets, Cognito user and `NS#` record. Files and secrets the user deleted after the cut-over come back.
+- **Cleanup:** `--cleanup` is refused until the hold ends. Then it deletes:
+  - every object version and delete marker under the old prefixes;
+  - the old secrets and the old Cognito password secret, with a 7-day recovery window;
+  - the old Cognito user;
+  - `/openclaw/container` log streams named `<old namespace>-*`;
+  - the old `NS#` record.
+
+  It refuses while anything under the old prefixes was written after the cut-over was verified, since that means something still wrote there; compare those objects with the new namespace before deleting them by hand.
+- **Not migrated:** the old namespace, or the actor it was made from, stays in:
+  - CloudTrail event history (90 days; a dedicated or organization trail keeps its own copy);
+  - Step Functions history of async scheduled runs (90 days after each run);
+  - events in shared log groups, until their retention ends;
+  - CloudWatch metrics with an ActorId dimension from before #230 (15 months);
+  - point-in-time recovery copies of the identity table (35 days);
+  - secrets inside their recovery window;
+  - AgentCore session storage, until it expires;
+  - transcripts and memory files that mention it. The skills refuse the old namespace with an error that points the agent to the user ID in its system prompt.
+
+  Schedule inputs keep the actor ID, as they do today.
+- **Deleting a migrated user:** `scripts/delete_user_data.py` finds both namespaces while a migration or its hold is in progress, and the remaining one afterwards.
+- **Output:** users are named by internal user ID only.
+- **Permissions:** the cut-over needs:
+  - DynamoDB `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem` and `Query` on the identity table (the backfill also needs `Scan`);
+  - `s3:ListBucket`, `GetObject`, `PutObject`, `ListBucketVersions` and `DeleteObjectVersion` on the user-files bucket, with `kms:Decrypt` and `kms:GenerateDataKey` on its key;
+  - `scheduler:ListSchedules`, `GetSchedule`, `CreateSchedule`, `UpdateSchedule` and `DeleteSchedule`, with `iam:PassRole` for the scheduler role;
+  - `secretsmanager:ListSecrets`, `DescribeSecret`, `GetSecretValue`, `CreateSecret`, `PutSecretValue`, `TagResource` and `DeleteSecret`;
+  - `cognito-idp:AdminDeleteUser`;
+  - `logs:DescribeLogStreams` and `DeleteLogStream`;
+  - `bedrock-agentcore:StopRuntimeSession`;
+  - `cloudformation:DescribeStacks`.
+
 ## Deploy a new bridge version
 
 Install the `uv` environments described in [Quick Start](../README.md#quick-start). Set `image_version` or supply a reviewed ARM64 image. Preserve the previous release manifest, choose an unused endpoint name, then run:
