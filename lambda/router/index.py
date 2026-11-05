@@ -51,6 +51,7 @@ import discord_channel
 import formatting
 import line_channel
 import telegram_group
+import channel_identity
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -71,6 +72,10 @@ REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "tru
 # Off: every Telegram group/supergroup message is ignored. On: allowlisted groups
 # are answered as their own identity (see telegram_group.py).
 TELEGRAM_GROUPS_ENABLED = os.environ.get("TELEGRAM_GROUPS_ENABLED", "false").lower() == "true"
+# Slack channels and Feishu group chats. "personal" (default): answered from the
+# sender's own session. "channel": allowlisted conversations are answered as
+# their own identity (see channel_identity.py).
+CHANNEL_IDENTITY_MODE = os.environ.get("CHANNEL_IDENTITY_MODE", "personal").strip().lower()
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 RUNTIME_TARGET = json.loads(os.environ.get("RUNTIME_TARGET", "null"))
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "")
@@ -2664,6 +2669,257 @@ def _handle_telegram_group(message, text, document, doc_mime, has_image, has_doc
     logger.info("Telegram group response sent to group %s", group_id)
 
 
+# ---------------------------------------------------------------------------
+# Slack channels and Feishu group chats as their own identity
+# (channel_identity_mode "channel"; see channel_identity.py for the rules)
+# ---------------------------------------------------------------------------
+
+SLACK_CHANNEL_MODEL_MESSAGE = "Model switching is not available in channels. This channel uses the default model."
+SLACK_CHANNEL_EXTERNAL_MESSAGE = (
+    "Sorry, in this channel I only answer members of this workspace. "
+    "People from other organizations in a Slack Connect channel can't use me here."
+)
+FEISHU_GROUP_MODEL_MESSAGE = "Model switching is not available in group chats. This group uses the default model."
+
+# Sender display names for the context line: platform user ID -> (name, expiry).
+# Cached per container, failed lookups too, so a missing permission costs one
+# API call per member per hour. A full cache is emptied rather than grown.
+MEMBER_NAME_TTL_SECONDS = 3600
+MEMBER_NAME_CACHE_MAX = 1000
+_slack_member_names = {}
+_feishu_member_names = {}
+SLACK_USER_ID_RE = re.compile(r"[UW][A-Z0-9]{2,31}")
+FEISHU_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9]{1,64}")
+
+
+def _channel_identity_on():
+    """True when Slack channels and Feishu group chats are their own identity."""
+    return CHANNEL_IDENTITY_MODE == "channel"
+
+
+def _cached_member_name(cache, member_id):
+    entry = cache.get(member_id)
+    return entry[0] if entry and entry[1] > time.time() else None
+
+
+def _remember_member_name(cache, member_id, name):
+    if len(cache) >= MEMBER_NAME_CACHE_MAX:
+        cache.clear()
+    cache[member_id] = (name, time.time() + MEMBER_NAME_TTL_SECONDS)
+    return name
+
+
+def _get_api(req):
+    """Send req and return up to 64 KB of the response body, or None. Never raises."""
+    try:
+        return _read_response(req, timeout=5)
+    except Exception as e:  # noqa: BLE001 -- the caller treats every failure as "no answer"
+        logger.info("Member name lookup failed: %s", type(e).__name__)
+        return None
+
+
+def _slack_member_name(event, slack_user_id, bot_token):
+    """The sender's Slack display name, or "" when Slack does not provide it.
+
+    Uses the event's user_profile when Slack includes one, else users.info,
+    which needs the users:read scope. The profile is never logged.
+    """
+    name = channel_identity.slack_profile_name(event.get("user_profile"))
+    if name:
+        return name
+    cached = _cached_member_name(_slack_member_names, slack_user_id)
+    if cached is not None:
+        return cached
+    raw = None
+    if bot_token and SLACK_USER_ID_RE.fullmatch(slack_user_id):
+        raw = _get_api(urllib_request.Request(
+            f"https://slack.com/api/users.info?user={quote(slack_user_id, safe='')}",
+            headers={"Authorization": f"Bearer {bot_token}"},
+        ))
+    if raw is not None:
+        error = formatting.slack_error(raw)
+        if error:
+            logger.info("Slack users.info refused: error=%s", error)
+        else:
+            user = json.loads(raw).get("user")
+            if isinstance(user, dict):
+                name = (channel_identity.slack_profile_name(user.get("profile"))
+                        or channel_identity.sender_name(user.get("real_name")))
+    return _remember_member_name(_slack_member_names, slack_user_id, name)
+
+
+def _feishu_member_name(open_id):
+    """The sender's Feishu name, or "" when the app may not read it.
+
+    Needs the contact:user.base:readonly permission, with the user inside the
+    app's contact range. The user record is never logged.
+    """
+    cached = _cached_member_name(_feishu_member_names, open_id)
+    if cached is not None:
+        return cached
+    name, raw = "", None
+    token = _get_feishu_tenant_token() if FEISHU_OPEN_ID_RE.fullmatch(open_id) else ""
+    if token:
+        raw = _get_api(urllib_request.Request(
+            f"{FEISHU_API_DOMAIN}/open-apis/contact/v3/users/{quote(open_id, safe='')}?user_id_type=open_id",
+            headers={"Authorization": f"Bearer {token}"},
+        ))
+    if raw is not None:
+        code = formatting.feishu_error(raw)
+        if code is not None:
+            logger.info("Feishu contact lookup refused: code=%s", code)
+        else:
+            data = json.loads(raw).get("data")
+            user = data.get("user") if isinstance(data, dict) else None
+            if isinstance(user, dict):
+                name = channel_identity.sender_name(user.get("name"))
+    return _remember_member_name(_feishu_member_names, open_id, name)
+
+
+def _is_disabled_sender(channel_key):
+    """True if the sender is a registered user an operator has disabled.
+
+    A disabled user cannot use the bot through a channel or group either.
+    Fails closed.
+    """
+    try:
+        mapping = identity_table.get_item(
+            Key={"PK": f"CHANNEL#{channel_key}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item")
+        return bool(mapping) and _is_user_disabled(mapping["userId"])
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        logger.error("Sender status check failed: %s", type(e).__name__)
+        return True
+
+
+def _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, image_files, in_thread, bot_token):
+    """Answer a Slack channel, private channel or group DM as its own identity, never the sender's."""
+    if not channel_identity.SLACK_CONVERSATION_ID_RE.fullmatch(channel_id):
+        logger.info("Slack: channel message ignored (malformed conversation ID)")
+        return
+    actor_id = f"{channel_identity.SLACK}:{channel_id}"
+    # Checked on every message; registration_open never applies to channels.
+    # A channel that is not allowlisted gets no reply.
+    if not _allow_record_exists(actor_id):
+        logger.info("Slack: channel message ignored (channel %s is not allowlisted)", channel_id)
+        return
+
+    def reply(reply_text):
+        send_slack_message(channel_id, reply_text, bot_token, **in_thread)
+
+    if channel_identity.slack_sender_is_external(event_data, event):
+        logger.info("Slack: channel %s message refused (sender is from another organization)", channel_id)
+        reply(SLACK_CHANNEL_EXTERNAL_MESSAGE)
+        return
+    if _is_disabled_sender(f"slack:{slack_user_id}"):
+        logger.info("Slack: channel %s message ignored (sender is disabled)", channel_id)
+        return
+    has_image = bool(image_files)
+    if not has_image and _parse_model_command(text) is not None:
+        reply(SLACK_CHANNEL_MODEL_MESSAGE)
+        return
+    if _is_bind_command(text)[0] or _is_link_command(text):
+        reply(LINK_DM_ONLY_MESSAGE)
+        return
+
+    channel_user_id, _ = resolve_user(channel_identity.SLACK, channel_id)
+    if channel_user_id is None:
+        logger.warning("Slack: channel %s has no usable identity (disabled or not enrolled)", channel_id)
+        return
+    route = get_or_create_session(channel_user_id)
+
+    message_text = channel_identity.agent_text(
+        "Slack channel", _slack_member_name(event, slack_user_id, bot_token), text)
+    agent_message = message_text
+    if has_image:
+        image_bytes, content_type, _ = _download_slack_file(image_files[0], bot_token)
+        if not image_bytes:
+            reply("Sorry, I couldn't download that image. Please try again.")
+            return
+        s3_key = _upload_image_to_s3(image_bytes, route.actor_id.replace(":", "_"), content_type)
+        if not s3_key:
+            reply("Sorry, I couldn't process that image. Please try again.")
+            return
+        agent_message = _build_structured_message(message_text, s3_key, content_type)
+
+    logger.info(
+        "Slack channel: user=%s actor=%s session=%s msg_len=%d has_image=%s",
+        channel_user_id, actor_id, route, len(text), has_image,
+    )
+    stop_notify = threading.Event()
+    notify_thread = threading.Thread(
+        target=_slack_progress_notify, args=(channel_id, bot_token, stop_notify), kwargs=in_thread, daemon=True,
+    )
+    notify_thread.start()
+    try:
+        # /model is off in channels: every turn uses the default model.
+        result = invoke_agent_runtime(route, channel_user_id, actor_id, channel_identity.SLACK, agent_message,
+                                      channel_target=channel_id, shared_chat=True)
+    finally:
+        stop_notify.set()
+        notify_thread.join(timeout=2)
+    reply(_extract_text_from_content_blocks(result.get("response", "Sorry, I couldn't process your message.")))
+
+
+def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image):
+    """Answer a Feishu group chat as its own identity, never the sender's."""
+    if not channel_identity.FEISHU_CHAT_ID_RE.fullmatch(chat_id):
+        logger.info("Feishu: group message ignored (malformed chat ID)")
+        return
+    actor_id = f"{channel_identity.FEISHU}:{chat_id}"
+    # Checked on every message; registration_open never applies to groups.
+    # A group that is not allowlisted gets no reply.
+    if not _allow_record_exists(actor_id):
+        logger.info("Feishu: group message ignored (group %s is not allowlisted)", chat_id)
+        return
+    if _is_disabled_sender(f"feishu:{sender_id}"):
+        logger.info("Feishu: group %s message ignored (sender is disabled)", chat_id)
+        return
+    if not has_image and _parse_model_command(text) is not None:
+        send_feishu_message(chat_id, FEISHU_GROUP_MODEL_MESSAGE)
+        return
+    if _is_bind_command(text)[0] or _is_link_command(text):
+        send_feishu_message(chat_id, LINK_DM_ONLY_MESSAGE.replace("`", ""))
+        return
+
+    group_user_id, _ = resolve_user(channel_identity.FEISHU, chat_id)
+    if group_user_id is None:
+        logger.warning("Feishu: group %s has no usable identity (disabled or not enrolled)", chat_id)
+        return
+    route = get_or_create_session(group_user_id)
+
+    name = _feishu_member_name(sender_id)
+    agent_message = channel_identity.agent_text("Feishu group", name, text or "hi")
+    if has_image:
+        image_bytes, content_type, _ = _download_feishu_image(content_str, msg_type)
+        if not image_bytes:
+            send_feishu_message(chat_id, "Sorry, I couldn't download that image. Please try again.")
+            return
+        s3_key = _upload_image_to_s3(image_bytes, route.actor_id.replace(":", "_"), content_type)
+        if not s3_key:
+            send_feishu_message(chat_id, "Sorry, I couldn't process that image. Please try again.")
+            return
+        agent_message = _build_structured_message(
+            channel_identity.agent_text("Feishu group", name, text or "What is this image?"), s3_key, content_type)
+
+    logger.info(
+        "Feishu group: user=%s actor=%s session=%s msg_len=%d has_image=%s",
+        group_user_id, actor_id, route, len(text), has_image,
+    )
+    stop_notify = threading.Event()
+    notify_thread = threading.Thread(target=_feishu_progress_notify, args=(chat_id, stop_notify), daemon=True)
+    notify_thread.start()
+    try:
+        # /model is off in group chats: every turn uses the default model.
+        result = invoke_agent_runtime(route, group_user_id, actor_id, channel_identity.FEISHU, agent_message,
+                                      channel_target=chat_id, shared_chat=True)
+    finally:
+        stop_notify.set()
+        notify_thread.join(timeout=2)
+    send_feishu_message(
+        chat_id, _extract_text_from_content_blocks(result.get("response", "Sorry, I couldn't process your message.")))
+
+
 SLACK_DEDUP_TTL_SECONDS = 86400
 
 
@@ -2772,6 +3028,12 @@ def handle_slack(body, headers=None):
     # Channel replies go to the message's thread; DM replies stay top-level.
     in_thread = _slack_thread_kwargs(None if is_dm else (event.get("thread_ts") or event.get("ts") or None))
     bot_token, _ = _get_slack_tokens()
+
+    # channel_identity_mode "channel": a channel, private channel or group DM is
+    # answered as its own identity (channel_identity.py). 1:1 DMs (D...) stay personal.
+    if not is_dm and _channel_identity_on() and not channel_id.startswith("D"):
+        _handle_slack_channel(event_data, event, text, slack_user_id, channel_id, image_files, in_thread, bot_token)
+        return {"statusCode": 200, "body": "ok"}
 
     # Handle bind commands BEFORE allowlist check — cross-channel binding
     # bypasses the allowlist since it links to an already-approved user.
@@ -2986,6 +3248,12 @@ def handle_feishu(body, headers=None):
     if len(sender_id) > 128:
         logger.warning("Feishu sender_id too long (%d chars), rejecting", len(sender_id))
         return {"statusCode": 400, "body": "Invalid sender ID"}
+
+    # channel_identity_mode "channel": a group chat is answered as its own
+    # identity (channel_identity.py). 1:1 (p2p) chats stay personal.
+    if message.get("chat_type") != "p2p" and _channel_identity_on():
+        _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_image)
+        return {"statusCode": 200, "body": "ok"}
 
     # Handle bind commands BEFORE allowlist check
     actor_id = f"feishu:{sender_id}"

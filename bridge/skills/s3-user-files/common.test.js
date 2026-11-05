@@ -212,3 +212,18 @@ describe("validateUserId", () => {
     }
   });
 });
+
+describe("validateUserId for Slack channel and Feishu group identities", () => {
+  it("accepts a Slack channel namespace bound to that channel", () => {
+    asUser("slack_channel:C0123CHAN", () => assert.doesNotThrow(() => validateUserId("slack_channel_C0123CHAN")));
+  });
+
+  it("accepts a Feishu group namespace bound to that group", () => {
+    asUser("feishu_group:oc_0123abcdef",
+      () => assert.doesNotThrow(() => validateUserId("feishu_group_oc_0123abcdef")));
+  });
+
+  it("rejects a member's own namespace in a channel's session", () => {
+    asUser("slack_channel:C0123CHAN", () => assert.equal(exitCodeOf(() => validateUserId("slack_U0123USER")), 1));
+  });
+});

@@ -271,3 +271,70 @@ def test_allowlist_whois_rejects_a_non_user_id_before_any_aws_call(env):
     assert result.returncode != 0
     assert "ERROR" in result.stderr
     assert not any(c["tool"] == "aws" for c in _calls(root))
+
+
+# ------------------------------------------- manage-allowlist: Slack channels, Feishu groups
+
+
+@pytest.mark.parametrize("key", ["slack_channel:C0123ABCDEF", "slack_channel:G0123PRIV", "feishu_group:oc_0123abcd"])
+@pytest.mark.parametrize("command", ["add", "remove"])
+def test_allowlist_accepts_slack_channel_and_feishu_group_keys(env, command, key):
+    root, environment = env
+    result = _run("manage-allowlist.sh", environment, command, key)
+    assert result.returncode == 0, result.stderr
+    call = next(c["args"] for c in _calls(root) if c["tool"] == "aws")
+    document = json.loads(call[call.index("--item" if command == "add" else "--key") + 1])
+    assert document["PK"] == {"S": f"ALLOW#{key}"}
+    assert document["SK"] == {"S": "ALLOW"}
+    if command == "add":
+        assert document["channelKey"] == {"S": key}
+        assert 'channel_identity_mode\nis "channel"' in result.stdout
+    else:
+        assert f"The next message from {key} is ignored." in result.stdout
+        assert "disable" not in result.stdout
+
+
+@pytest.mark.parametrize("key", [
+    "slack_channel:general", "slack_channel:#general", "slack_channel:U0123USER", "slack_channel:D0123DM",
+    "slack_channel:c0123abc", "slack_channel:C1", "feishu_group:ou_0123abcd", "feishu_group:0123abcd",
+    "feishu_group:oc_", "feishu_group:oc_0123-abcd",
+])
+@pytest.mark.parametrize("command", ["add", "remove", "disable", "enable"])
+def test_allowlist_rejects_malformed_conversation_keys_before_any_aws_call(env, command, key):
+    root, environment = env
+    result = _run("manage-allowlist.sh", environment, command, key)
+    assert result.returncode != 0
+    assert "ERROR" in result.stderr
+    assert not any(c["tool"] == "aws" for c in _calls(root))
+
+
+@pytest.mark.parametrize("command", ["disable", "enable"])
+def test_allowlist_disable_and_enable_accept_a_conversation_key(env, command):
+    root, environment = env
+    environment["FAKE_USER_ID"] = "user_0123abcd"
+    result = _run("manage-allowlist.sh", environment, command, "slack_channel:C0123ABCDEF")
+    assert result.returncode == 0, result.stderr
+    lookup, update = (c["args"] for c in _calls(root) if c["tool"] == "aws")
+    assert json.loads(lookup[lookup.index("--key") + 1]) == {
+        "PK": {"S": "CHANNEL#slack_channel:C0123ABCDEF"}, "SK": {"S": "PROFILE"}}
+    assert json.loads(update[update.index("--key") + 1]) == {
+        "PK": {"S": "USER#user_0123abcd"}, "SK": {"S": "PROFILE"}}
+
+
+@pytest.mark.parametrize("key", ["slack:U0XXXXXXXX2", "telegram_group:-1001234567890"])
+def test_allowlist_add_and_remove_output_is_unchanged_for_other_keys(env, key):
+    _, environment = env
+    added = _run("manage-allowlist.sh", environment, "add", key)
+    removed = _run("manage-allowlist.sh", environment, "remove", key)
+    assert added.returncode == removed.returncode == 0
+    assert added.stdout == f"Adding {key} to allowlist...\nDone. {key} is now allowed.\n"
+    assert "channel_identity_mode" not in added.stdout
+    assert f"run '{_REPO / 'scripts' / 'manage-allowlist.sh'} disable {key}'" in removed.stdout
+
+
+def test_allowlist_usage_names_the_conversation_keys(env):
+    _, environment = env
+    result = _run("manage-allowlist.sh", environment)
+    assert result.returncode != 0
+    assert "slack_channel:<channel_id>" in result.stdout
+    assert "feishu_group:<chat_id>" in result.stdout

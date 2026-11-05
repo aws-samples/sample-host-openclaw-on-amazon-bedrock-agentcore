@@ -174,3 +174,17 @@ describe("schedules in group chats", () => {
     assert.equal(scheduler.sent.length, 0);
   });
 });
+
+describe("schedules in Slack channels and Feishu groups", () => {
+  for (const actor of ["slack_channel:C0123CHAN", "feishu_group:oc_0123abcdef"]) {
+    it(`refuses to create a schedule for a ${actor.split(":")[0]} identity`, async () => {
+      const { scheduler, handler, token } = handlerFor(actor);
+      const out = await handler(
+        { expression: "rate(1 hour)", timezone: "UTC", message: "m", [RESERVED_ARG]: token },
+        h.gatewayContext("schedules", "create_schedule"),
+      );
+      assert.match(out.message || "", /not available in group chats/);
+      assert.equal(scheduler.sent.length, 0);
+    });
+  }
+});

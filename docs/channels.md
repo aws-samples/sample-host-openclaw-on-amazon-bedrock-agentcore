@@ -121,7 +121,7 @@ The signing secret is used by the Router Lambda to validate `X-Slack-Signature` 
     ./scripts/manage-allowlist.sh add slack:YOUR_MEMBER_ID
     ```
 
-**DMs and channels:** the bot answers every message in a DM. In a channel it answers only messages that @mention it (invite it with `/invite @YourBot` first), and it replies in the message's thread. Every other channel message is ignored: no reply, no agent turn and no enrollment, even with `registration_open`. A member who is not on the allowlist gets no answer in a channel; the "bot is private" notice with their ID is sent only in a DM. A channel @mention is answered from the sender's own session, with their memory and files, and the reply is visible to everyone in the channel. The Router marks such a turn as shared (`sharedChat`), and the system prompt then tells the agent that everyone in the conversation reads the reply and not to reveal user IDs, the namespace or storage paths, or the sender's saved memory, notes and files, unless the sender explicitly asks.
+**DMs and channels:** the bot answers every message in a DM. In a channel it answers only messages that @mention it (invite it with `/invite @YourBot` first), and it replies in the message's thread. Every other channel message is ignored: no reply, no agent turn and no enrollment, even with `registration_open`. A member who is not on the allowlist gets no answer in a channel; the "bot is private" notice with their ID is sent only in a DM. A channel @mention is answered from the sender's own session, with their memory and files, and the reply is visible to everyone in the channel. The Router marks such a turn as shared (`sharedChat`), and the system prompt then tells the agent that everyone in the conversation reads the reply and not to reveal user IDs, the namespace or storage paths, or the sender's saved memory, notes and files, unless the sender explicitly asks. To answer a channel as its own identity instead, with its own memory and files, see [Slack channels and Feishu groups](#slack-channels-and-feishu-groups).
 
 ## Feishu
 
@@ -138,9 +138,61 @@ Feishu (飞书 / Lark) uses the Events API with the Router Lambda as the webhook
    ./scripts/manage-allowlist.sh add feishu:YOUR_OPEN_ID
    ```
 
-**Group chats:** a group chat turn is answered from the sender's own session, and the reply is visible to the whole group. As for a Slack channel, the Router marks it as shared and the system prompt tells the agent not to reveal user IDs, the namespace or storage paths, or the sender's saved memory, notes and files, unless the sender explicitly asks.
+**Group chats:** a group chat turn is answered from the sender's own session, and the reply is visible to the whole group. As for a Slack channel, the Router marks it as shared and the system prompt tells the agent not to reveal user IDs, the namespace or storage paths, or the sender's saved memory, notes and files, unless the sender explicitly asks. To answer a group chat as its own identity instead, see [Slack channels and Feishu groups](#slack-channels-and-feishu-groups).
 
 Scheduled-task replies (see [Scheduled Tasks](how-it-works.md#scheduled-tasks-cron-jobs)) are delivered to Feishu users too: `lambda/cron/index.py` routes `feishu` targets to the Feishu sender, using the same `openclaw/channels/feishu` app credentials and a cached tenant access token. Design notes: [docs/design-feishu-channel.md](design-feishu-channel.md).
+
+## Slack channels and Feishu groups
+
+By default (`channel_identity_mode: "personal"`) the bot answers a Slack channel @mention or a Feishu group chat message from the sender's own session, memory and files, as described under [Slack](#slack) and [Feishu](#feishu). With `channel_identity_mode: "channel"` it answers an allowlisted conversation as the conversation's own identity instead, the way it answers [Telegram groups](#telegram-groups). Existing deployments keep the personal behaviour until they change the setting.
+
+A conversation here is any Slack conversation except a 1:1 DM (public channels, private channels and group DMs) and any Feishu chat except a 1:1 (p2p) chat. 1:1 chats work the same in both modes.
+
+### What changes for users
+
+- **A conversation is its own identity.** The router answers a Slack channel as actor `slack_channel:<channel_id>` and a Feishu group chat as `feishu_group:<chat_id>`, each with its own namespace (`slack_channel_<channel_id>`, `feishu_group_<chat_id>`), session, memory and files. A member's personal session, memory, files and `/model` choice are never used there.
+- **Everyone in the conversation shares its memory.** Anything a member tells the bot in the conversation can come back in a reply to any other member. Keep private things in a 1:1 chat with the bot. After a deployment switches to `channel`, each conversation starts with empty memory and files, and personal memory no longer reaches replies in conversations.
+- **Only allowlisted conversations are answered.** Every other conversation is ignored without a reply, even with `registration_open`: no "bot is private" notice, no agent turn and no enrollment.
+- **Every member of an allowlisted conversation can use the bot there**, including members who are not on the user allowlist. A user an operator has disabled (`manage-allowlist.sh disable`) is ignored in conversations too.
+- **Slack Connect.** In a channel shared with another organization, the bot answers only members of the workspace it is installed in. A member from another organization gets a short refusal in the thread, and no turn runs. With an org-wide Enterprise Grid installation the event does not name an installed workspace to compare with, so every member of a Slack Connect channel is refused.
+- **Feishu external groups.** The router does not tell Feishu members from other organizations apart: every member of an allowlisted external group can use the bot there. Allowlist an external group only if that is what you want.
+- **The sender is context only.** Each message reaches the agent with a first line such as `Slack channel message from Alex Example:` or `Feishu group message from Alex Example:`. The line carries the display name only, never a member ID or a phone number. The name is reduced to letters, digits, spaces and `.'-`, and a name with more than six digits is replaced by `a member`. The line never changes the namespace or what the bot may do.
+- **Display names.** Slack includes the sender's profile with some events; otherwise the router reads it with `users.info`, which needs the `users:read` bot token scope. Feishu needs the `contact:user.base:readonly` permission, with the sender inside the app's contact range. Without them every sender appears as `a member`. Names are cached for an hour in each Router Lambda container.
+- **The shared-conversation rules apply.** The system prompt tells the agent that the conversation is shared and that its memory and files belong to the conversation, and not to reveal user IDs, the namespace or storage paths, or saved memory, notes and files, unless the sender explicitly asks.
+- **Not available in conversations:** `/model` (a conversation always uses the default model), account linking (`link`, `link <code>`: the bot asks for a 1:1 chat instead), and scheduled tasks (the agent's cron tools refuse to create one).
+- **Replies** go where they went before: in Slack to the message's thread, in Feishu to the group chat.
+- **Token usage** for a conversation's turns is recorded under the conversation's internal user ID.
+
+### Turn it on
+
+1. Set `"channel_identity_mode": "channel"` in `cdk.json` (or pass `-c channel_identity_mode=channel`) and redeploy the `OpenClawRouter` stack. A value other than `personal` or `channel` fails the synth. No conversation is answered until you allowlist it.
+2. Optional, for display names: add the `users:read` bot token scope to the Slack app (**OAuth & Permissions**, then reinstall the app), and grant the Feishu app the `contact:user.base:readonly` permission.
+3. Allowlist each conversation, as below.
+
+### Allowlist a conversation
+
+A conversation is answered only if the identity table holds `ALLOW#slack_channel:<channel_id>` or `ALLOW#feishu_group:<chat_id>`. Only the operator can add the record, with the manage script; there is no in-chat command for it. To find the ID:
+
+- Slack: open the channel, click its name, and copy the **Channel ID** at the bottom of the **About** tab (`C...`; older private channels and group DMs start with `G`). Use the ID, not the `#name`.
+- Slack or Feishu: @mention the bot in the conversation. The Router log (`/openclaw/lambda/router`) then shows `channel <channel_id> is not allowlisted` or `group <chat_id> is not allowlisted`. Conversation IDs are not personal data, so they appear in the Router log as Telegram group IDs do.
+
+```bash
+./scripts/manage-allowlist.sh add slack_channel:C0123ABCDEF
+./scripts/manage-allowlist.sh add feishu_group:oc_0123abcd
+./scripts/manage-allowlist.sh list
+```
+
+To stop serving a conversation, remove its record. The router checks the record on every message, so the next message is ignored:
+
+```bash
+./scripts/manage-allowlist.sh remove slack_channel:C0123ABCDEF
+```
+
+`disable` / `enable` also work for a conversation that has already talked to the bot. Switching the setting back to `personal` returns every conversation to the senders' own sessions; a conversation's memory and files stay in its namespace and are used again if you switch back to `channel`.
+
+### Scheduled tasks created before the switch
+
+Schedules created in a Slack channel or Feishu group chat while the deployment was in `personal` mode (`CRON#` records with channel `slack` or `feishu` and a conversation as target) stay on the creator's personal session. Switching to `channel` neither moves nor stops them: they keep running with the creator's memory and files and keep posting to the conversation. The creator can list and delete them from a 1:1 chat with the bot.
 
 ## WhatsApp
 

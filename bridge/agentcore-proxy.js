@@ -21,10 +21,10 @@ const { buildRequestMetadata } = require("./request-metadata");
 const PORT = 18790;
 // Identity format allowlist — enforced as a post-condition on the bound actor.
 // Must include every channel the Router emits (telegram, telegram_group,
-// slack, discord, whatsapp, line, feishu). This is a shape check, not an
-// identity source.
+// slack, slack_channel, discord, whatsapp, line, feishu, feishu_group). This
+// is a shape check, not an identity source.
 const VALID_ACTOR_ID =
-  /^(telegram|telegram_group|slack|discord|whatsapp|line|feishu):[A-Za-z0-9_-]{1,64}$/;
+  /^(telegram|telegram_group|slack|slack_channel|discord|whatsapp|line|feishu|feishu_group):[A-Za-z0-9_-]{1,64}$/;
 // The SDK snapshot owner loads this body only after installing the bound
 // environment. Without a bound actor every request is refused (see
 // extractSessionMetadata); the tenant is never inferred from request data
@@ -36,7 +36,7 @@ if (BOUND_ACTOR_ID && !VALID_ACTOR_ID.test(BOUND_ACTOR_ID)) {
   console.error(
     "[proxy] FATAL: bound USER_ID does not " +
       "match the required <channel>:<id> format (channels: telegram, " +
-      "telegram_group, slack, discord, whatsapp, line, feishu).",
+      "telegram_group, slack, slack_channel, discord, whatsapp, line, feishu, feishu_group).",
   );
   process.exit(1);
 }
@@ -690,10 +690,12 @@ const VALID_CHANNELS = new Set([
   "telegram",
   "telegram_group",
   "slack",
+  "slack_channel",
   "discord",
   "whatsapp",
   "line",
   "feishu",
+  "feishu_group",
   "unknown",
 ]);
 
@@ -703,9 +705,11 @@ const VALID_CHANNELS = new Set([
 // a canonical-actor change and refused.
 const RUNTIME_SESSION_ID = /^[A-Za-z0-9:_@$#=/+,.-]{1,128}$/;
 
-// A Telegram group is its own identity (telegram_group:<chat_id>): the namespace
-// and files belong to the group, and every member of the group sees the replies.
-const GROUP_CHANNELS = new Set(["telegram_group"]);
+// A Telegram group (telegram_group:<chat_id>), and with channel_identity_mode
+// "channel" a Slack channel (slack_channel:<id>) or Feishu group chat
+// (feishu_group:<chat_id>), is its own identity: the namespace and files belong
+// to the conversation, and everyone in it sees the replies.
+const GROUP_CHANNELS = new Set(["telegram_group", "slack_channel", "feishu_group"]);
 const GROUP_CONTEXT =
   "\n## Group Chat\n" +
   "This conversation is a shared group chat. Everyone in the group reads your replies.\n" +
@@ -719,7 +723,9 @@ const groupContext = (channel) => (GROUP_CHANNELS.has(channel) ? GROUP_CONTEXT :
 
 // A Slack channel or Feishu group turn (the Router sets sharedChat): the user's
 // own identity, namespace and files, but everyone in the conversation sees the
-// reply. Schedules never set it.
+// reply. With channel_identity_mode "channel" the Router also sets it on the
+// conversation's own identity (slack_channel, feishu_group), next to the group
+// rules above. Schedules never set it.
 const SHARED_CHAT_CONTEXT =
   "\n## Shared Conversation\n" +
   "This message was posted in a shared channel or group chat, not a private chat. " +

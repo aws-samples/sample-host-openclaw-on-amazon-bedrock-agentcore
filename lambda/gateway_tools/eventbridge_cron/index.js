@@ -139,6 +139,10 @@ function scheduleNamespace(schedule) {
 // gateway surface refuses to allocate more than this many per caller.
 const MAX_SCHEDULES_PER_USER = 20;
 
+// Group conversations (one identity shared by a whole Telegram group, Slack
+// channel or Feishu group chat) cannot schedule tasks, as in the cron skill.
+const GROUP_CHANNELS = new Set(["telegram_group", "slack_channel", "feishu_group"]);
+
 function createHandler(deps = {}) {
   const env = {
     scheduleGroup: deps.scheduleGroup || process.env.EVENTBRIDGE_SCHEDULE_GROUP || "openclaw-cron",
@@ -251,7 +255,7 @@ function createHandler(deps = {}) {
       }
 
       const { channel, channelTarget } = channelInfo(identity.actorId);
-      if (channel === "telegram_group") throw new Error("Scheduled tasks are not available in group chats");
+      if (GROUP_CHANNELS.has(channel)) throw new Error("Scheduled tasks are not available in group chats");
       const scheduleId = newId();
       const ebName = buildScheduleName(identity.namespace, scheduleId);
       const displayName = scheduleName || `Schedule ${scheduleId}`;
