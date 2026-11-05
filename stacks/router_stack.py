@@ -27,7 +27,7 @@ from constructs import Construct
 
 from scripts.model_selection import CONTEXT_KEY as MODEL_SELECTION_KEY, parse_user_selectable_models
 from stacks import DeploymentNamer, apply_table_tags, retention_days
-from stacks.context_limits import context_int, reserved_concurrency
+from stacks.context_limits import context_int, per_user_daily_cost_usd, reserved_concurrency
 
 CHANNEL_IDENTITY_MODES = ("personal", "channel")
 
@@ -100,6 +100,8 @@ class RouterStack(Stack):
         # Test deployments only: log the Telegram reply text for the E2E log tailer.
         log_reply_text = str(
             self.node.try_get_context("router_log_reply_text") or "false").strip().lower() == "true"
+        # Per-user daily cost limit (USD), validated at synth; None = off.
+        daily_cost_limit = per_user_daily_cost_usd(self)
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
@@ -180,6 +182,8 @@ class RouterStack(Stack):
                 **({"LOG_REPLY_TEXT": "true"} if log_reply_text else {}),
                 # Set only in "channel" mode, so the default leaves the function unchanged.
                 **({"CHANNEL_IDENTITY_MODE": "channel"} if identity_mode == "channel" else {}),
+                # Set only when the limit is on, so the default (0) leaves the function unchanged.
+                **({"PER_USER_DAILY_COST_USD": daily_cost_limit} if daily_cost_limit else {}),
             },
             log_group=router_log_group,
         )

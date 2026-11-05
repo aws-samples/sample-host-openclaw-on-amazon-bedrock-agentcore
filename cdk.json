@@ -18,6 +18,7 @@
     "daily_token_budget": 18000000,
     "hourly_cost_alarm_usd": 30,
     "daily_cost_budget_usd": 100,
+    "per_user_daily_cost_usd": 0,
     "alarm_email": "",
     "anomaly_band_width": 2,
     "token_ttl_days": 90,

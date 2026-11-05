@@ -9,7 +9,9 @@ For each invocation log entry:
   3. Computes estimated cost using model pricing lookup
   4. Writes record to DynamoDB with composite keys for multi-access patterns:
      USER#<internal user ID>, or USER#<actor> for records from older bridge images
-  5. Publishes CloudWatch custom metrics by channel and model (never by user)
+  5. Adds the call to the user's daily usage item in the identity table
+     (USAGE#<user ID> / DAY#<UTC day>), read by the per-user daily cost limit and /usage
+  6. Publishes CloudWatch custom metrics by channel and model (never by user)
 """
 
 import base64
@@ -34,8 +36,12 @@ TABLE_NAME = os.environ["TABLE_NAME"]
 TTL_DAYS = int(os.environ.get("TTL_DAYS", "90"))
 METRICS_NAMESPACE = os.environ.get("METRICS_NAMESPACE", "OpenClaw/TokenUsage")
 
+# The identity table holds the per-user daily usage items. Unset: none are written.
+IDENTITY_TABLE_NAME = os.environ.get("IDENTITY_TABLE_NAME", "")
+
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
+identity_table = dynamodb.Table(IDENTITY_TABLE_NAME) if IDENTITY_TABLE_NAME else None
 cloudwatch = boto3.client("cloudwatch")
 
 # --- Model pricing (per 1M tokens) ---
@@ -164,6 +170,9 @@ _USER_ID = re.compile(r"^user_[0-9a-f]{16}$")
 AGENT_TYPES = ("main", "subagent", "cron")
 UNKNOWN_AGENT_TYPE = "unknown"
 UNBOUND_ACTOR = "default-user"
+# openclaw.trigger: the kind of turn that caused the call (a sub-agent of a
+# scheduled turn is agent type subagent with trigger cron).
+TRIGGERS = ("chat", "cron")
 
 
 def _clean(value, pattern=_SAFE_VALUE):
@@ -204,7 +213,7 @@ def _as_dict(value) -> dict:
 
 
 def extract_openclaw_metadata(log_entry: dict) -> dict:
-    """Extract OpenClaw attribution (user, session, channel, agent type) from a log entry.
+    """Extract OpenClaw attribution (user, session, channel, agent type, trigger) from a log entry.
 
     The bridge proxy sets Bedrock ``requestMetadata`` on every Converse /
     ConverseStream call (bridge/request-metadata.js) and Bedrock copies it into
@@ -223,6 +232,7 @@ def extract_openclaw_metadata(log_entry: dict) -> dict:
         "session_id": "default-session",
         "channel": "unknown",
         "agent_type": UNKNOWN_AGENT_TYPE,
+        "trigger": None,
         "attribution": "none",
     }
 
@@ -265,6 +275,8 @@ def extract_openclaw_metadata(log_entry: dict) -> dict:
              channel=request_metadata.get("openclaw.channel"))
         agent_type = request_metadata.get("openclaw.agent_type")
         metadata["agent_type"] = agent_type if agent_type in AGENT_TYPES else UNKNOWN_AGENT_TYPE
+        trigger = request_metadata.get("openclaw.trigger")
+        metadata["trigger"] = trigger if trigger in TRIGGERS else None
         metadata["attribution"] = "request-metadata"
 
     return metadata
@@ -366,6 +378,92 @@ def write_to_dynamodb(record: dict):
             raise
         # A concurrent write added cost after ours and sets GSI3SK from its total.
         logger.warning("GSI3SK update skipped: cost total moved past %s concurrently", total)
+
+
+# --- Per-user daily usage (per_user_daily_cost_usd and /usage) ---------------
+# Same keys as lambda/shared/python/usage_limits.py, which the Router and the
+# Cron Lambda read them with (this Lambda does not load that layer).
+USAGE_PK_PREFIX = "USAGE#"
+USAGE_DAY_PREFIX = "DAY#"
+# A day item expires two days after its UTC day ends.
+USAGE_TTL_GRACE_SECONDS = 2 * 86400
+# Records of bridge images before the user ID change name only the actor; its
+# user is CHANNEL#<actor>/PROFILE.userId. Cached per container (unresolved
+# actors too) for 10 minutes; a full cache is emptied rather than grown.
+ACTOR_USER_TTL_SECONDS = 600
+ACTOR_USER_CACHE_MAX = 1000
+_actor_users = {}
+# The userId of a CHANNEL# record becomes a key part, so only an identifier is used.
+_STORED_USER_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# Matched by the openclaw-token-metrics-errors alarm (stacks/token_monitoring_stack.py).
+USAGE_WRITE_FAILED = "Usage aggregate not written"
+
+
+def _usage_user_id(record: dict):
+    """The internal user ID the call counts against, or None (unbound or unresolved actor)."""
+    if record.get("user_id"):
+        return record["user_id"]
+    actor = record.get("actor_id")
+    if not actor or actor == UNBOUND_ACTOR:
+        return None
+    now = time.monotonic()
+    cached = _actor_users.get(actor)
+    if cached and cached[1] > now:
+        return cached[0]
+    item = identity_table.get_item(
+        Key={"PK": f"CHANNEL#{actor}", "SK": "PROFILE"}, ProjectionExpression="userId",
+    ).get("Item") or {}
+    user_id = item.get("userId")
+    user_id = user_id if isinstance(user_id, str) and _STORED_USER_ID.match(user_id) else None
+    if len(_actor_users) >= ACTOR_USER_CACHE_MAX:
+        _actor_users.clear()
+    _actor_users[actor] = (user_id, now + ACTOR_USER_TTL_SECONDS)
+    return user_id
+
+
+def _usage_ttl(day: str) -> int:
+    """Epoch seconds of the next 00:00 UTC after day (yyyy-mm-dd), plus the grace period."""
+    start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(start.timestamp()) + 86400 + USAGE_TTL_GRACE_SECONDS
+
+
+def write_usage_aggregate(record: dict):
+    """Add the call to its user's item for the call's UTC day: USAGE#<user ID> / DAY#<day>.
+
+    One UpdateItem with ADD, so concurrent invocations add safely. A scheduled
+    turn's call (trigger cron, or agent type cron when the record has no
+    trigger) also adds to cronCostUsd and cronCalls. Unbound calls and actors
+    without a CHANNEL# record are not counted. Never raises: a failure is
+    logged with its error type, and the token-usage row and the metrics are
+    written regardless.
+    """
+    if identity_table is None:
+        return
+    try:
+        user_id = _usage_user_id(record)
+        if not user_id:
+            return
+        day = record["date"]
+        trigger = record.get("trigger")
+        scheduled = trigger == "cron" or (trigger is None and record.get("agent_type") == "cron")
+        add = "costUsd :cost, inputTokens :inp, outputTokens :out, calls :one"
+        if scheduled:
+            add += ", cronCostUsd :cost, cronCalls :one"
+        identity_table.update_item(
+            Key={"PK": f"{USAGE_PK_PREFIX}{user_id}", "SK": f"{USAGE_DAY_PREFIX}{day}"},
+            UpdateExpression=f"SET #ttl = :ttl, updatedAt = :now ADD {add}",
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":ttl": _usage_ttl(day),
+                ":now": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                ":cost": Decimal(str(record["estimated_cost_usd"])).quantize(COST_QUANTUM),
+                ":inp": record["input_tokens"],
+                ":out": record["output_tokens"],
+                ":one": 1,
+            },
+        )
+    except Exception as error:  # noqa: BLE001 -- the token-usage row and the metrics still count the call
+        logger.warning("%s: %s", USAGE_WRITE_FAILED, type(error).__name__)
 
 
 def publish_metrics(record: dict):
@@ -487,6 +585,7 @@ def process_log_entry(log_entry: dict):
         "session_id": metadata["session_id"],
         "channel": metadata["channel"],
         "agent_type": metadata["agent_type"],
+        "trigger": metadata["trigger"],
         "attribution": metadata["attribution"],
         "model_id": model_id,
         "input_tokens": input_tokens,
@@ -516,6 +615,7 @@ def process_log_entry(log_entry: dict):
     )
 
     write_to_dynamodb(record)
+    write_usage_aggregate(record)
     publish_metrics(record)
 
 
@@ -558,6 +658,7 @@ def handler(event, context):
 
         except Exception:
             errors += 1
+            # Matched by the openclaw-token-metrics-errors alarm.
             logger.exception("Failed to process log event")
 
     logger.info("Completed: processed=%d errors=%d total=%d", processed, errors, len(log_events))

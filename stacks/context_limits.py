@@ -5,7 +5,13 @@ so these helpers treat only an absent (or empty) key as "use the default" and
 reject anything that is not a non-negative integer, so a typo never deploys.
 """
 
+from decimal import Decimal, InvalidOperation
+
 from constructs import Construct
+
+PER_USER_DAILY_COST_KEY = "per_user_daily_cost_usd"
+# Also the largest override scripts/manage-allowlist.sh set-cap accepts.
+MAX_PER_USER_DAILY_COST_USD = Decimal(10000)
 
 
 def context_int(scope: Construct, key: str, default: int, minimum: int = 0) -> int:
@@ -35,3 +41,25 @@ def reserved_concurrency(scope: Construct, key: str) -> int | None:
     """
     value = context_int(scope, key, default=0)
     return value or None
+
+
+def per_user_daily_cost_usd(scope: Construct) -> str | None:
+    """The per-user daily cost limit as the Lambdas' PER_USER_DAILY_COST_USD value, or None when off.
+
+    ``per_user_daily_cost_usd`` is a number of USD from 0 to 10000; anything
+    else fails the synth. Unset or 0 (the default) is off: the Router and the
+    Cron Lambda then get no variable, so their configuration is unchanged.
+    """
+    raw = scope.node.try_get_context(PER_USER_DAILY_COST_KEY)
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return None
+    value = None
+    if not isinstance(raw, bool):
+        try:
+            value = Decimal(str(raw).strip())
+        except InvalidOperation:
+            value = None
+    if value is None or not value.is_finite() or not 0 <= value <= MAX_PER_USER_DAILY_COST_USD:
+        raise ValueError(f"context '{PER_USER_DAILY_COST_KEY}' must be a number of USD from 0 to "
+                         f"{MAX_PER_USER_DAILY_COST_USD}, got {raw!r}")
+    return format(value.normalize(), "f") if value else None

@@ -74,7 +74,7 @@ The Router API Gateway HTTP API uses explicit routes — only three paths are ex
 | Control | Implementation |
 |---|---|
 | User allowlist | `registration_open=false` by default; new users require an `ALLOW#` record in DynamoDB |
-| DynamoDB identity table | `CHANNEL#`, `USER#`, `SESSION`, `BIND#`, `ALLOW#`, `CRON#` record types with composite key schema |
+| DynamoDB identity table | `CHANNEL#`, `USER#`, `SESSION`, `BIND#`, `ALLOW#`, `CRON#` record types with composite key schema; `USAGE#<user ID>` daily usage items and limit overrides (per-user daily cost limit), outside the agent's `USER#` partition |
 | Cognito User Pool | Self-signup disabled (`self_sign_up_enabled=False`); users auto-provisioned by proxy via `AdminCreateUser`. Threat protection is opt-in via `cognito_advanced_security_mode` (`AUDIT` or `ENFORCED`, default `OFF`); enabling it moves the pool to the Plus feature plan, billed per monthly active user |
 | Random per-user passwords | Generated with `crypto.randomBytes` and stored in one Secrets Manager secret per user, `openclaw/cognito-user/<poolId>/<namespace>`, read with the execution role (`bridge/cognito-token.js`); never sent to end users. Users created by the earlier HMAC derivation get one on their next authentication |
 | Account recovery disabled | `AccountRecovery.NONE` — no password reset flows (passwords are generated, not chosen) |
