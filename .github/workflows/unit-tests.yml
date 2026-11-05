@@ -1,0 +1,76 @@
+# Hermetic unit tests: fakes, loopback servers and synthetic CDK context only.
+# No AWS credentials, secrets or deployed stack; tests/e2e never runs here.
+# Contributors run the same suites with scripts/run-unit-tests.sh.
+name: Unit tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, release/v1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # A new push to a pull request cancels its superseded run; main and
+  # release/v1 runs finish so every merged commit gets a result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  node:
+    name: Node 24 (bridge, skills, gateway tools)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+      - name: Install bridge dependencies
+        # Same flags as the image build (bridge/Dockerfile): no install scripts.
+        run: npm ci --prefix bridge --ignore-scripts --no-audit --no-fund
+      - name: Bridge
+        run: scripts/run-unit-tests.sh bridge
+      - name: Skills
+        run: scripts/run-unit-tests.sh skills
+      - name: Gateway tools
+        run: scripts/run-unit-tests.sh gateway-tools
+
+  python:
+    # 3.13 is the Router and Cron Lambda runtime (stacks/router_stack.py, stacks/cron_stack.py).
+    name: Python 3.13 (router, cron, tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The CDK synth tests run app.py, whose jsii runtime needs Node.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-deploy.txt
+            requirements-deploy.lock
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt -r requirements-deploy.txt pytest
+      # Router and Cron both import a module named `index`: separate processes.
+      - name: Router
+        run: scripts/run-unit-tests.sh router
+      - name: Cron
+        run: scripts/run-unit-tests.sh cron
+      - name: tests/ (without e2e)
+        env:
+          JSII_RUNTIME_PACKAGE_CACHE_ROOT: ${{ runner.temp }}/jsii-package-cache
+        run: scripts/run-unit-tests.sh tests
