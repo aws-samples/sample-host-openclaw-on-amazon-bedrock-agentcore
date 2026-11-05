@@ -1501,16 +1501,24 @@ def _escape_slack_text(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def send_slack_message(channel_id, text, bot_token):
-    """Send a message via Slack Web API."""
+def _slack_thread_kwargs(thread_ts):
+    """Pass thread_ts on only when set, so DM sends keep their old call shape."""
+    return {} if thread_ts is None else {"thread_ts": thread_ts}
+
+
+def send_slack_message(channel_id, text, bot_token, thread_ts=None):
+    """Send a message via Slack Web API, as a reply in the thread of thread_ts if given."""
     if not bot_token:
         logger.error("No Slack bot token available")
         return
     url = "https://slack.com/api/chat.postMessage"
-    data = json.dumps({
+    message = {
         "channel": channel_id,
         "text": _escape_slack_text(text),
-    }).encode()
+    }
+    if thread_ts:
+        message["thread_ts"] = thread_ts
+    data = json.dumps(message).encode()
     req = urllib_request.Request(
         url,
         data=data,
@@ -1525,7 +1533,7 @@ def send_slack_message(channel_id, text, bot_token):
         logger.error("Failed to send Slack message to %s: %s", channel_id, e)
 
 
-def _slack_progress_notify(channel_id, bot_token, stop_event, notify_after_s=30):
+def _slack_progress_notify(channel_id, bot_token, stop_event, notify_after_s=30, thread_ts=None):
     """Send a one-time progress message to Slack if the request takes longer than notify_after_s."""
     if not stop_event.wait(timeout=notify_after_s):
         send_slack_message(
@@ -1533,6 +1541,7 @@ def _slack_progress_notify(channel_id, bot_token, stop_event, notify_after_s=30)
             "\u23f3 Working on your request \u2014 this may take a few minutes. "
             "I'll send the full response when it's ready.",
             bot_token,
+            **_slack_thread_kwargs(thread_ts),
         )
 
 
@@ -2031,6 +2040,29 @@ def _is_slack_dm(event):
     if channel_type:
         return channel_type == "im"
     return str(event.get("channel", "")).startswith("D")
+
+
+def _slack_bot_user_id(event_data):
+    """The bot's user ID from the envelope's authorizations: the is_bot entry, else the first."""
+    authorizations = event_data.get("authorizations")
+    if not isinstance(authorizations, list):
+        return ""
+    authorizations = [a for a in authorizations if isinstance(a, dict)]
+    for authorization in authorizations:
+        if authorization.get("is_bot") and authorization.get("user_id"):
+            return str(authorization["user_id"])
+    return str(authorizations[0].get("user_id") or "") if authorizations else ""
+
+
+def _slack_addresses_bot(event_data, event):
+    """True for an app_mention, or a message whose text mentions the bot user (<@U...>)."""
+    if event.get("type") == "app_mention":
+        return True
+    bot_user_id = _slack_bot_user_id(event_data)
+    text = event.get("text")
+    if not bot_user_id or not isinstance(text, str):
+        return False
+    return f"<@{bot_user_id}>" in text or f"<@{bot_user_id}|" in text
 
 
 def _is_bind_command(text):
@@ -2593,10 +2625,56 @@ def _handle_telegram_group(message, text, document, doc_mime, has_image, has_doc
     logger.info("Telegram group response sent to group %s", group_id)
 
 
+SLACK_DEDUP_TTL_SECONDS = 86400
+
+
+def _claim_slack_key(key):
+    """Record one Slack dedupe key in the identity table. False = already recorded.
+
+    A DynamoDB error other than the failed condition counts as claimed (True),
+    as in _claim_feishu_event: a rare duplicate reply is better than a lost
+    message.
+    """
+    try:
+        identity_table.put_item(
+            Item={"PK": f"DEDUP#slack:{key}", "SK": "DEDUP",
+                  "ttl": int(time.time()) + SLACK_DEDUP_TTL_SECONDS},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("Slack dedupe write failed: %s", type(e).__name__)
+        return True
+
+
+def _claim_slack_event(event_id, channel_id, ts):
+    """Claim a Slack delivery so it runs once. False = duplicate.
+
+    A Slack retry repeats the envelope's event_id. The app_mention and the
+    message event for one post have different event_ids but the same channel
+    and ts. Both keys are claimed; either one already recorded means the post
+    was handled.
+    """
+    if event_id and not _claim_slack_key(f"event:{event_id}"):
+        return False
+    if channel_id and ts and not _claim_slack_key(f"message:{channel_id}:{ts}"):
+        return False
+    return True
+
+
 def handle_slack(body, headers=None):
     """Process a Slack Events API webhook.
 
     Returns a response dict for immediate replies (url_verification).
+
+    Every DM message is answered. In a channel only messages addressed to the
+    bot are: app_mention events, and message events whose text mentions the
+    bot user. Other channel messages are ignored without a reply. Channel
+    replies go to the message's thread. A delivery is claimed before anything
+    is sent, so a Slack retry, or the app_mention and message events for one
+    post, run one turn.
     """
     event_data = json.loads(body) if isinstance(body, str) else body
 
@@ -2604,18 +2682,20 @@ def handle_slack(body, headers=None):
     if event_data.get("type") == "url_verification":
         return {"statusCode": 200, "body": json.dumps({"challenge": event_data["challenge"]})}
 
-    # Ignore retries (Slack resends if no ACK within 3s — we self-invoke async)
-    if headers and headers.get("x-slack-retry-num"):
-        logger.info("Slack: ignoring retry %s", headers.get("x-slack-retry-num"))
-        return {"statusCode": 200, "body": "ok"}
-
     event = event_data.get("event", {})
     event_type = event.get("type")
-    # Allow-list: message (DM), app_mention (channel @mentions), file_share subtype (image uploads)
+    # Allow-list: message (DM or channel), app_mention (channel @mentions), file_share subtype (image uploads)
     if event_type not in ("message", "app_mention"):
         return {"statusCode": 200, "body": "ok"}
     # For "message" events, only allow plain messages and file_share subtype
     if event_type == "message" and event.get("subtype") not in (None, "file_share"):
+        return {"statusCode": 200, "body": "ok"}
+
+    # In a channel, answer only messages addressed to the bot. Any other
+    # channel message gets no reply, no "bot is private" notice and no
+    # enrollment, and runs no turn.
+    is_dm = _is_slack_dm(event)
+    if not is_dm and not _slack_addresses_bot(event_data, event):
         return {"statusCode": 200, "body": "ok"}
 
     text = event.get("text", "")
@@ -2643,6 +2723,15 @@ def handle_slack(body, headers=None):
     if event.get("bot_id"):
         return {"statusCode": 200, "body": "ok"}
 
+    # Claim the delivery before any reply or turn. Retries are not dropped by
+    # their x-slack-retry-num header: a retry of a handled delivery stops
+    # here, and a retry whose first delivery never got this far runs.
+    if not _claim_slack_event(str(event_data.get("event_id") or ""), channel_id, str(event.get("ts") or "")):
+        logger.info("Slack: duplicate event ignored")
+        return {"statusCode": 200, "body": "ok"}
+
+    # Channel replies go to the message's thread; DM replies stay top-level.
+    in_thread = _slack_thread_kwargs(None if is_dm else (event.get("thread_ts") or event.get("ts") or None))
     bot_token, _ = _get_slack_tokens()
 
     # Handle bind commands BEFORE allowlist check — cross-channel binding
@@ -2652,22 +2741,26 @@ def handle_slack(body, headers=None):
     if is_bind:
         bound_user_id, success = redeem_bind_code(code, "slack", slack_user_id)
         if success:
-            send_slack_message(channel_id, "Accounts linked successfully! Your sessions are now unified.", bot_token)
+            send_slack_message(channel_id, "Accounts linked successfully! Your sessions are now unified.", bot_token,
+                               **in_thread)
         else:
-            send_slack_message(channel_id, "Invalid or expired link code. Please try again.", bot_token)
+            send_slack_message(channel_id, "Invalid or expired link code. Please try again.", bot_token, **in_thread)
         return {"statusCode": 200, "body": "ok"}
 
     # Resolve user identity
     resolved_user_id, is_new = resolve_user("slack", slack_user_id)
 
     if resolved_user_id is None:
-        send_slack_message(
-            channel_id,
-            f"Sorry, this bot is private and requires an invitation.\n\n"
-            f"Your ID: `slack:{slack_user_id}`\n\n"
-            f"Send this ID to the bot admin to request access.",
-            bot_token,
-        )
+        # The notice shows the sender's ID, so it is sent only in a DM. In a
+        # channel it would be public; the sender can DM the bot to get it.
+        if is_dm:
+            send_slack_message(
+                channel_id,
+                f"Sorry, this bot is private and requires an invitation.\n\n"
+                f"Your ID: `slack:{slack_user_id}`\n\n"
+                f"Send this ID to the bot admin to request access.",
+                bot_token,
+            )
         return {"statusCode": 200, "body": "ok"}
 
     session_id = get_or_create_session(resolved_user_id)
@@ -2676,8 +2769,8 @@ def handle_slack(body, headers=None):
     # Handle link-accounts command (generate bind code for existing users).
     # A bind code links whoever redeems it first, so it is only sent in a DM.
     if _is_link_command(text):
-        if not _is_slack_dm(event):
-            send_slack_message(channel_id, LINK_DM_ONLY_MESSAGE, bot_token)
+        if not is_dm:
+            send_slack_message(channel_id, LINK_DM_ONLY_MESSAGE, bot_token, **in_thread)
             return {"statusCode": 200, "body": "ok"}
         code = create_bind_code(resolved_user_id)
         if not code:
@@ -2695,7 +2788,7 @@ def handle_slack(body, headers=None):
     # Slack client sends it as a message instead of a slash command).
     model_argument = None if has_image else _parse_model_command(text)
     if model_argument is not None:
-        send_slack_message(channel_id, handle_model_command(resolved_user_id, model_argument), bot_token)
+        send_slack_message(channel_id, handle_model_command(resolved_user_id, model_argument), bot_token, **in_thread)
         return {"statusCode": 200, "body": "ok"}
 
     # Build message payload (structured if image, plain string if text-only)
@@ -2710,10 +2803,12 @@ def handle_slack(body, headers=None):
             if s3_key:
                 agent_message = _build_structured_message(text, s3_key, content_type)
             else:
-                send_slack_message(channel_id, "Sorry, I couldn't process that image. Please try again.", bot_token)
+                send_slack_message(channel_id, "Sorry, I couldn't process that image. Please try again.", bot_token,
+                                   **in_thread)
                 return {"statusCode": 200, "body": "ok"}
         else:
-            send_slack_message(channel_id, "Sorry, I couldn't download that image. Please try again.", bot_token)
+            send_slack_message(channel_id, "Sorry, I couldn't download that image. Please try again.", bot_token,
+                               **in_thread)
             return {"statusCode": 200, "body": "ok"}
 
     logger.info(
@@ -2726,6 +2821,7 @@ def handle_slack(body, headers=None):
     notify_thread = threading.Thread(
         target=_slack_progress_notify,
         args=(channel_id, bot_token, stop_notify),
+        kwargs=in_thread,
         daemon=True,
     )
     notify_thread.start()
@@ -2739,7 +2835,7 @@ def handle_slack(body, headers=None):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     response_text = _extract_text_from_content_blocks(response_text)
 
-    send_slack_message(channel_id, response_text, bot_token)
+    send_slack_message(channel_id, response_text, bot_token, **in_thread)
     return {"statusCode": 200, "body": "ok"}
 
 
@@ -3481,11 +3577,9 @@ def _handle_event(event, context):
                 "body": json.dumps({"challenge": challenge}),
             }
 
-        # Ignore Slack retries
-        if headers.get("x-slack-retry-num"):
-            return {"statusCode": 200, "body": "ok"}
-
-        # Self-invoke async for actual processing
+        # Self-invoke async for actual processing. Retries (x-slack-retry-num)
+        # are dispatched too: handle_slack claims each delivery, so a retry of
+        # a handled one is dropped there and a retry of a lost one still runs.
         _self_invoke_async("slack", body, headers)
         return {"statusCode": 200, "body": "ok"}
 

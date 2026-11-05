@@ -496,7 +496,7 @@ def test_bound_channel_image_upload_uses_canonical_namespace_and_actual_delivery
     assert module.redeem_bind_code("LINKCODE", "slack", "456") == (user, True)
     module.agentcore_client = FakeRuntime([{"response": "image received"}])
     event = {"type": "event_callback", "event": {
-        "type": "message", "user": "456", "channel": "C123", "text": "hi",
+        "type": "message", "user": "456", "channel": "C123", "channel_type": "im", "text": "hi",
         "files": [{"mimetype": "image/png", "url_private_download": "https://example.invalid/image.png"}],
     }}
     with patch.object(module, "_get_slack_tokens", return_value=("token", "signing")), patch.object(

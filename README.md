@@ -474,6 +474,7 @@ The first message waits for state restoration and full OpenClaw initialization. 
     --query SecretString --output text
   ```
 - **Bot not in DMs**: Go to **Features** > **App Home** and enable **Messages Tab** + **Allow users to send messages**.
+- **No answer in a channel**: In a channel the bot answers only messages that @mention it, in the message's thread. Invite the bot to the channel and subscribe to the `app_mention` event ([docs/channels.md](docs/channels.md#slack)).
 - **Separate session from Telegram**: By default, Slack and Telegram create separate user identities. Use [cross-channel linking](docs/how-it-works.md#cross-channel-account-linking) to add an unregistered channel to an existing user; independently registered accounts cannot be merged.
 
 ### Telegram bot not responding
