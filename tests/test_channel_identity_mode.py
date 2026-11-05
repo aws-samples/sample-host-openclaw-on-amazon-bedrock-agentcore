@@ -8,11 +8,14 @@ like a Telegram group, and ignores every other conversation without a reply.
 """
 
 import hashlib
+import io
 import json
+import logging
 import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -57,19 +60,41 @@ class _Response:
 
 
 class FakeApi:
-    """urlopen stand-in for the Slack and Feishu APIs: records every call."""
+    """urlopen stand-in for the Slack and Feishu APIs: records every call.
 
-    def __init__(self, slack_names=None, users_info_error=None, feishu_names=None, contact_code=0):
+    chat is the answer to GET /open-apis/im/v1/chats/:chat_id: a dict without
+    "code" is the chat data (code 0), a dict with "code" is the whole body
+    (HTTP 200), (status, body) is an HTTP error with that body, and an
+    exception is raised. send_codes are the codes of successive Feishu sends.
+    """
+
+    def __init__(self, slack_names=None, users_info_error=None, feishu_names=None, contact_code=0,
+                 chat=None, send_codes=()):
         self.calls = []
+        self.chat_auth = []
         self.slack_names = {MEMBER: MEMBER_NAME} if slack_names is None else slack_names
         self.users_info_error = users_info_error
         self.feishu_names = {FEISHU_MEMBER: FEISHU_NAME} if feishu_names is None else feishu_names
         self.contact_code = contact_code
+        self.chat = {"chat_mode": "group", "external": False} if chat is None else chat
+        self.send_codes = list(send_codes)
 
     def __call__(self, req, timeout=None):
         url = urlparse(req.full_url)
         payload = json.loads(req.data.decode()) if req.data else {k: v[0] for k, v in parse_qs(url.query).items()}
         self.calls.append((url.path, payload))
+        if url.path.startswith("/open-apis/im/v1/chats/"):
+            self.chat_auth.append(req.get_header("Authorization"))
+            answer = self.chat
+            if isinstance(answer, BaseException):
+                raise answer
+            if isinstance(answer, tuple):
+                status, body = answer
+                raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+                raise HTTPError(req.full_url, status, "error", {}, io.BytesIO(raw))
+            return _Response(answer if "code" in answer else {"code": 0, "msg": "success", "data": answer})
+        if url.path == "/open-apis/im/v1/messages" and self.send_codes:
+            return _Response({"code": self.send_codes.pop(0), "data": {}})
         if url.path == "/api/users.info":
             if self.users_info_error:
                 return _Response({"ok": False, "error": self.users_info_error})
@@ -96,6 +121,19 @@ class FakeApi:
 
     def lookups(self):
         return [path for path, _ in self.calls if path == "/api/users.info" or "/contact/" in path]
+
+    def chat_checks(self):
+        return [path.rsplit("/", 1)[-1] for path, _ in self.calls if path.startswith("/open-apis/im/v1/chats/")]
+
+
+class Clock:
+    """time.time stand-in for the Router's caches."""
+
+    def __init__(self, now=1_800_000_000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
 
 
 def router(mode="channel", allow_conversations=True, allow_users=True):
@@ -155,11 +193,12 @@ def run_slack(module, envelope, api=None):
     return api
 
 
-def run_feishu(module, envelope, api=None):
+def run_feishu(module, envelope, api=None, clock=None, token="t-fixture"):
     api = api or FakeApi()
-    with patch.object(module, "_get_feishu_tenant_token", return_value="t-fixture"), \
+    with patch.object(module, "_get_feishu_tenant_token", return_value=token), \
             patch.object(module, "_feishu_progress_notify", lambda *a, **k: None), \
-            patch.object(module.urllib_request, "urlopen", api):
+            patch.object(module.urllib_request, "urlopen", api), \
+            patch.object(module.time, "time", clock or module.time.time):
         assert module.handle_feishu(json.dumps(envelope)) == {"statusCode": 200, "body": "ok"}
     return api
 
@@ -574,3 +613,160 @@ def test_feishu_p2p_chat_is_unchanged_in_channel_mode():
     assert payload["message"] == "hello"
     assert "sharedChat" not in payload
     assert api.lookups() == []
+
+
+# --- Feishu groups: only a confirmed internal group is served -------------------
+
+EXTERNAL_NOTICE = (f"NOTICE#feishu_group:{FEISHU_CHAT}", "EXTERNAL_GROUP")
+
+
+def test_internal_feishu_group_is_checked_with_the_tenant_token_and_served():
+    module = router()
+    api = run_feishu(module, feishu_event())
+    assert api.chat_checks() == [FEISHU_CHAT]
+    assert api.chat_auth == ["Bearer t-fixture"]
+    payload, = payloads(module)
+    assert payload["actorId"] == f"feishu_group:{FEISHU_CHAT}"
+    assert api.feishu_sends() == [(FEISHU_CHAT, "channel answer")]
+
+
+def test_external_feishu_group_is_refused_and_told_once():
+    module = router()
+    api, clock = FakeApi(chat={"chat_mode": "group", "external": True}), Clock()
+    for n in range(3):
+        run_feishu(module, feishu_event(event_id=f"evt_{n}"), api, clock)
+        clock.now += 301  # past the five-minute cache, so Feishu is asked every time
+    assert api.chat_checks() == [FEISHU_CHAT] * 3
+    assert module.agentcore_client.calls == []
+    assert user_records(module) == []
+    notice = (FEISHU_CHAT, module.formatting.feishu_text(module.FEISHU_EXTERNAL_GROUP_MESSAGE))
+    assert api.feishu_sends() == [notice]
+    # Another Router container (empty cache) does not post it again either.
+    module._feishu_group_checks.clear()
+    run_feishu(module, feishu_event(event_id="evt_9"), api, clock)
+    assert api.feishu_sends() == [notice]
+    assert EXTERNAL_NOTICE in module.identity_table.items
+
+
+@pytest.mark.parametrize("text", ["@_user_1 /model opus", "@_user_1 link", "@_user_1 hello"])
+def test_external_group_is_refused_before_commands(text):
+    module = router()
+    module.USER_SELECTABLE_MODELS = {"opus": "model-a"}
+    api = run_feishu(module, feishu_event(text=text), FakeApi(chat={"external": True}))
+    assert module.agentcore_client.calls == []
+    assert [message for _, message in api.feishu_sends()] == [
+        module.formatting.feishu_text(module.FEISHU_EXTERNAL_GROUP_MESSAGE)]
+
+
+def test_external_group_notice_that_could_not_be_sent_is_tried_again():
+    module = router()
+    api, clock = FakeApi(chat={"external": True}, send_codes=[230002]), Clock()
+    run_feishu(module, feishu_event(event_id="evt_1"), api, clock)
+    assert EXTERNAL_NOTICE not in module.identity_table.items
+    for n in (2, 3):
+        clock.now += 301
+        run_feishu(module, feishu_event(event_id=f"evt_{n}"), api, clock)
+    assert len(api.feishu_sends()) == 2  # the refused send, then one delivered notice
+    assert EXTERNAL_NOTICE in module.identity_table.items
+    assert module.agentcore_client.calls == []
+
+
+@pytest.mark.parametrize("chat", [
+    (500, b"<html>502 Bad Gateway</html>"),
+    (400, {"code": 232011, "msg": "Operator can NOT be out of the chat."}),
+    (400, {"code": 232033, "msg": "The operator or invited bots does NOT have the authority to manage external chats"}),
+    {"code": 232034, "msg": "The app is unavailable or inactivated by the tenant."},
+    {"chat_mode": "group"},
+    {"chat_mode": "group", "external": "false"},
+    {"chat_mode": "group", "external": None},
+    URLError("timed out"),
+    TimeoutError("timed out"),
+])
+def test_group_feishu_cannot_confirm_as_internal_is_refused_without_a_reply(chat, caplog):
+    module = router()
+    with caplog.at_level(logging.INFO):
+        api = run_feishu(module, feishu_event(), FakeApi(chat=chat))
+    assert api.chat_checks() == [FEISHU_CHAT]
+    assert module.agentcore_client.calls == []
+    assert api.feishu_sends() == []
+    assert user_records(module) == [] and EXTERNAL_NOTICE not in module.identity_table.items
+    assert f"Feishu: group {FEISHU_CHAT} could not be checked" in caplog.text
+    assert f"Feishu: group {FEISHU_CHAT} message refused (unconfirmed group)" in caplog.text
+
+
+def test_group_is_refused_without_a_tenant_token():
+    module = router()
+    api = run_feishu(module, feishu_event(), token="")
+    assert api.chat_checks() == []
+    assert module.agentcore_client.calls == []
+
+
+def test_missing_permission_is_refused_and_logged_once(caplog):
+    module = router()
+    api = FakeApi(chat=(400, {"code": 99991672, "msg": "Access denied. One of the following scopes is required: "
+                                                       "[im:chat:readonly, im:chat:read, im:chat]"}))
+    clock = Clock()
+    with caplog.at_level(logging.INFO):
+        for n in range(3):
+            run_feishu(module, feishu_event(event_id=f"evt_{n}"), api, clock)
+            clock.now += 301
+    assert api.chat_checks() == [FEISHU_CHAT] * 3
+    assert module.agentcore_client.calls == []
+    assert api.feishu_sends() == []
+    scope_lines = [record for record in caplog.records if "im:chat:readonly" in record.getMessage()]
+    assert len(scope_lines) == 1
+    assert scope_lines[0].levelno == logging.ERROR
+    assert "99991672" in scope_lines[0].getMessage()
+
+
+def test_internal_answer_is_cached_for_an_hour():
+    module = router()
+    module.agentcore_client = FakeRuntime([{"response": "ok"}] * 3)
+    api, clock = FakeApi(), Clock()
+    run_feishu(module, feishu_event(event_id="evt_1"), api, clock)
+    clock.now += 3599
+    run_feishu(module, feishu_event(event_id="evt_2"), api, clock)
+    assert api.chat_checks() == [FEISHU_CHAT]
+    clock.now += 2
+    run_feishu(module, feishu_event(event_id="evt_3"), api, clock)
+    assert api.chat_checks() == [FEISHU_CHAT] * 2
+    assert len(module.agentcore_client.calls) == 3
+
+
+def test_refused_answer_is_cached_for_five_minutes_so_a_failure_recovers():
+    module = router()
+    api, clock = FakeApi(chat=(503, b"unavailable")), Clock()
+    run_feishu(module, feishu_event(event_id="evt_1"), api, clock)
+    clock.now += 299
+    run_feishu(module, feishu_event(event_id="evt_2"), api, clock)
+    assert api.chat_checks() == [FEISHU_CHAT]
+    assert module.agentcore_client.calls == []
+    api.chat = {"chat_mode": "group", "external": False}  # Feishu answers again
+    clock.now += 2
+    run_feishu(module, feishu_event(event_id="evt_3"), api, clock)
+    assert api.chat_checks() == [FEISHU_CHAT] * 2
+    assert len(module.agentcore_client.calls) == 1
+
+
+def test_external_answer_is_cached_for_five_minutes():
+    module = router()
+    api, clock = FakeApi(chat={"external": True}), Clock()
+    run_feishu(module, feishu_event(event_id="evt_1"), api, clock)
+    clock.now += 299
+    run_feishu(module, feishu_event(event_id="evt_2"), api, clock)
+    assert api.chat_checks() == [FEISHU_CHAT]
+    clock.now += 2
+    run_feishu(module, feishu_event(event_id="evt_3"), api, clock)
+    assert api.chat_checks() == [FEISHU_CHAT] * 2
+
+
+def test_personal_mode_and_p2p_chats_make_no_group_check():
+    module = router(mode="personal")
+    api = run_feishu(module, feishu_event(), FakeApi(chat={"external": True}))
+    assert api.chat_checks() == []
+    assert len(module.agentcore_client.calls) == 1
+    module = router()
+    api = run_feishu(module, feishu_event(text="hello", chat_id="oc_p2pchat", chat_type="p2p"),
+                     FakeApi(chat={"external": True}))
+    assert api.chat_checks() == []
+    assert len(module.agentcore_client.calls) == 1

@@ -2699,6 +2699,22 @@ SLACK_CHANNEL_EXTERNAL_MESSAGE = (
     "People from other organizations in a Slack Connect channel can't use me here."
 )
 FEISHU_GROUP_MODEL_MESSAGE = "Model switching is not available in group chats. This group uses the default model."
+FEISHU_EXTERNAL_GROUP_MESSAGE = "Sorry, this bot isn't available in external groups."
+
+# Whether a Feishu group is internal, from the "external" flag of
+# GET /open-apis/im/v1/chats/:chat_id: chat_id -> (verdict, expiry), verdict
+# "internal", "external" or "unconfirmed". Only "internal" is served. It is
+# cached for an hour; any other answer for five minutes, so a failed read is
+# retried soon. Feishu documents no reliable per-sender tenant field, so the
+# whole group is checked rather than each sender.
+FEISHU_GROUP_INTERNAL_TTL_SECONDS = 3600
+FEISHU_GROUP_REFUSED_TTL_SECONDS = 300
+FEISHU_GROUP_CACHE_MAX = 1000
+_feishu_group_checks = {}
+# Feishu's code for "the app has not been granted this API's permission".
+FEISHU_MISSING_SCOPE_CODE = 99991672
+# The missing-permission line is logged once per container.
+_feishu_chat_scope_logged = False
 
 # Sender display names for the context line: platform user ID -> (name, expiry).
 # Cached per container, failed lookups too, so a missing permission costs one
@@ -2793,6 +2809,101 @@ def _feishu_member_name(open_id):
             if isinstance(user, dict):
                 name = channel_identity.sender_name(user.get("name"))
     return _remember_member_name(_feishu_member_names, open_id, name)
+
+
+def _read_feishu_chat(chat_id, token):
+    """GET /open-apis/im/v1/chats/:chat_id: (HTTP status, body), or (None, None). Never raises.
+
+    Feishu answers an API error with HTTP 4xx and a JSON body that carries the
+    error code, so the body of an HTTP error is returned too.
+    """
+    req = urllib_request.Request(
+        f"{FEISHU_API_DOMAIN}/open-apis/im/v1/chats/{quote(chat_id, safe='')}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        return 200, _read_response(req, timeout=5)
+    except urllib_request.HTTPError as e:
+        try:
+            return e.code, e.read(65536)
+        except Exception:  # noqa: BLE001 -- an unreadable error body leaves the group unconfirmed
+            return e.code, b""
+        finally:
+            e.close()
+    except Exception as e:  # noqa: BLE001 -- the caller refuses the group
+        logger.warning("Feishu: group %s could not be checked: %s", chat_id, type(e).__name__)
+        return None, None
+
+
+def _feishu_group_verdict(chat_id):
+    """"internal" or "external" as Feishu reports it, else "unconfirmed"."""
+    global _feishu_chat_scope_logged
+    token = _get_feishu_tenant_token()
+    if not token:
+        logger.warning("Feishu: group %s could not be checked: no tenant access token", chat_id)
+        return "unconfirmed"
+    status, raw = _read_feishu_chat(chat_id, token)
+    if raw is None:
+        return "unconfirmed"
+    code = formatting.feishu_error(raw)
+    if code == FEISHU_MISSING_SCOPE_CODE:
+        if not _feishu_chat_scope_logged:
+            _feishu_chat_scope_logged = True
+            logger.error(
+                "Feishu: the app lacks the im:chat:readonly permission (Feishu code %s), so the router cannot "
+                "check whether a group is external. Every Feishu group is refused in channel mode until the "
+                "permission is granted.", code,
+            )
+        return "unconfirmed"
+    if code is not None:
+        logger.warning("Feishu: group %s could not be checked: HTTP %s, code=%s", chat_id, status, code)
+        return "unconfirmed"
+    data = json.loads(raw).get("data")
+    external = data.get("external") if isinstance(data, dict) else None
+    if external is False:
+        return "internal"
+    if external is True:
+        return "external"
+    logger.warning("Feishu: group %s could not be checked: no external field in the answer", chat_id)
+    return "unconfirmed"
+
+
+def _feishu_group_status(chat_id):
+    """The cached verdict for a Feishu group (see FEISHU_GROUP_INTERNAL_TTL_SECONDS)."""
+    entry = _feishu_group_checks.get(chat_id)
+    if entry and entry[1] > time.time():
+        return entry[0]
+    verdict = _feishu_group_verdict(chat_id)
+    ttl = FEISHU_GROUP_INTERNAL_TTL_SECONDS if verdict == "internal" else FEISHU_GROUP_REFUSED_TTL_SECONDS
+    if len(_feishu_group_checks) >= FEISHU_GROUP_CACHE_MAX:
+        _feishu_group_checks.clear()
+    _feishu_group_checks[chat_id] = (verdict, time.time() + ttl)
+    return verdict
+
+
+def _notify_external_feishu_group(chat_id):
+    """Post the external-group refusal once per group.
+
+    NOTICE#feishu_group:<chat_id> in the identity table records that it was
+    sent, across Router containers. If the send fails the record is removed,
+    so a later message tries again.
+    """
+    key = {"PK": f"NOTICE#{channel_identity.FEISHU}:{chat_id}", "SK": "EXTERNAL_GROUP"}
+    try:
+        identity_table.put_item(
+            Item={**key, "sentAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+    except Exception as e:  # noqa: BLE001 -- the notice is best effort; the group stays refused
+        if getattr(e, "response", {}).get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            logger.warning("Feishu: external-group notice record write failed: %s", type(e).__name__)
+        return
+    if send_feishu_message(chat_id, FEISHU_EXTERNAL_GROUP_MESSAGE):
+        return
+    try:
+        identity_table.delete_item(Key=key)
+    except Exception as e:  # noqa: BLE001 -- the notice is then not retried
+        logger.warning("Feishu: external-group notice record cleanup failed: %s", type(e).__name__)
 
 
 def _is_disabled_sender(channel_key):
@@ -2892,6 +3003,13 @@ def _handle_feishu_group(text, sender_id, chat_id, content_str, msg_type, has_im
     # A group that is not allowlisted gets no reply.
     if not _allow_record_exists(actor_id):
         logger.info("Feishu: group message ignored (group %s is not allowlisted)", chat_id)
+        return
+    # Fail closed: only a group Feishu confirms as internal is served.
+    verdict = _feishu_group_status(chat_id)
+    if verdict != "internal":
+        logger.info("Feishu: group %s message refused (%s group)", chat_id, verdict)
+        if verdict == "external":
+            _notify_external_feishu_group(chat_id)
         return
     if _is_disabled_sender(f"feishu:{sender_id}"):
         logger.info("Feishu: group %s message ignored (sender is disabled)", chat_id)
