@@ -28,7 +28,7 @@ node {baseDir}/create.js <user_id> <cron_expression> <timezone> <message> [chann
 - `timezone` (required): IANA timezone (e.g., `Asia/Tokyo`, `America/New_York`, `Europe/London`, `UTC`)
 - `message` (required): The task message the agent should execute on each trigger
 - `channel` (optional): Channel type — defaults to extracting from user_id (e.g., `telegram`)
-- `channel_target` (optional): Channel destination — defaults to extracting from user_id (e.g., `12345`)
+- `channel_target` (optional): Channel destination — defaults to the current conversation's target. If given, it must equal the current conversation's target.
 - `schedule_name` (optional): Human-readable name for the schedule
 
 **Cron expression format**: `cron(minutes hours day-of-month month day-of-week year)`
