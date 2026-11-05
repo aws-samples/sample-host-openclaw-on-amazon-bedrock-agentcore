@@ -78,7 +78,7 @@ The Router API Gateway HTTP API uses explicit routes — only three paths are ex
 | Account recovery disabled | `AccountRecovery.NONE` — no password reset flows (passwords are derived, not chosen) |
 | Cross-channel binding | Time-limited bind codes (10-min TTL in DynamoDB, one-time use). Binding bypasses allowlist since it links to an already-approved user |
 | JWT token caching | Per-user JWT cached with 60-second early refresh window |
-| Slack retry deduplication | `x-slack-retry-num` header detected; retries ignored to prevent duplicate processing |
+| Slack event deduplication | Each event's `event_id`, and its channel and message `ts`, are recorded in the identity table for 24 hours with a conditional put before anything is sent, so a Slack retry (`x-slack-retry-num`), or the `app_mention` and `message` events for one post, run once. A retry still runs if its first delivery was never handled |
 
 ### 3.4 Per-User Isolation (Zero Trust)
 

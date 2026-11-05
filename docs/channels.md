@@ -61,7 +61,7 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
 4. Go to **Features** > **OAuth & Permissions** > **Scopes** > **Bot Token Scopes** and add:
    - `chat:write` — send messages
    - `files:read` — download image attachments (required for image upload support)
-   - `app_mentions:read` — detect @mentions (optional)
+   - `app_mentions:read` — receive @mentions of the bot in channels (the `app_mention` event)
    - `im:history` — read DM history
    - `im:read` — access DMs
    - `im:write` — send DMs
@@ -90,8 +90,10 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
     Slack sends a verification challenge — you should see a green checkmark confirming the URL is valid.
 12. Under **Subscribe to bot events**, add:
     - `message.im` — receive direct messages
-    - `message.channels` — messages in channels the bot is in (optional)
-13. Click **Save Changes**
+    - `app_mention` — receive channel messages that @mention the bot
+
+    `message.channels` is optional. The bot answers a channel message only when the message @mentions the bot, and `app_mention` delivers exactly those messages. Apps that subscribe to `message.channels` keep working, and a post that arrives as both events is answered once.
+13. Click **Save Changes** (reinstall the app if Slack asks for it after adding events)
 
 **Store credentials in Secrets Manager:**
 
@@ -118,6 +120,8 @@ The signing secret is used by the Router Lambda to validate `X-Slack-Signature` 
     ```bash
     ./scripts/manage-allowlist.sh add slack:YOUR_MEMBER_ID
     ```
+
+**DMs and channels:** the bot answers every message in a DM. In a channel it answers only messages that @mention it (invite it with `/invite @YourBot` first), and it replies in the message's thread. Every other channel message is ignored: no reply, no agent turn and no enrollment, even with `registration_open`. A member who is not on the allowlist gets no answer in a channel; the "bot is private" notice with their ID is sent only in a DM. A channel @mention is answered from the sender's own session, with their memory and files, and the reply is visible to everyone in the channel.
 
 ## Feishu
 

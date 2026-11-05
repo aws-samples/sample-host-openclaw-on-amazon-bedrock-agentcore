@@ -110,7 +110,8 @@ class TestTelegramLink(_LinkCommandBase):
 
 class TestSlackLink(_LinkCommandBase):
     def _send(self, **event):
-        body = {"event": {"type": "message", "text": "link", "user": "U0XXXXXX1", "channel": "D0XXXXXX1", **event}}
+        body = {"authorizations": [{"user_id": "U0BOT0001", "is_bot": True}],
+                "event": {"type": "message", "text": "link", "user": "U0XXXXXX1", "channel": "D0XXXXXX1", **event}}
         with patch.object(index, "send_slack_message") as send, \
                 patch.object(index, "_get_slack_tokens", return_value=("xoxb-test", "signing")):
             index.handle_slack(json.dumps(body))
@@ -125,16 +126,27 @@ class TestSlackLink(_LinkCommandBase):
                 self.assertIn(CODE, send.call_args[0][1])
 
     def test_channels_and_mentions_get_no_code(self):
-        for event in ({"type": "app_mention", "channel": "C0XXXXXX1", "text": "<@U0BOT0001> link"},
-                      {"channel": "C0XXXXXX1", "channel_type": "channel"},
-                      {"channel": "G0XXXXXX1", "channel_type": "group"},
-                      {"channel": "G0XXXXXX2", "channel_type": "mpim"},
-                      {"channel": "D0XXXXXX1", "channel_type": "mpim"}):
+        mention = "<@U0BOT0001> link"
+        for event in ({"type": "app_mention", "channel": "C0XXXXXX1", "text": mention},
+                      {"channel": "C0XXXXXX1", "channel_type": "channel", "text": mention},
+                      {"channel": "G0XXXXXX1", "channel_type": "group", "text": mention},
+                      {"channel": "G0XXXXXX2", "channel_type": "mpim", "text": mention},
+                      {"channel": "D0XXXXXX1", "channel_type": "mpim", "text": mention}):
             with self.subTest(event=event):
                 self.create_bind_code.reset_mock()
                 send = self._send(**event)
                 self.create_bind_code.assert_not_called()
                 self.assertEqual(send.call_args[0][1], index.LINK_DM_ONLY_MESSAGE)
+
+    def test_channel_link_without_a_mention_gets_no_reply(self):
+        for event in ({"channel": "C0XXXXXX1", "channel_type": "channel"},
+                      {"channel": "G0XXXXXX1", "channel_type": "group"},
+                      {"channel": "G0XXXXXX2", "channel_type": "mpim"}):
+            with self.subTest(event=event):
+                self.create_bind_code.reset_mock()
+                send = self._send(**event)
+                self.create_bind_code.assert_not_called()
+                send.assert_not_called()
 
 
 class TestFeishuLink(_LinkCommandBase):
