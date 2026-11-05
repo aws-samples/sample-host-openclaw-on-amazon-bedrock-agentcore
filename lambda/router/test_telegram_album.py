@@ -405,8 +405,8 @@ class AlbumTestCase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TelegramAlbumTurns(AlbumTestCase):
-    def test_probe_album_1_three_photos_run_one_turn(self):
-        """Probe album-1 inverted: one turn with every photo and the caption, one reply."""
+    def test_three_photos_run_one_turn_with_the_caption(self):
+        """Three photos, the caption on the first: one turn with every photo and the caption, one reply."""
         self.deliver(update(10, CAPTION), (0.1, update(11)), (0.2, update(12)))
         self.assertEqual(self.agent_messages(), [{"text": CAPTION, "images": [image(10), image(11), image(12)]}])
         self.assertEqual(self.chunks.call_count, 1)
