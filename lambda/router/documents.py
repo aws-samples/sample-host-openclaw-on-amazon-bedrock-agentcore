@@ -52,6 +52,15 @@ KIND_INFO = {
 }
 
 ACCEPTED_FILES_TEXT = "images (JPEG, PNG, GIF, WebP), Markdown (.md) files and ZIP (.zip) archives"
+# Telegram private chats and groups ("telegram_group") also take documents.
+_DOCUMENT_CHANNELS = frozenset({"telegram", "telegram_group"})
+
+
+def accepted_text(channel):
+    """What a channel can read, for the notice sent when a message cannot be read."""
+    if channel in _DOCUMENT_CHANNELS:
+        return f"text, {ACCEPTED_FILES_TEXT}"
+    return "text and images (JPEG, PNG, GIF, WebP)"
 
 
 def classify_document(mime_type, file_name):

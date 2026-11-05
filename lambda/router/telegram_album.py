@@ -11,14 +11,15 @@ The items of an album meet in one identity-table record,
 top-level attribute ``m<message_id>`` (top-level, because ``SET map.key`` fails
 while the map does not exist yet): ``pending`` while its image is stored, then
 ``ready`` (with the S3 key), ``failed`` or ``unsupported`` (a video or audio
-file, whose caption still counts). The first item to register leads. Once its
-own item has settled, it polls the record and closes it when no other item is
-pending and none has registered for QUIET_SECONDS, when MAX_WAIT_SECONDS have
-passed since it registered, or when MAX_ITEMS have settled. It then runs one
-turn with the ready images in message order and the captions. The other
-invocations stop after storing their image. An item that registers or settles
-after the close runs on its own, as before, so no photo is lost; a redelivered
-update (same message_id) is dropped.
+file: the agent is told about it, and its caption still counts; an album of
+only such items and no caption gets one notice). The first item to register
+leads. Once its own item has settled, it polls the record and closes it when
+no other item is pending and none has registered for QUIET_SECONDS, when
+MAX_WAIT_SECONDS have passed since it registered, or when MAX_ITEMS have
+settled. It then runs one turn with the ready images in message order and the
+captions. The other invocations stop after storing their image. An item that
+registers or settles after the close runs on its own, as before, so no photo
+is lost; a redelivered update (same message_id) is dropped.
 
 The store and the clock are passed in, so the coordination is tested without
 AWS. Logs carry counts and durations only, never chat, message or album IDs.
@@ -27,6 +28,8 @@ AWS. Logs carry counts and durations only, never chat, message or album IDs.
 import logging
 import re
 import time
+
+import unsupported_media
 
 logger = logging.getLogger(__name__)
 
@@ -162,14 +165,15 @@ class DynamoAlbumStore:
         return response.get("Attributes") or {}
 
 
-def join(message, caption, user_id, is_image, store, reply, clock=None):
+def join(message, caption, user_id, is_image, store, reply, clock=None, notice=None):
     """Register a private-chat photo, video or audio update in its album.
 
     Returns None when the update is not part of an album, or when it must be
     handled on its own (the album already closed, or the store failed). Otherwise
     returns the AlbumItem: drop the update if ``duplicate`` is set, else pass the
     item's own agent message to ``finish``. Documents are not grouped; the caller
-    does not pass them.
+    does not pass them. notice is the reply for an album whose items are all
+    videos or audio files without a caption.
     """
     media_group_id = message.get("media_group_id")
     message_id = message.get("message_id")
@@ -179,14 +183,15 @@ def join(message, caption, user_id, is_image, store, reply, clock=None):
         return None
     kind = "photo" if is_image else next((name for name in _UNSUPPORTED_KINDS if message.get(name)), "media")
     item = AlbumItem(store, record_key(chat_id, media_group_id), message_id, user_id,
-                     caption=caption, kind=kind, reply=reply, clock=clock)
+                     caption=caption, kind=kind, reply=reply, clock=clock, notice=notice)
     return None if item.join() == ALONE else item
 
 
 class AlbumItem:
     """One update's part in an album: join(), then finish() with its agent message."""
 
-    def __init__(self, store, key, message_id, user_id, caption="", kind="photo", reply=None, clock=None):
+    def __init__(self, store, key, message_id, user_id, caption="", kind="photo", reply=None, clock=None,
+                 notice=None):
         self.store = store
         self.key = key
         self.message_id = message_id
@@ -195,6 +200,7 @@ class AlbumItem:
         self.caption = (caption or "")[:MAX_CAPTION_CHARS]
         self.kind = kind
         self.clock = clock or time  # anything with time() and sleep()
+        self.notice = notice
         self.role = None
         self._reply = reply or (lambda _text: None)
         self._held_reply = None
@@ -320,7 +326,7 @@ class AlbumItem:
         items = [entries[message_id] for message_id in sorted(entries) if entries[message_id].get("s") != PENDING]
         spread_ms = max(0, _number(record.get("lastAt")) - _number(record.get("firstAt")))
         logger.info("Telegram: album items=%d spread_ms=%d", len(items), spread_ms)
-        message, reply_text = album_message(items)
+        message, reply_text = album_message(items, self.notice)
         if reply_text:
             self._reply(reply_text)
         return message
@@ -340,25 +346,44 @@ def _photos(count):
     return "1 photo" if count == 1 else f"{count} photos"
 
 
-def album_message(items):
+_KIND_NAMES = {"video": ("a video", "videos"), "audio": ("an audio file", "audio files")}
+_OTHER_NAMES = ("an attachment", "attachments")
+
+
+def _unsupported_names(items):
+    """Name the album's items the bot cannot read: "a video", "2 videos and an audio file"."""
+    counts = {}
+    for item in items:
+        if item.get("s") == UNSUPPORTED:
+            kind = item.get("kind") or "media"
+            counts[kind] = counts.get(kind, 0) + 1
+    names = []
+    for kind, count in counts.items():
+        one, many = _KIND_NAMES.get(kind, _OTHER_NAMES)
+        names.append(one if count == 1 else f"{count} {many}")
+    return " and ".join(names)
+
+
+def album_message(items, notice=None):
     """The agent message for an album's settled items, given in message order.
 
     Returns (message, reply). message is for the agent: a dict with the ready
     images, or the captions alone when no image is ready. reply is a text for the
-    user instead of a turn. Both are None when there is nothing to answer.
+    user instead of a turn: an apology when every download failed, or notice when
+    every item is one the bot cannot read and none has a caption. Both are None
+    when there is nothing to answer.
     """
     images = [{"s3Key": item["k"], "contentType": item["t"]} for item in items if item.get("s") == READY]
     failed = sum(1 for item in items if item.get("s") == FAILED)
     captions = list(dict.fromkeys(item["c"] for item in items if (item.get("c") or "").strip()))
-    kinds = list(dict.fromkeys(item.get("kind") or "media" for item in items if item.get("s") == UNSUPPORTED))
+    unsupported = _unsupported_names(items)
     if not images and failed:
         return None, ALL_FAILED_REPLY
     if not images and not captions:
-        return None, None
-    parts = ["\n\n".join(captions) or f"The user sent {_photos(len(images))} without a message."]
+        return None, (notice if unsupported else None)
+    text = "\n\n".join(captions) or f"The user sent {_photos(len(images))} without a message."
     if failed:
-        parts.append(f"[{_photos(failed)} could not be downloaded.]")
-    if kinds:
-        parts.append(f"[The user also sent {' and '.join(kinds)}, which cannot be read yet.]")
-    text = "\n\n".join(parts)
+        text += f"\n\n[{_photos(failed)} could not be downloaded.]"
+    if unsupported:
+        text += unsupported_media.note(unsupported, text_only=not images)
     return ({"text": text, "images": images} if images else text), None

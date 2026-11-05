@@ -34,6 +34,8 @@ _MESSAGE_ID_RE = re.compile(r"^\d{1,32}$")
 _EVENT_ID_RE = re.compile(r"^[0-9A-Za-z]{1,64}$")
 _REPLY_TOKEN_RE = re.compile(r"^[0-9A-Za-z_\-]{1,256}$")
 _SIGNATURE_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
+# Message types the bot cannot read yet: kept so the Router can say so.
+UNSUPPORTED_TYPES = frozenset({"audio", "video", "file", "sticker", "location"})
 
 MAX_BODY_BYTES = 1_000_000
 # LINE text messages are limited to 5000 characters; one request carries at most 5 messages.
@@ -86,7 +88,9 @@ def extract_events(payload, bot_user_id="", now=None):
     """Return normalized 1:1 user message events from a verified webhook payload.
 
     Each item: {"event_id", "user_id", "reply_token", "type", "text", "message_id",
-    "redelivery"}. Group/room messages, standby-mode events, unsupported message
+    "redelivery", "unsupported"}. A message of one of UNSUPPORTED_TYPES is kept
+    with unsupported=True, so the Router can say it cannot read it.
+    Group/room messages, standby-mode events, non-message events, other message
     types and events outside the replay window are dropped. An empty event list
     (LINE's console "Verify" request) yields [].
     """
@@ -134,7 +138,7 @@ def _normalize_event(event, now):
     message = event.get("message") or {}
     msg_type = message.get("type")
     item = {"event_id": event_id, "user_id": user_id, "reply_token": reply_token, "type": msg_type,
-            "text": "", "message_id": "", "redelivery": redelivery}
+            "text": "", "message_id": "", "redelivery": redelivery, "unsupported": False}
     if msg_type == "text":
         item["text"] = str(message.get("text", ""))
     elif msg_type == "image":
@@ -143,6 +147,8 @@ def _normalize_event(event, now):
         if provider != "line" or not _MESSAGE_ID_RE.match(message_id):
             return None
         item["message_id"] = message_id
+    elif msg_type in UNSUPPORTED_TYPES:
+        item["unsupported"] = True
     else:
         return None
     return item

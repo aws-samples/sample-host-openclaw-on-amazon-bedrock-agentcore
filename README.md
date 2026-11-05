@@ -562,7 +562,7 @@ Node.js's Happy Eyeballs (`autoSelectFamily`, Node 20+) tries both IPv4 and IPv6
 | **ClawHub skills** | 5 pre-installed; available only after full OpenClaw startup |
 | **Single region** | AgentCore Runtime deployed in one region; no multi-region failover |
 | **V2 Regions only** | `main` deploys only in the AgentCore Runtime V2 Regions; use [`release/v1`](docs/release-v1.md) elsewhere. V1 deployments cannot be migrated in place |
-| **No voice/video input** | Users can send text and images only; no audio or video messages. Scheduled briefs can send an MP3 on Telegram ([brief audio](docs/how-it-works.md#brief-audio)) |
+| **No voice/video input** | Users can send text and images (on Telegram, also Markdown and ZIP files). Voice notes, audio, video, stickers, locations and other files get a short notice that the bot can't read them yet, and no turn runs ([details](docs/how-it-works.md#image-uploads)). Scheduled briefs can send an MP3 on Telegram ([brief audio](docs/how-it-works.md#brief-audio)) |
 | **Token usage attribution** | Per-user totals are in DynamoDB only, keyed by internal user ID (`USER#user_<16 hex>`; rows from older bridge images keep the channel actor until they expire); CloudWatch token metrics are per channel and model. Records from older releases, or from other Bedrock callers in the account, stay under `default-user` / `unknown` |
 
 ## Security

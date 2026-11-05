@@ -229,8 +229,9 @@ class TestExtractMessages(unittest.TestCase):
     def test_other_phone_number_dropped(self):
         self.assertEqual(whatsapp.extract_messages(_payload(phone_number_id="999"), PHONE_NUMBER_ID), [])
 
-    def test_unsupported_type_and_status_dropped(self):
-        self.assertEqual(whatsapp.extract_messages(_payload(msg_type="sticker"), PHONE_NUMBER_ID), [])
+    def test_reaction_and_status_dropped(self):
+        # Stickers and other media are kept as unsupported items (test_unsupported_messages.py).
+        self.assertEqual(whatsapp.extract_messages(_payload(msg_type="reaction"), PHONE_NUMBER_ID), [])
         statuses = _payload()
         del statuses["entry"][0]["changes"][0]["value"]["messages"]
         statuses["entry"][0]["changes"][0]["value"]["statuses"] = [{"id": "x", "status": "read"}]
