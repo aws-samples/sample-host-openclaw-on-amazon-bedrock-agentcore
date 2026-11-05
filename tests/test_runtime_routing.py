@@ -365,6 +365,14 @@ def allow_record(actor=ACTOR):
     return {"PK": f"ALLOW#{actor}", "SK": "ALLOW", "channelKey": actor}
 
 
+def owner_record(actor, user_id=USER, runtime_actor=ACTOR):
+    # Durable, agent-unwritable ACTOR#<actor>/OWNER record (PK ACTOR#...).
+    return {
+        "PK": f"ACTOR#{actor}", "SK": "OWNER", "userId": user_id, "actorId": actor,
+        "platformVersion": "V2", "ownerGeneration": 1, "runtimeActorId": runtime_actor,
+    }
+
+
 def test_router_keeps_old_random_user_id():
     module = load_lambda("router")
     module.identity_table = FakeTable({"PK": f"CHANNEL#{ACTOR}", "SK": "PROFILE", "userId": USER})
@@ -381,16 +389,32 @@ def test_router_denies_an_enrolled_identity_whose_allow_record_was_removed():
     assert module.resolve_user("telegram", "123") == (USER, False)
 
 
-def test_router_linked_channel_is_allowed_through_the_owner_enrollment_actor():
+def test_router_linked_channel_is_allowed_through_the_owner_record_runtime_actor():
     module = load_lambda("router")
     linked = "slack:U456"
     module.identity_table = FakeTable({"PK": f"CHANNEL#{linked}", "SK": "PROFILE", "userId": USER})
-    module.identity_table.items[(f"USER#{USER}", "PROFILE")] = {
-        "PK": f"USER#{USER}", "SK": "PROFILE", "enrollmentActorId": ACTOR,
-    }
+    # The linked channel's primary (runtime) actor comes from the durable,
+    # agent-unwritable ACTOR#<actor>/OWNER record, not USER#/PROFILE.
+    module.identity_table.items[(f"ACTOR#{linked}", "OWNER")] = owner_record(linked)
     assert module.resolve_user("slack", "U456") == (None, False)
     module.identity_table.items[(f"ALLOW#{ACTOR}", "ALLOW")] = allow_record()
     assert module.resolve_user("slack", "U456") == (USER, False)
+
+
+def test_router_linked_channel_ignores_a_tampered_profile_enrollment_actor():
+    # A USER#/PROFILE.enrollmentActorId the agent could itself write must not
+    # authorize a linked channel whose own primary actor is not allowlisted.
+    module = load_lambda("router")
+    linked = "slack:U456"
+    module.identity_table = FakeTable({"PK": f"CHANNEL#{linked}", "SK": "PROFILE", "userId": USER})
+    module.identity_table.items[(f"ACTOR#{linked}", "OWNER")] = owner_record(linked)
+    module.identity_table.items[(f"USER#{USER}", "PROFILE")] = {
+        "PK": f"USER#{USER}", "SK": "PROFILE", "enrollmentActorId": "telegram:999",
+    }
+    module.identity_table.items[("ALLOW#telegram:999", "ALLOW")] = allow_record("telegram:999")
+    # The owner record's runtime actor (telegram:123) is not allowlisted, so
+    # the tampered enrollmentActorId does not keep the linked channel authorized.
+    assert module.resolve_user("slack", "U456") == (None, False)
 
 
 def test_router_open_registration_skips_the_allow_record_check():
