@@ -86,3 +86,23 @@ describe("validateUserId cross-tenant check", () => {
     assert.match(r.stderr, /Invalid user_id/);
   });
 });
+
+describe("validateUserId for Slack channel and Feishu group identities", () => {
+  it("accepts a Slack channel namespace matching USER_ID", () => {
+    const r = run(["slack_channel_C0123CHAN"], { USER_ID: "slack_channel:C0123CHAN" });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /ok/);
+  });
+
+  it("accepts a Feishu group namespace matching USER_ID", () => {
+    const r = run(["feishu_group_oc_0123abcdef"], { USER_ID: "feishu_group:oc_0123abcdef" });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /ok/);
+  });
+
+  it("rejects a member's own namespace in a channel's session", () => {
+    const r = run(["slack_U0123USER"], { USER_ID: "slack_channel:C0123CHAN" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /does not match the user this session belongs to/);
+  });
+});

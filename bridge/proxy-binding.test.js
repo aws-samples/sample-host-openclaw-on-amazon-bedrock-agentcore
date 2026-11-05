@@ -263,3 +263,26 @@ test("a Telegram group keeps its own group rules and gets no shared-conversation
   assert.match(text, /shared group chat/);
   assert.doesNotMatch(text, /## Shared Conversation/);
 });
+
+test("a Slack channel or Feishu group identity gets its own namespace, the group rules and the shared-conversation rules", async () => {
+  for (const [actor, channel, target] of [
+    ["slack_channel:C0123CHAN", "slack_channel", "C0123CHAN"],
+    ["feishu_group:oc_0123abcdef", "feishu_group", "oc_0123abcdef"],
+  ]) {
+    // The bound actor passes the format allowlist at load (a refused one exits).
+    const app = proxy(actor);
+    app.identity({ actorId: actor, channel, channelActorId: actor, channelTarget: target, sharedChat: true });
+    assert.equal((await app.request()).status, 200, actor);
+    assert.deepEqual(app.cognito, [actor]);
+    const namespace = actor.replace(/:/g, "_");
+    assert.ok(app.s3.length > 0);
+    assert.ok(app.s3.every((request) => request.Key.startsWith(`${namespace}/`) ||
+      request.Key.startsWith(`_system/${namespace}/`)));
+    const text = app.model[0].system.map((block) => block.text || "").join("");
+    assert.ok(text.includes(`You are chatting with a user (namespace: ${namespace}) on channel: ${channel}.`));
+    assert.match(text, /shared group chat/);
+    assert.match(text, /Scheduled tasks \(cron\) are not available in group chats/);
+    assert.match(text, /## Shared Conversation/);
+    assert.equal(text.includes(actor), false, "raw actor in the system prompt");
+  }
+});

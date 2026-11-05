@@ -5,6 +5,8 @@
 #   ./scripts/manage-allowlist.sh add telegram:123456
 #   ./scripts/manage-allowlist.sh add slack:U789ABC
 #   ./scripts/manage-allowlist.sh add telegram_group:-1001234567890   (a Telegram group; see docs/channels.md)
+#   ./scripts/manage-allowlist.sh add slack_channel:C0123ABCDEF       (a Slack channel; see docs/channels.md)
+#   ./scripts/manage-allowlist.sh add feishu_group:oc_0123abcd        (a Feishu group chat; see docs/channels.md)
 #   ./scripts/manage-allowlist.sh remove telegram:123456
 #   ./scripts/manage-allowlist.sh disable telegram:123456
 #   ./scripts/manage-allowlist.sh enable telegram:123456
@@ -69,6 +71,9 @@ usage() {
     echo "  whois   <user_id>          — List the channel actors linked to an internal user ID"
     echo ""
     echo "  A Telegram group is allowed with telegram_group:<chat_id> (e.g. telegram_group:-1001234567890)."
+    echo "  With channel_identity_mode \"channel\", a Slack channel is allowed with slack_channel:<channel_id>"
+    echo "  (e.g. slack_channel:C0123ABCDEF) and a Feishu group chat with feishu_group:<chat_id>"
+    echo "  (e.g. feishu_group:oc_0123abcd)."
     echo ""
     echo "Environment:"
     echo "  AWS_REGION   — AWS region (default: us-west-2)"
@@ -89,6 +94,12 @@ cmd_add() {
     echo "Adding $channel_key to allowlist..."
     aws_ddb put-item --item "$item"
     echo "Done. $channel_key is now allowed."
+    case "$channel_key" in
+        slack_channel:*|feishu_group:*)
+            echo "Note: the conversation is answered as its own identity only while channel_identity_mode"
+            echo "is \"channel\" in cdk.json (see docs/channels.md)."
+            ;;
+    esac
 }
 
 cmd_remove() {
@@ -98,6 +109,13 @@ cmd_remove() {
 
     echo "Removing $channel_key from allowlist..."
     aws_ddb delete-item --key "$(ddb_key "ALLOW#${channel_key}" ALLOW)"
+    case "$channel_key" in
+        slack_channel:*|feishu_group:*)
+            # The router reads the record on every message from the conversation.
+            echo "Done. The next message from $channel_key is ignored."
+            return
+            ;;
+    esac
     echo "Done. $channel_key is no longer allowed to register."
     echo "Note: if $channel_key has already registered, run '$0 disable $channel_key'"
     echo "to block it on every linked channel and its scheduled tasks."
@@ -202,6 +220,23 @@ validate_channel_key() {
         echo "       only contain letters, digits and _ . @ + -" >&2
         exit 1
     fi
+    # A conversation identity takes the platform's conversation ID, the same
+    # shape the router accepts (lambda/router/channel_identity.py).
+    case "$1" in
+        slack_channel:*)
+            if ! [[ "$1" =~ ^slack_channel:[CG][A-Z0-9]{2,31}$ ]]; then
+                echo "ERROR: expected slack_channel:<channel ID>, e.g. slack_channel:C0123ABCDEF" >&2
+                echo "       (the channel ID from the channel details, not its #name or a member ID)" >&2
+                exit 1
+            fi
+            ;;
+        feishu_group:*)
+            if ! [[ "$1" =~ ^feishu_group:oc_[A-Za-z0-9]{1,49}$ ]]; then
+                echo "ERROR: expected feishu_group:<chat_id>, e.g. feishu_group:oc_0123abcd" >&2
+                exit 1
+            fi
+            ;;
+    esac
 }
 
 if [ $# -lt 1 ]; then

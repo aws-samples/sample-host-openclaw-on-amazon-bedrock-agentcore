@@ -19,8 +19,9 @@ const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
 // The contract server writes the bound user's identity here and sets USER_ID
 // ("channel:id") before OpenClaw runs a skill.
 const IDENTITY_FILE = "/tmp/current-identity.json";
-// Group conversations (one identity shared by a whole group) cannot schedule tasks.
-const GROUP_CHANNELS = new Set(["telegram_group"]);
+// Group conversations (one identity shared by a whole Telegram group, Slack
+// channel or Feishu group chat) cannot schedule tasks.
+const GROUP_CHANNELS = new Set(["telegram_group", "slack_channel", "feishu_group"]);
 
 /**
  * Namespaces ("channel_id") of the user this AgentCore Runtime session is

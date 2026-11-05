@@ -29,6 +29,23 @@ from scripts.model_selection import CONTEXT_KEY as MODEL_SELECTION_KEY, parse_us
 from stacks import DeploymentNamer, apply_table_tags, retention_days
 from stacks.context_limits import context_int, reserved_concurrency
 
+CHANNEL_IDENTITY_MODES = ("personal", "channel")
+
+
+def channel_identity_mode(node) -> str:
+    """The ``channel_identity_mode`` context value: "personal" (default) or "channel".
+
+    Any other value raises ValueError at synth time, so a typo cannot silently
+    keep Slack channels and Feishu group chats on the personal session.
+    """
+    value = node.try_get_context("channel_identity_mode")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "personal"
+    mode = str(value).strip().lower()
+    if isinstance(value, bool) or mode not in CHANNEL_IDENTITY_MODES:
+        raise ValueError(f"context channel_identity_mode must be personal or channel, got {value!r}")
+    return mode
+
 
 class RouterStack(Stack):
     def __init__(
@@ -73,6 +90,9 @@ class RouterStack(Stack):
         # Telegram groups: off by default, so every group message is ignored.
         telegram_groups_enabled = str(
             self.node.try_get_context("telegram_groups_enabled") or "false").lower() == "true"
+        # Slack channels and Feishu group chats: "personal" (default) answers from
+        # the sender's own session, "channel" as the conversation's own identity.
+        identity_mode = channel_identity_mode(self.node)
         # Per-user `/model` switching: validated at synth so a bad map never deploys.
         user_selectable_models = parse_user_selectable_models(
             self.node.try_get_context(MODEL_SELECTION_KEY))
@@ -158,6 +178,8 @@ class RouterStack(Stack):
                 "USER_SELECTABLE_MODELS": json.dumps(user_selectable_models, separators=(",", ":")),
                 "DEFAULT_MODEL_ID": default_model_id,
                 **({"LOG_REPLY_TEXT": "true"} if log_reply_text else {}),
+                # Set only in "channel" mode, so the default leaves the function unchanged.
+                **({"CHANNEL_IDENTITY_MODE": "channel"} if identity_mode == "channel" else {}),
             },
             log_group=router_log_group,
         )

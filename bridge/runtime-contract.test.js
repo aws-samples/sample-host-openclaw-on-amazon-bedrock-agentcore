@@ -2007,3 +2007,17 @@ test("sharedChat from the Router reaches the identity file only when true, and m
     assert.equal(refused.body.error, "sharedChat must be a boolean");
   }
 });
+
+test("Cron creation is refused for a Slack channel or Feishu group identity, before any schedule is written", async () => {
+  for (const [actor, channel, target] of [
+    ["slack_channel:C0123CHAN", "slack_channel", "C0123CHAN"],
+    ["feishu_group:oc_0123abcdef", "feishu_group", "oc_0123abcdef"],
+  ]) {
+    for (const args of [[], ["", ""], [channel, target]]) {
+      // The namespace passes the skill's format gate; the group rule refuses it.
+      await assert.rejects(createCronForIdentity({
+        actorId: actor, channel, channelActorId: actor, channelTarget: target,
+      }, args, actor.replace(/:/g, "_")), /not available in group chats/);
+    }
+  }
+});
