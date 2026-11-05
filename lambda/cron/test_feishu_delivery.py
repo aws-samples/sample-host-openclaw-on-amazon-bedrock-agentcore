@@ -148,6 +148,30 @@ class TestSendFeishuMessage(FeishuTestBase):
         self.assertEqual(len(calls), 1)
         self.assertIn("tenant_access_token", calls[0].full_url)
 
+    def test_markdown_is_sent_as_plain_text(self):
+        fake, calls = self._fake_urlopen()
+        with patch.object(index.urllib_request, "urlopen", side_effect=fake):
+            self.assertTrue(index.send_feishu_message(
+                "ou_xxxxxxxx",
+                "## Brief\n**Rain** after 3 pm <at user_id=\"all\"></at>\n- [map](https://example.com/m)"))
+        content = json.loads(json.loads(calls[-1].data)["content"])
+        self.assertEqual(content, {"text": "Brief\nRain after 3 pm \n\u2022 map (https://example.com/m)"})
+
+    def test_refused_brief_is_logged_with_feishu_code_only(self):
+        def fake(req, timeout=None):
+            if "tenant_access_token" in req.full_url:
+                return _response({"code": 0, "tenant_access_token": "t-test-token", "expire": 7200})
+            return _response({"code": 230002, "msg": "Bot is not in the chat"})
+
+        with patch.object(index.urllib_request, "urlopen", side_effect=fake), \
+                self.assertLogs(index.logger, level="ERROR") as logs:
+            index.deliver_response("feishu", "ou_xxxxxxxx", "Secret morning brief")
+        output = "\n".join(logs.output)
+        self.assertIn("Feishu refused the message: code=230002", output)
+        self.assertIn("Cron response to Feishu was not delivered", output)
+        for leaked in ("Bot is not in the chat", "Secret morning brief", "t-test-token"):
+            self.assertNotIn(leaked, output)
+
 
 if __name__ == "__main__":
     unittest.main()

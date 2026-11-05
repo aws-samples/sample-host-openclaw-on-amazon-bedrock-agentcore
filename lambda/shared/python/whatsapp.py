@@ -18,6 +18,8 @@ import time
 from urllib import request as urllib_request
 from urllib.parse import quote
 
+import formatting
+
 logger = logging.getLogger()
 
 REQUIRED_KEYS = ("accessToken", "appSecret", "verifyToken", "phoneNumberId")
@@ -201,7 +203,8 @@ def send_text(config, to, text, timeout=10):
         return False
     url = _graph_url(config, f"{config['phoneNumberId']}/messages")
     ok = True
-    for chunk in split_text(text):
+    # Model Markdown in WhatsApp's own formatting (*bold*, _italic_, links as "label (url)").
+    for chunk in split_text(formatting.whatsapp_text(text)):
         data = json.dumps({
             "messaging_product": "whatsapp",
             "recipient_type": "individual",

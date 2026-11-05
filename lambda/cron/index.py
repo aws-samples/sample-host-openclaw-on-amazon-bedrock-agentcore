@@ -23,6 +23,7 @@ from runtime_routing import RouteUnavailable, admit_route, is_unknown_outcome, r
 import whatsapp
 import line_channel
 import discord_channel
+import formatting
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
 from runtime_invocation import RELEASE_RESERVE_SECONDS, InvocationTransportError, invoke_bounded
 
@@ -706,27 +707,28 @@ def _send_telegram_chunks(chat_id, text, token, limit=TELEGRAM_CHUNK_UTF16_UNITS
     return delivered_all
 
 
-def _escape_slack_text(text):
-    """Neutralize Slack control characters per Slack's documented escaping rules.
-
-    Replaces ``&`` with ``&amp;``, ``<`` with ``&lt;``, and ``>`` with ``&gt;`` so
-    that attacker-influenced content (e.g. model output) cannot inject mrkdwn link
-    syntax (``<url|label>``) or broadcast/user mention tokens (``<!channel>``,
-    ``<!here>``, ``<@U...>``, ``<!subteam^ID>``) into chat.postMessage ``text``.
-    See https://api.slack.com/reference/surfaces/formatting#escaping.
-    """
-    if not isinstance(text, str):
-        return text
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def _read_response(req, timeout=10):
+    """POST req and return up to 64 KB of the response body."""
+    resp = urllib_request.urlopen(req, timeout=timeout)
+    try:
+        return resp.read(65536)
+    finally:
+        resp.close()
 
 
 def send_slack_message(channel_id, text, bot_token):
-    """Send a message via Slack Web API."""
+    """Send a message via Slack Web API.
+
+    The text goes out as Slack mrkdwn (formatting.slack_mrkdwn), escaped so
+    model output cannot mention, broadcast or inject links. Slack answers a
+    refused message with HTTP 200 and ok:false; that is logged with Slack's
+    error code only. Returns True when Slack accepted the message.
+    """
     if not bot_token:
         logger.error("No Slack bot token available")
-        return
+        return False
     url = "https://slack.com/api/chat.postMessage"
-    data = json.dumps({"channel": channel_id, "text": _escape_slack_text(text)}).encode()
+    data = json.dumps({"channel": channel_id, "text": formatting.slack_mrkdwn(text)}).encode()
     req = urllib_request.Request(
         url,
         data=data,
@@ -736,9 +738,15 @@ def send_slack_message(channel_id, text, bot_token):
         },
     )
     try:
-        urllib_request.urlopen(req, timeout=10)
+        body = _read_response(req)
     except Exception as e:
         logger.error("Failed to send Slack message to %s: %s", channel_id, e)
+        return False
+    error = formatting.slack_error(body)
+    if error:
+        logger.error("Slack refused the message: error=%s", error)
+        return False
+    return True
 
 
 def send_feishu_message(receiver_id, text):
@@ -746,19 +754,26 @@ def send_feishu_message(receiver_id, text):
 
     receiver_id can be an open_id (ou_xxx) or chat_id (oc_xxx).
     The API receive_id_type is auto-detected from the prefix.
+
+    The text goes out as plain text (formatting.feishu_text): Markdown markers
+    and <at> mention tags are removed. Feishu answers a refused message with a
+    non-zero code; that is logged with the code only. Returns True when every
+    chunk was accepted.
     """
     token = _get_feishu_tenant_token()
     if not token:
         logger.error("No Feishu tenant_access_token available")
-        return
+        return False
 
     id_type = "open_id" if receiver_id.startswith("ou_") else "chat_id"
     url = f"{FEISHU_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={id_type}"
     MAX_FEISHU_TEXT_LEN = 20000
 
+    text = formatting.feishu_text(text)
     chunks = [text[i:i + MAX_FEISHU_TEXT_LEN]
               for i in range(0, len(text), MAX_FEISHU_TEXT_LEN)] if len(text) > MAX_FEISHU_TEXT_LEN else [text]
 
+    delivered = True
     for chunk in chunks:
         data = json.dumps({
             "receive_id": receiver_id,
@@ -770,9 +785,16 @@ def send_feishu_message(receiver_id, text):
             "Authorization": f"Bearer {token}",
         })
         try:
-            urllib_request.urlopen(req, timeout=10)
+            body = _read_response(req)
         except Exception as e:
             logger.error("Failed to send Feishu message to %s: %s", receiver_id, e)
+            delivered = False
+            continue
+        code = formatting.feishu_error(body)
+        if code is not None:
+            logger.error("Feishu refused the message: code=%s", code)
+            delivered = False
+    return delivered
 
 
 
@@ -1008,9 +1030,11 @@ def deliver_response(channel, channel_target, response_text):
             logger.error("Cron response to Telegram %s was not fully delivered", channel_target)
     elif channel == "slack":
         bot_token, _ = _get_slack_tokens()
-        send_slack_message(channel_target, response_text, bot_token)
+        if not send_slack_message(channel_target, response_text, bot_token):
+            logger.error("Cron response to Slack was not delivered")
     elif channel == "feishu":
-        send_feishu_message(channel_target, response_text)
+        if not send_feishu_message(channel_target, response_text):
+            logger.error("Cron response to Feishu was not delivered")
     elif channel == "whatsapp":
         # Free-form messages only reach users inside WhatsApp's 24-hour
         # customer-service window; outside it Meta rejects the send.

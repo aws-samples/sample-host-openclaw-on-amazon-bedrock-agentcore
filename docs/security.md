@@ -67,6 +67,8 @@ The Router API Gateway HTTP API uses explicit routes — only three paths are ex
 
 **Key detail**: Both Telegram and Slack webhook validators use `hmac.compare_digest()` for constant-time comparison, preventing timing side-channel attacks.
 
+**Replies cannot ping people.** Model output is untrusted text. Slack replies escape `&`, `<` and `>` in it, so it cannot form `<!channel>`, `<!here>`, `<@U…>` or `<url|label>` sequences, and the only links are ones the router builds from http(s) Markdown links. Feishu replies drop `<at>` tags. Discord replies set `allowed_mentions` to `{"parse": []}`. Telegram HTML links are limited to http(s), `tg` and `mailto` URLs. See `lambda/shared/python/formatting.py`.
+
 ### 3.3 Identity & Access Control
 
 | Control | Implementation |
