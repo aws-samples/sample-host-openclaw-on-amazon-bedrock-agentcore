@@ -1,5 +1,6 @@
 // Token attribution: every Bedrock request the proxy sends carries
-// requestMetadata identifying the actor, channel, session and agent type.
+// requestMetadata identifying the user (by internal user ID, never the channel
+// actor), channel, session and agent type.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -12,6 +13,9 @@ const source = fs.readFileSync(require.resolve("./agentcore-proxy"), "utf8");
 // Bedrock's documented limits for requestMetadata (Converse / ConverseStream).
 const BEDROCK_PATTERN = /^[a-zA-Z0-9\s:_@$#=/+,\-.]*$/;
 const MAX_ENTRIES = 16;
+// Synthetic IDs. The internal user ID is user_ + 16 hex digits.
+const USER = "user_0123456789abcdef";
+const WA_PHONE = "15551234567";
 
 function assertBedrockValid(metadata) {
   const entries = Object.entries(metadata);
@@ -23,13 +27,13 @@ function assertBedrockValid(metadata) {
   }
 }
 
-test("a bound main-agent chat call carries actor, channel, session and agent type", () => {
+test("a bound main-agent chat call carries the user ID, channel, session and agent type", () => {
   const metadata = buildRequestMetadata({
-    actorId: "telegram:1001", channel: "telegram", sessionId: "ses_user_abc_0123456789ab_cdef",
+    userId: USER, channel: "telegram", sessionId: "ses_user_abc_0123456789ab_cdef",
     subagent: false, trigger: "chat", idSource: "identity-file",
   });
   assert.deepEqual(metadata, {
-    "openclaw.actor_id": "telegram:1001",
+    "openclaw.user_id": USER,
     "openclaw.channel": "telegram",
     "openclaw.session_id": "ses_user_abc_0123456789ab_cdef",
     "openclaw.agent_type": "main",
@@ -41,22 +45,38 @@ test("a bound main-agent chat call carries actor, channel, session and agent typ
   assertBedrockValid(metadata);
 });
 
+test("the user field is the internal user ID or absent: never the actor", () => {
+  const actor = `whatsapp:${WA_PHONE}`;
+  for (const userId of [undefined, null, "", actor, `whatsapp_${WA_PHONE}`, "u1", "user_0123",
+    "user_0123456789ABCDEF", `${USER} `, 42, {}]) {
+    const metadata = buildRequestMetadata({ userId, actorId: actor, channel: "whatsapp", sessionId: "s" });
+    assert.equal(Object.hasOwn(metadata, "openclaw.user_id"), false, `userId ${JSON.stringify(userId)}`);
+    assert.equal(Object.hasOwn(metadata, "openclaw.actor_id"), false);
+    assert.equal(metadata["openclaw.identity"], "unbound");
+    assert.equal(Object.values(metadata).some((value) => value.includes(WA_PHONE)), false);
+    assertBedrockValid(metadata);
+  }
+  const bound = buildRequestMetadata({ userId: USER, actorId: actor, channel: "whatsapp" });
+  assert.equal(bound["openclaw.user_id"], USER);
+  assert.equal(Object.hasOwn(bound, "openclaw.actor_id"), false);
+  assert.equal(Object.values(bound).some((value) => value.includes(WA_PHONE)), false);
+});
+
 test("agent type: sub-agent wins over the turn kind, cron otherwise", () => {
-  const base = { actorId: "slack:U0XXXXXXX", channel: "slack", sessionId: "s", idSource: "identity-file" };
+  const base = { userId: USER, channel: "slack", sessionId: "s", idSource: "identity-file" };
   assert.equal(buildRequestMetadata({ ...base, trigger: "cron" })["openclaw.agent_type"], "cron");
   assert.equal(buildRequestMetadata({ ...base, trigger: "cron", subagent: true })["openclaw.agent_type"], "subagent");
   assert.equal(buildRequestMetadata({ ...base, trigger: "chat", subagent: true })["openclaw.agent_type"], "subagent");
   assert.equal(buildRequestMetadata({ ...base, trigger: "warmup" })["openclaw.trigger"], "chat");
 });
 
-test("unbound calls are explicit: default-user, unbound, default session", () => {
-  const metadata = buildRequestMetadata({ actorId: "default-user", idSource: "fallback" });
-  assert.equal(metadata["openclaw.actor_id"], "default-user");
+test("unbound calls are explicit: no user field, unbound, default session", () => {
+  const metadata = buildRequestMetadata({ idSource: "fallback" });
+  assert.equal(Object.hasOwn(metadata, "openclaw.user_id"), false);
   assert.equal(metadata["openclaw.identity"], "unbound");
   assert.equal(metadata["openclaw.id_source"], "fallback");
   assert.equal(metadata["openclaw.session_id"], "default-session");
   assert.equal(metadata["openclaw.channel"], "unknown");
-  assert.equal(buildRequestMetadata({})["openclaw.actor_id"], "default-user");
   assertBedrockValid(buildRequestMetadata({}));
 });
 
@@ -70,11 +90,13 @@ test("values outside Bedrock's character set or length are hashed, never sent ra
     "<script>",
   ];
   for (const value of hostile) {
-    const metadata = buildRequestMetadata({ actorId: value, sessionId: value, idSource: value, channel: value });
+    const metadata = buildRequestMetadata({ userId: value, sessionId: value, idSource: value, channel: value });
     assertBedrockValid(metadata);
-    for (const key of ["openclaw.actor_id", "openclaw.session_id", "openclaw.id_source"]) {
+    for (const key of ["openclaw.session_id", "openclaw.id_source"]) {
       assert.match(metadata[key], /^sha256:[0-9a-f]{32}$/, `${key} for ${JSON.stringify(value)}`);
     }
+    // A malformed user ID is dropped, not hashed.
+    assert.equal(Object.hasOwn(metadata, "openclaw.user_id"), false);
     assert.equal(metadata["openclaw.channel"], "unknown");
   }
   assert.notEqual(sanitizeValue("telegram:1 a", "d"), sanitizeValue("telegram:1 b", "d"),
@@ -94,8 +116,8 @@ function slice(startMarker, endMarker) {
   return source.slice(start, end);
 }
 
-function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram" }, bound = "telegram:1001",
-  fail = () => false } = {}) {
+function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram", INTERNAL_USER_ID: USER },
+  bound = "telegram:1001", boundUser = env.INTERNAL_USER_ID || "", fail = () => false } = {}) {
   const requests = [];
   let handler;
   const sdk = {
@@ -127,7 +149,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     },
     crypto: require("node:crypto"), Date, structuredClone, process: { env },
     fs: { readFileSync: () => { if (identity === undefined) throw new Error("ENOENT"); return JSON.stringify(identity); } },
-    BOUND_ACTOR_ID: bound, sessionMap: new Map(),
+    BOUND_ACTOR_ID: bound, BOUND_USER_ID: boundUser, sessionMap: new Map(),
     VALID_ACTOR_ID: /^(telegram|slack|discord|whatsapp|line|feishu):[A-Za-z0-9_-]{1,64}$/,
     console: { log() {}, error() {}, warn() {}, debug() {} },
     http: { createServer(callback) { handler = callback; return {}; } },
@@ -182,30 +204,60 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
   };
 }
 
-const IDENTITY = { actorId: "telegram:1001", channel: "telegram", trigger: "chat",
+// The identity file as the contract writes it: the actor and its user ID.
+const IDENTITY = { actorId: "telegram:1001", userId: USER, channel: "telegram", trigger: "chat",
   sessionId: "ses_user_abc_0123456789ab_cdef0123456789" };
 const MAIN = { model: "bedrock-agentcore", stream: true, messages: [{ role: "user", content: "hi" }] };
 const SUB = { ...MAIN, model: "agentcore/bedrock-agentcore-subagent" };
 
-test("main-agent streaming request carries the bound actor, channel and runtime session", async () => {
+test("main-agent streaming request carries the bound user ID, channel and runtime session", async () => {
   const app = proxy({ identity: IDENTITY });
   assert.equal(await app.chat(MAIN), 200);
   assert.equal(app.requests.length, 1);
   const metadata = app.requests[0].input.requestMetadata;
   assert.deepEqual(metadata, buildRequestMetadata({ ...IDENTITY, subagent: false, idSource: "identity-file" }));
+  assert.equal(metadata["openclaw.user_id"], USER);
+  assert.equal(Object.hasOwn(metadata, "openclaw.actor_id"), false);
+  assert.equal(JSON.stringify(metadata).includes("1001"), false, "no part of the actor");
   assert.equal(metadata["openclaw.agent_type"], "main");
   assert.equal(metadata["openclaw.session_id"], IDENTITY.sessionId);
   assertBedrockValid(metadata);
 });
 
-test("sub-agent streaming request is tagged subagent, on the same actor and session", async () => {
+test("sub-agent streaming request is tagged subagent, on the same user and session", async () => {
   const app = proxy({ identity: IDENTITY });
   assert.equal(await app.chat(SUB), 200);
   const metadata = app.requests[0].input.requestMetadata;
   assert.equal(app.requests[0].input.modelId, policy.SUBAGENT_MODEL_ID);
   assert.equal(metadata["openclaw.agent_type"], "subagent");
-  assert.equal(metadata["openclaw.actor_id"], "telegram:1001");
+  assert.equal(metadata["openclaw.user_id"], USER);
   assert.equal(metadata["openclaw.session_id"], IDENTITY.sessionId);
+});
+
+test("the user ID comes from the binding; the identity file must agree and never supplies it alone", async () => {
+  // An identity file without userId (written before this release) still gets the bound user ID.
+  const { userId: _omit, ...legacy } = IDENTITY;
+  const fromBinding = proxy({ identity: legacy });
+  assert.equal(await fromBinding.chat(MAIN), 200);
+  assert.equal(fromBinding.requests[0].input.requestMetadata["openclaw.user_id"], USER);
+
+  // A different user ID in the file is refused like a different actor.
+  const mismatch = proxy({ identity: { ...IDENTITY, userId: "user_fedcba9876543210" } });
+  assert.equal(await mismatch.chat(MAIN), 502);
+  assert.equal(mismatch.requests.length, 0);
+
+  // Without a bound user ID the field is omitted (pooled on default-user), never the actor.
+  const env = { USER_ID: "telegram:1001", CHANNEL: "telegram" };
+  const unbound = proxy({ identity: legacy, env });
+  assert.equal(await unbound.chat(MAIN), 200);
+  const metadata = unbound.requests[0].input.requestMetadata;
+  assert.equal(Object.hasOwn(metadata, "openclaw.user_id"), false);
+  assert.equal(Object.hasOwn(metadata, "openclaw.actor_id"), false);
+  assert.equal(metadata["openclaw.identity"], "unbound");
+  // ... and a user ID in the file alone does not bind one.
+  const fileOnly = proxy({ identity: IDENTITY, env });
+  assert.equal(await fileOnly.chat(MAIN), 502);
+  assert.equal(fileOnly.requests.length, 0);
 });
 
 test("a cron turn's main request is tagged cron and its sub-agent subagent", async () => {
@@ -232,7 +284,7 @@ test("non-streaming Converse requests carry it too, on every retry", async () =>
   assert.equal(app.requests.length, 2);
   for (const request of app.requests) {
     assert.equal(request.stream, false);
-    assert.equal(request.input.requestMetadata["openclaw.actor_id"], "telegram:1001");
+    assert.equal(request.input.requestMetadata["openclaw.user_id"], USER);
     assert.equal(request.input.requestMetadata["openclaw.agent_type"], "main");
   }
 });
@@ -271,8 +323,9 @@ test("a malformed identity-file session is refused before any Bedrock request", 
   assert.equal(app.requests.length, 0);
 });
 
-test("an identity-file channel or trigger outside the proxy allowlists is refused", async () => {
-  for (const identity of [{ ...IDENTITY, channel: "email" }, { ...IDENTITY, trigger: "webhook" }]) {
+test("an identity-file channel, trigger or sharedChat outside the proxy allowlists is refused", async () => {
+  for (const identity of [{ ...IDENTITY, channel: "email" }, { ...IDENTITY, trigger: "webhook" },
+    { ...IDENTITY, sharedChat: "yes" }]) {
     const app = proxy({ identity });
     assert.notEqual(await app.chat(MAIN), 200);
     assert.equal(app.requests.length, 0);

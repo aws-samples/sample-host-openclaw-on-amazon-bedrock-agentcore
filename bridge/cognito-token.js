@@ -167,7 +167,8 @@ function createCognitoTokenProvider(config) {
       // claim a fresh password, then set whichever value won the claim.
       const password = await claimPassword(actorId, generatePassword());
       await setPermanentPassword(actorId, password);
-      log("[cognito] user password migrated to a per-user secret: " + actorId);
+      // Log lines never name the actor (the Cognito username): it can be a phone number.
+      log("[cognito] user password migrated to a per-user secret");
       return password;
     }
 
@@ -187,7 +188,7 @@ function createCognitoTokenProvider(config) {
       if (err.name !== "UsernameExistsException") throw err;
     }
     await setPermanentPassword(actorId, password);
-    log("[cognito] user provisioned: " + actorId);
+    log("[cognito] user provisioned");
     return password;
   }
 
@@ -213,7 +214,7 @@ function createCognitoTokenProvider(config) {
       // Cognito holds a different password than the stored secret. The secret
       // is authoritative: set it on Cognito again and retry once.
       await setPermanentPassword(actorId, password);
-      log("[cognito] user password re-synchronised from its secret: " + actorId);
+      log("[cognito] user password re-synchronised from its secret");
       response = await initiateAuth(actorId, password);
     }
     const result = response.AuthenticationResult;
@@ -225,7 +226,7 @@ function createCognitoTokenProvider(config) {
       access: { token: result.AccessToken, expiresAt, expiresIn },
     };
     tokenCache.set(actorId, entry);
-    log("[cognito] token acquired for " + actorId + " (expires in " + expiresIn + "s)");
+    log("[cognito] token acquired (expires in " + expiresIn + "s)");
     return entry;
   }
 

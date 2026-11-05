@@ -580,20 +580,25 @@ function stopGateway(waitMs) {
 }
 
 function updateIdentityFile(actorId, channel, channelActorId = null, channelTarget = null,
-  modelOverride = null, { trigger = "chat", sessionId = null } = {}) {
+  modelOverride = null, { trigger = "chat", sessionId = null, userId = null, sharedChat = false } = {}) {
   const tempFile = `${IDENTITY_FILE}.${osRandomUUID()}.tmp`;
   try {
     // modelOverride is per turn: a turn without one (Cron, or no /model choice)
     // rewrites the file without it, so the proxy uses the deployment default.
     // trigger (chat | cron) and sessionId (the AgentCore runtime session) are
     // per turn too: the proxy puts them in Bedrock requestMetadata so the
-    // token_metrics Lambda can attribute usage.
+    // token_metrics Lambda can attribute usage. userId is the binding's
+    // internal user ID, the user the proxy names in logs and request metadata.
+    // sharedChat (Slack channel or Feishu group turns, set by the Router) adds
+    // the shared-conversation rules to the system prompt.
     fs.writeFileSync(
       tempFile,
       JSON.stringify({ actorId, channel, channelActorId, channelTarget,
+        ...(typeof userId === "string" && userId ? { userId } : {}),
         ...(modelOverride ? { modelOverride } : {}),
         trigger: trigger === "cron" ? "cron" : "chat",
-        ...(typeof sessionId === "string" && sessionId ? { sessionId } : {}) }),
+        ...(typeof sessionId === "string" && sessionId ? { sessionId } : {}),
+        ...(sharedChat === true ? { sharedChat: true } : {}) }),
       "utf-8",
     );
     fs.renameSync(tempFile, IDENTITY_FILE);
@@ -1542,7 +1547,7 @@ async function setupGatewayBearer(actorId) {
   }
   gatewayBearer = await provider.getAccessToken(actorId);
   console.log(
-    `[contract] Gateway MCP bearer acquired for ${actorId} (expires ${new Date(gatewayBearer.expiresAt).toISOString()})`,
+    `[contract] Gateway MCP bearer acquired (expires ${new Date(gatewayBearer.expiresAt).toISOString()})`,
   );
   gatewayTokenProvider = provider;
   activationScope.checkpoint();
@@ -1575,7 +1580,9 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
     const namespace = actorId.replace(/:/g, "_");
     currentUserId = userId;
     currentNamespace = namespace;
-    scopedLogger = cwLogger.startOwned(`${namespace}-${Date.now()}`, {
+    // The stream is named after the internal user ID, not the namespace (for
+    // WhatsApp, a phone number). scripts/delete_user_data.py finds both forms.
+    scopedLogger = cwLogger.startOwned(`${userId}-${Date.now()}`, {
       binding: v2Lifecycle.snapshot().binding, generation: activationScope.generation,
       signal: activationScope.signal,
     });
@@ -1587,12 +1594,10 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
     process.env.INTERNAL_USER_ID = userId;
 
     // Write initial identity file for the proxy to read
-    updateIdentityFile(actorId, channel, channelActorId, channelTarget);
+    updateIdentityFile(actorId, channel, channelActorId, channelTarget, null, { userId });
     startBrowserOverlap(userId);
 
-    console.log(
-      `[contract] Init for user=${userId} actor=${actorId} namespace=${namespace}`,
-    );
+    console.log(`[contract] Init for user=${userId}`);
 
     // Fetch secrets only after binding the user.
     if (!GATEWAY_TOKEN) {
@@ -2113,7 +2118,8 @@ function createTelegramStreamer(chatId) {
     typingStarted = true;
     sendTyping();
     typingInterval = setInterval(sendTyping, 5000);
-    console.log(`[telegram-stream] Typing indicator started for chat_id=${chatId}`);
+    // No chat_id: in a private chat it is the user's Telegram ID.
+    console.log("[telegram-stream] Typing indicator started");
   };
 
   const stopTypingLoop = () => {
@@ -2152,10 +2158,9 @@ function createTelegramStreamer(chatId) {
       }
     }
     console.warn(
-      "[telegram-stream] Caller disconnected before reply; contract sent %s of %s chunk(s) for chat_id=%s",
+      "[telegram-stream] Caller disconnected before reply; contract sent %s of %s chunk(s)",
       sent,
       chunks.length,
-      chatId,
     );
     return lastId;
   };
@@ -2229,11 +2234,10 @@ async function deliverLateAnnounce(text, route) {
   // validated against the user binding.
   const tripleKey = routeTripleKey(route);
   if (!tripleKey || !knownDeliveryRoutes.has(tripleKey)) {
+    // The channel only: the channel actor and target name the person or chat.
     console.warn(
-      "[contract] Late sub-agent announce not delivered: delivery triple not owned by the current binding (channel=%s, channelActorId=%s, channelTarget=%s)",
+      "[contract] Late sub-agent announce not delivered: delivery triple not owned by the current binding (channel=%s)",
       String(route.channel || "unknown"),
-      String(route.channelActorId || ""),
-      String(route.channelTarget || ""),
     );
     return;
   }
@@ -2362,9 +2366,14 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival,
   if (channelTarget !== null && (typeof channelTarget !== "string" || !channelTarget)) {
     return reply({ error: "Invalid channel delivery target" }, 400);
   }
+  // The Router sets sharedChat on Slack channel and Feishu group turns.
+  if (payload.sharedChat !== undefined && typeof payload.sharedChat !== "boolean") {
+    return reply({ error: "sharedChat must be a boolean" }, 400);
+  }
+  const sharedChat = payload.sharedChat === true;
   const modelOverride = payloadModelOverride(payload.modelOverride);
   const context = Object.freeze({
-    userId, actorId, channel, channelActorId, channelTarget, modelOverride,
+    userId, actorId, channel, channelActorId, channelTarget, modelOverride, sharedChat,
     runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
     routingGeneration: payload.routingGeneration ?? null,
     // Bounds the queue wait; the turn itself is re-bounded at dispatch below.
@@ -2432,7 +2441,9 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival,
         throw error;
       }
       updateIdentityFile(turn.actorId, turn.channel, turn.channelActorId, turn.channelTarget,
-        turn.modelOverride, { trigger: action, sessionId: turn.runtimeSessionId });
+        turn.modelOverride, {
+          trigger: action, sessionId: turn.runtimeSessionId, userId: turn.userId, sharedChat: turn.sharedChat,
+        });
       lateTurn = lateAnnounces?.beginTurn({
         actorId: turn.actorId, channel: turn.channel,
         channelActorId: turn.channelActorId, channelTarget: turn.channelTarget,

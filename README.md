@@ -508,7 +508,7 @@ The text is delivered and the Lambda logs `Brief audio not sent: <exception type
 
 ### Cost alarm fires often, or token usage shows `default-user`
 
-`openclaw-hourly-cost-spike` compares the cost of one hour with `hourly_cost_alarm_usd` (default `30`) and `openclaw-daily-cost-budget` compares one day with `daily_cost_budget_usd` (default `100`). One Opus brief or task-generation run can cost several dollars, so set both to what you expect to spend. The proxy attributes each Bedrock call to its user, channel, session and agent type. Usage under `default-user` / `unknown` comes from records without request metadata: ones written by older releases, or by another Bedrock caller in the account. See [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking).
+`openclaw-hourly-cost-spike` compares the cost of one hour with `hourly_cost_alarm_usd` (default `30`) and `openclaw-daily-cost-budget` compares one day with `daily_cost_budget_usd` (default `100`). One Opus brief or task-generation run can cost several dollars, so set both to what you expect to spend. The proxy attributes each Bedrock call to its user (by internal user ID), channel, session and agent type. Usage under `default-user` / `unknown` comes from records without request metadata: ones written by older releases, or by another Bedrock caller in the account. It also appears when a bridge image that sends `openclaw.user_id` runs before the token-metrics Lambda that reads it; deploy the Lambda first ([deploy order](docs/operations.md#deploy-a-new-bridge-version)). See [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking).
 
 ### Node.js ETIMEDOUT / ENETUNREACH in VPC
 
@@ -537,7 +537,7 @@ Node.js's Happy Eyeballs (`autoSelectFamily`, Node 20+) tries both IPv4 and IPv6
 | **Single region** | AgentCore Runtime deployed in one region; no multi-region failover |
 | **V2 Regions only** | `main` deploys only in the AgentCore Runtime V2 Regions; use [`release/v1`](docs/release-v1.md) elsewhere. V1 deployments cannot be migrated in place |
 | **No voice/video input** | Users can send text and images only; no audio or video messages. Scheduled briefs can send an MP3 on Telegram ([brief audio](docs/how-it-works.md#brief-audio)) |
-| **Token usage attribution** | Per-user totals are in DynamoDB only; CloudWatch token metrics are per channel and model. Records from older releases, or from other Bedrock callers in the account, stay under `default-user` / `unknown` |
+| **Token usage attribution** | Per-user totals are in DynamoDB only, keyed by internal user ID (`USER#user_<16 hex>`; rows from older bridge images keep the channel actor until they expire); CloudWatch token metrics are per channel and model. Records from older releases, or from other Bedrock callers in the account, stay under `default-user` / `unknown` |
 
 ## Security
 

@@ -30,6 +30,8 @@ function loadContract(t, {
   const calls = [];
   const errors = [];
   const logs = [];
+  const warnings = [];
+  const streams = [];
   const files = new Map();
   const children = [];
   const preparations = [];
@@ -265,7 +267,11 @@ function loadContract(t, {
     "@aws-crypto/sha256-js": { Sha256: class {} },
     "@aws-sdk/credential-provider-node": { defaultProvider: () => ({}) },
     "./cloudwatch-logger": {
-      startOwned: () => { calls.push("logger"); return { ready: Promise.resolve(true), retire() {} }; },
+      startOwned: (name, options) => {
+        calls.push("logger");
+        streams.push({ name, userId: options?.binding?.userId });
+        return { ready: Promise.resolve(true), retire() {} };
+      },
       shutdown: async () => {}, flush: async () => {},
     },
     "./cognito-token": {
@@ -380,7 +386,11 @@ function loadContract(t, {
       env, on(name, callback) { processHandlers[name] = callback; },
       exit() { calls.push("exit"); },
     },
-    console: { log(...args) { logs.push(args.join(" ")); }, warn() {}, error(...args) { errors.push(args.join(" ")); } },
+    console: {
+      log(...args) { logs.push(args.join(" ")); },
+      warn(...args) { warnings.push(require("util").format(...args)); },
+      error(...args) { errors.push(args.join(" ")); },
+    },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf8"), context);
   t.after(() => {
@@ -414,7 +424,8 @@ function loadContract(t, {
     return result.promise;
   }
   return {
-    request, calls, files, children, errors, logs, preparations, activations, remoteBrowserStatus,
+    request, calls, files, children, errors, logs, warnings, streams, preparations, activations, remoteBrowserStatus,
+    evaluate: (code) => vm.runInContext(code, context),
     gatewayEnv: () => vm.runInContext('openclawEnvFor("u1")', context),
     shutdown: () => processHandlers.SIGTERM(),
     shutdownDeadline: () => timeouts.findLast((entry) => entry.delay === 12000).callback(),
@@ -1521,8 +1532,8 @@ test("a linked Slack turn and its Cron retain delivery metadata separately from 
   assert.equal(app.activations[0].env.USER_ID, "telegram:123");
   assert.equal(app.activations[0].env.INTERNAL_USER_ID, "u1");
   const identity = JSON.parse(app.files.get("/tmp/current-identity.json"));
-  assert.deepEqual(identity, { actorId: "telegram:123", channel: "slack", channelActorId: "slack:U456", channelTarget,
-    trigger: "chat", sessionId: "session-1" });
+  assert.deepEqual(identity, { actorId: "telegram:123", userId: "u1", channel: "slack", channelActorId: "slack:U456",
+    channelTarget, trigger: "chat", sessionId: "session-1" });
   const { schedules, records } = await createCronForIdentity(identity);
   assert.equal(schedules.length, 1);
   assert.match(schedules[0].Name, /^openclaw-telegram_123-/);
@@ -1710,8 +1721,8 @@ test("a payload model override reaches the proxy identity file for that turn onl
   const plain = await app.request({ ...owner, action: "chat", message: "next" });
   assert.equal(plain.body.execution.phase, "completed");
   assert.deepEqual(JSON.parse(app.files.get(OVERRIDE_IDENTITY_FILE)),
-    { actorId: owner.actorId, channel: owner.channel, channelActorId: null, channelTarget: null,
-      trigger: "chat", sessionId: "session-1" });
+    { actorId: owner.actorId, userId: owner.userId, channel: owner.channel, channelActorId: null,
+      channelTarget: null, trigger: "chat", sessionId: "session-1" });
 
   const cron = await app.request({ ...owner, action: "cron", message: "scheduled" });
   assert.equal(cron.body.execution.phase, "completed");
@@ -1922,4 +1933,77 @@ test("a queued cron turn replies status:error at its caller deadline, while the 
   assert.equal(gateway.turns.length, 1, "CN was dispatched after its caller had its reply");
   assert.equal(app.calls.filter((entry) => entry === "chat.send").length, 1);
   assert.equal((await app.request(null, "GET", "/ping")).body.status, "Healthy");
+});
+
+// --- Container log privacy ---------------------------------------------------
+// Synthetic IDs. Container log lines and the log stream name the user by the
+// internal user ID only: never the channel actor, the platform ID (for WhatsApp
+// a phone number), the namespace or a delivery target.
+const LOG_USER = "user_0123456789abcdef";
+const OTHER_CHAT = "445566001";
+
+for (const [label, actorId, platformId] of [
+  ["WhatsApp", "whatsapp:15551234567", "15551234567"],
+  ["Telegram", "telegram:778899001", "778899001"],
+]) {
+  test(`${label}: activation, turn and late-announce logs and the stream name carry only the user ID`, async (t) => {
+    const channel = actorId.split(":")[0];
+    const namespace = actorId.replace(/:/g, "_");
+    const app = loadContract(t, {
+      gatewayMcpEnabled: true,
+      gatewayTurnImpl: async (args) => {
+        args.onDelta("streamed reply text that is long enough to start the Telegram typing indicator");
+        return { phase: "completed", response: "reply", runId: "run-1" };
+      },
+    });
+    app.stubTelegramApi([]);
+    const subject = { userId: LOG_USER, actorId, channel, routingGeneration: 1, runtimeSessionId: "session-1" };
+    // A disconnected caller makes the contract deliver the Telegram reply itself.
+    const turn = await app.request({ ...subject, channelActorId: actorId, channelTarget: platformId,
+      action: "chat", message: "hello" }, "POST", "/invocations", true);
+    assert.equal(turn.body.execution.phase, "completed", app.errors.join("\n"));
+    // A late announce to a chat this activation never used is refused and logged.
+    await app.evaluate(`deliverLateAnnounce("late answer", ${JSON.stringify({
+      actorId, channel: "telegram", channelActorId: `telegram:${OTHER_CHAT}`, channelTarget: OTHER_CHAT })})`);
+
+    const output = [...app.logs, ...app.warnings, ...app.errors].join("\n");
+    for (const forbidden of [actorId, platformId, namespace, OTHER_CHAT]) {
+      assert.equal(output.includes(forbidden), false, `container log contains ${forbidden}`);
+    }
+    // The checked lines ran, so the assertion above is not vacuous.
+    assert.ok(app.logs.includes(`[contract] Init for user=${LOG_USER}`), app.logs.join("\n"));
+    assert.ok(app.logs.some((line) => line.startsWith("[contract] Gateway MCP bearer acquired (expires ")));
+    assert.ok(app.warnings.some((line) => line.endsWith("not owned by the current binding (channel=telegram)")));
+    if (channel === "telegram") {
+      assert.ok(app.logs.includes("[telegram-stream] Typing indicator started"));
+      assert.ok(app.warnings.some((line) => line.startsWith("[telegram-stream] Caller disconnected before reply")));
+    }
+    // The container log stream is <user ID>-<epoch ms>.
+    assert.equal(app.streams.length, 1);
+    assert.match(app.streams[0].name, /^user_0123456789abcdef-\d{13}$/);
+    assert.equal(app.streams[0].userId, LOG_USER);
+    // The proxy reads the user ID next to the actor in the identity file.
+    assert.equal(JSON.parse(app.files.get("/tmp/current-identity.json")).userId, LOG_USER);
+  });
+}
+
+test("sharedChat from the Router reaches the identity file only when true, and must be a boolean", async (t) => {
+  const app = loadContract(t);
+  const identity = () => JSON.parse(app.files.get("/tmp/current-identity.json"));
+  const slack = { ...owner, channel: "slack", channelActorId: "slack:U456", channelTarget: "C789" };
+  assert.equal((await app.request({ ...slack, sharedChat: true, action: "chat", message: "in a channel" }))
+    .body.execution.phase, "completed", app.errors.join("\n"));
+  assert.equal(identity().sharedChat, true);
+  // The next turn without the flag (a DM, or a schedule) clears it.
+  await app.request({ ...slack, channelTarget: "D789", action: "chat", message: "in a DM" });
+  assert.equal(Object.hasOwn(identity(), "sharedChat"), false);
+  await app.request({ ...slack, sharedChat: false, action: "chat", message: "explicit false" });
+  assert.equal(Object.hasOwn(identity(), "sharedChat"), false);
+  await app.request({ ...owner, action: "cron", message: "scheduled" });
+  assert.equal(Object.hasOwn(identity(), "sharedChat"), false);
+  for (const sharedChat of ["true", 1, null, {}]) {
+    const refused = await app.request({ ...slack, sharedChat, action: "chat", message: "bad flag" });
+    assert.equal(refused.code, 400, `sharedChat ${JSON.stringify(sharedChat)}`);
+    assert.equal(refused.body.error, "sharedChat must be a boolean");
+  }
 });

@@ -222,3 +222,44 @@ test("a private chat's system prompt has no group rules", async () => {
   assert.equal((await app.request()).status, 200);
   assert.doesNotMatch(JSON.stringify(app.model[0].system), /shared group chat/);
 });
+
+test("Slack channel and Feishu group turns get the shared-conversation rules; DMs do not", async () => {
+  const system = (app) => app.model.at(-1).system.map((block) => block.text || "").join("");
+  const cases = [
+    // The Router sets sharedChat for Slack channel turns and Feishu group turns.
+    ["slack:owner", { channel: "slack", channelActorId: "slack:owner", channelTarget: "C0123CHAN", sharedChat: true }, true],
+    ["slack:owner", { channel: "slack", channelActorId: "slack:owner", channelTarget: "G0123PRIV", sharedChat: true }, true],
+    ["feishu:ou_fixture", { channel: "feishu", channelActorId: "feishu:ou_fixture", channelTarget: "oc_group",
+      sharedChat: true }, true],
+    // DMs, a Feishu p2p chat and schedules carry no flag.
+    ["slack:owner", { channel: "slack", channelActorId: "slack:owner", channelTarget: "D0123DM" }, false],
+    ["slack:owner", { channel: "slack", channelActorId: "slack:owner", channelTarget: "D0123DM", sharedChat: false }, false],
+    ["feishu:ou_fixture", { channel: "feishu", channelActorId: "feishu:ou_fixture", channelTarget: "oc_p2p" }, false],
+    ["slack:owner", { channel: "slack", trigger: "cron" }, false],
+  ];
+  for (const [actor, turn, shared] of cases) {
+    const app = proxy(actor);
+    app.identity({ actorId: actor, ...turn });
+    assert.equal((await app.request()).status, 200);
+    const text = system(app);
+    assert.equal(text.includes("## Shared Conversation"), shared, JSON.stringify(turn));
+    assert.equal(/Everyone in the conversation can read your reply/.test(text), shared);
+    assert.equal(/Do not reveal user IDs, the namespace or storage paths in your reply/.test(text), shared);
+    assert.equal(/Do not reveal the user's saved memory, notes or files/.test(text), shared);
+    assert.equal(/only when the sender explicitly asks/.test(text), shared);
+    // The sender's own namespace and files still apply; this is not the Telegram group model.
+    assert.doesNotMatch(text, /shared group chat/);
+    assert.equal(text.includes(actor), false, "raw actor in the system prompt");
+    assert.ok(text.includes(`You are chatting with a user (namespace: ${actor.replace(/:/g, "_")}) on channel: `));
+  }
+});
+
+test("a Telegram group keeps its own group rules and gets no shared-conversation section", async () => {
+  const group = "telegram_group:-1001234567890";
+  const app = proxy(group);
+  app.identity({ actorId: group, channel: "telegram_group", channelActorId: group, channelTarget: "-1001234567890" });
+  assert.equal((await app.request()).status, 200);
+  const text = JSON.stringify(app.model[0].system);
+  assert.match(text, /shared group chat/);
+  assert.doesNotMatch(text, /## Shared Conversation/);
+});

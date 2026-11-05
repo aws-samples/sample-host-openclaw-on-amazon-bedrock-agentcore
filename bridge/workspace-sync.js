@@ -793,8 +793,10 @@ async function runRestore(namespace, overwrite, attempt) {
   const startedAt = Date.now();
   const concurrency = _restoreTuning.concurrency;
 
+  // The S3 prefix starts with the namespace (for WhatsApp, a phone number), so
+  // only its fixed part is logged.
   console.log(
-    `[workspace-sync] Restoring workspace from s3://${BUCKET}/${prefix}` +
+    `[workspace-sync] Restoring workspace from S3 (${WORKSPACE_PREFIX}/)` +
       (overwrite ? "" : " (missing files only — existing local files are kept)"),
   );
 
@@ -832,7 +834,7 @@ async function runRestore(namespace, overwrite, attempt) {
       hadState = true;
       if (++candidates > _limits.maxRestoreFiles) {
         throw new Error(
-          `Workspace restore has more than ${_limits.maxRestoreFiles} objects under ${prefix} ` +
+          `Workspace restore has more than ${_limits.maxRestoreFiles} objects under ${WORKSPACE_PREFIX}/ ` +
             "(WORKSPACE_RESTORE_MAX_FILES)",
         );
       }
@@ -1598,7 +1600,9 @@ async function uploadCompressedFile(key, filePath, { hash, size, verify } = {}) 
       try {
         await s3.send(new sdk.AbortMultipartUploadCommand({ Bucket: BUCKET, Key: key, UploadId: uploadId }));
       } catch (abortErr) {
-        console.warn(`[workspace-sync] Could not abort multipart upload of ${key}: ${abortErr.message}`);
+        // The key without its first segment (the namespace).
+        console.warn(`[workspace-sync] Could not abort multipart upload of ${key.slice(key.indexOf("/") + 1)}: ` +
+          abortErr.message);
       }
     }
     throw err;

@@ -214,6 +214,23 @@ class TestHandleFeishuTextMessage(unittest.TestCase):
         invoke_args = mock_invoke.call_args
         self.assertIn("What is the weather?", invoke_args[0][4])  # 5th arg is message
 
+    @patch.object(index, "send_feishu_message")
+    @patch.object(index, "invoke_agent_runtime", return_value={"response": "reply"})
+    @patch.object(index, "get_or_create_session", return_value=TEST_ROUTE)
+    @patch.object(index, "resolve_user", return_value=("user_abc123", False))
+    def test_group_turns_are_marked_shared_and_p2p_turns_are_not(self, mock_resolve, mock_session, mock_invoke,
+                                                                 mock_send):
+        """The bridge adds the shared-conversation rules to the prompt for shared_chat turns."""
+        mention = [{"key": "@_user_1", "id": {"open_id": "ou_bot"}, "name": "Bot"}]
+        for chat_type, shared in (("p2p", False), ("group", True)):
+            with self.subTest(chat_type=chat_type):
+                mock_invoke.reset_mock()
+                event = _make_feishu_text_event(text="@_user_1 hi", chat_type=chat_type,
+                                                mentions=mention if chat_type == "group" else None)
+                index.handle_feishu(json.dumps(event))
+                mock_invoke.assert_called_once()
+                self.assertIs(mock_invoke.call_args.kwargs["shared_chat"], shared)
+
     def test_group_mention_only_text_becomes_hi(self):
         """After stripping group @mention with no remaining text, text defaults to 'hi'."""
         event = _make_feishu_text_event(

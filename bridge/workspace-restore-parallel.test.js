@@ -216,6 +216,26 @@ describe("parallel workspace restore", () => {
     assert.match(line, /Restored 2 file\(s\) to .* — 6 bytes, concurrency 3, \d+\.\d s, 0 retries$/);
   });
 
+  it("restore log lines and errors carry no namespace (for WhatsApp, the phone number)", async () => {
+    const phone = "15551234567";
+    const namespace = `whatsapp_${phone}`;
+    for (const rel of ["a.md", "workspace/b.md"]) {
+      const raw = Buffer.from(`synthetic ${rel}`);
+      s3.objects[`${namespace}/.openclaw/${rel}`] = raw;
+      s3.metadata[`${namespace}/.openclaw/${rel}`] = { sha256: sha256(raw) };
+    }
+    assert.equal((await sync.restoreWorkspace(namespace)).restored, 2);
+    assert.ok(logs.some((l) => l === "[workspace-sync] Restoring workspace from S3 (.openclaw/)"), logs.join("\n"));
+    // The over-budget error is logged by the contract ("Workspace restore failed: ...").
+    process.env.WORKSPACE_RESTORE_MAX_FILES = "1";
+    const over = freshModule(path.join(root, "over"));
+    const error = await over.restoreWorkspace(namespace).catch((err) => err);
+    assert.match(error.message, /more than 1 objects under \.openclaw\/ \(WORKSPACE_RESTORE_MAX_FILES\)/);
+    for (const text of [...logs, ...warnings, error.message]) {
+      assert.equal(text.includes(phone), false, `namespace in: ${text}`);
+    }
+  });
+
   // --- failure mid-restore ----------------------------------------------------
 
   it("a failure in the middle fails the whole restore: no ready signal, uploads stay off, no temp files", async () => {

@@ -173,7 +173,7 @@ Exporting `BEDROCK_GUARDRAIL_ID` in your own shell does **not** configure the Ag
 
 ### Guardrail E2E Tests
 
-`tests/e2e/test_guardrail_wiring.py` verifies the wiring end to end. `test_guardrail_blocks_harmful_content` passes only when the application log (`/openclaw/container`, scoped by the canonical actor from the saved V2 route) contains the proxy's `[guardrail] intervention ...` line, i.e. Bedrock returned `stopReason: guardrail_intervened`. A refusal written by the model itself does not count, so this test fails on a deployment where the guardrail is deployed but not wired.
+`tests/e2e/test_guardrail_wiring.py` verifies the wiring end to end. `test_guardrail_blocks_harmful_content` passes only when the application log (`/openclaw/container`, the streams of the saved V2 route's user ID) contains the proxy's `[guardrail] intervention ...` line, i.e. Bedrock returned `stopReason: guardrail_intervened`. A refusal written by the model itself does not count, so this test fails on a deployment where the guardrail is deployed but not wired.
 
 ```bash
 pytest tests/e2e/test_guardrail_wiring.py -v

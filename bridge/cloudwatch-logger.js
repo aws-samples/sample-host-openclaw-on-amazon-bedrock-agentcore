@@ -4,7 +4,7 @@
  * Hooks console.log/warn/error to buffer log events and flush them
  * to CloudWatch periodically (every 5s) and on process exit.
  *
- * Usage: require('./cloudwatch-logger').init('stream-name');
+ * Usage: require('./cloudwatch-logger').startOwned('<user ID>-<epoch ms>', { binding, generation, signal });
  */
 const {
   CloudWatchLogsClient,
@@ -155,12 +155,20 @@ async function shutdown() {
   }
 }
 
+// A scoped stream is named "<binding user ID>-<epoch ms>": the internal user ID,
+// never the namespace (for WhatsApp, a phone number). scripts/delete_user_data.py
+// finds a user's streams by that prefix.
+function streamOwnedBy(streamName, userId) {
+  return typeof streamName === "string" && streamName.startsWith(`${userId}-`) &&
+    /^[0-9]{1,16}$/.test(streamName.slice(userId.length + 1));
+}
+
 // Capture belongs to the bound session while remote log initialization overlaps activation.
 function startOwned(streamName, { binding, generation, signal } = {}) {
   if (!binding || typeof binding.userId !== "string" || !binding.userId ||
       typeof binding.actorId !== "string" || !binding.actorId ||
       typeof generation !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(generation) ||
-      typeof streamName !== "string" || !streamName ||
+      !streamOwnedBy(streamName, binding.userId) ||
       (binding.routingGeneration != null &&
         (!Number.isSafeInteger(binding.routingGeneration) || binding.routingGeneration < 0)) ||
       (binding.runtimeSessionId != null && typeof binding.runtimeSessionId !== "string") ||

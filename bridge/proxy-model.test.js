@@ -48,7 +48,7 @@ test("request session IDs use fresh OS entropy and retain per-user reuse", () =>
         randomBytes() { assert.fail("Request IDs must not use the snapshot-restored DRBG"); } },
       Date: { now: () => 1234567890 },
       fs: { readFileSync: () => JSON.stringify({ actorId: "slack:owner", channel: "slack" }) },
-      BOUND_ACTOR_ID: "slack:owner",
+      BOUND_ACTOR_ID: "slack:owner", BOUND_USER_ID: "",
       VALID_ACTOR_ID: /^(telegram|slack|discord|whatsapp|line|feishu):[A-Za-z0-9_-]{1,64}$/,
       process: { env: { USER_ID: "slack:owner", CHANNEL: "slack" } },
       sessionMap: new Map(), console: { log() {} },
@@ -74,7 +74,7 @@ test("the proxy reads the per-turn model override only from the bound identity f
   const load = (fileText, env = { USER_ID: "slack:owner", CHANNEL: "slack" }) => {
     const box = {
       require: () => ({ osRandomUUID: () => "00000000-0000-4000-8000-000000000001" }),
-      crypto: require("node:crypto"), Date, BOUND_ACTOR_ID: "slack:owner",
+      crypto: require("node:crypto"), Date, BOUND_ACTOR_ID: "slack:owner", BOUND_USER_ID: "",
       VALID_ACTOR_ID: /^(telegram|slack|discord|whatsapp|line|feishu):[A-Za-z0-9_-]{1,64}$/,
       fs: { readFileSync: () => { if (fileText === null) throw new Error("ENOENT"); return fileText; } },
       process: { env }, sessionMap: new Map(), console: { log() {} },

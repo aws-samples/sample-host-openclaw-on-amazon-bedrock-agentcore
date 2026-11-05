@@ -83,7 +83,7 @@ uv run --no-project --python .venv/bin/python python -m tests.e2e.bot_test --sub
 - If either counter read is unavailable, the test reports that gap and omits the counter assertion; sub-agent execution remains unverified.
 - Response-length assertions alone do not prove sub-agent health or which Bedrock model was used.
 
-Container stdout/stderr is available in `/openclaw/container`. `container_logs.py` reads streams for the saved canonical actor; use those logs to investigate execution details.
+Container stdout/stderr is available in `/openclaw/container`. `container_logs.py` reads the streams of the saved route's user (`<user ID>-*`, or `<namespace>-*` from older bridge images); use those logs to investigate execution details.
 
 **Sub-agent configuration path** (for debugging failures):
 ```
@@ -360,7 +360,7 @@ If new log lines are added to `lambda/router/index.py`:
 
 ## Observability
 
-The application logger sends container output to `/openclaw/container`, with stream prefixes derived from the saved canonical actor. `container_logs.py` and Guardrail wiring tests use that prefix. Router lifecycle logs remain in `/openclaw/lambda/router`.
+The application logger sends container output to `/openclaw/container`, in streams named `<user ID>-<epoch ms>` after the saved route's user (`<namespace>-<epoch ms>` from older bridge images). `container_logs.py` and Guardrail wiring tests look under both prefixes. Router lifecycle logs remain in `/openclaw/lambda/router`.
 
 Native AgentCore Runtime log delivery is separate and is not inferred from application logs. Historical empty native streams do not establish that current application diagnostics are absent. Router text previews are truncated; use bound status and full completion metadata for V2 assertions.
 
