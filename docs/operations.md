@@ -39,7 +39,14 @@ Phase 1 needs no manifest. Phase 3 requires successful warmup and live V2 readba
 
 ## Run tests
 
-Install the pinned SDK and pytest using the [AgentCore Runtime V2 offline setup](runtime-v2.md#offline-checks). Those checks use fake clients/servers and synthetic CDK context. Run each command below independently from the repository root. Keep Router and Cron tests in separate Python processes because both use a module named `index`. Channel E2E uses real AWS resources, model/tool calls and channel messages; use a dedicated V2 test identity and its saved route.
+Install the pinned SDK, pytest and the bridge dependencies using the [AgentCore Runtime V2 offline setup](runtime-v2.md#offline-checks). Those checks use fake clients/servers and synthetic CDK context. `scripts/run-unit-tests.sh` runs every unit-test suite from the repository root without AWS credentials; it never runs E2E tests. The [Unit tests workflow](../.github/workflows/unit-tests.yml) runs the same script on every pull request and on pushes to `main` and `release/v1`.
+
+```bash
+scripts/run-unit-tests.sh                  # all suites: bridge, skills, gateway-tools, router, cron, tests (tests/ without tests/e2e)
+scripts/run-unit-tests.sh router cron      # selected suites; `node` and `python` select each group, --help lists them
+```
+
+To run one suite or file, run each command below independently from the repository root. Keep Router and Cron tests in separate Python processes because both use a module named `index`. Channel E2E uses real AWS resources, model/tool calls and channel messages; use a dedicated V2 test identity and its saved route.
 
 ```bash
 cd bridge && node --test *.test.js                     # bridge unit tests (Node 24)
