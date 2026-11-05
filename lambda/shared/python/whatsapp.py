@@ -114,8 +114,9 @@ def extract_messages(payload, phone_number_id, now=None):
     """Yield normalized inbound user messages from a webhook payload.
 
     Each item: {"id", "from", "name", "type", "text", "image_id", "image_mime",
-    "document_id", "document_mime", "document_name", "timestamp", "unsupported"}.
-    A document keeps its caption as the text. A message of one of
+    "document_id", "document_mime", "document_name", "audio_id", "audio_mime",
+    "timestamp", "unsupported"}. A document keeps its caption as the text. An
+    audio message keeps its media ID, for voice transcription. A message of one of
     UNSUPPORTED_TYPES, or a document without a usable media ID, is kept with
     unsupported=True (and the caption of a video or document as its text), so
     the Router can say it cannot read it. Messages for another phone number,
@@ -171,7 +172,7 @@ def _normalize_message(msg, now):
     msg_type = msg.get("type")
     item = {"id": msg_id, "from": sender, "type": msg_type, "text": "",
             "image_id": "", "image_mime": "", "document_id": "", "document_mime": "", "document_name": "",
-            "timestamp": ts, "unsupported": False}
+            "audio_id": "", "audio_mime": "", "timestamp": ts, "unsupported": False}
     if msg_type == "text":
         item["text"] = str((msg.get("text") or {}).get("body", ""))
     elif msg_type == "image":
@@ -192,6 +193,14 @@ def _normalize_message(msg, now):
             item["document_name"] = str(document.get("filename", "") or "")[:256]
         else:
             item["unsupported"] = True
+    elif msg_type == "audio":
+        # Unsupported unless the Router transcribes voice messages; the media ID is kept for that.
+        item["unsupported"] = True
+        audio = msg.get("audio") if isinstance(msg.get("audio"), dict) else {}
+        media_id = str(audio.get("id", ""))
+        if _MEDIA_ID_RE.match(media_id):
+            item["audio_id"] = media_id
+            item["audio_mime"] = str(audio.get("mime_type", "")).split(";")[0].strip()[:128]
     elif msg_type in UNSUPPORTED_TYPES:
         item["unsupported"] = True
         media = msg.get(msg_type)
@@ -294,6 +303,14 @@ def download_media(config, media_id, allowed_types, max_bytes, timeout=15):
     """Download an inbound media object. Returns (bytes, content_type) or (None, None)."""
     data, mime, _ = _fetch_media(config, media_id, allowed_types, max_bytes, timeout)
     return data, mime
+
+
+def download_audio(config, media_id, allowed_types, max_bytes, timeout=15):
+    """Download an inbound audio message. Returns (bytes, content_type, None) or (None, None, reason).
+
+    reason is "too_large" (Meta's declared size is checked before the download) or "failed".
+    """
+    return _fetch_media(config, media_id, allowed_types, max_bytes, timeout)
 
 
 def download_document(config, media_id, max_bytes, timeout=15):

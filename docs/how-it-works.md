@@ -131,6 +131,37 @@ Slack reads one file per message: the first image, else the first document, and 
 
 **Existing users after an upgrade:** text, Markdown and ZIP files work for every user as soon as the Router is deployed, because the Router inlines or lists them. Reading a PDF needs `read_pdf_text`, which ships in the bridge image, and a saved route keeps the endpoint, and so the image, it enrolled on ([runtime-v2.md](runtime-v2.md#existing-user-migration-and-cutover)). A user whose route is on an image without `read_pdf_text` can send a PDF and it is stored, but the agent says it cannot read PDFs yet until the route is migrated to a newer endpoint. Users enrolled on an endpoint with the newer image read PDFs at once.
 
+## Voice Messages
+
+Off by default. With `voice_transcription: "transcribe"` (see the [configuration table](../README.md)), the Router transcribes these with Amazon Transcribe and runs the turn on the transcript:
+- on Telegram, voice notes, audio files and video notes, in private chats and in groups (when addressed to the bot);
+- on WhatsApp and LINE, audio messages.
+
+With the setting off, these messages get the notice above. Album items keep the album's single notice. Video is not read.
+
+For each message, the Router (`lambda/router/voice.py`):
+
+1. Refuses audio over `voice_max_seconds` (default 300) before the download, where the platform reports the duration (Telegram, LINE). A WhatsApp Ogg Opus voice note is measured after the download. Files over 10 MB, and formats Transcribe does not read, are refused too (the latter with the notice).
+2. Stores the audio at `<namespace>/_uploads/voice_<ts>_<hex>.<ext>` in the user-files bucket and keeps the object's version ID.
+3. Starts a batch job named `oc-<random hex>` with automatic language identification (limited to `voice_language_options` when set). The job has no output bucket, so the transcript stays in Transcribe's own storage.
+4. Polls the job every second from 2 seconds on, for up to `voice_transcribe_timeout_seconds` (default 45). The typing indicator (Telegram) or loading animation (LINE) shows meanwhile.
+5. Reads at most 1 MB of the transcript from its temporary https URI, which must be on an amazonaws.com host.
+6. Always deletes the job, then that version of the audio object, so the versioned bucket keeps no copy.
+
+The agent gets the caption (if any), then a line such as `[Voice message, 0:14, transcribed automatically; it may contain errors]`, then the transcript. If Transcribe finds no words, the reply is "Sorry, I could not make out any words in that voice message." A failed or timed-out job gets "Sorry, I could not transcribe that voice message. Please try again or type it." No turn runs in either case.
+
+Logs carry the duration, size, job status and `elapsed_ms` only, never the transcript, the S3 key or the job name.
+
+The Router role gets two statements only when the setting is on:
+- `transcribe:StartTranscriptionJob`, `GetTranscriptionJob` and `DeleteTranscriptionJob` on `transcription-job/oc-*`;
+- `s3:GetObject`, `s3:DeleteObject` and `s3:DeleteObjectVersion` on `*/_uploads/voice_*`. Transcribe reads the audio with the Router's permissions, including its existing `kms:Decrypt` on the CMK.
+
+Before turning it on:
+- Check your AWS Organization's AI services opt-out policy: unless it opts out of Amazon Transcribe, AWS may store and use content that Transcribe processes to improve its services.
+- Measure the latency in your Region; it has not been measured.
+- Know that the wait for a transcription comes out of `router_lambda_timeout_seconds`, so a voice turn has that much less time for the agent's reply.
+- Know that a job still running at the timeout may refuse deletion: the Router logs `cleanup failed step=job`, and Transcribe keeps that job until it removes it itself. The audio is still deleted.
+
 ## Cross-Channel Account Linking
 
 By default, each channel creates a separate user identity. Link an unowned second channel to the canonical user before independently registering it. Existing independent owners are not merged:

@@ -73,12 +73,13 @@ ACCEPTED_FILES_TEXT = (
 )
 
 
-def accepted_text(channel):
+def accepted_text(channel, voice=False):
     """What the bot can read, for the notice sent when a message cannot be read.
 
     Every channel takes the same files, so the channel only names the caller.
+    voice: voice messages are transcribed on this channel (voice.py).
     """
-    return f"text, {ACCEPTED_FILES_TEXT}"
+    return f"text, {'voice messages, ' if voice else ''}{ACCEPTED_FILES_TEXT}"
 
 
 def classify_document(mime_type, file_name):

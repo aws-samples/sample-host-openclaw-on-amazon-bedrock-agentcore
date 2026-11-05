@@ -23,6 +23,7 @@ from aws_cdk import (
 )
 import cdk_nag
 import json
+import re
 from constructs import Construct
 
 from scripts.model_selection import CONTEXT_KEY as MODEL_SELECTION_KEY, parse_user_selectable_models
@@ -45,6 +46,57 @@ def channel_identity_mode(node) -> str:
     if isinstance(value, bool) or mode not in CHANNEL_IDENTITY_MODES:
         raise ValueError(f"context channel_identity_mode must be personal or channel, got {value!r}")
     return mode
+
+
+VOICE_MAX_SECONDS_LIMIT = 3600
+# The wait comes out of router_lambda_timeout_seconds, which the turn also needs.
+VOICE_TIMEOUT_LIMIT_SECONDS = 120
+VOICE_LANGUAGE_CODE_RE = re.compile(r"[a-z]{2,3}-[A-Z]{2}")
+
+
+def voice_transcription(scope) -> dict | None:
+    """The Router's VOICE_* variables when ``voice_transcription`` is "transcribe", or None when off.
+
+    ``voice_transcription``: "off" (default) or "transcribe"; anything else
+    fails the synth. When on, ``voice_max_seconds`` (1 to 3600, default 300),
+    ``voice_transcribe_timeout_seconds`` (5 to 120, default 45) and
+    ``voice_language_options`` (empty, or 2 to 10 distinct Amazon Transcribe
+    language codes such as "en-US") are checked too. Off adds nothing to the stack.
+    """
+    raw = scope.node.try_get_context("voice_transcription")
+    mode = raw.strip().lower() if isinstance(raw, str) else raw
+    if mode in (None, "", "off"):
+        return None
+    if mode != "transcribe":
+        raise ValueError(f"context voice_transcription must be off or transcribe, got {raw!r}")
+    max_seconds = context_int(scope, "voice_max_seconds", 300, minimum=1)
+    timeout = context_int(scope, "voice_transcribe_timeout_seconds", 45, minimum=5)
+    if max_seconds > VOICE_MAX_SECONDS_LIMIT:
+        raise ValueError(f"context voice_max_seconds must be <= {VOICE_MAX_SECONDS_LIMIT}, got {max_seconds}")
+    if timeout > VOICE_TIMEOUT_LIMIT_SECONDS:
+        raise ValueError(f"context voice_transcribe_timeout_seconds must be <= {VOICE_TIMEOUT_LIMIT_SECONDS}, "
+                         f"got {timeout}")
+    raw_options = scope.node.try_get_context("voice_language_options")
+    options = raw_options
+    if options is None:
+        options = []
+    elif isinstance(options, str):  # -c voice_language_options='["en-US","zh-CN"]'
+        try:
+            options = json.loads(options) if options.strip() else []
+        except ValueError:
+            options = None
+    valid = (isinstance(options, list) and len(options) != 1 and len(options) <= 10
+             and all(isinstance(code, str) and VOICE_LANGUAGE_CODE_RE.fullmatch(code) for code in options)
+             and len(set(options)) == len(options))
+    if not valid:
+        raise ValueError("context voice_language_options must be [] or 2 to 10 distinct Amazon Transcribe "
+                         f"language codes such as \"en-US\", got {raw_options!r}")
+    return {
+        "VOICE_TRANSCRIPTION": "transcribe",
+        "VOICE_MAX_SECONDS": str(max_seconds),
+        "VOICE_TRANSCRIBE_TIMEOUT_SECONDS": str(timeout),
+        **({"VOICE_LANGUAGE_OPTIONS": json.dumps(options, separators=(",", ":"))} if options else {}),
+    }
 
 
 class RouterStack(Stack):
@@ -102,6 +154,8 @@ class RouterStack(Stack):
             self.node.try_get_context("router_log_reply_text") or "false").strip().lower() == "true"
         # Per-user daily cost limit (USD), validated at synth; None = off.
         daily_cost_limit = per_user_daily_cost_usd(self)
+        # Voice transcription (voice_transcription): None when off, the default.
+        voice_env = voice_transcription(self)
 
         # --- DynamoDB Identity Table ---
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
@@ -184,6 +238,8 @@ class RouterStack(Stack):
                 **({"CHANNEL_IDENTITY_MODE": "channel"} if identity_mode == "channel" else {}),
                 # Set only when the limit is on, so the default (0) leaves the function unchanged.
                 **({"PER_USER_DAILY_COST_USD": daily_cost_limit} if daily_cost_limit else {}),
+                # Set only when transcription is on, so the default leaves the function unchanged.
+                **(voice_env or {}),
             },
             log_group=router_log_group,
         )
@@ -367,6 +423,30 @@ class RouterStack(Stack):
             )
         )
 
+        # Voice transcription, only when on (lambda/router/voice.py). The Router
+        # starts, polls and deletes its own jobs, named oc-<uuid4 hex>. Transcribe
+        # reads the stored audio with the Router's permissions (and its kms:Decrypt
+        # above), and the Router deletes that exact object version afterwards.
+        transcribe_jobs_arn = f"arn:aws:transcribe:{region}:{account}:transcription-job/oc-*"
+        voice_objects_arn = f"{user_files_bucket_arn}/*/_uploads/voice_*"
+        if voice_env:
+            self.router_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "transcribe:StartTranscriptionJob",
+                        "transcribe:GetTranscriptionJob",
+                        "transcribe:DeleteTranscriptionJob",
+                    ],
+                    resources=[transcribe_jobs_arn],
+                )
+            )
+            self.router_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=["s3:GetObject", "s3:DeleteObject", "s3:DeleteObjectVersion"],
+                    resources=[voice_objects_arn],
+                )
+            )
+
         # --- Outputs ---
         CfnOutput(
             self,
@@ -400,7 +480,10 @@ class RouterStack(Stack):
                     "list covers only the channel/webhook secrets this Lambda reads. "
                     "DynamoDB grant_read_write_data adds index wildcards and KMS "
                     "wildcards for CMK-encrypted table. S3 PutObject scoped to "
-                    "*/_uploads/* prefix for image uploads.",
+                    "*/_uploads/* prefix for image uploads."
+                    + (" Voice transcription: Transcribe jobs named oc-* (the Router names each "
+                       "oc-<uuid4 hex>), and the */_uploads/voice_* objects Transcribe reads and the "
+                       "Router deletes." if voice_env else ""),
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
                         *[
@@ -410,6 +493,8 @@ class RouterStack(Stack):
                         ],
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
+                        *([f"Resource::{transcribe_jobs_arn}",
+                           "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/voice_*"] if voice_env else []),
                         "Action::kms:GenerateDataKey*",
                         "Action::kms:ReEncrypt*",
                     ],
