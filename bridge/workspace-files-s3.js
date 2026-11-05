@@ -109,7 +109,8 @@ async function readWorkspaceFile({ s3, commands, bucket, namespace, filename, lo
       ContentType: "text/markdown; charset=utf-8",
       IfNoneMatch: "*",
     }));
-    log(`[proxy] Copied legacy ${filename} for ${namespace} to ${SYSTEM_ROOT_PREFIX}`);
+    // The file name only; the namespace is not logged.
+    log(`[proxy] Copied legacy ${filename} to ${SYSTEM_ROOT_PREFIX}`);
     return { content: legacy, source: "migrated" };
   } catch (err) {
     if (!isPreconditionFailed(err)) throw err;

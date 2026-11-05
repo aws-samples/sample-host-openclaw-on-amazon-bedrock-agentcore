@@ -13,8 +13,9 @@ Requires:
     - Deployed stack with BEDROCK_GUARDRAIL_ID configured on the runtime
       (scripts/deploy.sh Phase 2 does this from the OpenClawGuardrails outputs)
     - E2E_TELEGRAM_CHAT_ID and E2E_TELEGRAM_USER_ID env vars set
-    - logs:FilterLogEvents on /openclaw/container, scoped to the canonical
-      actor from the saved V2 route for proxy intervention evidence
+    - logs:FilterLogEvents on /openclaw/container, scoped to the user ID (and,
+      for older bridge images, the namespace) of the saved V2 route for proxy
+      intervention evidence
 """
 
 import os
@@ -24,7 +25,7 @@ import pytest
 
 from .log_tailer import tail_logs
 from .session import get_agent_status
-from .container_logs import CONTAINER_LOG_GROUP, namespace
+from .container_logs import CONTAINER_LOG_GROUP, stream_prefixes
 from .webhook import post_webhook
 
 # The actual guardrail ID deployed — used to verify it is NOT leaked
@@ -62,22 +63,25 @@ def _find_guardrail_intervention(
 
     logs = boto3.client("logs", region_name=cfg.region)
     log_group = CONTAINER_LOG_GROUP
-    stream_prefix = namespace(cfg) + "-"
+    # Streams are named by user ID; containers of older bridge images used the namespace.
+    prefixes = stream_prefixes(cfg)
     start = time.monotonic()
     while (time.monotonic() - start) < timeout_s:
-        resp = logs.filter_log_events(
-            logGroupName=log_group,
-            logStreamNamePrefix=stream_prefix,
-            startTime=since_ms,
-            filterPattern=_GUARDRAIL_INTERVENTION_FILTER,
-            limit=50,
-            interleaved=True,
-        )
-        matches = [
-            e.get("message", "")
-            for e in resp.get("events", [])
-            if any(m in e.get("message", "") for m in _GUARDRAIL_INTERVENTION_MARKERS)
-        ]
+        matches = []
+        for stream_prefix in prefixes:
+            resp = logs.filter_log_events(
+                logGroupName=log_group,
+                logStreamNamePrefix=stream_prefix,
+                startTime=since_ms,
+                filterPattern=_GUARDRAIL_INTERVENTION_FILTER,
+                limit=50,
+                interleaved=True,
+            )
+            matches += [
+                e.get("message", "")
+                for e in resp.get("events", [])
+                if any(m in e.get("message", "") for m in _GUARDRAIL_INTERVENTION_MARKERS)
+            ]
         if matches:
             return matches
         time.sleep(poll_interval_s)

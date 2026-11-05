@@ -170,7 +170,7 @@ V2 uses the ports, proxy and OpenClaw `2026.9.5` shown below, with the readiness
 |    |-- POST /v1/chat/completions -> Bedrock ConverseStream            |
 |    |-- GET /v1/models -> available models                             |
 |    |-- GET /health -> proxy status                                    |
-|    |-- Cognito auto-provisioning (HMAC passwords)                     |
+|    |-- Cognito auto-provisioning (random per-user passwords)          |
 |    |-- Per-user workspace files (AGENTS.md, SOUL.md, etc.)            |
 |                                                                       |
 |  OpenClaw Gateway (port 18789) — headless mode                        |
@@ -355,7 +355,7 @@ CDK creates the foundation and Lambda stacks. `scripts/runtime_deploy.py` deploy
 | Encryption | KMS CMK | All data encrypted with customer-managed key (S3, DynamoDB, SNS, CloudTrail, Secrets Manager) |
 | Secrets | Secrets Manager | 7 secrets: gateway token, webhook secret, cognito HMAC, 4 channel tokens |
 | Identity | DynamoDB | Channel-to-user mapping, cross-channel binding, session management |
-| Identity | Cognito User Pool | Auto-provisioned users with HMAC-derived passwords |
+| Identity | Cognito User Pool | Auto-provisioned users with random per-user passwords stored in Secrets Manager |
 | IAM | Least privilege | cdk-nag AwsSolutions checks enforced at synth |
 | Storage | S3 encryption | KMS-encrypted user files bucket, SSL enforced, public access blocked |
 | Audit | CloudTrail | API call logging with S3 storage and file validation |

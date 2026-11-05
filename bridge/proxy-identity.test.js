@@ -152,7 +152,7 @@ function buildIdentityText(actorId, channel, workspaceContents) {
 
   const trustedRules =
     "\n## Current User\n" +
-    `You are chatting with user: ${actorId} (namespace: ${namespace}) on channel: ${channel}.\n` +
+    `You are chatting with a user (namespace: ${namespace}) on channel: ${channel}.\n` +
     `Always use "${namespace}" as the user_id when calling the s3-user-files skill.\n` +
     "\n## Per-User Isolation Rules (CRITICAL, TRUSTED)\n" +
     "1. NEVER write to local files (NOTES.md, scratch.md, etc.) for storing " +

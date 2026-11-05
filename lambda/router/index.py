@@ -975,12 +975,15 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 # ---------------------------------------------------------------------------
 
 def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_target=None,
-                         model_override=None):
+                         model_override=None, shared_chat=False):
     """Invoke the AgentCore Runtime with a per-user session.
 
     Message can be a plain string or a structured dict with text + images.
     model_override is the user's allowlisted /model choice (a model ID), sent
     on every turn so it survives container recycling; omitted when unset.
+    shared_chat marks a turn from a Slack channel or a Feishu group chat, where
+    everyone in the conversation sees the reply; the bridge then tells the
+    agent not to reveal user IDs, the namespace or the user's files there.
     """
     payload = json.dumps({
         "action": "chat",
@@ -991,6 +994,7 @@ def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_tar
         "channelTarget": str(channel_target) if channel_target is not None else actor_id.split(":", 1)[-1],
         "message": message,
         **({"modelOverride": model_override} if model_override else {}),
+        **({"sharedChat": True} if shared_chat else {}),
         **route.payload_context(),
     }).encode()
 
@@ -2861,9 +2865,11 @@ def handle_slack(body, headers=None):
     )
     notify_thread.start()
     try:
+        # Anything but a 1:1 DM (a channel, private channel or group DM) is shared.
         result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message,
                                       channel_target=channel_id,
-                                      model_override=get_model_override(resolved_user_id))
+                                      model_override=get_model_override(resolved_user_id),
+                                      shared_chat=not is_dm)
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)
@@ -3060,9 +3066,11 @@ def handle_feishu(body, headers=None):
     )
     notify_thread.start()
     try:
+        # As for /link: anything but a 1:1 (p2p) chat is shared.
         result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "feishu", agent_message,
                                       channel_target=chat_id,
-                                      model_override=get_model_override(resolved_user_id))
+                                      model_override=get_model_override(resolved_user_id),
+                                      shared_chat=message.get("chat_type") != "p2p")
     finally:
         stop_notify.set()
         notify_thread.join(timeout=2)

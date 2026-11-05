@@ -196,6 +196,11 @@ class TestPayloadForwarding(ModelSwitchingCase):
         self.assertEqual(set(payload), {"action", "userId", "actorId", "channelActorId", "channel",
                                         "channelTarget", "message", "runtimeSessionId", "routingGeneration"})
 
+    def test_shared_chat_flag_is_sent_only_for_shared_conversations(self):
+        self.assertIs(self.invoke(shared_chat=True)["sharedChat"], True)
+        self.assertNotIn("sharedChat", self.invoke(shared_chat=False))
+        self.assertNotIn("sharedChat", self.invoke())
+
 
 class TestChannelHandlers(ModelSwitchingCase):
     """/model replies directly and never reaches AgentCore; normal turns carry the override."""

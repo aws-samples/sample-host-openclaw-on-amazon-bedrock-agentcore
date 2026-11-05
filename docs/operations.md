@@ -32,7 +32,7 @@ uv run --no-project --python .venv-deploy/bin/python python scripts/delete_user_
 - **Order:**
   1. Revoke: `ALLOW#` records are deleted, and PROFILE gets `accessStatus = DISABLED`, as `disable` does.
   2. Stop: the route is frozen and the AgentCore session is stopped.
-  3. Delete: schedules and `CRON#` records; every S3 object version and delete marker under `<namespace>/` and `_system/<namespace>/`, checked empty afterwards; `openclaw/user/<namespace>/*` and the Cognito password secret; the Cognito user; token-usage rows; and `/openclaw/container` log streams.
+  3. Delete: schedules and `CRON#` records; every S3 object version and delete marker under `<namespace>/` and `_system/<namespace>/`, checked empty afterwards; `openclaw/user/<namespace>/*` and the Cognito password secret; the Cognito user; token-usage rows (`USER#<user ID>` and the older `USER#<runtime actor>` form); and `/openclaw/container` log streams (`<user ID>-*` and the older `<namespace>-*` form).
   4. Identity records go last.
 - **Secrets:** they are deleted with a 7-day recovery window. `--force-delete-secrets` deletes them at once.
 - **Refusals:** the tool refuses (exit 3) while the route holds invocation admissions, which means a turn is running or an unknown outcome needs reconciling (see Inspect sessions). It also refuses when the identity records disagree. When it refuses or a call fails (exit 1), re-run the same command: every step lists before it deletes, so a re-run finishes the job.
@@ -71,6 +71,16 @@ Install the `uv` environments described in [Quick Start](../README.md#quick-star
 ```
 
 Add `--image-uri "$IMAGE_URI"` to use a prebuilt image. The default manifest is `.runtime/runtime-v2.json`, passed to CDK as `runtime_manifest`. Initial deployment uses `release_1`; subsequent changed releases require new immutable endpoint names. Existing users retain their saved endpoint/version. A CDK-only deployment does not update the AgentCore Runtime image.
+
+**Deploy order for the user ID token attribution change (bridge image that sends `openclaw.user_id`): deploy the token-metrics Lambda first, then the bridge image.** The new image names the user in Bedrock request metadata by internal user ID and no longer sends `openclaw.actor_id`. A token-metrics Lambda from before this change ignores such records, so their usage is attributed to `default-user` until the Lambda is updated. On an existing deployment, run Phase 3 against the current manifest first; it updates the token-metrics Lambda (and the Router), and the new Lambda still reads records from older images. Then deploy the image and run Phase 3 again as usual:
+
+```bash
+./scripts/deploy.sh --phase3 --manifest .runtime/runtime-v2.json   # 1. token-metrics Lambda (and Router) on the current release
+./scripts/deploy.sh --runtime-only --endpoint-name release_2       # 2. the new bridge image
+./scripts/deploy.sh --phase3                                       # 3. as usual
+```
+
+A fresh deployment (`./scripts/deploy.sh` without a mode) needs no extra step: the token-metrics Lambda and its log subscription are created in Phase 3, so only the new Lambda ever processes records. After the change, new token-usage rows are keyed `USER#<user ID>` and new container log streams are named `<user ID>-<epoch ms>`; rows and streams written before keep the actor and namespace forms until they expire, and `scripts/delete_user_data.py` deletes both forms.
 
 ## Update shared stacks
 

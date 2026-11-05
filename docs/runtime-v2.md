@@ -137,7 +137,7 @@ Before dependent-stack deployment, Phase 3 uses `--check-existing-callers` to re
 | Restore, credential, gateway or Browser failure | Keep the failed binding closed. Inspect state and readiness logs; do not start an empty gateway or substitute another owner |
 | Missing ownership/SESSION | Reconcile identity records and their saved route; never delete SESSION or identity records as a reset |
 
-Transport errors, deadlines and `unknown_outcome` retain admission tokens and `inFlight`, even when a decoded response otherwise claims success. Remote work may continue. Do not retry or clear retained tokens until effects and delivery are reconciled. Application logs are in `/openclaw/container`, prefixed by the saved actor with `:` replaced by `_`.
+Transport errors, deadlines and `unknown_outcome` retain admission tokens and `inFlight`, even when a decoded response otherwise claims success. Remote work may continue. Do not retry or clear retained tokens until effects and delivery are reconciled. Application logs are in `/openclaw/container`, in streams named `<internal user ID>-<epoch ms>` of the saved route's user (`<namespace>-<epoch ms>` from bridge images before the user ID change).
 
 ## Startup measurement points
 

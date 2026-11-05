@@ -32,13 +32,18 @@ const VALID_ACTOR_ID =
 // allowlist means the loader or contract is corrupt, so stop at load.
 const BOUND_ACTOR_ID = process.env.USER_ID || "";
 if (BOUND_ACTOR_ID && !VALID_ACTOR_ID.test(BOUND_ACTOR_ID)) {
+  // The value is not echoed: an actor ID can be a phone number.
   console.error(
-    `[proxy] FATAL: bound USER_ID "${BOUND_ACTOR_ID.slice(0, 80)}" does not ` +
+    "[proxy] FATAL: bound USER_ID does not " +
       "match the required <channel>:<id> format (channels: telegram, " +
       "telegram_group, slack, discord, whatsapp, line, feishu).",
   );
   process.exit(1);
 }
+// The internal user ID of the same binding (proxy-sdk-snapshot.js checks it
+// against the activation before this module loads). Logs and Bedrock request
+// metadata name the user by this ID, never by the actor.
+const BOUND_USER_ID = process.env.INTERNAL_USER_ID || "";
 const AWS_REGION = process.env.AWS_REGION;
 if (!AWS_REGION) {
   console.error("[proxy] FATAL: AWS_REGION environment variable is not set.");
@@ -162,7 +167,8 @@ function sleep(ms) {
 
 /**
  * Resolve the bound actor and per-turn metadata from the identity file.
- * Returns { sessionId, actorId, channel, idSource, modelOverride, trigger }; throws when unbound.
+ * Returns { sessionId, actorId, userId, channel, idSource, modelOverride, trigger, sharedChat };
+ * throws when unbound.
  */
 function extractSessionMetadata(parsed, headers) {
   // Identity resolution fails closed: the proxy only serves the actor bound
@@ -180,7 +186,8 @@ function extractSessionMetadata(parsed, headers) {
   // Without a binding there is no trusted identity: refuse instead of inferring a
   // user from the identity file, request headers or message text.
   if (!BOUND_ACTOR_ID) throw new Error("Proxy actor is not bound");
-  if (process.env.USER_ID !== BOUND_ACTOR_ID) {
+  if (process.env.USER_ID !== BOUND_ACTOR_ID ||
+      (process.env.INTERNAL_USER_ID || "") !== BOUND_USER_ID) {
     throw new Error("Proxy canonical actor changed");
   }
 
@@ -197,6 +204,13 @@ function extractSessionMetadata(parsed, headers) {
     throw new Error("Proxy identity file missing bound actor");
   }
   if (identity.actorId !== BOUND_ACTOR_ID) {
+    throw new Error("Proxy canonical actor changed");
+  }
+  // The contract writes the binding's user ID next to the actor; it must agree
+  // with the bound environment, like the actor. The proxy never takes a user
+  // ID from the file alone.
+  if (identity.userId !== undefined && identity.userId !== null &&
+      identity.userId !== BOUND_USER_ID) {
     throw new Error("Proxy canonical actor changed");
   }
   // The identity file is written by the trusted contract once per turn, but
@@ -218,6 +232,10 @@ function extractSessionMetadata(parsed, headers) {
       identity.trigger !== "chat" && identity.trigger !== "cron") {
     throw new Error("Proxy canonical actor changed");
   }
+  if (identity.sharedChat !== undefined && identity.sharedChat !== null &&
+      typeof identity.sharedChat !== "boolean") {
+    throw new Error("Proxy canonical actor changed");
+  }
 
   const actorId = identity.actorId;
   // Post-condition: the bound actorId must still match the format allowlist.
@@ -237,6 +255,10 @@ function extractSessionMetadata(parsed, headers) {
   const runtimeSessionId = typeof identity.sessionId === "string"
     ? identity.sessionId
     : "";
+  // Set by the Router for a Slack channel or Feishu group turn: the reply is
+  // visible to everyone in that conversation.
+  const sharedChat = identity.sharedChat === true;
+  const userId = BOUND_USER_ID;
 
   // Generate (or reuse) a stable per-user session ID. AgentCore requires
   // sessionId length >= 33 characters.
@@ -252,10 +274,10 @@ function extractSessionMetadata(parsed, headers) {
   const sessionId = runtimeSessionId || sessionMap.get(key);
 
   console.log(
-    `[proxy][identity] actorId=${actorId}, channel=${channel}, source=${idSource}`,
+    `[proxy][identity] user=${userId || "unknown"}, channel=${channel}, source=${idSource}`,
   );
 
-  return { sessionId, actorId, channel, idSource, modelOverride, trigger };
+  return { sessionId, actorId, userId, channel, idSource, modelOverride, trigger, sharedChat };
 }
 
 // Per-user Cognito ID tokens (user provisioning, per-user random password in
@@ -340,20 +362,21 @@ const VALID_BEDROCK_FORMATS = new Set(["jpeg", "png", "gif", "webp"]);
  * path traversal sequences.
  */
 async function fetchImageFromS3(s3Key, expectedNamespace) {
+  // Rejected keys are not logged: they come from message text and may name anything.
   // Reject path traversal attempts
   if (s3Key.includes("..")) {
-    console.warn(`[proxy] Rejected S3 image key with path traversal: ${s3Key}`);
+    console.warn("[proxy] Rejected S3 image key with path traversal");
     return null;
   }
 
   // Validate key belongs to the expected user namespace
   const expectedPrefix = expectedNamespace + "/_uploads/";
   if (!s3Key.startsWith(expectedPrefix)) {
-    console.warn(
-      `[proxy] Rejected S3 image key outside user namespace: ${s3Key} (expected prefix: ${expectedPrefix})`,
-    );
+    console.warn("[proxy] Rejected S3 image key outside the user's uploads prefix");
     return null;
   }
+  // Accepted keys are logged without the namespace (for WhatsApp, a phone number).
+  const logKey = s3Key.slice(expectedNamespace.length + 1);
 
   const bucket = process.env.S3_USER_FILES_BUCKET;
   if (!bucket) {
@@ -377,7 +400,7 @@ async function fetchImageFromS3(s3Key, expectedNamespace) {
 
     if (bytes.length > MAX_IMAGE_BYTES) {
       console.warn(
-        `[proxy] S3 image too large: ${bytes.length} bytes (key=${s3Key})`,
+        `[proxy] S3 image too large: ${bytes.length} bytes (key=${logKey})`,
       );
       return null;
     }
@@ -391,12 +414,12 @@ async function fetchImageFromS3(s3Key, expectedNamespace) {
       rawFormat && VALID_BEDROCK_FORMATS.has(rawFormat) ? rawFormat : "jpeg";
 
     console.log(
-      `[proxy] Fetched image from S3: ${s3Key} (${bytes.length} bytes, format=${format})`,
+      `[proxy] Fetched image from S3: ${logKey} (${bytes.length} bytes, format=${format})`,
     );
     return { bytes, format };
   } catch (err) {
     console.error(
-      `[proxy] Failed to fetch image from S3: ${s3Key} — ${err.message}`,
+      `[proxy] Failed to fetch image from S3: ${logKey} — ${err.message}`,
     );
     return null;
   }
@@ -577,19 +600,19 @@ async function readUserFileFromS3(namespace, filename) {
       s3: getS3Client(), commands: s3Commands(), bucket, namespace, filename,
       log: (msg) => console.log(msg),
     });
+    // Log lines name the file, not the namespace (for WhatsApp, a phone number).
     if (source === "none") {
-      console.log(`[proxy] No ${filename} for ${namespace} (not created yet)`);
+      console.log(`[proxy] No ${filename} yet (not created)`);
     } else {
       console.log(
-        `[proxy] Read ${filename} for ${namespace}: ${content.length} bytes`,
+        `[proxy] Read ${filename}: ${content.length} bytes`,
       );
     }
     return content;
   } catch (err) {
     console.warn(
-      "[proxy] Failed to read %s for %s:",
+      "[proxy] Failed to read %s:",
       filename,
-      namespace,
       err.message,
     );
     return "";
@@ -616,14 +639,13 @@ async function writeUserFileToS3(namespace, filename, content) {
     });
     if (written) {
       console.log(
-        `[proxy] Seeded ${filename} for ${namespace}: ${content.length} bytes`,
+        `[proxy] Seeded ${filename}: ${content.length} bytes`,
       );
     }
   } catch (err) {
     console.warn(
-      "[proxy] Failed to seed %s for %s:",
+      "[proxy] Failed to seed %s:",
       filename,
-      namespace,
       err.message,
     );
   }
@@ -646,7 +668,7 @@ async function ensureWorkspaceFiles(namespace, rawContents) {
   if (missing.length === 0) return;
 
   console.log(
-    `[proxy] Seeding ${missing.length} workspace file(s) for ${namespace}: ${missing.map((w) => w.filename).join(", ")}`,
+    `[proxy] Seeding ${missing.length} workspace file(s): ${missing.map((w) => w.filename).join(", ")}`,
   );
   await Promise.all(
     missing.map((wf) =>
@@ -695,12 +717,25 @@ const GROUP_CONTEXT =
 
 const groupContext = (channel) => (GROUP_CHANNELS.has(channel) ? GROUP_CONTEXT : "");
 
+// A Slack channel or Feishu group turn (the Router sets sharedChat): the user's
+// own identity, namespace and files, but everyone in the conversation sees the
+// reply. Schedules never set it.
+const SHARED_CHAT_CONTEXT =
+  "\n## Shared Conversation\n" +
+  "This message was posted in a shared channel or group chat, not a private chat. " +
+  "Everyone in the conversation can read your reply.\n" +
+  "- Do not reveal user IDs, the namespace or storage paths in your reply.\n" +
+  "- Do not reveal the user's saved memory, notes or files.\n" +
+  "- Make an exception only when the sender explicitly asks for that information here.\n";
+
+const sharedChatContext = (sharedChat) => (sharedChat === true ? SHARED_CHAT_CONTEXT : "");
+
 async function retrieveMemoryContext(_actorId, _lastUserText) {
   // Stub — memory retrieval not yet implemented.
   return "";
 }
 
-async function buildUserIdentityContext(actorId, channel) {
+async function buildUserIdentityContext(actorId, channel, { sharedChat = false } = {}) {
   const safeChannel = VALID_CHANNELS.has(channel) ? channel : "unknown";
   const namespace = actorId.replace(/:/g, "_");
 
@@ -784,11 +819,14 @@ async function buildUserIdentityContext(actorId, channel) {
   // user-writable path (or stale data from before the reserved-name denylist)
   // cannot precede or imitate the trusted rules. The workspace blocks that
   // follow are explicitly labelled as untrusted reference data.
+  // The raw actor is not in the prompt; the namespace stays until it is no
+  // longer derived from the actor.
   const trustedRules =
     "\n## Current User\n" +
-    `You are chatting with user: ${actorId} (namespace: ${namespace}) on channel: ${safeChannel}.\n` +
+    `You are chatting with a user (namespace: ${namespace}) on channel: ${safeChannel}.\n` +
     `Always use "${namespace}" as the user_id when calling the s3-user-files skill.\n` +
     groupContext(safeChannel) +
+    sharedChatContext(sharedChat) +
     "\n## Per-User Isolation Rules (CRITICAL, TRUSTED)\n" +
     "1. NEVER write to local files (NOTES.md, scratch.md, etc.) for storing " +
     "persistent data. Local files are SHARED across all users.\n" +
@@ -1506,15 +1544,16 @@ const server = http.createServer(async (req, res) => {
         );
 
         // Extract identity for all modes (used for logging + Cognito)
-        const { sessionId, actorId, channel, idSource, modelOverride, trigger } =
+        const { sessionId, actorId, userId, channel, idSource, modelOverride, trigger, sharedChat } =
           extractSessionMetadata(parsed, req.headers);
         chatRequestCount++;
 
         // Detect and count subagent requests
         const isSubagent = isSubagentRequest(parsed);
         // Bedrock requestMetadata for token attribution (identifiers only, sanitised).
+        // It names the internal user ID, not the actor.
         const metadataFor = (modelRoute) => buildRequestMetadata({
-          actorId, channel, sessionId, subagent: isSubagent, trigger, idSource, modelRoute,
+          userId, channel, sessionId, subagent: isSubagent, trigger, idSource, modelRoute,
         });
         if (isSubagent) {
           subagentRequestCount++;
@@ -1538,10 +1577,11 @@ const server = http.createServer(async (req, res) => {
         try {
           cognitoToken = await getCognitoToken(actorId);
         } catch (err) {
+          // An AWS error is logged by name only: its message can quote the
+          // per-user secret name, which contains the namespace.
           console.warn(
-            "[proxy] Cognito token acquisition failed for %s:",
-            actorId,
-            err.message,
+            "[proxy] Cognito token acquisition failed: %s",
+            err?.name && err.name !== "Error" ? err.name : err?.message || "unknown error",
           );
         }
 
@@ -1591,9 +1631,7 @@ const server = http.createServer(async (req, res) => {
                   },
                 });
               } else {
-                console.warn(
-                  `[proxy] Skipping unfetchable image: ${img.s3Key}`,
-                );
+                console.warn("[proxy] Skipping unfetchable image");
               }
             }
             // Fall back to original message if all images failed and no text
@@ -1631,6 +1669,7 @@ const server = http.createServer(async (req, res) => {
         const identityContext = await buildUserIdentityContext(
           actorId,
           channel,
+          { sharedChat },
         );
         const baseSystemText = extractSystemText(messages, SYSTEM_PROMPT);
         const systemTextOverride = baseSystemText + identityContext + memoryContext;

@@ -360,6 +360,24 @@ class TestSlackChannelMessages(_SlackTurnCase):
         self.send_slack_message.assert_called_once_with(
             "C12345CHAN", "agent reply", SLACK_BOT_TOKEN, thread_ts=MESSAGE_TS)
 
+    def test_channel_turns_are_marked_shared_and_dm_turns_are_not(self):
+        """The bridge adds the shared-conversation rules to the prompt for shared_chat turns."""
+        cases = (
+            (_make_slack_dm_event(text="hello"), False),
+            (_make_slack_message_event(text="<@UBOT123> hi", channel_type="channel", event_id="Ev1"), True),
+            (_make_slack_app_mention_event(text="<@UBOT123> hi", event_id="Ev2", ts="1234567890.200000"), True),
+            (_make_slack_message_event(text="<@UBOT123> hi", channel_id="G12345PRIV", channel_type="group",
+                                       event_id="Ev3"), True),
+            (_make_slack_message_event(text="<@UBOT123> hi", channel_id="G12345MPIM", channel_type="mpim",
+                                       event_id="Ev4"), True),
+        )
+        for event, shared in cases:
+            with self.subTest(channel=event["event"]["channel"], event_type=event["event"]["type"]):
+                self.invoke_agent_runtime.reset_mock()
+                index.handle_slack(json.dumps(event))
+                self.invoke_agent_runtime.assert_called_once()
+                self.assertIs(self.invoke_agent_runtime.call_args.kwargs["shared_chat"], shared)
+
     def test_mention_inside_a_thread_is_answered_in_that_thread(self):
         for event in (
             _make_slack_message_event(text="<@UBOT123> and this?", channel_type="channel",

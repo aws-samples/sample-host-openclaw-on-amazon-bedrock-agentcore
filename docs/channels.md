@@ -121,7 +121,7 @@ The signing secret is used by the Router Lambda to validate `X-Slack-Signature` 
     ./scripts/manage-allowlist.sh add slack:YOUR_MEMBER_ID
     ```
 
-**DMs and channels:** the bot answers every message in a DM. In a channel it answers only messages that @mention it (invite it with `/invite @YourBot` first), and it replies in the message's thread. Every other channel message is ignored: no reply, no agent turn and no enrollment, even with `registration_open`. A member who is not on the allowlist gets no answer in a channel; the "bot is private" notice with their ID is sent only in a DM. A channel @mention is answered from the sender's own session, with their memory and files, and the reply is visible to everyone in the channel.
+**DMs and channels:** the bot answers every message in a DM. In a channel it answers only messages that @mention it (invite it with `/invite @YourBot` first), and it replies in the message's thread. Every other channel message is ignored: no reply, no agent turn and no enrollment, even with `registration_open`. A member who is not on the allowlist gets no answer in a channel; the "bot is private" notice with their ID is sent only in a DM. A channel @mention is answered from the sender's own session, with their memory and files, and the reply is visible to everyone in the channel. The Router marks such a turn as shared (`sharedChat`), and the system prompt then tells the agent that everyone in the conversation reads the reply and not to reveal user IDs, the namespace or storage paths, or the sender's saved memory, notes and files, unless the sender explicitly asks.
 
 ## Feishu
 
@@ -137,6 +137,8 @@ Feishu (飞书 / Lark) uses the Events API with the Router Lambda as the webhook
      --region $CDK_DEFAULT_REGION
    ./scripts/manage-allowlist.sh add feishu:YOUR_OPEN_ID
    ```
+
+**Group chats:** a group chat turn is answered from the sender's own session, and the reply is visible to the whole group. As for a Slack channel, the Router marks it as shared and the system prompt tells the agent not to reveal user IDs, the namespace or storage paths, or the sender's saved memory, notes and files, unless the sender explicitly asks.
 
 Scheduled-task replies (see [Scheduled Tasks](how-it-works.md#scheduled-tasks-cron-jobs)) are delivered to Feishu users too: `lambda/cron/index.py` routes `feishu` targets to the Feishu sender, using the same `openclaw/channels/feishu` app credentials and a cached tenant access token. Design notes: [docs/design-feishu-channel.md](design-feishu-channel.md).
 

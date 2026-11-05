@@ -1,14 +1,16 @@
 """Token metrics Lambda: attribution from Bedrock requestMetadata.
 
-The bridge proxy sets requestMetadata (openclaw.actor_id, openclaw.channel,
+The bridge proxy sets requestMetadata (openclaw.user_id, openclaw.channel,
 openclaw.session_id, openclaw.agent_type, ...) on every Converse /
 ConverseStream call, and Bedrock copies it into the invocation log record.
-Records written before that, or by another caller, have none and must keep
+Bridge images before the user ID change send openclaw.actor_id instead; those
+records are still attributed, on their old USER#<actor> key. Records written
+before requestMetadata, or by another caller, have none and must keep
 accumulating exactly as before: default-user / unknown / default-session, on
 the old sort key.
 
-The actor ID stays in the DynamoDB row only. A WhatsApp actor ID is the user's
-phone number, so it is neither a CloudWatch metric dimension nor in a log line.
+A WhatsApp actor ID is the user's phone number, so it is neither a CloudWatch
+metric dimension nor in a log line, and new rows are keyed by user ID.
 
     pytest tests/test_token_metrics_attribution.py -v
 """
@@ -64,6 +66,19 @@ def _meta(actor="telegram:1001", channel="telegram", session=SESSION, agent="mai
         "openclaw.identity": "unbound" if actor == "default-user" else "bound",
         "openclaw.id_source": "identity-file", "openclaw.model_route": "primary", **extra,
     }
+
+
+USER = "user_0123456789abcdef"
+
+
+def _user_meta(user=USER, channel="telegram", session=SESSION, agent="main", **extra):
+    """requestMetadata as the bridge sends it from the user ID change on: no actor."""
+    meta = _meta(channel=channel, session=session, agent=agent, **extra)
+    del meta["openclaw.actor_id"]
+    if user is not None:
+        meta["openclaw.user_id"] = user
+    meta["openclaw.identity"] = "bound" if user else "unbound"
+    return meta
 
 
 def _rows(tm):
@@ -208,6 +223,67 @@ def test_log_id_is_a_digest_behind_a_plain_channel_word(tm, actor, prefix):
 
 def test_unbound_actor_is_logged_as_is(tm):
     assert tm.actor_log_id("default-user") == "default-user"
+
+
+def test_user_id_keys_the_row_and_no_actor_is_stored(tm):
+    tm.process_log_entry(_log(_user_meta(channel="whatsapp")))
+    key = (f"USER#{USER}", f"DATE#{DAY}#CHANNEL#whatsapp#SESSION#{SESSION}#AGENT#main")
+    assert list(_rows(tm)) == [key]
+    row = tm.table.items[key]
+    assert row["userId"] == USER
+    assert "actorId" not in row
+    assert (row["channel"], row["agentType"], row["attribution"]) == ("whatsapp", "main", "request-metadata")
+
+
+def test_dual_read_new_user_id_rows_and_older_bridge_actor_rows(tm):
+    """During a rollout old and new bridge images write side by side; each keeps its key."""
+    tm.process_log_entry(_log(_user_meta()))
+    tm.process_log_entry(_log(_meta(actor="telegram:1001")))
+    tm.process_log_entry(_log(_user_meta(agent="subagent")))
+    by_pk = {}
+    for (pk, _sk), row in tm.table.items.items():
+        by_pk.setdefault(pk, []).append(row)
+    assert set(by_pk) == {f"USER#{USER}", "USER#telegram:1001"}
+    assert all(row["userId"] == USER and "actorId" not in row for row in by_pk[f"USER#{USER}"])
+    assert len(by_pk[f"USER#{USER}"]) == 2
+    (legacy,) = by_pk["USER#telegram:1001"]
+    assert legacy["actorId"] == "telegram:1001" and "userId" not in legacy
+
+
+def test_user_id_wins_over_an_actor_in_the_same_record(tm):
+    tm.process_log_entry(_log(_meta(actor="whatsapp:15551234567", **{"openclaw.user_id": USER})))
+    (key,) = _rows(tm)
+    assert key[0] == f"USER#{USER}"
+    row = tm.table.items[key]
+    assert "actorId" not in row
+    assert "15551234567" not in repr(row)
+
+
+@pytest.mark.parametrize("bad", ["whatsapp:15551234567", "user_0123", "user_0123456789ABCDEF", "", 42, None])
+def test_a_malformed_user_id_falls_back_to_the_actor(tm, bad):
+    tm.process_log_entry(_log(_meta(actor="telegram:1001", **{"openclaw.user_id": bad})))
+    (key,) = _rows(tm)
+    assert key[0] == "USER#telegram:1001"
+
+
+def test_a_bridge_record_without_any_user_is_pooled_on_default_user_with_its_attribution(tm):
+    tm.process_log_entry(_log(_user_meta(user=None, agent="cron")))
+    (key,) = _rows(tm)
+    assert key == ("USER#default-user", f"DATE#{DAY}#CHANNEL#telegram#SESSION#{SESSION}#AGENT#cron")
+    row = tm.table.items[key]
+    assert row["actorId"] == "default-user"
+    assert row["attribution"] == "request-metadata"
+
+
+def test_user_id_records_are_logged_by_user_id_and_never_dimensioned(tm, caplog):
+    with caplog.at_level(logging.DEBUG):
+        result = tm.handler(_cwl_event(_log(_user_meta(channel="whatsapp"))), None)
+    assert result == {"processed": 1, "errors": 0, "total": 1}
+    messages = [r.getMessage() for r in caplog.records]
+    [line] = [m for m in messages if m.startswith("Processing invocation:")]
+    assert f" user={USER} channel=whatsapp " in line
+    data = [m for c in tm.cloudwatch.put_metric_data.call_args_list for m in c.kwargs["MetricData"]]
+    assert {d["Value"] for m in data for d in m["Dimensions"]} == {"whatsapp", "global.anthropic.claude-opus-5-5"}
 
 
 def test_handler_mixes_old_and_new_records_in_one_batch(tm):

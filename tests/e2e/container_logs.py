@@ -2,7 +2,8 @@
 
 The bridge ships the container's stdout/stderr to the CloudWatch log group
 ``/openclaw/container`` (bridge/cloudwatch-logger.js), one stream per
-container named ``<namespace>-<boot ms>``. The Gateway tool Lambdas log one
+container named ``<internal user ID>-<boot ms>`` (``<namespace>-<boot ms>``
+from bridge images before the user ID change). The Gateway tool Lambdas log one
 ``gateway_tool_call`` JSON line per invocation (lambda/gateway_tools/lib/mcp.js).
 
 These helpers let a test prove *how* a reply was produced, not just that a
@@ -44,21 +45,29 @@ def namespace(cfg: E2EConfig) -> str:
     return get_session_route(cfg).actor_id.replace(":", "_")
 
 
+def stream_prefixes(cfg: E2EConfig) -> List[str]:
+    """Container log stream name prefixes of the E2E user: user ID first, then the older namespace form."""
+    route = get_session_route(cfg)
+    return [f"{route.user_id}-", route.actor_id.replace(":", "_") + "-"]
+
+
 def _logs(cfg: E2EConfig):
     return boto3.client("logs", region_name=cfg.region)
 
 
 def latest_stream(cfg: E2EConfig) -> Optional[str]:
-    """Newest container log stream for the E2E user."""
-    resp = _logs(cfg).describe_log_streams(
-        logGroupName=CONTAINER_LOG_GROUP, logStreamNamePrefix=namespace(cfg) + "-",
-        orderBy="LogStreamName", descending=True, limit=10
-    )
-    ns = namespace(cfg)
-    for s in resp.get("logStreams", []):
-        if s["logStreamName"].startswith(ns):
-            return s["logStreamName"]
-    return None
+    """Newest container log stream for the E2E user, under either naming."""
+    newest = None
+    for prefix in stream_prefixes(cfg):
+        resp = _logs(cfg).describe_log_streams(
+            logGroupName=CONTAINER_LOG_GROUP, logStreamNamePrefix=prefix,
+            orderBy="LogStreamName", descending=True, limit=10
+        )
+        for s in resp.get("logStreams", []):
+            if s["logStreamName"].startswith(prefix) and (
+                    newest is None or s.get("creationTime", 0) > newest.get("creationTime", 0)):
+                newest = s
+    return newest["logStreamName"] if newest else None
 
 
 def stream_events(cfg: E2EConfig, stream: str, start_ms: Optional[int] = None) -> List[dict]:

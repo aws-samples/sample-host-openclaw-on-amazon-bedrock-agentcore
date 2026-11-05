@@ -76,8 +76,8 @@ The Router API Gateway HTTP API uses explicit routes — only three paths are ex
 | User allowlist | `registration_open=false` by default; new users require an `ALLOW#` record in DynamoDB |
 | DynamoDB identity table | `CHANNEL#`, `USER#`, `SESSION`, `BIND#`, `ALLOW#`, `CRON#` record types with composite key schema |
 | Cognito User Pool | Self-signup disabled (`self_sign_up_enabled=False`); users auto-provisioned by proxy via `AdminCreateUser`. Threat protection is opt-in via `cognito_advanced_security_mode` (`AUDIT` or `ENFORCED`, default `OFF`); enabling it moves the pool to the Plus feature plan, billed per monthly active user |
-| HMAC-derived passwords | `HMAC-SHA256(secret, actorId).slice(0, 32)` — deterministic, never stored or transmitted to end users |
-| Account recovery disabled | `AccountRecovery.NONE` — no password reset flows (passwords are derived, not chosen) |
+| Random per-user passwords | Generated with `crypto.randomBytes` and stored in one Secrets Manager secret per user, `openclaw/cognito-user/<poolId>/<namespace>`, read with the execution role (`bridge/cognito-token.js`); never sent to end users. Users created by the earlier HMAC derivation get one on their next authentication |
+| Account recovery disabled | `AccountRecovery.NONE` — no password reset flows (passwords are generated, not chosen) |
 | Cross-channel binding | Time-limited bind codes (10-min TTL in DynamoDB, one-time use). Binding bypasses allowlist since it links to an already-approved user |
 | JWT token caching | Per-user JWT cached with 60-second early refresh window |
 | Slack event deduplication | Each event's `event_id`, and its channel and message `ts`, are recorded in the identity table for 24 hours with a conditional put before anything is sent, so a Slack retry (`x-slack-retry-num`), or the `app_mention` and `message` events for one post, run once. A retry still runs if its first delivery was never handled |
@@ -584,6 +584,7 @@ aws logs start-query \
      --scan-index-forward false --limit 5 \
      --region $CDK_DEFAULT_REGION
    ```
+   Each row's `PK` is `USER#<user ID>` (`userId` attribute); rows written from older bridge images are `USER#<channel actor>` (`actorId`). `./scripts/manage-allowlist.sh whois user_<id>` lists the channel actors of a user ID.
 
 2. **Disable a user (per-user kill switch)** — Disable the registered user. This sets `USER#<user_id>/PROFILE.accessStatus = DISABLED` on the user the channel identity is bound to. From the next message, the router rejects turns on every channel linked to that user, and the cron Lambda stops their scheduled tasks. `enable` undoes it:
    ```bash

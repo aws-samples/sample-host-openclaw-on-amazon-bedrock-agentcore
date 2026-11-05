@@ -3,11 +3,13 @@
 Triggered by CloudWatch Logs subscription filter on /aws/bedrock/invocation-logs.
 For each invocation log entry:
   1. Extracts token counts (input/output), model ID
-  2. Extracts OpenClaw metadata (actor_id, session_id, channel, agent_type) from
-     the requestMetadata the bridge proxy sets on every Converse/ConverseStream call
+  2. Extracts OpenClaw metadata (user_id, session_id, channel, agent_type) from
+     the requestMetadata the bridge proxy sets on every Converse/ConverseStream call.
+     Bridge images before the user ID change send actor_id instead, which is still read.
   3. Computes estimated cost using model pricing lookup
-  4. Writes record to DynamoDB with composite keys for multi-access patterns
-  5. Publishes CloudWatch custom metrics by channel and model (never by actor)
+  4. Writes record to DynamoDB with composite keys for multi-access patterns:
+     USER#<internal user ID>, or USER#<actor> for records from older bridge images
+  5. Publishes CloudWatch custom metrics by channel and model (never by user)
 """
 
 import base64
@@ -157,6 +159,8 @@ def _int_field(source, *names) -> int:
 # only short identifier strings are accepted; anything else keeps the default.
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9:_@$#=/+,.-]{1,128}$")
 _SAFE_CHANNEL = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+# The internal user ID (lambda/shared/python/runtime_enrollment.py).
+_USER_ID = re.compile(r"^user_[0-9a-f]{16}$")
 AGENT_TYPES = ("main", "subagent", "cron")
 UNKNOWN_AGENT_TYPE = "unknown"
 UNBOUND_ACTOR = "default-user"
@@ -174,12 +178,13 @@ _LOG_CHANNEL = re.compile(r"^[a-z]{1,32}$")
 def actor_log_id(actor_id: str) -> str:
     """The actor as it appears in log lines: "<channel>:sha256:<12 hex digits>".
 
-    A WhatsApp actor ID is "whatsapp:<phone number>", so the ID itself is never
-    logged (the Router logs only the internal user ID for the same reason).
-    The digest is unkeyed, like the internal user ID (user_<sha256 prefix>).
-    It keeps the number out of the log, but it is a pseudonym: hashing a known
-    or guessed actor ID finds that actor's lines. The unbound default-user is
-    not personal and is logged as is.
+    Only records from bridge images before the user ID change carry an actor;
+    newer records are logged by internal user ID, as the Router and the bridge
+    log them. A WhatsApp actor ID is "whatsapp:<phone number>", so the ID
+    itself is never logged. The digest is unkeyed, like the internal user ID
+    (user_<sha256 prefix>). It keeps the number out of the log, but it is a
+    pseudonym: hashing a known or guessed actor ID finds that actor's lines.
+    The unbound default-user is not personal and is logged as is.
     """
     if actor_id == UNBOUND_ACTOR:
         return actor_id
@@ -199,17 +204,21 @@ def _as_dict(value) -> dict:
 
 
 def extract_openclaw_metadata(log_entry: dict) -> dict:
-    """Extract OpenClaw attribution (actor, session, channel, agent type) from a log entry.
+    """Extract OpenClaw attribution (user, session, channel, agent type) from a log entry.
 
     The bridge proxy sets Bedrock ``requestMetadata`` on every Converse /
     ConverseStream call (bridge/request-metadata.js) and Bedrock copies it into
-    the invocation log record. That is the authoritative source. Records
-    written before the proxy set it, or by any other caller, have none and keep
-    the explicit defaults: default-user / default-session / unknown, with
-    agent type "unknown". The older AgentCore-shaped fields are still read, but
-    only to fill values requestMetadata does not provide.
+    the invocation log record. That is the authoritative source. The user is
+    ``openclaw.user_id``, the internal user ID; bridge images before it send
+    ``openclaw.actor_id`` instead, which is read when there is no user ID.
+    ``user_id`` is then None and ``actor_id`` carries the actor. Records
+    written before the proxy set requestMetadata, or by any other caller, have
+    none and keep the explicit defaults: default-user / default-session /
+    unknown, with agent type "unknown". The older AgentCore-shaped fields are
+    still read, but only to fill values requestMetadata does not provide.
     """
     metadata = {
+        "user_id": None,
         "actor_id": UNBOUND_ACTOR,
         "session_id": "default-session",
         "channel": "unknown",
@@ -243,10 +252,17 @@ def extract_openclaw_metadata(log_entry: dict) -> dict:
         metadata["attribution"] = "legacy"
 
     request_metadata = _as_dict(log_entry.get("requestMetadata"))
-    if request_metadata.get("openclaw.actor_id") is not None:
-        fill(request_metadata.get("openclaw.actor_id"),
-             request_metadata.get("openclaw.session_id"),
-             request_metadata.get("openclaw.channel"))
+    # A bridge without a user ID omits openclaw.user_id but still sends the
+    # other openclaw.* keys, so any of them marks a bridge record.
+    if any(isinstance(key, str) and key.startswith("openclaw.") for key in request_metadata):
+        user_id = request_metadata.get("openclaw.user_id")
+        if isinstance(user_id, str) and _USER_ID.match(user_id):
+            metadata["user_id"] = user_id
+        else:
+            # Bridge images before the user ID change send the actor.
+            fill(actor=request_metadata.get("openclaw.actor_id"))
+        fill(session=request_metadata.get("openclaw.session_id"),
+             channel=request_metadata.get("openclaw.channel"))
         agent_type = request_metadata.get("openclaw.agent_type")
         metadata["agent_type"] = agent_type if agent_type in AGENT_TYPES else UNKNOWN_AGENT_TYPE
         metadata["attribution"] = "request-metadata"
@@ -265,8 +281,15 @@ def write_to_dynamodb(record: dict):
     the second sets GSI3SK from that total, conditional on the total being
     unchanged, so a concurrent writer that added more cost (and will set
     GSI3SK from its own, higher total) is never overwritten with a lower one.
+
+    A record with a user ID is keyed USER#<user ID> and stores userId; one from
+    an older bridge image is keyed USER#<actor> and stores actorId, as before.
+    The two never share a row, so a user's usage during a rollout is split
+    across both keys (scripts/delete_user_data.py deletes both).
     """
+    user_id = record.get("user_id")
     actor_id = record["actor_id"]
+    owner_attribute, owner = ("userId", user_id) if user_id else ("actorId", actor_id)
     session_id = record["session_id"]
     channel = record["channel"]
     model_id = record["model_id"]
@@ -280,7 +303,7 @@ def write_to_dynamodb(record: dict):
     sort_key = f"DATE#{date_str}#CHANNEL#{channel}#SESSION#{session_id}"
     if agent_type in AGENT_TYPES:
         sort_key += f"#AGENT#{agent_type}"
-    key = {"PK": f"USER#{actor_id}", "SK": sort_key}
+    key = {"PK": f"USER#{owner}", "SK": sort_key}
 
     response = table.update_item(
         Key=key,
@@ -291,7 +314,7 @@ def write_to_dynamodb(record: dict):
             # an existing row's GSI3SK is set from the total below.
             "GSI3PK = :g3pk, GSI3SK = if_not_exists(GSI3SK, :g3sk), "
             "channel = :channel, modelId = :model, "
-            "actorId = :actor, sessionId = :session, "
+            "#owner = :owner, sessionId = :session, "
             "agentType = :agent, attribution = :attribution, "
             "#ts = :ts, #ttl_attr = :ttl "
             "ADD inputTokens :inp, outputTokens :out, "
@@ -299,6 +322,7 @@ def write_to_dynamodb(record: dict):
             "estimatedCostUSD :cost"
         ),
         ExpressionAttributeNames={
+            "#owner": owner_attribute,
             "#ts": "timestamp",
             "#ttl_attr": "ttl",
         },
@@ -314,7 +338,7 @@ def write_to_dynamodb(record: dict):
             ":g3sk": cost_sort_key(cost),
             ":channel": channel,
             ":model": model_id,
-            ":actor": actor_id,
+            ":owner": owner,
             ":session": session_id,
             ":agent": agent_type,
             ":attribution": record.get("attribution", "none"),
@@ -347,10 +371,10 @@ def write_to_dynamodb(record: dict):
 def publish_metrics(record: dict):
     """Publish CloudWatch custom metrics by channel and model.
 
-    The actor ID is not a dimension: for WhatsApp it is the user's phone
-    number, CloudWatch keeps metric data for up to 15 months and cannot delete
-    it, and anyone allowed cloudwatch:ListMetrics can read dimension values.
-    Per-user totals are in DynamoDB.
+    Neither the user ID nor the actor ID is a dimension: an actor ID can be
+    the user's phone number, CloudWatch keeps metric data for up to 15 months
+    and cannot delete it, and anyone allowed cloudwatch:ListMetrics can read
+    dimension values. Per-user totals are in DynamoDB.
     """
     dimensions_base = [
         {"Name": "Channel", "Value": record["channel"]},
@@ -458,6 +482,7 @@ def process_log_entry(log_entry: dict):
                          cache_read_tokens, cache_write_tokens)
 
     record = {
+        "user_id": metadata["user_id"],
         "actor_id": metadata["actor_id"],
         "session_id": metadata["session_id"],
         "channel": metadata["channel"],
@@ -474,14 +499,17 @@ def process_log_entry(log_entry: dict):
         "date": date_str,
     }
 
+    # The internal user ID as is; an older bridge's actor only as a digest.
+    subject = (f"user={metadata['user_id']}" if metadata["user_id"]
+               else f"actor={actor_log_id(metadata['actor_id'])}")
     logger.info(
-        "Processing invocation: model=%s input=%d output=%d cost=$%.6f actor=%s channel=%s "
+        "Processing invocation: model=%s input=%d output=%d cost=$%.6f %s channel=%s "
         "agent=%s attribution=%s",
         model_id,
         input_tokens,
         output_tokens,
         cost,
-        actor_log_id(metadata["actor_id"]),
+        subject,
         metadata["channel"],
         metadata["agent_type"],
         metadata["attribution"],
