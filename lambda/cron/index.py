@@ -1230,6 +1230,22 @@ def verify_cron_event(event):
     if not actor_id.startswith(f"{channel}:"):
         return None, {"statusCode": 403, "body": "Channel identity verification failed"}
 
+    # Defence in depth on the delivery target. The eventbridge-cron skill is
+    # the enforcement point: it binds a schedule's channelTarget to the
+    # creating turn's own target. A CRON# record's channelTarget is otherwise
+    # agent-writable, so flag a schedule that delivers somewhere other than the
+    # actor's own channel user id. This is logged, not refused: Slack delivers
+    # to a channel id and Feishu to a chat id, both of which legitimately
+    # differ from the actor's user id, so refusing on a mismatch would break
+    # those channels and any pre-existing schedule.
+    actor_channel_user_id = actor_id.split(":", 1)[1] if ":" in actor_id else ""
+    if channel_target != actor_channel_user_id:
+        logger.warning(
+            "Scheduled task %s delivers to %s:%s, not the actor's own chat id; "
+            "verify the target was set by the owning conversation",
+            schedule_id, channel, channel_target,
+        )
+
     # Phase 1: Get or create session
     try:
         session_id = get_or_create_session(current_user_id)
