@@ -142,6 +142,7 @@ cron_stack = CronStack(
     feishu_token_secret_name=security_stack.channel_secrets["feishu"].secret_name,
     whatsapp_token_secret_name=WHATSAPP_SECRET_NAME,
     line_token_secret_name=LINE_SECRET_NAME,
+    discord_token_secret_name=DISCORD_SECRET_NAME,
     cmk_arn=security_stack.cmk.key_arn,
     agentcore_execution_role=agentcore_stack.execution_role,
     user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,

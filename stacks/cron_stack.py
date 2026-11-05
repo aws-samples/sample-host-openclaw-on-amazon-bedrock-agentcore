@@ -47,6 +47,7 @@ class CronStack(Stack):
         user_files_bucket_arn: str,
         whatsapp_token_secret_name: str = "",
         line_token_secret_name: str = "",
+        discord_token_secret_name: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -138,6 +139,7 @@ class CronStack(Stack):
                 "FEISHU_TOKEN_SECRET_ID": feishu_token_secret_name,
                 "WHATSAPP_TOKEN_SECRET_ID": whatsapp_token_secret_name,
                 "LINE_TOKEN_SECRET_ID": line_token_secret_name,
+                "DISCORD_TOKEN_SECRET_ID": discord_token_secret_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
                 "USER_FILES_BUCKET": user_files_bucket_name,
                 "CRON_ASYNC_STATE_MACHINE_ARN": state_machine_arn if cron_async else "",
@@ -276,6 +278,7 @@ class CronStack(Stack):
             feishu_token_secret_name,
             whatsapp_token_secret_name,
             line_token_secret_name,
+            discord_token_secret_name,
         ]
         cron_secret_resources = [
             f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-??????"

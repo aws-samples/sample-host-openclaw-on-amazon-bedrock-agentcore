@@ -83,6 +83,14 @@ def test_router_can_read_the_webhook_secret(base):
     assert any(iam_pattern_matches(p, _arn("openclaw/webhook-secret")) for p in patterns)
 
 
+def test_cron_can_read_the_discord_secret_for_scheduled_task_dms(base):
+    patterns = _secret_patterns(base, "cron")
+    assert any(iam_pattern_matches(p, _arn("openclaw/channels/discord")) for p in patterns)
+    fn = next(res for _, _, res in resources({"OpenClawCron": base["OpenClawCron"]}, "AWS::Lambda::Function")
+              if res["Properties"].get("FunctionName") == "openclaw-cron-executor")
+    assert fn["Properties"]["Environment"]["Variables"]["DISCORD_TOKEN_SECRET_ID"] == "openclaw/channels/discord"
+
+
 @pytest.mark.parametrize("which", sorted(_LAMBDA_ROLE_POLICIES))
 @pytest.mark.parametrize("name", [
     "openclaw/cognito-password-secret",

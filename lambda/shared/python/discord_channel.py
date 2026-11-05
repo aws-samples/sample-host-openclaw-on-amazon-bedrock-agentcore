@@ -1,10 +1,12 @@
-"""Discord Interactions (slash command) helpers for the Router Lambda.
+"""Discord helpers for the Router Lambda (slash commands) and the Cron Lambda (DMs).
 
 Discord delivers ordinary messages only over its Gateway websocket, which a
 Lambda cannot hold open. This channel uses the HTTP Interactions endpoint
 instead: users talk to the bot with the /ask slash command (in DMs and in
-servers). Stdlib only; Ed25519 verification uses the system OpenSSL
-(libcrypto), as the Feishu AES decrypt in the router already does.
+servers). Scheduled-task results have no interaction to answer, so the Cron
+Lambda DMs them with the bot token. Stdlib only; Ed25519 verification uses
+the system OpenSSL (libcrypto), as the Feishu AES decrypt in the router
+already does.
 
 The channel is disabled unless the ``openclaw/channels/discord`` secret is a
 JSON object with ``applicationId`` and ``publicKey``; the deploy-time
@@ -18,6 +20,7 @@ import logging
 import re
 import threading
 import time
+from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlparse
 
@@ -260,6 +263,134 @@ class _NoRedirect(urllib_request.HTTPRedirectHandler):
 
 _NO_REDIRECT_OPENER = urllib_request.build_opener(_NoRedirect)
 _CDN_HOSTS = ("cdn.discordapp.com", "media.discordapp.net")
+
+
+# ---------------------------------------------------------------------------
+# Outbound: DMs with the bot token (scheduled-task results from the Cron Lambda)
+# ---------------------------------------------------------------------------
+
+# Discord IDs as ASCII digits only; the DM channel ID goes into a URL path.
+_ASCII_ID_RE = re.compile(r"[0-9]{1,25}")
+# A 429 is retried once when Discord's retry_after is at most this long.
+MAX_RATE_LIMIT_WAIT_SECONDS = 5.0
+
+
+class DiscordAPIError(Exception):
+    """A bot API request failed: the HTTP status and Discord's error code (None if absent)."""
+
+    def __init__(self, status, code=None):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.code = code
+
+
+def parse_bot_token(raw):
+    """Return the secret's botToken, or "" when it is missing or not token-shaped."""
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    token = data.get("botToken") if isinstance(data, dict) else None
+    # fullmatch: no CR/LF can reach the Authorization header.
+    return token if isinstance(token, str) and _TOKEN_RE.fullmatch(token) else ""
+
+
+def _error_details(error):
+    """(Discord error code, retry_after seconds) from a failed response; None where absent."""
+    try:
+        body = json.loads(error.read(4096) or b"{}")
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    code = body.get("code")
+    if not isinstance(code, int) or isinstance(code, bool):
+        code = None
+    retry_after = body.get("retry_after")
+    if not isinstance(retry_after, (int, float)) or isinstance(retry_after, bool):
+        try:
+            retry_after = float(error.headers.get("Retry-After"))
+        except (AttributeError, TypeError, ValueError):
+            retry_after = None
+    if retry_after is not None and not 0 <= retry_after < float("inf"):
+        retry_after = None
+    return code, retry_after
+
+
+def _bot_request(bot_token, path, payload, timeout):
+    """POST one request as the bot and return its JSON object ({} if none).
+
+    Redirects are refused so the bot token is never sent to another host. A 429
+    is retried once after Discord's retry_after when that is short; any other
+    failure raises DiscordAPIError at once.
+    """
+    data = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT,
+               "Authorization": f"Bot {bot_token}"}
+    for attempt in (1, 2):
+        req = urllib_request.Request(f"{API_BASE}{path}", data=data, method="POST", headers=headers)
+        try:
+            with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
+                body = resp.read(65536)
+        except urllib_error.HTTPError as e:
+            code, retry_after = _error_details(e)
+            if (e.code == 429 and attempt == 1 and retry_after is not None
+                    and retry_after <= MAX_RATE_LIMIT_WAIT_SECONDS):
+                time.sleep(retry_after)
+                continue
+            raise DiscordAPIError(e.code, code) from None
+        try:
+            parsed = json.loads(body) if body else {}
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    raise DiscordAPIError(429)
+
+
+def send_dm(bot_token, user_id, text, timeout=10):
+    """DM text to a user as the bot. Returns True when all of it was sent.
+
+    Opens the user's DM channel (Discord returns the existing one), then posts
+    the text in MESSAGE_CHUNK_CHARS pieces with mentions disabled. Discord
+    answers 403 when the user shares no server with the bot or does not accept
+    DMs; that is logged and not retried. Logs carry the HTTP status and
+    Discord's error code only, never the text or the token.
+    """
+    recipient = str(user_id)
+    if not isinstance(bot_token, str) or not _TOKEN_RE.fullmatch(bot_token):
+        logger.error("Discord DM skipped: no usable bot token")
+        return False
+    if not _ASCII_ID_RE.fullmatch(recipient):
+        logger.error("Discord DM skipped: bad recipient")
+        return False
+    chunks = [chunk for chunk in split_text(text) if chunk.strip()]
+    if not chunks:
+        logger.info("Discord DM skipped: empty message")
+        return True
+    sent = 0
+    try:
+        channel_id = _bot_request(bot_token, "/users/@me/channels", {"recipient_id": recipient}, timeout).get("id")
+        if not isinstance(channel_id, str) or not _ASCII_ID_RE.fullmatch(channel_id):
+            logger.error("Discord DM failed: no DM channel ID in the response")
+            return False
+        for chunk in chunks:
+            _bot_request(bot_token, f"/channels/{channel_id}/messages",
+                         {"content": chunk, "allowed_mentions": {"parse": []}}, timeout)
+            sent += 1
+        return True
+    except DiscordAPIError as e:
+        if e.status == 403:
+            logger.error("Discord DM refused: status=403 code=%s "
+                         "(no shared server with the bot, or DMs turned off)", e.code)
+        else:
+            logger.error("Discord DM failed: status=%s code=%s after %d/%d messages",
+                         e.status, e.code, sent, len(chunks))
+        return False
+    except Exception as e:
+        logger.error("Discord DM failed: %s after %d/%d messages", type(e).__name__, sent, len(chunks))
+        return False
 
 
 def download_attachment(attachment, allowed_types, max_bytes, timeout=15):
