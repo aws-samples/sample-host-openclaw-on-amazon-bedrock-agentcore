@@ -113,6 +113,8 @@ Users can send photos alongside text messages. The system supports JPEG, PNG, GI
 
 **Telegram**: Photos use the `caption` field for text (not `text`). The Router Lambda checks both. The largest photo size in the `photo` array is used.
 
+**Telegram albums**: in a private chat, the photos of an album (up to 10 sent together) get one agent turn and one reply. Telegram sends each photo as its own update with a shared `media_group_id`, and the caption on one of them. The first update to arrive registers the album in the identity table (`DEDUP#telegram_album:<chat_id>:<media_group_id>` / `ALBUM`, which holds the photos' S3 keys and captions and expires after 1 hour) and starts the turn once no photo has arrived for 2 seconds, or 8 seconds after it arrived. The agent gets every photo in message order and the captions; a photo that could not be downloaded is mentioned in the message instead of getting its own error reply, and the caption of a video in the album still reaches the agent, with a note that the video cannot be read. A photo that arrives after the turn started gets its own turn, as a single photo does, and a redelivered update is dropped. Albums of files (documents) and albums in groups are not combined: each item is handled on its own (`lambda/router/telegram_album.py`).
+
 **Slack**: The bot requires the `files:read` OAuth scope to download file attachments. Without it, images are silently ignored and only text is processed.
 
 ## Cross-Channel Account Linking
