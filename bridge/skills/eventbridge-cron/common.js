@@ -353,8 +353,13 @@ function resolveScheduleDelivery(userId, { channel, channelTarget } = {}) {
   if (typeof target !== "string" || !target) {
     throw new Error("Schedule delivery target is unavailable");
   }
-  if (requested !== null && requested !== target) {
-    throw new Error("Schedule delivery target must be the current conversation's target");
+  if (requested !== null) {
+    if (typeof requested !== "string" || !requested) {
+      throw new Error("Schedule delivery target is unavailable");
+    }
+    if (requested !== target) {
+      throw new Error("Schedule delivery target must be the current conversation's target");
+    }
   }
   return {
     actorId: identity.actorId,
