@@ -161,6 +161,13 @@ describe("shouldSkip", () => {
     assert.ok(shouldSkip("workspace/AGENTS.md"));
   });
 
+  it("skips OpenClaw's onboarding file but keeps syncing the user's workspace files", () => {
+    assert.ok(shouldSkip("workspace/BOOTSTRAP.md"));
+    for (const file of ["USER.md", "SOUL.md", "IDENTITY.md", "MEMORY.md", "memory/2026-11-10.md", "notes/BOOTSTRAP.md"]) {
+      assert.equal(shouldSkip(`workspace/${file}`), false, `workspace/${file} must still sync`);
+    }
+  });
+
   // OpenClaw 2.0 SQLite state (agents/<id>/agent/openclaw-agent.sqlite, WAL mode)
   it("skips SQLite WAL/SHM/journal sidecars (only valid with the exact main-db bytes)", () => {
     assert.ok(shouldSkip("agents/main/agent/openclaw-agent.sqlite-wal"));
@@ -925,6 +932,26 @@ describe("restoreWorkspace seeds the upload hash cache", () => {
     fs.writeFileSync(path.join(tmpDir, ".openclaw", "workspace", "BROKEN.md"), "x");
     await workspaceSync.saveWorkspace("telegram_1");
     assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/BROKEN.md"]);
+  });
+
+  it("restores the user's workspace files but not BOOTSTRAP.md, and never uploads BOOTSTRAP.md", async () => {
+    objects["telegram_1/.openclaw/workspace/USER.md"] = "user v1\n";
+    objects["telegram_1/.openclaw/workspace/BOOTSTRAP.md"] = "bootstrap from an earlier session\n";
+    const r = await workspaceSync.restoreWorkspace("telegram_1");
+    assert.equal(r.restored, 3, "SOUL.md, runtime-skills.json and USER.md");
+    const ws = path.join(tmpDir, ".openclaw", "workspace");
+    assert.equal(fs.readFileSync(path.join(ws, "USER.md"), "utf8"), "user v1\n");
+    assert.equal(fs.existsSync(path.join(ws, "BOOTSTRAP.md")), false);
+
+    // A BOOTSTRAP.md written during the session stays local; other changes are saved.
+    fs.writeFileSync(path.join(ws, "BOOTSTRAP.md"), "written in this session\n");
+    fs.writeFileSync(path.join(ws, "USER.md"), "user v2\n");
+    await workspaceSync.saveWorkspace("telegram_1");
+    assert.deepEqual(puts.map((p) => p.input.Key), ["telegram_1/.openclaw/workspace/USER.md"]);
+    assert.equal(await workspaceSync.saveFile("telegram_1", "workspace/BOOTSTRAP.md"), false);
+    assert.equal(puts.length, 1);
+    // The earlier S3 copy is left alone (deletes are never propagated).
+    assert.equal(objects["telegram_1/.openclaw/workspace/BOOTSTRAP.md"], "bootstrap from an earlier session\n");
   });
 
   // --- fill-missing restore (session-storage mount already had SOME state) ---

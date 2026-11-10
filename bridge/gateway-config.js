@@ -56,6 +56,11 @@ function renderConfig({ gatewayToken } = {}) {
         sandbox: {
           mode: "off", // No Docker in AgentCore container; microVMs provide isolation
         },
+        // OpenClaw's workspace bootstrap files are not added to the system prompt;
+        // the proxy adds the operator-managed workspace files. skipBootstrap keeps
+        // OpenClaw from seeding its onboarding templates.
+        contextInjection: "never",
+        skipBootstrap: true,
       },
     },
     tools: {

@@ -22,6 +22,7 @@ AgentCore Runtime V2 is available in `us-east-1`, `us-east-2`, `us-west-2`, `eu-
 - [Per-user daily cost limit](#per-user-daily-cost-limit)
 - [Channel Setup](#channel-setup)
 - [Operations](#operations)
+- [Upgrading: OpenClaw's workspace files are no longer in the system prompt](#upgrading-openclaws-workspace-files-are-no-longer-in-the-system-prompt)
 - [Upgrading: budget alarms are now hourly and daily](#upgrading-budget-alarms-are-now-hourly-and-daily)
 - [Upgrading from OpenClaw 2026.3.x](#upgrading-from-openclaw-20263x)
 - [Troubleshooting](#troubleshooting)
@@ -456,6 +457,10 @@ Operator commands are in [docs/operations.md](docs/operations.md):
 - Scheduled tasks: [delivery, deadlines and failures](docs/how-it-works.md#delivery-deadlines-and-failures) and the [brief audio marker](docs/how-it-works.md#brief-audio) for prompt authors
 - Token usage, cost estimates and budget alarms: [Token Usage Tracking](docs/how-it-works.md#token-usage-tracking)
 - DynamoDB tables have deletion protection and `RETAIN`; for accounts with automated cleanup of untagged resources, set `table_tags` (see [Configuration](#configuration))
+
+## Upgrading: OpenClaw's workspace files are no longer in the system prompt
+
+The bridge now sets `agents.defaults.contextInjection: "never"` and `skipBootstrap: true` (`bridge/gateway-config.js`). OpenClaw no longer adds its workspace files (`SOUL.md`, `USER.md`, `IDENTITY.md`, `MEMORY.md` and its `AGENTS.md` template under `~/.openclaw/workspace/`) to the system prompt, so replies stop following them automatically; the proxy's operator-managed files from `_system/<namespace>/` are used instead. The files stay in the workspace and in S3, and the agent can still read them when asked. OpenClaw no longer seeds its onboarding templates, and `BOOTSTRAP.md` is no longer backed up or restored. An existing user gets this when their saved route moves to a release built with this image; the proxy logs `[proxy] OpenClaw workspace files in system prompt: no` at the first request.
 
 ## Upgrading: budget alarms are now hourly and daily
 

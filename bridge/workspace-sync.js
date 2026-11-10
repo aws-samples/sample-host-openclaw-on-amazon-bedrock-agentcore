@@ -54,6 +54,10 @@ const SKIP_PATTERNS = [
   "openclaw.json",
   "AGENTS.md",
   "workspace/AGENTS.md",
+  // OpenClaw's onboarding file. The gateway config sets skipBootstrap, so OpenClaw
+  // no longer seeds it. It is not backed up, and an existing S3 copy (deletes are
+  // never propagated) is not restored.
+  "workspace/BOOTSTRAP.md",
   // Security: exclude files that commonly contain secrets
   ".env",
   ".secrets/",

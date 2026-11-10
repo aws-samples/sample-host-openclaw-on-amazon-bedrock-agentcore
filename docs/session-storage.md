@@ -94,7 +94,9 @@ The whole state dir therefore lives on local disk and the mount holds a mirror o
 Workspace files persist as of the last watcher flush (seconds after the change). Everything else
 persists as of the last mirror: on a graceful stop that is the moment of shutdown, on an ungraceful
 one up to `STATE_MIRROR_INTERVAL_MS` (5 min) earlier.
-`openclaw.json` and `AGENTS.md` are still regenerated on every init. A 1.x state dir left on the mount
+`openclaw.json` and `AGENTS.md` are still regenerated on every init. `workspace/BOOTSTRAP.md`, OpenClaw's
+onboarding file, is neither mirrored nor restored, and the S3 backup skips it too: the gateway config sets
+`agents.defaults.skipBootstrap`, so OpenClaw no longer seeds it. A 1.x state dir left on the mount
 (plain `agents/<id>/sessions/sessions.json`) is restored the same way and then imported by
 `openclaw doctor --fix` — see [openclaw-2.0-upgrade.md](openclaw-2.0-upgrade.md). Files the mount
 holds from a *previous* layout (the whole state dir symlinked onto the mount, or only `workspace/`
