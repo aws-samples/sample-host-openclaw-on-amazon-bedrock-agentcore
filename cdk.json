@@ -46,6 +46,8 @@
     "cron_lambda_timeout_seconds": 900,
     "cron_lambda_memory_mb": 256,
     "cron_reserved_concurrency": 0,
+    "cron_target_check": "refuse",
+    "cron_legacy_records": "read",
     "token_metrics_reserved_concurrency": 0,
     "enable_cloudtrail": false,
     "cognito_advanced_security_mode": "OFF",
