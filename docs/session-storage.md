@@ -179,6 +179,14 @@ before. Doctor's own archive of the imported files, `agents/<id>/session-sqlite-
 excluded from the backup: S3 already holds the originals, and uploading the archive would double
 the small-file restore time of every cold start.
 
+Doctor also keeps a full copy of each database it upgrades, next to it:
+`<db>.pre-startup-migration-<run id>.bak` (or `.scoped.bak`), for example when OpenClaw 2026.11.2
+upgrades a user's 2026.9.5 state on their first activation. Neither the mirror nor the S3 backup
+carries these copies (`isDoctorMigrationBackup` in `bridge/state-storage.js`). Each is as large as
+the database it saved, and the versioned bucket already keeps the pre-upgrade database versions
+(noncurrent versions expire after 30 days). The copies stay on the container's local disk. The rule
+matches only that name, so a user's own `*.bak` files are backed up as usual.
+
 The same never-delete rule resurrects every other pre-2.0 file doctor retired (`workspace-state.json`,
 `auth-profiles.json`, `exec-approvals.json`, the imported `.jsonl` transcripts, …) on each restore —
 both the cold-start restore and the fill-missing restore of a same-session restart — and the 2.0

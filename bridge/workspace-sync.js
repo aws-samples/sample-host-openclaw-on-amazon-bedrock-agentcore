@@ -72,6 +72,8 @@ const SKIP_PATTERNS = [
   // OpenClaw gateway lock files. SQLite-named but hold no state; snapshotting
   // them fails ("not an error") on every save and they must never be restored.
   "*.lock.sqlite",
+  // Doctor's pre-migration database copies (`*.pre-startup-migration-*.bak`)
+  // are skipped by name in shouldSkip(); these patterns have no "contains" form.
   // Rotated config backups written by `openclaw doctor` — regenerated, never restored.
   "openclaw.json.bak",
   "*.json.bak.1",
@@ -277,6 +279,9 @@ function detectCredentials(content) {
  * Check if a relative path matches any skip pattern.
  */
 function shouldSkip(relativePath) {
+  // `openclaw doctor --fix`'s full copy of each database it upgraded; the S3
+  // versions of the pre-upgrade databases are the rollback copy (state-storage.js).
+  if (stateStorage.isDoctorMigrationBackup(relativePath)) return true;
   for (const pattern of SKIP_PATTERNS) {
     if (pattern.endsWith("/")) {
       // Directory pattern

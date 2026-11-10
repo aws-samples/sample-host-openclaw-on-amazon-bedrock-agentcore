@@ -183,6 +183,23 @@ describe("shouldSkip", () => {
     assert.ok(shouldSkip("openclaw.json.bak.1"));
     assert.ok(shouldSkip("openclaw.json.bak.4"));
   });
+
+  it("skips doctor's pre-migration database copies, and no other .bak file", () => {
+    const run = "f26e9ccd-df42-8bba-8cfc-d7457c5550bd";
+    assert.ok(shouldSkip(`agents/main/agent/openclaw-agent.sqlite.pre-startup-migration-${run}.bak`));
+    assert.ok(shouldSkip(`state/openclaw.sqlite.pre-startup-migration-${run}.bak`));
+    assert.ok(shouldSkip(`state/openclaw.sqlite.pre-startup-migration-${run}.scoped.bak`));
+    for (const rel of [
+      "notes.bak",
+      "workspace/notes.bak",
+      "workspace/report.docx.bak",
+      "workspace/pre-startup-migration-notes.bak",
+      `workspace/x.pre-startup-migration-${run}.bak.txt`,
+      `workspace/a.pre-startup-migration-${run}.bak/notes.md`,
+    ]) {
+      assert.equal(shouldSkip(rel), false, rel);
+    }
+  });
 });
 
 // --- snapshotSqlite ---
@@ -1334,6 +1351,13 @@ describe("change-driven backup", () => {
       }
     });
 
+    it("drops doctor's pre-migration database copies and keeps a user's own .bak", () => {
+      const run = "f26e9ccd-df42-8bba-8cfc-d7457c5550bd";
+      assert.equal(workspaceSync.changeTarget(`agents/main/agent/openclaw-agent.sqlite.pre-startup-migration-${run}.bak`), null);
+      assert.equal(workspaceSync.changeTarget(`state/openclaw.sqlite.pre-startup-migration-${run}.scoped.bak`), null);
+      assert.equal(workspaceSync.changeTarget("workspace/notes.bak"), "workspace/notes.bak");
+    });
+
     it("refuses paths that escape the state dir", () => {
       assert.equal(workspaceSync.changeTarget("../outside.json"), null);
       assert.equal(workspaceSync.changeTarget("/etc/passwd"), null);
@@ -2210,6 +2234,68 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
     assert.equal(workspaceSync.DEFAULT_LARGE_SQLITE_MIN_INTERVAL_MS, 10 * 60 * 1000);
     workspaceSync.startChangeBackup(NS, { debounceMs: 10, maxWaitMs: 100, sqliteMinIntervalMs: 90_000, largeSqliteMinIntervalMs: 1_000 });
     assert.ok(logs.some((l) => /databases over 65536 bytes at most every 90s, gzip'd/.test(l)), logs.join("\n"));
+  });
+
+  // `openclaw doctor --fix` keeps a full copy of each database it upgrades
+  // (OpenClaw 2026.11.2 upgrading 2026.9.5 state). Without the name rule, a copy
+  // over the plain-file cap logged "Skipping" on every save, and a smaller one
+  // was uploaded once and restored on every cold start.
+  const RUN = "f26e9ccd-df42-8bba-8cfc-d7457c5550bd";
+  const BIG_COPY = `agents/main/agent/openclaw-agent.sqlite.pre-startup-migration-${RUN}.bak`;
+  const SMALL_COPY = `state/openclaw.sqlite.pre-startup-migration-${RUN}.bak`;
+  function writeLocal(rel, bytes) {
+    const file = path.join(tmpDir, ".openclaw", rel);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, bytes);
+  }
+
+  it("a full save leaves doctor's pre-migration copies out without a Skipping warning; a user's own .bak takes the normal path", async () => {
+    writeLocal(BIG_COPY, Buffer.alloc(LIMITS.maxFileSize + 1024, 1));
+    writeLocal(SMALL_COPY, Buffer.alloc(1024, 2));
+    writeLocal("workspace/notes.bak", "mine");
+    writeLocal("workspace/export.bak", Buffer.alloc(LIMITS.maxFileSize + 1024, 3));
+
+    await workspaceSync.saveWorkspace(NS);
+
+    assert.deepEqual(Object.keys(s3.objects), [`${NS}/.openclaw/workspace/notes.bak`], "only the user's small .bak is uploaded");
+    assert.deepEqual(s3.calls, ["put"]);
+    assert.deepEqual(warnings.filter((w) => /pre-startup-migration/.test(w)), [], warnings.join("\n"));
+    // The control: the user's own .bak over the cap still gets the usual warning.
+    assert.equal(warnings.filter((w) => /Skipping workspace\/export\.bak \(\d+ bytes > 65536\)/.test(w)).length, 1, warnings.join("\n"));
+    assert.ok(fs.existsSync(path.join(tmpDir, ".openclaw", BIG_COPY)), "the copies stay on local disk");
+    assert.ok(fs.existsSync(path.join(tmpDir, ".openclaw", SMALL_COPY)));
+  });
+
+  it("the change backup ignores doctor's pre-migration copies, also on a full sweep", async () => {
+    writeLocal(BIG_COPY, Buffer.alloc(LIMITS.maxFileSize + 1024, 1));
+    writeLocal(SMALL_COPY, Buffer.alloc(1024, 2));
+    workspaceSync.startChangeBackup(NS, { debounceMs: 10, maxWaitMs: 100, sqliteMinIntervalMs: 0 });
+    workspaceSync.markChanged(BIG_COPY);
+    workspaceSync.markChanged(SMALL_COPY);
+    workspaceSync.markChanged(null); // an fs.watch event without a file name sweeps the whole state dir
+    const r = await workspaceSync.flushPendingSaves("test");
+    assert.equal(r.uploaded, 0);
+    assert.equal(r.skipped, 0);
+    assert.deepEqual(s3.calls, []);
+    assert.deepEqual(warnings.filter((w) => /Skipping|pre-startup-migration/.test(w)), [], warnings.join("\n"));
+  });
+
+  it("a restore leaves a pre-migration copy that is already in S3 alone: not downloaded, not deleted", async () => {
+    const copyKey = `${NS}/.openclaw/${SMALL_COPY}`;
+    const notesKey = `${NS}/.openclaw/workspace/notes.bak`;
+    s3.objects[copyKey] = Buffer.alloc(1024, 2);
+    s3.metadata[copyKey] = { sha256: sha256(s3.objects[copyKey]) };
+    s3.objects[notesKey] = Buffer.from("mine");
+    s3.metadata[notesKey] = { sha256: sha256("mine") };
+
+    const fresh = freshModule();
+    const r = await fresh.restoreWorkspace(NS);
+
+    assert.deepEqual(r, { restored: 1, kept: 0, keptUnchanged: 0, failed: 0, hadState: true });
+    assert.deepEqual(s3.calls, ["list", "get"], "one download, for the user's file");
+    assert.equal(fs.readFileSync(path.join(tmpDir, ".openclaw", "workspace", "notes.bak"), "utf8"), "mine");
+    assert.equal(fs.existsSync(path.join(tmpDir, ".openclaw", SMALL_COPY)), false);
+    assert.ok(copyKey in s3.objects, "the S3 object is untouched");
   });
 });
 

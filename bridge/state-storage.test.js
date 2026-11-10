@@ -89,6 +89,29 @@ describe("state-storage path helpers", () => {
     }
   });
 
+  it("isDoctorMigrationBackup matches doctor's pre-migration database copies by file name, not other .bak files", () => {
+    const run = "f26e9ccd-df42-8bba-8cfc-d7457c5550bd";
+    for (const f of [
+      `agents/main/agent/openclaw-agent.sqlite.pre-startup-migration-${run}.bak`,
+      `state/openclaw.sqlite.pre-startup-migration-${run}.bak`,
+      `state/openclaw.sqlite.pre-startup-migration-${run}.scoped.bak`,
+    ]) {
+      assert.equal(storage.isDoctorMigrationBackup(f), true, f);
+      assert.equal(storage.isTransientFile(f), true, `${f} is never mirrored or restored`);
+    }
+    for (const f of [
+      "workspace/notes.bak",
+      "workspace/report.docx.bak",
+      "workspace/pre-startup-migration-notes.bak",
+      `workspace/x.pre-startup-migration-${run}.bak.txt`,
+      `workspace/a.pre-startup-migration-${run}.bak/notes.md`,
+      "agents/main/agent/openclaw-agent.sqlite",
+    ]) {
+      assert.equal(storage.isDoctorMigrationBackup(f), false, f);
+      assert.equal(storage.isTransientFile(f), false, f);
+    }
+  });
+
   it("isWorkspacePath matches only the workspace subtree", () => {
     assert.equal(storage.isWorkspacePath("workspace"), true);
     assert.equal(storage.isWorkspacePath("workspace/memory/2026.md"), true);
@@ -262,6 +285,40 @@ describe("mirrorStateDir / restoreStateDir", () => {
     assert.equal(fs.existsSync(path.join(mountState, "state/openclaw.sqlite-wal")), false);
     assert.equal(fs.readFileSync(path.join(mountState, "workspace/memory.md"), "utf8"), "m");
     assert.equal(r.pruned, 0);
+  });
+
+  it("leaves doctor's pre-migration database copies off the mount and still mirrors a user's own .bak", async () => {
+    const run = "f26e9ccd-df42-8bba-8cfc-d7457c5550bd";
+    const copies = [
+      `agents/main/agent/openclaw-agent.sqlite.pre-startup-migration-${run}.bak`,
+      `state/openclaw.sqlite.pre-startup-migration-${run}.bak`,
+    ];
+    for (const rel of copies) write(path.join(stateDir, rel), "copy of a 2026.9.5 database");
+    write(path.join(stateDir, "workspace/notes.bak"), "mine");
+    const r = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log: quietLog, sqlite: null });
+    assert.equal(r.files, 1);
+    for (const rel of copies) {
+      assert.equal(fs.existsSync(path.join(mountState, rel)), false, `${rel} is not on the mount`);
+      assert.equal(fs.existsSync(path.join(stateDir, rel)), true, `${rel} stays on local disk`);
+    }
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/notes.bak"), "utf8"), "mine");
+
+    // The workspace watcher's mirror applies the same name rule.
+    write(path.join(stateDir, `workspace/memory.sqlite.pre-startup-migration-${run}.bak`), "copy");
+    write(path.join(stateDir, "workspace/draft.bak"), "draft");
+    storage.mirrorWorkspaceDir({ stateDir, mountStateDir: mountState, log: quietLog });
+    assert.equal(fs.existsSync(path.join(mountState, `workspace/memory.sqlite.pre-startup-migration-${run}.bak`)), false);
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/draft.bak"), "utf8"), "draft");
+  });
+
+  it("does not restore a doctor pre-migration copy from the mount, and restores a user's own .bak", () => {
+    const copy = "state/openclaw.sqlite.pre-startup-migration-f26e9ccd-df42-8bba-8cfc-d7457c5550bd.bak";
+    write(path.join(mountState, copy), "copy");
+    write(path.join(mountState, "workspace/notes.bak"), "mine");
+    const r = storage.restoreStateDir({ stateDir, mountStateDir: mountState, log: quietLog });
+    assert.deepEqual(r, { files: 0, workspaceFiles: 1, skipped: 0 });
+    assert.equal(fs.existsSync(path.join(stateDir, copy)), false);
+    assert.equal(fs.readFileSync(path.join(stateDir, "workspace/notes.bak"), "utf8"), "mine");
   });
 
   it("prunes mirror files deleted locally (consumed legacy sessions.json does not come back)", async () => {

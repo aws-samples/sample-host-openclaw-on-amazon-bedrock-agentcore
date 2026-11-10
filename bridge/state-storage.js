@@ -92,11 +92,25 @@ function getNodeSqlite() {
   return _nodeSqlite;
 }
 
+// `openclaw doctor --fix` keeps a full copy of each SQLite database it upgrades
+// next to it: `<db>.pre-startup-migration-<run id>.bak` (or `.scoped.bak`), for
+// example when OpenClaw 2026.11.2 upgrades a 2026.9.5 state dir. A copy is as
+// large as the database it saved, and S3 versioning already keeps the
+// pre-upgrade database versions for rollback, so neither the mirror nor the S3
+// backup (workspace-sync.js) carries them; they stay on the container's local
+// disk. Same name rule as OpenClaw's own recovery inventory. It looks at the
+// file name only, so a user's own `*.bak` files are mirrored and backed up.
+const DOCTOR_MIGRATION_BACKUP_RE = /^.+\.pre-startup-migration-.+\.bak$/;
+
+function isDoctorMigrationBackup(relativePath) {
+  return DOCTOR_MIGRATION_BACKUP_RE.test(path.basename(relativePath));
+}
+
 /**
  * Files that are only meaningful next to the exact live database bytes they
  * were written against (SQLite sidecars), in-flight snapshot staging files,
- * our own atomic-copy temp files, lock files and logs. Never mirrored, never
- * restored.
+ * our own atomic-copy temp files, lock files, logs, and doctor's pre-migration
+ * database copies (above). Never mirrored, never restored.
  */
 function isTransientFile(relativePath) {
   const name = path.basename(relativePath);
@@ -105,7 +119,8 @@ function isTransientFile(relativePath) {
     /\.tmp-\d+$/.test(name) ||
     name.endsWith(".lock") ||
     name.endsWith(".lock.sqlite") ||
-    name.endsWith(".log")
+    name.endsWith(".log") ||
+    isDoctorMigrationBackup(name)
   );
 }
 
@@ -840,6 +855,7 @@ module.exports = {
   _resetMirrorMemo: () => _mirrored.clear(),
   walkFiles,
   isTransientFile,
+  isDoctorMigrationBackup,
   isTransientDir,
   isWorkspacePath,
   getNodeSqlite,
