@@ -38,7 +38,7 @@ The live seed has been removed from the bridge. It used to be available for benc
 
 Restore failure, partial failure or timeout blocks activation and uploads. Credentials and gateway/Browser readiness are checked before dispatch. SQLite stays on local disk, mirrored to session storage and backed up to S3; never open its databases directly on the mount. See [state storage](session-storage.md) and [runtime behavior](how-it-works.md).
 
-OpenClaw `2026.9.5` keeps its generated Runtime metadata in system messages while Guardrails assess user input. Preserve this boundary when changing providers. Source patches verify package versions and exact hashes; upgrades require rechecking patches, initialization boundaries and tests. See [Guardrails](guardrails.md).
+OpenClaw `2026.11.2` sends its generated runtime context (date and time, sub-agent status, interrupted inputs, child results) as a user message after the user's own message, and Guardrails input assessment now covers that message in the latest user turn as well. This is a wider check than on 2026.9.5, where the metadata stayed in system messages; nothing is exempted based on content. Source patches verify package versions and exact hashes; upgrades require rechecking patches, initialization boundaries and tests. A returning user's state written by 2026.9.5 is upgraded once with `openclaw doctor --fix` before activation (`bridge/state-schema.js`); the upgraded databases cannot be opened by 2026.9.5 again. See [Guardrails](guardrails.md).
 
 ### Model and API contract
 

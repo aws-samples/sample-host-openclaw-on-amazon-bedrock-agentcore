@@ -175,14 +175,13 @@ describe("proxy system text conversion", () => {
     const snapshot = structuredClone(messages);
     const { bedrockMessages, systemText } = convertMessages(messages);
     assert.equal(systemText, "Follow the rules.\nRuntime: generated metadata");
+    // Consecutive user messages share one Bedrock message (Converse needs alternating roles).
     assert.deepEqual(bedrockMessages, [
-      { role: "user", content: [{ text: userText }] },
-      { role: "user", content: userBlocks.map((text) => ({ text })) },
+      { role: "user", content: [{ text: userText }, ...userBlocks.map((text) => ({ text }))] },
     ]);
     const scoped = scopeGuardrailToLatestUserTurn(bedrockMessages);
     assert.deepEqual(scoped, [
-      { role: "user", content: [{ guardContent: { text: { text: userText } } }] },
-      { role: "user", content: userBlocks.map((text) => ({ guardContent: { text: { text } } })) },
+      { role: "user", content: [userText, ...userBlocks].map((text) => ({ guardContent: { text: { text } } })) },
     ]);
     assert.deepEqual(messages, snapshot);
   });

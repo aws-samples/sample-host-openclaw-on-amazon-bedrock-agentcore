@@ -52,8 +52,8 @@ describe("pinned build patch guards", () => {
 
   it("rejects unknown versions and malformed metadata before touching source", (t) => {
     for (const manifest of [
-      { name: "openclaw", version: "2026.9.6" }, { name: "other", version: OPENCLAW_VERSION },
-      { name: "openclaw", version: 2026.95 }, {}, null,
+      { name: "openclaw", version: "2026.9.5" }, { name: "other", version: OPENCLAW_VERSION },
+      { name: "openclaw", version: 2026.112 }, {}, null,
     ]) {
       refusesWithoutWriting(t, packageCopy(t, {}, manifest), /Expected OpenClaw package version/);
     }
@@ -65,7 +65,7 @@ describe("pinned build patch guards", () => {
 
 const packageDir = process.env.OPENCLAW_PACKAGE_DIR;
 describe("actual pinned OpenClaw source (offline)", {
-  skip: packageDir ? false : "Set OPENCLAW_PACKAGE_DIR to the unmodified OpenClaw 2026.9.5 package.",
+  skip: packageDir ? false : "Set OPENCLAW_PACKAGE_DIR to the unmodified OpenClaw 2026.11.2 package.",
 }, () => {
   let originals, manifest;
   before(() => {
@@ -149,20 +149,31 @@ describe("actual pinned OpenClaw source (offline)", {
   it("rejects changed versions even for fully patched source", (t) => {
     const root = packageCopy(t, originals);
     patchPackage(root);
-    fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "openclaw", version: "2026.10.0" }));
+    fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "openclaw", version: "2026.11.5" }));
     refusesWithoutWriting(t, root, /Expected OpenClaw package version/);
   });
+
+  // The launcher's entry block, balanced: 2026.11.2 nests it inside runLauncher().
+  function launcherEntryBlock(source) {
+    const marker = "if (!waitingForCompileCacheRespawn) {";
+    const start = source.lastIndexOf(marker);
+    assert.ok(start > 0);
+    let depth = 0;
+    for (let index = start + marker.length - 1; index < source.length; index += 1) {
+      if (source[index] === "{") depth += 1;
+      else if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+    }
+    return assert.fail("Unbalanced launcher entry block.");
+  }
 
   function launcherHarness({ optIn = "1", env, prepare = async () => {}, entry = async () => true } = {}) {
     const calls = [];
     const source = originals[LAUNCHER_FILE].toString("utf8");
-    const start = source.lastIndexOf("if (!waitingForCompileCacheRespawn) {");
-    assert.ok(start > 0);
-    // Evaluate the preload entry and original launcher tail with imports stubbed.
+    // Evaluate the preload entry and original launcher entry block with imports stubbed.
     const preloader = fs.readFileSync(path.join(__dirname, "openclaw-preinit.mjs"), "utf8");
     const preloadStart = preloader.lastIndexOf('\nif (process.env.OPENCLAW_AGENTCORE_PREINIT === "1") {');
     assert.ok(preloadStart > 0);
-    const body = preloader.slice(preloadStart) + source.slice(start);
+    const body = preloader.slice(preloadStart) + launcherEntryBlock(source);
     const dependencies = {
       waitingForCompileCacheRespawn: false,
       isHelpFastPathDisabled: () => true,
@@ -268,6 +279,14 @@ describe("actual pinned OpenClaw source (offline)", {
     assert.deepEqual(descendant.calls, ["warning-filter", "./dist/entry.js"]);
   });
 
+  function pinnedRegion(file, name) {
+    const source = fs.readFileSync(path.join(packageDir, file), "utf8");
+    const start = source.indexOf(`//#region ${name}\n`);
+    const end = source.indexOf("//#endregion", start);
+    assert.ok(start >= 0 && end > start, `Pinned source must define region ${name}.`);
+    return source.slice(start, end);
+  }
+
   function pinnedFunction(file, name) {
     const source = fs.readFileSync(path.join(packageDir, file), "utf8");
     const match = source.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^\\}`, "m"));
@@ -289,20 +308,22 @@ describe("actual pinned OpenClaw source (offline)", {
     };
     const before = structuredClone(env);
     const functions = [
-      pinnedFunction("dist/openclaw-exec-env-Cc7ECPuD.mjs", "ensureOpenClawExecMarkerOnProcess"),
-      pinnedFunction("dist/env-CZ7wtIBj.mjs", "normalizeZaiEnv"),
-      pinnedFunction("dist/env-CZ7wtIBj.mjs", "normalizeEnv"),
+      pinnedFunction("dist/openclaw-exec-env-eyUZROLC.mjs", "ensureOpenClawExecMarkerOnProcess"),
+      pinnedRegion("dist/fs-safe-env-wxBiM84C.mjs", "src/infra/fs-safe-env.ts"),
+      pinnedFunction("dist/env-DbG527wb.mjs", "normalizeZaiEnv"),
+      pinnedFunction("dist/env-DbG527wb.mjs", "normalizeEnv"),
     ].join("\n");
     vm.compileFunction(`${functions}
       ensureOpenClawExecMarkerOnProcess();
       normalizeEnv();`, ["process", "OPENCLAW_CLI_ENV_VAR", "CLI_ENV_VALUE"])(
-      { env }, "OPENCLAW_CLI", "1");
+      { env, emitWarning: () => assert.fail("The bridge environment carries no legacy fs-safe selector.") },
+      "OPENCLAW_CLI", "1");
     // Normal CLI startup intentionally adds a marker after the preinit barrier.
     assert.deepEqual(env, { ...before, OPENCLAW_CLI: "1" });
     assert.equal(Object.hasOwn(env, "ZAI_API_KEY"), false);
   });
 
-  it("the pinned entry cannot plan an environment or compile-cache respawn for the prepared package", () => {
+  it("the pinned entry cannot plan an environment or compile-cache respawn for the prepared package", async () => {
     const packageRoot = "/usr/local/lib/node_modules/openclaw";
     const child = {
       argv: ["node", `${packageRoot}/openclaw.mjs`, "gateway", "run", "--port", "18789", "--verbose"],
@@ -310,29 +331,33 @@ describe("actual pinned OpenClaw source (offline)", {
       execArgv: [], execPath: "/usr/local/bin/node", platform: "linux",
     };
     const original = structuredClone(child);
+    // Startup environment respawn: OPENCLAW_NO_RESPAWN returns before any TLS or Node environment work.
     const general = vm.compileFunction(
-      `return (${pinnedFunction("dist/entry.respawn-czfKIVQC.mjs", "buildCliRespawnPlan")});`,
-      ["process", "shouldSkipStartupEnvironmentRespawnForArgv", "isTruthyEnvValue", "resolveNodeStartupTlsEnvironment"],
-    )(child, () => false, (value) => value === "1",
-      () => assert.fail("NO_RESPAWN must return before TLS/Node environment mutation."));
+      `return (${pinnedFunction("dist/entry.respawn-Cmajum_1.mjs", "buildCliRespawnPlan")});`,
+      ["process", "shouldSkipStartupEnvironmentRespawnForArgv", "isTruthyEnvValue", "normalizeWindowsArgv",
+        "readNonBlankString"],
+    )(child, () => false, (value) => value === "1", () => assert.fail("The prepared gateway is not on Windows."),
+      () => assert.fail("NO_RESPAWN must return before environment mutation."));
     assert.equal(general({ env: child.env }), null);
 
-    const entryFunctions = [
-      "isSourceCheckoutInstallRoot", "isNodeCompileCacheDisabled", "isNodeCompileCacheRequested",
-      "buildOpenClawCompileCacheRespawnPlan",
-    ].map((name) => pinnedFunction("dist/entry.js", name)).join("\n");
-    const compileCache = vm.compileFunction(
-      `${entryFunctions}\nreturn buildOpenClawCompileCacheRespawnPlan;`,
-      ["process", "path", "existsSync", "isForegroundGmailRunArgv", "shouldKeepNativeHookRelayInProcess"],
-    )(child, path, (file) => {
-      assert.ok(file.startsWith(packageRoot + "/"));
-      // Inspect only immutable package layout; never run the entry or gateway.
-      return fs.existsSync(path.join(packageDir, path.relative(packageRoot, file)));
-    }, () => false, () => false);
-    assert.equal(compileCache({
-      installRoot: packageRoot, currentFile: `${packageRoot}/dist/entry.js`,
-      env: child.env, compileCacheDir: undefined,
-    }), undefined);
+    // Compile-cache respawn: the real foreground-gateway path keeps the same process while the cache is disabled.
+    const load = (file) => import(new URL(file, `file://${packageDir}/`).href);
+    const compileCache = await load("dist/node-compile-cache-D2yvJTzP.mjs");
+    const { r: isForegroundGatewayRunArgv } = await load("dist/gateway-run-argv-uoU8-Fwk.mjs");
+    assert.equal(isForegroundGatewayRunArgv(child.argv), true);
+    const entryFunctions = ["isSourceEntry", "isNodeCompileCacheRequested", "buildOpenClawCompileCacheRespawnPlan",
+      "respawnWithoutOpenClawCompileCacheIfNeeded"].map((name) => pinnedFunction("dist/entry.js", name)).join("\n");
+    const respawn = vm.compileFunction(
+      `${entryFunctions}\nreturn respawnWithoutOpenClawCompileCacheIfNeeded;`,
+      ["process", "path", "resolveOpenClawCompileCacheRespawnEnv", "resolveOpenClawCompileCacheDirectory",
+        "resolveEntryInstallRoot", "isForegroundGatewayRunArgv", "isForegroundGmailRunArgv",
+        "shouldKeepNativeHookRelayInProcess", "isTerminalInteractiveRespawnArgv", "getCompileCacheDir",
+        "COMPILE_CACHE_DISABLED_RESPAWNED_ENV"],
+    )({ ...child, execve: () => assert.fail("The prepared gateway must not replace its process.") }, path,
+      compileCache.r, compileCache.n, () => packageRoot, isForegroundGatewayRunArgv, () => false, () => false,
+      () => false, () => "/tmp/compile-cache", "OPENCLAW_COMPILE_CACHE_DISABLED_RESPAWNED");
+    assert.equal(compileCache.r({ directory: "/tmp/compile-cache", env: child.env, foregroundGateway: true }), undefined);
+    assert.equal(await respawn({ currentFile: `${packageRoot}/dist/entry.js`, env: child.env }), false);
     assert.deepEqual(child, original);
   });
 
@@ -350,8 +375,9 @@ describe("actual pinned OpenClaw source (offline)", {
       };`);
     const dependencies = {
       normalizeOptionalLowercaseString: (value) => typeof value === "string" ? value.trim().toLowerCase() : undefined,
-      normalizeOptionalString: (value) => typeof value === "string" ? value.trim() : undefined,
       normalizeLowercaseStringOrEmpty: (value) => value?.toLowerCase() || "",
+      normalizeUniqueTrimmedStringList: (values) => [...new Set(values
+        .map((value) => typeof value === "string" ? value.trim() : "").filter(Boolean))],
       truncateUtf16Safe: (value, length) => value.slice(0, length),
       resolveRuntimeServiceVersion: () => OPENCLAW_VERSION,
       pickBestEffortPrimaryLanIPv4: () => clock.ip,

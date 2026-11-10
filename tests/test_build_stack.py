@@ -210,7 +210,7 @@ def script_env(tmp_path):
     shutil.copy(_REPO / "scripts/env_suffix.py", tmp_path / "scripts")
     (tmp_path / "bridge").mkdir()
     (tmp_path / "bridge/Dockerfile").write_text("FROM scratch\n")
-    (tmp_path / "bridge/patch-openclaw.test.js").write_text("// copied by the Dockerfile\n")
+    (tmp_path / "bridge/patch-openclaw-preinit.test.js").write_text("// copied by the Dockerfile\n")
     (tmp_path / "bridge/node_modules").mkdir()
     (tmp_path / "bridge/node_modules/dep.js").write_text("")
     (tmp_path / "cdk.json").write_text(json.dumps({"context": {"region": "", "image_version": "70"}}))
@@ -289,7 +289,7 @@ def test_script_keeps_test_files_the_dockerfile_copies(script_env):
     root, env = script_env
     assert _run_script(root, env).returncode == 0
     names = zipfile.ZipFile(root / "uploaded.zip").namelist()
-    assert "patch-openclaw.test.js" in names
+    assert "patch-openclaw-preinit.test.js" in names
     assert "Dockerfile" in names
     assert not any(n.startswith("node_modules/") for n in names)
 

@@ -43,6 +43,25 @@ describe("OpenClaw tool deny list", () => {
     assert.ok(!denyList().includes("exec"));
   });
 
+  // OpenClaw 2026.11.2 added `theme` and `presence`; denying them keeps the agent's
+  // tool surface the same as on 2026.9.5. Any other change to this list must be deliberate.
+  it("denies exactly the reviewed tool list", () => {
+    assert.deepEqual(denyList(), [
+      "write", "edit", "apply_patch", "read", "browser", "canvas", "cron", "gateway",
+      "terminal", "process", "plugins", "ask_user", "secrets", "screen", "progress_card", "nodes",
+      "heartbeat_respond", "image_generate", "music_generate", "video_generate", "tts",
+      "message", "conversations_send", "conversations_turn",
+      "theme", "presence",
+    ]);
+  });
+
+  it("keeps tool search off so every request carries the full tool list", () => {
+    const { tools } = renderConfig({ gatewayToken: "test-token" });
+    assert.equal(tools.toolSearch, false);
+    assert.equal(tools.profile, "full");
+    assert.deepEqual(Object.keys(tools).sort(), ["deny", "exec", "profile", "toolSearch"]);
+  });
+
   it("AGENTS.md tells the model its reply text is delivered automatically", () => {
     assert.match(
       renderAgents({ browserEnabled: true }),

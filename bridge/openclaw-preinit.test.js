@@ -52,7 +52,7 @@ function harness(options = {}) {
     createInvariant: options.createInvariant,
     readFile(file) {
       assert.equal(file, `${PACKAGE_ROOT}/package.json`, "No user config or credential file may be read.");
-      return options.manifest ?? JSON.stringify({ name: "openclaw", version: "2026.9.5" });
+      return options.manifest ?? JSON.stringify({ name: "openclaw", version: "2026.11.2" });
     },
     realpath: options.realpath ?? ((file) => file),
     importModule: async (url) => {
@@ -133,7 +133,7 @@ describe("same-process preparation and activation", () => {
     await nextTurn();
     assert.equal(completed, false);
     assert.deepEqual(h.child.env, h.seed);
-    assert.deepEqual(h.sent, [{ type: "openclaw:prepared", version: "2026.9.5" }]);
+    assert.deepEqual(h.sent, [{ type: "openclaw:prepared", version: "2026.11.2" }]);
     const activation = h.message();
     h.child.emit("message", activation);
     // IPC input must be copied before any further asynchronous work.
@@ -467,7 +467,7 @@ describe("fixed package, command and seed", () => {
       { url: "file:///tmp/other/openclaw.mjs" },
       { options: { realpath: () => "/tmp/replaced" } },
       { options: { manifest: JSON.stringify({ name: "openclaw", version: "2026.9.6" }) } },
-      { options: { manifest: JSON.stringify({ name: "other", version: "2026.9.5" }) } },
+      { options: { manifest: JSON.stringify({ name: "other", version: "2026.11.2" }) } },
       { options: { manifest: "{invalid" } },
       { options: { manifest: "null" } },
     ];

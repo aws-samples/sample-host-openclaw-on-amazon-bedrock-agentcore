@@ -130,16 +130,19 @@ def assert_no_marker(texts):
 
 
 def test_marker_label_is_not_a_secret_name_to_openclaw_redaction():
-    """OpenClaw 2026.9.5 redacts values after labels that look like secret names.
+    """OpenClaw 2026.11.2 redacts values after labels that look like secret names.
 
-    Patterns copied from the pinned dist (dist/redact-*.mjs):
-    ENV_ASSIGNMENT_REDACT_PATTERN (the one that turned AUDIO_S3_KEY's value into
-    ***) and DEFAULT_REDACT_PREFILTER_SOURCES[0] (text without these words is not
-    scanned at all). bridge/brief-audio-marker.test.js runs OpenClaw's own
-    redaction on the marker line when the dist is installed.
+    ENV_ASSIGNMENT_REDACT_PATTERN is copied from the pinned dist
+    (dist/redact-*.mjs, with PAYMENT_CREDENTIAL_ENV_KEYS expanded); it is the
+    pattern that turned AUDIO_S3_KEY's value into ***. The marker must also avoid
+    the secret-like words other redaction patterns key on.
+    bridge/brief-audio-marker.test.js runs OpenClaw's own redaction on the marker
+    line when the dist is installed.
     """
     module = load_lambda("cron")
-    env_assignment = re.compile(r"\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)\b\s*[=:]\s*")
+    env_assignment = re.compile(
+        r"\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CARD[_-]?NUMBER|CARD[_-]?CVC|CARD[_-]?CVV|CVC|CVV"
+        r"|SECURITY[_-]?CODE|PAYMENT[_-]?CREDENTIAL|SHARED[_-]?PAYMENT[_-]?TOKEN)\b\s*[=:]\s*")
     prefilter = re.compile(
         r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH|COOKIE|SIGNATURE|CREDENTIAL|CARD|CVC|CVV|PAYMENT", re.I)
     assert module.AUDIO_MARKER_LABEL == MARKER

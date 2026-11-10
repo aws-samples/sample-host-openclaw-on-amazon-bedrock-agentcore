@@ -4,7 +4,9 @@
  * Arming records the restored actor, user and generation without binding the
  * anonymous worker. The first claim sends its current environment, verifies
  * the bound acknowledgement and empty slot, then transfers the slot to the
- * ordinary open path.
+ * ordinary open path. A claim for a different carrier module retires the
+ * reservation instead. Opens that arrive while a claim is binding wait for it
+ * and then acquire an ordinary slot.
  *
  * A failed claim can return null only after retiring the unused reservation;
  * cancellation or changed identity still fails. Once consumed, the slot can
@@ -15,26 +17,35 @@ import { backendPreparationEnabled } from "./sqlite-backend-prepare.mjs";
 import { randomUUID } from "node:crypto";
 import { CONTROL, ordinaryEnvironment, environmentHash, validateEnvironment } from "./sqlite-receiver-control.mjs";
 
+// Empty-state inventory reported by the patched OpenClaw 2026.11.2 SQLite store worker.
+export const EMPTY_KEYS = Object.freeze(["actors", "contexts", "pendingInput", "pendingResult",
+  "sourceLoader", "operationAdmission", "cleanupFailure", "nativeAdmission"]);
+
 export function brokerEmpty(broker) {
+  const input = broker.inputAdmission;
   return !broker.actors.size && !broker.clients.size && !broker.stores.size &&
-    !broker.operations.size && !broker.requests && !broker.bytes && !broker.admissionBytes;
+    !broker.operations.size && !broker.waiters.size && !broker.bytes && !!input &&
+    !input.bytes && !input.inputPreparations.size && !input.openQueue.size && !input.opens.size;
 }
 function emptyProof(reply) {
-  const keys = ["actors", "paths", "contexts", "fences", "pendingInput", "pendingResult",
-    "sourceLoader", "operationAdmission", "lifecycle", "maintenanceFence"];
-  return reply?.empty && Object.keys(reply.empty).length === keys.length &&
-    keys.every(key => reply.empty[key] === 0);
+  return reply?.empty && Object.keys(reply.empty).length === EMPTY_KEYS.length &&
+    EMPTY_KEYS.every(key => reply.empty[key] === 0);
 }
 export class ReceiverReservation {
   #arming = null;
-  constructor(broker, environment) {
+  constructor(broker, environment, carrierUrl) {
     validateEnvironment(ordinaryEnvironment(environment), false);
+    if (typeof carrierUrl !== "string" || !carrierUrl.startsWith("file:///")) {
+      throw new Error("SQLite receiver requires its carrier module URL");
+    }
     this.broker = broker;
+    this.carrierUrl = carrierUrl;
     this.backendExpected = backendPreparationEnabled(environment);
     this.phase = "preparing";
     this.seedHash = environmentHash(ordinaryEnvironment(environment));
     this.slot = null;
     this.pending = null;
+    this.claiming = null;
   }
   get generation() { return this.#arming?.generation ?? null; }
   attach(slot) { this.slot = slot; }
@@ -118,7 +129,23 @@ export class ReceiverReservation {
     this.phase = "armed";
     return this.proof();
   }
-  async claim(environment) {
+  /**
+   * Broker entry for an admitted open. The first call claims the reservation;
+   * calls during that claim wait for it and return null, so they acquire an
+   * ordinary slot. Returns null once the reservation is consumed or retired.
+   */
+  acquire(environment, carrierUrl) {
+    if (this.phase === "armed") {
+      this.claiming = this.claim(environment, carrierUrl);
+      return this.claiming;
+    }
+    if (this.phase === "binding" && this.claiming) return this.claiming.then(() => null, () => null);
+    if (this.phase === "ready" || this.phase === "preparing") {
+      return Promise.reject(new Error("SQLite receiver binding must precede database selection"));
+    }
+    return Promise.resolve(null);
+  }
+  async claim(environment, carrierUrl) {
     if (this.phase !== "armed") throw new Error("SQLite receiver is not armed");
     let boundEnvironment;
     try {
@@ -126,6 +153,11 @@ export class ReceiverReservation {
     } catch (error) {
       await this.retire("armed_identity_or_environment_changed");
       throw error;
+    }
+    if (String(carrierUrl) !== this.carrierUrl) {
+      // A runtime generation that resolves another carrier module cannot use this worker.
+      await this.retire("carrier_changed");
+      return null;
     }
     if (!this.slotAvailable() || !this.slotEmpty()) {
       await this.retire("worker_or_empty_state_changed");
@@ -179,7 +211,7 @@ export class ReceiverReservation {
         if (this.slot.actors.size || this.slot.current || this.slot.queue.length || this.slot.pendingOpens) {
           throw new Error("SQLite receiver lost empty reservation ownership");
         }
-        await this.broker.retire(this.slot);
+        await this.broker.lifecycle.retire(this.slot);
       }
       if (this.broker.agentCoreReceiver === this) this.broker.agentCoreReceiver = undefined;
       this.phase = "retired";

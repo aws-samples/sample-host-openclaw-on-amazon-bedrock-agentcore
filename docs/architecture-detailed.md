@@ -61,7 +61,7 @@ flowchart TB
 |---|---|---|
 | **Contract Server** | 8080 | AgentCore HTTP contract (`/ping`, `/invocations`); V2 bootstrap/activation and full-gateway admission |
 | **Bedrock Proxy** | 18790 | OpenAI-compatible API → Bedrock ConverseStream, Cognito identity, multimodal image handling |
-| **OpenClaw Gateway** | 18789 | Headless OpenClaw `2026.9.5` with full tools and ClawHub skills; V2 verifies `/startupz`, protocol-4 token handshake and cached `last-heartbeat` RPC |
+| **OpenClaw Gateway** | 18789 | Headless OpenClaw `2026.11.2` with full tools and ClawHub skills; V2 verifies `/startupz`, protocol-4 token handshake and cached `last-heartbeat` RPC |
 | **Shared routing layer** | — | Conditional Router/Cron admission on one AgentCore Runtime ARN, endpoint name, session ID and generation |
 
 ## Data Flow

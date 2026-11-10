@@ -1,11 +1,12 @@
 """The bridge image must not ship undici below the GHSA-xjj6-f33q-929c fix.
 
-The deployed OpenClaw gateway can load undici from three places: Node's bundled
-global fetch, the globally installed ``openclaw`` package, and the globally
-installed ``clawhub`` package. All three were vulnerable on the pinned
-base image / package versions. This PR pins the base image to Node 24.22.1
-(undici 7.30.1), bumps clawhub to a release whose undici is fixed, and overrides
-openclaw's bundled undici to 8.12.2.
+The deployed OpenClaw gateway can load undici from four places: Node's bundled
+global fetch, the globally installed ``openclaw`` package, the npm that
+openclaw bundles (node-gyp's header download), and the globally installed
+``clawhub`` package. The base image is pinned to Node 24.22.1 (undici 7.30.1),
+clawhub to a release whose undici is fixed, and openclaw 2026.11.2 ships the
+fixed undici 8.12.2. Its bundled npm 12.2.0 still carries undici 6.28.0, so the
+Dockerfile overrides that copy to 6.29.1.
 
 These are static checks over ``bridge/Dockerfile`` and the bridge sources: they
 need neither Docker, an arm64 builder, nor the CDK toolchain, so they run in the
@@ -56,8 +57,22 @@ def test_clawhub_is_bumped_to_a_fixed_release():
     assert "clawhub@0.23.3" not in text
 
 
-def test_openclaw_undici_is_overridden_to_the_fixed_version():
-    assert "undici@8.12.2" in _dockerfile()
+def test_openclaw_ships_the_fixed_undici_without_an_override():
+    text = _dockerfile()
+    # openclaw 2026.11.2 ships undici 8.12.2, so its own copy is no longer swapped.
+    assert "npm install -g openclaw@2026.11.2 " in text
+    assert "undici@8.12.2" not in text
+    assert 'paths:["/usr/local/lib/node_modules/openclaw"]' not in text
+
+
+def test_openclaw_bundled_npm_undici_is_overridden_to_the_fixed_version():
+    text = _dockerfile()
+    assert "undici@6.29.1" in text
+    npm_undici = "/usr/local/lib/node_modules/openclaw/node_modules/npm/node_modules/undici"
+    # The swap must land on the copy node-gyp resolves, and nowhere else.
+    assert f'test "$undici_dir" = {npm_undici};' in text
+    assert re.search(r'require\.resolve\("undici/package\.json",\{paths:\["/usr/local/lib/node_modules/openclaw/'
+                     r'node_modules/npm/node_modules/node-gyp"\]\}\)', text)
 
 
 def test_the_build_runs_the_undici_floor_check():
@@ -65,9 +80,10 @@ def test_the_build_runs_the_undici_floor_check():
     check = BRIDGE / "undici-floor-check.js"
     assert check.exists(), "bridge/undici-floor-check.js is missing"
     body = check.read_text()
-    # The three GHSA-xjj6-f33q-929c floors the gate enforces.
-    for floor in ('"7.30.1"', '"8.12.2"'):
+    # The GHSA-xjj6-f33q-929c floors the gate enforces, including openclaw's bundled npm copy.
+    for floor in ('"6.29.1"', '"7.30.1"', '"8.12.2"'):
         assert floor in body, f"floor {floor} not enforced by undici-floor-check.js"
+    assert "openclaw/node_modules/npm/node_modules/node-gyp" in body
 
 
 def test_runtime_version_guards_track_the_base_image():

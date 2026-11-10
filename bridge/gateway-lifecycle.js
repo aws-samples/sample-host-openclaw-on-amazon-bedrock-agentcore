@@ -77,11 +77,11 @@ const HISTORY_TIMEOUT_MS = 15000;
 const HISTORY_ATTEMPTS = 2;
 const HISTORY_RETRY_MIN_MS = 100;
 const HISTORY_LIMIT = 100;
-const HISTORY_MAX_CHARS = 500000; // openclaw 2026.9.5 ChatHistoryParamsSchema maximum; default 8000 truncates.
+const HISTORY_MAX_CHARS = 500000; // openclaw 2026.11.2 ChatHistoryParamsSchema maximum; default 8000 truncates.
 // The bridge runs one turn at a time, so any run already active on the main
 // session when a turn is sent belongs to nobody waiting on it (for example
 // openclaw's restart recovery of a turn interrupted before a container stop).
-// openclaw 2026.9.5 defaults to "steer": it folds the new message into that run
+// openclaw 2026.11.2 defaults to "steer": it folds the new message into that run
 // and answers chat.send with an empty final, so the user gets no reply.
 // "interrupt" stops that run and answers this turn as its own run.
 const CHAT_QUEUE_MODE = "interrupt";
@@ -104,7 +104,7 @@ function historyUserKey(message) {
 }
 
 /**
- * Pick the text to deliver for one run from openclaw 2026.9.5 chat.history.
+ * Pick the text to deliver for one run from openclaw 2026.11.2 chat.history.
  *
  * The WS chat final carries the run's whole text buffer, so status lines the
  * model wrote before tool calls reach the user. The answer is the last
@@ -509,109 +509,6 @@ function watchChatEvents({
   return { ready, stopped, readRunAnswer };
 }
 
-const STALE_DELIVERY_MS = 2 * 60 * 60 * 1000;
-const TASKS_LIST_LIMIT = 500; // openclaw 2026.9.5 TasksListParamsSchema maximum.
-const TASKS_DISMISS_BATCH = 10; // openclaw 2026.9.5 TasksRecoveryParamsSchema maxItems.
-
-function taskTimestamp(value) {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value) {
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-  return undefined;
-}
-
-/**
- * True for a tasks.list entry whose sub-agent completion delivery is stuck.
- *
- * openclaw 2026.9.5 does not put the sub-agent's `delivery.status` in the
- * public task summary. Suspension (blockSubagentCompletionDelivery) is the
- * only path that writes task deliveryStatus "failed" together with
- * terminalOutcome "blocked" on a succeeded sub-agent task; intentional
- * non-delivery leaves no "blocked" outcome. tasks.dismiss itself refuses any
- * task whose delivery is not suspended, so a misclassified row is a no-op.
- */
-function isStaleSuspendedDelivery(task, now = Date.now(), staleMs = STALE_DELIVERY_MS) {
-  if (!task || typeof task !== "object") return false;
-  if (task.runtime !== "subagent" || task.status !== "completed") return false;
-  if (task.deliveryStatus !== "failed" || task.terminalOutcome !== "blocked") return false;
-  if (typeof (task.taskId || task.id) !== "string" || !(task.taskId || task.id)) return false;
-  const times = [taskTimestamp(task.updatedAt), taskTimestamp(task.endedAt)].filter((t) => t !== undefined);
-  if (times.length === 0) return false;
-  return now - Math.max(...times) >= staleMs;
-}
-
-/**
- * Dismiss sub-agent result deliveries that openclaw suspended long ago.
- *
- * A suspended delivery is rendered into every main-session turn as
- * "Child results awaiting delivery" for 7 days (openclaw 2026.9.5), and the
- * model narrates it into replies. Run once after the gateway is ready and
- * before the first chat turn. Never rejects: startup must not depend on it.
- */
-async function dismissStaleSuspendedDeliveries({
-  url, token, signal, deadline = Date.now() + 15000, now = Date.now(),
-  staleMs = STALE_DELIVERY_MS, log = console, maxPages = 10,
-}) {
-  const result = { phase: "done", listed: 0, candidates: [], dismissed: [], notDismissed: [] };
-  let session;
-  try {
-    session = await openOperatorSession({ url, token, signal, deadline });
-    if (!session.methods.includes("tasks.list") || !session.methods.includes("tasks.dismiss")) {
-      result.phase = "skipped";
-      log?.warn?.("[gateway] Stale delivery sweep skipped: task methods unavailable");
-      return result;
-    }
-    const stale = [];
-    let cursor;
-    for (let page = 0; page < maxPages; page++) {
-      const params = { status: "completed", limit: TASKS_LIST_LIMIT, ...(cursor ? { cursor } : {}) };
-      const payload = await session.call("tasks.list", params);
-      const tasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
-      result.listed += tasks.length;
-      for (const task of tasks) if (isStaleSuspendedDelivery(task, now, staleMs)) stale.push(task);
-      cursor = typeof payload?.nextCursor === "string" && payload.nextCursor ? payload.nextCursor : undefined;
-      if (!cursor) break;
-    }
-    result.candidates = stale.map((task) => task.taskId || task.id);
-    const runIds = new Map(stale.map((task) => [task.taskId || task.id, task.runId || "unknown"]));
-    for (let i = 0; i < result.candidates.length; i += TASKS_DISMISS_BATCH) {
-      const taskIds = result.candidates.slice(i, i + TASKS_DISMISS_BATCH);
-      let items;
-      try {
-        const payload = await session.call("tasks.dismiss", { taskIds });
-        items = Array.isArray(payload?.results) ? payload.results : [];
-      } catch (error) {
-        for (const taskId of taskIds) result.notDismissed.push({ taskId, reason: error.message });
-        log?.warn?.("[gateway] tasks.dismiss failed; tasks, error:", taskIds.join(","), error.message);
-        continue;
-      }
-      for (const taskId of taskIds) {
-        const item = items.find((entry) => entry?.taskId === taskId);
-        if (item?.ok === true) {
-          result.dismissed.push(taskId);
-          log?.log?.("[gateway] Dismissed stale sub-agent delivery task", taskId, "run", runIds.get(taskId));
-        } else {
-          const reason = typeof item?.reason === "string" ? item.reason : "no result";
-          result.notDismissed.push({ taskId, reason });
-          log?.warn?.("[gateway] Sub-agent delivery not dismissed task", taskId, "reason", reason);
-        }
-      }
-    }
-    log?.log?.("[gateway] Stale delivery sweep: listed", result.listed, "stale", result.candidates.length,
-      "dismissed", result.dismissed.length, "not_dismissed", result.notDismissed.length);
-  } catch (error) {
-    result.phase = "failed";
-    result.error = error?.message || "unknown error";
-    log?.warn?.("[gateway] Stale delivery sweep failed:", result.error);
-  } finally {
-    session?.close();
-  }
-  return result;
-}
-
 module.exports = {
-  readStartup, waitForGateway, gatewayTurn, appliedConfigReady, watchChatEvents,
-  dismissStaleSuspendedDeliveries, isStaleSuspendedDelivery, STALE_DELIVERY_MS, selectFinalAnswer,
+  readStartup, waitForGateway, gatewayTurn, appliedConfigReady, watchChatEvents, selectFinalAnswer,
 };

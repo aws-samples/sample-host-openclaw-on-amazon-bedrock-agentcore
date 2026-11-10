@@ -667,20 +667,25 @@ test("streamUsage ignores missing or invalid counts", () => {
 });
 
 test("pinned OpenClaw reads the proxy's final-chunk usage as the turn's prompt size", {
-  skip: !process.env.OPENCLAW_SOURCE_ROOT && "Set OPENCLAW_SOURCE_ROOT to the pinned 2026.9.5 source fixture",
+  skip: !process.env.OPENCLAW_SOURCE_ROOT && "Set OPENCLAW_SOURCE_ROOT to the pinned 2026.11.2 package",
 }, () => {
   const path = require("node:path");
   const root = process.env.OPENCLAW_SOURCE_ROOT;
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version, "2026.9.5");
-  const worker = fs.readFileSync(path.join(root, "dist/worker/worker.mjs"), "utf8");
-  const start = worker.indexOf("function parseOpenAICompletionsUsage(");
-  const end = worker.indexOf("function createOpenAIResponseHook(", start);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version, "2026.11.2");
+  const ai = path.join(root, "node_modules/@openclaw/ai/dist");
+  const shared = fs.readFileSync(path.join(ai, "openai-responses-shared-iWBHb0Sq.mjs"), "utf8");
+  const transport = fs.readFileSync(path.join(ai, "openai-completions-transport-CnFaKYO-.mjs"), "utf8");
+  const start = shared.indexOf("function parseOpenAICompletionsUsage(");
+  const end = shared.indexOf("function createOpenAIResponseHook(", start);
   assert.ok(start >= 0 && end > start, "Pinned source boundaries: parseOpenAICompletionsUsage");
-  // The completions stream reader parses `usage` from any chunk that has it.
-  assert.match(worker, /\.usage&&\([A-Za-z_$][\w$]*\.usage=parseOpenAICompletionsUsage\(/);
-  const box = { calculateCost() {}, applyProviderReportedUsageCost() {} };
+  // The completions stream reader parses `usage` from any chunk that has it, and usage on the
+  // chunk that carries finish_reason (the proxy's final chunk) is reported as available.
+  assert.ok(transport.includes("output.usage = parseOpenAICompletionsUsage(usage, model, "));
+  assert.ok(transport.includes("const terminalUsage = Boolean(finishReason || choice?.finish_reason || chunk.choices?.length === 0);"));
+  const box = { calculateCost() {}, applyProviderReportedUsageCost() {},
+    asFiniteNumber: (value) => typeof value === "number" && Number.isFinite(value) ? value : undefined };
   vm.createContext(box);
-  vm.runInContext(worker.slice(start, end), box);
+  vm.runInContext(shared.slice(start, end), box);
   const usage = box.parseOpenAICompletionsUsage(policy.streamUsage({ inputTokens: 1200, outputTokens: 80,
     cacheReadInputTokens: 250000, cacheWriteInputTokens: 16000 }), {}, {});
   assert.equal(usage.input, 1200);
@@ -688,6 +693,8 @@ test("pinned OpenClaw reads the proxy's final-chunk usage as the turn's prompt s
   assert.equal(usage.cacheWrite, 16000);
   assert.equal(usage.output, 80);
   assert.equal(usage.totalTokens, 267280);
+  assert.deepEqual({ ...usage.contextUsage }, { state: "available", promptTokens: 267200, totalTokens: 267280 });
+  assert.equal(usage.cacheTelemetry.state, "available");
 });
 
 test("unknown outcome fences fresh streaming requests before another SDK client or route", async () => {
@@ -796,57 +803,53 @@ for (const subagent of [false, true]) for (const stream of [true, false, undefin
 }
 
 test("pinned OpenClaw projects HTTP/SSE failures into terminal assistant errors without replay", {
-  skip: !process.env.OPENCLAW_SOURCE_ROOT && "Set OPENCLAW_SOURCE_ROOT to the pinned 2026.9.5 source fixture",
+  skip: !process.env.OPENCLAW_SOURCE_ROOT && "Set OPENCLAW_SOURCE_ROOT to the pinned 2026.11.2 package",
 }, async () => {
   const path = require("node:path");
+  const { pathToFileURL } = require("node:url");
   const root = process.env.OPENCLAW_SOURCE_ROOT;
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version, "2026.9.5");
-  const worker = fs.readFileSync(path.join(root, "dist/worker/worker.mjs"), "utf8");
-  const retry = fs.readFileSync(path.join(root, "dist/retry-C-xDi4CZ.mjs"), "utf8");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version, "2026.11.2");
+  const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
+  const load = (file) => import(pathToFileURL(path.join(root, file)).href);
+  // Chunk exports are minified aliases; resolve each name from the chunk's export list.
+  const exported = async (file, names) => {
+    const source = read(file), mod = await load(file);
+    return Object.fromEntries(names.map((name) => {
+      const alias = source.match(new RegExp(`\\b${name} as ([\\w$]+)\\b`))?.[1];
+      assert.ok(alias && typeof mod[alias] === "function", `Pinned export ${name} in ${file}`);
+      return [name, mod[alias]];
+    }));
+  };
   const between = (text, start, end) => {
     const a = text.indexOf(start), b = text.indexOf(end, a + start.length);
     assert.ok(a >= 0 && b > a, `Pinned source boundaries: ${start}`);
     return text.slice(a, b);
   };
+  const ai = "node_modules/@openclaw/ai/dist/";
+  const { projectProviderError } = await exported(`${ai}provider-error-qtZD2inE.mjs`, ["projectProviderError"]);
+  const { isTerminalAssistantError, isRetryableAssistantError } = await exported("dist/retry-Bp4pXKKd.mjs",
+    ["isTerminalAssistantError", "isRetryableAssistantError"]);
+  const { isRetryableProviderHttpStatus } = await exported("dist/retry-evidence-Bp2ClYIy.mjs", ["isRetryableProviderHttpStatus"]);
+  const { APIError } = await load("node_modules/openai/core/error.mjs");
+  const { Stream } = await load("node_modules/openai/core/streaming.mjs");
+  // The completions transport makes one SDK attempt and projects stream failures with projectProviderError.
+  const transport = read(`${ai}openai-completions-transport-CnFaKYO-.mjs`);
+  assert.ok(transport.includes("maxRetries: 0"));
+  assert.match(transport, /c as failTransportStream[^}]*\} from "\.\/transport-stream-shared-lhgkTOz3\.mjs"/);
+  assert.ok(read(`${ai}transport-stream-shared-lhgkTOz3.mjs`).includes("const projection = projectProviderError(error, signal);"));
+  assert.ok(read("node_modules/openai/core/streaming.mjs")
+    .includes("throw new APIError(undefined, data.error, undefined, response.headers);"));
+  const pendingTools = new Function(`const executedIds = new Set(); return (message) => {${between(read("dist/agent-core-Coj2uQc9.mjs"),
+    'if (message.stopReason === "error" || message.stopReason === "aborted") return;',
+    "const hasUnobservedAsyncToolResults")}return calls; };`)();
   const box = {
-    OpenAIError: Error,
-    asOptionalRecord: (value) => value && typeof value === "object" ? value : undefined,
-    normalizeStringifiedOptionalString: (value) => String(value).trim() || undefined,
-    truncateUtf16Safe: (value, length) => value.slice(0, length),
-    redactDiagnosticText: (value) => value,
-    stableStringify: JSON.stringify,
-    MAX_ERROR_BODY_LENGTH: 4000,
-    PROVIDER_FAILURE_WITH_OUTPUT_ERROR_CODE: "PROVIDER_FAILURE_WITH_OUTPUT",
-    PROVIDER_POST_DISPATCH_AMBIGUITY_ERROR_CODE: "PROVIDER_POST_DISPATCH_AMBIGUITY",
-    WEBSOCKET_NON_RETRYABLE_CLOSE_ERROR_CODE: "ERR_WEBSOCKET_NON_RETRYABLE_CLOSE",
-    console,
-    _iterSSEMessages$1: async function* (response) {
-      for (const frame of response.frames) yield { event: null, data: frame.slice(6).trim() };
-    },
-    Stream$11: class {
-      constructor(iterator) { this.iterator = iterator; }
-      [Symbol.asyncIterator]() { return this.iterator(); }
-    },
-    isTransportAbortError: () => false,
+    decode: (status, body) => projectProviderError(new APIError(status, body.error, undefined, new Headers())),
+    terminal: isTerminalAssistantError, retryable: isRetryableAssistantError, pendingTools,
+    sse: { fromSSEResponse: (response, controller) => Stream.fromSSEResponse(
+      new Response(response.frames.join("")), controller) },
   };
-  vm.createContext(box);
-  vm.runInContext(
-    `const APIError = ${between(worker, "class APIError$2 extends OpenAIError", ",APIUserAbortError$2=")}; const APIError$2 = APIError;\n` +
-    between(worker, "function readProviderErrorField(", "function projectProviderError(") + "\n" +
-    between(retry, "function isProviderRefusalAssistantError(", "//#endregion") + "\n" +
-    between(retry, "const RETRYABLE_HTTP_STATUS_CODES", "const RATE_LIMIT_RETRY_CONTEXT_RE") + "\n" +
-    between(retry, "function resolveRetrySignalStatus(", "function hasRateLimitRetryContext(") + "\n" +
-    between(retry, "const TERMINAL_ASSISTANT_ERROR_CODES", "//#endregion") + "\n" +
-    "this.decode = (status, body) => buildProjection(new APIError(status, body.error));" +
-    "this.terminal = isTerminalAssistantError; this.retryable = isRetryableAssistantError;" +
-    "this.transient = hasTransientRetryEvidence;" +
-    `const wi = new Set(); let ${between(worker, "enqueueTools=Ot=>{", "let _n=wi.size>0;")}return Zt;}; this.pendingTools = enqueueTools;` +
-    `this.sse = class { ${between(worker, "static fromSSEResponse(", "static fromReadableStream(")} };`,
-    box);
-  assert.ok(worker.includes("if(_n&&_n.error)throw new APIError$2(void 0,_n.error,void 0,Ot.headers)"));
-  assert.ok(worker.includes("maxRetries:0"));
   assert.equal(box.terminal(box.decode(502, { error: { type: "proxy_error", message: "timeout" } })), false);
-  assert.equal(box.transient({ status: 502 }), true);
+  assert.equal(isRetryableProviderHttpStatus(502), true);
   const tool = { type: "toolCall", id: "id", name: "test", arguments: {} };
   assert.equal(box.pendingTools({ stopReason: "toolUse", content: [tool] }).length, 1);
 
@@ -877,8 +880,7 @@ test("pinned OpenClaw projects HTTP/SSE failures into terminal assistant errors 
             { frames: app.frames }, new AbortController())) {}
         } catch (error) { streamError = error; }
         assert.ok(streamError, "The actual SDK SSE decoder must throw before normal completion");
-        box.streamError = streamError;
-        assistant = vm.runInContext("buildProjection(streamError)", box);
+        assistant = projectProviderError(streamError);
       }
       assert.equal(box.terminal(assistant), true);
       assert.equal(box.pendingTools({ ...assistant, content: [tool] }), undefined);

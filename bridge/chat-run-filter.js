@@ -7,7 +7,7 @@
  * bridge request with the sub-agent's text and closes the socket while the
  * main run is still working (seen in production with a cron brief).
  *
- * Gateway protocol v4 (openclaw 2026.9.5, packages/gateway-protocol
+ * Gateway protocol v4 (openclaw 2026.11.2, packages/gateway-protocol
  * ChatEventBaseSchema): every chat event carries `runId` and `sessionKey`
  * (both required), plus optional `spawnedBy` for sub-agent sessions.
  * `chat.send` uses the request's `idempotencyKey` as the run id

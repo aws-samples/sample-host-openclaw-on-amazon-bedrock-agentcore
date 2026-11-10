@@ -2,10 +2,10 @@
  * Forward late sub-agent announce finals to the user (issue #148, option B).
  *
  * When a sub-agent finishes while its requester session is idle, openclaw
- * 2026.9.5 starts an "announce" run in that session through the gateway's
+ * 2026.11.2 starts an "announce" run in that session through the gateway's
  * `agent` method. Its run id is the announce idempotency key,
  * `announce:v1:<child session key>:<child run id>` (upstream
- * src/agents/announce-idempotency.ts, isAnnounceRunId). The container has no
+ * buildAnnounceIdempotencyKey and buildAnnounceIdFromChildRun). The container has no
  * channels, so that run's final only lands in the transcript and the user
  * sees it on their next turn.
  *

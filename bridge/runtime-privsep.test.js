@@ -194,6 +194,39 @@ test("ensureAgentDirs creates each directory parent-first, 0700, owned by the ag
   assert.equal(ops.filter((op) => op[0] === "lchown").length, made.length);
 });
 
+test("ensureDoctorCaptureDir prepares OpenClaw's capture directory beside the state dir for the agent uid", () => {
+  // OpenClaw 2026.11.2 doctor writes its pre-repair copy to `<state dir>.update-captures`.
+  assert.equal(privsep.doctorCaptureDir("/root/.openclaw"), "/root/.openclaw.update-captures");
+  assert.equal(privsep.doctorCaptureDir("/root/.openclaw/"), "/root/.openclaw.update-captures");
+  const ops = [];
+  const fs = {
+    mkdirSync: (p, o) => ops.push(["mkdir", p, o.mode]),
+    lstatSync: () => ({ isDirectory: () => true, isSymbolicLink: () => false }),
+    lchownSync: (p, u, g) => ops.push(["lchown", p, u, g]),
+    chmodSync: (p, m) => ops.push(["chmod", p, m]),
+  };
+  assert.equal(privsep.ensureDoctorCaptureDir("/root/.openclaw", { proc: rootProc, env: {}, fs }), true);
+  assert.deepEqual(ops, [
+    ["mkdir", "/root/.openclaw.update-captures", 0o700],
+    ["lchown", "/root/.openclaw.update-captures", 10001, 10001],
+    ["chmod", "/root/.openclaw.update-captures", 0o700],
+  ]);
+  // Not root, no state dir, or a relative path: nothing is touched.
+  for (const [dir, proc] of [["/root/.openclaw", nonRootProc], ["", rootProc], ["relative/.openclaw", rootProc]]) {
+    let touched = 0;
+    assert.equal(privsep.ensureDoctorCaptureDir(dir, { proc, env: {}, fs: { mkdirSync: () => { touched += 1; } } }), false);
+    assert.equal(touched, 0);
+  }
+  // A planted symlink is reported and never chowned.
+  const warnings = [];
+  const linked = { ...fs, mkdirSync: () => { throw Object.assign(new Error("exists"), { code: "EEXIST" }); },
+    lstatSync: () => ({ isDirectory: () => false, isSymbolicLink: () => true }),
+    lchownSync: () => assert.fail("must not chown a symlink") };
+  assert.equal(privsep.ensureDoctorCaptureDir("/root/.openclaw",
+    { proc: rootProc, env: {}, fs: linked, log: { warn: (m) => warnings.push(m) } }), false);
+  assert.match(warnings.join("\n"), /\/root\/\.openclaw\.update-captures is not a directory/);
+});
+
 test("ensureAgentDirs is a no-op when not root", () => {
   let touched = 0;
   const fs = { mkdirSync: () => { touched += 1; } };

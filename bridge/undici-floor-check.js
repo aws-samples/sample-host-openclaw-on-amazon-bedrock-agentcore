@@ -5,10 +5,10 @@
 // Run this after the base image, OpenClaw and ClawHub are in place. It fails the
 // build unless every undici the image can load is at or above the fixed version:
 //   - Node's bundled global-fetch undici  >= 7.30.1 (Node >= 24.22.1)
-//   - openclaw's undici                    >= 8.12.2 (openclaw 2026.9.5 pins the
-//                                            vulnerable 8.10.2; the Dockerfile
-//                                            overrides it, and openclaw 2026.10.10
-//                                            ships 8.12.2 natively)
+//   - openclaw's undici                    >= 8.12.2 (openclaw 2026.11.2 ships 8.12.2)
+//   - undici bundled in openclaw's npm     >= 6.29.1 (npm 12.2.0 ships the vulnerable
+//                                            6.28.0, which only node-gyp's header
+//                                            download loads; the Dockerfile overrides it)
 //   - clawhub's undici                     >= 7.30.1 (clawhub >= 0.25.1)
 //
 // Usage: node undici-floor-check.js [global node_modules dir]
@@ -35,6 +35,7 @@ const resolvedUndici = (pkg) => {
 const checks = [
   ["node bundled undici (global fetch)", process.versions.undici, "7.30.1"],
   ["openclaw undici", resolvedUndici("openclaw"), "8.12.2"],
+  ["openclaw npm undici (node-gyp)", resolvedUndici("openclaw/node_modules/npm/node_modules/node-gyp"), "6.29.1"],
   ["clawhub undici", resolvedUndici("clawhub"), "7.30.1"],
 ];
 

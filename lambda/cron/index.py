@@ -819,14 +819,14 @@ def send_feishu_message(receiver_id, text):
 # sending another user's file.
 #
 # The label must not look like a secret name. OpenClaw's gateway redacts the
-# value after any upper-case label ending in KEY, TOKEN, SECRET, PASSWORD or
-# PASSWD followed by ':' or '=' (2026.9.5 dist/redact-*.mjs,
-# ENV_ASSIGNMENT_REDACT_PATTERN), and only scans text containing KEY, TOKEN,
-# SECRET, PASSWORD, PASSWD, AUTH, COOKIE, SIGNATURE, CREDENTIAL, CARD, CVC, CVV
-# or PAYMENT (DEFAULT_REDACT_PREFILTER_SOURCES, case-insensitive). The earlier
-# label AUDIO_S3_KEY reached the Lambda as "AUDIO_S3_KEY: ***". BRIEF_AUDIO
-# contains none of those words; bridge/brief-audio-marker.test.js checks it
-# against OpenClaw's own redaction when the dist is installed.
+# value after any upper-case label ending in KEY, TOKEN, SECRET, PASSWORD,
+# PASSWD or a payment-credential name (CARD_NUMBER, CVC, CVV, SECURITY_CODE,
+# PAYMENT_CREDENTIAL, ...) followed by ':' or '=' (2026.11.2 dist/redact-*.mjs,
+# ENV_ASSIGNMENT_REDACT_PATTERN), and other patterns key on words such as AUTH,
+# COOKIE, SIGNATURE, CREDENTIAL, CARD or PAYMENT. The earlier label
+# AUDIO_S3_KEY reached the Lambda as "AUDIO_S3_KEY: ***". BRIEF_AUDIO contains
+# none of those words; bridge/brief-audio-marker.test.js checks it against
+# OpenClaw's own redaction when the dist is installed.
 AUDIO_MARKER_LABEL = "BRIEF_AUDIO"
 
 # Telegram Bot API upload limit for sendAudio.
