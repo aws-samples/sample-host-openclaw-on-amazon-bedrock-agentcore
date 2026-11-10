@@ -19,7 +19,8 @@ function renderConfig({ gatewayToken } = {}) {
   // The proxy maps this name → SUBAGENT_BEDROCK_MODEL_ID (or MODEL_ID fallback).
   const subagentModel = `agentcore/${SUBAGENT_MODEL_NAME}`;
 
-  // Keep OpenClaw's generated runtime context in system messages.
+  // OpenAI-compatible proxy settings. Without a developer role, OpenClaw 2026.11.2 sends its
+  // runtime context as a user message, which the proxy keeps in the user turn.
   const modelCompat = {
     cacheControlFormat: "anthropic",
     supportsDeveloperRole: false,
@@ -101,7 +102,14 @@ function renderConfig({ gatewayToken } = {}) {
         "message", // Channel send/actions (Telegram, Slack, ...)
         "conversations_send", // Send to an external conversation address
         "conversations_turn", // Send + wait for an external reply
+        // --- Tools added between OpenClaw 2026.9.5 and 2026.11.2, denied to keep
+        // the 2026.9.5 tool surface.
+        "theme", // Control UI appearance for the requesting user — no UI here
+        "presence", // People and devices online on this gateway — not meaningful per user microVM
       ],
+      // OpenClaw 2026.11.2 enables tool search by default, which offers the model a
+      // short tool list plus a search tool. Keep the full tool list in every request.
+      toolSearch: false,
       // Note: `exec` is intentionally NOT denied — skills like clawhub-manage
       // need Bash(node:*) to run scripts. The scoped STS credential_process
       // narrows the AWS SDK/CLI access to the user's namespace, but it is

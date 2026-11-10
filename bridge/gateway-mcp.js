@@ -8,7 +8,7 @@
  *     headers: { Authorization: "Bearer <per-user Cognito ACCESS token>" }, ...
  *   }
  *
- * to the generated openclaw.json (OpenClaw v2026.9.5 docs/gateway/config-extensions.md).
+ * to the generated openclaw.json (OpenClaw v2026.11.2 docs/gateway/config-extensions.md).
  * With the env var unset nothing is added and the config is byte-identical to
  * the pre-gateway build.
  *

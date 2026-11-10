@@ -17,38 +17,41 @@ RUN pip3 install --no-cache-dir --break-system-packages awscli
 # Pinned to tested versions — update intentionally to avoid unexpected breaking changes.
 # To upgrade: test the new version locally first, then bump both pins here.
 #   openclaw release notes: https://github.com/openclaw/openclaw/releases
-COPY patch-openclaw.js patch-openclaw.test.js /tmp/openclaw-patch/
+COPY patch-openclaw-delivery-expiry.js patch-openclaw-delivery-expiry.test.js /tmp/openclaw-patch/
 COPY patch-openclaw-preinit.js patch-openclaw-preinit.test.js /tmp/openclaw-patch/
 COPY patch-openclaw-snapshot.js patch-openclaw-snapshot.test.js /tmp/openclaw-patch/
 COPY patches/runtime-v2.json /tmp/openclaw-patch/patches/runtime-v2.json
 COPY openclaw-preinit.mjs gateway-invariant-prewarm.mjs scoped-credentials.js /tmp/openclaw-patch/
+COPY state-schema.js state-schema.test.js /tmp/openclaw-patch/
 COPY undici-floor-check.js /tmp/openclaw-patch/undici-floor-check.js
-# Omit the empty subagent status fact at its source; keep active/completed status.
-RUN npm install -g openclaw@2026.9.5 clawhub@0.25.1 --allow-scripts=openclaw
+RUN npm install -g openclaw@2026.11.2 clawhub@0.25.1 --allow-scripts=openclaw
 
-# Patch the undici response-decompression DoS (GHSA-xjj6-f33q-929c). openclaw
-# 2026.9.5 pins undici 8.10.2, which is vulnerable (fixed in 8.12.2); its
-# web_fetch tool reaches this copy, so a crafted reply can crash the gateway.
-# Swap in 8.12.2 in place, leaving the rest of openclaw's pinned tree
-# byte-for-byte as the release shipped it, then gate the build on every undici
-# the image can load (Node's global-fetch copy, openclaw's and clawhub's).
-# openclaw 2026.10.10 ships 8.12.2 and will remove the need for the swap (PR B);
-# the floor check stays. undici lives under node_modules, not in openclaw's
-# dist/, so the SHA-256-pinned dist patches below are unaffected — the three
-# patch-script test suites pass with the forced undici in place.
+# Patch the undici response-decompression DoS (GHSA-xjj6-f33q-929c) in the npm
+# that openclaw 2026.11.2 bundles: npm 12.2.0 ships undici 6.28.0 (fixed in
+# 6.29.1), which only node-gyp's Node-header download loads. Swap in 6.29.1 in
+# place, leaving the rest of the tree as the release shipped it, then gate the
+# build on every undici the image can load (Node's global-fetch copy,
+# openclaw's own 8.12.2, the npm copy and clawhub's). undici lives under
+# node_modules, not in openclaw's dist/, so the pinned dist patches below are
+# unaffected.
 RUN set -eu; \
-    npm install --prefix /tmp/undici-pin --no-save --no-audit --no-fund --ignore-scripts undici@8.12.2; \
-    undici_dir="$(node -e 'process.stdout.write(require("path").dirname(require.resolve("undici/package.json",{paths:["/usr/local/lib/node_modules/openclaw"]})))')"; \
-    test -n "$undici_dir" && test -f "$undici_dir/package.json"; \
+    npm install --prefix /tmp/undici-pin --no-save --no-audit --no-fund --ignore-scripts undici@6.29.1; \
+    undici_dir="$(node -e 'process.stdout.write(require("path").dirname(require.resolve("undici/package.json",{paths:["/usr/local/lib/node_modules/openclaw/node_modules/npm/node_modules/node-gyp"]})))')"; \
+    test "$undici_dir" = /usr/local/lib/node_modules/openclaw/node_modules/npm/node_modules/undici; \
+    test -f "$undici_dir/package.json"; \
     find "$undici_dir" -mindepth 1 -delete; \
     cp -a /tmp/undici-pin/node_modules/undici/. "$undici_dir/"; \
     node /tmp/openclaw-patch/undici-floor-check.js
 
+# Lower the stuck-delivery expiry to 2 h, then apply the preinit and snapshot
+# patches. Each patch script checks the pinned version and SHA-256 hashes, and
+# the state schema versions must match the installed package.
 RUN OPENCLAW_PACKAGE_DIR=/usr/local/lib/node_modules/openclaw \
-      node --test /tmp/openclaw-patch/patch-openclaw.test.js \
+      node --test /tmp/openclaw-patch/patch-openclaw-delivery-expiry.test.js \
         /tmp/openclaw-patch/patch-openclaw-preinit.test.js \
-        /tmp/openclaw-patch/patch-openclaw-snapshot.test.js && \
-    node /tmp/openclaw-patch/patch-openclaw.js /usr/local/lib/node_modules/openclaw && \
+        /tmp/openclaw-patch/patch-openclaw-snapshot.test.js \
+        /tmp/openclaw-patch/state-schema.test.js && \
+    node /tmp/openclaw-patch/patch-openclaw-delivery-expiry.js /usr/local/lib/node_modules/openclaw && \
     node /tmp/openclaw-patch/patch-openclaw-preinit.js /usr/local/lib/node_modules/openclaw && \
     node /tmp/openclaw-patch/patch-openclaw-snapshot.js /usr/local/lib/node_modules/openclaw
 
@@ -152,8 +155,9 @@ COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-package
 # Copy OpenClaw and ClawHub from builder (global npm modules + binaries)
 COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
 # Re-assert the undici floor (GHSA-xjj6-f33q-929c) on the shipped image: the
-# runtime base image's global-fetch undici plus the openclaw and clawhub copies
-# carried from the builder. Fails the build if any is below the fixed version.
+# runtime base image's global-fetch undici plus the openclaw, openclaw npm and
+# clawhub copies carried from the builder. Fails the build if any is below the
+# fixed version.
 COPY undici-floor-check.js /tmp/undici-floor-check.js
 RUN node /tmp/undici-floor-check.js
 # Re-create symlinks instead of COPY (which resolves symlinks and breaks
@@ -227,6 +231,7 @@ COPY workspace-sync.js /app/workspace-sync.js
 COPY workspace-files-s3.js /app/workspace-files-s3.js
 COPY state-storage.js /app/state-storage.js
 COPY legacy-session-import.js /app/legacy-session-import.js
+COPY state-schema.js /app/state-schema.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY startup-timing.js /app/startup-timing.js
 COPY scoped-credentials.js /app/scoped-credentials.js

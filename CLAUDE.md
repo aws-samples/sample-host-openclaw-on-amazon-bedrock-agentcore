@@ -106,7 +106,7 @@ openclaw-on-agentcore/
     token_monitoring_stack.py     # Lambda processor, DynamoDB, token analytics
     cron_stack.py                 # EventBridge Scheduler, Cron executor Lambda, IAM
   bridge/
-    Dockerfile                    # Container image (node:24-slim, ARM64, OpenClaw 2026.9.5, clawhub skills)
+    Dockerfile                    # Container image (node:24-slim, ARM64, OpenClaw 2026.11.2, clawhub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with V2 readiness and full OpenClaw
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images

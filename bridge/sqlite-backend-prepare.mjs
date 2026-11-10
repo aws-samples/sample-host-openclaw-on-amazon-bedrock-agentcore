@@ -6,6 +6,11 @@
  * match at binding, and deferred effects must be activated before callers
  * can consume the retained namespace. Loading definitions alone does not
  * authorize mutable backend effects.
+ *
+ * The patched store worker imports this module first. In an empty receiver
+ * with backend preparation enabled, evaluating it begins preparation, so the
+ * worker's own static imports (which reach tslog in OpenClaw 2026.11.2) are
+ * evaluated under the same deferral as the backend graph.
  */
 export const BACKEND_PREPARE_FLAG = "OPENCLAW_AGENTCORE_SQLITE_BACKEND_PREPARE";
 export const BACKEND_MODULE_URL = "file:///usr/local/lib/node_modules/openclaw/dist/state/openclaw-state.worker.js";
@@ -16,9 +21,12 @@ let generation;
 let consumptions = 0;
 let activated = false;
 let selectorSeed;
-// Pinned import audit: these selectors can become module constants before binding.
-const SELECTOR_KEYS = Object.freeze(["HOME", "OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH",
-  "OPENCLAW_WORKSPACE_DIR", "OPENCLAW_NIX_MODE", "OPENCLAW_BUNDLED_VERSION", "NODE_DEBUG", "VITEST"]);
+// Pinned import audit (2026.11.2 receiver graph): these selectors can become module constants
+// before binding. OPENCLAW_DIAGNOSTICS feeds worker-request-diagnostics' detailed timing flag.
+// NODE_OPTIONS is also read, but only to describe the worker's own startup flags.
+export const SELECTOR_KEYS = Object.freeze(["HOME", "OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH",
+  "OPENCLAW_WORKSPACE_DIR", "OPENCLAW_NIX_MODE", "OPENCLAW_BUNDLED_VERSION", "NODE_DEBUG", "VITEST",
+  "OPENCLAW_DIAGNOSTICS"]);
 const deferred = new Map();
 
 export function backendPreparationEnabled(environment = process.env) {
@@ -123,4 +131,9 @@ export function backendDefinitionPreparationProof() {
     generation_bound: generation !== undefined, deferred_effects: deferred.size,
     activated, consumptions,
   };
+}
+
+// Only the receiver worker carries OPENCLAW_AGENTCORE_EMPTY_SQLITE_RECEIVER; other threads stay inactive.
+if (process.env.OPENCLAW_AGENTCORE_EMPTY_SQLITE_RECEIVER === "1" && backendPreparationEnabled()) {
+  beginBackendDefinitionPreparation();
 }

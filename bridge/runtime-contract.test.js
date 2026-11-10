@@ -22,7 +22,8 @@ function loadContract(t, {
   signBrowser, cleanup = async () => {}, activationTimeoutMs = 1000,
   managerFactory, persistenceSave, gatewayTurnImpl, privsepMock,
   prepare = Promise.resolve(), gatewayActivation = Promise.resolve(), migration,
-  migrationExitCode = 0, remainingLegacy = false,
+  migrationExitCode = 0, remainingLegacy = false, legacyIndex = Boolean(migration),
+  outdatedSchema = [], outdatedAfterDoctor = false,
   home = "/test-home", beforeFsOperation, proxyHealth, runtimeEnv = {},
 } = {}) {
   let handler;
@@ -63,7 +64,7 @@ function loadContract(t, {
     existsSync: (filename) => poisoned && filename === stateDir || files.has(filename),
     readdirSync: () => poisoned ? ["state.sqlite"] : [],
     readFileSync: (filename) => {
-      if (filename.endsWith("/openclaw/package.json")) return '{"version":"2026.9.5"}';
+      if (filename.endsWith("/openclaw/package.json")) return '{"version":"2026.11.2"}';
       if (filename.startsWith("/skills/")) return "# Skill";
       if (files.has(filename)) return files.get(filename);
       return fs.readFileSync(filename, "utf8");
@@ -329,13 +330,20 @@ function loadContract(t, {
     },
     "./legacy-session-import": {
       pruneRetiredFiles: () => ({ pruned: [], changed: [] }),
-      planLegacyImport: () => ({ alreadyImported: [], toImport: migration ? ["legacy-index"] : [] }),
+      planLegacyImport: () => ({ alreadyImported: [], toImport: legacyIndex ? ["legacy-index"] : [] }),
       findLegacySessionStores: () => remainingLegacy ? ["legacy-index"] : [],
       fingerprintIndexes: () => [],
       fingerprintStateDir: () => new Map(),
       writeReceipts: () => [],
       diffRetiredFiles: () => [],
       writeRetiredManifest: () => null,
+    },
+    "./state-schema": {
+      findOutdatedStores: (dir) => {
+        assert.equal(dir, stateDir);
+        calls.push("schema:check");
+        return calls.includes("migration:done") && !outdatedAfterDoctor ? [] : outdatedSchema;
+      },
     },
     "./runtime-skills": {
       manifestPath: (dir) => `${dir}/runtime-skills.json`,
@@ -353,10 +361,6 @@ function loadContract(t, {
         ready();
         assert.equal(options.configProbe, true);
         calls.push("gateway:verified");
-      },
-      dismissStaleSuspendedDeliveries: async () => {
-        calls.push("gateway:sweep");
-        return { phase: "done", listed: 0, candidates: [], dismissed: [], notDismissed: [] };
       },
       watchChatEvents: () => {
         calls.push("gateway:watch");
@@ -587,7 +591,7 @@ for (const home of ["/test-home", ""]) {
       realpath: (file) => file,
       readFile: (file) => {
         assert.equal(file, `${PACKAGE_ROOT}/package.json`, "Preparation must not read user state.");
-        return '{"name":"openclaw","version":"2026.9.5"}';
+        return '{"name":"openclaw","version":"2026.11.2"}';
       },
       importModule: async (url) => {
         if (url.endsWith(RUNTIME_FILES.server)) return {};
@@ -801,10 +805,8 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   // An action-less payload no longer falls into the status branch.
   assert.match((await app.request({ ...owner })).body.response, /Unknown action/);
   assert.ok(app.calls.some((call) => call.includes("[OPENCLAW_IMAGES:")));
-  // The stale suspended-delivery sweep runs once, after readiness, before the first turn.
-  assert.equal(app.calls.filter((call) => call === "gateway:sweep").length, 1);
-  assert.ok(app.calls.indexOf("gateway:verified") < app.calls.indexOf("gateway:sweep"));
-  assert.ok(app.calls.indexOf("gateway:sweep") < app.calls.indexOf("chat.send"));
+  // The verified gateway readiness precedes the first turn; no task-RPC sweep runs in between.
+  assert.ok(app.calls.indexOf("gateway:verified") < app.calls.indexOf("chat.send"));
   assert.equal((await app.request({ ...owner, action: "warmup" })).body.status, "ready");
   assert.equal(app.children.find((child) => child.kind === "node").env.NODE_COMPILE_CACHE, "/app/.compile-cache");
   const phases = app.logs.map((line) => line.match(
@@ -852,6 +854,42 @@ for (const options of [{ migrationExitCode: 1 }, { remainingLegacy: true }]) {
     assert.ok(app.errors.some((error) => error.includes("Legacy session import did not complete")));
   });
 }
+
+// OpenClaw 2026.11.2 refuses an agent database written by 2026.9.5 until doctor upgrades it.
+const OLD_AGENT_STORE = { kind: "agent", file: "/test-home/.openclaw/agents/main/agent/openclaw-agent.sqlite",
+  version: 21, required: 27 };
+test("a restored 2026.9.5 state schema runs doctor before activation", async (t) => {
+  const app = loadContract(t, { migration: Promise.resolve(), legacyIndex: false, outdatedSchema: [OLD_AGENT_STORE] });
+  await tick();
+  const result = await app.request({ ...owner, action: "chat", message: { text: "hi" } });
+  assert.equal(result.body.phase, "USER_READY", app.errors.join("\n"));
+  assert.equal(app.activations.length, 1);
+  const doctor = app.calls.indexOf("spawn:doctor");
+  assert.ok(doctor !== -1, "doctor upgrades the schema");
+  assert.ok(app.calls.indexOf("schema:check") < doctor);
+  assert.ok(app.calls.lastIndexOf("schema:check") > app.calls.indexOf("migration:done"), "the upgrade is verified");
+  assert.ok(app.logs.includes("[contract] OpenClaw state schema upgrade needed: agent 21->27"), app.logs.join("\n"));
+});
+
+test("a state schema that doctor did not upgrade fails activation", async (t) => {
+  const app = loadContract(t, { migration: Promise.resolve(), legacyIndex: false,
+    outdatedSchema: [OLD_AGENT_STORE], outdatedAfterDoctor: true });
+  await tick();
+  const reply = await app.request({ ...owner, action: "chat", message: "hello" });
+  assert.equal(reply.body.status, "error");
+  assert.equal(app.activations.length, 0);
+  assert.ok(!app.calls.includes("chat.send"));
+  assert.ok(app.errors.some((error) => error.includes("OpenClaw state schema upgrade did not complete")), app.errors.join("\n"));
+});
+
+test("a current state schema runs no doctor", async (t) => {
+  const app = loadContract(t);
+  await tick();
+  const result = await app.request({ ...owner, action: "chat", message: { text: "hi" } });
+  assert.equal(result.body.phase, "USER_READY", app.errors.join("\n"));
+  assert.ok(app.calls.includes("schema:check"));
+  assert.ok(!app.calls.includes("spawn:doctor"));
+});
 
 test("activation timeout stops the prepared child and rejects a late activation acknowledgement", async (t) => {
   const gatewayActivation = deferred();

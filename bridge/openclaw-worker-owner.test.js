@@ -36,7 +36,7 @@ function fixture(t, options = {}) {
 
 async function prepared(f) {
   const promise = f.owner.prepare();
-  f.child.emit("message", { type: "openclaw:prepared", version: "2026.9.5" });
+  f.child.emit("message", { type: "openclaw:prepared", version: "2026.11.2" });
   await promise;
 }
 
@@ -89,7 +89,7 @@ test("preparation waits for the child and preserves that child for activation", 
   assert.equal(spawnOptions.env.OPENCLAW_NO_RESPAWN, "1");
   assert.equal(spawnOptions.env.NODE_DISABLE_COMPILE_CACHE, "1");
   assert.equal(spawnOptions.stdio[3], "ipc");
-  f.child.emit("message", { type: "openclaw:prepared", version: "2026.9.5" });
+  f.child.emit("message", { type: "openclaw:prepared", version: "2026.11.2" });
   await promise;
   const activating = f.owner.activate(activation());
   assert.equal(f.child.messages[0].env.USER_ID, binding.actorId);

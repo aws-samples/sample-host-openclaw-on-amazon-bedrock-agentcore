@@ -104,7 +104,7 @@ suppressions documented inline in `stacks/gateway_stack.py`.
 }
 ```
 
-This is the `mcp.servers` shape from OpenClaw 2026.9.5 (`docs/gateway/config-extensions.md`,
+This is the `mcp.servers` shape from OpenClaw 2026.11.2 (`docs/gateway/config-extensions.md`,
 `docs/tools/mcp.md`; built-in OpenClaw sessions read the in-process MCP catalog). `mcp` is a
 hot-reloadable key: "MCP config changes retire only changed or removed server connections ...
 active runs can continue calling their tools" (`docs/gateway/configuration/hot-reload.md`).

@@ -226,50 +226,18 @@ test("restored instances do not reuse external idempotency keys or RPC IDs with 
   assert.equal(gateway.calls.filter((method) => method === "chat.send").length, 3);
 });
 
-// ── Startup sweep of stale suspended sub-agent deliveries ───────────────────
-// openclaw 2026.9.5 keeps a sub-agent result whose delivery was suspended in
-// every main-session turn ("Child results awaiting delivery") for 7 days.
-// The bridge dismisses suspended deliveries older than 2 h at startup.
+// ── Log helpers ─────────────────────────────────────────────────────────────
+// The stale-delivery startup sweep is gone: OpenClaw 2026.11.2 removed the
+// tasks.list/tasks.dismiss RPCs, and patch-openclaw-delivery-expiry.js makes the
+// gateway expire a suspended sub-agent delivery after 2 h itself.
 
-const lifecycle = require("./gateway-lifecycle");
-
-const HOUR = 60 * 60 * 1000;
-const NOW = Date.parse("2026-10-14T00:00:00Z");
-const TASK_METHODS = ["chat.send", "last-heartbeat", "config.get", "tasks.list", "tasks.dismiss"];
-
-// openclaw 2026.9.5 packages/gateway-protocol (dist/src-*.mjs) closed schemas.
-const TASK_SUMMARY_KEYS = new Set([
-  "id", "kind", "runtime", "status", "title", "agentId", "sessionKey", "childSessionKey",
-  "hasTranscript", "ownerKey", "runId", "taskId", "flowId", "parentTaskId", "sourceId",
-  "createdAt", "updatedAt", "startedAt", "endedAt", "toolUseCount", "lastToolName", "execution",
-  "lastActivity", "diffStat", "progressSummary", "terminalSummary", "error", "deliveryStatus",
-  "terminalOutcome", "result", "prompt",
-]);
-const TASK_LEDGER_STATUSES = ["queued", "running", "completed", "failed", "cancelled", "timed_out"];
-const TASK_DELIVERY_STATUSES = ["pending", "delivered", "session_queued", "failed", "dismissed",
-  "parent_missing", "not_applicable"];
-const TASK_TERMINAL_OUTCOMES = ["succeeded", "blocked"];
-const TASKS_LIST_PARAM_KEYS = new Set(["status", "agentId", "sessionKey", "limit", "cursor", "sortBy"]);
-
-/**
- * One tasks.list entry as mapTaskSummary (dist/task-summary-*.mjs) returns it
- * for a sub-agent whose completion delivery was suspended on expiry:
- * blockSubagentCompletionDelivery writes deliveryStatus "failed" and
- * resolveRequiredCompletionDeliveryFailureTerminalResult writes
- * terminalOutcome "blocked". Ids are placeholders.
- */
-function suspendedTask(overrides = {}) {
-  return {
-    id: "task-old", taskId: "task-old", kind: "subagent", runtime: "subagent", status: "completed",
-    execution: { state: "finished" }, title: "placeholder sub-agent label",
-    sessionKey: "agent:main:main", childSessionKey: "agent:main:subagent:placeholder",
-    hasTranscript: true, ownerKey: "agent:main:main", runId: "run-old",
-    createdAt: NOW - 6 * HOUR, updatedAt: NOW - 3 * HOUR, startedAt: NOW - 6 * HOUR, endedAt: NOW - 5 * HOUR,
-    terminalSummary: "Required completion delivery failed before reaching the requester: delivery path none did not complete.",
-    deliveryStatus: "failed", terminalOutcome: "blocked",
-    ...overrides,
-  };
-}
+test("activation no longer sweeps sub-agent deliveries over task RPCs", () => {
+  const lifecycleSource = fs.readFileSync(path.join(__dirname, "gateway-lifecycle.js"), "utf8");
+  const contractSource = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf8");
+  for (const source of [lifecycleSource, contractSource]) {
+    assert.doesNotMatch(source, /dismissStaleSuspendedDeliveries|tasks\.list|tasks\.dismiss/);
+  }
+});
 
 function recordingLog() {
   const lines = [];
@@ -285,173 +253,6 @@ function assertConstantFormats(lines, ids) {
     for (const id of ids) assert.ok(!format.includes(id), `format string must not embed ${id}`);
   }
 }
-
-function taskGateway(t, { pages, dismiss, methods = TASK_METHODS } = {}) {
-  const dismissCalls = [];
-  const listCalls = [];
-  return fakeGateway(t, {
-    methods,
-    handlers: {
-      "tasks.list": ({ frame, reply }) => {
-        listCalls.push(frame.params);
-        for (const key of Object.keys(frame.params)) {
-          if (!TASKS_LIST_PARAM_KEYS.has(key)) return reply(false, undefined);
-        }
-        if (!Number.isInteger(frame.params.limit) || frame.params.limit < 1 || frame.params.limit > 500) {
-          return reply(false, undefined);
-        }
-        const index = frame.params.cursor ? Number(frame.params.cursor.split(".")[1]) : 0;
-        const page = pages[index];
-        reply(true, { tasks: page, ...(index + 1 < pages.length ? { nextCursor: `1.${index + 1}` } : {}) });
-      },
-      "tasks.dismiss": ({ frame, reply, socket }) => {
-        assert.deepEqual(Object.keys(frame.params), ["taskIds"]);
-        assert.ok(frame.params.taskIds.length >= 1 && frame.params.taskIds.length <= 10);
-        dismissCalls.push(frame.params.taskIds);
-        if (dismiss) return dismiss({ frame, reply, socket });
-        reply(true, { results: frame.params.taskIds.map((taskId) => ({
-          taskId, ok: true, task: suspendedTask({ id: taskId, taskId, deliveryStatus: "dismissed" }),
-        })) });
-      },
-    },
-  }).then((gateway) => ({ ...gateway, dismissCalls, listCalls }));
-}
-
-test("fixtures match the openclaw 2026.9.5 task summary schema", () => {
-  for (const task of [suspendedTask(), suspendedTask({ deliveryStatus: "dismissed" })]) {
-    for (const key of Object.keys(task)) assert.ok(TASK_SUMMARY_KEYS.has(key), `unknown TaskSummary key ${key}`);
-    assert.ok(TASK_LEDGER_STATUSES.includes(task.status));
-    assert.ok(TASK_DELIVERY_STATUSES.includes(task.deliveryStatus));
-    assert.ok(TASK_TERMINAL_OUTCOMES.includes(task.terminalOutcome));
-  }
-  assert.equal(lifecycle.STALE_DELIVERY_MS, 2 * HOUR);
-});
-
-test("an old suspended sub-agent delivery is dismissed exactly once", async (t) => {
-  const gateway = await taskGateway(t, { pages: [[suspendedTask()]] });
-  const out = recordingLog();
-  const result = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: gateway.url, token: "secret", now: NOW, log: out, deadline: Date.now() + 2000,
-  });
-  assert.deepEqual(gateway.dismissCalls, [["task-old"]]);
-  assert.deepEqual(gateway.listCalls, [{ status: "completed", limit: 500 }]);
-  assert.equal(result.phase, "done");
-  assert.deepEqual(result.dismissed, ["task-old"]);
-  assert.ok(out.lines.some(([level, format, ...args]) => level === "log" && /Dismissed/.test(format) &&
-    args.includes("task-old") && args.includes("run-old")));
-  assert.ok(out.lines.some(([level, format, ...args]) => level === "log" && /sweep/.test(format) &&
-    [format, ...args].join(" ") === "[gateway] Stale delivery sweep: listed 1 stale 1 dismissed 1 not_dismissed 0"));
-  assertConstantFormats(out.lines, ["task-old", "run-old"]);
-  assert.ok(!gateway.calls.includes("chat.send"));
-});
-
-test("fresh, delivered, dismissed, intentional non-delivery and non-subagent tasks are left alone", async (t) => {
-  const gateway = await taskGateway(t, { pages: [[
-    suspendedTask({ id: "fresh", taskId: "fresh", updatedAt: NOW - 30 * 60 * 1000, endedAt: NOW - 40 * 60 * 1000 }),
-    suspendedTask({ id: "late-update", taskId: "late-update", updatedAt: NOW - HOUR }),
-    suspendedTask({ id: "delivered", taskId: "delivered", deliveryStatus: "delivered", terminalOutcome: "succeeded" }),
-    suspendedTask({ id: "dismissed", taskId: "dismissed", deliveryStatus: "dismissed" }),
-    // Intentional non-delivery: deliveryStatus "failed" with no blocked outcome.
-    suspendedTask({ id: "intentional", taskId: "intentional", terminalOutcome: undefined,
-      terminalSummary: undefined }),
-    suspendedTask({ id: "cron", taskId: "cron", runtime: "cron", kind: "cron" }),
-    suspendedTask({ id: "undated", taskId: "undated", updatedAt: undefined, endedAt: undefined }),
-  ]] });
-  const result = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: gateway.url, token: "secret", now: NOW, log: recordingLog(), deadline: Date.now() + 2000,
-  });
-  assert.deepEqual(gateway.dismissCalls, []);
-  assert.equal(result.phase, "done");
-  assert.equal(result.listed, 7);
-  assert.deepEqual(result.candidates, []);
-});
-
-test("ISO timestamps, pagination and batches of ten follow the 2026.9.5 limits", async (t) => {
-  const old = (i) => suspendedTask({ id: `task-${i}`, taskId: `task-${i}`, runId: `run-${i}`,
-    updatedAt: new Date(NOW - 3 * HOUR).toISOString(), endedAt: new Date(NOW - 4 * HOUR).toISOString() });
-  const gateway = await taskGateway(t, { pages: [
-    Array.from({ length: 7 }, (_, i) => old(i)),
-    Array.from({ length: 5 }, (_, i) => old(i + 7)),
-  ] });
-  const result = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: gateway.url, token: "secret", now: NOW, log: recordingLog(), deadline: Date.now() + 2000,
-  });
-  assert.equal(gateway.listCalls.length, 2);
-  assert.equal(gateway.listCalls[1].cursor, "1.1");
-  assert.deepEqual(gateway.dismissCalls.map((ids) => ids.length), [10, 2]);
-  assert.equal(result.dismissed.length, 12);
-});
-
-test("a tasks.dismiss error is logged and the sweep still resolves", async (t) => {
-  const gateway = await taskGateway(t, {
-    pages: [[suspendedTask()]],
-    dismiss: ({ frame, socket }) => socket.send(JSON.stringify({ type: "res", id: frame.id, ok: false,
-      error: { code: "UNAVAILABLE", message: "dismiss failed" } })),
-  });
-  const out = recordingLog();
-  const result = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: gateway.url, token: "secret", now: NOW, log: out, deadline: Date.now() + 2000,
-  });
-  assert.equal(result.phase, "done");
-  assert.deepEqual(result.dismissed, []);
-  assert.deepEqual(result.notDismissed, [{ taskId: "task-old", reason: "dismiss failed" }]);
-  assert.ok(out.lines.some(([level, , ...args]) => level === "warn" && args.includes("dismiss failed")));
-  assertConstantFormats(out.lines, ["task-old"]);
-});
-
-test("a per-task refusal (delivery no longer suspended) is logged, not counted", async (t) => {
-  const gateway = await taskGateway(t, {
-    pages: [[suspendedTask()]],
-    dismiss: ({ frame, reply }) => reply(true, { results: [
-      { taskId: frame.params.taskIds[0], ok: false, reason: "completion delivery is not blocked" },
-    ] }),
-  });
-  const out = recordingLog();
-  const result = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: gateway.url, token: "secret", now: NOW, log: out, deadline: Date.now() + 2000,
-  });
-  assert.deepEqual(result.dismissed, []);
-  assert.deepEqual(result.notDismissed, [{ taskId: "task-old", reason: "completion delivery is not blocked" }]);
-});
-
-test("list failure, missing task methods, hangs and dead gateways never reject", async (t) => {
-  const failing = await fakeGateway(t, { methods: TASK_METHODS, handlers: {
-    "tasks.list": ({ reply }) => reply(false, undefined),
-  } });
-  const out = recordingLog();
-  const failed = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: failing.url, token: "secret", now: NOW, log: out, deadline: Date.now() + 2000,
-  });
-  assert.equal(failed.phase, "failed");
-  assert.ok(out.lines.some(([level]) => level === "warn"));
-  assertConstantFormats(out.lines, []);
-
-  const old = await taskGateway(t, { pages: [[suspendedTask()]], methods: ["chat.send", "last-heartbeat"] });
-  const skipped = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: old.url, token: "secret", now: NOW, log: recordingLog(), deadline: Date.now() + 2000,
-  });
-  assert.equal(skipped.phase, "skipped");
-  assert.deepEqual(old.listCalls, []);
-
-  const hanging = await fakeGateway(t, { methods: TASK_METHODS, handlers: { "tasks.list": () => {} } });
-  const started = Date.now();
-  const hung = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: hanging.url, token: "secret", now: NOW, log: recordingLog(), deadline: Date.now() + 150,
-  });
-  assert.equal(hung.phase, "failed");
-  assert.ok(Date.now() - started < 1500);
-
-  const dead = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: "ws://127.0.0.1:1", token: "secret", now: NOW, log: recordingLog(), deadline: Date.now() + 500,
-  });
-  assert.equal(dead.phase, "failed");
-
-  const rejected = await fakeGateway(t, { auth: false, methods: TASK_METHODS });
-  const unauth = await lifecycle.dismissStaleSuspendedDeliveries({
-    url: rejected.url, token: "secret", now: NOW, log: recordingLog(), deadline: Date.now() + 500,
-  });
-  assert.equal(unauth.phase, "failed");
-});
 
 // ── Final delivery: only the run's answer, not the whole run buffer ─────────
 // openclaw 2026.9.5 server-chat emitChatDelta/emitChatTerminal join every
@@ -703,7 +504,8 @@ test("bridge log lines render the same through console and the CloudWatch logger
   // apply printf placeholders, so "%s" would reach CloudWatch literally.
   const src = fs.readFileSync(path.join(__dirname, "gateway-lifecycle.js"), "utf8");
   const calls = [...src.matchAll(/log\?\.(?:log|warn)\?\.\(\s*("(?:[^"\\]|\\.)*")/g)];
-  assert.ok(calls.length >= 8);
+  // Seven call sites remain after the stale-delivery sweep (six more) was removed.
+  assert.ok(calls.length >= 7);
   for (const [, literal] of calls) assert.doesNotMatch(literal, /%[sdifjoOc]/, literal);
 });
 
@@ -772,19 +574,16 @@ test("the contract's turn keeps handing the gateway result to delivery unchanged
   assert.match(contract, /outcome\.response \|\| "The request completed without a text response\."/);
 });
 
-test("the contract runs the sweep after gateway readiness and before the first turn", () => {
+test("the contract starts the relay and marks the gateway ready only after readiness", () => {
   const contract = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf8");
-  assert.match(contract, /dismissStaleSuspendedDeliveries[^;]*\} = require\("\.\/gateway-lifecycle"\)/s);
   const branch = contract.indexOf("const gatewayBranch = async () => {");
   assert.notEqual(branch, -1);
   const body = contract.slice(branch, contract.indexOf("const browserBranch", branch));
   const ready = body.indexOf("await waitForGateway(");
-  const sweep = body.indexOf("await dismissStaleSuspendedDeliveries(");
+  const relay = body.indexOf("startLateAnnounceRelay();");
   const flag = body.indexOf("openclawReady = true;");
-  assert.ok(ready !== -1 && sweep > ready && flag > sweep, "sweep must sit between readiness and openclawReady");
-  const v2 = contract.indexOf("async function handleV2Invocation(");
-  const v2Body = contract.slice(v2, contract.indexOf("\n}\n", v2));
-  assert.ok(!v2Body.includes("dismissStaleSuspendedDeliveries"), "handleV2Invocation stays untouched");
+  assert.ok(ready !== -1 && relay > ready && flag > relay, "relay and openclawReady must follow readiness");
+  assert.ok(!body.includes("dismissStaleSuspendedDeliveries"), "no stale-delivery sweep before the first turn");
 });
 
 // ── A run already active on the main session (restart recovery) ─────────────

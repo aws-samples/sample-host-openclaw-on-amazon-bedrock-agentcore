@@ -38,7 +38,7 @@ export function createInvariantPrewarmer() {
       pins = JSON.parse(fs.readFileSync(new URL("./patches/runtime-v2.json", import.meta.url), "utf8")).files;
       if (!Array.isArray(pins) || !pins.length) throw new Error("Missing SQLite preparation source pins");
       verify();
-      broker = await guarded(() => importModule(new URL("dist/sqlite-worker-store-CpUHa3pA.mjs", launcherUrl).href));
+      broker = await guarded(() => importModule(new URL("dist/sqlite-worker-store-CpfrwHqQ.mjs", launcherUrl).href));
       live();
       await guarded(() => broker.prepareUnboundSqliteReceiver({ timeoutMs: 10000 }));
       this.proof();

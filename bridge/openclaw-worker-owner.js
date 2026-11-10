@@ -81,7 +81,7 @@ function createPreparedGateway({
 
   function onMessage(message) {
     if (state === "PREPARING" && message?.type === "openclaw:prepared" &&
-        message.version === "2026.9.5") {
+        message.version === "2026.11.2") {
       state = "PREPARED";
       clearPending();
     } else if (state === "ACTIVATING" && message?.type === "openclaw:activated" &&

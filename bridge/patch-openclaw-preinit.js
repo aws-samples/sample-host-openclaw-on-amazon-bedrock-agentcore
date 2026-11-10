@@ -3,6 +3,8 @@
  *
  * The added reset refreshes the instance ID and clock origins after user
  * binding, once per process and only while self-presence is the sole entry.
+ * The gateway is spawned after the snapshot restore, so this now guards the
+ * preparation window rather than a snapshotted process.
  * Package version, source hashes, and replacement anchors are pinned; all
  * required inputs and resulting hashes are checked before vendor files change.
  */
@@ -10,10 +12,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createHash } = require("node:crypto");
 
-const OPENCLAW_VERSION = "2026.9.5";
+const OPENCLAW_VERSION = "2026.11.2";
 const LAUNCHER_FILE = "openclaw.mjs";
-const PRESENCE_FILE = "dist/system-presence-B9mMmTN5.mjs";
-const PRESENCE_EXPORT = "export { upsertPresence as i, touchPresence as n, updateSystemPresence as r, listSystemPresence as t };";
+const PRESENCE_FILE = "dist/system-presence-Di2OrVHO.mjs";
+const PRESENCE_EXPORT = "export { upsertPresence as a, updateSystemPresence as i, listSystemPresence as n, touchPresence as r, commitPresence as t };";
 const PRESENCE_RESET = `// AgentCore calls this only after binding, before the original CLI starts.
 let agentCorePresenceReset = false;
 function resetAgentCoreSnapshotPresence() {
@@ -30,20 +32,21 @@ function resetAgentCoreSnapshotPresence() {
 \tinitSelfPresence();
 \tagentCorePresenceReset = true;
 }
-export { resetAgentCoreSnapshotPresence, upsertPresence as i, touchPresence as n, updateSystemPresence as r, listSystemPresence as t };`;
+export { resetAgentCoreSnapshotPresence, upsertPresence as a, updateSystemPresence as i, listSystemPresence as n, touchPresence as r, commitPresence as t };`;
 
 const PATCHES = Object.freeze([
   Object.freeze({
     file: PRESENCE_FILE,
-    originalSha256: "36f48de3d1ea40ab551a0bef2c55da17bd71c6f73ead689622b5bb4d9a457671",
-    patchedSha256: "c58957886f965656d3fa751bec6ebcf49f8dbfe5a809560e2ad6f13da3bae52b",
+    originalSha256: "0671b94acc271233e3a03c065536cf1f0434b8e1817d8e885177f69473ed68e3",
+    patchedSha256: "63b624abc8629e1e236801c2b6758fc0f7d2a2e35f0a9409ee83c0315b2cf645",
   }),
 ]);
 const PINNED_RUNTIME_FILES = Object.freeze({
-  [LAUNCHER_FILE]: "538e8ee2b65a0b24bb8a5ed3421bfe66621b1e0b5f726a167758c004f566fb36",
-  "dist/server-start-gE7ggn-j.mjs": "ca2f0adbe8273b170462bfe9a0a25f53a77c9828fb22cbb7160cae186f9af7d8",
-  "dist/get-reply-from-config.runtime-uSvr2ey5.mjs": "a58da16a2a15c2457e90853fdeeb3fe6c52764a25a89d3e71a67d80d98a84b62",
-  "dist/get-reply-DN4OcavF.mjs": "ddacdea4bc3ea5e0fc10418e7c2688f76f97fe74358b03ba6d6c29ded4c51081",
+  [LAUNCHER_FILE]: "469e60c9f60b615ff71c985a54238ee532a8f949866d76aebe7d6e4bc7219902",
+  // The gateway's lazily loaded server implementation (startGatewayServerCore).
+  "dist/gateway-prewarm.js": "78681bb339bea4253b22860dd450fbce59663b411ccddf21bae661c87681b3cb",
+  "dist/get-reply-from-config.runtime-COs94SyF.mjs": "2456193106b30c00117cd8743a09e8f0a7aab35176c59659cfcbb70635ddf4a3",
+  "dist/get-reply-CvPWdKII.mjs": "7ef72b03167d556c1aee49c50b46e01e8b64fbeb1e82c670ee012f52f037454d",
 });
 
 function sha256(source) {

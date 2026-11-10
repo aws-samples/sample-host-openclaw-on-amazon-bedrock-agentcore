@@ -15,12 +15,21 @@ const { PRIMARY_MODEL_ID, FALLBACK_MODEL_ID, SUBAGENT_MODEL_ID } = require("./mo
 
 const SOURCE_PINS = [
   ["/app/system-messages.js", "aaf0d64a1d0b53585286edbb1fba4bb468afe13c3672054a1a908ce3a89b2060"],
-  ["/usr/local/lib/node_modules/openclaw/dist/system-prompt-params-DtkB_Kxm.mjs",
-    "3437ad361afcfbc4e9072f430a8f4a04f139f7b61c4f3ffc787b038147c1b7e4"],
-  ["/usr/local/lib/node_modules/openclaw/node_modules/@openclaw/ai/dist/openai-completions-DJ1Vm-CD.mjs",
-    "7f6385963407435415aed2108c0f88817a13e9a7728aae10beeb6c180af4f550"],
-  ["/usr/local/lib/node_modules/openclaw/node_modules/@openclaw/ai/dist/openai-completions-stream-Bu98b0Hv.mjs",
-    "761ac664eaf802b14fa0d6f482253f4e8846bc684526ff55ace660fdc568c7ce"],
+  // OpenClaw 2026.11.2: buildAgentSystemPrompt, which places SYSTEM_PROMPT_CACHE_BOUNDARY.
+  ["/usr/local/lib/node_modules/openclaw/dist/system-prompt-BqEmWpCF.mjs",
+    "37e244f4117c91b38ef465db181bee87dd92a144f9602d3239e354339e9dcbbe"],
+  // The STABLE/DYNAMIC markers around the boundary split.
+  ["/usr/local/lib/node_modules/openclaw/dist/session-prompt-state-Bw4h3BAn.mjs",
+    "07ce6ae39fe6b19ef3c82a8b65478e080422fd905f4a97ce995f4d60a494fff9"],
+  // SYSTEM_PROMPT_CACHE_BOUNDARY and splitSystemPromptCacheBoundary.
+  ["/usr/local/lib/node_modules/openclaw/node_modules/@openclaw/ai/dist/simple-options-xJkqrG_E.mjs",
+    "eae593e04f063b1008ba6023925bf80c5146665c2cf9207a4be9b1535d77ecad"],
+  // System message conversion and cache_control placement, managed and direct transports.
+  ["/usr/local/lib/node_modules/openclaw/node_modules/@openclaw/ai/dist/openai-completions-transport-CnFaKYO-.mjs",
+    "fad80fee04aecfedbbdb13e6a39787ef7a96a1ca940452ac5d90a9ac008e2525"],
+  // Direct openai-completions provider entry.
+  ["/usr/local/lib/node_modules/openclaw/node_modules/@openclaw/ai/dist/openai-completions-BdfBhFjx.mjs",
+    "079283034d7b2a4d9cf7579f2e9235f8e9de4bada90b32b4680ba3a30b29c272"],
 ];
 const MAX_ITEMS = 4096, MAX_TEXT_UNITS = 4 * 1024 * 1024;
 const data = (value, key) => value && typeof value === "object"

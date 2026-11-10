@@ -358,8 +358,9 @@ describe("retired-files wiring in agentcore-contract.js (F5)", () => {
     const restored = idx("await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);");
     const prune = idx("const resurrected = pruneResurrectedLegacyFiles();");
     const config = source.indexOf("writeOpenClawConfig();", prune);
-    const doctor = idx("migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 })");
-    assert.ok(restored < prune && prune < config && config < doctor);
+    const force = idx("const forceDoctor = resurrected.changed.length > 0 || outdatedStores.length > 0;");
+    const doctor = idx("migrateLegacySessionStore(openclawEnv, { forceDoctor })");
+    assert.ok(restored < prune && prune < config && config < force && force < doctor);
     assert.ok(source.includes("legacySessionImport.pruneRetiredFiles(OPENCLAW_DIR)"));
   });
 

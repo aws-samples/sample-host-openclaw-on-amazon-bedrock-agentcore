@@ -927,6 +927,14 @@ function convertTools(openaiTools) {
  */
 function convertMessages(messages) {
   const bedrockMessages = [];
+  // Converse needs alternating roles. OpenClaw 2026.11.2 sends its runtime-context
+  // message as a second user message after the user's own, and a steered message
+  // can follow tool results, so consecutive user-role entries share one message.
+  const pushUser = (content) => {
+    const prev = bedrockMessages[bedrockMessages.length - 1];
+    if (prev && prev.role === "user") prev.content.push(...content);
+    else bedrockMessages.push({ role: "user", content });
+  };
   for (const msg of messages) {
     if (msg.role === "system") continue;
 
@@ -942,20 +950,17 @@ function convertMessages(messages) {
           }
         }
         if (bedrockContent.length > 0) {
-          bedrockMessages.push({ role: "user", content: bedrockContent });
+          pushUser(bedrockContent);
         }
       } else {
-        bedrockMessages.push({
-          role: "user",
-          content: [
-            {
-              text:
-                typeof msg.content === "string"
-                  ? msg.content
-                  : JSON.stringify(msg.content),
-            },
-          ],
-        });
+        pushUser([
+          {
+            text:
+              typeof msg.content === "string"
+                ? msg.content
+                : JSON.stringify(msg.content),
+          },
+        ]);
       }
     } else if (msg.role === "assistant") {
       const content = [];
@@ -1010,20 +1015,8 @@ function convertMessages(messages) {
           ],
         },
       };
-      // If the previous message is already a user message with toolResult, append
-      const prev = bedrockMessages[bedrockMessages.length - 1];
-      if (
-        prev &&
-        prev.role === "user" &&
-        prev.content.some((c) => c.toolResult)
-      ) {
-        prev.content.push(toolResultContent);
-      } else {
-        bedrockMessages.push({
-          role: "user",
-          content: [toolResultContent],
-        });
-      }
+      // Consecutive tool results share the user message that follows the tool use.
+      pushUser([toolResultContent]);
     }
   }
 
@@ -1615,14 +1608,19 @@ const server = http.createServer(async (req, res) => {
           );
         }
 
-        // --- Preprocess images: extract markers from last user message ---
+        // --- Preprocess images: extract markers from the latest user turn ---
+        // The turn is the run of user messages ending at the last one. OpenClaw
+        // 2026.11.2 appends its runtime-context message after the user's own
+        // message, so the marker is not always in the last user message.
         let processedMessages = messages;
         const lastUserIdx = messages.reduce(
           (acc, m, i) => (m.role === "user" ? i : acc),
           -1,
         );
-        if (lastUserIdx >= 0) {
-          const lastUser = messages[lastUserIdx];
+        let firstUserIdx = lastUserIdx;
+        while (firstUserIdx > 0 && messages[firstUserIdx - 1].role === "user") firstUserIdx--;
+        for (let userIdx = firstUserIdx; lastUserIdx >= 0 && userIdx <= lastUserIdx; userIdx++) {
+          const lastUser = processedMessages[userIdx];
           const textContent =
             typeof lastUser.content === "string"
               ? lastUser.content
@@ -1635,7 +1633,7 @@ const server = http.createServer(async (req, res) => {
           const { cleanText, images } = extractImageReferences(textContent);
           if (images.length > 0) {
             console.log(
-              `[proxy] Found ${images.length} image reference(s) in last user message`,
+              `[proxy] Found ${images.length} image reference(s) in the latest user turn`,
             );
             const contentParts = [];
             if (cleanText) {
@@ -1660,9 +1658,9 @@ const server = http.createServer(async (req, res) => {
             if (contentParts.length > 0) {
               // Build new messages array (immutable — don't mutate original)
               processedMessages = [
-                ...messages.slice(0, lastUserIdx),
+                ...processedMessages.slice(0, userIdx),
                 { ...lastUser, content: contentParts },
-                ...messages.slice(lastUserIdx + 1),
+                ...processedMessages.slice(userIdx + 1),
               ];
             } else {
               console.warn(

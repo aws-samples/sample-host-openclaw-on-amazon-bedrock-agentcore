@@ -273,7 +273,7 @@ describe("contract wiring", () => {
   });
 
   it("starts the watcher only after the gateway is ready, scoped to the activation", () => {
-    const ready = src.indexOf("await dismissStaleSuspendedDeliveries(");
+    const ready = src.indexOf("await waitForGateway(", src.indexOf("const gatewayBranch = async () => {"));
     assert.notEqual(ready, -1);
     assert.notEqual(src.indexOf("startLateAnnounceRelay();", ready), -1, "relay not started after readiness");
     const start = functionBody("function startLateAnnounceRelay(");

@@ -138,7 +138,7 @@ Authorized links retain the canonical storage actor and saved V2 route while sep
 
 ## Container Internal Architecture
 
-V2 uses the ports, proxy and OpenClaw `2026.9.5` shown below, with the readiness and strict-restore barriers above. SQLite stays on local disk and is mirrored to `/mnt/workspace/.openclaw/`, with S3 backups.
+V2 uses the ports, proxy and OpenClaw `2026.11.2` shown below, with the readiness and strict-restore barriers above. SQLite stays on local disk and is mirrored to `/mnt/workspace/.openclaw/`, with S3 backups.
 
 ```
 +-----------------------------------------------------------------------+

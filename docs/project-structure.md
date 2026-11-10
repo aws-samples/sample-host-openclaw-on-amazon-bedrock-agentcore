@@ -20,10 +20,10 @@ openclaw-on-agentcore/
     gateway_stack.py              # Prototype: AgentCore Gateway (MCP) + interceptor + tool Lambdas; only when enable_gateway=true
     build_stack.py                # CodeBuild project + source bucket for remote ARM64 image builds; only when enable_codebuild=true
   bridge/
-    Dockerfile                    # Container image (node:24-slim, ARM64, pinned openclaw@2026.9.5 + clawhub@0.23.3, 5 owner-pinned ClawHub skills)
+    Dockerfile                    # Container image (node:24-slim, ARM64, pinned openclaw@2026.11.2 + clawhub@0.25.1, 5 owner-pinned ClawHub skills)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # HTTP contract; V2 full-gateway readiness
-    openclaw-tool-deny.test.js    # openclaw.json tools.deny covers the channel-delivery tools (node:test, 7 tests)
+    openclaw-tool-deny.test.js    # openclaw.json tools.deny (exact list) and tools.toolSearch=false (node:test, 9 tests)
     read-body.js                  # Reads a request body as Buffers and decodes UTF-8 once (contract server keeps its 1 MB / 413 cap)
     read-body.test.js             # Request body decoding + size cap tests (node:test, 8 tests)
     chat-run-filter.js            # Chat-event ownership filter: only the run chat.send started (or its sessions_yield successor) ends a bridge request; sub-agent events are ignored
@@ -34,6 +34,8 @@ openclaw-on-agentcore/
     late-announce.bridge.test.js  # Real gatewayTurn() + chat event watcher against a fake broadcasting gateway, plus contract wiring (node:test; skips without ws)
     legacy-session-import.js      # Pre-2.0 sessions.json import receipts (import runs once)
     legacy-session-import.test.js # Import receipt tests (node:test, 23 tests)
+    state-schema.js               # Schema versions of restored OpenClaw SQLite stores; an older store runs doctor before activation
+    state-schema.test.js          # Header reads, outdated-store detection, pinned versions with OPENCLAW_PACKAGE_DIR (node:test)
     gateway-mcp.js                # mcp.servers.agentcore config + bearer refresh (only when AGENTCORE_GATEWAY_URL is set)
     gateway-mcp.test.js           # Gateway MCP config/refresh + Cognito token provider tests (node:test, 12 tests)
     cognito-token.js              # Per-user Cognito ID/access token provider shared by proxy and contract server
@@ -41,7 +43,8 @@ openclaw-on-agentcore/
     tool-history.js               # History toolUse/toolResult blocks -> text when a request has no tools
     tool-history.test.js          # Tool-history rewrite + proxy integration tests (node:test)
     system-prefix-cache.js        # Bedrock cachePoint blocks after OpenClaw's stable system prefix and tool specs
-    gateway-lifecycle.js          # Gateway readiness, chat transport with final-answer selection, stale sub-agent delivery sweep
+    system-prefix-cache.test.js   # Pin mismatch keeps the original block; pinned sources accept the 2026.11.2 split (OPENCLAW_PACKAGE_DIR)
+    gateway-lifecycle.js          # Gateway readiness, chat transport with final-answer selection
     brief-audio-marker.test.js    # BRIEF_AUDIO label survives OpenClaw's secret redaction (skips without the OpenClaw dist)
     image-support.test.js         # Image support unit tests (node:test)
     proxy-identity.test.js        # Proxy identity resolution tests (node:test)

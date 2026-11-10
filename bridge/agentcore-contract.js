@@ -27,6 +27,7 @@ const workspaceSync = require("./workspace-sync");
 const stateStorage = require("./state-storage");
 const cronJobs = require("./cron-jobs");
 const legacySessionImport = require("./legacy-session-import");
+const stateSchema = require("./state-schema");
 const cwLogger = require("./cloudwatch-logger");
 const { createStartupTiming } = require("./startup-timing");
 const startupTiming = createStartupTiming({
@@ -41,7 +42,7 @@ const { readBody } = require("./read-body");
 const { createRuntimeLifecycle, osRandomUUID } = require("./runtime-lifecycle");
 const userNamespace = require("./user-namespace");
 const {
-  waitForGateway, gatewayTurn, dismissStaleSuspendedDeliveries, watchChatEvents,
+  waitForGateway, gatewayTurn, watchChatEvents,
 } = require("./gateway-lifecycle");
 const { createLateAnnounceRelay } = require("./late-announce");
 const { createPreparedGateway } = require("./openclaw-worker-owner");
@@ -271,7 +272,7 @@ async function commonBootstrap() {
   // Validate immutable inputs before preparing code in the serving child.
   fs.readFileSync(`${__dirname}/CLAUDE.md`, "utf8");
   const pin = JSON.parse(fs.readFileSync("/usr/local/lib/node_modules/openclaw/package.json", "utf8"));
-  if (pin.version !== "2026.9.5") throw new Error("Unexpected OpenClaw version");
+  if (pin.version !== "2026.11.2") throw new Error("Unexpected OpenClaw version");
   for (const skill of ["jina-reader", "deep-research-pro", "telegram-compose", "transcript",
     "task-decomposer", "s3-user-files", "eventbridge-cron", "clawhub-manage", "api-keys",
     "agentcore-browser"]) {
@@ -320,7 +321,7 @@ async function commonBootstrap() {
     networkBlock: process.env.OPENCLAW_MMDS_BLOCK || "unknown",
     procHidden: process.env.OPENCLAW_PROC_HIDDEN || "unknown",
   }))) console.log(line);
-  console.log("[contract] BOOTSTRAP_READY platform=V2 openclaw=2026.9.5");
+  console.log("[contract] BOOTSTRAP_READY platform=V2 openclaw=2026.11.2");
 }
 
 function assertUnboundResourcesAbsent() {
@@ -864,6 +865,10 @@ async function migrateLegacySessionStore(env, { forceDoctor = false } = {}) {
   }
 
   const remaining = findLegacySessionStores();
+  const outdatedStores = stateSchema.findOutdatedStores(OPENCLAW_DIR);
+  if (result.code === 0 && remaining.length === 0 && outdatedStores.length > 0) {
+    throw new Error("OpenClaw state schema upgrade did not complete");
+  }
   if (result.code === 0 && remaining.length === 0) {
     console.log(
       `[contract] Legacy session store imported into SQLite in ${Date.now() - started}ms`,
@@ -1787,7 +1792,16 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
     const openclawEnv = openclawEnvFor(userId);
     // doctor runs as the OpenClaw uid, so the restored state must be its own first.
     handRuntimeStateToOpenClaw("pre-doctor");
-    const migrated = await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 });
+    // OpenClaw 2026.11.2 refuses agent databases written by 2026.9.5 until doctor
+    // upgrades their schema (state-schema.js), so an older restored store runs
+    // the same doctor step. The upgrade is one-way.
+    const outdatedStores = stateSchema.findOutdatedStores(OPENCLAW_DIR);
+    if (outdatedStores.length > 0) {
+      console.log(`[contract] OpenClaw state schema upgrade needed: ${outdatedStores
+        .map((store) => `${store.kind} ${store.version}->${store.required}`).join(", ")}`);
+    }
+    const forceDoctor = resurrected.changed.length > 0 || outdatedStores.length > 0;
+    const migrated = await migrateLegacySessionStore(openclawEnv, { forceDoctor });
     checkpoint();
     if (migrated) {
       writeOpenClawConfig();
@@ -1869,13 +1883,8 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
         deadline: Date.now() + ACTIVATION_TIMEOUT_MS, configProbe: true,
       });
       checkpoint();
-      // A suspended sub-agent delivery stays in every turn's context for 7 days
-      // and gets narrated into replies. Bounded and non-throwing.
-      await dismissStaleSuspendedDeliveries({
-        url: `ws://127.0.0.1:${OPENCLAW_PORT}`, token: GATEWAY_TOKEN, signal: activationScope.signal,
-        deadline: Date.now() + 15000,
-      });
-      checkpoint();
+      // Suspended sub-agent deliveries expire after 2 h in the gateway itself
+      // (patch-openclaw-delivery-expiry.js), so activation no longer sweeps them.
       startLateAnnounceRelay();
       openclawReady = true;
       activationScope.mark("gateway");

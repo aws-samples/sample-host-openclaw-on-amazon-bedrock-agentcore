@@ -16,13 +16,13 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createInvariantPrewarmer } from "./gateway-invariant-prewarm.mjs";
 
-export const OPENCLAW_VERSION = "2026.9.5";
+export const OPENCLAW_VERSION = "2026.11.2";
 export const PACKAGE_ROOT = "/usr/local/lib/node_modules/openclaw";
 export const LAUNCHER_URL = pathToFileURL(`${PACKAGE_ROOT}/openclaw.mjs`).href;
 export const RUNTIME_FILES = Object.freeze({
-  server: "dist/server-start-gE7ggn-j.mjs",
-  reply: "dist/get-reply-from-config.runtime-uSvr2ey5.mjs",
-  presence: "dist/system-presence-B9mMmTN5.mjs",
+  server: "dist/gateway-prewarm.js",
+  reply: "dist/get-reply-from-config.runtime-COs94SyF.mjs",
+  presence: "dist/system-presence-Di2OrVHO.mjs",
 });
 const IDENTITIES = new Set(["USER_ID", "INTERNAL_USER_ID"]);
 const CREDENTIAL_SOURCES = [
