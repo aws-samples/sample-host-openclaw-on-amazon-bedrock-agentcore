@@ -72,6 +72,9 @@ else
   chown -R 10001:10001 /root/.openclaw
   node -e "process.exit(require(\"/app/runtime-privsep.js\").ensureAgentDirs({ log: console }) ? 0 : 1)" \
     || fail "ensureAgentDirs failed"
+  # With the handover, doctor's capture directory next to the state dir (handRuntimeStateToOpenClaw).
+  node -e "process.exit(require(\"/app/runtime-privsep.js\").ensureDoctorCaptureDir(\"/root/.openclaw\", { log: console }) ? 0 : 1)" \
+    || fail "ensureDoctorCaptureDir failed"
   mapfile -t AGENT_ENV < <(node -e "
 for (const [k, v] of Object.entries(require(\"/app/runtime-privsep.js\").agentDirEnv())) console.log(k + \"=\" + v);
 ")

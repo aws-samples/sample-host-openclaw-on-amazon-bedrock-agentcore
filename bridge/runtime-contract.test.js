@@ -1154,7 +1154,9 @@ test("privilege separation: gateway + doctor spawn unprivileged, state dir hande
     chownToOpenClaw: (p) => { privsepMock._chowns.push(p); return true; },
     agentDirEnv: () => ({ XDG_CACHE_HOME: "/home/openclaw/.cache", TMPDIR: "/home/openclaw/tmp" }),
     ensureAgentDirs: () => { privsepMock._ensured += 1; return true; },
+    ensureDoctorCaptureDir: (dir) => { privsepMock._captureDirs.push(dir); return true; },
     _ensured: 0,
+    _captureDirs: [],
     describeProtections: (x) => ({ uidSplit: "active", uid: 10001, networkBlock: x.networkBlock, procHidden: x.procHidden }),
     formatStartupLines: (st) => [`[privsep] uid-split=${st.uidSplit} mmds=${st.networkBlock} hidepid=${st.procHidden}`],
     _chowns: [],
@@ -1178,6 +1180,9 @@ test("privilege separation: gateway + doctor spawn unprivileged, state dir hande
   assert.ok(app.preparations.length);
   assert.ok(privsepMock._chowns.filter((p) => p === "/test-home/.openclaw").length >= 2,
     `state dir chowned, got: ${JSON.stringify(privsepMock._chowns)}`);
+  // Each handover also prepares doctor's capture directory beside the state dir.
+  assert.deepEqual([...new Set(privsepMock._captureDirs)], ["/test-home/.openclaw"]);
+  assert.equal(privsepMock._captureDirs.length, privsepMock._chowns.filter((p) => p === "/test-home/.openclaw").length);
   // The agent uid gets writable cache/temp dirs (HOME=/root is not writable for
   // it): created once at bootstrap, and in the env of the prepared gateway, the
   // activation and doctor. HOME itself is unchanged.

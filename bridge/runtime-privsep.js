@@ -46,6 +46,7 @@
 "use strict";
 
 const realFs = require("node:fs");
+const path = require("node:path");
 
 // Fixed, unprivileged uid/gid the OpenClaw gateway and its shells run as. A
 // numeric id (not a name) so the container never trips the AgentCore >53-layer
@@ -209,25 +210,52 @@ function ensureAgentDirs({ proc = process, env = process.env, fs = realFs, log }
   const uid = openClawUid(env);
   const gid = openClawGid(env);
   for (const { path: dir } of agentDirLayout(env)) {
-    try {
-      try {
-        fs.mkdirSync(dir, { mode: 0o700 });
-      } catch (error) {
-        if (!error || error.code !== "EEXIST") throw error;
-      }
-      const stat = fs.lstatSync(dir);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) {
-        log?.warn?.(`[privsep] ${dir} is not a directory; agent uid caches and temp files may fail`);
-        return false;
-      }
-      (fs.lchownSync || fs.chownSync)(dir, uid, gid);
-      fs.chmodSync(dir, 0o700);
-    } catch (error) {
-      log?.warn?.(`[privsep] could not prepare ${dir} for ${uid}:${gid}: ${error.message}`);
-      return false;
-    }
+    if (!prepareAgentOwnedDir(dir, uid, gid, fs, log)) return false;
   }
   return true;
+}
+
+// One 0700 directory owned by the agent uid. An existing entry that is not a
+// plain directory is reported and left alone; chown never follows a link.
+function prepareAgentOwnedDir(dir, uid, gid, fs, log) {
+  try {
+    try {
+      fs.mkdirSync(dir, { mode: 0o700 });
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") throw error;
+    }
+    const stat = fs.lstatSync(dir);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      log?.warn?.(`[privsep] ${dir} is not a directory; agent uid caches and temp files may fail`);
+      return false;
+    }
+    (fs.lchownSync || fs.chownSync)(dir, uid, gid);
+    fs.chmodSync(dir, 0o700);
+    return true;
+  } catch (error) {
+    log?.warn?.(`[privsep] could not prepare ${dir} for ${uid}:${gid}: ${error.message}`);
+    return false;
+  }
+}
+
+// OpenClaw 2026.11.2's `openclaw doctor` keeps a pre-repair copy of the state
+// dir in a sibling directory, `<state dir>.update-captures`. With the state dir
+// at /root/.openclaw that sibling sits directly under /root, which the agent uid
+// cannot create entries in, so doctor logs EACCES and repairs without the copy.
+// The supervisor creates it for the agent uid together with the state handover.
+// It is outside the state dir, so workspace-sync never backs it up.
+function doctorCaptureDir(stateDir) {
+  return `${path.resolve(stateDir)}.update-captures`;
+}
+
+/**
+ * Create the doctor capture directory next to `stateDir` for the agent uid.
+ * Returns false when privilege separation is off or the directory cannot be
+ * prepared (doctor then repairs without its capture, as before). Never throws.
+ */
+function ensureDoctorCaptureDir(stateDir, { proc = process, env = process.env, fs = realFs, log } = {}) {
+  if (!canDropPrivileges(proc, env) || typeof stateDir !== "string" || !stateDir.startsWith("/")) return false;
+  return prepareAgentOwnedDir(doctorCaptureDir(stateDir), openClawUid(env), openClawGid(env), fs, log);
 }
 
 // Normalise a status reported by the entrypoint to "active" / "INACTIVE" /
@@ -338,6 +366,8 @@ module.exports = {
   agentDirLayout,
   agentDirEnv,
   ensureAgentDirs,
+  doctorCaptureDir,
+  ensureDoctorCaptureDir,
   credentialEndpointShape,
   describeProtections,
   formatStartupLines,

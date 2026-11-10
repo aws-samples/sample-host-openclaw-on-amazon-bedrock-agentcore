@@ -738,6 +738,8 @@ function handRuntimeStateToOpenClaw(reason) {
   if (privsep.chownToOpenClaw(OPENCLAW_DIR, { recursive: true, log: console })) {
     console.log(`[contract] runtime state dir owned by the OpenClaw uid (${reason})`);
   }
+  // Doctor's pre-repair copy goes next to the state dir, under /root (runtime-privsep.js).
+  privsep.ensureDoctorCaptureDir(OPENCLAW_DIR, { log: console });
 }
 
 /**
