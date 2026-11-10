@@ -184,6 +184,26 @@ describe("shouldSkip", () => {
     assert.ok(shouldSkip("openclaw.json.bak.4"));
   });
 
+  it("skips OpenClaw's own skill directories, anchored at the state dir", () => {
+    for (const rel of [
+      "skills/probe-st/SKILL.md",
+      "workspace/skills/probe-ws/SKILL.md",
+      "workspace/skills/probe-ws/scripts/run.sh",
+      "workspace/.agents/skills/probe-ag/SKILL.md",
+    ]) {
+      assert.ok(shouldSkip(rel), rel);
+    }
+    for (const rel of [
+      "workspace/docs/skills/resume.md",
+      "workspace/skills.md",
+      "workspace/my-skills/a.md",
+      "skillsets/a.md",
+      "runtime-skills.json",
+    ]) {
+      assert.equal(shouldSkip(rel), false, rel);
+    }
+  });
+
   it("skips doctor's pre-migration database copies, and no other .bak file", () => {
     const run = "f26e9ccd-df42-8bba-8cfc-d7457c5550bd";
     assert.ok(shouldSkip(`agents/main/agent/openclaw-agent.sqlite.pre-startup-migration-${run}.bak`));
@@ -1351,6 +1371,13 @@ describe("change-driven backup", () => {
       }
     });
 
+    it("drops OpenClaw's own skill directories and keeps a user's skills/ folder", () => {
+      assert.equal(workspaceSync.changeTarget("skills/probe-st/SKILL.md"), null);
+      assert.equal(workspaceSync.changeTarget("workspace/skills/probe-ws/SKILL.md"), null);
+      assert.equal(workspaceSync.changeTarget("workspace/.agents/skills/probe-ag/SKILL.md"), null);
+      assert.equal(workspaceSync.changeTarget("workspace/docs/skills/resume.md"), "workspace/docs/skills/resume.md");
+    });
+
     it("drops doctor's pre-migration database copies and keeps a user's own .bak", () => {
       const run = "f26e9ccd-df42-8bba-8cfc-d7457c5550bd";
       assert.equal(workspaceSync.changeTarget(`agents/main/agent/openclaw-agent.sqlite.pre-startup-migration-${run}.bak`), null);
@@ -2280,6 +2307,62 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
     assert.deepEqual(warnings.filter((w) => /Skipping|pre-startup-migration/.test(w)), [], warnings.join("\n"));
   });
 
+  // OpenClaw 2026.11.2 lists the skills in its own skill directories in the
+  // system prompt. The bridge installs skills only to /skills, so a backup
+  // never carries those directories and a restart does not bring them back.
+  const SKILL_DIR_FILES = [
+    "skills/probe-st/SKILL.md",
+    "workspace/skills/probe-ws/SKILL.md",
+    "workspace/.agents/skills/probe-ag/SKILL.md",
+  ];
+  const SKILL_MD = "---\nname: probe\ndescription: PROBE-SKILL-0001\n---\n";
+
+  it("a full save leaves OpenClaw's own skill directories out and uploads a user's skills/ folder", async () => {
+    for (const rel of SKILL_DIR_FILES) writeLocal(rel, SKILL_MD);
+    writeLocal("workspace/docs/skills/resume.md", "mine");
+
+    await workspaceSync.saveWorkspace(NS);
+
+    assert.deepEqual(Object.keys(s3.objects), [`${NS}/.openclaw/workspace/docs/skills/resume.md`]);
+    assert.deepEqual(s3.calls, ["put"]);
+    assert.deepEqual(warnings.filter((w) => /Skipping|skills/.test(w)), [], warnings.join("\n"));
+  });
+
+  it("the change backup ignores OpenClaw's own skill directories, also on a full sweep", async () => {
+    for (const rel of SKILL_DIR_FILES) writeLocal(rel, SKILL_MD);
+    workspaceSync.startChangeBackup(NS, { debounceMs: 10, maxWaitMs: 100, sqliteMinIntervalMs: 0 });
+    for (const rel of SKILL_DIR_FILES) workspaceSync.markChanged(rel);
+    workspaceSync.markChanged(null); // an fs.watch event without a file name sweeps the whole state dir
+    const r = await workspaceSync.flushPendingSaves("test");
+    assert.equal(r.uploaded, 0);
+    assert.equal(r.skipped, 0);
+    assert.deepEqual(s3.calls, []);
+  });
+
+  it("a restart from a backup that holds OpenClaw's own skill directories does not restore them, and leaves the S3 objects alone", async () => {
+    const put = (rel, body) => {
+      const key = `${NS}/.openclaw/${rel}`;
+      s3.objects[key] = Buffer.from(body);
+      s3.metadata[key] = { sha256: sha256(body) };
+      return key;
+    };
+    const skillKeys = SKILL_DIR_FILES.map((rel) => put(rel, SKILL_MD));
+    put("workspace/USER.md", "user");
+    put("workspace/docs/skills/resume.md", "mine");
+
+    const fresh = freshModule();
+    const r = await fresh.restoreWorkspace(NS);
+
+    assert.deepEqual(r, { restored: 2, kept: 0, keptUnchanged: 0, failed: 0, hadState: true });
+    assert.deepEqual(s3.calls, ["list", "get", "get"], "two downloads, none for the skill directories");
+    for (const rel of SKILL_DIR_FILES) {
+      assert.equal(fs.existsSync(path.join(tmpDir, ".openclaw", rel)), false, `${rel} is not restored`);
+    }
+    for (const key of skillKeys) assert.ok(key in s3.objects, `${key} is untouched`);
+    assert.equal(fs.readFileSync(path.join(tmpDir, ".openclaw", "workspace", "docs", "skills", "resume.md"), "utf8"), "mine");
+    assert.equal(fresh.getRestoreState(), "ready");
+  });
+
   it("a restore leaves a pre-migration copy that is already in S3 alone: not downloaded, not deleted", async () => {
     const copyKey = `${NS}/.openclaw/${SMALL_COPY}`;
     const notesKey = `${NS}/.openclaw/workspace/notes.bak`;
@@ -2565,27 +2648,35 @@ describe("strict workspace restore", () => {
   it("still backs up user skill content outside the generated root", async (t) => {
     await sync.restoreWorkspace("telegram_1");
     const userFiles = [
-      "skills/custom/SKILL.md",
-      "workspace/skills/custom/SKILL.md",
-      "workspace/plugin-skills/custom/SKILL.md",
       "plugin-skills-custom/SKILL.md",
+      "workspace/docs/skills/custom/SKILL.md",
+      "workspace/plugin-skills/custom/SKILL.md",
       "runtime-skills.json",
     ];
-    for (const rel of userFiles) write(rel, "user content");
+    // OpenClaw's own skill directories are not backed up: the bridge installs
+    // skills only to /skills (state-storage.js, isOpenClawSkillDirPath).
+    const openclawSkillDirFiles = ["skills/custom/SKILL.md", "workspace/skills/custom/SKILL.md"];
+    for (const rel of [...userFiles, ...openclawSkillDirFiles]) write(rel, "user content");
     // A generated link must not consume the walker's cycle guard for user content.
     fs.mkdirSync(local("plugin-skills"));
     fs.symlinkSync(local("workspace/plugin-skills/custom"), local("plugin-skills/custom"));
-    assert.deepEqual(sync.walkDir(state).sort(), [...userFiles].sort());
+    assert.deepEqual(sync.walkDir(state).sort(), [...userFiles, ...openclawSkillDirFiles].sort());
     t.mock.method(fs, "watch", () => ({ on() {}, close() {} }));
     sync.startChangeBackup("telegram_1");
     for (const rel of userFiles) {
       assert.equal(sync.changeTarget(rel), rel);
       sync.markChanged(rel);
     }
+    for (const rel of openclawSkillDirFiles) {
+      assert.equal(sync.changeTarget(rel), null, rel);
+      sync.markChanged(rel);
+    }
     assert.equal((await sync.flushPendingSaves("user-skills")).uploaded, userFiles.length);
     write(userFiles[0], "updated user content");
     assert.equal(await sync.saveFile("telegram_1", userFiles[0]), true);
+    assert.equal(await sync.saveFile("telegram_1", openclawSkillDirFiles[0]), false);
     write(userFiles[1], "updated workspace content");
+    write(openclawSkillDirFiles[1], "updated workspace content");
     await sync.saveWorkspace("telegram_1");
     assert.deepEqual(
       [...new Set(calls.filter((c) => c.kind === "put").map((c) => c.input.Key))].sort(),
@@ -2599,17 +2690,26 @@ describe("strict workspace restore", () => {
     fs.mkdirSync(outside);
     fs.writeFileSync(path.join(outside, "SKILL.md"), "must stay outside");
     fs.mkdirSync(local("workspace"), { recursive: true });
-    fs.mkdirSync(local("skills"));
+    fs.mkdirSync(local("custom"));
     fs.symlinkSync(path.join(outside, "SKILL.md"), local("workspace/escape.md"));
     fs.symlinkSync(outside, local("workspace/plugin-skills"));
     fs.symlinkSync(outside, local("plugin-skills-custom"));
-    fs.symlinkSync(outside, local("skills/linked"));
+    fs.symlinkSync(outside, local("custom/linked"));
     const escapes = [
       "workspace/escape.md",
       "workspace/plugin-skills/SKILL.md",
       "plugin-skills-custom/SKILL.md",
-      "skills/linked/SKILL.md",
+      "custom/linked/SKILL.md",
     ];
+    // The same nested link in OpenClaw's own skills directory is skipped before
+    // its path is read (the bridge installs skills only to /skills), and the
+    // low-level upload still refuses it.
+    fs.mkdirSync(local("skills"));
+    fs.symlinkSync(outside, local("skills/linked"));
+    assert.equal(sync.changeTarget("skills/linked/SKILL.md"), null);
+    assert.equal(await sync.saveFile("telegram_1", "skills/linked/SKILL.md"), false);
+    await assert.rejects(sync.uploadStateFile("telegram_1", "skills/linked/SKILL.md", { force: true }),
+      /State path contains symlink/);
     t.mock.method(fs, "watch", () => ({ on() {}, close() {} }));
     sync.startChangeBackup("telegram_1");
     for (const rel of escapes) {

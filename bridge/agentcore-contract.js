@@ -1778,6 +1778,12 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
     // again (F5, us-west-2 F1 staging test).
     const resurrected = pruneResurrectedLegacyFiles();
 
+    // 1e''. The bridge installs skills only to /skills; OpenClaw's own skill
+    // directories are not restored (state-storage.js). Remove any that exist
+    // before doctor or the gateway reads the state dir.
+    stateStorage.removeOpenClawSkillDirs(OPENCLAW_DIR, { log: console });
+    checkpoint();
+
     // 1f. Write OpenClaw config + AGENTS.md AFTER the session-storage restore
     // (so they are not overwritten by stale restored data) and
     // BEFORE gateway activation (2.0 validates config strictly at startup; the

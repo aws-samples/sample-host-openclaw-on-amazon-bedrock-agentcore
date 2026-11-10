@@ -106,6 +106,20 @@ function isDoctorMigrationBackup(relativePath) {
   return DOCTOR_MIGRATION_BACKUP_RE.test(path.basename(relativePath));
 }
 
+// OpenClaw's own skill directories in the state dir (2026.11.2: the managed
+// root, the workspace root and the workspace `.agents` root). OpenClaw lists
+// the skills it finds there in the system prompt. The bridge installs skills
+// only to /skills (skills.load.extraDirs, runtime-skills.js), so these are not
+// restored: neither the mirror nor the S3 backup (workspace-sync.js) carries
+// them, and activation removes them (removeOpenClawSkillDirs) before OpenClaw
+// starts. State-dir-relative and anchored: a `skills/` folder elsewhere in the
+// workspace is the user's own data and is backed up as usual.
+const OPENCLAW_SKILL_DIRS = Object.freeze(["skills", "workspace/skills", "workspace/.agents/skills"]);
+
+function isOpenClawSkillDirPath(relativePath) {
+  return OPENCLAW_SKILL_DIRS.some((dir) => relativePath === dir || relativePath.startsWith(`${dir}/`));
+}
+
 /**
  * Files that are only meaningful next to the exact live database bytes they
  * were written against (SQLite sidecars), in-flight snapshot staging files,
@@ -406,7 +420,8 @@ function sameSizeAndMtime(src, dest) {
  *
  * Fills missing files and validates SQLite without clobbering local state.
  * Workspace files are restored without overwriting anything already present locally (never destroys
- * local work); transient files and 0-byte *.sqlite files (a database that was
+ * local work); transient files, OpenClaw's own skill directories and 0-byte
+ * *.sqlite files (a database that was
  * created but never written — e.g. left behind by a gateway that crashed on
  * the mount — which would otherwise shadow a real snapshot) are skipped.
  *
@@ -418,7 +433,7 @@ function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
   let workspaceFiles = 0;
   let skipped = 0;
   for (const rel of walkFiles(mountStateDir, mountStateDir, { strict: true })) {
-    if (isTransientFile(rel)) continue;
+    if (isTransientFile(rel) || isOpenClawSkillDirPath(rel)) continue;
     const src = path.join(mountStateDir, rel);
     const dest = path.join(stateDir, rel);
     if (!insideBase(resolvedBase, dest)) {
@@ -452,6 +467,35 @@ function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
 }
 
 /**
+ * Remove OpenClaw's own skill directories (OPENCLAW_SKILL_DIRS) from the local
+ * state dir. Called at activation after every restore and before OpenClaw
+ * starts: the bridge installs skills only to /skills. A symlink at one of these
+ * paths is removed as a link; a symlink in a parent directory throws instead of
+ * touching anything outside the state dir.
+ *
+ * @returns {string[]} the state-dir-relative directories that were removed
+ */
+function removeOpenClawSkillDirs(stateDir, { log = console } = {}) {
+  const removed = [];
+  for (const dir of OPENCLAW_SKILL_DIRS) {
+    const target = path.join(stateDir, dir);
+    assertSafePath(stateDir, path.dirname(target));
+    try {
+      fs.lstatSync(target);
+    } catch (err) {
+      if (err.code === "ENOENT") continue;
+      throw err;
+    }
+    fs.rmSync(target, { recursive: true, force: true });
+    removed.push(dir);
+  }
+  if (removed.length) {
+    log.log(`[state-storage] Removed ${removed.join(", ")} from ${stateDir}: the bridge installs skills only to /skills`);
+  }
+  return removed;
+}
+
+/**
  * Mirror the local state dir to the mount: plain files copied (unchanged
  * files, by size+mtime, are skipped), each *.sqlite written as a consistent
  * snapshot, transient files skipped, and mirror files that no longer exist
@@ -469,7 +513,8 @@ async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite =
   budgetBytes = mirrorBudgetBytes() } = {}) {
   if (assertReady) assertReady();
   const result = { files: 0, unchanged: 0, sqlite: 0, skipped: 0, pruned: 0, budgetSkipped: 0, mountErrors: 0 };
-  const localFiles = walkFiles(stateDir, stateDir, { strict: true }).filter((rel) => !isTransientFile(rel));
+  const localFiles = walkFiles(stateDir, stateDir, { strict: true })
+    .filter((rel) => !isTransientFile(rel) && !isOpenClawSkillDirPath(rel));
   const localSet = new Set(localFiles);
   const acct = { used: diskUsageBytes(path.dirname(mountStateDir)), budget: budgetBytes, skippedForBudget: 0 };
   const staging = stagingDir || fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-state-mirror-"));
@@ -557,7 +602,9 @@ function mirrorWorkspaceDir({ stateDir, mountStateDir, log = console, assertRead
   const workspaceDir = path.join(stateDir, WORKSPACE_SUBDIR);
   const mountWorkspaceDir = path.join(mountStateDir, WORKSPACE_SUBDIR);
   if (!fs.existsSync(workspaceDir)) return result;
-  const localFiles = walkFiles(workspaceDir, workspaceDir, { strict: true }).filter((rel) => !isTransientFile(rel));
+  // Paths here are workspace-relative; the skill-dir rule is state-dir-relative.
+  const localFiles = walkFiles(workspaceDir, workspaceDir, { strict: true })
+    .filter((rel) => !isTransientFile(rel) && !isOpenClawSkillDirPath(`${WORKSPACE_SUBDIR}/${rel}`));
   const localSet = new Set(localFiles);
   let acct = null;
   for (const rel of localFiles) {
@@ -839,6 +886,7 @@ module.exports = {
   setupSessionStorage,
   sessionStorageHasContent,
   restoreStateDir,
+  removeOpenClawSkillDirs,
   mirrorStateDir,
   mirrorWorkspaceDir,
   mirrorNow,
@@ -856,6 +904,8 @@ module.exports = {
   walkFiles,
   isTransientFile,
   isDoctorMigrationBackup,
+  OPENCLAW_SKILL_DIRS,
+  isOpenClawSkillDirPath,
   isTransientDir,
   isWorkspacePath,
   getNodeSqlite,

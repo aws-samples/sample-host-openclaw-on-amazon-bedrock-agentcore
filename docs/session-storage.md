@@ -187,6 +187,13 @@ the database it saved, and the versioned bucket already keeps the pre-upgrade da
 (noncurrent versions expire after 30 days). The copies stay on the container's local disk. The rule
 matches only that name, so a user's own `*.bak` files are backed up as usual.
 
+The bridge installs skills only to `/skills` (the image's skills and the runtime-skills manifest
+above). OpenClaw's own skill directories in the state dir, `skills/`, `workspace/skills/` and
+`workspace/.agents/skills/`, are not restored: neither the mirror nor the S3 backup carries them
+(`isOpenClawSkillDirPath` in `bridge/state-storage.js`), and activation removes them before doctor
+and the gateway start. The rule is anchored at those three paths, so a `skills/` folder elsewhere in
+the workspace is backed up as usual. Copies already in S3 stay in place and are not restored.
+
 The same never-delete rule resurrects every other pre-2.0 file doctor retired (`workspace-state.json`,
 `auth-profiles.json`, `exec-approvals.json`, the imported `.jsonl` transcripts, …) on each restore —
 both the cold-start restore and the fill-missing restore of a same-session restart — and the 2.0

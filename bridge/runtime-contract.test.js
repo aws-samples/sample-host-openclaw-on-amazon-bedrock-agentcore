@@ -326,6 +326,11 @@ function loadContract(t, {
         calls.push("mount");
         return { available: false };
       },
+      removeOpenClawSkillDirs: (dir) => {
+        ready();
+        calls.push(`skills:remove:${dir}`);
+        return [];
+      },
       stopPeriodicMirror: () => {}, stopWorkspaceWatcher: () => {},
     },
     "./legacy-session-import": {
@@ -889,6 +894,22 @@ test("a current state schema runs no doctor", async (t) => {
   assert.equal(result.body.phase, "USER_READY", app.errors.join("\n"));
   assert.ok(app.calls.includes("schema:check"));
   assert.ok(!app.calls.includes("spawn:doctor"));
+});
+
+// The bridge installs skills only to /skills; OpenClaw's own skill directories are not restored.
+test("activation removes OpenClaw's own skill directories after both restores, before doctor and the gateway", async (t) => {
+  const app = loadContract(t, { migration: Promise.resolve(), legacyIndex: false, outdatedSchema: [OLD_AGENT_STORE] });
+  await tick();
+  const result = await app.request({ ...owner, action: "chat", message: { text: "hi" } });
+  assert.equal(result.body.phase, "USER_READY", app.errors.join("\n"));
+  const removals = app.calls.filter((call) => call.startsWith("skills:remove:"));
+  assert.deepEqual(removals, ["skills:remove:/test-home/.openclaw"], "once, on the local state dir");
+  const removal = app.calls.indexOf(removals[0]);
+  assert.ok(removal > app.calls.indexOf("mount"), "after the session-storage restore");
+  assert.ok(removal > app.calls.indexOf("restore"), "after the S3 restore (the mock also checks the restore barrier)");
+  assert.ok(removal < app.calls.indexOf("spawn:doctor"), "before doctor");
+  assert.ok(removal < app.calls.indexOf("skills"), "before the runtime-skills reinstall into /skills");
+  assert.ok(removal < app.calls.indexOf("activate:openclaw"), "before gateway activation");
 });
 
 test("activation timeout stops the prepared child and rejects a late activation acknowledgement", async (t) => {

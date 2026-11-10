@@ -386,6 +386,8 @@ Five ClawHub community skills are pre-installed at Docker build time with `clawh
 
 clawhub installs a qualified spec into `/skills/@owner/<slug>`; the Dockerfile moves it to the flat `/skills/<slug>` path that `skills.load.extraDirs`, the `clawhub-manage` skill and the system prompt all use.
 
+The bridge installs skills only to `/skills`; OpenClaw's own skill directories (`~/.openclaw/skills`, `~/.openclaw/workspace/skills` and `~/.openclaw/workspace/.agents/skills`) are not restored. Neither the S3 backup nor the session-storage mirror carries them, and activation removes them before OpenClaw starts (see [session-storage.md](session-storage.md)).
+
 Prototype: with `enable_gateway: true` the `s3-user-files` and `eventbridge-cron` capabilities are additionally served as typed MCP tools by an AgentCore Gateway; see [AgentCore Gateway MCP tools](#agentcore-gateway-mcp-tools-prototype) below.
 
 V2 restores recorded runtime skills before `USER_READY`. Web, file, schedule, ClawHub and API key tools run through full OpenClaw.

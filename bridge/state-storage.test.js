@@ -89,6 +89,32 @@ describe("state-storage path helpers", () => {
     }
   });
 
+  it("isOpenClawSkillDirPath matches OpenClaw's own skill directories, anchored at the state dir", () => {
+    for (const rel of [
+      "skills",
+      "skills/probe-st/SKILL.md",
+      "workspace/skills",
+      "workspace/skills/probe-ws/SKILL.md",
+      "workspace/.agents/skills/probe-ag/SKILL.md",
+    ]) {
+      assert.equal(storage.isOpenClawSkillDirPath(rel), true, rel);
+    }
+    for (const rel of [
+      "plugin-skills/browser-automation/SKILL.md",
+      "skillsets/a.md",
+      "skills.md",
+      "workspace/skills.md",
+      "workspace/my-skills/notes.md",
+      "workspace/docs/skills/resume.md",
+      "workspace/.agents/notes.md",
+      "workspace/workspace/skills/x.md",
+      "agents/main/sessions/skills/x.json",
+    ]) {
+      assert.equal(storage.isOpenClawSkillDirPath(rel), false, rel);
+    }
+    assert.deepEqual([...storage.OPENCLAW_SKILL_DIRS], ["skills", "workspace/skills", "workspace/.agents/skills"]);
+  });
+
   it("isDoctorMigrationBackup matches doctor's pre-migration database copies by file name, not other .bak files", () => {
     const run = "f26e9ccd-df42-8bba-8cfc-d7457c5550bd";
     for (const f of [
@@ -319,6 +345,52 @@ describe("mirrorStateDir / restoreStateDir", () => {
     assert.deepEqual(r, { files: 0, workspaceFiles: 1, skipped: 0 });
     assert.equal(fs.existsSync(path.join(stateDir, copy)), false);
     assert.equal(fs.readFileSync(path.join(stateDir, "workspace/notes.bak"), "utf8"), "mine");
+  });
+
+  const SKILL_FILES = [
+    "skills/probe-st/SKILL.md",
+    "workspace/skills/probe-ws/SKILL.md",
+    "workspace/.agents/skills/probe-ag/SKILL.md",
+  ];
+
+  it("leaves OpenClaw's own skill directories off the mount, prunes older mount copies, and mirrors a user's skills/ folder", async () => {
+    for (const rel of SKILL_FILES) {
+      write(path.join(stateDir, rel), "---\nname: probe\n---\n");
+      write(path.join(mountState, rel), "older mirror copy");
+    }
+    write(path.join(stateDir, "workspace/docs/skills/resume.md"), "mine");
+    write(path.join(stateDir, "runtime-skills.json"), "{}");
+    const r = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log: quietLog, sqlite: null });
+    assert.equal(r.files, 2);
+    assert.equal(r.pruned, SKILL_FILES.length, "the mount's older copies are removed");
+    for (const rel of SKILL_FILES) {
+      assert.equal(fs.existsSync(path.join(mountState, rel)), false, `${rel} is not on the mount`);
+    }
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/docs/skills/resume.md"), "utf8"), "mine");
+    assert.equal(fs.readFileSync(path.join(mountState, "runtime-skills.json"), "utf8"), "{}");
+  });
+
+  it("the workspace watcher's mirror applies the skill-directory rule to workspace-relative paths", () => {
+    for (const rel of SKILL_FILES.filter((f) => f.startsWith("workspace/"))) {
+      write(path.join(stateDir, rel), "---\nname: probe\n---\n");
+      write(path.join(mountState, rel), "older mirror copy");
+    }
+    write(path.join(stateDir, "workspace/docs/skills/resume.md"), "mine");
+    const r = storage.mirrorWorkspaceDir({ stateDir, mountStateDir: mountState, log: quietLog });
+    assert.equal(r.files, 1);
+    assert.equal(r.pruned, 2);
+    assert.equal(fs.existsSync(path.join(mountState, "workspace/skills/probe-ws/SKILL.md")), false);
+    assert.equal(fs.existsSync(path.join(mountState, "workspace/.agents/skills/probe-ag/SKILL.md")), false);
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/docs/skills/resume.md"), "utf8"), "mine");
+  });
+
+  it("does not restore OpenClaw's own skill directories from the mount, and restores a user's skills/ folder", () => {
+    for (const rel of SKILL_FILES) write(path.join(mountState, rel), "---\nname: probe\n---\n");
+    write(path.join(mountState, "workspace/docs/skills/resume.md"), "mine");
+    const r = storage.restoreStateDir({ stateDir, mountStateDir: mountState, log: quietLog });
+    assert.deepEqual(r, { files: 0, workspaceFiles: 1, skipped: 0 });
+    for (const rel of SKILL_FILES) assert.equal(fs.existsSync(path.join(stateDir, rel)), false, rel);
+    assert.equal(fs.readFileSync(path.join(stateDir, "workspace/docs/skills/resume.md"), "utf8"), "mine");
   });
 
   it("prunes mirror files deleted locally (consumed legacy sessions.json does not come back)", async () => {
@@ -647,6 +719,66 @@ describe("mirrorWorkspaceDir / workspace watcher", () => {
   it("flushWorkspaceMirror is a no-op after stop", () => {
     storage.stopWorkspaceWatcher();
     assert.equal(storage.flushWorkspaceMirror("test"), null);
+  });
+});
+
+describe("removeOpenClawSkillDirs", () => {
+  let home, stateDir, outside;
+  beforeEach(() => {
+    home = mkTmp("ss-skills-home-");
+    outside = mkTmp("ss-skills-outside-");
+    stateDir = path.join(home, ".openclaw");
+    fs.mkdirSync(stateDir);
+  });
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+
+  it("removes the three directories with their contents and leaves everything else", () => {
+    write(path.join(stateDir, "skills/probe-st/SKILL.md"), "x");
+    write(path.join(stateDir, "workspace/skills/probe-ws/SKILL.md"), "x");
+    write(path.join(stateDir, "workspace/skills/probe-ws/scripts/run.sh"), "x");
+    write(path.join(stateDir, "workspace/.agents/skills/probe-ag/SKILL.md"), "x");
+    write(path.join(stateDir, "workspace/.agents/notes.md"), "keep");
+    write(path.join(stateDir, "workspace/docs/skills/resume.md"), "keep");
+    write(path.join(stateDir, "plugin-skills/browser-automation/SKILL.md"), "keep");
+    write(path.join(stateDir, "runtime-skills.json"), "keep");
+    const logs = [];
+    const removed = storage.removeOpenClawSkillDirs(stateDir, { log: { log: (m) => logs.push(m) } });
+    assert.deepEqual(removed, ["skills", "workspace/skills", "workspace/.agents/skills"]);
+    for (const dir of removed) assert.equal(fs.existsSync(path.join(stateDir, dir)), false, dir);
+    for (const rel of ["workspace/.agents/notes.md", "workspace/docs/skills/resume.md",
+      "plugin-skills/browser-automation/SKILL.md", "runtime-skills.json"]) {
+      assert.equal(fs.readFileSync(path.join(stateDir, rel), "utf8"), "keep", rel);
+    }
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /^\[state-storage\] Removed skills, workspace\/skills, workspace\/\.agents\/skills from .+: the bridge installs skills only to \/skills$/);
+  });
+
+  it("is a silent no-op when none of them exists (a fresh container)", () => {
+    write(path.join(stateDir, "workspace/USER.md"), "keep");
+    const logs = [];
+    assert.deepEqual(storage.removeOpenClawSkillDirs(stateDir, { log: { log: (m) => logs.push(m) } }), []);
+    assert.deepEqual(logs, []);
+    assert.equal(fs.readFileSync(path.join(stateDir, "workspace/USER.md"), "utf8"), "keep");
+  });
+
+  it("removes a symlink at one of the paths as a link, without touching its target", () => {
+    write(path.join(outside, "probe/SKILL.md"), "outside");
+    fs.symlinkSync(outside, path.join(stateDir, "skills"));
+    write(path.join(stateDir, "workspace/skills"), "a plain file");
+    assert.deepEqual(storage.removeOpenClawSkillDirs(stateDir, { log: quietLog }), ["skills", "workspace/skills"]);
+    assert.equal(fs.existsSync(path.join(stateDir, "skills")), false);
+    assert.equal(fs.existsSync(path.join(stateDir, "workspace/skills")), false);
+    assert.equal(fs.readFileSync(path.join(outside, "probe/SKILL.md"), "utf8"), "outside");
+  });
+
+  it("refuses a symlinked parent directory and leaves the link target alone", () => {
+    write(path.join(outside, "skills/probe/SKILL.md"), "outside");
+    fs.symlinkSync(outside, path.join(stateDir, "workspace"));
+    assert.throws(() => storage.removeOpenClawSkillDirs(stateDir, { log: quietLog }), /State path contains symlink/);
+    assert.equal(fs.readFileSync(path.join(outside, "skills/probe/SKILL.md"), "utf8"), "outside");
   });
 });
 
