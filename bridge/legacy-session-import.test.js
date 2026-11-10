@@ -356,8 +356,8 @@ describe("retired-files wiring in agentcore-contract.js (F5)", () => {
 
   it("prunes resurrected files after EVERY restore, before the config write and before deciding on doctor", () => {
     const restored = idx("await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);");
-    const prune = idx("const resurrected = liveAdopted ? { changed: [] } : pruneResurrectedLegacyFiles();");
-    const config = source.indexOf("writeOpenClawConfig({ preserveSeedFiles: liveAdopted });", restored);
+    const prune = idx("const resurrected = pruneResurrectedLegacyFiles();");
+    const config = source.indexOf("writeOpenClawConfig();", prune);
     const doctor = idx("migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 })");
     assert.ok(restored < prune && prune < config && config < doctor);
     assert.ok(source.includes("legacySessionImport.pruneRetiredFiles(OPENCLAW_DIR)"));

@@ -46,7 +46,7 @@ const {
 const { createLateAnnounceRelay } = require("./late-announce");
 const { createPreparedGateway } = require("./openclaw-worker-owner");
 const { renderConfig, renderAgents } = require("./gateway-config");
-const { createLiveSeedBridge, readGatewayToken } = require("./live-seed-bridge");
+const { createGatewayActivation } = require("./gateway-activation");
 const privsep = require("./runtime-privsep");
 const { createProxySdkSnapshotOwner } = require("./proxy-sdk-snapshot");
 const workspaceFilesS3 = require("./workspace-files-s3");
@@ -88,7 +88,7 @@ const MOUNTED_OPENCLAW_DIR = stateStorage.resolvePaths().mountStateDir;
 // (staging logs), and an idle gateway reaches "shutdown started" within ~50 ms.
 const GATEWAY_STOP_WAIT_MS = parseInt(process.env.GATEWAY_STOP_WAIT_MS || "2000", 10);
 
-// Gateway token — re-fetched during user activation after common seed preparation.
+// Gateway token — fetched during user activation, after common bootstrap.
 // No fallback — container will fail to authenticate WebSocket if not set.
 let GATEWAY_TOKEN = null;
 
@@ -296,26 +296,7 @@ async function commonBootstrap() {
       v2Lifecycle.fail(error);
     },
   });
-  preparedGateway = createLiveSeedBridge({
-    createOwner: async (options) => (await import("./live-gateway-seed-owner.mjs"))
-      .createLiveGatewaySeedOwner({ ...options, onEvent: (event) => {
-        if (["prepared", "bound", "stopped"].includes(event.event)) {
-          console.log("[gateway] " + JSON.stringify({ stage: event.event,
-            gateway_pid: event.pid, seed_id: event.seedId,
-            generation: v2Lifecycle.snapshot().generation }));
-        }
-      } }),
-    createCold, render: (token) => ({ config: renderConfig({ gatewayToken: token }),
-      agentsText: renderAgents({ browserEnabled: !!process.env.BROWSER_IDENTIFIER }) }),
-    stateStorage, workspaceSync, neutralEnv: env,
-    readToken: () => readGatewayToken({ SecretsManagerClient, GetSecretValueCommand }),
-    onChild: observeGatewayChild,
-    onDiscard: (child) => { if (child) intentionalGatewayStop = child; },
-    inspectLocalEligibility: () => findLegacySessionStores().length === 0 &&
-      !fs.existsSync(runtimeSkills.manifestPath(OPENCLAW_DIR)) &&
-      !fs.existsSync(`${OPENCLAW_DIR}/.pre-2.0-retired-files.json`),
-    port: OPENCLAW_PORT,
-  });
+  preparedGateway = createGatewayActivation({ createCold });
   // Imports only: clients and credential resolution remain behind user binding.
   require("@aws-sdk/client-bedrock-agentcore");
   require("@smithy/signature-v4");
@@ -330,11 +311,10 @@ async function commonBootstrap() {
   await proxySdkOwner.prepare();
   v2Lifecycle.checkpoint();
   assertUnboundResourcesAbsent();
-  // Default: starts no gateway, so no OpenClaw key or ID is created before the snapshot.
+  // Starts no gateway, so no OpenClaw key or ID is created before the snapshot.
   await preparedGateway.prepare();
   v2Lifecycle.checkpoint();
-  assertUnboundResourcesAbsent(preparedGateway.prepared);
-  console.log(`[contract] gateway_seed=${preparedGateway.sharedSeedEnabled === true ? "unsafe_shared" : "off"}`);
+  assertUnboundResourcesAbsent();
   console.log(`[contract] preparation elapsedMs=${Date.now() - preparationStarted}`);
   for (const line of privsep.formatStartupLines(privsep.describeProtections({
     networkBlock: process.env.OPENCLAW_MMDS_BLOCK || "unknown",
@@ -343,16 +323,15 @@ async function commonBootstrap() {
   console.log("[contract] BOOTSTRAP_READY platform=V2 openclaw=2026.9.5");
 }
 
-function assertUnboundResourcesAbsent(seedPrepared = false) {
+function assertUnboundResourcesAbsent() {
   for (const path of [IDENTITY_FILE, BROWSER_SESSION_FILE, `${SCOPED_CREDS_DIR}/scoped-creds.json`,
     `${SCOPED_CREDS_DIR}/scoped-aws-config`]) {
     if (fs.existsSync(path)) throw new Error("User resource present before bootstrap");
   }
-  if (!seedPrepared && fs.existsSync(OPENCLAW_DIR) && fs.readdirSync(OPENCLAW_DIR).length) {
+  if (fs.existsSync(OPENCLAW_DIR) && fs.readdirSync(OPENCLAW_DIR).length) {
     throw new Error("User state present before bootstrap");
   }
   if (process.env.USER_ID || process.env.INTERNAL_USER_ID) throw new Error("User binding present before bootstrap");
-  if (seedPrepared) preparedGateway.assertFiles();
 }
 
 async function cleanupV2Resources() {
@@ -1049,7 +1028,7 @@ const SUBAGENT_MODEL_NAME = "bedrock-agentcore-subagent";
  * Sub-agents enabled for deep-research-pro and task-decomposer skills.
  * Sandbox disabled — AgentCore microVMs provide per-user isolation.
  */
-function writeOpenClawConfig({ preserveSeedFiles = false } = {}) {
+function writeOpenClawConfig() {
   activationScope.checkpoint();
   workspaceSync.assertRestoreReady();
   const fs = require("fs");
@@ -1065,30 +1044,24 @@ function writeOpenClawConfig({ preserveSeedFiles = false } = {}) {
   });
 
   const homeDir = process.env.HOME || "/root";
-  if (preserveSeedFiles) preparedGateway.assertFiles();
-  else {
-    fs.mkdirSync(`${homeDir}/.openclaw`, { recursive: true });
-    fs.writeFileSync(
-      `${homeDir}/.openclaw/openclaw.json`,
-      JSON.stringify(finalConfig, null, 2),
-    );
-  }
+  fs.mkdirSync(`${homeDir}/.openclaw`, { recursive: true });
+  fs.writeFileSync(
+    `${homeDir}/.openclaw/openclaw.json`,
+    JSON.stringify(finalConfig, null, 2),
+  );
   console.log(
     `[contract] OpenClaw headless config written${finalConfig.mcp ? " (mcp.servers.agentcore enabled)" : ""}`,
   );
 
   // Write AGENTS.md — OpenClaw loads this as workspace bootstrap instructions.
-  // Restored workspaces may carry stale instructions. An adopted seed was
-  // already checked against this exact template.
+  // Restored workspaces may carry stale instructions.
   const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
   {
-    if (!preserveSeedFiles) {
-      fs.writeFileSync(
-        agentsMdPath,
-        renderAgents({ browserEnabled: !!process.env.BROWSER_IDENTIFIER }),
-      );
-      console.log("[contract] AGENTS.md written");
-    }
+    fs.writeFileSync(
+      agentsMdPath,
+      renderAgents({ browserEnabled: !!process.env.BROWSER_IDENTIFIER }),
+    );
+    console.log("[contract] AGENTS.md written");
 
     // Also upload to S3 so the proxy's system prompt injection picks it up.
     // The proxy reads AGENTS.md from S3 (not local filesystem), so without
@@ -1579,7 +1552,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
 
   initPromise = (async () => {
     const activationStarted = Date.now();
-    // Phase names and details are fixed values chosen here and in live-seed-bridge.js; details
+    // Phase names and details are fixed values chosen here and in gateway-activation.js; details
     // are still reduced to short word characters so a log line cannot be forged.
     const logActivationPhase = (phase, details) => {
       const extra = Object.entries(details || {})
@@ -1665,17 +1638,14 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
     // state-storage.js), and the mount's mirror restored to local disk. Must
     // happen before anything touches ~/.openclaw (lock cleanup, S3 restore,
     // config/AGENTS.md write, legacy import, gateway activation).
-    const liveRestore = await preparedGateway.restoreForBinding({
-      lifecycle: v2Lifecycle, scope: activationScope, namespace, channel,
-      token: GATEWAY_TOKEN, boundEnv: openclawEnvFor(userId), waitMs: RESTORE_WAIT_MS,
-      onPhase: logActivationPhase,
+    await preparedGateway.restoreForBinding({
+      lifecycle: v2Lifecycle, scope: activationScope, namespace, onPhase: logActivationPhase,
     });
     checkpoint();
-    const liveAdopted = liveRestore?.status === "adopted";
-    logActivationPhase("gateway_prepared", { path: liveAdopted ? "seed" : "cold" });
-    const sessionStorageAvailable = liveAdopted ? liveRestore.storage.available : setupSessionStorage();
+    logActivationPhase("gateway_prepared", { path: "cold" });
+    const sessionStorageAvailable = setupSessionStorage();
     sessionStorageActive = sessionStorageAvailable;
-    if (!liveAdopted) logActivationPhase("session_storage_ready", { available: sessionStorageAvailable });
+    logActivationPhase("session_storage_ready", { available: sessionStorageAvailable });
 
     // 2. Start the Bedrock proxy with user identity env vars
     // Only pass required env vars — avoid leaking secrets via process.env spread
@@ -1757,46 +1727,40 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
     // The S3 restore ALWAYS runs: workspace-sync uploads nothing until it has
     // completed (or S3 confirmed there is no saved state), and nothing at all
     // from a container whose restore failed.
-    if (liveAdopted) {
+    let restorePromise;
+    if (sessionStorageAvailable) {
+      // Session storage is primary — S3 becomes a cold backup (30min instead of 5min)
       workspaceSync.setBackupMode(true);
-      checkpoint();
-      workspaceSync.assertRestoreReady();
-    } else {
-      let restorePromise;
-      if (sessionStorageAvailable) {
-        // Session storage is primary — S3 becomes a cold backup (30min instead of 5min)
-        workspaceSync.setBackupMode(true);
 
-        // Check if session storage already has data (returning user). Empty
-        // directories created by setupSessionStorage() itself do not count.
-        const hasContent = stateStorage.sessionStorageHasContent(MOUNTED_OPENCLAW_DIR);
+      // Check if session storage already has data (returning user). Empty
+      // directories created by setupSessionStorage() itself do not count.
+      const hasContent = stateStorage.sessionStorageHasContent(MOUNTED_OPENCLAW_DIR);
 
-        if (hasContent) {
-          // The mount's mirror may be partial: on staging a mid-turn restart found
-          // only the workspace files there (the 2 s workspace mirror had run, the
-          // 5 min state mirror had not), started with no state DBs or skill
-          // manifest, and the change backup then uploaded a fresh empty database
-          // over the good S3 copy. Fill in whatever is missing from S3 without
-          // touching the (fresher) files the mount did have.
-          console.log("[contract] Session storage has existing data — restoring only missing files from S3");
-          restorePromise = workspaceSync.restoreWorkspace(namespace, { overwrite: false });
-        } else {
-          console.log("[contract] Session storage is empty — restoring from S3 backup");
-          restorePromise = workspaceSync.restoreWorkspace(namespace);
-        }
+      if (hasContent) {
+        // The mount's mirror may be partial: on staging a mid-turn restart found
+        // only the workspace files there (the 2 s workspace mirror had run, the
+        // 5 min state mirror had not), started with no state DBs or skill
+        // manifest, and the change backup then uploaded a fresh empty database
+        // over the good S3 copy. Fill in whatever is missing from S3 without
+        // touching the (fresher) files the mount did have.
+        console.log("[contract] Session storage has existing data — restoring only missing files from S3");
+        restorePromise = workspaceSync.restoreWorkspace(namespace, { overwrite: false });
       } else {
-        // No session storage — use S3 sync as primary (existing behavior)
+        console.log("[contract] Session storage is empty — restoring from S3 backup");
         restorePromise = workspaceSync.restoreWorkspace(namespace);
       }
-      logActivationPhase("restore_start");
-      // Reject incomplete restoration before any user state is written.
-      await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);
-      checkpoint();
-      workspaceSync.assertRestoreReady();
+    } else {
+      // No session storage — use S3 sync as primary (existing behavior)
+      restorePromise = workspaceSync.restoreWorkspace(namespace);
     }
+    logActivationPhase("restore_start");
+    // Reject incomplete restoration before any user state is written.
+    await workspaceSync.awaitRestore(restorePromise, RESTORE_WAIT_MS);
+    checkpoint();
+    workspaceSync.assertRestoreReady();
     activationScope.mark("restore");
     logActivationPhase("restore_ready");
-    if (!liveAdopted) await cleanupLockFiles();
+    await cleanupLockFiles();
     checkpoint();
     await startProxy();
 
@@ -1805,13 +1769,13 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
     // path), and the 2.0 gateway refuses to run while they exist. Remove the
     // ones whose bytes still match doctor's input; a changed one needs doctor
     // again (F5, us-west-2 F1 staging test).
-    const resurrected = liveAdopted ? { changed: [] } : pruneResurrectedLegacyFiles();
+    const resurrected = pruneResurrectedLegacyFiles();
 
     // 1f. Write OpenClaw config + AGENTS.md AFTER the session-storage restore
     // (so they are not overwritten by stale restored data) and
     // BEFORE gateway activation (2.0 validates config strictly at startup; the
     // pre-2.0 code relied on gateway boot latency to win this race).
-    writeOpenClawConfig({ preserveSeedFiles: liveAdopted });
+    writeOpenClawConfig();
 
     // 1g. OpenClaw 2.0 moved session state to per-agent SQLite. A pre-2.0
     // sessions.json in the state dir makes the gateway REFUSE READINESS until
@@ -1823,7 +1787,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
     const openclawEnv = openclawEnvFor(userId);
     // doctor runs as the OpenClaw uid, so the restored state must be its own first.
     handRuntimeStateToOpenClaw("pre-doctor");
-    const migrated = liveAdopted ? false : await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 });
+    const migrated = await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 });
     checkpoint();
     if (migrated) {
       writeOpenClawConfig();
@@ -1866,11 +1830,6 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
         log: console,
         assertReady: workspaceSync.assertRestoreReady,
       });
-      if (liveAdopted) {
-        const mirrored = stateStorage.flushWorkspaceMirror("live-seed-initial");
-        if (!mirrored || mirrored.skipped) throw new Error("Live seed initial mirror failed");
-        checkpoint();
-      }
     }
 
     console.log("[contract] Starting OpenClaw gateway (headless)...");
@@ -1935,7 +1894,7 @@ async function init(userId, actorId, channel, channelActorId, channelTarget, bou
     activationScope.mark("browser");
     logActivationPhase("browser_ready");
     workspaceSync.startPeriodicSave(namespace);
-    if (workspaceSync.startChangeBackup(namespace, liveAdopted ? { initialSweep: true } : undefined).mode === "none") {
+    if (workspaceSync.startChangeBackup(namespace).mode === "none") {
       throw new Error("Required state backup is unavailable");
     }
     startRuntimeSkillManifestBackup(namespace);

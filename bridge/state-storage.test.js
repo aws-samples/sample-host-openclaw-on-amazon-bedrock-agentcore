@@ -611,8 +611,8 @@ describe("state storage wiring in agentcore-contract.js", () => {
   });
 
   it("restores the mirror before config write, legacy import and gateway activation (in that order)", () => {
-    const setup = idx("const sessionStorageAvailable = liveAdopted ? liveRestore.storage.available : setupSessionStorage();");
-    const config = idx("writeOpenClawConfig({ preserveSeedFiles: liveAdopted });");
+    const setup = idx("const sessionStorageAvailable = setupSessionStorage();");
+    const config = source.indexOf("writeOpenClawConfig();", setup);
     const migrate = idx("await migrateLegacySessionStore(openclawEnv, { forceDoctor: resurrected.changed.length > 0 })");
     const spawnGw = source.indexOf("await preparedGateway.activate(", migrate);
     assert.ok(setup < config, "setup before config write");

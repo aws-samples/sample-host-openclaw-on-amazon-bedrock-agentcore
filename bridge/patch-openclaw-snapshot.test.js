@@ -3,7 +3,6 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
-const vm = require("node:vm");
 const { PATCHES, patchSource, patchPackage, sha256 } = require("./patch-openclaw-snapshot");
 const base = require("./patch-openclaw");
 const preinit = require("./patch-openclaw-preinit");
@@ -22,35 +21,18 @@ test("snapshot delta contains only pinned functional changes", () => {
     assert.doesNotMatch(delta, /\/app\/(?:.*diagnostic|.*probe|.*timing|chat-preparation-detail|jiti)/);
     assert.doesNotMatch(delta, /OPENCLAW_DIAGNOSTICS_/);
     assert.doesNotMatch(delta, /liveSeedChatHandlerWitness|observeLiveSeedReplyRuntime/);
+    // The shared live seed was removed: no replacement may keep one of its hooks.
+    assert.doesNotMatch(delta, /liveGatewaySeed|liveSeedReplyRuntimeWitness|session-diff-worker|seedQuiesce|seedHeartbeat/);
   }
+  // Only the SQLite receiver preparation used on every activation remains.
+  assert.deepEqual(PATCHES.map(pin => pin.file).sort(), [
+    "dist/execution-identity-admission-Bf_lkljE.mjs", "dist/infra/sqlite-store.worker.js",
+    "dist/sqlite-worker-store-CpUHa3pA.mjs", "node_modules/tslog/esm/index.node.js",
+  ]);
   assert.throws(() => patchSource("dist/unknown.js", Buffer.alloc(0)), /Unsupported/);
 });
 
 const packageDir = process.env.OPENCLAW_PACKAGE_DIR;
-test("ordinary reply loaders do not invoke the preparation observer", {
-  skip: !packageDir && "Set OPENCLAW_PACKAGE_DIR to the offline npm source fixture",
-}, async () => {
-  const file = "dist/get-reply-DN4OcavF.mjs";
-  const patched = patchSource(file, fs.readFileSync(path.join(packageDir, file))).source.toString();
-  const source = patched.slice(patched.indexOf("const embeddedAgentRuntimeLoader"),
-    patched.indexOf("function hasInboundHistoryBody"));
-  const globals = {}, promises = [], key = Symbol.for("openclaw.liveSeedReplyRuntimeWitness");
-  const createLazyImportLoader = () => {
-    const promise = Promise.resolve({});
-    promises.push(promise);
-    return { load: () => promise, peek: () => promise };
-  };
-  const api = vm.compileFunction(source + "\nreturn {prewarmReplyRunRuntimes, loadEmbeddedAgentRuntime, loadAgentRunnerRuntime, loadSessionUpdatesRuntime};",
-    ["createLazyImportLoader", "globalThis"])(createLazyImportLoader, globals);
-  let captures = 0;
-  globals[key] = value => { captures++; assert.equal(value.length, 3); assert.ok(value.every(p => promises.includes(p))); };
-  await api.prewarmReplyRunRuntimes();
-  assert.equal(captures, 1);
-  await Promise.all([api.loadEmbeddedAgentRuntime(), api.loadAgentRunnerRuntime(), api.loadSessionUpdatesRuntime()]);
-  assert.equal(captures, 1);
-  globals[key] = () => { throw new Error("invalid capture"); };
-  await assert.rejects(api.prewarmReplyRunRuntimes(), /invalid capture/);
-});
 test("offline npm source applies base, preinit and snapshot patches idempotently", {
   skip: !packageDir && "Set OPENCLAW_PACKAGE_DIR to a read-only OpenClaw 2026.9.5 source fixture",
 }, t => {

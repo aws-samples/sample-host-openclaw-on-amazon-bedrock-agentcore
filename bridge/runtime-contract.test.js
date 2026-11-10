@@ -184,18 +184,18 @@ function loadContract(t, {
         };
       },
     },
-    "./live-seed-bridge": {
-      createLiveSeedBridge({ createCold }) {
+    "./gateway-activation": {
+      createGatewayActivation({ createCold }) {
         const cold = createCold();
         return {
           get child() { return cold.child; },
-          get prepared() { return false; },
           prepare: () => cold.prepare(),
           activate: (input) => cold.activate(input),
           restoreForBinding: async (input) => {
             input.onPhase?.("cold_prepare_start");
-            input.onPhase?.("seed_ineligible", { reason: "bad value\n[contract] forged" });
-            return { adopted: false };
+            // Hostile details prove the contract's phase log cannot be forged.
+            input.onPhase?.("cold_prepare_ack", { reason: "bad value\n[contract] forged" });
+            return { status: "cold" };
           },
           stop: async () => cold.stop(),
         };
@@ -828,7 +828,7 @@ test("cold activation logs every phase in order with monotonic elapsed times", a
     /^\[contract\] ([a-z_]+) elapsedMs=(\d+) generation=(\S+)((?: [a-z_]+=[\w.:-]+)*)$/,
   )).filter(Boolean);
   assert.deepEqual(phases.map((phase) => phase[1] + phase[4]), [
-    "credentials_ready", "cold_prepare_start", "seed_ineligible reason=bad_value__contract__forged",
+    "credentials_ready", "cold_prepare_start", "cold_prepare_ack reason=bad_value__contract__forged",
     "gateway_prepared path=cold", "session_storage_ready available=false", "restore_start", "restore_ready",
     "config_skills_ready", "gateway_activate_start", "gateway_activated", "proxy_ready", "gateway_ready",
     "browser_ready", "user_ready",
