@@ -84,8 +84,8 @@ function assertCredentialsFresh(creds, { now = Date.now, minValidityMs = 0 } = {
 // the authorization-token variables used with the container credential
 // endpoint (previously missing — their presence let the child reach the
 // endpoint directly). Keep this list in sync with the lists in
-// bridge/openclaw-worker-owner.js, bridge/openclaw-preinit.mjs,
-// bridge/live-gateway-seed-common.mjs and bridge/sqlite-receiver-control.mjs.
+// bridge/openclaw-worker-owner.js, bridge/openclaw-preinit.mjs and
+// bridge/sqlite-receiver-control.mjs.
 const CREDENTIAL_ENV_BLOCKLIST = [
   "AWS_ACCESS_KEY_ID",
   "AWS_SECRET_ACCESS_KEY",

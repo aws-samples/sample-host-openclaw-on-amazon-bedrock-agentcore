@@ -138,7 +138,7 @@ def test_contract_server_dependencies_are_in_the_runtime_stage():
     # server and the modules it is known to load.
     runtime = _stages()[-1]
     for name in ("agentcore-contract.js", "agentcore-proxy.js", "channel-authz.js",
-                 "cognito-token.js", "live-gateway-seed-owner.mjs"):
+                 "cognito-token.js", "gateway-activation.js", "openclaw-preinit.mjs"):
         assert f"/app/{name}" in runtime
 
 

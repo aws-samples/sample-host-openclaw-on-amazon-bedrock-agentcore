@@ -21,7 +21,7 @@ A process that is running when the snapshot is taken resumes with the same rando
 
 Earlier images kept a user-neutral OpenClaw gateway (the "live seed") running across the snapshot and bound it to each new user, which made the first start of a new user ready in about 6 s. Every new user bound to the same runtime version then received the same OpenClaw device Ed25519 private key and `device_id`, the same `boot_id`, main session id and transcript/audit event ids, and the same OpenSSL state for TLS until OpenSSL's hourly reseed. The gateway listens only on loopback inside each microVM, so no other user could use the key, but it is still a secret shared across users.
 
-The bridge therefore starts nothing from OpenClaw before the snapshot. Every activation spawns a fresh gateway process after the snapshot restore (log `seed_ineligible reason=disabled`, then `cold_prepare_start`), so OpenClaw creates its device key and ids from fresh OS entropy. The bridge's own per-user ids (activation generation, run and idempotency keys, proxy session ids) read `/dev/urandom` directly (`osRandomUUID` in `bridge/runtime-lifecycle.js`) and stay safe in the snapshotted contract and proxy processes.
+The bridge therefore starts nothing from OpenClaw before the snapshot. Every activation spawns a fresh gateway process after the snapshot restore (log `cold_prepare_start`), so OpenClaw creates its device key and ids from fresh OS entropy. The bridge's own per-user ids (activation generation, run and idempotency keys, proxy session ids) read `/dev/urandom` directly (`osRandomUUID` in `bridge/runtime-lifecycle.js`) and stay safe in the snapshotted contract and proxy processes.
 
 Cost: a new user's first start now pays for the gateway spawn, module load and boot, like a returning user with small state. On us-west-2 staging (16 Oct 2026, Opus 5.5, one plain prompt per fresh session), measured from the invoke:
 
@@ -34,7 +34,7 @@ Cost: a new user's first start now pays for the gateway spawn, module load and b
 
 Most of the new cost is `cold_prepare_start` to `cold_prepare_ack` (spawn and module load: 4-46 s, the long values on some fresh microVMs) and `gateway_activated` to `gateway_ready` (12-18 s). Returning users are unchanged: they already started a fresh gateway. The snapshot no longer holds an OpenClaw process, and bootstrap preparation dropped from about 12-19 s to under 0.1 s.
 
-`OPENCLAW_UNSAFE_SHARED_SEED=1` (exact value; anything else is off) on the AgentCore Runtime environment brings the pre-snapshot seed back for benchmarking. Do not set it for real users: it reintroduces the shared device key and ids described above.
+The live seed has been removed from the bridge. It used to be available for benchmarking with `OPENCLAW_UNSAFE_SHARED_SEED=1`; the bridge now ignores that variable, and an image never starts an OpenClaw process before the snapshot. Its vendor patches (gateway lock and owner-lease handover, lease heartbeat preparation, server attach and admission, reply and Git worker preparation) and the modules that drove it (`live-gateway-seed-*.mjs`, `live-seed-bridge.js`, `session-diff-worker-*.mjs`) are gone. The table above keeps its measurements for reference.
 
 Restore failure, partial failure or timeout blocks activation and uploads. Credentials and gateway/Browser readiness are checked before dispatch. SQLite stays on local disk, mirrored to session storage and backed up to S3; never open its databases directly on the mount. See [state storage](session-storage.md) and [runtime behavior](how-it-works.md).
 
@@ -158,13 +158,9 @@ Each activation logs `[contract] <phase> elapsedMs=<ms> generation=<id>` lines, 
 | Phase | Meaning |
 |---|---|
 | `credentials_ready` | Scoped credentials acquired |
-| `seed_ineligible reason=disabled` | Default: no pre-snapshot gateway exists, so the gateway is started fresh |
-| `seed_restore_start` | `OPENCLAW_UNSAFE_SHARED_SEED=1` only: the prepared live seed checks S3 for saved state |
-| `seed_ineligible reason=<r>` | `OPENCLAW_UNSAFE_SHARED_SEED=1` only: the seed cannot be used, because of saved state (`reason=namespace_content` etc.) or a bridge check |
-| `seed_stop_start`, `seed_stopped` | `OPENCLAW_UNSAFE_SHARED_SEED=1` only: the unused seed is stopped and its files removed |
-| `cold_prepare_start`, `cold_prepare_ack` | A prepared gateway for normal startup is obtained (spawn and module load, up to the preinit acknowledgement) |
-| `gateway_prepared path=seed\|cold` | The gateway path is decided (always `cold` by default) |
-| `session_storage_ready available=<bool>` | Cold path: local state dir set up from the session-storage mirror |
+| `cold_prepare_start`, `cold_prepare_ack` | The user's prepared gateway is spawned after the snapshot restore (spawn and module load, up to the preinit acknowledgement) |
+| `gateway_prepared path=cold` | The prepared gateway is ready for the restore (always `cold`; images with the live seed could also log `seed_*` phases and `path=seed`) |
+| `session_storage_ready available=<bool>` | Local state dir set up from the session-storage mirror |
 | `restore_start`, `restore_ready` | S3 workspace restore started and committed |
 | `config_skills_ready` | Config, legacy import and runtime skills done |
 | `gateway_activate_start`, `gateway_activated` | Prepared gateway released and acknowledged |

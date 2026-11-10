@@ -144,8 +144,8 @@ function chownRecursiveSync(dir, uid, gid, fs) {
 
 // --- Writable locations for the agent uid ---------------------------------
 //
-// HOME stays /root for every OpenClaw-family child: the state dir, the config
-// path and the live-seed layout checks are all derived from it, and /root is
+// HOME stays /root for every OpenClaw-family child: the state dir and the
+// config path are derived from it, and /root is
 // 0711 (traverse only), so the agent uid cannot create anything directly under
 // it. OpenClaw, clawhub and the tools they run still write per-user caches and
 // temp files relative to HOME or the XDG base directories, e.g. OpenClaw's

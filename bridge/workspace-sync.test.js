@@ -1692,7 +1692,7 @@ describe("change backup wiring in agentcore-contract.js", () => {
 
   it("starts the change backup once the gateway is ready, next to the periodic save", () => {
     const periodic = idx("workspaceSync.startPeriodicSave(namespace);");
-    const change = idx("workspaceSync.startChangeBackup(namespace, liveAdopted ? { initialSweep: true } : undefined)");
+    const change = idx("workspaceSync.startChangeBackup(namespace)");
     assert.ok(change > periodic && change - periodic < 200);
   });
 

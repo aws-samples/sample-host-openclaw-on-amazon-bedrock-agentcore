@@ -246,15 +246,13 @@ COPY runtime-skills.js /app/runtime-skills.js
 COPY runtime-lifecycle.js /app/runtime-lifecycle.js
 COPY user-namespace.js /app/user-namespace.js
 COPY gateway-lifecycle.js /app/gateway-lifecycle.js
-COPY gateway-config.js live-seed-bridge.js model-policy.js invocation-stream.js cron-jobs.js /app/
+COPY gateway-config.js gateway-activation.js model-policy.js invocation-stream.js cron-jobs.js /app/
 COPY proxy-sdk-snapshot.js proxy-auth-prepare.js system-prefix-cache.js /app/
 COPY openclaw-worker-owner.js /app/openclaw-worker-owner.js
 COPY runtime-privsep.js /app/runtime-privsep.js
 COPY mmds-firewall.sh /app/mmds-firewall.sh
 RUN chmod +x /app/mmds-firewall.sh
 COPY openclaw-preinit.mjs /app/openclaw-preinit.mjs
-COPY live-gateway-seed-owner.mjs live-gateway-seed-child.mjs live-gateway-seed-common.mjs /app/
-COPY session-diff-worker-prewarm.mjs session-diff-worker-bootstrap.mjs /app/
 COPY sqlite-receiver-control.mjs sqlite-receiver-reservation.mjs sqlite-backend-prepare.mjs /app/
 COPY gateway-invariant-prewarm.mjs /app/gateway-invariant-prewarm.mjs
 COPY patches/runtime-v2.json /app/patches/runtime-v2.json
@@ -340,12 +338,6 @@ pin("/app/patches/runtime-v2.json");
 const patch = JSON.parse(fs.readFileSync("/app/patches/runtime-v2.json", "utf8"));
 for (const [file, expected] of Object.entries(patch.requires)) pin(vendor + file, expected);
 for (const entry of patch.files) pin(vendor + entry.file, entry.patchedSha256);
-const child = fs.readFileSync("/app/live-gateway-seed-child.mjs", "utf8");
-const list = child.match(/export const CHAT_PREPARE_MODULES = Object\.freeze\(([\s\S]*?)\.map\(Object\.freeze\)\);/);
-if (!list) throw new Error("Missing chat preparation pins");
-const matches = [...list[1].matchAll(/\["([^"\n]+)", "([a-f0-9]{64})"\]/g)];
-if (!matches.length) throw new Error("Empty chat preparation pins");
-for (const [, file, expected] of matches) pin(vendor + "dist/" + file, expected);
 pin("/app/node_modules/@aws-sdk/client-bedrock-runtime/dist-cjs/index.js",
   "2d0c2e259d5ea7b483ee5b9dc301ac85f85f9a612074f1c5a5d1ee9be8887682");
 fs.writeFileSync("/app/runtime-source-manifest.json", JSON.stringify({

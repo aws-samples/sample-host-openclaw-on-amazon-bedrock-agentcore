@@ -28,9 +28,7 @@ EXPECTED_NODE = "24.22.1"
 # the base image or the gateway refuses to start on the new image.
 VERSION_PINNED_FILES = (
     "gateway-invariant-prewarm.mjs",
-    "live-gateway-seed-owner.mjs",
     "proxy-sdk-snapshot.js",
-    "native-owner.test.js",
 )
 
 

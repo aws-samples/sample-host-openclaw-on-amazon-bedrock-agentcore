@@ -488,134 +488,6 @@ function setRestoreState(state) {
  * @returns {Promise<{ restored: number, kept: number, keptUnchanged: number, failed: number, hadState: boolean }>}
  *   `keptUnchanged` counts the kept files verified identical to S3 (seeded).
  */
-async function restoreAbsentSeed(namespace, { lifecycle, scope, bindSeed } = {}) {
-  assertNamespaceBound(namespace);
-  if (_fatalRestoreError) throw _fatalRestoreError;
-  if (_restoreState !== "unknown") throw new Error("Live seed restore was already attempted");
-  if (!BUCKET || !_credentialProvider || typeof bindSeed !== "function") {
-    throw new Error("Live seed restore requires a bound persistence owner");
-  }
-  const binding = lifecycle.snapshot().binding;
-  const provider = _credentialProvider;
-  const attempt = { controller: new AbortController(), error: null };
-  _restoreNamespace = namespace;
-  _restoreAttempt = attempt;
-  setRestoreState("pending");
-  let bound = false;
-  const abort = () => {
-    const error = scope.signal.reason || new Error("Live seed restore aborted");
-    attempt.error = error;
-    _fatalRestoreError ||= error;
-    attempt.controller.abort(error);
-    setRestoreState("failed");
-  };
-  const check = () => {
-    assertRestoreActive(attempt);
-    scope.checkpoint();
-    lifecycle.checkpoint();
-    const current = lifecycle.snapshot();
-    if (_restoreAttempt !== attempt || _restoreState !== "pending" ||
-        current.state !== "BINDING" || current.binding !== binding ||
-        current.generation !== scope.generation || !current.resources.includes("credentials") ||
-        provider !== _credentialProvider || !binding || current.namespace !== namespace ||
-        process.env.USER_ID !== binding.actorId || process.env.INTERNAL_USER_ID !== binding.userId) {
-      throw new Error("Live seed restore owner changed");
-    }
-    lifecycle.assertBinding(binding);
-  };
-  const ineligible = (reason) => Object.assign(new Error("Live seed restore is ineligible"), {
-    code: "LIVE_SEED_INELIGIBLE", reason,
-  });
-  async function inspectNamespace() {
-    const prefix = `${namespace}/`;
-    const s3 = getS3Client();
-    const tokens = new Set();
-    let continuationToken;
-    do {
-      check();
-      const params = { Bucket: BUCKET, Prefix: prefix, MaxKeys: 1000 };
-      if (continuationToken !== undefined) params.ContinuationToken = continuationToken;
-      const page = await s3.send(new (getS3Sdk().ListObjectsV2Command)(params),
-        { abortSignal: attempt.controller.signal });
-      check();
-      if (!page || typeof page !== "object" ||
-          typeof page.IsTruncated !== "boolean" ||
-          (page.Contents !== undefined && !Array.isArray(page.Contents)) ||
-          (page.CommonPrefixes !== undefined &&
-            (!Array.isArray(page.CommonPrefixes) || page.CommonPrefixes.length)) ||
-          (page.Prefix !== undefined && page.Prefix !== prefix)) {
-        throw ineligible("listing_invalid");
-      }
-      const contents = page.Contents || [];
-      if (page.KeyCount !== undefined &&
-          (!Number.isSafeInteger(page.KeyCount) || page.KeyCount !== contents.length)) {
-        throw ineligible("listing_invalid");
-      }
-      for (const item of contents) {
-        if (!item || typeof item.Key !== "string" || !item.Key.startsWith(prefix)) {
-          throw ineligible("listing_invalid");
-        }
-      }
-      if (contents.length) throw ineligible("namespace_content");
-      if (page.IsTruncated) {
-        const next = page.NextContinuationToken;
-        if (typeof next !== "string" || !next || tokens.has(next)) {
-          throw ineligible("listing_incomplete");
-        }
-        tokens.add(next);
-        continuationToken = next;
-      } else {
-        if (page.NextContinuationToken !== undefined) throw ineligible("listing_invalid");
-        continuationToken = undefined;
-      }
-    } while (continuationToken !== undefined);
-  }
-  scope.signal.addEventListener("abort", abort, { once: true });
-  try {
-    if (scope.signal.aborted) abort();
-    check();
-    if ((process.env.AGENTCORE_GATEWAY_URL || "").trim()) throw ineligible("mcp_enabled");
-    const ticket = stateStorage.inspectEmptySessionStorage();
-    await inspectNamespace();
-    check();
-    stateStorage.assertEmptySessionStorage(ticket);
-    // Recheck remote absence immediately before admission; this is not a distributed lock.
-    await inspectNamespace();
-    check();
-    stateStorage.assertEmptySessionStorage(ticket);
-    const proof = Object.freeze({
-      generation: scope.generation, actorId: binding.actorId, userId: binding.userId,
-      verified: true, restoreGateVerified: true, mcpDisabled: true,
-    });
-    const result = await bindSeed(proof);
-    bound = result?.status === "bound" && result.bound === true;
-    check();
-    if (!bound) throw ineligible("owner_declined");
-    if (result.generation !== scope.generation || result.userReady !== false ||
-        !Number.isSafeInteger(result.pid) || result.pid <= 0) {
-      throw new Error("Live seed owner acknowledgement mismatch");
-    }
-    // A changed mirror after bind is fatal, never a deletion of bound user state.
-    stateStorage.assertEmptySessionStorage(ticket);
-    const storage = stateStorage.attachEmptySessionStorage(ticket);
-    check();
-    setRestoreState("ready");
-    return { status: "adopted", owner: result, storage, restored: 0, failed: 0, hadState: false };
-  } catch (error) {
-    if (error.code === "LIVE_SEED_INELIGIBLE" && !bound && !attempt.error && !_fatalRestoreError) {
-      setRestoreState("ineligible");
-      return { status: "ineligible", reason: error.reason };
-    }
-    attempt.error ||= error;
-    _fatalRestoreError ||= error;
-    attempt.controller.abort(error);
-    setRestoreState("failed");
-    throw error;
-  } finally {
-    scope.signal.removeEventListener("abort", abort);
-  }
-}
-
 async function restoreWorkspace(namespace, { overwrite = true } = {}) {
   assertNamespaceBound(namespace);
   if (_fatalRestoreError) throw _fatalRestoreError;
@@ -2043,7 +1915,6 @@ function startChangeBackup(namespace, opts = {}) {
     largeSqliteMinIntervalMs: Math.max(0, sqliteMinIntervalMs, largeSqliteMinIntervalMs),
   };
   const fallbackIntervalMs = opts.fallbackIntervalMs || DEFAULT_CHANGE_POLL_INTERVAL_MS;
-  if (opts.initialSweep === true) markChanged(null);
   try {
     fs.mkdirSync(LOCAL_PATH, { recursive: true });
     _changeWatcher = fs.watch(LOCAL_PATH, { recursive: true, persistent: false }, (_event, filename) => {
@@ -2121,7 +1992,6 @@ async function cleanup(namespace) {
 }
 
 module.exports = {
-  restoreAbsentSeed,
   assertRestoreReady,
   restoreWorkspace,
   awaitRestore,
