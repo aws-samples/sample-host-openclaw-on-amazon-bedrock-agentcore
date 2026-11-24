@@ -38,4 +38,12 @@ function extractSystemText(messages, fallback) {
   return systemTexts.length > 0 ? systemTexts.join("\n") : fallback;
 }
 
-module.exports = { extractSystemText };
+/**
+ * True when OpenClaw's system text has its "# Project Context" section, where
+ * OpenClaw puts the workspace files it loads (AGENTS.md, SOUL.md, USER.md, ...).
+ */
+function hasProjectContext(systemText) {
+  return /(^|\n)# Project Context(\n|$)/.test(systemText);
+}
+
+module.exports = { extractSystemText, hasProjectContext };

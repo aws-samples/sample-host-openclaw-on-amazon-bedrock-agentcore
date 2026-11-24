@@ -78,6 +78,15 @@ const SKIP_DIR_NAMES = new Set(["node_modules", ".cache", ".npm"]);
 // Short-lived staging directories OpenClaw creates next to the file it is
 // about to publish (tempFile({ rootDir, prefix: "openclaw-bootstrap" })).
 const TRANSIENT_DIR_RE = /^openclaw-(bootstrap|publish|tmp)-/;
+// State-dir paths that are neither mirrored nor restored. OpenClaw's onboarding
+// file: the gateway config sets skipBootstrap, so OpenClaw no longer seeds it,
+// and a copy left on the mount by an earlier session is not restored.
+// workspace-sync.js keeps it out of the S3 backup too.
+const UNMIRRORED_PATHS = new Set([`${WORKSPACE_SUBDIR}/BOOTSTRAP.md`]);
+
+function isUnmirroredPath(relativePath) {
+  return UNMIRRORED_PATHS.has(relativePath);
+}
 
 // Lazy node:sqlite (Node >= 22.13 / 24 in the image; may be absent locally).
 let _nodeSqlite;
@@ -403,7 +412,7 @@ function restoreStateDir({ stateDir, mountStateDir, log = console } = {}) {
   let workspaceFiles = 0;
   let skipped = 0;
   for (const rel of walkFiles(mountStateDir, mountStateDir, { strict: true })) {
-    if (isTransientFile(rel)) continue;
+    if (isTransientFile(rel) || isUnmirroredPath(rel)) continue;
     const src = path.join(mountStateDir, rel);
     const dest = path.join(stateDir, rel);
     if (!insideBase(resolvedBase, dest)) {
@@ -454,7 +463,8 @@ async function mirrorStateDir({ stateDir, mountStateDir, log = console, sqlite =
   budgetBytes = mirrorBudgetBytes() } = {}) {
   if (assertReady) assertReady();
   const result = { files: 0, unchanged: 0, sqlite: 0, skipped: 0, pruned: 0, budgetSkipped: 0, mountErrors: 0 };
-  const localFiles = walkFiles(stateDir, stateDir, { strict: true }).filter((rel) => !isTransientFile(rel));
+  const localFiles = walkFiles(stateDir, stateDir, { strict: true })
+    .filter((rel) => !isTransientFile(rel) && !isUnmirroredPath(rel));
   const localSet = new Set(localFiles);
   const acct = { used: diskUsageBytes(path.dirname(mountStateDir)), budget: budgetBytes, skippedForBudget: 0 };
   const staging = stagingDir || fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-state-mirror-"));
@@ -542,7 +552,8 @@ function mirrorWorkspaceDir({ stateDir, mountStateDir, log = console, assertRead
   const workspaceDir = path.join(stateDir, WORKSPACE_SUBDIR);
   const mountWorkspaceDir = path.join(mountStateDir, WORKSPACE_SUBDIR);
   if (!fs.existsSync(workspaceDir)) return result;
-  const localFiles = walkFiles(workspaceDir, workspaceDir, { strict: true }).filter((rel) => !isTransientFile(rel));
+  const localFiles = walkFiles(workspaceDir, workspaceDir, { strict: true })
+    .filter((rel) => !isTransientFile(rel) && !isUnmirroredPath(path.join(WORKSPACE_SUBDIR, rel)));
   const localSet = new Set(localFiles);
   let acct = null;
   for (const rel of localFiles) {

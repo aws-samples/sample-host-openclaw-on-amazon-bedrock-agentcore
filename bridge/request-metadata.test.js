@@ -168,6 +168,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     retrieveMemoryContext: async () => "",
     buildUserIdentityContext: async () => "",
     extractSystemText: require("./system-messages").extractSystemText,
+    hasProjectContext: require("./system-messages").hasProjectContext,
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
     blockedGuardrailInput: require("./guardrail-scope").createBlockedInputRegistry(),
     reconcileToolHistory: require("./tool-history").reconcileToolHistory,
@@ -176,7 +177,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     systemPrefixCache: { capture: () => undefined, apply: (_prefix, system) => system },
     addToolPrefixCachePoint: require("./system-prefix-cache").addToolPrefixCachePoint,
     buildRequestMetadata,
-    modelOutcomeUnknown: false, chatRequestCount: 0, subagentRequestCount: 0,
+    modelOutcomeUnknown: false, chatRequestCount: 0, subagentRequestCount: 0, projectContextLogged: false,
   };
   vm.createContext(box);
   vm.runInContext(slice("const VALID_CHANNELS = new Set([", "\nasync function retrieveMemoryContext("), box);

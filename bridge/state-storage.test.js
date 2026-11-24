@@ -502,6 +502,55 @@ describe("mirror stays inside the session storage quota", () => {
   });
 });
 
+describe("OpenClaw's onboarding file (workspace/BOOTSTRAP.md) is neither mirrored nor restored", () => {
+  let home, mount, stateDir, mountState;
+  beforeEach(() => {
+    home = mkTmp("ss-boot-home-");
+    mount = mkTmp("ss-boot-mount-");
+    storage.setupSessionStorage({ homeDir: home, mountDir: mount, log: quietLog });
+    stateDir = path.join(home, ".openclaw");
+    mountState = path.join(mount, ".openclaw");
+  });
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(mount, { recursive: true, force: true });
+  });
+
+  it("mirrorStateDir and mirrorWorkspaceDir copy the user's files, skip BOOTSTRAP.md and prune an old copy", async () => {
+    write(path.join(stateDir, "workspace/USER.md"), "u");
+    write(path.join(stateDir, "workspace/BOOTSTRAP.md"), "b");
+    write(path.join(stateDir, "workspace/notes/BOOTSTRAP.md"), "user's own file");
+    write(path.join(mountState, "workspace/BOOTSTRAP.md"), "old");
+    const r = await storage.mirrorStateDir({ stateDir, mountStateDir: mountState, log: quietLog, sqlite: null });
+    assert.equal(r.files, 2);
+    assert.equal(r.pruned, 1);
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/USER.md"), "utf8"), "u");
+    assert.equal(fs.readFileSync(path.join(mountState, "workspace/notes/BOOTSTRAP.md"), "utf8"), "user's own file");
+    assert.equal(fs.existsSync(path.join(mountState, "workspace/BOOTSTRAP.md")), false);
+
+    write(path.join(mountState, "workspace/BOOTSTRAP.md"), "old");
+    const w = storage.mirrorWorkspaceDir({ stateDir, mountStateDir: mountState, log: quietLog });
+    assert.equal(w.files, 0);
+    assert.equal(w.unchanged, 2);
+    assert.equal(w.pruned, 1);
+    assert.equal(fs.existsSync(path.join(mountState, "workspace/BOOTSTRAP.md")), false);
+  });
+
+  it("setupSessionStorage restores the workspace from the mount without BOOTSTRAP.md", () => {
+    write(path.join(mountState, "workspace/USER.md"), "u");
+    write(path.join(mountState, "workspace/BOOTSTRAP.md"), "from an earlier session");
+    const home2 = mkTmp("ss-boot-home2-");
+    try {
+      const r = storage.setupSessionStorage({ homeDir: home2, mountDir: mount, log: quietLog });
+      assert.equal(r.restored.workspaceFiles, 1);
+      assert.equal(fs.readFileSync(path.join(home2, ".openclaw/workspace/USER.md"), "utf8"), "u");
+      assert.equal(fs.existsSync(path.join(home2, ".openclaw/workspace/BOOTSTRAP.md")), false);
+    } finally {
+      fs.rmSync(home2, { recursive: true, force: true });
+    }
+  });
+});
+
 // --- wiring in agentcore-contract.js (source-level ordering guarantees) ---
 describe("mirrorWorkspaceDir / workspace watcher", () => {
   let home, mount, stateDir, mountState, ws;

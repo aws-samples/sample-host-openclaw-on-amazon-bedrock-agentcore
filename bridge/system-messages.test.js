@@ -208,3 +208,18 @@ describe("proxy system text conversion", () => {
     assert.match(source, /const baseSystemText = extractSystemText\(messages, SYSTEM_PROMPT\);/);
   });
 });
+
+describe("hasProjectContext", () => {
+  const { hasProjectContext } = require("./system-messages");
+
+  it("finds the section OpenClaw puts its workspace files in", () => {
+    assert.equal(hasProjectContext("You are a personal assistant.\n\n# Project Context\n\nLoaded project context:\n## USER.md\n"), true);
+    assert.equal(hasProjectContext("# Project Context\n\n## AGENTS.md\n"), true);
+  });
+
+  it("is false without that heading, for a lower-level heading and for the words inside a line", () => {
+    for (const text of ["", "You are a personal assistant.\n## Tooling\n", "## Project Context\n", "See # Project Context.\n"]) {
+      assert.equal(hasProjectContext(text), false, JSON.stringify(text));
+    }
+  });
+});

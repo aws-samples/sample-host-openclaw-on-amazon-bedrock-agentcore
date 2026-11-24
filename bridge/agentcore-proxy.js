@@ -10,7 +10,7 @@ const http = require("http");
 const crypto = require("crypto");
 const { osRandomUUID } = require("./runtime-lifecycle");
 const fs = require("fs");
-const { extractSystemText } = require("./system-messages");
+const { extractSystemText, hasProjectContext } = require("./system-messages");
 const modelPolicy = require("./model-policy");
 const { preparedSdk } = require("./proxy-sdk-snapshot");
 const { createProxyAuthChild } = require("./proxy-auth-prepare");
@@ -113,6 +113,7 @@ let lastIdentityDiag = null;
 let chatRequestCount = 0;
 let subagentRequestCount = 0;
 let modelOutcomeUnknown = false;
+let projectContextLogged = false;
 
 const SYSTEM_PROMPT =
   "You are a helpful personal assistant powered by OpenClaw. You are friendly, " +
@@ -1694,6 +1695,15 @@ const server = http.createServer(async (req, res) => {
           { sharedChat },
         );
         const baseSystemText = extractSystemText(messages, SYSTEM_PROMPT);
+        // Once per container, at the first request with OpenClaw's system prompt:
+        // whether OpenClaw added its workspace files to it (gateway-config.js sets
+        // contextInjection: "never"). Lets an operator check a route's setting.
+        if (!projectContextLogged && messages.some((m) => m.role === "system")) {
+          projectContextLogged = true;
+          console.log(
+            `[proxy] OpenClaw workspace files in system prompt: ${hasProjectContext(baseSystemText) ? "yes" : "no"}`,
+          );
+        }
         const systemTextOverride = baseSystemText + identityContext + memoryContext;
         const systemPrefix = stream
           ? systemPrefixCache.capture(messages, baseSystemText, systemTextOverride) : undefined;
