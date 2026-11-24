@@ -27,6 +27,26 @@ from constructs import Construct
 from stacks import DeploymentNamer, retention_days
 from stacks.context_limits import per_user_daily_cost_usd, reserved_concurrency
 
+# Scheduled-task delivery checks in the Cron Lambda (lambda/cron, verify_cron_event).
+# The first value of each is the default.
+CRON_LEGACY_RECORDS_MODES = ("read", "off")
+CRON_TARGET_CHECK_MODES = ("refuse", "log")
+
+
+def context_choice(node, key: str, choices: tuple[str, ...]) -> str:
+    """The value of context ``key`` from ``choices``; unset or empty is ``choices[0]``.
+
+    Case and surrounding spaces are ignored. Any other value raises
+    ValueError at synth time, so a typo cannot deploy.
+    """
+    value = node.try_get_context(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return choices[0]
+    mode = value.strip().lower() if isinstance(value, str) else None
+    if mode not in choices:
+        raise ValueError(f"context {key} must be {' or '.join(choices)}, got {value!r}")
+    return mode
+
 
 class CronStack(Stack):
     def __init__(
@@ -66,6 +86,12 @@ class CronStack(Stack):
                          is not None else "true").lower() not in ("false", "0", "no", "off")
         # Per-user daily cost limit (USD), validated at synth; None = off.
         daily_cost_limit = per_user_daily_cost_usd(self)
+        # Where the Lambda reads schedule records: "read" = SCHED#<userId>, then
+        # USER#<userId>; "off" = SCHED#<userId> only.
+        legacy_records = context_choice(self.node, "cron_legacy_records", CRON_LEGACY_RECORDS_MODES)
+        # Telegram, WhatsApp, LINE and Discord schedules whose stored target is not
+        # the owner's own chat: "refuse" (no run, one notice) or "log" (run, warning).
+        target_check = context_choice(self.node, "cron_target_check", CRON_TARGET_CHECK_MODES)
         namer = DeploymentNamer.from_scope(self)
         schedule_group_name = namer.name("openclaw-cron")
         scheduler_role_name = namer.name(f"openclaw-cron-scheduler-role-{region}")
@@ -145,6 +171,8 @@ class CronStack(Stack):
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
                 "USER_FILES_BUCKET": user_files_bucket_name,
                 "CRON_ASYNC_STATE_MACHINE_ARN": state_machine_arn if cron_async else "",
+                "CRON_LEGACY_RECORDS": legacy_records,
+                "CRON_TARGET_CHECK": target_check,
                 # Set only when the limit is on, so the default (0) leaves the function unchanged.
                 **({"PER_USER_DAILY_COST_USD": daily_cost_limit} if daily_cost_limit else {}),
             },

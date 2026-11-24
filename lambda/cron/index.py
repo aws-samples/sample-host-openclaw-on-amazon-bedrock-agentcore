@@ -52,6 +52,31 @@ CRON_ASYNC_STATE_MACHINE_ARN = os.environ.get("CRON_ASYNC_STATE_MACHINE_ARN", ""
 # 0 = off: no usage is read before a run. See lambda/shared/python/usage_limits.py.
 PER_USER_DAILY_COST_USD = usage_limits.parse_limit(os.environ.get("PER_USER_DAILY_COST_USD"))
 
+
+def _choice_setting(name, choices):
+    """The value of environment variable ``name`` from ``choices``; unset is ``choices[0]``.
+
+    The synth validates these values, so anything else is a manual change: it
+    is logged and the default (``choices[0]``) applies.
+    """
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return choices[0]
+    if value not in choices:
+        logger.error("%s must be %s; using %s", name, " or ".join(choices), choices[0])
+        return choices[0]
+    return value
+
+
+# Schedule records (cron_legacy_records). "read" (default): a schedule's record
+# is read from SCHED#<userId> first, then from USER#<userId>, where the
+# eventbridge-cron skill and the gateway tool write it. "off": SCHED# only.
+CRON_LEGACY_RECORDS = _choice_setting("CRON_LEGACY_RECORDS", ("read", "off"))
+# Delivery target check on Telegram, WhatsApp, LINE and Discord
+# (cron_target_check). "refuse" (default): a schedule whose stored target is
+# not its owner's own chat does not run. "log": it runs and a warning is logged.
+CRON_TARGET_CHECK = _choice_setting("CRON_TARGET_CHECK", ("refuse", "log"))
+
 # --- Clients ---
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION,
                          config=Config(connect_timeout=2, read_timeout=3, retries={"max_attempts": 0}))
@@ -87,6 +112,20 @@ USAGE_LIMIT_SKIPPED_MESSAGE = (
     "Skipped: today's usage limit is reached. "
     "It runs again at its next scheduled time after 00:00 UTC."
 )
+TARGET_REFUSED_MESSAGE = (
+    "This scheduled task is paused because it was set to deliver to a different chat. "
+    "Create it again from the chat that should receive it."
+)
+# Channels where a schedule delivers only to its owner's own chat: the Router
+# passes the sender's own channel user ID as the delivery target there. Slack
+# (a channel ID) and Feishu (a chat ID) targets can differ from the user ID.
+OWN_CHAT_CHANNELS = frozenset({"telegram", "whatsapp", "line", "discord"})
+# Shortest time between two runs of one schedule. The eventbridge-cron skill
+# and the gateway tool allow every 5 minutes at most; the margin absorbs
+# EventBridge Scheduler's timing jitter.
+MIN_FIRE_INTERVAL_SECONDS = 270
+# A schedule's SCHED#<userId>/FIRE#<scheduleId> item expires this long after its last run.
+FIRE_RECORD_TTL_SECONDS = 8 * 24 * 3600
 
 
 def _get_secret(secret_id):
@@ -1103,7 +1142,7 @@ def handler(event, context):
     job, error = verify_cron_event(event)
     if error:
         return error
-    skipped = skip_over_usage_limit(job)
+    skipped = skip_recent_fire(job) or skip_over_usage_limit(job)
     if skipped:
         return skipped
     channel, channel_target, message = job["channel"], job["channelTarget"], job["message"]
@@ -1182,9 +1221,7 @@ def verify_cron_event(event):
     # Verify schedule ownership — cross-check DynamoDB CRON# record
     # Use current_user_id (resolved from channel identity) for the lookup.
     try:
-        cron_record = identity_table.get_item(
-            Key={"PK": f"USER#{current_user_id}", "SK": f"CRON#{schedule_id}"}, ConsistentRead=True,
-        ).get("Item")
+        cron_record = read_schedule_record(current_user_id, schedule_id)
         if not cron_record:
             logger.error(
                 "Schedule %s not owned by user %s — skipping execution",
@@ -1237,21 +1274,24 @@ def verify_cron_event(event):
     if not actor_id.startswith(f"{channel}:"):
         return None, {"statusCode": 403, "body": "Channel identity verification failed"}
 
-    # Defence in depth on the delivery target. The eventbridge-cron skill is
-    # the enforcement point: it binds a schedule's channelTarget to the
-    # creating turn's own target. A CRON# record's channelTarget is otherwise
-    # agent-writable, so flag a schedule that delivers somewhere other than the
-    # actor's own channel user id. This is logged, not refused: Slack delivers
-    # to a channel id and Feishu to a chat id, both of which legitimately
-    # differ from the actor's user id, so refusing on a mismatch would break
-    # those channels and any pre-existing schedule.
+    # The delivery target. The eventbridge-cron skill binds a schedule's
+    # channelTarget to the creating turn's own target. On Telegram, WhatsApp,
+    # LINE and Discord that is always the actor's own channel user id, so a
+    # schedule with any other target does not run there (cron_target_check
+    # "refuse", the default) or runs with a warning ("log"). Slack delivers to
+    # a channel id and Feishu to a chat id, both of which can differ from the
+    # actor's user id, so on those channels a different target is logged only.
     actor_channel_user_id = actor_id.split(":", 1)[1] if ":" in actor_id else ""
-    if channel_target != actor_channel_user_id:
-        logger.warning(
-            "Scheduled task %s on channel %s delivers to a target that is not the "
-            "actor's own chat id; verify the target was set by the owning conversation",
-            schedule_id, channel,
-        )
+    refuse_target = False
+    if str(channel_target) != actor_channel_user_id:
+        if channel in OWN_CHAT_CHANNELS and CRON_TARGET_CHECK == "refuse":
+            refuse_target = True
+        else:
+            logger.warning(
+                "Scheduled task %s on channel %s delivers to a target that is not the "
+                "actor's own chat id; verify the target was set by the owning conversation",
+                schedule_id, channel,
+            )
 
     # Phase 1: Get or create session
     try:
@@ -1260,10 +1300,108 @@ def verify_cron_event(event):
     except Exception as error:
         logger.error("AgentCore Runtime route unavailable: %s", error)
         return None, {"statusCode": 503, "body": "Runtime route unavailable"}
-    return {
+    job = {
         "userId": current_user_id, "actorId": actor_id, "channel": channel, "channelTarget": channel_target,
         "message": message, "scheduleId": schedule_id, "scheduleName": schedule_name, "route": session_id,
-    }, None
+    }
+    if refuse_target:
+        # Only an enabled, authorized owner gets the notice, in their own chat.
+        return None, refuse_delivery_target(job, actor_channel_user_id)
+    return job, None
+
+
+def read_schedule_record(user_id, schedule_id):
+    """A schedule's record: SCHED#<userId>/CRON#<scheduleId>, else USER#<userId>/CRON#<scheduleId>.
+
+    The SCHED# record wins when both exist. The USER# record is read only
+    while cron_legacy_records is "read" (the default), and each use is logged
+    so an operator can see which schedules still depend on it. None when
+    there is no record. Read errors propagate to the caller.
+    """
+    record = identity_table.get_item(
+        Key={"PK": f"SCHED#{user_id}", "SK": f"CRON#{schedule_id}"}, ConsistentRead=True,
+    ).get("Item")
+    if record or CRON_LEGACY_RECORDS != "read":
+        return record
+    record = identity_table.get_item(
+        Key={"PK": f"USER#{user_id}", "SK": f"CRON#{schedule_id}"}, ConsistentRead=True,
+    ).get("Item")
+    if record:
+        logger.info("Scheduled task %s uses its legacy USER# record", schedule_id)
+    return record
+
+
+def _error_code(error):
+    """The DynamoDB error code of a botocore ClientError, else None."""
+    response = getattr(error, "response", None)
+    return response.get("Error", {}).get("Code") if isinstance(response, dict) else None
+
+
+def refuse_delivery_target(job, owner_chat):
+    """The Lambda response for a schedule whose stored target is not its owner's own chat.
+
+    Nothing runs and nothing is sent to the stored target. The owner gets one
+    notice in their own chat (owner_chat) per schedule. The log line avoids
+    the terms of the scheduled-task failure alarm.
+    """
+    logger.warning("Scheduled task %s refused: its delivery target is not the owner's chat", job["scheduleId"])
+    if claim_target_notice(job["userId"], job["scheduleId"]):
+        deliver_response(job["channel"], owner_chat,
+                         f"[Scheduled: {job['scheduleName'] or job['scheduleId']}] {TARGET_REFUSED_MESSAGE}")
+    return {"statusCode": 403, "body": "Delivery target is not the owner's chat"}
+
+
+def claim_target_notice(user_id, schedule_id, now=None):
+    """Mark the schedule's target notice as sent. False if it already was or the write failed.
+
+    A conditional write of targetNoticeAt on SCHED#<userId>/FIRE#<scheduleId>,
+    so the owner is told once per schedule, also when fires overlap. The
+    write also removes the item's expiry, so the mark is kept while the
+    schedule keeps being refused; the next run of the schedule sets an
+    expiry again.
+    """
+    try:
+        identity_table.update_item(
+            Key={"PK": f"SCHED#{user_id}", "SK": f"FIRE#{schedule_id}"},
+            UpdateExpression="SET #notice = :at REMOVE #ttl",
+            ConditionExpression="attribute_not_exists(#notice)",
+            ExpressionAttributeNames={"#notice": "targetNoticeAt", "#ttl": "ttl"},
+            ExpressionAttributeValues={":at": int(time.time() if now is None else now)},
+        )
+        return True
+    except Exception as error:  # noqa: BLE001 -- the notice is best effort; the run is refused either way
+        if _error_code(error) != "ConditionalCheckFailedException":
+            logger.warning("Scheduled task %s notice record write failed: %s", schedule_id, type(error).__name__)
+        return False
+
+
+def skip_recent_fire(job, now=None):
+    """The Lambda response for a fire that comes too soon after the schedule's last run, else None.
+
+    One conditional UpdateItem of lastFiredAt on SCHED#<userId>/FIRE#<scheduleId>
+    per fire, before the usage limit and the warm-up: a fire less than
+    MIN_FIRE_INTERVAL_SECONDS after the last run is skipped, which also skips
+    a repeated invocation of the same fire. The item expires
+    FIRE_RECORD_TTL_SECONDS after the last run. A failed write lets the fire
+    run and logs a WARNING (fail open, like the usage limit). The log lines
+    avoid the terms of the scheduled-task failure alarm.
+    """
+    now = int(time.time() if now is None else now)
+    try:
+        identity_table.update_item(
+            Key={"PK": f"SCHED#{job['userId']}", "SK": f"FIRE#{job['scheduleId']}"},
+            UpdateExpression="SET #fired = :at, #ttl = :ttl",
+            ConditionExpression="attribute_not_exists(#fired) OR #fired <= :cutoff",
+            ExpressionAttributeNames={"#fired": "lastFiredAt", "#ttl": "ttl"},
+            ExpressionAttributeValues={":at": now, ":ttl": now + FIRE_RECORD_TTL_SECONDS,
+                                       ":cutoff": now - MIN_FIRE_INTERVAL_SECONDS},
+        )
+    except Exception as error:  # noqa: BLE001 -- fail open: the run proceeds
+        if _error_code(error) == "ConditionalCheckFailedException":
+            logger.warning("Scheduled task %s skipped: it ran less than 5 minutes ago", job["scheduleId"])
+            return {"statusCode": 200, "body": "Skipped: it ran less than 5 minutes ago"}
+        logger.warning("Scheduled task %s fire record write failed: %s", job["scheduleId"], type(error).__name__)
+    return None
 
 
 def scheduled_message(job):
@@ -1395,7 +1533,7 @@ def launch_async(event):
     job, error = verify_cron_event(event)
     if error:
         return error
-    skipped = skip_over_usage_limit(job)
+    skipped = skip_recent_fire(job) or skip_over_usage_limit(job)
     if skipped:
         return skipped
     name = async_job_id(event, job["userId"])
